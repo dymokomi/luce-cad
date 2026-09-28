@@ -1,0 +1,170 @@
+## Bounded native face jobs. Workers borrow immutable CAD/edge data; each owns
+## its native scratch and ARC temporaries. Only copied raw arrays cross back.
+import memory
+import thread
+import ownership
+import interop
+import sync
+from three import Vector3, MeshBuilder, invalid
+from luce_cad.brep_types import Surface, Curve, BrepFace, Samples
+from luce_cad.surface_normals import face_normals
+from luce_cad.layout_types import GridLayout
+
+pub type FaceMesher = func(MeshBuilder*, BrepFace, Surface, const Curve[], const Samples[], GridLayout, i64, f64, f64) -> unit!
+
+struct Product:
+    var points: Vector3[]
+    var sizes: i64[]
+    var corners: i64[]
+    var normals: f64[]
+    var owns_normals: bool = true
+    var failure: interop.Packet[str]? = none
+    func close():
+        if self.points.length > 0: free(self.points) in memory.heap
+        if self.sizes.length > 0: free(self.sizes) in memory.heap
+        if self.corners.length > 0: free(self.corners) in memory.heap
+        if self.owns_normals and self.normals.length > 0: free(self.normals) in memory.heap
+        if let failure = self.failure: failure.release()
+
+struct Jobs:
+    var lock: sync.Mutex
+    var next: usize = 0
+    var completed: usize = 0
+    var stop: bool = false
+    var failure: interop.Packet[str]? = none
+    let points: const Vector3[]
+    let edges: const Curve[]
+    let surfaces: const Surface[]
+    let faces: const BrepFace[]
+    let samples: const Samples[]
+    let plans: const GridLayout[]
+    let divisions: i64
+    let tolerance: f64
+    let edge_size: f64
+    let products: Product[]
+    let mesher: FaceMesher
+
+func run(raw: void*?):
+    ownership.enter()
+    defer ownership.finish_task()
+    let jobs = (Jobs*)(raw else return)
+    work(jobs) catch failure:
+        jobs.lock.lock()
+        defer jobs.lock.unlock()
+        if jobs.failure == none:
+            jobs.failure = interop.text_transfer.copy(failure.message) catch exhausted: trap(exhausted.message)
+        jobs.stop = true
+
+func work(jobs: Jobs*) -> !:
+    var scratch = try MeshBuilder()
+    defer scratch.close()
+    for point in jobs.points:
+        discard(try scratch.point(point))
+    while true:
+        jobs.lock.lock()
+        if jobs.stop or jobs.next == jobs.faces.length:
+            jobs.lock.unlock()
+            return
+        let index = jobs.next
+        jobs.next += 1
+        jobs.lock.unlock()
+        scratch.np = jobs.points.length
+        scratch.nf = 0
+        scratch.nc = 0
+        prepare(jobs, index, &scratch) catch failure:
+            var context: u8[1024]
+            let message = format(context, f"CAD face {index}: {failure.message}") catch exhausted: recover failure.message
+            jobs.products[index].failure = interop.text_transfer.copy(message) catch exhausted: trap(exhausted.message)
+        jobs.lock.lock()
+        jobs.completed += 1
+        jobs.lock.unlock()
+
+func prepare(jobs: Jobs*, index: usize, scratch: MeshBuilder*) -> !:
+    let face = jobs.faces[index]
+    let plan = jobs.plans[index]
+    try jobs.mesher(scratch, face, jobs.surfaces[(usize)face.surface], jobs.edges, jobs.samples, plan, jobs.divisions, jobs.tolerance, jobs.edge_size)
+    let product = &jobs.products[index]
+    product.points = try alloc Vector3[scratch.np - jobs.points.length] in memory.heap
+    product.sizes = try alloc i64[scratch.nf] in memory.heap
+    product.corners = try alloc i64[scratch.nc] in memory.heap
+    memory.copy(product.points, scratch.points[jobs.points.length..<scratch.np], product.points.length)
+    memory.copy(product.sizes, scratch.sizes, scratch.nf)
+    memory.copy(product.corners, scratch.corners, scratch.nc)
+    product.owns_normals = not (plan.applied.length > 0 and plan.applied[0])
+    product.normals = (try face_normals(scratch, 0, scratch.nc, face, jobs.surfaces[(usize)face.surface], jobs.tolerance)) if product.owns_normals else plan.normals[0].values
+
+## The caller invokes progress on its own thread. Results are assembled in face
+## order, so parallel scheduling cannot change point IDs, topology or attributes.
+pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], samples: const Samples[], plans: const GridLayout[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]?, mesher: FaceMesher) -> f64[]!:
+    let products = try alloc Product[faces.length] in memory.heap
+    defer free(products) in memory.heap
+    for index in 0..<products.length:
+        products[index] = Product()
+    defer close_products(products)
+    var jobs = Jobs(points = mesh.points[..<mesh.np], edges = edges, surfaces = surfaces, faces = faces, samples = samples, plans = plans, divisions = divisions, tolerance = tolerance, edge_size = edge_size, products = products, mesher = mesher)
+    defer release_failure(&jobs)
+    var handles: thread.Handle[4]
+    var started: usize = 0
+    defer stop_jobs(&jobs, handles[..<started])
+    for index in 0..<(usize)4:
+        handles[index] = try thread.spawn(run, (void*)&jobs, name = "CAD face mesh")
+        started += 1
+    var reported: usize = 0
+    while true:
+        jobs.lock.lock()
+        let completed = jobs.completed
+        let stopped = jobs.stop
+        jobs.lock.unlock()
+        if completed != reported:
+            if let report = progress:
+                let outcome = report.invoke((f64)completed / (f64)faces.length * 0.9)
+                defer outcome.release()
+                try outcome.get()
+            reported = completed
+        if completed == faces.length or stopped:
+            break
+        thread.sleep(2)
+    stop_jobs(&jobs, handles[..<started])
+    started = 0
+    if let failure = jobs.failure:
+        let owned = try interop.copy_text(failure.value)
+        if let owner = owned.owner: discard(ownership.pool_object(owner))
+        error(invalid, owned.value)
+    let boundary = mesh.np
+    var normal_count: usize = 0
+    for product in products: normal_count += product.normals.length
+    let normals = try alloc f64[normal_count] in memory.heap
+    errdefer free(normals) in memory.heap
+    var normal_offset: usize = 0
+    for index in 0..<products.length:
+        let product = products[index]
+        if let failure = product.failure:
+            let owned = try interop.copy_text(failure.value)
+            if let owner = owned.owner: discard(ownership.pool_object(owner))
+            error(invalid, owned.value)
+        let base = mesh.np
+        for point in product.points:
+            discard(try mesh.point(point))
+        var corner: usize = 0
+        for size in product.sizes:
+            try mesh.face(size, (i64)index)
+            for at in 0..<size:
+                let id = product.corners[corner]
+                try mesh.corner(id if (usize)id < boundary else (i64)(base + (usize)id - boundary))
+                corner += 1
+        memory.copy(normals[normal_offset..<normal_offset + product.normals.length], product.normals, product.normals.length)
+        normal_offset += product.normals.length
+    return normals
+
+func stop_jobs(jobs: Jobs*, handles: const thread.Handle[]):
+    jobs.lock.lock()
+    jobs.stop = true
+    jobs.lock.unlock()
+    for handle in handles:
+        handle.join() catch failure: trap(failure.message)
+
+func close_products(products: const Product[]):
+    for product in products: product.close()
+
+func release_failure(jobs: Jobs*):
+    if let failure = jobs.failure: failure.release()

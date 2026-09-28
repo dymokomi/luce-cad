@@ -1,0 +1,340 @@
+## Format-independent CAD model. Analytic control nets survive mesh generation.
+## Independent patches and shared B-rep topology retain their analytic data.
+import interop
+import memory
+import math
+import ownership
+import luce_cad.brep as brep
+pub type BrepModel = brep.BrepModel
+pub let brep_model_type = brep.brep_model_type
+from three import PolygonMesh, MeshBuilder, MeshNormals, Vector3, Matrix4, invalid
+from tesselator import NurbsSurface
+from luce_cad.patch_grid import planar_grid
+
+struct Face:
+    let points: Vector3[]
+    let weights: f64[]
+    let ku: f64[]
+    let kv: f64[]
+    let nu: i64
+    let nv: i64
+    let du: i64
+    let dv: i64
+    var u0: f64
+    var u1: f64
+    var v0: f64
+    var v1: f64
+    var reversed: bool
+
+    func close():
+        free(self.points) in memory.heap
+        free(self.weights) in memory.heap
+        free(self.ku) in memory.heap
+        free(self.kv) in memory.heap
+
+pub struct CadModel:
+    let faces: Face[]
+    var count: usize
+    var boundary: interop.Reference[BrepModel]? = none
+    var placement: Matrix4
+
+    pub func init() -> !:
+        self.faces = try alloc Face[1024] in memory.heap
+        self.count = 0
+        self.boundary = none
+        self.placement = Matrix4()
+
+    ## Number of analytic faces, independent of tessellation resolution.
+    pub func face_count() -> i64:
+        if let value = self.boundary:
+            return (i64)self.count + value.value().face_count()
+        return (i64)self.count
+
+    pub mutating func attach_brep(value: interop.Reference[BrepModel]) -> !:
+        if let existing = self.boundary:
+            error(invalid, "CAD model already has boundary topology")
+        self.boundary = value.clone()
+
+    pub func edge_count() -> i64:
+        if let value = self.boundary:
+            return value.value().edge_count()
+        return 0
+
+    ## Object hierarchy metadata is independent of surface representation.
+    pub func face_path(face: i64) -> str!:
+        if face < 0 or face >= self.face_count():
+            error(invalid, "CAD face index out of range")
+        if let boundary = self.boundary:
+            if face >= (i64)self.count:
+                return try boundary.value().face_path(face - (i64)self.count)
+        return ""
+
+    ## Extract analytic B-rep faces without tessellating or flattening metadata.
+    pub func subset(selection: const i64[]) -> interop.Reference[CadModel]!:
+        if self.count != 0:
+            error(invalid, "CAD subsets currently require B-rep topology")
+        let boundary = self.boundary else error(invalid, "CAD model has no B-rep")
+        let part = try boundary.value().subset(selection)
+        defer part.release()
+        let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
+        errdefer result.release()
+        try result.value().attach_brep(part)
+        result.value().placement = self.placement
+        return result
+
+    ## Return an independent transformed analytic model, retaining trim domains.
+    pub func transformed(translation: Vector3, rotation: Vector3, scale: Vector3) -> interop.Reference[CadModel]!:
+        if not translation.is_finite() or not rotation.is_finite() or not scale.is_finite() or math.abs(scale.x) < 0.000001 or math.abs(scale.y) < 0.000001 or math.abs(scale.z) < 0.000001:
+            error(invalid, "CAD transform must be finite and nonsingular")
+        let matrix = Matrix4.compose(translation, rotation, scale)
+        let reflected = matrix.determinant() < 0.0
+        let output = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
+        errdefer output.release()
+        for entry in self.faces[..<self.count]:
+            let points = try alloc Vector3[entry.points.length] in memory.heap
+            defer free(points) in memory.heap
+            for index in 0..<points.length:
+                points[index] = matrix.transform_point(entry.points[points.length - 1 - index if reflected and entry.nu == 0 else index])
+            try output.value().append(points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv)
+            if entry.nu > 0:
+                let index = output.value().count - 1
+                try output.value().trim_rectangle((i64)index, entry.u0, entry.u1, entry.v0, entry.v1)
+                output.value().faces[index].reversed = entry.reversed != reflected
+        if let boundary = self.boundary:
+            try output.value().attach_brep(boundary)
+            output.value().placement = matrix.multiply(self.placement)
+        return output
+
+    ## Add a simple, coplanar outer boundary. Winding controls face orientation.
+    ## Holes and shared topological edges are not supported by this first API.
+    pub mutating func add_planar(boundary: const Vector3[]) -> !:
+        if boundary.length < 3 or boundary.length > 256:
+            error(invalid, "CAD planar boundary requires 3..256 points")
+        var normal = Vector3()
+        for at in 0..<boundary.length:
+            normal = normal.add(boundary[at].subtract(boundary[0]).cross(boundary[(at + 1) % boundary.length].subtract(boundary[0])))
+        normal = try normal.normalized()
+        for point in boundary:
+            if not point.is_finite() or math.abs(point.subtract(boundary[0]).dot(normal)) > 0.000001:
+                error(invalid, "CAD planar boundary must be finite and coplanar within 1e-6 source units")
+        let checked = try planar_mesh(boundary)
+        defer checked.release()
+        var empty: f64[1]
+        try self.append(boundary, empty[..<0], 0, 0, 0, 0, empty[..<0], empty[..<0])
+
+    ## Preserve an exact rational control net and its full parameter domain.
+    pub mutating func add_nurbs(points: const Vector3[], weights: const f64[], nu: i64, nv: i64,
+                               degree_u: i64, degree_v: i64, knots_u: const f64[], knots_v: const f64[]) -> !:
+        try NurbsSurface.check(points, weights, nu, nv, degree_u, degree_v, knots_u, knots_v)
+        try self.append(points, weights, nu, nv, degree_u, degree_v, knots_u, knots_v)
+
+    ## Set an axis-aligned parameter-space trim on a NURBS face.
+    ## This does not approximate the surface by clipping a pre-existing mesh.
+    pub mutating func trim_rectangle(face: i64, u0: f64, u1: f64, v0: f64, v1: f64) -> !:
+        if face < 0 or (usize)face >= self.count:
+            error(invalid, "CAD face index out of range")
+        let entry = self.faces[(usize)face]
+        if entry.nu == 0:
+            error(invalid, "parameter trimming requires a NURBS face")
+        try NurbsSurface.check_region(entry.ku, entry.kv, entry.nu, entry.nv, entry.du, entry.dv, u0, u1, v0, v1)
+        self.faces[(usize)face].u0 = u0
+        self.faces[(usize)face].u1 = u1
+        self.faces[(usize)face].v0 = v0
+        self.faces[(usize)face].v1 = v1
+
+    ## Produce a disposable display mesh; the analytic model is unchanged.
+    pub func face_edge_count(face: i64) -> i64!:
+        if face < 0 or face >= self.face_count():
+            error(invalid, "CAD face index out of range")
+        if let boundary = self.boundary:
+            if face >= (i64)self.count:
+                return try boundary.value().face_edge_count(face - (i64)self.count)
+        return (i64)self.faces[(usize)face].points.length if self.faces[(usize)face].nu == 0 else 4
+
+    pub func face_edge_point(face: i64, edge: i64, fraction: f64) -> Vector3!:
+        let count = try self.face_edge_count(face)
+        if edge < 0 or edge >= count or fraction < 0.0 or fraction > 1.0 or not math.is_finite(fraction):
+            error(invalid, "invalid CAD boundary sample")
+        if let boundary = self.boundary:
+            if face >= (i64)self.count:
+                return self.placement.transform_point(try boundary.value().face_edge_point(face - (i64)self.count, edge, fraction))
+        let entry = self.faces[(usize)face]
+        if entry.nu == 0:
+            let a = entry.points[(usize)edge]
+            let b = entry.points[(usize)((edge + 1) % count)]
+            return a.add(b.subtract(a).multiply_scalar(fraction))
+        let u = entry.u0 + (entry.u1 - entry.u0) * fraction
+        let v = entry.v0 + (entry.v1 - entry.v0) * fraction
+        return try NurbsSurface.at(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv,
+            u if edge == 0 or edge == 2 else (entry.u1 if edge == 1 else entry.u0), v if edge == 1 or edge == 3 else (entry.v0 if edge == 0 else entry.v1))
+
+    pub func face_edge_linear(face: i64, edge: i64) -> bool!:
+        let count = try self.face_edge_count(face)
+        if edge < 0 or edge >= count:
+            error(invalid, "CAD edge use index out of range")
+        if let boundary = self.boundary:
+            if face >= (i64)self.count:
+                return try boundary.value().face_edge_linear(face - (i64)self.count, edge)
+        return self.faces[(usize)face].nu == 0
+
+    pub func face_edge_id(face: i64, edge: i64) -> i64!:
+        let count = try self.face_edge_count(face)
+        if edge < 0 or edge >= count:
+            error(invalid, "CAD edge use index out of range")
+        if let boundary = self.boundary:
+            if face >= (i64)self.count:
+                return try boundary.value().face_edge_id(face - (i64)self.count, edge)
+        return self.edge_count() + face * 256 + edge
+
+    pub func preview_face(face: i64, divisions: i64 = 8) -> interop.Reference[PolygonMesh]!:
+        if face < 0 or face >= self.face_count():
+            error(invalid, "CAD preview face index out of range")
+        if let boundary = self.boundary:
+            if face >= (i64)self.count:
+                let part = try boundary.value().preview_face(face - (i64)self.count, divisions)
+                defer part.release()
+                return try part.value().placed(self.placement)
+        let entry = self.faces[(usize)face]
+        if entry.nu == 0:
+            return try planar_mesh(entry.points)
+        let part = try NurbsSurface.tessellate_region(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv, entry.u0, entry.u1, entry.v0, entry.v1, divisions)
+        defer part.release()
+        var output = try MeshBuilder()
+        defer output.close()
+        try output.copy_points(part.value())
+        for at in 0..<part.value().face_count():
+            let count = try part.value().face_size(at)
+            try output.face(count)
+            for corner in 0..<count:
+                try output.corner(try part.value().face_point(at, count - 1 - corner if entry.reversed else corner))
+        let raw = try output.finish()
+        defer raw.release()
+        var groups: i64[1]
+        return try MeshNormals.generate(raw, groups[..<0])
+
+    pub func tessellate(segments: i64 = 16, edge_size: f64 = 0.0, progress: interop.Callback[f64, unit]? = none) -> interop.Reference[PolygonMesh]!:
+        if not math.is_finite(edge_size) or edge_size < 0.0:
+            error(invalid, "edge size must be finite and nonnegative")
+        if segments < 1 or segments > 64:
+            error(invalid, "CAD tessellation segments must be 1..64")
+        if self.face_count() == 0:
+            error(invalid, "CAD model has no faces")
+        # The common STEP path needs no second mesh rebuild, recoloring, BVH or
+        # normal generation. Placement is applied only when nonidentity.
+        if self.count == 0:
+            if let boundary = self.boundary:
+                let part = try boundary.value().mesh(segments, edge_size, progress)
+                defer part.release()
+                return try part.value().placed(self.placement)
+        var output = try MeshBuilder()
+        defer output.close()
+        let colors = try alloc f64[2097152 * 3] in memory.heap
+        defer free(colors) in memory.heap
+        for index in 0..<colors.length:
+            colors[index] = 1.0
+        var has_colors = false
+        if let boundary = self.boundary:
+            let part = try boundary.value().mesh(segments, edge_size, progress)
+            defer part.release()
+            for point in 0..<part.value().point_count():
+                discard(try output.point(self.placement.transform_point(try part.value().point(point))))
+            let reversed = self.placement.determinant() < 0.0
+            let groups = part.value().find_attribute("cad_face", 2)
+            let cd = part.value().find_attribute("Cd", 2)
+            has_colors = cd >= 0
+            for face in 0..<part.value().face_count():
+                let count = try part.value().face_size(face)
+                if cd >= 0:
+                    for component in 0..<3:
+                        colors[output.nf * 3 + (usize)component] = try part.value().attribute_value(cd, face, component)
+                try output.face(count, (i64)(try part.value().attribute_value(groups, face, 0)))
+                for corner in 0..<count:
+                    try output.corner(try part.value().face_point(face, count - 1 - corner if reversed else corner))
+        for face_id in 0..<self.count:
+            let entry = self.faces[face_id]
+            if entry.nu == 0 and edge_size == 0.0:
+                try output.face((i64)entry.points.length, (i64)face_id + 1024)
+                for point in entry.points:
+                    try output.corner(try output.point(point))
+                continue
+            var resolution = segments
+            if entry.nu > 0 and edge_size > 0.0:
+                var span: f64 = 0.0
+                for point in entry.points:
+                    span = math.max(span, point.subtract(entry.points[0]).length())
+                let needed = math.ceil(span / edge_size)
+                if needed > 64.0:
+                    error(invalid, "edge size exceeds independent NURBS grid budget; increase it")
+                resolution = (i64)math.max((f64)segments, needed)
+            let part = try planar_grid(entry.points, edge_size) if entry.nu == 0 else (try NurbsSurface.tessellate_region(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv, entry.u0, entry.u1, entry.v0, entry.v1, resolution))
+            defer part.release()
+            let offset = (i64)output.np
+            for point in 0..<part.value().point_count():
+                discard(try output.point(try part.value().point(point)))
+            for face in 0..<part.value().face_count():
+                let count = try part.value().face_size(face)
+                try output.face(count, (i64)face_id + 1024)
+                for corner in 0..<count:
+                    try output.corner(offset + (try part.value().face_point(face, count - 1 - corner if entry.reversed else corner)))
+        let raw = try output.finish()
+        defer raw.release()
+        for index in 0..<output.nf:
+            if output.face_parents[index] < 0:
+                output.face_parents[index] = (i64)index + 1024
+        let values = try alloc f64[output.nf] in memory.heap
+        defer free(values) in memory.heap
+        for index in 0..<output.nf:
+            values[index] = (f64)output.face_parents[index]
+        let tagged = try raw.value().with_attribute("cad_face", 2, 1, values, true)
+        defer tagged.release()
+        if has_colors:
+            let colored = try tagged.value().with_attribute("Cd", 2, 3, colors[..<output.nf * 3])
+            defer colored.release()
+            return try MeshNormals.generate(colored, output.face_parents[..<output.nf])
+        return try MeshNormals.generate(tagged, output.face_parents[..<output.nf])
+
+    mutating func append(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[]) -> !:
+        if self.count == self.faces.length:
+            error(invalid, "CAD model exceeds 1024 faces")
+        let copied = try alloc Vector3[points.length] in memory.heap
+        errdefer free(copied) in memory.heap
+        for index in 0..<points.length:
+            copied[index] = points[index]
+        let w = try copy_values(weights)
+        errdefer free(w) in memory.heap
+        let u = try copy_values(ku)
+        errdefer free(u) in memory.heap
+        let v = try copy_values(kv)
+        self.faces[self.count] = Face(copied, w, u, v, nu, nv, du, dv,
+                                    ku[(usize)du] if nu > 0 else 0.0, ku[(usize)nu] if nu > 0 else 0.0,
+                                    kv[(usize)dv] if nv > 0 else 0.0, kv[(usize)nv] if nv > 0 else 0.0, false)
+        self.count += 1
+
+    ## Release owned control nets and face storage.
+    pub mutating func close():
+        for entry in self.faces[..<self.count]:
+            entry.close()
+        free(self.faces) in memory.heap
+        if let boundary = self.boundary:
+            boundary.release()
+        self.boundary = none
+
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        if let boundary = self.boundary:
+            boundary.trace(visit, context)
+
+pub let cad_model_type: interop.Type[CadModel] = interop.Type[CadModel]("CadModel", CadModel.close, CadModel.trace, closeable = true)
+
+func copy_values(values: const f64[]) -> f64[]!:
+    let output = try alloc f64[values.length] in memory.heap
+    for index in 0..<values.length:
+        output[index] = values[index]
+    return output
+
+func planar_mesh(points: const Vector3[]) -> interop.Reference[PolygonMesh]!:
+    var builder = try MeshBuilder()
+    defer builder.close()
+    try builder.face((i64)points.length)
+    for point in points:
+        try builder.corner(try builder.point(point))
+    return try builder.finish()

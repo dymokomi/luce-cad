@@ -1,0 +1,133 @@
+## Lift a frozen UV cell arrangement onto its exact CAD support. Shared boundary
+## IDs survive clipping; n-gons describe cut cells, not hidden coarse geometry.
+import memory
+import math
+from three import Vector3, MeshBuilder, invalid, squared_triangle_distance
+from tesselator import TrimGrid
+from luce_cad.brep_types import Surface, BrepFace, Samples
+from luce_cad.layout_types import GridLayout, Stations
+from luce_cad.mapped_patch import point
+from luce_cad.patch_sides import edge_index
+from luce_cad.surface_normals import nurbs_normal
+from luce_cad.clipped_cells import append_cells
+
+## Emit planned cells or fail atomically at the caller's rollback boundary.
+pub func clipped_patch(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: i64) -> !:
+    if not plan.valid: error(invalid,"no compatible trimmed-grid layout")
+    var length: usize = 0
+    for use in face.uses: length += samples[edge_index(use)].ids.length-1
+    if length > 16384: error(invalid,"trim grid boundary budget exceeded")
+    let uv = try alloc Vector3[length] in memory.heap
+    defer free(uv) in memory.heap
+    let ids = try alloc i64[length] in memory.heap
+    defer free(ids) in memory.heap
+    let sizes = try alloc i64[face.sizes.length] in memory.heap
+    defer free(sizes) in memory.heap
+    var written: usize = 0
+    var offset: usize = 0
+    var seed = Vector3(0.5,0.5,0.0)
+    for loop in 0..<face.sizes.length:
+        let start = written
+        for at in 0..<(usize)face.sizes[loop]:
+            let use = face.uses[offset+at]
+            let chain = samples[edge_index(use)].ids
+            for i in 0..<chain.length-1:
+                let id = chain[i if use > 0 else chain.length-1-i]
+                let chain_uv = plan.chains[offset+at].points
+                if chain_uv.length != chain.length: error(invalid,"trim layout boundary is not frozen")
+                seed = chain_uv[i if use > 0 else chain.length-1-i]
+                uv[written] = seed
+                ids[written] = id
+                written += 1
+        offset += (usize)face.sizes[loop]
+        sizes[loop] = (i64)(written-start)
+    let original_uv = try alloc Vector3[uv.length] in memory.heap
+    defer free(original_uv) in memory.heap
+    memory.copy(original_uv,uv,uv.length)
+    var begin: usize = 0
+    for size in sizes:
+        for at in 0..<(usize)size:
+            let index = begin+at
+            let p = mesh.points[(usize)ids[index]]
+            let before = mesh.points[(usize)ids[begin+(at+(usize)size-1)%(usize)size]]
+            let after = mesh.points[(usize)ids[begin+(at+1)%(usize)size]]
+            # Only topology-safe UV alignment: never merge close trim vertices,
+            # never move the canonical 3D point, and stay inside CAD uncertainty.
+            let budget = math.min(tolerance*0.05,math.min(p.subtract(before).length(),p.subtract(after).length())*0.2)
+            let original = try point(surface,uv[index])
+            for axis in 0..<(usize)2:
+                let stations = plan.u if axis == 0 else plan.v
+                let value = uv[index].x if axis == 0 else uv[index].y
+                let aligned = nearest(stations,value)
+                let previous_uv = original_uv[begin+(at+(usize)size-1)%(usize)size]
+                let next_uv = original_uv[begin+(at+1)%(usize)size]
+                let low = math.min(previous_uv.x,next_uv.x) if axis == 0 else math.min(previous_uv.y,next_uv.y)
+                let high = math.max(previous_uv.x,next_uv.x) if axis == 0 else math.max(previous_uv.y,next_uv.y)
+                # Align actual crossings, not an entire near-tangent run. The
+                # latter can flatten a curved sliver onto another trim edge and
+                # change topology even when each move is within CAD tolerance.
+                if math.abs(aligned-value) > plan.epsilon*1e-5 and (aligned <= low or aligned >= high): continue
+                let candidate = Vector3(aligned,uv[index].y,0.0) if axis == 0 else Vector3(uv[index].x,aligned,0.0)
+                let support = try point(surface,candidate)
+                if support.subtract(original).length() <= budget and support.subtract(p).length() <= tolerance:
+                    uv[index] = candidate
+        begin += (usize)size
+    let cells = try TrimGrid.clip_identified(uv,sizes,plan.u.values[..<plan.u.count],plan.v.values[..<plan.v.count],ids)
+    defer cells.release()
+    let part = cells.value()
+    var lifted = try MeshBuilder()
+    defer lifted.close()
+    let mapping = try alloc i64[(usize)part.point_count()] in memory.heap
+    defer free(mapping) in memory.heap
+    for at in 0..<part.point_count():
+        let p = mesh.points[(usize)ids[(usize)at]] if (usize)at < ids.length else (try point(surface,try part.point(at)))
+        discard(try lifted.point(p))
+    try append_cells(&lifted,part,face.sense)
+    # Validate the real display triangulation, including concave cut cells.
+    let validation = try lifted.finish()
+    defer validation.release()
+    if surface.kind != 0:
+        let extent = validation.value().bounds().maximum.subtract(validation.value().bounds().minimum).length()
+        let deviation = math.max(tolerance,extent/((f64)divisions*(f64)divisions*16.0))
+        for triangle in 0..<validation.value().index_count()//3:
+            var corners: i64[3]
+            for at in 0..<3:
+                let index = validation.value().index(triangle*3+at)
+                defer index.release()
+                corners[(usize)at] = lifted.corners[(usize)(try index.get())]
+            let a = try part.point(corners[0])
+            let b = try part.point(corners[1])
+            let c = try part.point(corners[2])
+            let pa = lifted.points[(usize)corners[0]]
+            let pb = lifted.points[(usize)corners[1]]
+            let pc = lifted.points[(usize)corners[2]]
+            for probe in [a.add(b).add(c).multiply_scalar(1.0/3.0),a.add(b).multiply_scalar(0.5),b.add(c).multiply_scalar(0.5),c.add(a).multiply_scalar(0.5)]:
+                if squared_triangle_distance(try point(surface,probe),pa,pb,pc) > deviation*deviation:
+                    error(invalid,"clipped cell exceeds surface deviation")
+    let normals = try alloc Vector3[mapping.length] in memory.heap
+    defer free(normals) in memory.heap
+    for at in 0..<normals.length:
+        var n = surface.z if surface.kind == 0 else (try nurbs_normal(surface,try part.point((i64)at)))
+        if n.length() < 1e-15: error(invalid,"trimmed grid touches a singular support")
+        normals[at] = try face.placement.transform_normal(n.multiply_scalar(1.0 if face.sense else -1.0))
+    plan.normals[0].values = try alloc f64[lifted.nc*3] in memory.heap
+    var normal_corner: usize = 0
+    for at in 0..<mapping.length:
+        mapping[at] = ids[at] if at < ids.length else (try mesh.point(lifted.points[at]))
+    for f in 0..<lifted.nf:
+        let count = lifted.sizes[f]
+        try mesh.face(count)
+        for at in 0..<count:
+            let id = (usize)lifted.corners[normal_corner]
+            try mesh.corner(mapping[id])
+            let n = normals[id]
+            plan.normals[0].values[normal_corner*3] = n.x
+            plan.normals[0].values[normal_corner*3+1] = n.y
+            plan.normals[0].values[normal_corner*3+2] = n.z
+            normal_corner += 1
+
+func nearest(stations: Stations, value: f64) -> f64:
+    var result = stations.values[0]
+    for at in 1..<stations.count:
+        if math.abs(stations.values[at]-value) < math.abs(result-value): result = stations.values[at]
+    return result

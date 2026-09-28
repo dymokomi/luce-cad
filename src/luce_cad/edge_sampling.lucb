@@ -1,0 +1,77 @@
+## Geometric edge counts and guarded physical-spacing selection.
+import math
+from three import Vector3
+from luce_cad.brep_types import Curve
+from luce_cad.curve_spacing import ArcMetric
+
+## Reduce straight/simple spline sampling within the requested quality budget.
+## This sampled criterion is not a certified deflection bound. Complex/C0 edges
+## retain the full divisions*4 budget; opposite-side agreement may increase it.
+pub func curve_intervals(edge: Curve, divisions: i64, tolerance: f64, metric: ArcMetric*) -> usize!:
+    if edge.kind == 0: return 1
+    if edge.kind == 1:
+        return (usize)math.max(2.0, math.ceil((f64)(divisions * 4) * math.abs(edge.sweep) / (2.0 * math.pi) - 0.000000001))
+    var length: f64 = 0.0
+    var previous = try edge.at(0.0)
+    for at in 1..<33:
+        let p = try edge.at((f64)at / 32.0)
+        length += p.subtract(previous).length()
+        previous = p
+    let chord = math.max(tolerance, length / ((f64)divisions * (f64)divisions * 16.0))
+    let cosine = math.cos(0.75 * 2.0 * math.pi / (4.0 * (f64)divisions))
+    var count: usize = 1
+    while true:
+        var accepted = true
+        for interval in 0..<count:
+            var p = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+            let ta = metric.station((f64)interval/(f64)count)
+            let tb = metric.station((f64)(interval+1)/(f64)count)
+            for at in 0..<(usize)5: p[at] = try edge.at(ta+(tb-ta)*(f64)at/4.0)
+            let span = p[4].subtract(p[0])
+            for at in 1..<(usize)4:
+                let t = math.clamp(p[at].subtract(p[0]).dot(span) / span.dot(span), 0.0, 1.0) if span.dot(span) > 1e-30 else 0.0
+                if p[at].subtract(p[0].add(span.multiply_scalar(t))).length() > chord:
+                    accepted = false
+            for a in 0..<(usize)4:
+                for b in a + 1..<(usize)4:
+                    let da = p[a + 1].subtract(p[a])
+                    let db = p[b + 1].subtract(p[b])
+                    if da.length() > tolerance * 0.001 and db.length() > tolerance * 0.001 and da.dot(db) < cosine * da.length() * db.length(): accepted = false
+        if accepted: return count
+        # Sharp knots cannot meet an angular target under uniform refinement.
+        # Never turn the heuristic into a new import failure or runaway budget.
+        if count >= (usize)(divisions * 4):
+            if metric.uniform:
+                metric.uniform = false
+                let parameter_count = try curve_intervals(edge,divisions,tolerance,metric)
+                # C0 knots can prevent either distribution from satisfying the
+                # angular target at the cap. Prefer even spacing only when its
+                # sampled chord error and turn are no worse than the retained
+                # parameter grid; do not reject it solely for the same kink.
+                if parameter_count == count:
+                    let original = try measure_error(edge,metric,count,tolerance)
+                    metric.uniform = true
+                    let even = try measure_error(edge,metric,count,tolerance)
+                    metric.uniform = even.x <= original.x+1e-12 and even.y <= original.y+1e-8
+                return parameter_count
+            return count
+        count = (usize)math.min((f64)(count * 2), (f64)(divisions * 4))
+
+func measure_error(edge: Curve, metric: ArcMetric*, count: usize, tolerance: f64) -> Vector3!:
+    var result = Vector3()
+    for interval in 0..<count:
+        var p = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+        let a = metric.station((f64)interval/(f64)count)
+        let b = metric.station((f64)(interval+1)/(f64)count)
+        for at in 0..<(usize)5: p[at] = try edge.at(a+(b-a)*(f64)at/4.0)
+        let span = p[4].subtract(p[0])
+        for at in 1..<(usize)4:
+            let t = math.clamp(p[at].subtract(p[0]).dot(span)/span.dot(span),0.0,1.0) if span.dot(span) > 1e-30 else 0.0
+            result.x = math.max(result.x,p[at].subtract(p[0].add(span.multiply_scalar(t))).length())
+        for first in 0..<(usize)4:
+            for second in first+1..<(usize)4:
+                let da = p[first+1].subtract(p[first])
+                let db = p[second+1].subtract(p[second])
+                if da.length() > tolerance*0.001 and db.length() > tolerance*0.001:
+                    result.y = math.max(result.y,1.0-da.dot(db)/(da.length()*db.length()))
+    return result

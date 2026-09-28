@@ -1,0 +1,85 @@
+## Unexported low-level layout contracts, independent of external STEP fixtures.
+import memory
+from three import Vector3, invalid
+from luce_cad.brep_types import Surface, Curve
+from luce_cad.mapped_spacing import redistribute
+from luce_cad.layout_cell_error import refine_cells
+from luce_cad.layout_types import Stations
+import math
+
+## Both boundary-to-first-row gaps are included; the boundary itself is fixed.
+pub func interior_spacing_contract() -> !:
+    let s = try Surface(3,Vector3(),Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),0.0,0.0,
+        [Vector3(),Vector3(0.0,1.0,0.0),Vector3(1.0,0.0,0.0),Vector3(1.0,1.0,0.0)],
+        [1.0,1.0,1.0,1.0],[0.0,0.0,1.0,1.0],[0.0,0.0,1.0,1.0],2,2,1,1)
+    defer s.close()
+    let grid = try alloc Vector3[25] in memory.heap
+    defer free(grid) in memory.heap
+    for both_axes in [false,true]:
+        for row in 0..<(usize)5:
+            for col in 0..<(usize)5:
+                let boundary = row == 0 or row == 4 or col == 0 or col == 4
+                grid[row*5+col] = Vector3((f64)col/4.0 if boundary else 0.3+(f64)col*0.1,
+                    (f64)row/4.0 if boundary or not both_axes else 0.3+(f64)row*0.1,0.0)
+        try redistribute(grid,4,4,s,1e-6)
+        for row in 0..<(usize)5:
+            for col in 0..<(usize)5:
+                let boundary = row == 0 or row == 4 or col == 0 or col == 4
+                # Coupled axes converge iteratively within the bounded sweeps;
+                # boundary values and the single-axis affine case stay exact.
+                let limit = 1e-10 if boundary or not both_axes else 0.01
+                if grid[row*5+col].subtract(Vector3((f64)col/4.0,(f64)row/4.0,0.0)).length() > limit:
+                    error(invalid,"interior spacing must include both end intervals and preserve every trim vertex")
+        for axis in 0..<(usize)2:
+            for line in 1..<(usize)4:
+                var low: f64 = 1e100
+                var high: f64 = 0.0
+                let stride = 1 if axis == 0 else (usize)5
+                let start = line*5 if axis == 0 else line
+                for at in 0..<(usize)4:
+                    let gap = grid[start+(at+1)*stride].subtract(grid[start+at*stride]).length()
+                    low = math.min(low,gap)
+                    high = math.max(high,gap)
+                if high > low*1.05: error(invalid,"both interior row families must have evenly spaced end gaps")
+
+pub func main(arguments: str[]) -> i32!:
+    try interior_spacing_contract()
+    try diagonal_error_contract()
+    try endpoint_roundoff_contract()
+    return 0
+
+## Floating endpoint reconstruction must clamp tiny overshoots, while a real
+## interval crossing the seam of a closed spline must still wrap normally.
+func endpoint_roundoff_contract() -> !:
+    for reversed in [false,true]:
+        let edge = try Curve(2,0,1,Vector3(),Vector3(),Vector3(),0.0,
+            [Vector3(),Vector3(1.0,0.0,0.0)],[1.0,1.0],[0.0,0.0,0.3,0.3],1,not reversed,
+            0.2 if reversed else 0.1,-0.20000000000000004 if reversed else 0.2)
+        defer edge.close()
+        let p = try edge.at(1.0)
+        if math.abs(p.x-(0.0 if reversed else 1.0)) > 1e-12:
+            error(invalid,"open spline endpoint wrapped across its knot domain")
+    let closed = try Curve(2,0,1,Vector3(),Vector3(),Vector3(),0.0,
+        [Vector3(),Vector3(1.0,0.0,0.0),Vector3()],[1.0,1.0,1.0],[0.0,0.0,0.5,1.0,1.0],1,true,0.75,0.5)
+    defer closed.close()
+    if math.abs((try closed.at(1.0)).x-0.5) > 1e-12:
+        error(invalid,"a real periodic crossing must still wrap")
+
+## A bilinear saddle has straight isocurves, but its display triangles are not
+## on the support. Planning must catch this before shared cuts are frozen.
+func diagonal_error_contract() -> !:
+    let s = try Surface(3,Vector3(),Vector3(),Vector3(),0.0,0.0,
+        [Vector3(),Vector3(0.0,1.0,0.0),Vector3(1.0,0.0,0.0),Vector3(1.0,1.0,1.0)],
+        [1.0,1.0,1.0,1.0],[0.0,0.0,1.0,1.0],[0.0,0.0,1.0,1.0],2,2,1,1)
+    defer s.close()
+    var u = Stations()
+    var v = Stations()
+    try u.open(257)
+    defer u.close()
+    try v.open(257)
+    defer v.close()
+    for t in [0.0,1.0]:
+        discard(try u.insert(t,1e-9))
+        discard(try v.insert(t,1e-9))
+    try refine_cells(&u,&v,s,8,1e-6,1e-9)
+    if u.count < 9 or v.count < 9: error(invalid,"mixed curvature needs complete support rows")

@@ -1,0 +1,119 @@
+## Periodic analytic support inversion and trim meshing in unwrapped UV space.
+import memory
+import math
+from three import Vector3, MeshBuilder, invalid
+from tesselator import TrimPolygon
+from luce_cad.brep_types import Surface
+from luce_cad.analytic_eval import evaluate
+from luce_cad.adaptive_uv import refine_uv
+
+func wrap(value: f64, previous: f64) -> f64:
+    var result = value
+    while result - previous > math.pi:
+        result -= 2.0 * math.pi
+    while result - previous < -math.pi:
+        result += 2.0 * math.pi
+    return result
+
+pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    let uv = try alloc Vector3[ids.length] in memory.heap
+    defer free(uv) in memory.heap
+    let uscale = math.max(s.radius, tolerance)
+    let vscale = s.radius if s.kind == 4 else (s.angle if s.kind == 5 else 1.0)
+    var offset: usize = 0
+    var anchor = Vector3()
+    for loop in 0..<sizes.length:
+        var previous = anchor
+        for at in 0..<(usize)sizes[loop]:
+            let p = mesh.points[(usize)ids[offset + at]].subtract(s.origin)
+            let x = p.dot(s.x)
+            let y = p.dot(s.y)
+            let z = p.dot(s.z)
+            let radius = math.sqrt(x * x + y * y)
+            var u = math.atan2(y, x)
+            var v = math.atan2(z, radius) if s.kind == 4 else (math.atan2(z, radius - s.radius) if s.kind == 5 else z)
+            if at > 0 or loop > 0:
+                u = wrap(u, previous.x)
+                if s.kind == 5:
+                    v = wrap(v, previous.y)
+            if evaluate(s, u, v).subtract(mesh.points[(usize)ids[offset + at]]).length() > tolerance:
+                error(invalid, "analytic trim is outside its support tolerance")
+            previous = Vector3(u, v, 0.0)
+            uv[offset + at] = Vector3(u * uscale, v * vscale, 0.0)
+            if loop == 0 and at == 0:
+                anchor = previous
+        offset += (usize)sizes[loop]
+    # A single latitude loop bounds a spherical cap; UV has a singular pole.
+    if s.kind == 4 and sizes.length == 1:
+        var latitude = true
+        for p in uv:
+            latitude = latitude and math.abs(p.y - uv[0].y) <= tolerance
+        if latitude:
+            try spherical_cap(mesh, ids, uv, s, sense, divisions)
+            return
+    var spacing = uscale * math.pi / (2.0 * (f64)divisions)
+    var vertical = vscale * math.pi / (2.0 * (f64)divisions) if s.kind == 4 or s.kind == 5 else spacing
+    if edge_size == 0.0:
+        var minimum = uv[0]
+        var maximum = uv[0]
+        for p in uv:
+            minimum = Vector3(math.min(minimum.x, p.x), math.min(minimum.y, p.y), 0.0)
+            maximum = Vector3(math.max(maximum.x, p.x), math.max(maximum.y, p.y), 0.0)
+        # A tiny-radius, long axial strip must not request millions of square
+        # cells when target edge length is off. Shared boundary samples retain
+        # angular resolution; interior refinement stays bounded by divisions.
+        spacing = math.max(math.min(spacing, (maximum.x - minimum.x) / (f64)divisions), (maximum.x - minimum.x) / ((f64)divisions * 4.0))
+        vertical = math.max(math.min(vertical, (maximum.y - minimum.y) / (f64)divisions), (maximum.y - minimum.y) / ((f64)divisions * 4.0))
+    if edge_size > 0.0:
+        spacing = math.min(spacing, edge_size)
+        vertical = math.min(vertical, edge_size)
+    let initial = try TrimPolygon.quadrangulate_seams(uv, sizes, Vector3(0.0, 0.0, 1.0), ids, spacing, vertical)
+    defer initial.release()
+    var low = mesh.points[(usize)ids[0]]
+    var high = low
+    for id in ids:
+        let p = mesh.points[(usize)id]
+        low = Vector3(math.min(low.x,p.x),math.min(low.y,p.y),math.min(low.z,p.z))
+        high = Vector3(math.max(high.x,p.x),math.max(high.y,p.y),math.max(high.z,p.z))
+    let deviation = math.max(tolerance,high.subtract(low).length()/((f64)divisions*(f64)divisions*16.0))
+    let part = try refine_uv(initial,s,uscale,vscale,deviation)
+    defer part.release()
+    let mapped = try alloc i64[(usize)part.value().point_count()] in memory.heap
+    defer free(mapped) in memory.heap
+    for at in 0..<mapped.length:
+        let p = try part.value().point((i64)at)
+        mapped[at] = ids[at] if at < ids.length else (try mesh.point(evaluate(s, p.x / uscale, p.y / vscale)))
+    for face in 0..<part.value().face_count():
+        let count = try part.value().face_size(face)
+        try mesh.face(count)
+        for at in 0..<count:
+            try mesh.corner(mapped[(usize)(try part.value().face_point(face, at if sense else count - 1 - at))])
+
+func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s: Surface, sense: bool, divisions: i64) -> !:
+    let north = uv[uv.length - 1].x > uv[0].x
+    let pole_v = math.pi * (0.5 if north else -0.5)
+    let start_v = uv[0].y / s.radius
+    let previous = try alloc i64[ids.length] in memory.heap
+    defer free(previous) in memory.heap
+    let next = try alloc i64[ids.length] in memory.heap
+    defer free(next) in memory.heap
+    for at in 0..<ids.length:
+        previous[at] = ids[at]
+    for row in 1..<divisions:
+        let v = start_v + (pole_v - start_v) * (f64)row / (f64)divisions
+        for at in 0..<ids.length:
+            next[at] = try mesh.point(evaluate(s, uv[at].x / s.radius, v))
+        for at in 0..<ids.length:
+            let following = (at + 1) % ids.length
+            let corners = [previous[at], previous[following], next[following], next[at]]
+            try mesh.face(4)
+            for index in 0..<(usize)4:
+                try mesh.corner(corners[index if sense else 3 - index])
+        for at in 0..<ids.length:
+            previous[at] = next[at]
+    let pole = try mesh.point(evaluate(s, 0.0, pole_v))
+    for at in 0..<ids.length:
+        let corners = [previous[at], previous[(at + 1) % ids.length], pole]
+        try mesh.face(3)
+        for index in 0..<(usize)3:
+            try mesh.corner(corners[index if sense else 2 - index])

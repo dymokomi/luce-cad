@@ -1,0 +1,45 @@
+## Endpoint inversion for STEP edges trimmed inside a B-spline's knot domain.
+## Search each nonempty span, not a uniform grid that can miss short spans.
+import math
+import interop
+import ownership
+from three import Vector3, invalid
+from tesselator import NurbsCurve
+
+pub func parameter(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], point: Vector3, preferred: f64, tolerance: f64) -> f64!:
+    var best = preferred
+    var distance = (try NurbsCurve.at(points, weights, degree, knots, best)).subtract(point).length()
+    if distance <= tolerance: return best
+    for span in (usize)degree..<points.length:
+        if knots[span + 1] <= knots[span]: continue
+        # Split each span before a bounded scalar minimization; a degree-eight
+        # curve may have several local distance minima in one span.
+        for part in 0..<16:
+            var a = knots[span] + (knots[span + 1] - knots[span]) * (f64)part / 16.0
+            var b = knots[span] + (knots[span + 1] - knots[span]) * (f64)(part + 1) / 16.0
+            var left = b - (b - a) * 0.6180339887498949
+            var right = a + (b - a) * 0.6180339887498949
+            var dl = (try NurbsCurve.at(points, weights, degree, knots, left)).subtract(point).length()
+            var dr = (try NurbsCurve.at(points, weights, degree, knots, right)).subtract(point).length()
+            for iteration in 0..<48:
+                if dl < dr:
+                    b = right
+                    right = left
+                    dr = dl
+                    left = b - (b - a) * 0.6180339887498949
+                    dl = (try NurbsCurve.at(points, weights, degree, knots, left)).subtract(point).length()
+                else:
+                    a = left
+                    left = right
+                    dl = dr
+                    right = a + (b - a) * 0.6180339887498949
+                    dr = (try NurbsCurve.at(points, weights, degree, knots, right)).subtract(point).length()
+            if math.min(dl, dr) < distance:
+                distance = math.min(dl, dr)
+                best = left if dl < dr else right
+    if distance > tolerance:
+        var buffer: u8[256]
+        let text = try interop.copy_text(try format(buffer, f"B-spline endpoint residual {distance} exceeds tolerance {tolerance}"))
+        if let owner = text.owner: discard(ownership.pool_object(owner))
+        error(invalid, text.value)
+    return best

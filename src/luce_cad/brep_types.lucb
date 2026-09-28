@@ -1,0 +1,181 @@
+## Owned exact B-rep curve/surface records, independent of file syntax.
+import memory
+import interop
+import math
+from three import Vector3, Matrix4, invalid
+from tesselator import NurbsCurve, NurbsSurface
+
+## Shared, immutable boundary discretization borrowed by face workers.
+pub struct Samples:
+    pub let ids: i64[]
+    pub let baseline: i64[]
+
+pub func copy_numbers(values: const f64[]) -> f64[]!:
+    let result = try alloc f64[values.length] in memory.heap
+    for at in 0..<values.length:
+        result[at] = values[at]
+    return result
+
+pub func copy_points(values: const Vector3[]) -> Vector3[]!:
+    let result = try alloc Vector3[values.length] in memory.heap
+    for at in 0..<values.length:
+        result[at] = values[at]
+    return result
+
+pub struct Curve:
+    pub let kind: i64
+    pub let start: i64
+    pub let end: i64
+    pub let origin: Vector3
+    pub let x: Vector3
+    pub let y: Vector3
+    pub let radius: f64
+    pub let points: Vector3[]
+    pub let weights: f64[]
+    pub let knots: f64[]
+    pub let degree: i64
+    pub let sense: bool
+    pub let angle: f64
+    pub let sweep: f64
+
+    ## kind 0 line, 1 circle arc, 2 trimmed B-spline interval, 3 ellipse arc.
+    ## Ellipse minor radius is stored as the single weight; splines own a full net.
+    pub func init(kind: i64, start: i64, end: i64, origin: Vector3, x: Vector3, y: Vector3, radius: f64,
+                  points: const Vector3[], weights: const f64[], knots: const f64[], degree: i64, sense: bool,
+                  angle: f64 = 0.0, sweep: f64 = 0.0) -> !:
+        let p = try copy_points(points)
+        errdefer free(p) in memory.heap
+        let w = try copy_numbers(weights)
+        errdefer free(w) in memory.heap
+        let k = try copy_numbers(knots)
+        self.kind = kind
+        self.start = start
+        self.end = end
+        self.origin = origin
+        self.x = x
+        self.y = y
+        self.radius = radius
+        self.points = p
+        self.weights = w
+        self.knots = k
+        self.degree = degree
+        self.sense = sense
+        self.angle = angle
+        self.sweep = sweep
+
+    pub func at(fraction: f64) -> Vector3!:
+        if fraction < 0.0 or fraction > 1.0 or not math.is_finite(fraction):
+            error(invalid, "invalid curve fraction")
+        if self.kind == 0:
+            return self.points[0].add(self.points[1].subtract(self.points[0]).multiply_scalar(fraction))
+        if self.kind == 1 or self.kind == 3:
+            let a = self.angle + self.sweep * fraction
+            let minor = self.weights[0] if self.kind == 3 else self.radius
+            return self.origin.add(self.x.multiply_scalar(self.radius * math.cos(a))).add(self.y.multiply_scalar(minor * math.sin(a)))
+        let low = self.knots[(usize)self.degree]
+        let high = self.knots[self.points.length]
+        var parameter = self.angle + self.sweep * fraction
+        if self.angle == high and self.sweep == low - high:
+            parameter = low + (high - low) * (1.0 - fraction)
+        # Closed curves may cross their parameter seam. The interval was checked
+        # against both topological endpoints before the immutable curve was built.
+        # Reconstructing an endpoint as angle+sweep can miss a knot by a few
+        # ulps. Do not turn that roundoff into an entire periodic traversal:
+        # an open edge then jumps back to its start and poisons arc-length and
+        # curvature planning, even though the topological endpoint is correct.
+        let roundoff = math.max(1.0,math.max(math.abs(low),math.abs(high)))*8e-15
+        if parameter < low-roundoff: parameter += high - low
+        if parameter > high+roundoff: parameter -= high - low
+        return try NurbsCurve.at(self.points, self.weights, self.degree, self.knots, math.clamp(parameter, low, high))
+
+    pub func close():
+        free(self.points) in memory.heap
+        free(self.weights) in memory.heap
+        free(self.knots) in memory.heap
+
+pub struct Surface:
+    pub let kind: i64
+    pub let origin: Vector3
+    pub let x: Vector3
+    pub let y: Vector3
+    pub let z: Vector3
+    pub let radius: f64
+    pub let angle: f64
+    pub let points: Vector3[]
+    pub let weights: f64[]
+    pub let ku: f64[]
+    pub let kv: f64[]
+    pub let nu: i64
+    pub let nv: i64
+    pub let du: i64
+    pub let dv: i64
+
+    ## kind 0 plane, 1 cylinder, 2 cone, 3 rational B-spline, 4 sphere, 5 torus.
+    ## angle is the cone's semi-angle or, for a torus, its minor radius.
+    pub func init(kind: i64, origin: Vector3, x: Vector3, z: Vector3, radius: f64, angle: f64,
+                  points: const Vector3[], weights: const f64[], ku: const f64[], kv: const f64[],
+                  nu: i64, nv: i64, du: i64, dv: i64) -> !:
+        if kind == 3: try NurbsSurface.check(points, weights, nu, nv, du, dv, ku, kv)
+        let p = try copy_points(points)
+        errdefer free(p) in memory.heap
+        let w = try copy_numbers(weights)
+        errdefer free(w) in memory.heap
+        let u = try copy_numbers(ku)
+        errdefer free(u) in memory.heap
+        let v = try copy_numbers(kv)
+        self.kind = kind
+        self.origin = origin
+        self.x = x
+        self.z = z
+        self.y = z.cross(x)
+        self.radius = radius
+        self.angle = angle
+        self.points = p
+        self.weights = w
+        self.ku = u
+        self.kv = v
+        self.nu = nu
+        self.nv = nv
+        self.du = du
+        self.dv = dv
+
+    pub func at(u: f64, v: f64) -> Vector3!:
+        return try NurbsSurface.sample_checked(self.points, self.weights, self.nu, self.nv, self.du, self.dv, self.ku, self.kv, u, v)
+
+    pub func close():
+        free(self.points) in memory.heap
+        free(self.weights) in memory.heap
+        free(self.ku) in memory.heap
+        free(self.kv) in memory.heap
+
+pub struct BrepFace:
+    pub var path: interop.Packet[str]?
+    pub var placement: Matrix4
+    pub var color: Vector3
+    pub var colored: bool
+    pub let surface: i64
+    pub let uses: i64[]
+    pub let sizes: i64[]
+    pub let sense: bool
+
+    pub func init(surface: i64, uses: const i64[], sizes: const i64[], sense: bool) -> !:
+        self.path = none
+        self.placement = Matrix4()
+        self.color = Vector3(1.0, 1.0, 1.0)
+        self.colored = false
+        let copied = try alloc i64[uses.length] in memory.heap
+        errdefer free(copied) in memory.heap
+        let counts = try alloc i64[sizes.length] in memory.heap
+        for at in 0..<uses.length:
+            copied[at] = uses[at]
+        for at in 0..<sizes.length:
+            counts[at] = sizes[at]
+        self.surface = surface
+        self.uses = copied
+        self.sizes = counts
+        self.sense = sense
+
+    pub func close():
+        free(self.uses) in memory.heap
+        free(self.sizes) in memory.heap
+        if let path = self.path: path.release()

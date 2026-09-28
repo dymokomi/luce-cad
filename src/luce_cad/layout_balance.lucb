@@ -1,0 +1,65 @@
+## Continue boundary rows through mapped patches without introducing new phases
+## on aligned circular bands. Count-only matching is insufficient for fillets.
+from luce_cad.brep_types import Curve, BrepFace
+from luce_cad.patch_sides import PatchSides, edge_index
+from luce_cad.layout_types import Stations, GridLayout
+from luce_cad.layout_phase import align_sides
+from luce_cad.curve_spacing import ArcMetric
+
+## Preserve original stations, pair circular phases, then balance logical sides.
+pub func balance(faces: const BrepFace[], edges: const Curve[], sides: const PatchSides[], cuts: Stations[], metrics: const ArcMetric[], plans: GridLayout[], tolerance: f64) -> !:
+    for pass in 0..<32:
+        var changed = false
+        for face_id in 0..<faces.length:
+            let side = sides[face_id]
+            let face = faces[face_id]
+            let rows = plans[face_id].rows
+            for use in 0..<face.uses.length:
+                if not plans[face_id].flow[use] and not plans[face_id].support_rows[use]: continue
+                let shared = cuts[edge_index(face.uses[use])]
+                for at in 0..<shared.count:
+                    let added = try rows[use].insert(shared.values[at],1e-9)
+                    changed = changed or added
+            let mapped = side.valid and not plans[face_id].valid
+            for pair in 0..<(2 if mapped else (usize)0):
+                let aligned = try align_sides(face,edges,side,pair,rows,tolerance)
+                changed = changed or aligned
+            var totals: usize[4]
+            for axis in 0..<(4 if mapped else (usize)0):
+                totals[axis] = 0
+                for segment in 0..<side.lengths[axis]:
+                    let use = (side.starts[axis]+segment)%face.uses.length
+                    totals[axis] += rows[use].count-1
+            for pair in 0..<(2 if mapped else (usize)0):
+                let a = totals[pair]
+                let b = totals[pair+2]
+                if a == b or a > 512 or b > 512: continue
+                let axis = pair if a < b else pair+2
+                let missing = b-a if a < b else a-b
+                for extra in 0..<missing:
+                    var largest: f64 = 0.0
+                    var selected: usize = 0
+                    var interval: usize = 0
+                    for segment in 0..<side.lengths[axis]:
+                        let use = (side.starts[axis]+segment)%face.uses.length
+                        let metric = metrics[edge_index(face.uses[use])]
+                        for at in 0..<rows[use].count-1:
+                            let gap = metric.at(rows[use].values[at+1])-metric.at(rows[use].values[at])
+                            if gap > largest:
+                                largest = gap
+                                selected = use
+                                interval = at
+                    if largest <= 1e-14: break
+                    let cut = &rows[selected]
+                    let metric = metrics[edge_index(face.uses[selected])]
+                    let midpoint = metric.parameter((metric.at(cut.values[interval])+metric.at(cut.values[interval+1]))*0.5)
+                    let inserted = try cut.insert(midpoint,1e-9)
+                    changed = changed or inserted
+            # Publishing a row only adds a boundary corner to a stopped neighbor.
+            # It becomes an interior row there only across a classified flow seam.
+            for use in 0..<face.uses.length:
+                let shared = &cuts[edge_index(face.uses[use])]
+                for at in 0..<rows[use].count:
+                    let added = try shared.insert(rows[use].values[at],1e-9)
+                    changed = changed or added
+        if not changed: break
