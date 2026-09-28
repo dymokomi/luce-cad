@@ -1,0 +1,69 @@
+## A rejected face stops new work but joins earlier in-flight faces. The first
+## failing face in source order must be independent of worker completion order.
+import memory
+import sync
+import thread
+from three import Vector3, MeshBuilder, invalid
+from luce_cad.brep_types import BrepFace, Surface, Curve, Samples
+from luce_cad.layout_types import GridLayout
+from luce_cad.face_jobs import mesh_faces
+
+var lock: sync.Mutex
+var entered: usize = 0
+var visits: usize[64]
+
+pub func face_jobs_contract() -> !:
+    var empty: f64[]
+    var points: Vector3[]
+    var edges: Curve[]
+    var samples: Samples[]
+    let surface = try Surface(0,Vector3(),Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),0.0,0.0,points,empty,empty,empty,0,0,0,0)
+    defer surface.close()
+    let surfaces = [surface]
+    let faces = try alloc BrepFace[64] in memory.heap
+    defer free(faces) in memory.heap
+    var created: usize = 0
+    defer close_faces(faces[..<created])
+    let plans = try alloc GridLayout[64] in memory.heap
+    defer free(plans) in memory.heap
+    for at in 0..<faces.length:
+        faces[at] = try BrepFace(0,[(i64)at],[1],true)
+        created += 1
+        plans[at] = GridLayout()
+    for repeat in 0..<16:
+        entered = 0
+        for at in 0..<visits.length: visits[at] = 0
+        var builder = try MeshBuilder()
+        defer builder.close()
+        var failed = false
+        let result = mesh_faces(&builder,edges,surfaces,faces,samples,plans,4,1e-6,0.0,none,fail_ordered) catch failure:
+            if failure.code != invalid or failure.message != "CAD face 1: earlier failure": error(invalid,"face jobs lost source-order failure reporting")
+            failed = true
+            recover empty
+        defer free(result) in memory.heap
+        if not failed: error(invalid,"face jobs accepted a failed model")
+        if entered < 4 or entered > 7: error(invalid,"face jobs kept scheduling after failure")
+        for at in 0..<(usize)4:
+            if visits[at] != 1: error(invalid,"face jobs did not join the earlier in-flight work")
+        if builder.nf != 0 or builder.nc != 0 or builder.np != 0: error(invalid,"failed face jobs assembled a partial result")
+
+func fail_ordered(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], plan: GridLayout, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    let index = (usize)face.uses[0]
+    lock.lock()
+    entered += 1
+    visits[index] += 1
+    lock.unlock()
+    # Synchronize the first four callbacks so both failing faces are in flight.
+    while true:
+        lock.lock()
+        let ready = entered >= 4
+        lock.unlock()
+        if ready: break
+        thread.sleep(1)
+    if index == 1:
+        thread.sleep(5)
+        error(invalid,"earlier failure")
+    if index >= 3: error(invalid,"later failure")
+
+func close_faces(faces: const BrepFace[]):
+    for face in faces: face.close()

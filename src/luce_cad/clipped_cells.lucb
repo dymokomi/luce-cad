@@ -1,41 +1,40 @@
-## Local display fallback for warped cut cells, never the surrounding patch.
-from three import PolygonMesh, MeshBuilder, invalid
+## Lifted cut cells retain their polygon boundary and their UV triangulation.
+## Display diagonals are not mesh edges and must not change quad-flow valence.
+from three import Vector3, PolygonMesh, MeshBuilder, invalid
+from luce_cad.clipped_display import folds, repair
+from luce_cad.clipped_triangulation import solve
 
-## Retain regular quads and valid cut n-gons. If a cut cell cannot be projected
-## as a single 3D polygon, use its already validated parameter-space triangles.
-## All boundary IDs survive; only this cell gains internal polygon edges.
-pub func append_cells(lifted: MeshBuilder*, part: PolygonMesh*, forward: bool) -> !:
-    var scratch = try MeshBuilder()
-    defer scratch.close()
+pub func append_cells(lifted: MeshBuilder*, part: PolygonMesh*, forward: bool, normals: const Vector3[], failed: i64*? = none) -> !:
     var triangle: i64 = 0
+    var indices: i64[762]
+    var alternate: i64[762]
     for face in 0..<part.face_count():
         let count = try part.face_size(face)
-        var polygon = true
-        if count > 4:
-            scratch.np = 0
-            scratch.nf = 0
-            scratch.nc = 0
-            try scratch.face(count)
-            for at in 0..<count:
-                let id = try part.face_point(face,at if forward else count-1-at)
-                try scratch.corner(try scratch.point(lifted.points[(usize)id]))
-            check(&scratch) catch failure:
+        let offset = try part.face_offset(face)
+        try lifted.face(count)
+        for at in 0..<count:
+            try lifted.corner(try part.face_point(face,at if forward else count-1-at))
+        for t in 0..<count-2:
+            for at in 0..<3:
+                let index = part.index(triangle+t*3+(at if forward else 2-at))
+                defer index.release()
+                let corner_index = (try index.get())-offset
+                indices[(usize)(t*3+at)] = corner_index if forward else count-1-corner_index
+        let chosen = indices[..<(usize)(count-2)*3]
+        let other = alternate[..<chosen.length]
+        var bad = folds(lifted,chosen,normals)
+        if bad > 0:
+            try repair(lifted,part,face,forward,chosen,normals)
+            bad = folds(lifted,chosen,normals)
+        if bad > 0:
+            var valid = true
+            lifted.triangulate_last(other) catch failure:
                 if failure.code != invalid: error(failure.code,failure.message)
-                polygon = false
-                recover ()
-        if polygon:
-            try lifted.face(count)
-            for at in 0..<count: try lifted.corner(try part.face_point(face,at if forward else count-1-at))
-        else:
-            let offset = try part.face_offset(face)
-            for t in 0..<count-2:
-                try lifted.face(3)
-                for at in 0..<3:
-                    let reference = part.index(triangle+t*3+(at if forward else 2-at))
-                    defer reference.release()
-                    try lifted.corner(try part.face_point(face,(try reference.get())-offset))
+                valid = false
+            if valid and folds(lifted,other,normals) < bad:
+                for at in 0..<chosen.length: chosen[at] = other[at]
+            if folds(lifted,chosen,normals) > 0 and not (try solve(lifted,part,face,forward,chosen,normals)):
+                if let destination = failed: *destination = face
+                error(invalid,"trimmed cell has no consistently oriented display triangulation")
+        try lifted.set_last_display(chosen)
         triangle += (count-2)*3
-
-func check(scratch: MeshBuilder*) -> !:
-    let result = try scratch.finish()
-    result.release()

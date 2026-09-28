@@ -6,6 +6,7 @@ from tesselator import TrimPolygon
 from luce_cad.brep_types import Surface
 from luce_cad.analytic_eval import evaluate
 from luce_cad.adaptive_uv import refine_uv
+from luce_cad.sphere_chart import local_sphere, touches_pole
 
 func wrap(value: f64, previous: f64) -> f64:
     var result = value
@@ -16,6 +17,27 @@ func wrap(value: f64, previous: f64) -> f64:
     return result
 
 pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    if s.kind == 4 and touches_pole(s,mesh.points[..<mesh.np],ids):
+        let chart = try local_sphere(s,mesh.points[..<mesh.np],ids)
+        defer chart.close()
+        try mesh_in_chart(mesh,ids,sizes,chart,sense,divisions,tolerance,edge_size)
+        return
+    let np = mesh.np
+    let nf = mesh.nf
+    let nc = mesh.nc
+    mesh_in_chart(mesh,ids,sizes,s,sense,divisions,tolerance,edge_size) catch failure:
+        if failure.code != invalid or s.kind != 4: error(failure.code,failure.message)
+        mesh.np = np
+        mesh.nf = nf
+        mesh.nc = nc
+        # Retry a failed angular chart away from an authored pole too.
+        # Canonical trim positions/IDs never move.
+        let chart = try local_sphere(s,mesh.points[..<mesh.np],ids)
+        defer chart.close()
+        try mesh_in_chart(mesh,ids,sizes,chart,sense,divisions,tolerance,edge_size)
+        recover ()
+
+func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
     let uv = try alloc Vector3[ids.length] in memory.heap
     defer free(uv) in memory.heap
     let uscale = math.max(s.radius, tolerance)

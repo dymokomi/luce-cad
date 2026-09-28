@@ -6,6 +6,8 @@ import math
 from three import PolygonMesh, MeshBuilder, Vector3, invalid, squared_triangle_distance
 from luce_cad.brep_types import Surface
 from luce_cad.analytic_eval import evaluate
+from luce_cad.adaptive_cells import split_triangle, center_conditioned
+from luce_cad.support_normals import support_normal
 
 func sample(s: Surface, p: Vector3, uscale: f64, vscale: f64) -> Vector3!:
     if s.kind != 3: return evaluate(s,p.x/uscale,p.y/vscale)
@@ -77,6 +79,18 @@ func refine_pass(source: interop.Reference[PolygonMesh], surface: Surface, uscal
         if not split:
             try output.copy_face(input, face)
             continue
+        if count == 3:
+            let vertices = [try input.face_point(face,0),try input.face_point(face,1),try input.face_point(face,2)]
+            let cuts = [splits[(usize)(try input.face_edge(face,0))],splits[(usize)(try input.face_edge(face,1))],splits[(usize)(try input.face_edge(face,2))]]
+            let nf = output.nf
+            let nc = output.nc
+            if not center_conditioned(&output,vertices,cuts,center) and (try split_triangle(&output,vertices,cuts)):
+                # A good UV diagonal need not be good on a curved support.
+                # Keep edge-only refinement only when every lifted child has
+                # the support's orientation; otherwise retain the centre path.
+                if try oriented(&output,nc,surface,uscale,vscale): continue
+                output.nf = nf
+                output.nc = nc
         let middle = try output.point(center)
         for at in 0..<count:
             let a = try input.face_point(face, at)
@@ -103,3 +117,16 @@ func deviation(mesh: PolygonMesh*, points: const Vector3[], face: i64, p: Vector
 func triangle(mesh: MeshBuilder*, a: i64, b: i64, c: i64) -> !:
     try mesh.face(3)
     for id in [a, b, c]: try mesh.corner(id)
+
+func oriented(mesh: const MeshBuilder*, start: usize, surface: Surface, uscale: f64, vscale: f64) -> bool!:
+    for at in 0..<(mesh.nc-start)//3:
+        var uv = [Vector3(),Vector3(),Vector3()]
+        var p = uv
+        for i in 0..<(usize)3:
+            uv[i] = mesh.points[(usize)mesh.corners[start+at*3+i]]
+            p[i] = try sample(surface,uv[i],uscale,vscale)
+        let cross = p[1].subtract(p[0]).cross(p[2].subtract(p[0]))
+        for q in uv:
+            let n = try support_normal(surface,Vector3(q.x/uscale,q.y/vscale,0.0))
+            if cross.dot(n) <= cross.length()*1e-10: return false
+    return true

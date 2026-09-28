@@ -23,6 +23,13 @@ The intended ownership is:
 - `face_count()` counts CAD faces, not tessellated polygons.
 - `preview_face(face, divisions=8)` produces one disposable display patch,
   without requiring the entire CAD model to fit a single polygon mesh.
+- `planned_face(face, segments=16, edge_size=0)` is a B-rep diagnostic: build
+  the complete shared-edge/layout plan, then mesh only the selected face.
+  Unlike isolated preview, this retains the full cook's neighboring station
+  decisions, source-face attributes, display triangulation and normals. Unused
+  points are compacted. Success does **not** validate the other face jobs or
+  prove that the full model tessellates; independent non-B-rep faces are not
+  supported by this diagnostic.
 - `face_edge_count/id/linear/point` expose shared boundary identities and exact
   samples for cached patch outlines, independent of display triangle edges.
 - `transformed(translation, rotation, scale)` returns a separate analytic model,
@@ -49,9 +56,10 @@ Supported face meshing:
   contain multiple STEP edges. Opposite side counts agree before shared edge
   sampling; interior curvature can raise the counts even with straight borders.
   Folded, singular and degenerate grids fall back to constrained trim meshing.
-- Nonperiodic NURBS trim loops projected to UV, meshed and lifted to the surface.
-  Projection must agree within the model tolerance; singular/ambiguous periodic
-  parameterizations and arbitrary p-curves are not supported.
+- NURBS trim loops projected to UV, meshed and lifted to the surface. Repeated
+  seams on verified closed supports retain separate periodic chart images but
+  stitch through the original shared 3D identities. Projection must agree within
+  model tolerance; singular/ambiguous charts and arbitrary p-curves can still fail.
 - B-spline edges can retain a trimmed knot subinterval, including a seam-crossing
   interval on a geometrically closed curve. Endpoints must agree with the curve
   within model tolerance; no silent tolerance inflation is performed.
@@ -62,9 +70,18 @@ Supported face meshing:
   face budget bound work; this is not a certified global chord-error guarantee.
 - Trimmed cylinders/cones/spheres/tori in unwrapped analytic UV coordinates;
   latitude-bounded spherical caps receive a pole-aware mesh.
+  Cylinder/cone clipping charts carry the angular branch between successive
+  coedges even without a repeated seam edge. Hole loops choose the outer loop's
+  chart branch; new shared stations retain that branch on refresh. This avoids
+  fictitious full-revolution trim chords without moving any boundary point.
 - Four-sided planar faces share the mapped path. The constrained fallback for
   complex planes uses an interior lattice before conservative triangle pairing.
-- Irregular planar/nonperiodic NURBS trims can use a grid-first cell-clipping
+  Planar four-side candidates are preflighted with the actual fitted mesher
+  while shared cuts are still mutable. A folded candidate receives a support
+  grid plan instead of skipping directly to fallback triangles. Successful
+  maps retain their strategy; four logical corners alone do not prove that
+  the fitted parameter grid is valid.
+- Irregular planar, cylindrical, conical and NURBS trims can use a grid-first cell-clipping
   path. Curvature and edge-size tests seed directional rows; compatible
   isoparametric coedges transfer their station positions across patch boundaries,
   including swapped/reversed UV axes. Exact CAD-curve/grid intersections become
@@ -73,8 +90,8 @@ Supported face meshing:
 - Four coedges no longer automatically select a boundary-fitted grid. Hard
   oblique trims on nonperiodic NURBS domains prefer the independent support
   grid. Opposite-edge parameter speed alone does not turn a smooth seam into
-  a flow stop. Periodic/repeated-edge
-  boundaries retain their existing periodic strategies. The clipped path is
+  a flow stop. Verified periodic/repeated-edge boundaries can use a cut chart;
+  unsupported charts retain their existing periodic strategies. The clipped path is
   attempted before a fallback that transports all shared boundary samples.
 - Support-grid planning checks sampled display-triangle error on both diagonals,
   in addition to directional isocurve tests. Mixed curvature can add complete
@@ -89,23 +106,106 @@ Supported face meshing:
   one axis is not blocked by an unchanged worst row in the other axis.
   Rejected moves do nothing; exact trims and CAD boundary tolerance stay fixed.
   This is not a certified global surface-error bound.
-- A warped cut n-gon that cannot be displayed safely is decomposed using its UV
-  triangles locally, without replacing the whole patch by a constrained fan.
-  Unaffected quads/n-gons and shared boundary identities remain unchanged.
-- Compatible single-circle sides transfer angular stations as well as counts.
-  Compound sides retain count matching with interior geometric refinement;
-  universal split-ring phase transfer still needs tolerance-aware trim healing.
-  This prevents equal-count but differently phased ordinary fillet strips.
+- Severely crowded clipped NURBS interiors can also redistribute complete
+  grid-line chains. A short terminal boolean-cut interval alone does not trigger
+  this pass. Every trim/hole vertex and polygon connection stays fixed; only
+  interior UV points move and are re-evaluated on the exact support. Three
+  bounded sweeps backtrack under the unchanged display-error budget. Acceptance
+  requires improved physical gap variance, no worse worst gap ratio, reduced
+  aggregate quad distortion, and no worse original stretched/skewed counts or
+  maximum edge ratio. Valid UV triangles and quad corner turns are preserved;
+  originally well-angled charts cannot acquire corners below a sine of 0.5.
+  Actual display triangles and support normals are checked transactionally.
+  This improves spacing without claiming a globally optimal quad layout or
+  eliminating competing station phases at the frozen boundary.
+- Cut polygons retain their own display triangles independently from their real
+  wire edges. Bounded diagonal flips remain inside convex UV quadrilaterals and
+  strictly reduce support-normal violations. UV and projected candidates are checked against exact support
+  normals; consistently oriented candidates survive worker assembly, affine
+  placement, copies and subsets. If local flips stall, a bounded dynamic program
+  searches visible UV diagonals for a complete normal-consistent triangulation
+  (up to 256 corners, only on failed cells). Tiny grazing cut cells can merge
+  across one internal manifold side into a larger neighbor: at most one eighth of its
+  UV area, no extra touching vertices, no moved/deleted trim points, and at most
+  32 merges per patch. The final lifted mesh still passes the same normal and
+  sampled surface-deviation checks. A clipped patch with an unresolved folded cell
+  is rejected transactionally so the next strategy can run. This does not claim
+  that all legacy fallback meshes are free of folded triangles.
+- Trim ribbons whose physical area/longest-edge ratio is below five percent
+  of model tolerance can merge into a larger adjacent cell. Only
+  boundary-adjacent cells qualify; the existing one-eighth-area, single-shared-
+  side and simple-union guards apply. At most 128 optional dissolves run per
+  patch. This removes redundant interior grid edges, not CAD boundary vertices
+  or geometry; final lifted display validation remains mandatory. Curved charts
+  use lifted physical positions for the area/edge measure, not arbitrary UV
+  distances. Unchanged display triangles are retained when dissolving the shared
+  side. This local cleanup does not promise well-shaped cells for every trim.
+- Compatible circular logical sides transfer angular stations as well as counts,
+  including compound sides made of several coedges. This prevents equal-count
+  but differently phased fillet strips. Fully mapped coaxial families first
+  agree on evenly distributed angular intervals between mandatory CAD endpoints,
+  with a circular-sagitta density floor. Optional quadrant anchors cannot crowd
+  nearby required endpoints. A clipped smooth neighbor seeds every coedge on
+  its dominant parameter rail before curvature refinement, so compound rails
+  do not acquire a competing phase on their shorter segments. Nearly constant
+  parameter rails must also pass a physical-displacement check at every station:
+  UV epsilon alone is unsafe on stretched charts. This classifies row transport;
+  it never snaps the exact trim or increases the model tolerance. Mixed
+  mapped/clipped circular families can therefore share the initial distribution
+  and add support rows together during reconciliation. Hard or incompatible neighbors still
+  terminate interior rows rather than inheriting the full canonical sample set.
   Mapped, clipped and constrained strategies validate their output before
   committing. Unsupported layouts fall back without dropping shared seam IDs.
+- Simple support grids can clip up to 1,024 authored coedges, subject to the
+  existing 16,384 sampled-boundary and bounded station/cell budgets. A grooved
+  cylinder/cone is not forced into triangle fans solely because it has more
+  than 128 topological edges. The four-sided mapped recognizer stays separate;
+  admitting a clipped chart does not pretend its jagged boundary is rectangular.
+- Support grids allow up to 1,025 stations per axis under a joint 131,072-grid-point
+  budget. A long, narrow patch is not forced into fallback triangles by a
+  square 257-by-257 axis limit. The joint limit is checked during inherited-row
+  planning and before diagonal-refinement allocation, not only at final clipping.
+  This supports anisotropic layouts; it does not solve inherited phase crowding
+  or promise a minimal polygon count.
+- Endpoint-only smooth rails do not impose a planar interior phase. Independent
+  narrow planes start with proportional physical axis counts. A late seam cut
+  is not extended across such a plane if it would create a rectangle over 20:1
+  and more than double that same rectangle's previous aspect. An unrelated
+  pre-existing skinny cell cannot excuse damage to another row. The exact cut stays on the
+  shared boundary; useful splits, existing coupled phases, size/curvature rows
+  and nonplanar grids are unchanged by this admission policy.
+- Proven affine NURBS extrusion directions can subdivide long support-grid
+  intervals at an even physical pitch, targeting sixteen times the mean
+  transverse interval. Curved-axis stations and existing straight-axis rows
+  stay fixed. Optional refinement is skipped atomically if its full proposal
+  exceeds either axis capacity or the joint grid budget. This is a support-grid
+  shape target, not a bound on every Boolean cut polygon. Once refined, the
+  straight direction rejects a later neighbor's row phase outside the middle
+  40–60% of an existing interval; the exact shared cut remains a boundary corner.
+  It does not spread hard-edge samples through the interior or resample curved
+  directions merely to improve aspect ratios.
+- Planar circle/ellipse trim envelopes include analytic projected extrema within
+  the trimmed sweep. A sampled arc plus a percentage guard is insufficient for
+  thin segments: later grid intersections can otherwise escape that envelope.
+  Exact envelope bounds do not relocate any canonical boundary vertex. Other
+  support/curve combinations still use their guarded sampled envelopes.
+- Close edge/grid intersections around a sampled boundary turn are distinct
+  incidences, not duplicate estimates of one crossing. Their roots and the
+  intervening extremum survive physical sample deduplication. Monotone runs
+  retain the existing close-point representative and align its chart coordinate
+  without moving canonical geometry. Regressions cover both sides of a shallow
+  tangent under loose/tight model tolerances, idempotent reconciliation, swapped
+  charts, reversed coedges and scaled monotone counterexamples.
 - Boundary stitching and interior row transport are separate. Sampled tangent
   planes and U/V directors classify seams before meshing: G0-only creases and
   incompatible smooth frames stop flow; aligned/reversed/90-degree-swapped
   smooth frames may continue it. Stopped seams retain all shared point IDs as
-  boundary polygon corners without imposing a grid on a planar neighbor.
-  Analytic bands and single-span transverse NURBS strips can retain additional
-  curved-boundary support rows locally. This guard is deliberately not applied
-  to doubly-curved NURBS patches, where it can reintroduce distorted row phases.
+  boundary polygon corners without imposing the same interior grid on a neighbor.
+  The former hard-curved-edge support-row override has been removed. If a
+  conformed mapped boundary polygon has invalid projected display ears, it can
+  retry support-chart triangulation, bounded diagonal repair and sampled support
+  error validation. The accepted indices survive worker assembly. A cell that
+  still fails rejects the strategy; boundary IDs are never dropped to hide it.
 
 Transforms retain the B-rep and compose an analytic placement matrix; they do
 not tessellate the source or approximate nonuniformly scaled circles as circles.
@@ -121,6 +221,10 @@ Quads remain quality-filtered; triangles are allowed near trims.
 Clipped patches reuse their known UVs for normals instead of projecting all
 generated vertices again. The integer primitive attribute `cad_trim_grid`
 identifies that path for diagnostics; `cad_face`, paths and colors are retained.
+`cad_mesher` records the accepted per-patch strategy: 1 = local-row mapping,
+2 = clipped support grid, 3 = full canonical-row mapping, 4 = constrained
+fallback, 5 = baseline fallback conformed to shared seams. It reports the
+actual accepted path, including parallel face jobs, not a quality guarantee.
 `cad_flow_island` identifies connected compatible-flow faces (the minimum local
 CAD face index in the component). It is layout provenance, not object hierarchy
 or a mathematically certified continuity classification. The current classifier
@@ -128,7 +232,8 @@ samples seven seam locations with 0.5-degree tangent-plane and 5-degree director
 tolerances. Conformed mapped polygons also check actual render triangles against
 support normals; invalid warped n-gons retry a denser/constrained strategy.
 
-Planning is bounded to 257 U/V stations per face, 1,025 stations per shared
+Planning is bounded to 1,025 U/V stations per face under a joint 131,072-point
+grid budget, 1,025 stations per shared
 edge, eight initial trim reconciliation passes, 32 mapped-side balancing passes
 per call, and at most twelve joint mapped/clipped reconciliation rounds.
 It is not a global cross-field parameterization or a guarantee of all quads.
@@ -141,10 +246,18 @@ NURBS, general singular trims, sewing disconnected shells, intersections,
 booleans and tolerance-controlled refinement remain unimplemented. Current
 stitching follows existing topology; it is not tolerance-based healing.
 Boundary/support agreement uses the model's tolerance (default 1e-6 source
-units). Full circles use `4 * segments` intervals; partial circles scale by sweep.
+units). Full circles start at `4 * segments` intervals; partial circles scale by
+sweep. Surface-error, shared-row and circular-family constraints can raise these
+counts before canonical points are frozen.
 Spline counts use sampled turn/deflection tests within that quality budget;
-straight/simple splines need fewer intervals. This is not a certified tolerance
-bound. Opposing logical sides agree on total counts, including split edges.
+straight/simple splines need fewer intervals. Opposite repeated seams confined
+to a single four-coedge band can refine the first passing power-of-two count
+within its bracket. Each returned count passes the same sampled criteria in its
+own phase. Externally shared edges and irregular trims retain their original
+dyadic family: changing those independently can crowd neighboring charts even
+when the curve's own error improves. This is neither a certified tolerance
+bound nor a globally minimal count. Opposing logical sides agree on total
+counts, including split edges.
 Lines start with one interval, then size/structured constraints may refine them.
 Unsupported trims and mesh-budget overflow fail explicitly.
 
@@ -157,9 +270,30 @@ cover internal valence four, exact curved-interior samples, compound sides,
 rational derivative normals, endpoint knots and reversed face orientation.
 Trim-grid tests additionally cover swapped/reversed UV flow, seam valence,
 oblique cuts, enclosed/crossing holes, and circular fillets with reversed frames
-and compound opposite sides.
+and compound opposite sides, including an arbitrary split almost coincident
+with an optional quadrant anchor. Interior circular rows must remain evenly
+distributed rather than merely sharing the union of two crowded phases.
 Seam regressions cover hard-edge n-gons, smooth 45-degree UV mismatches, 90-degree
 row transport, circular fillet/Cartesian-plane stops and curved strip support.
 Internal Base regressions cover endpoint roundoff versus real periodic wrap,
 diagonal curvature with straight isocurves, immutable trims, and first/last
 interior gaps with distortion in one or both row families.
+Near-grid corner alignment is completed after crossing alignment, so loop
+origin and winding cannot strand an endpoint in a neighboring cut cell.
+The bounded second pass preserves canonical 3D positions and rejects UV
+orientation changes, new crossings, and independently moved seam aliases.
+Clipped spacing also recognizes oversized boundary-to-first-row gaps, not just
+uneven interior gaps; an isolated tiny Boolean-cut interval is still left alone.
+Spacing proposals retain the existing topology, normal, sampled-deviation and
+shape-quality gates even when no original quad exceeds the 20:1 diagnostic.
+
+On affine NURBS extrusions, an isoparametric rail ending at a stopped oblique
+trim contributes a boundary corner, not necessarily an interior station. The
+planner recognizes translated control-net pairs with matching weights and
+keeps curved axes, smooth joins, rail subdivisions and uncertain chart aliases
+conservative. Guard cells cover the trim envelope; actual rectangular sides
+remain mandatory rows. This removes thin endpoint wedges without moving the
+exact shared trim. Warped and doubly curved supports retain the previous policy.
+Contracts cover scaled/transposed rational nets, reversed/rotated loops,
+smooth versus stopped neighbors, actual row inheritance, clipping area and
+canonical boundary preservation.

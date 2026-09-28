@@ -21,6 +21,26 @@ pub func fill(stations: Stations*, required: usize, epsilon: f64) -> !:
         for step in 1..<count: discard(try stations.insert(a+(b-a)*(f64)step/(f64)count,epsilon))
         at += count
 
+## Endpoint-only smooth joins impose no interior phase. A long planar strip
+## may use physical pitch unless a rail actually contributed interior stations.
+## Compact domains retain their existing initial resolution policy. Returns
+## whether the chart owns an independent phase for later flow admission.
+pub func fill_plane(u: Stations*, v: Stations*, trim_low: Vector3, trim_high: Vector3, required: usize, epsilon: f64) -> bool!:
+    let x = u.values[u.count-1]-u.values[0]
+    let y = v.values[v.count-1]-v.values[0]
+    let longest = math.max(x,y)
+    let independent = longest > 4.0*math.min(x,y) and not interior(*u,trim_low.x,trim_high.x,epsilon) and not interior(*v,trim_low.y,trim_high.y,epsilon)
+    let nu = (usize)math.max(1.0,math.ceil((f64)required*x/longest)) if independent else required
+    let nv = (usize)math.max(1.0,math.ceil((f64)required*y/longest)) if independent else required
+    try fill(u,nu,epsilon)
+    try fill(v,nv,epsilon)
+    return independent
+
+func interior(stations: Stations, low: f64, high: f64, epsilon: f64) -> bool:
+    for value in stations.values[..<stations.count]:
+        if value > low+epsilon and value < high-epsilon: return true
+    return false
+
 ## Insert complete rows only where directional deviation needs them. This
 ## resolves narrow knot spans without doubling an entire patch's resolution.
 pub func refine_axis(stations: Stations*, s: Surface, low: Vector3, high: Vector3, axis: usize, divisions: i64, tolerance: f64, edge_size: f64, epsilon: f64) -> !:
@@ -32,7 +52,13 @@ pub func refine_axis(stations: Stations*, s: Surface, low: Vector3, high: Vector
         let other = (f64)cross/4.0
         let first = try position(s,low,high,0.0,other,axis)
         let last = try position(s,low,high,1.0,other,axis)
-        targets[cross] = math.max(tolerance*0.5,last.subtract(first).length()/((f64)divisions*(f64)divisions*32.0))
+        var extent = last.subtract(first).length()
+        # Endpoint chords understate the scale of closed AND nearly closed
+        # isocurves (including analytic charts with exterior guard cells).
+        # Use sampled extent before refining against the deflection budget.
+        for sample in 1..<8:
+            extent = math.max(extent,(try position(s,low,high,(f64)sample/8.0,other,axis)).subtract(first).length())
+        targets[cross] = math.max(tolerance*0.5,extent/((f64)divisions*(f64)divisions*32.0))
     while at+1 < stations.count:
         let a = stations.values[at]
         let b = stations.values[at+1]

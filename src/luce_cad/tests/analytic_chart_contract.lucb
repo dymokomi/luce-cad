@@ -1,0 +1,93 @@
+## Analytic coedges share one continuous chart even without a repeated seam.
+## Test branch cuts, winding, loop starts and later shared-edge insertions.
+import memory
+import math
+from three import Vector3, invalid
+from luce_cad.brep_types import Surface, Curve, BrepFace
+from luce_cad.layout_types import GridLayout, UVChain, Stations
+from luce_cad.trim_chains import initialize, cached
+from luce_cad.mapped_patch import point
+
+pub func analytic_chart_contract() -> !:
+    for kind in [1,2]:
+        for scale in [0.001,1.0]:
+            for phase in [-3.2,0.0,2.5,3.3,5.8]:
+                for start in 0..<(usize)4:
+                    for reverse in [false,true]: try chart(kind,scale,phase,start,reverse)
+
+func chart(kind: i64, scale: f64, phase: f64, start: usize, reverse: bool) -> !:
+    var empty_points: Vector3[]
+    var empty_numbers: f64[]
+    let surface = try Surface(kind,Vector3(3.0,-7.0,11.0),Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),scale,0.2 if kind == 2 else 0.0,empty_points,empty_numbers,empty_numbers,empty_numbers,0,0,0,0)
+    defer surface.close()
+    let parameters = [Vector3(phase,0.0,0.0),Vector3(phase+1.2,0.0,0.0),Vector3(phase+1.2,scale,0.0),Vector3(phase,scale,0.0),
+                      Vector3(phase+0.3,scale*0.3,0.0),Vector3(phase+0.9,scale*0.3,0.0),Vector3(phase+0.9,scale*0.7,0.0),Vector3(phase+0.3,scale*0.7,0.0)]
+    var vertices = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+    for at in 0..<vertices.length: vertices[at] = try point(surface,parameters[at])
+    let edges = try alloc Curve[8] in memory.heap
+    var built: usize = 0
+    defer:
+        for at in 0..<built: edges[at].close()
+        free(edges) in memory.heap
+    for at in 0..<(usize)8:
+        let next = (at//4)*4+(at+1)%4
+        let a = parameters[at]
+        let b = parameters[next]
+        let radial = scale+a.y*math.tan(surface.angle)
+        edges[at] = try Curve(1 if at%2 == 0 else 0,(i64)at,(i64)next,surface.origin.add(surface.z.multiply_scalar(a.y)),surface.x,surface.y,radial,
+            [vertices[at],vertices[next]],empty_numbers,empty_numbers,0,true,a.x,b.x-a.x)
+        built += 1
+    var uses: i64[8]
+    for at in 0..<(usize)4:
+        let index = (start+(3-at if reverse else at))%4
+        uses[at] = -(i64)(index+1) if reverse else (i64)(index+1)
+        let hole = (start+(at if reverse else 3-at))%4
+        uses[at+4] = (i64)(hole+5) if reverse else -(i64)(hole+5)
+    let face = try BrepFace(0,uses,[4,4],not reverse)
+    defer face.close()
+    var cuts = [Stations(),Stations(),Stations(),Stations(),Stations(),Stations(),Stations(),Stations()]
+    defer:
+        for cut in cuts: cut.close()
+    for at in 0..<cuts.length:
+        try cuts[at].open(16)
+        for t in [0.0,0.25,0.5,0.75,1.0]: discard(try cuts[at].insert(t,1e-12))
+    var plan = GridLayout()
+    defer plan.close()
+    plan.chains = try alloc UVChain[8] in memory.heap
+    for at in 0..<plan.chains.length: plan.chains[at] = UVChain()
+    let tolerance = scale*1e-6
+    try initialize(plan.chains,face,surface,vertices,edges,cuts,tolerance)
+    for refresh in [false,true]:
+        if refresh:
+            for at in 0..<cuts.length: discard(try cuts[at].insert(0.125,1e-12))
+        var outer_low: f64 = 1e100
+        var outer_high: f64 = -1e100
+        for loop in 0..<(usize)2:
+            var first = Vector3()
+            var previous = Vector3()
+            var area: f64 = 0.0
+            for entry in 0..<(usize)4:
+                let at = loop*4+entry
+                let use = uses[at]
+                let edge = (usize)(-use-1 if use < 0 else use-1)
+                let uv = try cached(&plan.chains[at],surface,vertices,edges[edge],cuts[edge],tolerance)
+                let a = uv[0 if use > 0 else uv.length-1]
+                let b = uv[uv.length-1 if use > 0 else 0]
+                if entry == 0: first = a
+                elif a.subtract(previous).length() > 1e-10: error(invalid,"analytic coedges choose different angular branches")
+                previous = b
+                for i in 0..<uv.length:
+                    if (try point(surface,uv[i])).subtract(try edges[edge].at(cuts[edge].values[i])).length() > tolerance:
+                        error(invalid,"continuous analytic chart changed exact curve positions")
+                    if i > 0 and uv[i].subtract(uv[i-1]).length() > 0.4:
+                        error(invalid,"an analytic coedge jumps across the chart branch")
+                    if loop == 0:
+                        outer_low = math.min(outer_low,uv[i].x)
+                        outer_high = math.max(outer_high,uv[i].x)
+                    elif uv[i].x <= outer_low or uv[i].x >= outer_high:
+                        error(invalid,"analytic hole is on a different branch from its outer loop")
+                    if i+1 < uv.length: area += uv[i].cross(uv[i+1]).z*(1.0 if use > 0 else -1.0)*0.5
+            if previous.subtract(first).length() > 1e-10: error(invalid,"analytic trim chart does not close")
+            let expected = scale*(1.2 if loop == 0 else 0.24)
+            if math.abs(math.abs(area)-expected) > expected*1e-9: error(invalid,"analytic chart changed its trimmed area")
+        if math.abs(outer_high-outer_low-1.2) > 1e-10: error(invalid,"analytic trim spans a fictitious full revolution")
