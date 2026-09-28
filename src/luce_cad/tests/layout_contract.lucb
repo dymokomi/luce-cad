@@ -4,8 +4,33 @@ from three import Vector3, invalid
 from luce_cad.brep_types import Surface, Curve
 from luce_cad.mapped_spacing import redistribute
 from luce_cad.layout_cell_error import refine_cells
-from luce_cad.layout_types import Stations
+from luce_cad.layout_density import fill_plane
+from luce_cad.layout_types import Stations, check_grid_size
+from luce_cad.trim_chains import chart_identities
+from luce_cad.surface_normals import support_normal
+from luce_cad.mapped_patch import point
+from luce_cad.layout_rails import rail_axis
 import math
+from luce_cad.tests.cutcell_contract import cutcell_contract
+from luce_cad.tests.clipped_spacing_contract import clipped_spacing_contract
+from luce_cad.tests.edge_sampling_contract import edge_sampling_contract
+from luce_cad.tests.intersection_contract import intersection_contract
+from luce_cad.tests.flow_admission_contract import flow_admission_contract
+from luce_cad.tests.layout_policy_contract import layout_policy_contract
+from luce_cad.tests.trim_alignment_contract import trim_alignment_contract
+from luce_cad.tests.layout_envelope_contract import layout_envelope_contract
+from luce_cad.tests.layout_pitch_contract import layout_pitch_contract
+from luce_cad.tests.mapped_extrusion_contract import mapped_extrusion_contract
+from luce_cad.tests.planar_cut_contract import planar_cut_contract
+from luce_cad.tests.normal_scale_contract import normal_scale_contract
+from luce_cad.tests.display_error_contract import display_error_contract
+from luce_cad.tests.cut_sliver_contract import cut_sliver_contract
+from luce_cad.tests.analytic_chart_contract import analytic_chart_contract
+from luce_cad.tests.adaptive_cells_contract import adaptive_cells_contract
+from luce_cad.tests.face_jobs_contract import face_jobs_contract
+from luce_cad.tests.circular_endpoint_contract import circular_endpoint_contract
+from luce_cad.tests.layout_feasibility_contract import layout_feasibility_contract
+from luce_cad.tests.sphere_chart_contract import sphere_chart_contract
 
 ## Both boundary-to-first-row gaps are included; the boundary itself is fixed.
 pub func interior_spacing_contract() -> !:
@@ -13,6 +38,18 @@ pub func interior_spacing_contract() -> !:
         [Vector3(),Vector3(0.0,1.0,0.0),Vector3(1.0,0.0,0.0),Vector3(1.0,1.0,0.0)],
         [1.0,1.0,1.0,1.0],[0.0,0.0,1.0,1.0],[0.0,0.0,1.0,1.0],2,2,1,1)
     defer s.close()
+    # Identity is topological, never a proximity weld; a nonperiodic support
+    # cannot identify opposite rails just because their parameter difference is 1.
+    let chart = try chart_identities(s,[Vector3(),Vector3(),Vector3()],[7,7,8],1e-6)
+    defer free(chart) in memory.heap
+    if chart[0] != chart[1] or chart[0] == chart[2]: error(invalid,"trim chart identity must preserve explicit CAD topology")
+    var rejected = false
+    let bad = chart_identities(s,[Vector3(),Vector3(1.0,0.0,0.0)],[7,7],1e-6) catch failure:
+        if failure.code != invalid: error(failure.code,failure.message)
+        rejected = true
+        recover chart[..<0]
+    if bad.length > 0: free(bad) in memory.heap
+    if not rejected: error(invalid,"open support rails are not a periodic seam")
     let grid = try alloc Vector3[25] in memory.heap
     defer free(grid) in memory.heap
     for both_axes in [false,true]:
@@ -43,10 +80,107 @@ pub func interior_spacing_contract() -> !:
                 if high > low*1.05: error(invalid,"both interior row families must have evenly spaced end gaps")
 
 pub func main(arguments: str[]) -> i32!:
+    try sphere_chart_contract()
+    try layout_feasibility_contract()
+    try circular_endpoint_contract()
+    try face_jobs_contract()
+    try adaptive_cells_contract()
     try interior_spacing_contract()
     try diagonal_error_contract()
     try endpoint_roundoff_contract()
+    try analytic_normal_contract()
+    try metric_rail_contract()
+    try cutcell_contract()
+    try clipped_spacing_contract()
+    try edge_sampling_contract()
+    try anisotropic_budget_contract()
+    try intersection_contract()
+    try endpoint_flow_contract()
+    try flow_admission_contract()
+    try layout_policy_contract()
+    try trim_alignment_contract()
+    try layout_envelope_contract()
+    try layout_pitch_contract()
+    try mapped_extrusion_contract()
+    try planar_cut_contract()
+    try normal_scale_contract()
+    try display_error_contract()
+    try cut_sliver_contract()
+    try analytic_chart_contract()
     return 0
+
+func endpoint_flow_contract() -> !:
+    for swapped in [false,true]:
+        for coupled in [false,true]:
+            var u = Stations()
+            var v = Stations()
+            try u.open(128)
+            defer u.close()
+            try v.open(128)
+            defer v.close()
+            for value in [-0.1,0.0,10.0,10.1]:
+                if swapped: discard(try v.insert(value,1e-12))
+                else: discard(try u.insert(value,1e-12))
+            for value in [-0.005,0.0,0.5,0.505]:
+                if swapped: discard(try u.insert(value,1e-12))
+                else: discard(try v.insert(value,1e-12))
+            if coupled:
+                if swapped: discard(try u.insert(0.25,1e-12))
+                else: discard(try v.insert(0.25,1e-12))
+            let high = Vector3(0.5,10.0,0.0) if swapped else Vector3(10.0,0.5,0.0)
+            let independent = try fill_plane(&u,&v,Vector3(),high,16,1e-12)
+            if independent == coupled: error(invalid,"interior stations must determine planar phase ownership")
+            let across = u if swapped else v
+            let along = v if swapped else u
+            if along.count < 16: error(invalid,"long planar supports must retain requested longitudinal density")
+            if coupled:
+                if across.count < 16: error(invalid,"actual inherited interior rows must retain coupled support density")
+                var found = false
+                for value in across.values[..<across.count]: found = found or value == 0.25
+                if not found: error(invalid,"planar support fill moved an inherited row")
+            elif across.count != 4:
+                error(invalid,"trim endpoints and exterior guards are not interior flow constraints")
+
+func anisotropic_budget_contract() -> !:
+    for swap in [false,true]:
+        try check_grid_size(127 if swap else 1025,1025 if swap else 127)
+        for pair in [[1025,128],[363,363],[1026,2]]:
+            var rejected = false
+            check_grid_size((usize)pair[1 if swap else 0],(usize)pair[0 if swap else 1]) catch failure:
+                if failure.code != invalid: error(failure.code,failure.message)
+                rejected = true
+                recover ()
+            if not rejected: error(invalid,"anisotropic support grids must retain total and axis budgets")
+
+func metric_rail_contract() -> !:
+    var empty_points: Vector3[]
+    var empty_numbers: f64[]
+    let small = try Surface(0,Vector3(),Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),0.0,0.0,empty_points,empty_numbers,empty_numbers,empty_numbers,0,0,0,0)
+    defer small.close()
+    let noisy = [Vector3(),Vector3(0.5,2e-7,0.0),Vector3(1.0,0.0,0.0)]
+    if try rail_axis(small,noisy,1e-7,1e-6) != 0: error(invalid,"physical rail uncertainty must not create a second station family")
+    let large = try Surface(3,Vector3(),Vector3(),Vector3(),0.0,0.0,
+        [Vector3(),Vector3(0.0,1000000.0,0.0),Vector3(1.0,0.0,0.0),Vector3(1.0,1000000.0,0.0)],
+        [1.0,1.0,1.0,1.0],[0.0,0.0,1.0,1.0],[0.0,0.0,1.0,1.0],2,2,1,1)
+    defer large.close()
+    for delta in [2e-7,5e-8]:
+        if try rail_axis(large,[Vector3(),Vector3(0.5,delta,0.0),Vector3(1.0,0.0,0.0)],1e-7,1e-6) != -1:
+            error(invalid,"a tiny UV wobble can exceed physical CAD tolerance on a stretched chart")
+    if try rail_axis(small,[Vector3(),Vector3(0.5,0.1,0.0),Vector3(1.0,0.0,0.0)],1e-7,1.0) != -1:
+        error(invalid,"oblique trims are not rails even under a loose physical tolerance")
+
+func analytic_normal_contract() -> !:
+    var empty_points: Vector3[]
+    var empty_numbers: f64[]
+    for kind in [0,1,2,4,5]:
+        let s = try Surface(kind,Vector3(2.0,3.0,4.0),Vector3(0.0,1.0,0.0),Vector3(1.0,0.0,0.0),2.0,0.2,empty_points,empty_numbers,empty_numbers,empty_numbers,0,0,0,0)
+        defer s.close()
+        for uv in [Vector3(0.3,0.2,0.0),Vector3(-2.1,-0.4,0.0)]:
+            let du = (try point(s,uv.add(Vector3(1e-5,0.0,0.0)))).subtract(try point(s,uv.subtract(Vector3(1e-5,0.0,0.0))))
+            let dv = (try point(s,uv.add(Vector3(0.0,1e-5,0.0)))).subtract(try point(s,uv.subtract(Vector3(0.0,1e-5,0.0))))
+            let expected = try du.cross(dv).normalized()
+            if expected.subtract(try support_normal(s,uv)).length() > 1e-8:
+                error(invalid,"analytic chart normals must agree with support derivatives")
 
 ## Floating endpoint reconstruction must clamp tiny overshoots, while a real
 ## interval crossing the seam of a closed spline must still wrap normally.

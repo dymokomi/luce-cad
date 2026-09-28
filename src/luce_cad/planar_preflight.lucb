@@ -1,0 +1,64 @@
+## Verify a planar fitted layout before freezing shared grid intersections.
+## Four logical sides are only a topological hint: concave/rounded trims can
+## fold their Coons grid. Reuse the actual mesher rather than a second test.
+import memory
+from three import Vector3, MeshBuilder, invalid
+from luce_cad.brep_types import Curve, Surface, BrepFace, Samples
+from luce_cad.layout_types import Stations
+from luce_cad.patch_sides import edge_index
+from luce_cad.mapped_patch import mapped_patch
+
+## A rejected planar map must receive a clipped plan while shared cuts are
+## still mutable. Successful maps keep their existing geometry and phase.
+pub func can_map_plane(vertices: const Vector3[], edges: const Curve[], face: BrepFace, s: Surface, rows: const Stations[], tolerance: f64, divisions: i64) -> bool!:
+    if s.kind != 0: return true
+    return try can_map(vertices,edges,face,s,rows,tolerance,divisions)
+
+## The same real-mesher preflight also detects ambiguous closed NURBS maps.
+## A successful map must not acquire a second chart's optional row phase.
+pub func can_map(vertices: const Vector3[], edges: const Curve[], face: BrepFace, s: Surface, rows: const Stations[], tolerance: f64, divisions: i64) -> bool!:
+    let count = face.uses.length
+    # Curve records borrow their immutable source arrays; only this compact
+    # record storage is freed here, never the curve-owned control nets.
+    let curves = try alloc Curve[count] in memory.heap
+    defer free(curves) in memory.heap
+    let samples = try alloc Samples[count] in memory.heap
+    defer free(samples) in memory.heap
+    var allocated: usize = 0
+    defer:
+        for at in 0..<allocated: free(samples[at].ids) in memory.heap
+    let uses = try alloc i64[count] in memory.heap
+    defer free(uses) in memory.heap
+    let source = try alloc i64[count*2] in memory.heap
+    defer free(source) in memory.heap
+    let mapped = try alloc i64[count*2] in memory.heap
+    defer free(mapped) in memory.heap
+    var endpoints: usize = 0
+    var mesh = try MeshBuilder()
+    defer mesh.close()
+    for at in 0..<count:
+        let edge = edges[edge_index(face.uses[at])]
+        curves[at] = edge
+        uses[at] = (i64)(at+1) if face.uses[at] > 0 else -(i64)(at+1)
+        let values = rows[at].values[..<rows[at].count]
+        if values.length < 2: return false
+        let ids = try alloc i64[values.length] in memory.heap
+        samples[at] = Samples(ids)
+        allocated += 1
+        for step in 0..<values.length:
+            if step == 0 or step+1 == values.length:
+                let id = edge.start if step == 0 else edge.end
+                var found: usize = 0
+                while found < endpoints and source[found] != id: found += 1
+                if found == endpoints:
+                    source[found] = id
+                    mapped[found] = try mesh.point(vertices[(usize)id])
+                    endpoints += 1
+                ids[step] = mapped[found]
+            else: ids[step] = try mesh.point(try edge.at(values[step]))
+    let compact = try BrepFace(0,uses,face.sizes,face.sense)
+    defer compact.close()
+    mapped_patch(&mesh,compact,s,curves,samples,tolerance,divisions) catch failure:
+        if failure.code != invalid: error(failure.code,failure.message)
+        return false
+    return true

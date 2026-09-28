@@ -1,0 +1,92 @@
+## Shared trim discretization and interior flow are separate decisions.
+## Planar charts are orthonormal support-distance coordinates. Their existing
+## curvature/size grid needs no extra support from a late neighbor's phase.
+## Affine extrusions measure competing phases along their physical profile.
+import math
+from luce_cad.layout_types import Stations
+from luce_cad.layout_types import GridLayout
+from luce_cad.brep_types import Surface
+from luce_cad.mapped_patch import point
+from three import Vector3
+
+## Keep useful subdivisions, but stop a competing phase if its worst rectangle
+## exceeds 20:1 and is more than twice as stretched as the cell it splits.
+## Guard intervals outside the real trim bounds do not participate. Nothing
+## here removes a station, moves a trim vertex, or changes canonical edge IDs.
+pub func accept_plane_row(along: Stations, across: Stations, value: f64, low: f64, high: f64, cross_low: f64, cross_high: f64, epsilon: f64) -> bool:
+    if value <= low+epsilon or value >= high-epsilon: return true
+    var left = low
+    var right = high
+    for at in along.values[..<along.count]:
+        if math.abs(at-value) <= epsilon: return true
+        if at < value: left = math.max(left,at)
+        else:
+            right = math.min(right,at)
+            break
+    let whole = right-left
+    let small = math.min(value-left,right-value)
+    let large = math.max(value-left,right-value)
+    if small <= epsilon or whole <= epsilon: return true
+    for at in 0..<across.count-1:
+        let gap = math.min(cross_high,across.values[at+1])-math.max(cross_low,across.values[at])
+        if gap <= epsilon: continue
+        # Compare the same rectangle before/after. A pre-existing skinny cell
+        # in another row must not excuse a newly damaged healthy rectangle.
+        let before = math.max(whole/gap,gap/whole)
+        let after = math.max(large/gap,gap/small)
+        if after > 20.0 and after > before*2.0: return false
+    return true
+
+## Caller proves that the transverse axis is affine and the existing support
+## grid has already passed curvature refinement. Canonical cuts stay unchanged.
+## Measure along the profile, not raw UV: nonlinear parameter speed must not
+## admit a physically tiny new row or reject a useful physical midpoint.
+pub func accept_extruded_row(plan: GridLayout, s: Surface, axis: i64, value: f64) -> bool!:
+    let along = plan.u if axis == 0 else plan.v
+    let across = plan.v if axis == 0 else plan.u
+    let low = plan.trim_low.x if axis == 0 else plan.trim_low.y
+    let high = plan.trim_high.x if axis == 0 else plan.trim_high.y
+    let cross_low = plan.trim_low.y if axis == 0 else plan.trim_low.x
+    let cross_high = plan.trim_high.y if axis == 0 else plan.trim_high.x
+    if value <= low+plan.epsilon or value >= high-plan.epsilon: return true
+    var left = low
+    var right = high
+    for at in along.values[..<along.count]:
+        if math.abs(at-value) <= plan.epsilon: return true
+        if at < value: left = math.max(left,at)
+        else:
+            right = math.min(right,at)
+            break
+    let middle = (cross_low+cross_high)*0.5
+    let first = try profile_length(s,axis,left,value,middle)
+    let second = try profile_length(s,axis,value,right,middle)
+    let whole = first+second
+    let small = math.min(first,second)
+    let large = math.max(first,second)
+    if small <= 0.0 or cross_high <= cross_low: return true
+    let a = try sample(s,axis,value,cross_low)
+    let b = try sample(s,axis,value,cross_high)
+    let units = b.subtract(a).length()/(cross_high-cross_low)
+    for at in 0..<across.count-1:
+        let interval = math.min(cross_high,across.values[at+1])-math.max(cross_low,across.values[at])
+        if interval <= plan.epsilon: continue
+        let gap = interval*units
+        if gap <= 0.0: continue
+        let before = math.max(whole/gap,gap/whole)
+        let after = math.max(large/gap,gap/small)
+        if after > 20.0 and after > before*2.0*(1.0+1e-6): return false
+    return true
+
+## Bounded arc-length estimate for layout admission only, never a surface-error
+## certificate. Rejecting optional flow leaves the resolved support grid intact.
+func profile_length(s: Surface, axis: i64, low: f64, high: f64, across: f64) -> f64!:
+    var previous = try sample(s,axis,low,across)
+    var result: f64 = 0.0
+    for at in 1..<(usize)5:
+        let next = try sample(s,axis,low+(high-low)*(f64)at/4.0,across)
+        result += next.subtract(previous).length()
+        previous = next
+    return result
+
+func sample(s: Surface, axis: i64, along: f64, across: f64) -> Vector3!:
+    return try point(s,Vector3(along,across,0.0) if axis == 0 else Vector3(across,along,0.0))

@@ -9,6 +9,7 @@ from luce_cad.seam_conform import conform_seams
 from luce_cad.layout_types import GridLayout
 from luce_cad.patch_sides import edge_index
 from luce_cad.patch_validation import validate, validate_conformed
+from luce_cad.conformed_display import conform_display
 from three import Vector3, MeshBuilder, invalid
 from tesselator import TrimPolygon
 from luce_cad.brep_types import Curve, Surface, BrepFace, Samples
@@ -29,7 +30,9 @@ pub func mesh_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: 
         if failure.code != invalid: error(failure.code,failure.message)
         mapped = false
         recover ()
-    if mapped: return
+    if mapped:
+        plan.method[0] = 1
+        return
     # Never bypass an available boundary-terminating layout merely because the
     # first mapped candidate's warped n-gons could not be displayed safely.
     if plan.valid and not plan.cut_first and (try attempt_clip(mesh,face,surface,full_samples,plan,tolerance,divisions)): return
@@ -43,7 +46,9 @@ pub func mesh_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: 
         if failure.code != invalid: error(failure.code,failure.message)
         mapped = false
         recover ()
-    if mapped: return
+    if mapped:
+        plan.method[0] = 3
+        return
     let first_point = mesh.np
     let first_face = mesh.nf
     let first_corner = mesh.nc
@@ -55,7 +60,9 @@ pub func mesh_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: 
         mesh.nf = first_face
         mesh.nc = first_corner
         recover ()
-    if accepted: return
+    if accepted:
+        plan.method[0] = 4
+        return
     let samples = try alloc Samples[full_samples.length] in memory.heap
     defer free(samples) in memory.heap
     for use in face.uses:
@@ -64,6 +71,7 @@ pub func mesh_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: 
     try legacy_face(mesh,face,surface,edges,samples,divisions,tolerance,edge_size)
     try conform_seams(mesh,face,full_samples,first_face,first_corner)
     try validate(mesh,first_face,first_corner)
+    plan.method[0] = 5
 
 func attempt_clip(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: i64) -> bool!:
     let np = mesh.np
@@ -76,6 +84,7 @@ func attempt_clip(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples:
         if failure.code != invalid: error(failure.code,failure.message)
         return false
     plan.applied[0] = true
+    plan.method[0] = 2
     return true
 
 func mapped_rows(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: i64) -> !:
@@ -95,7 +104,10 @@ func mapped_rows(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Cu
             let index = edge_index(face.uses[use])
             samples[index] = Samples(full_samples[index].ids,plan.row_ids[use].values)
         try conform_seams(mesh,face,samples,nf,nc)
-        try validate_conformed(mesh,nf,nc,face,s,tolerance)
+        validate_conformed(mesh,nf,nc,face,s,tolerance) catch failure:
+            if failure.code != invalid: error(failure.code,failure.message)
+            try conform_display(mesh,nf,nc,face,s,tolerance,divisions)
+            recover ()
     else: try validate(mesh,nf,nc)
 
 func mapped_full(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, divisions: i64) -> !:

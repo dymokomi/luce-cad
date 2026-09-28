@@ -1,0 +1,84 @@
+## Sampling count refinement keeps the same geometric and angular criteria.
+import math
+import memory
+from three import Vector3, invalid
+from luce_cad.brep_types import Curve, BrepFace
+from luce_cad.edge_sampling import curve_intervals, compact_seams
+import luce_cad.curve_spacing as spacing
+
+pub func edge_sampling_contract() -> !:
+    try seam_ownership()
+    var nonbinary: usize = 0
+    for radius in [0.2,2.0]:
+        for tolerance in [1e-6,0.01]:
+            for phase in [0.0,1.3,2.7]:
+                for reverse in [false,true]:
+                    let axis = Vector3(math.cos(phase),math.sin(phase),0.0)
+                    let other = Vector3(-math.sin(phase),math.cos(phase),0.0)
+                    let origin = Vector3(3.0,-2.0,1.0)
+                    let points = [origin.add(axis.multiply_scalar(radius)),origin.add(axis.add(other).multiply_scalar(radius)),origin.add(other.multiply_scalar(radius))]
+                    let edge = try Curve(2,0,1,Vector3(),Vector3(),Vector3(),0.0,points,[1.0,math.sqrt(0.5),1.0],[0.0,0.0,0.0,1.0,1.0,1.0],2,true,1.0 if reverse else 0.0,-1.0 if reverse else 1.0)
+                    defer edge.close()
+                    let metrics = try spacing.measure([edge])
+                    defer spacing.close(metrics)
+                    if try curve_intervals(edge,16,tolerance,&metrics[0]) != 32: error(invalid,"shared-edge stations must retain their established dyadic phase")
+                    let count = try curve_intervals(edge,16,tolerance,&metrics[0],true)
+                    if count < 16 or count >= 32: error(invalid,"a quarter-circle spline should not round a passing count up to 32")
+                    if count != 16: nonbinary += 1
+                    var length: f64 = 0.0
+                    var previous = try edge.at(0.0)
+                    for at in 1..<33:
+                        let p = try edge.at((f64)at/32.0)
+                        length += p.subtract(previous).length()
+                        previous = p
+                    let limit = math.max(tolerance,length/4096.0)
+                    let cosine = math.cos(0.75*2.0*math.pi/64.0)
+                    for interval in 0..<count:
+                        let a = metrics[0].station((f64)interval/(f64)count)
+                        let b = metrics[0].station((f64)(interval+1)/(f64)count)
+                        let pa = try edge.at(a)
+                        let pb = try edge.at(b)
+                        let span = pb.subtract(pa)
+                        # Denser independent probes than the production sampler.
+                        for sample in 1..<64:
+                            let p = try edge.at(a+(b-a)*(f64)sample/64.0)
+                            let t = math.clamp(p.subtract(pa).dot(span)/span.dot(span),0.0,1.0)
+                            if p.subtract(pa.add(span.multiply_scalar(t))).length() > limit*(1.0+1e-6):
+                                error(invalid,"count refinement exceeded the original distance criterion")
+                            if math.abs(p.subtract(origin).length()-radius) > 1e-10: error(invalid,"sampling changed exact circular support")
+                        var samples = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+                        for at in 0..<(usize)5: samples[at] = try edge.at(a+(b-a)*(f64)at/4.0)
+                        for first in 0..<(usize)4:
+                            for second in first+1..<(usize)4:
+                                let u = samples[first+1].subtract(samples[first])
+                                let v = samples[second+1].subtract(samples[second])
+                                if u.dot(v) < cosine*u.length()*v.length(): error(invalid,"count refinement exceeded the original angular criterion")
+    if nonbinary == 0: error(invalid,"sampling regression did not exercise a non-power-of-two result")
+    # A true C0 kink cannot necessarily meet the turn target under a uniform
+    # count. Retain the existing bounded fallback, never loop or import-fail.
+    let kink = try Curve(2,0,1,Vector3(),Vector3(),Vector3(),0.0,[Vector3(),Vector3(0.4,0.0,0.0),Vector3(0.4,1.0,0.0)],[1.0,1.0,1.0],[0.0,0.0,0.3,1.0,1.0],1,true,0.0,1.0)
+    defer kink.close()
+    let metrics = try spacing.measure([kink])
+    defer spacing.close(metrics)
+    if try curve_intervals(kink,16,1e-6,&metrics[0],true) != 64: error(invalid,"C0 sampling must retain the bounded legacy fallback")
+
+func seam_ownership() -> !:
+    let a = try BrepFace(0,[1,2,-1,3],[4],true)
+    defer a.close()
+    let b = try BrepFace(0,[-4,-2,4,5],[4],false)
+    defer b.close()
+    let c = try BrepFace(0,[6,7,-6,8,9],[5],true)
+    defer c.close()
+    let d = try BrepFace(0,[10,11,-10,12],[4],true)
+    defer d.close()
+    let e = try BrepFace(0,[10,13,14],[3],true)
+    defer e.close()
+    let adjacent = try BrepFace(0,[16,-16,17,18],[4],true)
+    defer adjacent.close()
+    let same_sense = try BrepFace(0,[19,20,19,21],[4],true)
+    defer same_sense.close()
+    let flags = try compact_seams([a,b,c,d,e,adjacent,same_sense],21)
+    defer free(flags) in memory.heap
+    for edge in 0..<flags.length:
+        if flags[edge] != (edge == 0 or edge == 3):
+            error(invalid,"only opposite repeated seams confined to one rectangular band may compact")

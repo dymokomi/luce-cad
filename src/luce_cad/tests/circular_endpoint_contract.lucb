@@ -1,0 +1,112 @@
+## Independently fitted circular frames must not create duplicate end samples.
+import math
+import memory
+from three import Vector3, invalid
+from luce_cad.brep_types import Curve, Surface, BrepFace
+from luce_cad.patch_sides import patch_sides
+from luce_cad.layout_types import Stations, GridLayout
+from luce_cad.circular_lattice import regularize
+
+pub func circular_endpoint_contract() -> !:
+    for scale in [0.001,1.0,1000.0]:
+        for rotation in [0.0,0.7]:
+            for sense in [-1.0,1.0]:
+                for variant in 0..<3: try arcs(scale,rotation,sense,variant)
+                try closed_seams(scale,rotation,sense)
+
+func arcs(scale: f64, rotation: f64, sense: f64, variant: i64) -> !:
+    # Variants 0/1: independently fitted anchors within the coverage margin,
+    # including a nearly quarter-circle arc. Variant 2: even small angular
+    # noise exceeds this tighter model's physical allowance and must stay.
+    let jitter = 8e-10 if variant == 1 else 5e-11
+    let tolerance = scale*(1e-10 if variant == 2 else 1e-6)
+    let x = Vector3(math.cos(rotation),math.sin(rotation),0.0)
+    let y = Vector3(-math.sin(rotation),math.cos(rotation),0.0)
+    var no_points: Vector3[]
+    var empty: f64[]
+    let a = try Curve(1,0,1,Vector3(),x,y,scale,no_points,empty,empty,0,true,0.0,sense*math.pi*0.5)
+    let b = try Curve(1,3,2,Vector3(0.0,0.0,2.0*scale),x,y,scale,no_points,empty,empty,0,true,sense*jitter,sense*math.pi*0.5)
+    let edges = [a,
+        try Curve(0,1,2,Vector3(),Vector3(),Vector3(),0.0,[try a.at(1.0),try b.at(1.0)],empty,empty,0,true),b,
+        try Curve(0,3,0,Vector3(),Vector3(),Vector3(),0.0,[try b.at(0.0),try a.at(0.0)],empty,empty,0,true)]
+    defer:
+        for edge in edges: edge.close()
+    let s = try Surface(1,Vector3(),x,Vector3(0.0,0.0,1.0),scale,0.0,no_points,empty,empty,empty,0,0,0,0)
+    defer s.close()
+    let face = try BrepFace(0,[1,2,-3,4],[4],sense > 0.0)
+    defer face.close()
+    var plans = [GridLayout()]
+    defer plans[0].close()
+    plans[0].rows = try alloc Stations[4] in memory.heap
+    var baseline = [Stations(),Stations(),Stations(),Stations()]
+    defer:
+        for row in baseline: row.close()
+    for at in 0..<(usize)4: plans[0].rows[at] = Stations()
+    for at in 0..<(usize)4:
+        try baseline[at].open(1025)
+        try plans[0].rows[at].open(1025)
+        let spans: usize = 8 if at%2 == 0 else 1
+        for step in 0..<spans+1:
+            let t = (f64)step/(f64)spans
+            discard(try baseline[at].insert(t,1e-12))
+            discard(try plans[0].rows[at].insert(t,1e-12))
+    let side = try patch_sides(face,s,edges,tolerance)
+    try regularize(edges,[s],[face],[side],plans,baseline,16,tolerance)
+    var near = false
+    for at in 0..<(usize)4:
+        let row = baseline[at]
+        if row.values[0] != 0.0 or row.values[row.count-1] != 1.0: error(invalid,"circular phase changed an authored arc endpoint")
+        if at%2 != 0:
+            if row.count != 2: error(invalid,"circular phase changed a straight rail")
+            continue
+        if row.count < 9 or row.count != plans[0].rows[at].count: error(invalid,"circular endpoint guard lost resolved density or row ownership")
+        for item in 1..<row.count-1:
+            let t = row.values[item]
+            if t <= row.values[item-1] or t >= 1.0: error(invalid,"circular phase contains unordered or duplicate stations")
+            if math.min(t,1.0-t)*math.abs(edges[at].sweep) < 1e-8: near = true
+    if near != (variant == 2): error(invalid,"circular family endpoint residue was not distinguished from an out-of-tolerance cut")
+
+func closed_seams(scale: f64, rotation: f64, sense: f64) -> !:
+    # Closed circular rails cover the same angular domain even with different
+    # seams. This cut is inside the physical cap but beyond the endpoint/coverage
+    # margin; it must be transferred, not mistaken for a matching endpoint.
+    let jitter: f64 = 8e-9
+    let tolerance = scale*1e-6
+    let x = Vector3(math.cos(rotation),math.sin(rotation),0.0)
+    let y = Vector3(-math.sin(rotation),math.cos(rotation),0.0)
+    var no_points: Vector3[]
+    var empty: f64[]
+    let a = try Curve(1,0,0,Vector3(),x,y,scale,no_points,empty,empty,0,true,0.0,sense*2.0*math.pi)
+    let b = try Curve(1,1,1,Vector3(0.0,0.0,2.0*scale),x,y,scale,no_points,empty,empty,0,true,sense*jitter,sense*2.0*math.pi)
+    let edges = [a,try Curve(0,0,1,Vector3(),Vector3(),Vector3(),0.0,[try a.at(0.0),try b.at(0.0)],empty,empty,0,true),b]
+    defer:
+        for edge in edges: edge.close()
+    let s = try Surface(1,Vector3(),x,Vector3(0.0,0.0,1.0),scale,0.0,no_points,empty,empty,empty,0,0,0,0)
+    defer s.close()
+    let face = try BrepFace(0,[1,2,-3,-2],[4],sense > 0.0)
+    defer face.close()
+    var plans = [GridLayout()]
+    defer plans[0].close()
+    plans[0].rows = try alloc Stations[4] in memory.heap
+    for at in 0..<(usize)4: plans[0].rows[at] = Stations()
+    var baseline = [Stations(),Stations(),Stations()]
+    defer:
+        for row in baseline: row.close()
+    for at in 0..<(usize)3:
+        try baseline[at].open(1025)
+        let spans: usize = 32 if at%2 == 0 else 1
+        for step in 0..<spans+1: discard(try baseline[at].insert((f64)step/(f64)spans,1e-12))
+    for at in 0..<(usize)4:
+        try plans[0].rows[at].open(1025)
+        let spans: usize = 32 if at%2 == 0 else 1
+        for step in 0..<spans+1: discard(try plans[0].rows[at].insert((f64)step/(f64)spans,1e-12))
+    let side = try patch_sides(face,s,edges,tolerance)
+    try regularize(edges,[s],[face],[side],plans,baseline,16,tolerance)
+    var near = false
+    for at in [0,2]:
+        let row = baseline[(usize)at]
+        if row.count < 33 or row.values[0] != 0.0 or row.values[row.count-1] != 1.0: error(invalid,"closed circular family lost endpoints or density")
+        for item in 1..<row.count-1:
+            let distance = math.min(row.values[item],1.0-row.values[item])*2.0*math.pi
+            near = near or (distance > 1e-9 and distance < 1e-8)
+    if not near: error(invalid,"distinct closed-rail seam was erased by the endpoint guard")

@@ -1,0 +1,105 @@
+## Mapped affine strips own one even phase; shared trims retain all old cuts.
+import memory
+import math
+from three import Vector3, invalid
+from luce_cad.brep_types import Surface, Curve, BrepFace
+from luce_cad.layout_types import Stations, GridLayout
+from luce_cad.patch_sides import patch_sides, edge_index
+from luce_cad.curve_spacing import measure, close
+from luce_cad.mapped_extrusion import regularize
+
+pub func mapped_extrusion_contract() -> !:
+    for scale in [0.001,1.0,1000.0]:
+        for swapped in [false,true]:
+            for reversed in [false,true]:
+                for origin in 0..<(usize)4:
+                    for variant in 0..<10:
+                        for profile_spans in [(usize)1,(usize)8]: try strip(scale,swapped,reversed,origin,variant,profile_spans)
+
+func strip(scale: f64, swapped: bool, reversed: bool, origin: usize, variant: i64, profile_spans: usize) -> !:
+    # Wide, flat profiles amplify a tiny rail-direction fit error if coverage
+    # is projected onto that approximate edge instead of the exact support.
+    let width = 100.0 if variant >= 8 else 1.0
+    let length = 1.0 if variant >= 8 else 20.0
+    let bulge = 0.0 if variant >= 8 else 0.3
+    let controls = try alloc Vector3[12] in memory.heap
+    defer free(controls) in memory.heap
+    let weights = try alloc f64[12] in memory.heap
+    defer free(weights) in memory.heap
+    for u in 0..<(usize)3:
+        for v in 0..<(usize)4:
+            let at = v*3+u if swapped else u*4+v
+            controls[at] = Vector3(width*(f64)u*0.5,length*(f64)v/3.0,bulge if u == 1 else 0.0).multiply_scalar(scale)
+            weights[at] = 1.0
+            if variant == 1 and u == 1 and v == 2: controls[at].z += scale*0.01
+    let quadratic = [0.0,0.0,0.0,1.0,1.0,1.0]
+    let cubic = [0.0,0.0,0.0,0.0,1.0,1.0,1.0,1.0]
+    let s = try Surface(3,Vector3(),Vector3(),Vector3(),0.0,0.0,controls,weights,
+        cubic[..<8] if swapped else quadratic[..<6],quadratic[..<6] if swapped else cubic[..<8],
+        4 if swapped else 3,3 if swapped else 4,3 if swapped else 2,2 if swapped else 3)
+    defer s.close()
+    let shift = scale*(0.01 if variant == 3 else (2e-6 if variant == 9 else 0.0))
+    let noise = scale*(5e-7 if variant >= 8 else (2.5e-7 if variant == 5 else (1.01e-6 if variant == 6 else (1e-4 if variant == 7 else 0.0))))
+    let p = [Vector3(),Vector3(width*scale,0.0,0.0),Vector3(width*scale,length*scale,0.0),Vector3(noise,length*scale+shift,0.0)]
+    var empty: f64[]
+    let edges = [
+        try Curve(2,0,1,Vector3(),Vector3(),Vector3(),0.0,[p[0],Vector3(width*scale*0.5,0.0,scale*bulge),p[1]],[1.0,1.0,1.0],quadratic,2,true,0.0,1.0),
+        try Curve(0,1,2,Vector3(),Vector3(),Vector3(),0.0,[p[1],p[2]],empty,empty,0,true),
+        try Curve(2,2,3,Vector3(),Vector3(),Vector3(),0.0,[p[2],Vector3(width*scale*0.5,length*scale,scale*bulge),p[3]],[1.0,1.0,1.0],quadratic,2,true,0.0,1.0),
+        try Curve(0,3,0,Vector3(),Vector3(),Vector3(),0.0,[p[3],p[0]],empty,empty,0,true)]
+    defer:
+        for edge in edges: edge.close()
+    let metrics = try measure(edges)
+    defer close(metrics)
+    var uses = [0,0,0,0]
+    for use in 0..<(usize)4:
+        let edge = (origin+(3-use if reversed else use))%4
+        uses[use] = -((i64)edge+1) if reversed else (i64)edge+1
+    let face = try BrepFace(0,uses,[4],not reversed)
+    defer face.close()
+    var plans = [GridLayout()]
+    defer plans[0].close()
+    let plan = &plans[0]
+    plan.valid = variant == 4
+    plan.rows = try alloc Stations[4] in memory.heap
+    for use in 0..<(usize)4: plan.rows[use] = Stations()
+    var cuts = [Stations(),Stations(),Stations(),Stations()]
+    defer:
+        for cut in cuts: cut.close()
+    for edge in 0..<(usize)4: try cuts[edge].open(7 if variant == 2 and edge%2 != 0 else 1025)
+    for use in 0..<(usize)4:
+        let edge = edge_index(uses[use])
+        let row = &plan.rows[use]
+        try row.open(1025)
+        if edge%2 == 0:
+            for step in 0..<profile_spans+1: discard(try row.insert((f64)step/(f64)profile_spans,1e-12))
+        else:
+            for t in [0.0,0.02 if edge == 1 else 0.1,0.5 if edge == 1 else 0.9,1.0]: discard(try row.insert(t,1e-12))
+        for t in row.values[..<row.count]: discard(try cuts[edge].insert(t,1e-12))
+        if edge%2 != 0:
+            for t in [0.035,0.61]: discard(try cuts[edge].insert(t,1e-12))
+    let sides = try patch_sides(face,s,edges,scale*1e-6)
+    try regularize([face],[s],edges,[sides],metrics,cuts,plans,scale*(0.1 if variant == 7 else 1e-6))
+    for use in 0..<(usize)4:
+        let edge = edge_index(uses[use])
+        let row = plan.rows[use]
+        if edge%2 == 0:
+            if row.count != profile_spans+1 or cuts[edge].count != profile_spans+1: error(invalid,"affine redistribution changed a curvature station family")
+            for step in 0..<profile_spans+1:
+                if row.values[step] != (f64)step/(f64)profile_spans: error(invalid,"affine redistribution moved curved stations")
+            continue
+        for t in [0.0,0.02 if edge == 1 else 0.1,0.5 if edge == 1 else 0.9,1.0,0.035,0.61]:
+            var found = false
+            for value in cuts[edge].values[..<cuts[edge].count]: found = found or value == t
+            if not found: error(invalid,"affine phase regularization discarded an original shared trim cut")
+        if variant != 0 and variant != 5 and variant != 8:
+            if row.count != 4 or cuts[edge].count != 6: error(invalid,"unsupported or over-budget affine phase proposal was not atomic")
+            continue
+        if row.count < 4: error(invalid,"affine strip discarded requested interior spans")
+        for step in 0..<row.count:
+            if math.abs(row.values[step]-(f64)step/(f64)(row.count-1)) > 1e-12: error(invalid,"affine strip did not distribute both rails evenly")
+            var bound = false
+            for value in cuts[edge].values[..<cuts[edge].count]: bound = bound or value == row.values[step]
+            if not bound: error(invalid,"new affine row lacks a canonical boundary cut")
+        let pitch = metrics[0].at(1.0)/(f64)profile_spans
+        if metrics[edge].at(1.0)/(f64)(row.count-1) > pitch*16.0*(1.0+1e-12): error(invalid,"affine strip failed its physical pitch target")

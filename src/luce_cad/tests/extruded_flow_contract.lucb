@@ -1,0 +1,102 @@
+## Late flow uses support distance, not UV speed, without losing trim segments.
+import math
+import memory
+from three import Vector3, invalid
+from tesselator import TrimGrid
+from luce_cad.brep_types import Surface, Curve, BrepFace
+from luce_cad.layout_types import GridLayout, Stations, UVChain
+from luce_cad.trim_layout import reconcile
+from luce_cad.trim_chains import cached
+from luce_cad.trim_alignment import align
+
+pub func extruded_flow_contract() -> !:
+    for scale in [0.001,1.0,1000.0]:
+        for swap in [false,true]:
+            for reverse in [false,true]:
+                for nonlinear in [false,true]:
+                    for crowded in [false,true]: try late_profile_row(scale,swap,reverse,nonlinear,crowded)
+
+func late_profile_row(scale: f64, swap: bool, reverse: bool, nonlinear: bool, crowded: bool) -> !:
+    let vertices = [Vector3(),Vector3(scale,0.0,0.0),Vector3(scale,20.0*scale,0.0),Vector3(0.0,20.0*scale,0.0)]
+    let quadratic = [0.0,0.0,0.0,1.0,1.0,1.0]
+    let linear = [0.0,0.0,1.0,1.0]
+    let middle = scale*0.05 if nonlinear else scale*0.5
+    var empty: f64[]
+    let edges = [
+        try Curve(2,0,1,Vector3(),Vector3(),Vector3(),0.0,[vertices[0],Vector3(middle,0.0,0.0),vertices[1]],[1.0,1.0,1.0],quadratic,2,true,0.0,1.0),
+        try Curve(0,1,2,Vector3(),Vector3(),Vector3(),0.0,[vertices[1],vertices[2]],empty,empty,0,true),
+        try Curve(2,2,3,Vector3(),Vector3(),Vector3(),0.0,[vertices[2],Vector3(middle,20.0*scale,0.0),vertices[3]],[1.0,1.0,1.0],quadratic,2,true,0.0,1.0),
+        try Curve(0,3,0,Vector3(),Vector3(),Vector3(),0.0,[vertices[3],vertices[0]],empty,empty,0,true)]
+    defer:
+        for edge in edges: edge.close()
+    var controls = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+    for u in 0..<(usize)3:
+        for v in 0..<(usize)2:
+            controls[v*3+u if swap else u*2+v] = Vector3(0.0 if u == 0 else (middle if u == 1 else scale),20.0*scale*(f64)v,0.0)
+    let surface = try Surface(3,Vector3(),Vector3(),Vector3(),0.0,0.0,controls,[1.0,1.0,1.0,1.0,1.0,1.0],
+        linear[..<4] if swap else quadratic[..<6],quadratic[..<6] if swap else linear[..<4],2 if swap else 3,3 if swap else 2,1 if swap else 2,2 if swap else 1)
+    defer surface.close()
+    let face = try BrepFace(0,[-4,-3,-2,-1] if reverse else [1,2,3,4],[4],swap == reverse)
+    defer face.close()
+    var cuts = [Stations(),Stations(),Stations(),Stations()]
+    defer:
+        for cut in cuts: cut.close()
+    for at in 0..<(usize)4:
+        try cuts[at].open(128)
+        for value in [0.0,1.0]: discard(try cuts[at].insert(value,1e-12))
+    # x=.1u+.9u² has no singular endpoints. u=.25 bisects the UV interval but
+    # is near its physical end; solve x(u)=x(.5)/2 for the useful midpoint.
+    let late = (0.25 if crowded else (math.sqrt(0.505)-0.1)/1.8) if nonlinear else (0.01 if crowded else 0.25)
+    discard(try cuts[0].insert(late,1e-12))
+    var plan = GridLayout()
+    defer plan.close()
+    plan.valid = true
+    plan.cut_first = true
+    plan.epsilon = 1e-7
+    plan.trim_low = Vector3()
+    plan.trim_high = Vector3(1.0,1.0,0.0)
+    plan.flow = try alloc bool[4] in memory.heap
+    plan.chains = try alloc UVChain[4] in memory.heap
+    for use in 0..<(usize)4:
+        plan.flow[use] = use == (3 if reverse else (usize)0)
+        plan.chains[use] = UVChain()
+    try plan.u.open(128)
+    try plan.v.open(128)
+    for value in [0.0,0.5,1.0]:
+        discard(try plan.u.insert(value,1e-12))
+        discard(try plan.v.insert(value,1e-12))
+    discard(try reconcile(&plan,face,surface,vertices,edges,cuts,scale*1e-6,true))
+    if (plan.v.count if swap else plan.u.count) != (3 if crowded else (usize)4): error(invalid,"extruded flow admission ignored physical profile spacing")
+    var retained = false
+    for value in cuts[0].values[..<cuts[0].count]: retained = retained or value == late
+    if not retained: error(invalid,"stopping an extruded interior row discarded a canonical boundary station")
+    let uv = try alloc Vector3[128] in memory.heap
+    defer free(uv) in memory.heap
+    let canonical = try alloc Vector3[128] in memory.heap
+    defer free(canonical) in memory.heap
+    let ids = try alloc i64[128] in memory.heap
+    defer free(ids) in memory.heap
+    var count: usize = 0
+    for use in 0..<face.uses.length:
+        let signed = face.uses[use]
+        let index = (usize)(-signed-1 if signed < 0 else signed-1)
+        let chain = try cached(&plan.chains[use],surface,vertices,edges[index],cuts[index],scale*1e-6)
+        for at in 0..<chain.length-1:
+            let point_index = at if signed > 0 else chain.length-1-at
+            uv[count] = chain[point_index]
+            canonical[count] = try edges[index].at(cuts[index].values[point_index])
+            ids[count] = (i64)count
+            count += 1
+    try align(uv[..<count],[(i64)count],ids[..<count],canonical[..<count],surface,plan,scale*1e-6)
+    let cells = try TrimGrid.clip(uv[..<count],[(i64)count],plan.u.values[..<plan.u.count],plan.v.values[..<plan.v.count])
+    defer cells.release()
+    for at in 0..<count:
+        if (try cells.value().point((i64)at)).subtract(uv[at]).length() != 0.0: error(invalid,"extruded phase guard moved a boundary UV")
+        var uses: usize = 0
+        for polygon in 0..<cells.value().face_count():
+            let size = try cells.value().face_size(polygon)
+            for corner in 0..<size:
+                let a = try cells.value().face_point(polygon,corner)
+                let b = try cells.value().face_point(polygon,(corner+1)%size)
+                if (a == (i64)at and b == (i64)((at+1)%count)) or (b == (i64)at and a == (i64)((at+1)%count)): uses += 1
+        if uses != 1: error(invalid,"extruded phase guard lost a directed trim segment")

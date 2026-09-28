@@ -1,0 +1,141 @@
+## Synthetic grazing-rail cells: no STEP fixture IDs or coordinates involved.
+import math
+from three import Vector3, MeshBuilder, invalid
+from luce_cad.clipped_cells import append_cells
+from luce_cad.clipped_merge import append_repaired, merge_edge
+from luce_cad.clipped_display import folds
+from luce_cad.clipped_triangulation import solve
+
+pub func cutcell_contract() -> !:
+    for phase in [0.0,1.2,3.0]:
+        for reverse in [false,true]:
+            try grazing(phase,reverse,false)
+            try grazing(phase,reverse,true)
+    for reverse in [false,true]: try concave(reverse)
+    for reverse in [false,true]: try merge_ratios(reverse)
+
+func merge_ratios(reverse: bool) -> !:
+    for ratio in [0.02,0.1,0.25]:
+        var chart = try MeshBuilder()
+        defer chart.close()
+        for p in [Vector3(),Vector3(0.055,0.2*ratio,0.0),Vector3(0.11,0.0,0.0),Vector3(0.11,-0.1,0.0),Vector3(0.0,-0.1,0.0)]: discard(try chart.point(p))
+        try chart.face(3)
+        let a = [0,2,1]
+        for at in 0..<(usize)3: try chart.corner(a[2-at if reverse else at])
+        try chart.face(4)
+        let b = [2,0,4,3]
+        for at in 0..<(usize)4: try chart.corner(b[3-at if reverse else at])
+        let mesh = try chart.finish()
+        defer mesh.release()
+        if ((try merge_edge(mesh.value(),0)) >= 0) != (ratio <= 0.125):
+            error(invalid,"cut-cell agglomeration must admit small strips, not comparable cells")
+
+func concave(reverse: bool) -> !:
+    var chart = try MeshBuilder()
+    defer chart.close()
+    var lifted = try MeshBuilder()
+    defer lifted.close()
+    let points = [Vector3(),Vector3(3.0,0.0,0.0),Vector3(3.0,3.0,0.0),Vector3(2.0,3.0,0.0),Vector3(2.0,1.0,0.0),Vector3(1.0,1.0,0.0),Vector3(1.0,3.0,0.0),Vector3(0.0,3.0,0.0)]
+    let n = Vector3(0.0,0.0,-1.0 if reverse else 1.0)
+    let normals = [n,n,n,n,n,n,n,n]
+    try chart.face(8)
+    try lifted.face(8)
+    for at in 0..<(usize)8:
+        discard(try chart.point(points[at]))
+        discard(try lifted.point(points[at]))
+        try chart.corner((i64)at)
+        try lifted.corner((i64)(7-at if reverse else at))
+    let source = try chart.finish()
+    defer source.release()
+    var indices: i64[18]
+    if not (try solve(&lifted,source.value(),0,not reverse,indices,normals)):
+        error(invalid,"global triangulation must handle concave clipped polygons")
+    try lifted.set_last_display(indices)
+    let result = try lifted.finish()
+    defer result.release()
+    var area: f64 = 0.0
+    for triangle in 0..<6:
+        var positions = [Vector3(),Vector3(),Vector3()]
+        for at in 0..<(usize)3:
+            let index = result.value().index(triangle*3+(i64)at)
+            defer index.release()
+            positions[at] = try result.value().point(try result.value().corner_point(try index.get()))
+        let a = positions[0]
+        let b = positions[1]
+        let c = positions[2]
+        let signed = b.subtract(a).cross(c.subtract(a)).dot(n)*0.5
+        if signed <= 0.0: error(invalid,"global triangulation reversed an ear")
+        area += signed
+        let center = a.add(b).add(c).multiply_scalar(1.0/3.0)
+        if center.x > 1.0 and center.x < 2.0 and center.y > 1.0:
+            error(invalid,"global triangulation crossed a concave trim")
+    if math.abs(area-7.0) > 1e-10: error(invalid,"global triangulation changed polygon area")
+    let opposed = [n.multiply_scalar(-1.0),n.multiply_scalar(-1.0),n.multiply_scalar(-1.0),n.multiply_scalar(-1.0),n.multiply_scalar(-1.0),n.multiply_scalar(-1.0),n.multiply_scalar(-1.0),n.multiply_scalar(-1.0)]
+    if try solve(&lifted,source.value(),0,not reverse,indices,opposed):
+        error(invalid,"global triangulation must reject a chart opposing every normal")
+
+func grazing(phase: f64, reverse: bool, separate: bool) -> !:
+    var chart = try MeshBuilder()
+    defer chart.close()
+    var lifted = try MeshBuilder()
+    defer lifted.close()
+    var normals = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+    let points = [Vector3(0.0,0.0,0.0),Vector3(0.055,1e-9,0.0),Vector3(0.11,0.0,0.0),Vector3(0.11,-0.1,0.0),Vector3(0.0,-0.1,0.0)]
+    for at in 0..<(usize)5:
+        let p = points[at]
+        discard(try chart.point(p))
+        let n = Vector3(math.cos(phase+p.x),math.sin(phase+p.x),0.0)
+        # Near-rail UV alignment never moves the canonical 3D trim. This tiny
+        # fitted residual makes the isolated UV sliver fold when lifted.
+        discard(try lifted.point(n.multiply_scalar(0.2).add(Vector3(0.0,0.0,6e-8 if at == 2 else p.y))))
+        normals[at] = n.multiply_scalar(-1.0 if reverse else 1.0)
+    try chart.face(3)
+    for id in [0,2,1]: try chart.corner(id)
+    if not separate:
+        try chart.face(4)
+        for id in [2,0,4,3]: try chart.corner(id)
+    let source = try chart.finish()
+    defer source.release()
+    var rejected = false
+    append_cells(&lifted,source.value(),not reverse,normals) catch failure:
+        if failure.code != invalid: error(failure.code,failure.message)
+        rejected = true
+        recover ()
+    if not rejected: error(invalid,"grazing fixture must reject the isolated folded sliver")
+    if separate:
+        rejected = false
+        let unexpected = append_repaired(&lifted,source,not reverse,normals) catch failure:
+            if failure.code != invalid: error(failure.code,failure.message)
+            rejected = true
+            recover source.clone()
+        unexpected.release()
+        if not rejected: error(invalid,"a boundary-only sliver cannot be dropped or welded")
+        return
+    let repaired = try append_repaired(&lifted,source,not reverse,normals)
+    defer repaired.release()
+    if lifted.nf != 1 or lifted.nc != 5 or lifted.np != 5:
+        error(invalid,"sliver union must preserve all five boundary vertices")
+    for at in 0..<(usize)5:
+        if (try repaired.value().point((i64)at)).subtract(points[at]).length() != 0.0:
+            error(invalid,"cut-cell repair moved a trim chart vertex")
+        let p = points[at]
+        let radial = Vector3(math.cos(phase+p.x),math.sin(phase+p.x),0.0)
+        let expected = radial.multiply_scalar(0.2).add(Vector3(0.0,0.0,6e-8 if at == 2 else p.y))
+        if lifted.points[at].subtract(expected).length() != 0.0:
+            error(invalid,"cut-cell repair moved a canonical 3D boundary vertex")
+    let result = try lifted.finish()
+    defer result.release()
+    var indices: i64[9]
+    for at in 0..<(usize)9:
+        let index = result.value().index((i64)at)
+        defer index.release()
+        indices[at] = try index.get()
+    if folds(&lifted,indices,normals) != 0: error(invalid,"agglomerated cut cell still folds")
+    # The shared chord 0--2 is removed, but neither side of the exact trim is.
+    var boundary: usize = 0
+    for edge in 0..<result.value().edge_count():
+        let a = try result.value().edge_point(edge,0)
+        let b = try result.value().edge_point(edge,1)
+        if (a == 0 and b == 2) or (a == 2 and b == 0): error(invalid,"internal sliver chord survived")
+        boundary += 1
+    if boundary != 5: error(invalid,"agglomeration changed the outer boundary")

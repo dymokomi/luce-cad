@@ -16,6 +16,7 @@ struct Product:
     var points: Vector3[]
     var sizes: i64[]
     var corners: i64[]
+    var display: i64[]
     var normals: f64[]
     var owns_normals: bool = true
     var failure: interop.Packet[str]? = none
@@ -23,6 +24,7 @@ struct Product:
         if self.points.length > 0: free(self.points) in memory.heap
         if self.sizes.length > 0: free(self.sizes) in memory.heap
         if self.corners.length > 0: free(self.corners) in memory.heap
+        if self.display.length > 0: free(self.display) in memory.heap
         if self.owns_normals and self.normals.length > 0: free(self.normals) in memory.heap
         if let failure = self.failure: failure.release()
 
@@ -75,6 +77,12 @@ func work(jobs: Jobs*) -> !:
             var context: u8[1024]
             let message = format(context, f"CAD face {index}: {failure.message}") catch exhausted: recover failure.message
             jobs.products[index].failure = interop.text_transfer.copy(message) catch exhausted: trap(exhausted.message)
+            # Do not cook the rest of a rejected model. Lower indices have
+            # already been assigned; joining their in-flight jobs below keeps
+            # the reported first failing face deterministic across schedules.
+            jobs.lock.lock()
+            jobs.stop = true
+            jobs.lock.unlock()
         jobs.lock.lock()
         jobs.completed += 1
         jobs.lock.unlock()
@@ -90,6 +98,9 @@ func prepare(jobs: Jobs*, index: usize, scratch: MeshBuilder*) -> !:
     memory.copy(product.points, scratch.points[jobs.points.length..<scratch.np], product.points.length)
     memory.copy(product.sizes, scratch.sizes, scratch.nf)
     memory.copy(product.corners, scratch.corners, scratch.nc)
+    if scratch.display.length > 0:
+        product.display = try alloc i64[(scratch.nc-scratch.nf*2)*3] in memory.heap
+        memory.copy(product.display,scratch.display,product.display.length)
     product.owns_normals = not (plan.applied.length > 0 and plan.applied[0])
     product.normals = (try face_normals(scratch, 0, scratch.nc, face, jobs.surfaces[(usize)face.surface], jobs.tolerance)) if product.owns_normals else plan.normals[0].values
 
@@ -130,6 +141,13 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         let owned = try interop.copy_text(failure.value)
         if let owner = owned.owner: discard(ownership.pool_object(owner))
         error(invalid, owned.value)
+    # Check before allocating or assembling partial products. Unscheduled
+    # faces are empty, while every assigned worker has now been joined.
+    for product in products:
+        if let failure = product.failure:
+            let owned = try interop.copy_text(failure.value)
+            if let owner = owned.owner: discard(ownership.pool_object(owner))
+            error(invalid, owned.value)
     let boundary = mesh.np
     var normal_count: usize = 0
     for product in products: normal_count += product.normals.length
@@ -138,20 +156,24 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
     var normal_offset: usize = 0
     for index in 0..<products.length:
         let product = products[index]
-        if let failure = product.failure:
-            let owned = try interop.copy_text(failure.value)
-            if let owner = owned.owner: discard(ownership.pool_object(owner))
-            error(invalid, owned.value)
         let base = mesh.np
         for point in product.points:
             discard(try mesh.point(point))
         var corner: usize = 0
+        var display: usize = 0
+        var local_indices: i64[762]
         for size in product.sizes:
+            let first = corner
             try mesh.face(size, (i64)index)
             for at in 0..<size:
                 let id = product.corners[corner]
                 try mesh.corner(id if (usize)id < boundary else (i64)(base + (usize)id - boundary))
                 corner += 1
+            let count = ((usize)size-2)*3
+            if product.display.length > 0 and product.display[display] >= 0:
+                for at in 0..<count: local_indices[at] = product.display[display+at]-(i64)first
+                try mesh.set_last_display(local_indices[..<count])
+            display += count
         memory.copy(normals[normal_offset..<normal_offset + product.normals.length], product.normals, product.normals.length)
         normal_offset += product.normals.length
     return normals
