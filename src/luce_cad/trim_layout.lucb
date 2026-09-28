@@ -5,14 +5,23 @@ import memory
 import math
 from three import Vector3, invalid
 from luce_cad.brep_types import Surface, Curve, BrepFace
-from luce_cad.layout_types import Stations, GridLayout, UVChain, NormalCache
-from luce_cad.layout_density import fill, refine_axis
+from luce_cad.layout_types import Stations, GridLayout, UVChain, NormalCache, check_grid_size
+from luce_cad.layout_density import fill, fill_plane, refine_axis
 from luce_cad.layout_cell_error import refine_cells
 from luce_cad.layout_balance import balance
 from luce_cad.mapped_patch import parameter
+from luce_cad.layout_rails import rail_axis, bounds
+from luce_cad.layout_bounds import include_conics
 from luce_cad.patch_sides import edge_index, PatchSides
 from luce_cad.curve_spacing import ArcMetric
 from luce_cad.row_redistribution import redistribute
+from luce_cad.mapped_extrusion import regularize
+from luce_cad.trim_chains import cached, initialize
+from luce_cad.flow_admission import accept_plane_row, accept_extruded_row
+from luce_cad.layout_policy import prefers_clipping
+from luce_cad.layout_envelope import trim_rails, row_endpoint, extrusion_axis, affine_axis
+from luce_cad.layout_pitch import refine_pitch, accept_pitch_row
+from luce_cad.planar_preflight import can_map_plane, can_map
 
 ## Initialize and reconcile layouts before shared vertices are allocated.
 ## Invalid/over-budget layouts fall back; their already registered edge cuts are
@@ -21,15 +30,37 @@ pub func plan_layouts(vertices: const Vector3[], edges: const Curve[], surfaces:
     try balance(faces,edges,sides,cuts,metrics,plans,tolerance)
     for at in 0..<faces.length:
         let s = surfaces[(usize)faces[at].surface]
-        if s.kind != 0 and s.kind != 3: continue
+        # Cylinders/cones have regular analytic charts too. An oblique end trim
+        # must be allowed to cut those rows instead of forcing the entire fillet
+        # through the legacy constrained triangle path.
+        if s.kind != 0 and s.kind != 1 and s.kind != 2 and s.kind != 3: continue
         # Most four-sided domains retain their transfinite layout. A stopped
         # oblique trim instead cuts a support grid;
         # the number of CAD coedges alone cannot make that mapping compatible.
         if sides[at].valid:
-            plans[at].cut_first = prefers_clipping(faces[at],s,edges,plans[at],tolerance) catch failure:
+            let preferred = prefers_clipping(faces[at],s,edges,plans[at].flow,tolerance) catch failure:
                 if failure.code != invalid: error(failure.code,failure.message)
                 recover false
-            if not plans[at].cut_first: continue
+            plans[at].cut_first = plans[at].cut_first or preferred
+            if not plans[at].cut_first and s.kind == 0:
+                plans[at].cut_first = not (try can_map_plane(vertices,edges,faces[at],s,plans[at].rows,tolerance,divisions))
+            # A closed NURBS band can fail the single-seed mapped inverse at
+            # its duplicated seam. Prepare its branch-aware cut chart while
+            # shared cuts are still mutable, even if mapped quads get first
+            # refusal. The legacy trim fallback has no seam chart identity.
+            var periodic_fallback = false
+            if s.kind == 3:
+                for use in 0..<faces[at].uses.length:
+                    for before in 0..<use:
+                        periodic_fallback = periodic_fallback or edge_index(faces[at].uses[use]) == edge_index(faces[at].uses[before])
+                if periodic_fallback:
+                    periodic_fallback = not (try can_map(vertices,edges,faces[at],s,plans[at].rows,tolerance,divisions))
+            if not plans[at].cut_first and not periodic_fallback: continue
+        else:
+            # Without four logical sides the mapped mesher cannot succeed.
+            # Own the cut chart from the start, including its stopped-end and
+            # physical-pitch policies, rather than only retrying it at dispatch.
+            plans[at].cut_first = true
         seed_layout(&plans[at],faces[at],s,vertices,edges,cuts,divisions,tolerance,edge_size) catch failure:
             if failure.code != invalid: error(failure.code,failure.message)
             plans[at].valid = false
@@ -62,46 +93,30 @@ pub func plan_layouts(vertices: const Vector3[], edges: const Curve[], surfaces:
         if after == before: break
     # Freeze the final boundary chains after the last shared-edge insertion.
     try redistribute(faces,edges,metrics,cuts,plans)
+    try regularize(faces,surfaces,edges,sides,metrics,cuts,plans,tolerance)
     for at in 0..<faces.length:
         if not plans[at].valid: continue
         for use in 0..<faces[at].uses.length:
             let index = edge_index(faces[at].uses[use])
             discard(try cached(&plans[at].chains[use],surfaces[(usize)faces[at].surface],vertices,edges[index],cuts[index],tolerance))
 
-# Four topological sides do not imply a rectangular parameter domain. A hard
-# oblique/curved trim cuts the support grid; it must not shear its interior rows
-# to make a transfinite four-sided map fit that trim.
-func prefers_clipping(face: BrepFace, s: Surface, edges: const Curve[], plan: GridLayout, tolerance: f64) -> bool!:
-    if s.kind == 0: return false
-    for use in 0..<face.uses.length:
-        let edge = edges[edge_index(face.uses[use])]
-        if edge.start == edge.end: return false
-        for before in 0..<use:
-            if edge_index(face.uses[before]) == edge_index(face.uses[use]): return false
-    for use in 0..<face.uses.length:
-        if plan.flow[use]: continue
-        var uv = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
-        var seed = Vector3(0.5,0.5,0.0)
-        for at in 0..<(usize)9:
-            seed = try parameter(s,try edges[edge_index(face.uses[use])].at((f64)at/8.0),seed,tolerance)
-            uv[at] = seed
-        let span = uv[8].subtract(uv[0]).length()
-        if iso_axis(uv,math.max(1e-9,span*1e-7)) < 0: return true
-    # Opposite curves may parameterize identical physical distances very
-    # differently. That alone must not turn a smooth seam into a flow stop.
-    # Mapped interiors resolve physical spacing; hard oblique trims cut cells.
-    return false
-
 func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const Vector3[], edges: const Curve[], cuts: const Stations[], divisions: i64, tolerance: f64, edge_size: f64) -> !:
-    if face.uses.length > 128: error(invalid,"complex trim retains constrained layout")
-    try plan.u.open(257)
-    try plan.v.open(257)
+    # A simple support can have many authored groove boundaries. Coedge count
+    # alone does not make its clipped grid unsuitable; bound the actual sampled
+    # trim as well as chart construction work instead of excluding at 128 edges.
+    if face.uses.length > 1024: error(invalid,"trim chart coedge budget exceeded")
+    var boundary_count: usize = 0
+    for use in face.uses: boundary_count += cuts[edge_index(use)].count-1
+    if boundary_count > 16384: error(invalid,"trim grid boundary budget exceeded")
+    try plan.u.open(1025)
+    try plan.v.open(1025)
     plan.applied = try alloc bool[1] in memory.heap
     plan.applied[0] = false
     plan.normals = try alloc NormalCache[1] in memory.heap
     plan.normals[0] = NormalCache()
     plan.chains = try alloc UVChain[face.uses.length] in memory.heap
     for at in 0..<plan.chains.length: plan.chains[at] = UVChain()
+    try initialize(plan.chains,face,s,vertices,edges,cuts,tolerance)
     var low = Vector3(1e100,1e100,0.0)
     var high = Vector3(-1e100,-1e100,0.0)
     for use in 0..<face.uses.length:
@@ -110,9 +125,12 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
         for seed in chain:
             low = Vector3(math.min(low.x,seed.x),math.min(low.y,seed.y),0.0)
             high = Vector3(math.max(high.x,seed.x),math.max(high.y,seed.y),0.0)
+    try include_conics(s,face,edges,&low,&high)
     if high.x-low.x < 1e-9 or high.y-low.y < 1e-9: error(invalid,"singular trim layout")
     let trim_low = low
     let trim_high = high
+    plan.trim_low = trim_low
+    plan.trim_high = trim_high
     # The sampled trim polygon bounds are not the curve bounds. Subsequent exact
     # edge/grid intersections can lie outside that polygon (e.g. a circle near
     # its extremum). Guard cells cover that envelope and are clipped away.
@@ -127,12 +145,14 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
     discard(try plan.u.insert(high.x,plan.epsilon))
     discard(try plan.v.insert(low.y,plan.epsilon))
     discard(try plan.v.insert(high.y,plan.epsilon))
-    # Actual rectangular trim limits are mandatory stations; the optional row
-    # spacing rule must not suppress them in favor of exterior guard cells.
-    discard(try plan.u.insert(trim_low.x,plan.epsilon))
-    discard(try plan.u.insert(trim_high.x,plan.epsilon))
-    discard(try plan.v.insert(trim_low.y,plan.epsilon))
-    discard(try plan.v.insert(trim_high.y,plan.epsilon))
+    # Actual rectangular trim limits remain mandatory. An affine extrusion can
+    # let a stopped oblique end cut its grid: that end's envelope extrema are
+    # not additional interior rows. Curved axes retain their existing support.
+    let rails = (try trim_rails(s,plan.chains,trim_low,trim_high,plan.epsilon,tolerance)) if s.kind == 3 and plan.cut_first else [true,true,true,true]
+    if rails[0]: discard(try plan.u.insert(trim_low.x,plan.epsilon))
+    if rails[1]: discard(try plan.u.insert(trim_high.x,plan.epsilon))
+    if rails[2]: discard(try plan.v.insert(trim_low.y,plan.epsilon))
+    if rails[3]: discard(try plan.v.insert(trim_high.y,plan.epsilon))
     # Nearby competing row phases must not create microscopic sliver columns.
     # This bounds optional flow propagation, never the shared CAD edge samples.
     plan.u.separation = (high.x-low.x)/math.max(32.0,(f64)divisions*4.0)*0.9
@@ -146,7 +166,7 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
     for at in 0..<plan.chains.length:
         if not plan.flow[at]: continue
         let uv = plan.chains[at].points
-        let direction = iso_axis(uv,plan.epsilon)
+        let direction = try rail_axis(s,uv,plan.epsilon,tolerance)
         let span = uv[uv.length-1].subtract(uv[0])
         if direction == 0 and (math.abs(span.x) > span_u+plan.epsilon or (math.abs(math.abs(span.x)-span_u) <= plan.epsilon and uv.length > count_u)):
             dominant_u = at
@@ -157,64 +177,56 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
             count_v = uv.length
             span_v = math.abs(span.y)
     for at in 0..<plan.chains.length:
-        if at == dominant_u or at == dominant_v:
-            discard(try inherit(plan,plan.chains[at]))
+        if not plan.flow[at]: continue
+        # A dominant boundary rail can comprise several STEP coedges. Seed its
+        # entire station family before curvature refinement, not just its
+        # longest segment. Otherwise the uncovered remainder acquires a second
+        # independent phase which gets unioned with its real seam stations later.
+        if (try same_rail(s,plan.chains,at,dominant_u,0,plan.epsilon,tolerance)) or (try same_rail(s,plan.chains,at,dominant_v,1,plan.epsilon,tolerance)):
+            discard(try inherit(plan,s,face,at,tolerance))
     var planar_support: usize = 1
     if s.kind == 0:
         var samples: usize = 0
         for use in face.uses: samples += cuts[edge_index(use)].count-1
         if samples > 8: planar_support = (usize)math.min(math.max(32.0,(f64)divisions),math.max((f64)divisions,(f64)samples/4.0))
-    try fill(&plan.u,planar_support,plan.epsilon)
-    try fill(&plan.v,planar_support,plan.epsilon)
+    if s.kind == 0: plan.independent_phase = try fill_plane(&plan.u,&plan.v,trim_low,trim_high,planar_support,plan.epsilon)
+    else:
+        try fill(&plan.u,planar_support,plan.epsilon)
+        try fill(&plan.v,planar_support,plan.epsilon)
     try refine_axis(&plan.u,s,low,high,0,divisions,tolerance,edge_size,plan.epsilon)
     try refine_axis(&plan.v,s,low,high,1,divisions,tolerance,edge_size,plan.epsilon)
+    if plan.cut_first: plan.pitch_axes = try refine_pitch(&plan.u,&plan.v,s,plan.epsilon)
+    try check_grid_size(plan.u.count,plan.v.count)
     try refine_cells(&plan.u,&plan.v,s,divisions,tolerance,plan.epsilon)
     plan.valid = true
 
-func cached(chain: UVChain*, s: Surface, vertices: const Vector3[], edge: Curve, stations: Stations, tolerance: f64) -> const Vector3[]!:
-    if chain.points.length != stations.count:
-        let points = try alloc Vector3[stations.count] in memory.heap
-        errdefer free(points) in memory.heap
-        let times = try alloc f64[stations.count] in memory.heap
-        errdefer free(times) in memory.heap
-        var previous: usize = 0
-        var seed = Vector3(0.5,0.5,0.0)
-        for at in 0..<points.length:
-            let t = stations.values[at]
-            times[at] = t
-            while previous < chain.times.length and chain.times[previous] < t-1e-12: previous += 1
-            if previous < chain.times.length and math.abs(chain.times[previous]-t) < 1e-12:
-                seed = chain.points[previous]
-            else:
-                let p = vertices[(usize)edge.start] if at == 0 else (vertices[(usize)edge.end] if at+1 == points.length else (try edge.at(t)))
-                seed = try parameter(s,p,seed,tolerance)
-            points[at] = seed
-        if chain.points.length > 0: free(chain.points) in memory.heap
-        if chain.times.length > 0: free(chain.times) in memory.heap
-        chain.points = points
-        chain.times = times
-    return chain.points
+func same_rail(s: Surface, chains: const UVChain[], at: usize, dominant: usize, axis: i64, epsilon: f64, tolerance: f64) -> bool!:
+    if dominant == chains.length: return false
+    if at == dominant: return true
+    let candidate = chains[at].points
+    if try rail_axis(s,candidate,epsilon,tolerance) != axis: return false
+    let a = bounds(candidate,false)
+    let b = bounds(candidate,true)
+    let c = bounds(chains[dominant].points,false)
+    let d = bounds(chains[dominant].points,true)
+    return math.max(a.y,c.y) <= math.min(b.y,d.y)+epsilon if axis == 0 else math.max(a.x,c.x) <= math.min(b.x,d.x)+epsilon
 
-func iso_axis(uv: const Vector3[], epsilon: f64) -> i64:
-    var min_u: f64 = 1e100
-    var max_u: f64 = -1e100
-    var min_v: f64 = 1e100
-    var max_v: f64 = -1e100
-    for p in uv:
-        min_u = math.min(min_u,p.x)
-        max_u = math.max(max_u,p.x)
-        min_v = math.min(min_v,p.y)
-        max_v = math.max(max_v,p.y)
-    if max_v-min_v < epsilon: return 0
-    if max_u-min_u < epsilon: return 1
-    return -1
-
-func inherit(plan: GridLayout*, chain: UVChain) -> bool!:
-    let axis = iso_axis(chain.points,plan.epsilon)
+func inherit(plan: GridLayout*, s: Surface, face: BrepFace, use: usize, tolerance: f64) -> bool!:
+    let chain = plan.chains[use]
+    let axis = try rail_axis(s,chain.points,plan.epsilon,tolerance)
+    if axis < 0: return false
+    let can_stop = plan.cut_first and extrusion_axis(s,axis)
+    # Curvature-resolved rows also own their physical phase. On a proven
+    # extrusion, a late curved-rail station must not spoil adjacent cells.
+    let protect_curve = plan.valid and affine_axis(s,1-axis)
+    let start_row = not can_stop or (try row_endpoint(s,face,plan.chains,plan.flow,use,axis,true,plan.epsilon,tolerance))
+    let end_row = not can_stop or (try row_endpoint(s,face,plan.chains,plan.flow,use,axis,false,plan.epsilon,tolerance))
     let original_u = plan.u.separation
     let original_v = plan.v.separation
-    # The caller has already classified this as a compatible flow seam. Its
-    # shared stations are mandatory, not optional competing density requests.
+    # Smooth compatibility permits flow, but does not make every trim vertex
+    # an interior row. Curvature-seeded charts keep their own stations; reject
+    # late competing phases that would turn a usable cell into a severe sliver.
+    # The canonical edge cut remains shared and becomes a cut-polygon corner.
     plan.u.separation = 0.0
     plan.v.separation = 0.0
     defer:
@@ -222,16 +234,24 @@ func inherit(plan: GridLayout*, chain: UVChain) -> bool!:
         plan.v.separation = original_v
     var changed = false
     for at in 0..<chain.points.length:
+        if (at == 0 and not start_row) or (at+1 == chain.points.length and not end_row): continue
         let p = chain.points[at]
+        if protect_curve and not (try accept_extruded_row(*plan,s,axis,p.x if axis == 0 else p.y)): continue
         if axis == 0:
+            if plan.valid and plan.pitch_axes[0] and not accept_pitch_row(plan.u,p.x,plan.epsilon): continue
+            if plan.independent_phase and plan.valid and not accept_plane_row(plan.u,plan.v,p.x,plan.trim_low.x,plan.trim_high.x,plan.trim_low.y,plan.trim_high.y,plan.epsilon): continue
             let added = try plan.u.insert(math.clamp(p.x,plan.u.values[0],plan.u.values[plan.u.count-1]),plan.epsilon)
             changed = changed or added
         if axis == 1:
+            if plan.valid and plan.pitch_axes[1] and not accept_pitch_row(plan.v,p.y,plan.epsilon): continue
+            if plan.independent_phase and plan.valid and not accept_plane_row(plan.v,plan.u,p.y,plan.trim_low.y,plan.trim_high.y,plan.trim_low.x,plan.trim_high.x,plan.epsilon): continue
             let added = try plan.v.insert(math.clamp(p.y,plan.v.values[0],plan.v.values[plan.v.count-1]),plan.epsilon)
             changed = changed or added
+    try check_grid_size(plan.u.count,plan.v.count)
     return changed
 
-func reconcile(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const Vector3[], edges: const Curve[], cuts: Stations[], tolerance: f64, propagate: bool) -> bool!:
+## Register exact boundary/grid crossings before either adjacent face is meshed.
+pub func reconcile(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const Vector3[], edges: const Curve[], cuts: Stations[], tolerance: f64, propagate: bool) -> bool!:
     var revision: usize = 0
     for use in face.uses: revision += cuts[edge_index(use)].count
     if revision == plan.seen: return false
@@ -242,7 +262,7 @@ func reconcile(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const Ve
             if not plan.flow[use]: continue
             let index = edge_index(face.uses[use])
             discard(try cached(&plan.chains[use],s,vertices,edges[index],cuts[index],tolerance))
-            let grew = try inherit(plan,plan.chains[use])
+            let grew = try inherit(plan,s,face,use,tolerance)
             changed = changed or grew
     for use in 0..<face.uses.length:
         let index = edge_index(face.uses[use])
@@ -259,13 +279,34 @@ func reconcile(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const Ve
                 let b = uv[segment+1].x if axis == 0 else uv[segment+1].y
                 for line in 1..<lines.count-1:
                     let value = lines.values[line]
-                    if value <= math.min(a,b)+plan.epsilon or value >= math.max(a,b)-plan.epsilon: continue
+                    # Row deduplication tolerance is not geometric incidence.
+                    # A shallow crossing near a tangent is still a crossing;
+                    # skipping it sends an unsplit chord through the grid side
+                    # and can turn an otherwise valid cut cell inside out.
+                    let incidence = math.max(1e-13,plan.epsilon*1e-5)
+                    if value <= math.min(a,b)+incidence or value >= math.max(a,b)-incidence: continue
                     let t = intersection(s,edge,times[segment],times[segment+1],uv[segment],uv[segment+1],axis,value,tolerance,plan.epsilon) catch failure:
                         if failure.code != invalid: error(failure.code,failure.message)
                         recover times[segment]
-                    let added = try insert_cut(&cuts[index],edge,t,tolerance)
+                    let preserve = try separates_crossings(uv,times,segment,axis,value,incidence,edge,t,tolerance)
+                    let added = (try cuts[index].insert(t,cuts[index].epsilon)) if preserve else (try insert_cut(&cuts[index],edge,t,tolerance))
                     changed = changed or added
     return changed
+
+## A nearby sample can represent one crossing on a monotone run, but cannot
+## replace both crossings around an extremum. This also covers a tolerant CAD
+## endpoint that returns behind the last analytic curve sample. Keep the exact
+## roots and the intervening vertex; neither topology nor the turn may collapse.
+func separates_crossings(uv: const Vector3[], times: const f64[], segment: usize, axis: usize, value: f64, incidence: f64, edge: Curve, t: f64, tolerance: f64) -> bool!:
+    for at in [segment,segment+1]:
+        if at == 0 or at+1 == uv.length: continue
+        let a = uv[at-1].x if axis == 0 else uv[at-1].y
+        let p = uv[at].x if axis == 0 else uv[at].y
+        let b = uv[at+1].x if axis == 0 else uv[at+1].y
+        if math.abs(p-value) <= incidence: continue
+        if value > math.min(a,b)+incidence and value < math.max(a,b)-incidence: continue
+        if (try edge.at(t)).subtract(try edge.at(times[at])).length() < math.max(1e-8,tolerance*0.01): return true
+    return false
 
 func insert_cut(cuts: Stations*, edge: Curve, t: f64, tolerance: f64) -> bool!:
     var low: usize = 0
@@ -285,13 +326,18 @@ func intersection(s: Surface, edge: Curve, ta: f64, tb: f64, pa: Vector3, pb: Ve
     var high = tb
     var a = pa.x if axis == 0 else pa.y
     var b = pb.x if axis == 0 else pb.y
+    let chord = (try edge.at(tb)).subtract(try edge.at(ta)).length()
+    # Parameter error must also fit the physical snap budget. A short curved
+    # trim with a tight CAD tolerance cannot use the same UV residual as a
+    # metre-scale support with a loose modelling tolerance.
+    let target = epsilon*1e-5 if s.kind == 0 else math.min(epsilon*0.1,tolerance*0.01*math.abs(b-a)/math.max(tolerance,chord))
     var seed = pa.add(pb).multiply_scalar(0.5)
     for step in 0..<32:
         let fraction = 0.5 if step%4 == 3 else math.clamp((value-a)/(b-a),0.05,0.95)
         let t = low+(high-low)*fraction
         seed = try parameter(s,try edge.at(t),seed,tolerance)
         let p = seed.x if axis == 0 else seed.y
-        if math.abs(p-value) < epsilon*(1e-5 if s.kind == 0 else 0.1): return t
+        if math.abs(p-value) < target: return t
         if (p < value) == (a < value):
             low = t
             a = p

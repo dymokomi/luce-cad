@@ -1,0 +1,56 @@
+## A spherical cap fit depends on its extreme directions, not on how densely
+## each trim side was sampled. Reject genuine non-hemisphere domains as before.
+import memory
+import math
+from three import Vector3, Matrix4, invalid
+from luce_cad.brep_types import Surface
+from luce_cad.sphere_chart import local_sphere
+
+pub func sphere_chart_contract() -> !:
+    for scale in [1e-5,0.005,1.0,100.0]:
+        for pose in [false,true]:
+            for density in [1,8,64]:
+                for reverse in [false,true]: try cap(scale,pose,density,reverse)
+
+func cap(scale: f64, pose: bool, density: i64, reverse: bool) -> !:
+    let matrix = Matrix4.compose(Vector3(7.0,-2.0,13.0).multiply_scalar(scale),Vector3(0.4,-0.8,0.3) if pose else Vector3(),Vector3(1.0,1.0,1.0))
+    let center = matrix.transform_point(Vector3())
+    var empty_points: Vector3[]
+    var empty: f64[]
+    let surface = try Surface(4,center,matrix.x,matrix.z,scale,0.0,empty_points,empty,empty,empty,0,0,0,0)
+    defer surface.close()
+    let directions = [Vector3(-1.0,0.0,0.0),Vector3(0.0,-1.0,0.0),Vector3(0.8,0.0,0.6),Vector3(0.0,0.0,1.0)]
+    var points = [Vector3(),Vector3(),Vector3(),Vector3()]
+    for at in 0..<points.length: points[at] = matrix.transform_point(directions[at].multiply_scalar(scale))
+    let ids = try alloc i64[(usize)density+3] in memory.heap
+    defer free(ids) in memory.heap
+    ids[0] = 0
+    ids[1] = 1
+    ids[2] = 3
+    for at in 3..<ids.length: ids[at] = 2
+    if reverse:
+        for at in 0..<ids.length//2:
+            let old = ids[at]
+            ids[at] = ids[ids.length-1-at]
+            ids[ids.length-1-at] = old
+    let chart = try local_sphere(surface,points,ids)
+    defer chart.close()
+    if chart.origin != surface.origin or chart.radius != surface.radius: error(invalid,"chart fitting moved the spherical support")
+    for at in 0..<points.length:
+        let p = points[at].subtract(center)
+        if p.dot(chart.x) <= scale*0.05: error(invalid,"cap fitting ignored a sparsely sampled side")
+        let u = math.atan2(p.dot(chart.y),p.dot(chart.x))
+        let v = math.atan2(p.dot(chart.z),math.sqrt(p.dot(chart.x)*p.dot(chart.x)+p.dot(chart.y)*p.dot(chart.y)))
+        let lifted = chart.origin.add(chart.x.multiply_scalar(scale*math.cos(u)*math.cos(v))).add(chart.y.multiply_scalar(scale*math.sin(u)*math.cos(v))).add(chart.z.multiply_scalar(scale*math.sin(v)))
+        if lifted.subtract(points[at]).length() > scale*1e-12: error(invalid,"sphere chart changed its exact boundary positions")
+    # Biased antipodal samples still cannot share any open hemisphere.
+    points[0] = matrix.transform_point(Vector3(-scale,0.0,0.0))
+    points[1] = matrix.transform_point(Vector3(scale,0.0,0.0))
+    var rejected = false
+    let bad = local_sphere(surface,points,[0,1,1,1,1]) catch failure:
+        if failure.code != invalid: error(failure.code,failure.message)
+        rejected = true
+        recover chart
+    if not rejected:
+        bad.close()
+        error(invalid,"cap fitting accepted antipodal trim points")

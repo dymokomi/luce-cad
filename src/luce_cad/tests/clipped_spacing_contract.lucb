@@ -1,0 +1,139 @@
+## Crowded row families with fixed seams, both senses, axis swaps and a hole.
+import math
+import memory
+from three import Vector3, MeshBuilder, invalid
+from tesselator import TrimGrid
+from luce_cad.brep_types import Surface
+from luce_cad.clipped_cells import append_cells
+from luce_cad.clipped_spacing import redistribute
+from luce_cad.clipped_rows import Rows
+from luce_cad.mapped_patch import point
+from luce_cad.surface_normals import support_normal
+from luce_cad.display_error import validate_display_error
+
+pub func clipped_spacing_contract() -> !:
+    try short_trim_interval()
+    for hole in [false,true]:
+        for swapped in [false,true]:
+            for reverse in [false,true]:
+                for curved in [false,true]: try crowded(hole,swapped,reverse,curved)
+    for swapped in [false,true]:
+        for reverse in [false,true]:
+            for curved in [false,true]: try crowded(false,swapped,reverse,curved,true)
+
+## A boolean trim making the last interval tiny is not an overlapping interior
+## row family. Keep this ordinary Cartesian grid exactly where it was.
+func short_trim_interval() -> !:
+    let surface = try Surface(3,Vector3(),Vector3(),Vector3(),0.0,0.0,
+        [Vector3(),Vector3(0.0,1.0,0.0),Vector3(1.0,0.0,0.0),Vector3(1.0,1.0,0.0)],
+        [1.0,1.0,1.0,1.0],[0.0,0.0,1.0,1.0],[0.0,0.0,1.0,1.0],2,2,1,1)
+    defer surface.close()
+    let us = [0.0,0.2,0.4,0.6,0.8,1.0]
+    let vs = [0.0,0.25,0.5,0.75,1.0]
+    let right = 0.80001
+    var boundary = try MeshBuilder()
+    defer boundary.close()
+    for at in 0..<(usize)5: discard(try boundary.point(Vector3(us[at],0.0,0.0)))
+    for v in vs: discard(try boundary.point(Vector3(right,v,0.0)))
+    for at in 0..<(usize)5: discard(try boundary.point(Vector3(us[4-at],1.0,0.0)))
+    for at in 1..<(usize)4: discard(try boundary.point(Vector3(0.0,vs[4-at],0.0)))
+    let source = try TrimGrid.clip(boundary.points[..<boundary.np],[(i64)boundary.np],us,vs)
+    defer source.release()
+    var lifted = try MeshBuilder()
+    defer lifted.close()
+    let count = (usize)source.value().point_count()
+    let normals = try alloc Vector3[count] in memory.heap
+    defer free(normals) in memory.heap
+    for at in 0..<count:
+        discard(try lifted.point(try source.value().point((i64)at)))
+        normals[at] = Vector3(0.0,0.0,1.0)
+    try append_cells(&lifted,source.value(),true,normals)
+    let rows = try Rows(source.value(),boundary.np,lifted.points[..<count])
+    defer rows.close()
+    if rows.crowded(): error(invalid,"an isolated short trim interval must not count as interior crowding")
+    let chart = try redistribute(&lifted,source,boundary.np,surface,true,normals,1e-6,16)
+    defer chart.release()
+    if chart.value() != source.value(): error(invalid,"ordinary boolean cut grid should retain its snapshot")
+    for at in 0..<count:
+        if lifted.points[at].subtract(try source.value().point((i64)at)).length() != 0.0:
+            error(invalid,"boolean cut grid moved despite an uncrowded interior")
+
+func crowded(hole: bool, swapped: bool, reverse: bool, curved: bool, ends: bool = false) -> !:
+    let height = 0.15 if curved else 0.0
+    let tolerance = 0.005 if curved else 1e-6
+    let surface = try Surface(3,Vector3(),Vector3(),Vector3(),0.0,0.0,
+        [Vector3(),Vector3(0.0,1.0,0.0),Vector3(1.0,0.0,0.0),Vector3(1.0,1.0,height)],
+        [1.0,1.0,1.0,1.0],[0.0,0.0,1.0,1.0],[0.0,0.0,1.0,1.0],2,2,1,1)
+    defer surface.close()
+    let us = [0.0,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,1.0] if ends else [0.0,0.12,0.25,0.251,0.252,0.5,0.75,0.751,0.752,0.9,1.0]
+    let vs = [0.0,0.1,0.25,0.5,0.75,0.9,1.0]
+    var boundary = try MeshBuilder()
+    defer boundary.close()
+    for u in us: discard(try boundary.point(Vector3(u,0.0,0.0)))
+    for at in 1..<vs.length: discard(try boundary.point(Vector3(1.0,vs[at],0.0)))
+    for at in 1..<us.length: discard(try boundary.point(Vector3(us[us.length-1-at],1.0,0.0)))
+    for at in 1..<vs.length-1: discard(try boundary.point(Vector3(0.0,vs[vs.length-1-at],0.0)))
+    let outer = boundary.np
+    if hole:
+        for at in 2..<(usize)7: discard(try boundary.point(Vector3(us[at],0.25,0.0)))
+        for at in 3..<(usize)5: discard(try boundary.point(Vector3(0.75,vs[at],0.0)))
+        for at in 1..<(usize)5: discard(try boundary.point(Vector3(us[6-at],0.75,0.0)))
+        discard(try boundary.point(Vector3(0.25,0.5,0.0)))
+    if swapped:
+        for at in 0..<boundary.np:
+            let p = boundary.points[at]
+            boundary.points[at] = Vector3(p.y,p.x,0.0)
+    let sizes = [(i64)outer,(i64)(boundary.np-outer)]
+    let source = try TrimGrid.clip(boundary.points[..<boundary.np],sizes[..<(usize)(2 if hole else 1)],vs[..<vs.length] if swapped else us[..<us.length],us[..<us.length] if swapped else vs[..<vs.length])
+    defer source.release()
+    var lifted = try MeshBuilder()
+    defer lifted.close()
+    let count = (usize)source.value().point_count()
+    let normals = try alloc Vector3[count] in memory.heap
+    defer free(normals) in memory.heap
+    for at in 0..<count:
+        let p = try source.value().point((i64)at)
+        discard(try lifted.point(try point(surface,p)))
+        normals[at] = (try support_normal(surface,p)).multiply_scalar(-1.0 if reverse else 1.0)
+    try append_cells(&lifted,source.value(),not reverse,normals)
+    let rows = try Rows(source.value(),boundary.np,lifted.points[..<count])
+    defer rows.close()
+    if not rows.crowded(): error(invalid,"synthetic overlapping station families were not detected")
+    let before = rows.quality(lifted.points[..<count])
+    let baseline = try lifted.finish()
+    defer baseline.release()
+    try validate_display_error(baseline.value(),source.value(),surface,tolerance,16)
+    let chart = try redistribute(&lifted,source,boundary.np,surface,not reverse,normals,tolerance,16)
+    defer chart.release()
+    let after = rows.quality(lifted.points[..<count])
+    if after.x >= before.x*0.9 or after.y > before.y*(1.0+1e-6):
+        error(invalid,"clipped interior spacing must improve without worsening worst gap ratio")
+    if chart.value().point_count() != source.value().point_count() or chart.value().face_count() != source.value().face_count():
+        error(invalid,"spacing changed clipped topology counts")
+    for at in 0..<boundary.np:
+        if (try chart.value().point((i64)at)).subtract(boundary.points[at]).length() != 0.0 or lifted.points[at].subtract(try point(surface,boundary.points[at])).length() != 0.0:
+            error(invalid,"spacing moved a trim or hole boundary")
+    for at in 0..<count:
+        let p = lifted.points[at]
+        if math.abs(p.z-height*p.x*p.y) > 1e-12: error(invalid,"redistributed point left its exact surface")
+    for face in 0..<source.value().face_count():
+        if try source.value().face_size(face) != (try chart.value().face_size(face)): error(invalid,"spacing changed polygon size")
+        for at in 0..<(try source.value().face_size(face)):
+            if try source.value().face_point(face,at) != (try chart.value().face_point(face,at)): error(invalid,"spacing changed a polygon edge")
+    var area: f64 = 0.0
+    let mesh = try lifted.finish()
+    defer mesh.release()
+    try validate_display_error(mesh.value(),chart.value(),surface,tolerance,16)
+    for triangle in 0..<mesh.value().index_count()//3:
+        var p = [Vector3(),Vector3(),Vector3()]
+        for at in 0..<(usize)3:
+            let index = mesh.value().index(triangle*3+(i64)at)
+            defer index.release()
+            p[at] = try mesh.value().point(try mesh.value().corner_point(try index.get()))
+        let signed = p[1].subtract(p[0]).cross(p[2].subtract(p[0])).z*(-1.0 if reverse else 1.0)
+        if signed <= 0.0: error(invalid,"clipped spacing folded a display triangle")
+        area += signed*0.5
+        let center = p[0].add(p[1]).add(p[2]).multiply_scalar(1.0/3.0)
+        if hole and center.x > 0.25 and center.x < 0.75 and center.y > 0.25 and center.y < 0.75:
+            error(invalid,"clipped spacing bridged a hole")
+    if math.abs(area-(0.75 if hole else 1.0)) > 1e-10: error(invalid,"clipped spacing changed covered area")

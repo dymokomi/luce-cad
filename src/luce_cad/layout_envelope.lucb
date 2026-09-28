@@ -1,0 +1,98 @@
+## Endpoint-only row ownership on affine extrusions. A stopped oblique trim
+## supplies exact boundary corners without imposing its unequal end coordinates
+## across the support. Doubly curved and uncertain charts retain their stations.
+import math
+from three import Vector3
+from luce_cad.brep_types import Surface, BrepFace
+from luce_cad.layout_types import UVChain
+from luce_cad.layout_rails import rail_axis, bounds
+
+## Prove affine extrusion from the entire control net, including degree-elevated
+## and knot-inserted representations. Linear precision puts each control point
+## at its Greville abscissa on one common translation vector. Weights may vary
+## across the profile, but must be constant along every extrusion rail.
+pub func affine_axis(s: Surface, axis: i64) -> bool:
+    if s.kind != 3 or axis < 0 or axis > 1: return false
+    let along = s.nu if axis == 0 else s.nv
+    let degree = s.du if axis == 0 else s.dv
+    if along < 2 or degree < 1: return false
+    let knots = s.ku if axis == 0 else s.kv
+    let low = greville(knots,0,(usize)degree)
+    let high = greville(knots,(usize)along-1,(usize)degree)
+    if high <= low: return false
+    let across = (usize)(s.nv if axis == 0 else s.nu)
+    let stride = (usize)s.nv if axis == 0 else 1
+    let reference = s.points[((usize)along-1)*stride].subtract(s.points[0])
+    var scale = reference.length()
+    for p in s.points: scale = math.max(scale,p.subtract(s.points[0]).length())
+    if reference.length() <= scale*1e-12: return false
+    for at in 0..<across:
+        let first = at if axis == 0 else at*(usize)along
+        for row in 1..<(usize)along:
+            let index = first+row*stride
+            let wa = s.weights[first]
+            let wb = s.weights[index]
+            if math.abs(wa-wb) > math.max(wa,wb)*1e-12: return false
+            let fraction = (greville(knots,row,(usize)degree)-low)/(high-low)
+            let expected = reference.multiply_scalar(fraction)
+            if s.points[index].subtract(s.points[first]).subtract(expected).length() > scale*1e-10: return false
+    return true
+
+## Existing clipped endpoint/pitch policies are validated for linear rails.
+## Higher-degree affine recognition alone does not authorize those policies:
+## their neighboring mapped phases also need reconciliation.
+pub func extrusion_axis(s: Surface, axis: i64) -> bool:
+    if axis < 0 or axis > 1: return false
+    if (s.du if axis == 0 else s.dv) != 1: return false
+    if (s.nu if axis == 0 else s.nv) != 2: return false
+    return affine_axis(s,axis)
+
+func greville(knots: const f64[], index: usize, degree: usize) -> f64:
+    # Subtract the local origin before summing to avoid cancellation from a
+    # large translated knot domain. Validated NURBS inputs have degree >= 1.
+    let origin = knots[0]
+    var result: f64 = 0.0
+    for at in 1..<degree+1: result += knots[index+at]-origin
+    return result/(f64)degree
+
+## Curved axes keep their envelope stations. On an affine extrusion axis only
+## actual constant-coordinate rails make an envelope limit a mandatory row.
+pub func trim_rails(s: Surface, chains: const UVChain[], low: Vector3, high: Vector3, epsilon: f64, tolerance: f64) -> bool[4]!:
+    let u = extrusion_axis(s,0)
+    let v = extrusion_axis(s,1)
+    var result = [not u,not u,not v,not v]
+    for chain in chains:
+        let axis = try rail_axis(s,chain.points,epsilon,tolerance)
+        if axis < 0: continue
+        let a = bounds(chain.points,false)
+        let b = bounds(chain.points,true)
+        if axis == 0:
+            result[2] = result[2] or math.abs(a.y-low.y) <= epsilon
+            result[3] = result[3] or math.abs(b.y-high.y) <= epsilon
+        else:
+            result[0] = result[0] or math.abs(a.x-low.x) <= epsilon
+            result[1] = result[1] or math.abs(b.x-high.x) <= epsilon
+    return result
+
+## A rail ending at a stopped, non-isoparametric trim contributes a boundary
+## vertex, not an interior row. Smooth joins, rail subdivisions and rectangular
+## corners retain their station contract; closed-chart aliases stay conservative.
+pub func row_endpoint(s: Surface, face: BrepFace, chains: const UVChain[], flow: const bool[], use: usize, axis: i64, start: bool, epsilon: f64, tolerance: f64) -> bool!:
+    if axis < 0: return false
+    var offset: usize = 0
+    var count: usize = 0
+    for size in face.sizes:
+        count = (usize)size
+        if use < offset+count: break
+        offset += count
+    let head = start == (face.uses[use] > 0)
+    let neighbor = offset+(use-offset+count-1)%count if head else offset+(use-offset+1)%count
+    if flow[neighbor]: return true
+    let uv = chains[use].points
+    let other = chains[neighbor].points
+    if uv.length < 2 or other.length < 2: return true
+    if (try rail_axis(s,other,epsilon,tolerance)) >= 0: return true
+    let other_start = (face.uses[neighbor] < 0) if head else (face.uses[neighbor] > 0)
+    let p = uv[0 if start else uv.length-1]
+    let q = other[0 if other_start else other.length-1]
+    return p.subtract(q).length() > epsilon*2.0
