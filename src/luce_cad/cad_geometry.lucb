@@ -331,20 +331,27 @@ func tessellate_with_paths(model: const CadModel*, segments: i64, edge_size: f64
     let attribute = try text_attribute("path", Domain.face, faces, &strings, values)
     return try with_attribute_entry(mesh, attribute)
 
-## The set's instances with each child tessellated in turn.
+## The set's instances with each prototype tessellated once: every
+## instance keeps its prototype index and placement.
 func tessellate_instances(result: GeometrySet*, segments: i64, edge_size: f64, progress: interop.Callback[f64, unit]?, depth: usize) -> !:
     let data = set_find(result, instances_component()) else return
     let source = (const Instances*)data
     let rebuilt = try new_instances()
+    let close = instances_component().close
+    for index in 0..<source.prototype_count():
+        let child = tessellated_storage(source.prototype(index), segments, edge_size, progress, depth + 1) catch failure:
+            close((void*)rebuilt)
+            error(failure.code, failure.message)
+        let slot = rebuilt.add_prototype(child) catch failure:
+            close((void*)rebuilt)
+            error(failure.code, failure.message)
+        discard(slot)
     for index in 0..<source.count():
-        let item = source.item(index)
-        let child = tessellated_storage(item.set, segments, edge_size, progress, depth + 1) catch failure:
-            let close = instances_component().close
+        let row = source.row(index)
+        let placement = Placement(row.translation, row.rotation, row.scale, Matrix4.compose(row.translation, row.rotation, row.scale))
+        rebuilt.add_instance((usize)row.prototype, &placement, row.visible) catch failure:
             close((void*)rebuilt)
             error(failure.code, failure.message)
-        let placement = Placement(item.translation, item.rotation, item.scale, item.matrix())
-        rebuilt.add(child, &placement, item.visible) catch failure:
-            let close = instances_component().close
-            close((void*)rebuilt)
-            error(failure.code, failure.message)
-    try set_put(result, instances_component(), (void*)rebuilt)
+    set_put(result, instances_component(), (void*)rebuilt) catch failure:
+        close((void*)rebuilt)
+        error(failure.code, failure.message)
