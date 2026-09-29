@@ -12,6 +12,8 @@ import luce_cad.parallel as parallel
 var lock: sync.Mutex
 var entered: usize = 0
 var visits: usize[64]
+## Faces in flight together: four, or fewer on a small pool (CI runners).
+var wide: usize = 4
 
 pub func face_jobs_contract() -> !:
     var empty: f64[]
@@ -31,6 +33,7 @@ pub func face_jobs_contract() -> !:
         faces[at] = try BrepFace(0,[(i64)at],[1],true)
         created += 1
         plans[at] = GridLayout()
+    wide = parallel.width() if parallel.width() < 4 else 4
     for repeat in 0..<16:
         entered = 0
         for at in 0..<visits.length: visits[at] = 0
@@ -45,8 +48,8 @@ pub func face_jobs_contract() -> !:
         if not failed: error(invalid,"face jobs accepted a failed model")
         # Every pool worker may hold a face when the first failure lands; each
         # finishing worker may take at most a few more before it sees the stop.
-        if entered < 4 or entered > parallel.width() + 3: error(invalid,"face jobs kept scheduling after failure")
-        for at in 0..<(usize)4:
+        if entered < 2 or entered > parallel.width() + 3: error(invalid,"face jobs kept scheduling after failure")
+        for at in 0..<wide:
             if visits[at] != 1: error(invalid,"face jobs did not join the earlier in-flight work")
         if builder.nf != 0 or builder.nc != 0 or builder.np != 0: error(invalid,"failed face jobs assembled a partial result")
 
@@ -56,10 +59,10 @@ func fail_ordered(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: c
     entered += 1
     visits[index] += 1
     lock.unlock()
-    # Synchronize the first four callbacks so both failing faces are in flight.
+    # Synchronize the first callbacks so both failing faces are in flight.
     while true:
         lock.lock()
-        let ready = entered >= 4
+        let ready = entered >= wide
         lock.unlock()
         if ready: break
         thread.sleep(1)
