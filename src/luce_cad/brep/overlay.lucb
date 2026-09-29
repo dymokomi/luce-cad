@@ -4,8 +4,35 @@
 ## columns), both as point pairs placed by `matrix` after the faces' own
 ## placements.
 
-## Every edge's polyline, placed by the first face that uses it.
+## Every edge's polyline, placed by the first face that uses it, then by
+## `matrix`; made once per model (and passed to copies with moved cvs).
 pub func boundary_lines(model: const BrepModel*, matrix: Matrix4, out: Growing[Vector3]*) -> !:
+    let derived = model.derived
+    derived.lock.lock()
+    let known = derived.boundaries.count > 0
+    derived.lock.unlock()
+    # Made outside the lock: the tessellator's records take it too.
+    if not known:
+        var made = Growing[Vector3]()
+        defer made.close()
+        try edge_polylines(model, &made)
+        derived.lock.lock()
+        defer derived.lock.unlock()
+        if derived.boundaries.count == 0: try derived.boundaries.assign(made.view())
+    derived.lock.lock()
+    defer derived.lock.unlock()
+    let first = out.count
+    try out.reserve(first + derived.boundaries.count)
+    if matrix.is_identity():
+        memory.copy(out.items[first..<first + derived.boundaries.count], derived.boundaries.view(), derived.boundaries.count)
+        out.count += derived.boundaries.count
+        return
+    for point in derived.boundaries.view():
+        out.items[out.count] = matrix.transform_point(point)
+        out.count += 1
+
+func edge_polylines(model: const BrepModel*, out: Growing[Vector3]*) -> !:
+    let matrix = Matrix4()
     let edges = (usize)model.edge_count()
     var drawn = try BitsBuilder.zeros(edges)
     defer drawn.close()
@@ -25,22 +52,31 @@ pub func boundary_lines(model: const BrepModel*, matrix: Matrix4, out: Growing[V
                 try out.push(point)
                 previous = point
 
-## Every B-spline surface's control net, once per distinct placement of the
-## faces on it.
+## What the edges' polylines depend on: the vertices, curves and faces'
+## edge uses and placements (their columns' change ids). Equal keys draw
+## equal boundaries (a copy with moved cvs keeps its parent's).
+pub func boundary_key(model: const BrepModel*) -> u64:
+    let ids: u64[15] = [model.vertices.id(), model.curve_kind.id(), model.curve_ends.id(), model.curve_frame.id(), model.curve_degree.id(), model.curve_sense.id(),
+                        model.curve_points.id(), model.curve_weights.id(), model.curve_knots.id(), model.face_surface.id(), model.face_uses.id(),
+                        model.face_use_offsets.id(), model.face_placement.id(), (u64)model.face_count(), (u64)model.edge_count()]
+    var key: u64 = 0x9E3779B97F4A7C15
+    for id in ids: key = (key ^ id) *% 0x100000001B3
+    return key
+
+## Every B-spline surface's control net, once per placement change along
+## the faces on it (once, when all its faces share one).
 pub func hull_lines(model: const BrepModel*, matrix: Matrix4, out: Growing[Vector3]*) -> !:
     let surfaces = (usize)model.surface_count()
-    # The placements a surface's net was drawn with (a few at most).
-    var drawn = Growing[i64]()
-    defer drawn.close()
+    # The face whose placement each surface's net was last drawn with.
+    let drawn = try alloc i64[surfaces] in memory.heap
+    defer free(drawn) in memory.heap
+    for at in 0..<surfaces: drawn[at] = -1
     for face in 0..<(usize)model.face_count():
         let surface = (usize)model.face_surface.get(face)
         if model.surface_kind.get(surface) != 3: continue
         let placement = model.face_placement.get(face)
-        var seen = false
-        for entry in drawn.view():
-            if (usize)(entry >> 32) == surface and same_matrix(model.face_placement.get((usize)(entry & 0xFFFFFFFF)), placement): seen = true
-        if seen: continue
-        try drawn.push(((i64)surface << 32) | (i64)face)
+        if drawn[surface] >= 0 and same_matrix(model.face_placement.get((usize)drawn[surface]), placement): continue
+        drawn[surface] = (i64)face
         let dims = model.surface_dims.range(surface * 4, surface * 4 + 4)
         let nu = (usize)dims[0]
         let nv = (usize)dims[1]
@@ -56,7 +92,6 @@ pub func hull_lines(model: const BrepModel*, matrix: Matrix4, out: Growing[Vecto
                 if u + 1 < nu:
                     try out.push(here)
                     try out.push(place.transform_point(net[(u + 1) * nv + v]))
-    discard(surfaces)
 
 func same_matrix(a: Matrix4, b: Matrix4) -> bool:
     return a.x.subtract(b.x).length() == 0.0 and a.y.subtract(b.y).length() == 0.0 and a.z.subtract(b.z).length() == 0.0 and a.translation.subtract(b.translation).length() == 0.0

@@ -17,7 +17,7 @@ pub let cad_preview_set_type = preview_set.cad_preview_set_type
 import luce_cad.cad_overlay as cad_overlay
 pub type CadOverlay = cad_overlay.CadOverlay
 pub let cad_overlay_type = cad_overlay.cad_overlay_type
-from luce_cad.brep import boundary_lines, hull_lines, encode_brep, decode_brep
+from luce_cad.brep import boundary_lines, hull_lines, encode_brep, decode_brep, boundary_key
 from geocore_kernel import GeometryWriter, GeometryReader, dtype_float64, dtype_int32
 from geocore_shared import Column
 from geocore_growing import Growing
@@ -227,6 +227,18 @@ pub struct CadModel:
         result.value().placement = self.placement
         return result
 
+    ## What its edges' drawn lines depend on (0: not known, draw them anew):
+    ## a B-rep's edges and the model's placement. A copy with moved control
+    ## vertices keeps the key; the viewport keeps its lines.
+    pub func edges_key() -> i64:
+        if self.count != 0: return 0
+        let boundary = self.boundary else return 0
+        var key = boundary_key(boundary.value())
+        let m = self.placement
+        let values: f64[12] = [m.x.x, m.x.y, m.x.z, m.y.x, m.y.y, m.y.z, m.z.x, m.z.y, m.z.z, m.translation.x, m.translation.y, m.translation.z]
+        for value in values: key = (key ^ value.bits()) *% 0x100000001B3
+        return (i64)(key >> 1) | 1
+
     ## Lines to draw over the model: its edges, its hull and a normal guide
     ## per face of `mesh` (its tessellation).
     pub func overlay(mesh: interop.Reference[Mesh]) -> interop.Reference[CadOverlay]!:
@@ -391,7 +403,9 @@ pub struct CadModel:
 
     ## `curvature`/`directions` add principal curvature corner attributes
     ## (BrepModel.mesh); B-rep models only, under a uniform-scale placement.
-    pub func tessellate(segments: i64 = 16, edge_size: f64 = 0.0, progress: interop.Callback[f64, unit]? = none, curvature: bool = false, directions: bool = false) -> interop.Reference[Mesh]!:
+    ## `quick` lets a copy with moved cvs answer with its quick preview (a
+    ## drag's frames; brep/quick.lucb).
+    pub func tessellate(segments: i64 = 16, edge_size: f64 = 0.0, progress: interop.Callback[f64, unit]? = none, curvature: bool = false, directions: bool = false, quick: bool = false) -> interop.Reference[Mesh]!:
         if not math.is_finite(edge_size) or edge_size < 0.0:
             error(invalid, "edge size must be finite and nonnegative")
         if segments < 1 or segments > 64:
@@ -405,7 +419,7 @@ pub struct CadModel:
         # normal generation. Placement is applied only when nonidentity.
         if self.count == 0:
             if let boundary = self.boundary:
-                let part = try boundary.value().mesh(segments, edge_size, progress, curvature, directions)
+                let part = try boundary.value().mesh(segments, edge_size, progress, curvature, directions, quick)
                 defer part.release()
                 # An identity placement shares the mesh as it is.
                 if self.placement.is_identity(): return part.clone()

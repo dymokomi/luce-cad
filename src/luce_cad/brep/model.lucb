@@ -6,6 +6,7 @@
 ## once per model and kept until the model changes.
 import interop
 import memory
+import geocore_parallel as parallel
 import math
 import sync
 from geocore import Vector3, Matrix4, Mesh, invalid
@@ -20,6 +21,9 @@ from luce_cad.brep_mesh import tessellate
 from luce_cad.face_cache import FaceCache, dispose_cache, inherited
 from luce_cad.face_mesh import face_mesh
 from luce_cad.curve_trim import parameter
+from luce_cad.surface_trim import project, evaluate
+from geocore_kernel import moved_storage, mesh_adopt, point_span, precise_span, mesh_origin, offset_span, corner_span, attribute_entry, Float3, Attribute
+
 
 ## Values per curve frame: origin, x and y axes, radius, start angle, sweep.
 let curve_stride: usize = 12
@@ -60,6 +64,13 @@ struct Derived:
     var records: Records*?
     var faces: FaceCache*?
     var meshes: Growing[KeptMesh]
+    ## A copy with moved cvs: where its quick preview comes from, and the
+    ## preview once made (quick.lucb).
+    var quick: QuickSource*? = none
+    var quick_result: interop.Reference[Mesh]? = none
+    ## The edges' polylines (overlay.lucb), made once; copies with moved
+    ## cvs share every edge, so they start with them.
+    var boundaries: Growing[Vector3] = Growing[Vector3]()
 
 pub struct BrepModel:
     let tolerance: f64
@@ -561,6 +572,8 @@ pub struct BrepModel:
             derived.faces = none
         for kept in derived.meshes.view(): kept.mesh.release()
         derived.meshes.count = 0
+        drop_quick(derived)
+        derived.boundaries.clear()
 
     ## Disposable per-face display mesh; independent of the whole-model budget.
     pub func preview_face(face: i64, divisions: i64 = 8) -> interop.Reference[Mesh]!:
@@ -573,11 +586,15 @@ pub struct BrepModel:
     ## `curvature` adds corner attributes curvature.k1/k2 (principal
     ## curvatures, k1 >= k2, positive where convex); `directions` adds the unit
     ## principal directions curvature.d1/d2. Both are off by default.
-    pub func mesh(divisions: i64 = 16, edge_size: f64 = 0.0, progress: interop.Callback[f64, unit]? = none, curvature: bool = false, directions: bool = false) -> interop.Reference[Mesh]!:
+    ## With `quick`, a copy with moved cvs may answer with its quick preview
+    ## (quick.lucb) instead of tessellating.
+    pub func mesh(divisions: i64 = 16, edge_size: f64 = 0.0, progress: interop.Callback[f64, unit]? = none, curvature: bool = false, directions: bool = false, quick: bool = false) -> interop.Reference[Mesh]!:
         if not math.is_finite(edge_size) or edge_size < 0.0:
             error(invalid, "edge size must be finite and nonnegative")
         # The same parameters give the same mesh: share the kept one.
         if let kept = self.kept_mesh(divisions, edge_size, curvature, directions): return kept
+        if quick:
+            if let fast = try self.quick_mesh(divisions, edge_size, curvature, directions): return fast
         let records = try self.tessellation_records()
         let raw = try published(try tessellate(self.vertices.view(), records.edges, records.surfaces, records.faces, divisions, self.tolerance, edge_size, progress, -1, curvature, directions, try self.face_cache()))
         let made = try self.with_paths(raw)
@@ -624,6 +641,7 @@ pub struct BrepModel:
     pub mutating func close():
         self.changed()
         self.derived.meshes.close()
+        self.derived.boundaries.close()
         free(self.derived) in memory.heap
         self.vertices.close()
         self.curve_kind.close()

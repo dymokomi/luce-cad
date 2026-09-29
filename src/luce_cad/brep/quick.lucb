@@ -1,0 +1,223 @@
+## The quick preview of a copy with moved cvs, for an interactive drag: its
+## parent's kept tessellation with the moved surfaces' own points moved onto
+## the new surfaces, in milliseconds instead of a full tessellation. A point
+## of a moved face takes its parameters on the old surface (it lies on it)
+## and moves to the new surface there; points the face shares with other
+## faces (its edges' samples) stay, so the preview stays joined, as the full
+## tessellation's re-projected trims do. The layout, the sampling and every
+## other face are the parent's; releasing the drag tessellates in full.
+
+## Where a copy's quick preview comes from: the parent's kept mesh for
+## these parameters, and the surfaces whose cvs moved with their old cvs.
+struct QuickSource:
+    let divisions: i64
+    let edge_size: f64
+    let curvature: bool
+    let directions: bool
+    let base: interop.Reference[Mesh]
+    var surfaces: Growing[i64]
+    ## Old cvs of surfaces[i]: points[offsets[i]..<offsets[i + 1]].
+    var offsets: Growing[usize]
+    var points: Growing[Vector3]
+
+    mutating func close():
+        self.base.release()
+        self.surfaces.close()
+        self.offsets.close()
+        self.points.close()
+
+func drop_quick(derived: Derived*):
+    if let source = derived.quick:
+        source.close()
+        free(source) in memory.heap
+        derived.quick = none
+    if let result = derived.quick_result:
+        result.release()
+        derived.quick_result = none
+
+extend BrepModel:
+    ## Record in `copy` (made from this model with cvs `ids` moved) where its
+    ## quick preview comes from: this model's newest kept mesh. Nothing when
+    ## this model has none.
+    func pass_quick(copy: BrepModel*, ids: const i64[]) -> !:
+        let derived = self.derived
+        derived.lock.lock()
+        defer derived.lock.unlock()
+        if derived.meshes.count == 0: return
+        let kept = derived.meshes.items[derived.meshes.count - 1]
+        let source = try new QuickSource(kept.divisions, kept.edge_size, kept.curvature, kept.directions, kept.mesh.clone(), Growing[i64](), Growing[usize](), Growing[Vector3]()) in memory.heap
+        errdefer:
+            source.close()
+            free(source) in memory.heap
+        for id in ids:
+            let surface = try self.cv_surface(id)
+            var known = false
+            for entry in source.surfaces.view(): known = known or entry == surface
+            if not known: try source.surfaces.push(surface)
+        try source.offsets.push(0)
+        for surface in source.surfaces.view():
+            for point in self.cvs_of((usize)surface): try source.points.push(point)
+            try source.offsets.push(source.points.count)
+        let target = copy.derived
+        target.lock.lock()
+        defer target.lock.unlock()
+        drop_quick(target)
+        target.quick = source
+
+    ## The quick preview for these parameters, or none (no source, or other
+    ## parameters).
+    func quick_mesh(divisions: i64, edge_size: f64, curvature: bool, directions: bool) -> interop.Reference[Mesh]?!:
+        let derived = self.derived
+        derived.lock.lock()
+        defer derived.lock.unlock()
+        let source = derived.quick else return none
+        if source.divisions != divisions or source.edge_size != edge_size or source.curvature != curvature or source.directions != directions: return none
+        if let made = derived.quick_result: return made.clone()
+        let made = try self.quick_from(source)
+        derived.quick_result = made.clone()
+        return made
+
+    func quick_from(source: const QuickSource*) -> interop.Reference[Mesh]!:
+        let base = source.base.value()
+        let owner = base.find_attribute("cad_face", 2)
+        let shared = base.find_attribute(".cad_shared_points", 3)
+        if owner < 0 or shared < 0: error(invalid, "a kept CAD tessellation lost its faces")
+        let faces = try attribute_entry(base, owner)
+        let first_own = (usize)(try base.attribute_value(shared, 0))
+        let offsets = offset_span(base)
+        let corners = corner_span(base)
+        let polygons = offsets.length - 1
+        let count = point_span(base).length
+        # The moved faces; the faces' own points (after the shared ones) of
+        # their polygons, which come in face order, move.
+        let moved_face = try alloc bool[(usize)self.face_count()] in memory.heap
+        defer free(moved_face) in memory.heap
+        for face in 0..<moved_face.length:
+            let surface = (i64)self.face_surface.get(face)
+            var hit = false
+            for entry in source.surfaces.view(): hit = hit or entry == surface
+            moved_face[face] = hit
+        let owners = try alloc i64[count] in memory.heap
+        defer free(owners) in memory.heap
+        for at in 0..<count: owners[at] = -1
+        for face in 0..<moved_face.length:
+            if not moved_face[face]: continue
+            var low = first_polygon(faces, polygons, (f64)face)
+            while low < polygons and faces.number(low, 0) == (f64)face:
+                for corner in (usize)offsets[low]..<(usize)offsets[low + 1]:
+                    let point = (usize)corners[corner]
+                    if point >= first_own: owners[point] = (i64)face
+                low += 1
+        # Old and new surfaces, and each moved face's placement.
+        let origin = mesh_origin(base)
+        let exact = precise_span(base)
+        let loose = point_span(base)
+        var positions = try Column[Float3].copy_of(loose)
+        defer positions.release()
+        let placed = positions.span()
+        var moved = Growing[u32]()
+        defer moved.close()
+        # Each moved surface before and after, by its slot in the source.
+        var before = Growing[Surface]()
+        var now = Growing[Surface]()
+        defer:
+            for record in before.view(): record.close()
+            for record in now.view(): record.close()
+            before.close()
+            now.close()
+        for at in 0..<source.surfaces.count:
+            let record = try self.surface((usize)source.surfaces.items[at])
+            now.push(record) catch failure:
+                record.close()
+                error(failure.code, failure.message)
+            let old = try Surface(3, record.origin, record.x, record.z, record.radius, record.angle, source.points.items[source.offsets.items[at]..<source.offsets.items[at + 1]], record.weights, record.ku, record.kv, record.nu, record.nv, record.du, record.dv)
+            before.push(old) catch failure:
+                old.close()
+                error(failure.code, failure.message)
+        # Each moved face's slot and inverse placement.
+        let slots = try alloc i64[moved_face.length] in memory.heap
+        defer free(slots) in memory.heap
+        var backs = Growing[Matrix4]()
+        defer backs.close()
+        try backs.fill(moved_face.length, Matrix4())
+        for face in 0..<moved_face.length:
+            slots[face] = -1
+            if not moved_face[face]: continue
+            let surface = (i64)self.face_surface.get(face)
+            for at in 0..<source.surfaces.count:
+                if source.surfaces.items[at] == surface: slots[face] = (i64)at
+            backs.items[face] = try inverted(self.face_placement.get(face))
+        for point in 0..<count:
+            if owners[point] >= 0: try moved.push((u32)point)
+        # In parallel, a run of neighbouring points at a time: each seeds the
+        # next one's parameters.
+        let placements = self.face_placement.view()
+        var work = Projection(owners, slots, before.view(), now.view(), backs.view(), placements, exact, loose, origin, self.tolerance, moved.view(), placed)
+        parallel.parallel_for(moved.count, 64, project_points, (void*)&work)
+        if work.failed.load(.acquire) != 0: error(invalid, "a moved CAD surface could not be previewed")
+        return try mesh_adopt(try moved_storage(base, positions, moved.view()))
+
+## What projecting the moved points reads and writes.
+struct Projection:
+    let owners: const i64[]
+    let slots: const i64[]
+    let before: const Surface[]
+    let now: const Surface[]
+    let backs: const Matrix4[]
+    let placements: const Matrix4[]
+    let exact: const Vector3[]
+    let loose: const Float3[]
+    let origin: Vector3
+    let tolerance: f64
+    let points: const u32[]
+    let placed: Float3[]
+    var failed: @u32
+
+## Points `first..<end` of the moved list: parameters on the old surface,
+## positions on the new one.
+func project_points(context: void*?, first: usize, end: usize):
+    let work = (Projection*)(context else return)
+    var seed = Vector3(0.5, 0.5, 0.0)
+    var seeded: i64 = -1
+    for at in first..<end:
+        let point = (usize)work.points[at]
+        let face = work.owners[point]
+        let slot = (usize)work.slots[(usize)face]
+        if face != seeded:
+            seed = Vector3(0.5, 0.5, 0.0)
+            seeded = face
+        let world = work.exact[point] if work.exact.length > 0 else work.loose[point].vector().add(work.origin)
+        let uv = project(work.before[slot], work.backs[(usize)face].transform_point(world), seed, work.tolerance) catch failure:
+            work.failed.store(1, .relaxed)
+            return
+        seed = uv
+        let moved = evaluate(work.now[slot], uv) catch failure:
+            work.failed.store(1, .relaxed)
+            return
+        work.placed[point] = Float3.of(work.placements[(usize)face].transform_point(moved).subtract(work.origin))
+
+## The first polygon of face `face` (polygons run in face order), or where
+## it would be.
+func first_polygon(faces: const Attribute*, polygons: usize, face: f64) -> usize:
+    var low: usize = 0
+    var high = polygons
+    while low < high:
+        let middle = (low + high) // 2
+        if faces.number(middle, 0) < face: low = middle + 1
+        else: high = middle
+    return low
+
+## The inverse of an affine placement (its linear part by cofactors).
+func inverted(m: Matrix4) -> Matrix4!:
+    let determinant = m.determinant()
+    if not math.is_finite(determinant) or math.abs(determinant) < 0.000000000001: error(invalid, "CAD placement is singular")
+    let scale = 1.0 / determinant
+    # Rows of the inverse linear part: the cross products of the columns.
+    let r0 = m.y.cross(m.z).multiply_scalar(scale)
+    let r1 = m.z.cross(m.x).multiply_scalar(scale)
+    let r2 = m.x.cross(m.y).multiply_scalar(scale)
+    let x = Vector3(r0.x, r1.x, r2.x)
+    let y = Vector3(r0.y, r1.y, r2.y)
+    let z = Vector3(r0.z, r1.z, r2.z)
+    let t = m.translation
+    return Matrix4(x, y, z, Vector3(-r0.dot(t), -r1.dot(t), -r2.dot(t)))
