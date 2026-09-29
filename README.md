@@ -8,18 +8,33 @@ The intended ownership is:
 `luce-step` (file entities) → `luce-cad` (analytic faces/topology, surface
 evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
 
-Exports: `cad` (the analytic model, `luce_cad.model`) and `tessellation`
-(rational B-spline evaluation and trim/grid/recombine meshing,
-`luce_cad.tessellation.surface`). The tessellation modules were the separate
-`luce-tesselator` package until luce-cad 0.2.0.
+## Exports
 
-`cad_geometry` (`luce_cad.cad_geometry`) makes CAD models a family of
-luce-geocore's `GeometrySet`: the `cad` component holds models (shared, never
-copied), places, joins and filters them by face path, and
-`CadGeometry.tessellated(set, segments, edge_size, progress)` turns them into
-the set's mesh in one pass, each face's B-rep path in the `path` text
-attribute. Luce uses `CadGeometry.of_model`, `model_count`, `model` and
-`face_count`.
+- `cad` (`luce_cad.model`): `CadModel`, the analytic model (a B-rep, or
+  independent planar/NURBS faces), its placement, cv domain, overlays and
+  tessellation.
+- `cad_geometry` (`luce_cad.cad_geometry`): CAD models as a family of
+  luce-geocore's `GeometrySet`. The `cad` component holds models (shared,
+  never copied), places, joins and filters them by face path;
+  `CadGeometry.tessellated(set, segments, edge_size, progress)` turns them
+  into the set's mesh in one pass (each face's B-rep path in the `path` text
+  attribute; instances' prototypes tessellated once each, their placements
+  kept). `register_codec()` adds the family to geocore's geometry files, so a
+  set with CAD saves and loads as `.prism` (`brep/codec.lucb`: every column as
+  stored, bit for bit; derived data is never written). `cv_cloud`,
+  `with_cv_cloud` and `is_cv_cloud` expose the control vertices as a point
+  cloud for geocore's point verbs (`cv_cloud.lucb`).
+- `cad_edits` (`luce_cad.cad_edits`): `CadEdits`, editing a set's models
+  through a pick mesh (the display tessellations joined, tagged with
+  `cad_model`, `cad_face` and `cad_edge`): `pick_mesh`, `transformed_parts`
+  (whole models or faces' models moved by a group), `without_parts` (models
+  or faces deleted) and `with_model` (a model added).
+- `cad_solids` (`luce_cad.solids`): `CadSolids`, analytic solids as closed
+  B-reps (box, cylinder, cone or frustum, sphere, torus), centered on the
+  origin along +Y with outward faces.
+- `tessellation` (`luce_cad.tessellation.surface`): rational B-spline
+  evaluation and trim/grid/recombine meshing (the separate `luce-tesselator`
+  package until luce-cad 0.2.0).
 
 ## Analytic model API
 
@@ -31,8 +46,8 @@ attribute. Luce uses `CadGeometry.of_model`, `model_count`, `model` and
 - `trim_rectangle(face, u0, u1, v0, v1)` changes the NURBS face's rectangular
   parameter domain. Invalid edits leave the previous domain unchanged.
 - `tessellate(segments=16, edge_size=0, progress, curvature=false,
-  directions=false)` creates a display mesh without replacing
-  analytic data. Zero disables size refinement; positive values are target
+  directions=false, quick=false)` creates a display mesh without replacing
+  analytic data (`quick`: a drag's preview, see below). Zero disables size refinement; positive values are target
   spacing in source units, not a guaranteed minimum/maximum edge length.
 - `face_count()` counts CAD faces, not tessellated polygons.
 - `preview_face(face, divisions=8)` produces one disposable display patch,
@@ -52,8 +67,9 @@ attribute. Luce uses `CadGeometry.of_model`, `model_count`, `model` and
   supported by this diagnostic.
 - `face_edge_count/id/linear/point` expose shared boundary identities and exact
   samples for cached patch outlines, independent of display triangle edges.
-- `transformed(translation, rotation, scale)` returns a separate analytic model,
-  retaining trim domains and preserving orientation under reflection.
+- `transformed(translation, rotation, scale)` and `placed(matrix)` return a
+  separate analytic model, retaining trim domains and preserving orientation
+  under reflection.
 
 Planar boundaries currently have one outer loop with 3–256 corners and absolute
 coplanarity tolerance 1e-6 in source units. Up to 1024 independent CAD faces are
@@ -67,9 +83,11 @@ loops are columns (geocore `Column`s with change ids, `brep/model.lucb` and
 `brep_store.lucb`), so copies of a model share them by count. The control
 vertices of every B-spline surface form the **cv domain** (`cv_count`,
 `cv_position`, `cv_surface`); `with_cvs_moved(ids, delta)` returns an O(1)
-copy that shares every column but the cv positions. (A face stays valid while
-its trim edges still lie on the moved net: interior cvs, or boundary rows
-moved with their edges.)
+copy that shares every column but the cv positions, and `with_cvs_at(ids,
+positions)` places cvs exactly (the editor's moves, through
+`CadModel.with_cvs_placed`). A moved surface's trim
+edges are re-projected onto it, so boundary cvs can move too; faces sharing
+an edge stay joined.
 
 Tessellation is a cache, not a conversion:
 
@@ -87,9 +105,17 @@ Tessellation is a cache, not a conversion:
   without a copy: a Tessellate node with the viewport's settings is O(1) and
   its GPU buffers are the ones already made for the display.
 
+- **Quick previews** (`brep/quick.lucb`): during a cv drag,
+  `tessellate(..., quick=true)` on the moved copy answers from the parent's
+  kept mesh with the moved faces' own points carried onto their new surfaces
+  (shared edge samples stay, so the preview stays joined) in milliseconds;
+  releasing the drag tessellates in full.
+
 `CadModel.overlay(mesh)` returns a `CadOverlay`: each edge's polyline once
-(64 chords when curved), the hull (every control net, rows then columns, per
-distinct face placement) and a normal guide per face, as point pairs.
+(64 chords when curved; made once per model and passed to copies with moved
+cvs), the hull (every control net, rows then columns, per distinct face
+placement) and a normal guide per face, as point pairs. `edges_key()` names
+what the edge lines depend on, so a viewport keeps them while cvs move.
 
 On `camera.step` (2,710 faces, 26,674 cvs; 707k points, 655k polygons) the
 kept mesh takes 1.07 s to make (1.51 s before; arc sampling, interval counts
@@ -340,10 +366,10 @@ Lines start with one interval, then size/structured constraints may refine them.
 Unsupported trims and mesh-budget overflow fail explicitly.
 
 STEP exposes `Step.decode_model` / `Step.load_model`; its mesh convenience APIs
-delegate to this package. Regression tests currently run with sibling
-`luced-3d/tests/run.py`, covering model preservation, re-tessellation, rectangular
-trim bounds, invalid-trim atomicity, holes, periodic seams, shared-edge
-manifoldness, reflection and nonplanar boundary rejection. Mapped-patch tests
+delegate to this package. The regressions (see Tests below) cover model
+preservation, re-tessellation, rectangular trim bounds, invalid-trim atomicity,
+holes, periodic seams, shared-edge manifoldness, reflection and nonplanar
+boundary rejection. Mapped-patch tests
 cover internal valence four, exact curved-interior samples, compound sides,
 rational derivative normals, endpoint knots and reversed face orientation.
 Trim-grid tests additionally cover swapped/reversed UV flow, seam valence,
