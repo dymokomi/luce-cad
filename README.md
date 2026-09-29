@@ -13,6 +13,14 @@ Exports: `cad` (the analytic model, `luce_cad.model`) and `tessellation`
 `luce_cad.tessellation.surface`). The tessellation modules were the separate
 `luce-tesselator` package until luce-cad 0.2.0.
 
+`cad_geometry` (`luce_cad.cad_geometry`) makes CAD models a family of
+luce-geocore's `GeometrySet`: the `cad` component holds models (shared, never
+copied), places, joins and filters them by face path, and
+`CadGeometry.tessellated(set, segments, edge_size, progress)` turns them into
+the set's mesh in one pass, each face's B-rep path in the `path` text
+attribute. Luce uses `CadGeometry.of_model`, `model_count`, `model` and
+`face_count`.
+
 ## Analytic model API
 
 `cad.CadModel()` owns independent faces and copies input arrays:
