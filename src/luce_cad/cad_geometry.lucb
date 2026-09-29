@@ -13,7 +13,8 @@ from geocore_kernel import ComponentType, Placement, IdSet, TableBuilder, PathFi
 from geocore_kernel import adopt_set, dispose_set, empty_set, set_mesh, append_text, append_number, mesh_component, instances_component, new_instances, set_find, set_put, set_remove, set_storage, concatenated, with_attribute_entry, text_attribute, mesh_share
 from luce_cad.model import CadModel, cad_model_type
 
-## The models of one set: immutable once published, shared by count.
+## The models of one set: immutable once published; every owning set has
+## its own list of references (see share_parts).
 pub struct CadParts:
     var users: @usize
     var models: Growing[interop.Reference[CadModel]]
@@ -42,10 +43,16 @@ func new_parts() -> CadParts*!:
 pub let cad_component: ComponentType = ComponentType("cad", share_parts, close_parts, parts_size, parts_bytes, parts_bounds, place_parts, join_parts, parts_paths, filter_parts, describe_parts,
                                                      "This operation requires polygons; connect a Tessellate node first", trace_parts)
 
+## Another owner: a new list holding its own reference to every model. The
+## list is not shared by count, because each owning set traces its models:
+## every strong reference a trace visits must be owned exactly once by the
+## traced owner, or the cycle collector subtracts one edge per sharer from a
+## single reference and traps. O(models).
 func share_parts(data: const void*) -> void*!:
-    let parts = (CadParts*)data
-    discard(parts.users.add(1, .relaxed))
-    return (void*)parts
+    let copy = try new_parts()
+    errdefer close_parts((void*)copy)
+    for model in ((const CadParts*)data).models.view(): try copy.add(model)
+    return (void*)copy
 
 func close_parts(data: void*):
     let parts = (CadParts*)data

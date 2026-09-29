@@ -1,0 +1,52 @@
+## Geometry sets sharing a CAD component survive a cycle collection: each
+## owner traces only the model references it owns (the component protocol's
+## tracing rule), so the collector's counts never go below zero and nothing
+## leaks at exit.
+from cad import CadModel
+from cad_geometry import CadGeometry
+from geocore import Vector3, GeometrySet
+
+## Something the collector must walk: a small self-referencing cycle.
+class Link:
+    pub var next: Link? = none
+    pub var weight: int = 0
+
+## A class holding a set, as a node's result does: the collector walks
+## from it into the set and on into the CAD models.
+class Holder:
+    pub let geometry: GeometrySet
+    ## Makes the class one the collector walks (it can form cycles).
+    pub var next: Holder? = none
+
+    pub func init(self, geometry: GeometrySet):
+        self.geometry = geometry
+
+## Make holders of both sets collector candidates (a release that leaves
+## them alive), then enough cyclic garbage to run the collector over them.
+func churn(first: Holder, second: Holder, rounds: int) -> int:
+    let holders: list[Holder] = [first, second]
+    var total = holders.length
+    holders.clear()
+    for round in 0..<rounds:
+        let link = Link()
+        link.next = link
+        link.weight = round
+        total += link.weight % 2
+    return total
+
+## A set whose CAD component alone holds its model.
+func square() -> GeometrySet!:
+    let model = CadModel()
+    model.add_planar([Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.0), Vector3(0.0, 1.0, 0.0)])
+    return CadGeometry.of_model(model)
+
+pub func shared_set_tests() -> unit!:
+    let first = square()
+    # An identity placement shares every component of the set.
+    let second = first.transformed(Vector3(), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let a = Holder(first)
+    let b = Holder(second)
+    for round in 0..<4:
+        assert(churn(a, b, 3000) > 0)
+    assert(CadGeometry.model_count(second) == 1 and CadGeometry.model_count(first.merged(second)) == 2)
+    print("PASS sets sharing a CAD component survive cycle collections")
