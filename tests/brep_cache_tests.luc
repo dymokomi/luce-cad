@@ -1,11 +1,12 @@
 ## The B-rep's columns and caches: the cv domain, O(1) copies with moved
 ## control vertices, the kept tessellation a Tessellate node places, the
 ## per-face cache that re-meshes only what a move changed, the overlay, and
-## the geometry-file codec.
+## the geometry-file codec, and control vertices edited as a point cloud.
 from cad import BrepModel, CadModel
 from cad_geometry import CadGeometry
-from geocore import Vector3, GeometryFile
+from geocore import Vector3, GeometryFile, Verbs
 from checks import near, manifold
+from geocore import Mesh
 
 ## A closed solid: a raised B-spline dome (its border rows flat, so its
 ## lines stay on it) and a planar cap under it.
@@ -66,4 +67,32 @@ pub func brep_cache_tests() -> unit!:
         let q = back.cv_position(cv)
         assert(p.x == q.x and p.y == q.y and p.z == q.z)
     assert(back.tessellate(8).topology_hash() == raised.topology_hash())
-    print("PASS B-rep columns: cv domain, O(1) moved copies, kept tessellation placed by Tessellate, per-face cache reuse, overlay and file codec")
+    cv_cloud_edits(model, first)
+    print("PASS B-rep columns: cv domain, O(1) moved copies, kept tessellation placed by Tessellate, per-face cache reuse, overlay, file codec and cv cloud edits")
+
+## The cvs as points: a point verb moves some, and only those go back. A
+## boundary cv pulls the dome's trims off it: the tessellation still
+## succeeds (re-projected trims), and a fold leaves the face out, counted.
+func cv_cloud_edits(model: CadModel, first: Mesh) -> unit!:
+    let parts = CadGeometry.of_model(model)
+    let cloud = CadGeometry.cv_cloud(parts)
+    assert(cloud.point_count() == 9 and cloud.face_count() == 0 and CadGeometry.is_cv_cloud(cloud) and not CadGeometry.is_cv_cloud(first))
+    near(cloud.point(4).z, 4.0)
+    let moved = Verbs.run("Transform Components", cloud, "4", 1, [0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 3.0]).mesh()
+    let edited = CadGeometry.model(CadGeometry.with_cv_cloud(parts, cloud, moved), 0)
+    near(edited.cv_position(4).z, 3.0)
+    for cv in [0, 1, 2, 3, 5, 6, 7, 8]:
+        let a = model.cv_position(cv)
+        let b = edited.cv_position(cv)
+        assert(a.x == b.x and a.y == b.y and a.z == b.z)
+    let lowered = edited.tessellate(8)
+    manifold(lowered)
+    assert(CadGeometry.dropped_faces(lowered) == 0)
+    # A corner cv raised: the dome's edges no longer lie on it.
+    let raised = edited.with_cvs_moved([0], Vector3(0.0, 0.0, 1.5))
+    let pulled = raised.tessellate(8)
+    assert(CadGeometry.dropped_faces(pulled) == 0)
+    manifold(pulled)
+    # Folded far over the cap: the dome is left out, the model still meshes.
+    let folded = edited.with_cvs_moved([0, 1, 3], Vector3(3.0, 3.0, -6.0)).tessellate(8)
+    assert(folded.face_count() > 0 and CadGeometry.dropped_faces(folded) == 1)

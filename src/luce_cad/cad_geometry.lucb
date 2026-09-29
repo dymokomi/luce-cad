@@ -13,6 +13,7 @@ from geocore_kernel import ComponentType, Placement, IdSet, TableBuilder, PathFi
 from geocore_kernel import adopt_set, dispose_set, empty_set, set_mesh, append_text, append_number, mesh_component, instances_component, new_instances, set_find, set_put, set_remove, set_storage, concatenated, with_attribute_entry, text_attribute, mesh_share
 from luce_cad.model import CadModel, cad_model_type, encode_model, decode_model, numbered
 from geocore_kernel import register_codec, GeometryWriter, GeometryReader
+from luce_cad.cv_cloud import cloud_mesh, is_cloud, moved_models
 
 ## The models of one set: immutable once published; every owning set has
 ## its own list of references (see share_parts).
@@ -131,6 +132,10 @@ func describe_parts(data: const void*, out: Growing[u8]*) -> !:
 func trace_parts(data: const void*, visit: func(ownership.Object*, void*) -> unit, context: void*):
     for model in ((const CadParts*)data).models.view(): model.trace(visit, context)
 
+func detail_count(mesh: const Mesh*, name: str) -> i64!:
+    let index = mesh.find_attribute(name, (i64)(u8)Domain.detail)
+    return (i64)(try mesh.attribute_value(index, 0)) if index >= 0 else 0
+
 ## The CAD family in geometry files: element `cad` holding one `cad_model`
 ## child per model (m0, m1, …; luce_cad.model's codec).
 func encode_parts(data: const void*, writer: GeometryWriter*, path: str) -> !:
@@ -193,6 +198,39 @@ pub struct CadGeometry:
         let parts = (const CadParts*)data
         if index < 0 or (usize)index >= parts.count(): error(invalid, "CAD model index out of range")
         return parts.models.items[(usize)index].clone()
+
+    ## The set's own models' control vertices as a point cloud (placed; no
+    ## faces), which point verbs edit (cv_cloud.lucb).
+    pub static func cv_cloud(set: interop.Reference[GeometrySet]) -> interop.Reference[Mesh]!:
+        let data = set_find(try set.get(), &cad_component) else error(invalid, "the geometry has no CAD models")
+        return try cloud_mesh(((const CadParts*)data).models.view())
+
+    pub static func is_cv_cloud(mesh: interop.Reference[Mesh]) -> bool!:
+        return is_cloud(try mesh.get())
+
+    ## The set with the cvs `after` moved relative to `before` (its clouds).
+    pub static func with_cv_cloud(set: interop.Reference[GeometrySet], before: interop.Reference[Mesh], after: interop.Reference[Mesh]) -> interop.Reference[GeometrySet]!:
+        let source = try set.get()
+        let data = set_find(source, &cad_component) else error(invalid, "the geometry has no CAD models")
+        let parts = try new_parts()
+        let result = set_storage(source) catch failure:
+            close_parts((void*)parts)
+            error(failure.code, failure.message)
+        moved_models(((const CadParts*)data).models.view(), try before.get(), try after.get(), &parts.models) catch failure:
+            close_parts((void*)parts)
+            dispose_set(result)
+            error(failure.code, failure.message)
+        set_remove(result, &cad_component)
+        set_put(result, &cad_component, (void*)parts) catch failure:
+            close_parts((void*)parts)
+            dispose_set(result)
+            error(failure.code, failure.message)
+        return try adopt_set(result)
+
+    ## Faces of a CAD tessellation left out because their moved control
+    ## vertices pulled their trims into a shape that no longer meshes.
+    pub static func dropped_faces(mesh: interop.Reference[Mesh]) -> i64!:
+        return try detail_count(try mesh.get(), ".cad_dropped_faces")
 
     ## Analytic faces of the set's own CAD models.
     pub static func face_count(set: interop.Reference[GeometrySet]) -> i64!:

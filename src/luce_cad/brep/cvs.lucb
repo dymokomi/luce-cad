@@ -3,9 +3,14 @@
 ## makes a copy of the model that shares every other column; its per-face
 ## tessellation cache starts from this model's, so only faces whose inputs
 ## changed (the moved surfaces' faces, and neighbours whose layout follows
-## them) are meshed again. A face stays valid while its trim edges still lie
-## on the surface: moving the boundary rows of a trimmed net needs its edges
-## moved too, which this does not do.
+## them) are meshed again. The edges stay where they are, so moving a
+## trimmed net's boundary rows takes its trims off the surface: the moved
+## surfaces are marked edited, and their trims are re-projected (nearest
+## parameters; surface_trim.project) so the face follows its cvs and stays
+## joined to its neighbours along the unmoved edges. A face whose trims no
+## longer mesh (folded) is left out and counted (face_jobs.mesh_faces).
+## Placed, a surface's cvs take its first face's placement (the hull draws
+## a net once per placement; assemblies give each part's faces one).
 
 extend BrepModel:
     pub func cv_count() -> i64:
@@ -45,7 +50,60 @@ extend BrepModel:
         errdefer copy.release()
         let positions = try copy.value().cv_positions.writable()
         for id in ids: positions[(usize)id] = positions[(usize)id].add(delta)
+        try copy.value().mark_edited(ids)
         return copy
+
+    ## A copy with cvs `ids` at `positions` (B-rep space, one per id).
+    pub func with_cvs_at(ids: const i64[], positions: const Vector3[]) -> interop.Reference[BrepModel]!:
+        if ids.length != positions.length: error(invalid, "every moved control vertex needs a position")
+        for at in 0..<ids.length:
+            if ids[at] < 0 or ids[at] >= self.cv_count(): error(invalid, "CAD control vertex out of range")
+            if not positions[at].is_finite(): error(invalid, "a control vertex position must be finite")
+        let copy = try self.shared_copy()
+        errdefer copy.release()
+        let written = try copy.value().cv_positions.writable()
+        for at in 0..<ids.length: written[(usize)ids[at]] = positions[at]
+        try copy.value().mark_edited(ids)
+        return copy
+
+    ## Mark the surfaces owning cvs `ids` as edited.
+    mutating func mark_edited(ids: const i64[]) -> !:
+        let edited = try self.surface_edited.writable()
+        for id in ids: edited[(usize)(try self.cv_surface(id))] = 1
+
+    ## Each surface's placement (its first face's; the identity when no face
+    ## uses it), into `out`.
+    pub func surface_placements(out: Growing[Matrix4]*) -> !:
+        let surfaces = (usize)self.surface_count()
+        out.clear()
+        try out.fill(surfaces, Matrix4())
+        var seen = try BitsBuilder.zeros(surfaces)
+        defer seen.close()
+        for face in 0..<(usize)self.face_count():
+            let surface = (usize)self.face_surface.get(face)
+            if seen.view().get(surface): continue
+            seen.set(surface)
+            out.items[surface] = self.face_placement.get(face)
+
+    ## The placement of cv `index` (its surface's).
+    pub func cv_placement(index: i64) -> Matrix4!:
+        let surface = try self.cv_surface(index)
+        for face in 0..<(usize)self.face_count():
+            if (i64)self.face_surface.get(face) == surface: return self.face_placement.get(face)
+        return Matrix4()
+
+    ## Every cv placed by `matrix` after its surface's placement, appended
+    ## to `out`.
+    pub func placed_cvs(matrix: Matrix4, out: Growing[Vector3]*) -> !:
+        var placements = Growing[Matrix4]()
+        defer placements.close()
+        try self.surface_placements(&placements)
+        try out.reserve(out.count + (usize)self.cv_count())
+        for surface in 0..<(usize)self.surface_count():
+            let place = matrix.multiply(placements.items[surface])
+            for point in self.cvs_of(surface):
+                out.items[out.count] = place.transform_point(point)
+                out.count += 1
 
     ## Another model over the same columns (O(1) each), with copies of the
     ## face paths and a face cache inherited from this one.
@@ -70,6 +128,7 @@ extend BrepModel:
         target.curve_knot_offsets = self.curve_knot_offsets.share()
         target.curve_knots = self.curve_knots.share()
         target.surface_kind = self.surface_kind.share()
+        target.surface_edited = self.surface_edited.share()
         target.surface_frame = self.surface_frame.share()
         target.surface_dims = self.surface_dims.share()
         target.surface_cv_offsets.close()

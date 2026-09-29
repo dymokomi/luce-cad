@@ -5,7 +5,7 @@ import memory
 import math
 import geocore_parallel as parallel
 from luce_cad.patch_dispatch import mesh_face
-from luce_cad.face_jobs import mesh_faces
+from luce_cad.face_jobs import mesh_faces, FaceNotes
 from luce_cad.edge_sampling import curve_intervals, compact_seams
 from luce_cad.surface_normals import model_normals
 from luce_cad.surface_curvature import model_curvatures
@@ -104,11 +104,12 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     try bind(faces,cuts,samples,plans)
     var normals: f64[]
     defer free(normals) in memory.heap
+    var notes = FaceNotes()
     # Face jobs on the pool (and the per-face cache, when given); small
     # models without a cache mesh here, in order.
     let pooled = selected < 0 and (faces.length >= 16 or cache != none)
     if pooled:
-        normals = try mesh_faces(&mesh, edges, surfaces, faces, samples, plans, divisions, tolerance, edge_size, progress, mesh_face, cache)
+        normals = try mesh_faces(&mesh, edges, surfaces, faces, samples, plans, divisions, tolerance, edge_size, progress, mesh_face, cache, &notes)
     # Planned-face diagnostics keep ALL shared sampling/layout work above.
     # Only the final face jobs are restricted, unlike independent previews.
     let first_face = (usize)selected if selected >= 0 else 0
@@ -184,9 +185,17 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
         let colored = try islands.value().with_attribute("Cd", 2, 3, colors)
         defer colored.release()
         let shaded = try colored.value().with_attribute("N", 1, 3, normals, false, true)
-        return try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions)
+        return try with_notes(try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions), notes)
     let shaded = try islands.value().with_attribute("N", 1, 3, normals, false, true)
-    return try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions)
+    return try with_notes(try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions), notes)
+
+## Takes `made`; records how many edited faces no longer meshed as the
+## detail count .cad_dropped_faces (CadGeometry.dropped_faces reads it).
+func with_notes(made: interop.Reference[Mesh], notes: FaceNotes) -> interop.Reference[Mesh]!:
+    if notes.dropped == 0: return made
+    defer made.release()
+    let value: f64[1] = [(f64)notes.dropped]
+    return try made.value().with_attribute(".cad_dropped_faces", 3, 1, value[..<1], true)
 
 ## Takes `shaded`; adds the requested curvature columns as f32 (off by
 ## default: the analysis shading asks for them, ordinary tessellation pays

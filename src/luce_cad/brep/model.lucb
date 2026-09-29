@@ -80,8 +80,10 @@ pub struct BrepModel:
     var curve_knots: Store[f64]
     # Surfaces: kind (0 plane, 1 cylinder, 2 cone, 3 rational B-spline,
     # 4 sphere, 5 torus), frame, dimensions (nu, nv, du, dv), control
-    # vertices (the cv domain: positions and weights) and knots (u then v).
+    # vertices (the cv domain: positions and weights), knots (u then v), and
+    # whether its cvs were moved since import (its trims may leave it).
     var surface_kind: Store[u8]
+    var surface_edited: Store[u8]
     var surface_frame: Store[f64]
     var surface_dims: Store[i32]
     var surface_cv_offsets: Store[i32]
@@ -121,6 +123,7 @@ pub struct BrepModel:
         self.curve_knot_offsets = Store[i32]()
         self.curve_knots = Store[f64]()
         self.surface_kind = Store[u8]()
+        self.surface_edited = Store[u8]()
         self.surface_frame = Store[f64]()
         self.surface_dims = Store[i32]()
         self.surface_cv_offsets = Store[i32]()
@@ -223,7 +226,9 @@ pub struct BrepModel:
                 try uses.push((edges[index] + 1) * (1 if use > 0 else -1))
             for size in self.loops_of((usize)id): try sizes.push((i64)size)
             let sid = (usize)self.face_surface.get((usize)id)
-            if surfaces[sid] < 0: surfaces[sid] = try target.copy_surface(&self, sid)
+            if surfaces[sid] < 0:
+                surfaces[sid] = try target.copy_surface(&self, sid)
+                try target.surface_edited.set((usize)surfaces[sid], self.surface_edited.get(sid))
             let copied = try target.add_face(surfaces[sid], uses.view(), sizes.view(), self.face_sense.get((usize)id) == 1)
             try target.face_placement.set((usize)copied, self.face_placement.get((usize)id))
             try target.face_color.set((usize)copied, self.face_color.get((usize)id))
@@ -399,6 +404,7 @@ pub struct BrepModel:
     ## Append one surface's columns.
     mutating func push_surface(kind: u8, frame: const f64[], points: const Vector3[], weights: const f64[], ku: const f64[], kv: const f64[], dims: const i32[]) -> !:
         try self.surface_kind.push(kind)
+        try self.surface_edited.push(0)
         try self.surface_frame.append(frame)
         try self.surface_dims.append(dims)
         try self.cv_positions.append(points)
@@ -481,9 +487,11 @@ pub struct BrepModel:
     func surface(index: usize) -> Surface!:
         let frame = self.surface_frame.range(index * surface_stride, (index + 1) * surface_stride)
         let dims = self.surface_dims.range(index * 4, index * 4 + 4)
-        return try Surface((i64)self.surface_kind.get(index), Vector3(frame[0], frame[1], frame[2]), Vector3(frame[3], frame[4], frame[5]), Vector3(frame[6], frame[7], frame[8]),
-                           frame[9], frame[10], self.cvs_of(index), self.cv_weights_of(index), self.knots_of(index, 0), self.knots_of(index, 1),
-                           (i64)dims[0], (i64)dims[1], (i64)dims[2], (i64)dims[3])
+        var record = try Surface((i64)self.surface_kind.get(index), Vector3(frame[0], frame[1], frame[2]), Vector3(frame[3], frame[4], frame[5]), Vector3(frame[6], frame[7], frame[8]),
+                                 frame[9], frame[10], self.cvs_of(index), self.cv_weights_of(index), self.knots_of(index, 0), self.knots_of(index, 1),
+                                 (i64)dims[0], (i64)dims[1], (i64)dims[2], (i64)dims[3])
+        record.edited = self.surface_edited.get(index) == 1
+        return record
 
     func face(index: usize) -> BrepFace!:
         var uses = Growing[i64]()
@@ -630,6 +638,7 @@ pub struct BrepModel:
         self.curve_knot_offsets.close()
         self.curve_knots.close()
         self.surface_kind.close()
+        self.surface_edited.close()
         self.surface_frame.close()
         self.surface_dims.close()
         self.surface_cv_offsets.close()

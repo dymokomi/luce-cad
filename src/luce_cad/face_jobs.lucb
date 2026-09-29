@@ -17,6 +17,10 @@ import math
 
 pub type FaceMesher = func(MeshBuilder*, BrepFace, Surface, const Curve[], const Samples[], GridLayout, i64, f64, f64) -> unit!
 
+## Edited faces that no longer meshed, left out of the tessellation.
+pub struct FaceNotes:
+    pub var dropped: usize = 0
+
 struct Product:
     var points: Vector3[]
     var sizes: i64[]
@@ -87,12 +91,18 @@ func work(jobs: Jobs*) -> !:
             # Do not cook the rest of a rejected model. Lower indices have
             # already been assigned; joining their in-flight jobs below keeps
             # the reported first failing face deterministic across schedules.
-            jobs.lock.lock()
-            jobs.stop = true
-            jobs.lock.unlock()
+            # An edited face's failure is not a rejection (mesh_faces).
+            if not edited(jobs, index):
+                jobs.lock.lock()
+                jobs.stop = true
+                jobs.lock.unlock()
         jobs.lock.lock()
         jobs.completed += 1
         jobs.lock.unlock()
+
+## Whether face `index`'s surface had its cvs moved.
+func edited(jobs: const Jobs*, index: usize) -> bool:
+    return jobs.surfaces[(usize)jobs.faces[index].surface].edited
 
 func prepare(jobs: Jobs*, index: usize, scratch: MeshBuilder*) -> !:
     let face = jobs.faces[index]
@@ -115,7 +125,10 @@ func prepare(jobs: Jobs*, index: usize, scratch: MeshBuilder*) -> !:
 ## order, so parallel scheduling cannot change point IDs, topology or attributes.
 ## With a cache, faces whose inputs are unchanged reuse their pieces and the
 ## rest are kept for next time (face_cache.lucb).
-pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], samples: const Samples[], plans: const GridLayout[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]?, mesher: FaceMesher, cache: FaceCache*? = none) -> f64[]!:
+## A face whose surface's cvs were moved (Surface.edited) and that no longer
+## meshes (its trims pulled into a shape the mesher rejects) does not fail
+## the model: it is left out, and `notes` counts it.
+pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], samples: const Samples[], plans: const GridLayout[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]?, mesher: FaceMesher, cache: FaceCache*? = none, notes: FaceNotes*? = none) -> f64[]!:
     let products = try alloc Product[faces.length] in memory.heap
     defer free(products) in memory.heap
     for index in 0..<products.length:
@@ -171,21 +184,24 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         error(invalid, owned.value)
     # Check before allocating or assembling partial products. Unscheduled
     # faces are empty, while every assigned worker has now been joined.
-    for product in products:
-        if let failure = product.failure:
+    for index in 0..<products.length:
+        let failure = products[index].failure else continue
+        if not surfaces[(usize)faces[index].surface].edited:
             let owned = try interop.copy_text(failure.value)
             if let owner = owned.owner: discard(ownership.pool_object(owner))
             error(invalid, owned.value)
+        if let counts = notes: counts.dropped += 1
     let boundary = mesh.np
     # New faces become pieces for next time (unless a corner falls outside
     # the face's boundary table).
     if let store = cache:
         for index in order.view():
+            if products[index].failure != none: continue
             if let piece = try made_piece(&products[index], index, boundary, &tables, keys[index], plans[index]): try store.put(index, piece)
     var normal_count: usize = 0
     for index in 0..<products.length:
         if let piece = found[index]: normal_count += piece.normals.length
-        else: normal_count += products[index].normals.length
+        elif products[index].failure == none: normal_count += products[index].normals.length
     let normals = try alloc f64[normal_count] in memory.heap
     errdefer free(normals) in memory.heap
     var normal_offset: usize = 0
@@ -196,6 +212,7 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
             normal_offset += piece.normals.length
             continue
         let product = products[index]
+        if product.failure != none: continue
         let base = mesh.np
         for point in product.points:
             discard(try mesh.point(point))

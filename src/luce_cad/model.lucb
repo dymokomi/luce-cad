@@ -172,19 +172,41 @@ pub struct CadModel:
         if let boundary = self.boundary: return boundary.value().reused_faces()
         return 0
 
-    ## Where cv `index` is, placed as the model is.
+    ## Where cv `index` is, placed as the model is (and as its surface's
+    ## first face is).
     pub func cv_position(index: i64) -> Vector3!:
         let boundary = self.boundary else error(invalid, "CAD model has no B-rep")
-        return self.placement.transform_point(try boundary.value().cv_position(index))
+        let shape = boundary.value()
+        return self.placement.multiply(try shape.cv_placement(index)).transform_point(try shape.cv_position(index))
 
-    ## A copy with cvs `ids` moved by `delta` (model space): its B-rep shares
-    ## every column but the cv positions, and its tessellation reuses every
-    ## face whose inputs did not change.
+    ## A copy with cvs `ids` moved by `delta` (placed, as cv_position is):
+    ## its B-rep shares every column but the cv positions, and its
+    ## tessellation reuses every face whose inputs did not change.
     pub func with_cvs_moved(ids: const i64[], delta: Vector3) -> interop.Reference[CadModel]!:
+        let placed = try alloc Vector3[ids.length] in memory.heap
+        defer free(placed) in memory.heap
+        for at in 0..<ids.length: placed[at] = (try self.cv_position(ids[at])).add(delta)
+        return try self.with_cvs_placed(ids, placed)
+
+    ## A copy with cvs `ids` at the placed `positions` (one per id).
+    pub func with_cvs_placed(ids: const i64[], positions: const Vector3[]) -> interop.Reference[CadModel]!:
         let boundary = self.boundary else error(invalid, "CAD model has no B-rep")
-        let inner = try unplaced(self.placement, delta)
-        let moved = try boundary.value().with_cvs_moved(ids, inner)
+        let shape = boundary.value()
+        if ids.length != positions.length: error(invalid, "every moved control vertex needs a position")
+        var placements = Growing[Matrix4]()
+        defer placements.close()
+        try shape.surface_placements(&placements)
+        let inner = try alloc Vector3[ids.length] in memory.heap
+        defer free(inner) in memory.heap
+        for at in 0..<ids.length:
+            let place = self.placement.multiply(placements.items[(usize)(try shape.cv_surface(ids[at]))])
+            inner[at] = try unplaced(place, positions[at].subtract(place.translation))
+        let moved = try shape.with_cvs_at(ids, inner)
         defer moved.release()
+        return try self.with_brep(moved)
+
+    ## This model with `shape` in place of its B-rep.
+    func with_brep(shape: interop.Reference[BrepModel]) -> interop.Reference[CadModel]!:
         let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
         errdefer result.release()
         for entry in self.faces[..<self.count]:
@@ -195,7 +217,7 @@ pub struct CadModel:
             result.value().faces[index].v0 = entry.v0
             result.value().faces[index].v1 = entry.v1
             result.value().faces[index].reversed = entry.reversed
-        try result.value().attach_brep(moved)
+        try result.value().attach_brep(shape)
         result.value().placement = self.placement
         return result
 
@@ -687,3 +709,7 @@ pub func numbered(out: Growing[u8]*, prefix: str, number: usize) -> !:
     while count > 0:
         count -= 1
         try out.push(digits[count])
+
+## Every cv of `model` placed (as cv_position), appended to `out`.
+pub func placed_cvs(model: const CadModel*, out: Growing[Vector3]*) -> !:
+    if let boundary = model.boundary: try boundary.value().placed_cvs(model.placement, out)
