@@ -1,10 +1,12 @@
-## Bounded native face jobs. Workers borrow immutable CAD/edge data; each owns
-## its native scratch and ARC temporaries. Only copied raw arrays cross back.
+## Bounded native face jobs on the CAD worker pool. Workers borrow immutable
+## CAD/edge data; each owns its native scratch and ARC temporaries. Only copied
+## raw arrays cross back.
 import memory
 import thread
 import ownership
 import interop
 import sync
+import luce_cad.parallel as parallel
 from geocore import Vector3, MeshBuilder, invalid
 from luce_cad.brep_types import Surface, Curve, BrepFace, Samples
 from luce_cad.surface_normals import face_normals
@@ -46,9 +48,9 @@ struct Jobs:
     let products: Product[]
     let mesher: FaceMesher
 
-func run(raw: void*?):
-    ownership.enter()
-    defer ownership.finish_task()
+## One pool item per worker: each keeps one scratch builder for all its faces.
+func run(raw: void*?, slot: usize):
+    discard(slot)
     let jobs = (Jobs*)(raw else return)
     work(jobs) catch failure:
         jobs.lock.lock()
@@ -114,12 +116,12 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
     defer close_products(products)
     var jobs = Jobs(points = mesh.points[..<mesh.np], edges = edges, surfaces = surfaces, faces = faces, samples = samples, plans = plans, divisions = divisions, tolerance = tolerance, edge_size = edge_size, products = products, mesher = mesher)
     defer release_failure(&jobs)
-    var handles: thread.Handle[4]
-    var started: usize = 0
-    defer stop_jobs(&jobs, handles[..<started])
-    for index in 0..<(usize)4:
-        handles[index] = try thread.spawn(run, (void*)&jobs, name = "CAD face mesh")
-        started += 1
+    var job = parallel.Job()
+    let width = parallel.width()
+    parallel.start(&job, width if width < faces.length else faces.length, run, (void*)&jobs)
+    var running = true
+    defer:
+        if running: stop_jobs(&jobs, &job)
     var reported: usize = 0
     while true:
         jobs.lock.lock()
@@ -135,8 +137,8 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         if completed == faces.length or stopped:
             break
         thread.sleep(2)
-    stop_jobs(&jobs, handles[..<started])
-    started = 0
+    stop_jobs(&jobs, &job)
+    running = false
     if let failure = jobs.failure:
         let owned = try interop.copy_text(failure.value)
         if let owner = owned.owner: discard(ownership.pool_object(owner))
@@ -178,12 +180,11 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         normal_offset += product.normals.length
     return normals
 
-func stop_jobs(jobs: Jobs*, handles: const thread.Handle[]):
+func stop_jobs(jobs: Jobs*, job: parallel.Job*):
     jobs.lock.lock()
     jobs.stop = true
     jobs.lock.unlock()
-    for handle in handles:
-        handle.join() catch failure: trap(failure.message)
+    parallel.wait(job)
 
 func close_products(products: const Product[]):
     for product in products: product.close()

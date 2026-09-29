@@ -136,7 +136,7 @@ func check_knots(knots: const f64[], count: i64, degree: i64) -> !:
 
 ## Only degree+1 basis functions have support at a parameter. Binary span search
 ## plus local Cox-de Boor keeps sampling independent of control-net size.
-func local_basis(knots: const f64[], count: i64, degree: i64, parameter: f64, values: f64[9]*) -> usize:
+inline func local_basis(knots: const f64[], count: i64, degree: i64, parameter: f64, values: f64[9]*) -> usize:
     var low = (usize)degree
     var high = (usize)count
     while low + 1 < high:
@@ -159,22 +159,34 @@ func local_basis(knots: const f64[], count: i64, degree: i64, parameter: f64, va
         (*values)[level] = saved
     return span - (usize)degree
 
+## The hottest function of CAD import: scalar sums in the same order as the
+## Vector3 form (fp contraction is off), so results are bit-identical.
 func evaluate(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
     var bu: f64[9]
     var bv: f64[9]
     let first_u = local_basis(ku, nu, du, u, &bu)
     let first_v = local_basis(kv, nv, dv, v, &bv)
-    var result = Vector3()
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var z: f64 = 0.0
     var total: f64 = 0.0
+    let columns = (usize)nv
+    let span_v = (usize)dv + 1
     for iu in 0..<(usize)du + 1:
-        for iv in 0..<(usize)dv + 1:
-            let index = (first_u + iu) * (usize)nv + first_v + iv
-            let weight = bu[iu] * bv[iv] * weights[index]
-            result = result.add(points[index].multiply_scalar(weight))
+        let row = (first_u + iu) * columns + first_v
+        let basis = bu[iu]
+        for iv in 0..<span_v:
+            let index = row + iv
+            let weight = basis * bv[iv] * weights[index]
+            let p = points[index]
+            x = x + p.x * weight
+            y = y + p.y * weight
+            z = z + p.z * weight
             total += weight
     if not math.is_finite(total) or total <= 0.0:
         error(invalid, "invalid rational surface denominator")
-    return result.multiply_scalar(1.0 / total)
+    let scale = 1.0 / total
+    return Vector3(x * scale, y * scale, z * scale)
 
 ## Exact rational first-derivative normal on an immutable, check()-validated net.
 ## Zero indicates a singular parameterization; the CAD caller handles its pole.

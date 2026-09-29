@@ -6,7 +6,8 @@ from geocore import Vector3, invalid
 from luce_cad.brep_types import Surface, Curve, BrepFace
 from luce_cad.layout_types import UVChain, Stations
 from luce_cad.patch_sides import edge_index
-from luce_cad.mapped_patch import parameter, point
+from luce_cad.mapped_patch import point
+from luce_cad.trim_memo import TrimMemo, memo_parameter
 
 pub func initialize(chains: UVChain[], face: BrepFace, s: Surface, vertices: const Vector3[], edges: const Curve[], cuts: const Stations[], tolerance: f64) -> !:
     # Nonperiodic patches retain their original inverse-projection seeds. On
@@ -74,32 +75,41 @@ func closed_axis(s: Surface, axis: usize, tolerance: f64) -> bool!:
 
 ## Cached points remain in canonical edge order even when initialized backwards.
 ## New stations inherit the chart branch from the immutable old endpoints.
-pub func cached(chain: UVChain*, s: Surface, vertices: const Vector3[], edge: Curve, stations: Stations, tolerance: f64, initial: Vector3 = Vector3(0.5,0.5,0.0), forward: bool = true) -> const Vector3[]!:
+pub func cached(chain: UVChain*, s: Surface, vertices: const Vector3[], edge: Curve, stations: Stations, tolerance: f64, initial: Vector3 = Vector3(0.5,0.5,0.0), forward: bool = true, memo: TrimMemo*? = none) -> const Vector3[]!:
     if chain.points.length != stations.count:
-        let points = try alloc Vector3[stations.count] in memory.heap
-        errdefer free(points) in memory.heap
-        let times = try alloc f64[stations.count] in memory.heap
-        errdefer free(times) in memory.heap
-        var previous: usize = 0
-        var seed = initial
-        for step in 0..<points.length:
-            let at = step if forward else points.length-1-step
-            let t = stations.values[at]
-            times[at] = t
-            # Refreshes use canonical order; reverse traversal is only needed
-            # for the very first topological chart construction.
-            while previous < chain.times.length and chain.times[previous] < t-1e-12: previous += 1
-            if previous < chain.times.length and math.abs(chain.times[previous]-t) < 1e-12:
-                seed = chain.points[previous]
-            else:
-                let p = vertices[(usize)edge.start] if at == 0 else (vertices[(usize)edge.end] if at+1 == points.length else (try edge.at(t)))
-                seed = try parameter(s,p,seed,tolerance)
-            points[at] = seed
+        let fresh = try refreshed(*chain,s,vertices,edge,stations,tolerance,initial,forward,memo)
         if chain.points.length > 0: free(chain.points) in memory.heap
         if chain.times.length > 0: free(chain.times) in memory.heap
-        chain.points = points
-        chain.times = times
+        chain.points = fresh.points
+        chain.times = fresh.times
     return chain.points
+
+## The chain `cached` would store for `stations`, as new arrays; `chain` is
+## only read, so speculative passes can preview a refresh.
+pub func refreshed(chain: UVChain, s: Surface, vertices: const Vector3[], edge: Curve, stations: Stations, tolerance: f64, initial: Vector3 = Vector3(0.5,0.5,0.0), forward: bool = true, memo: TrimMemo*? = none) -> UVChain!:
+    let points = try alloc Vector3[stations.count] in memory.heap
+    errdefer free(points) in memory.heap
+    let times = try alloc f64[stations.count] in memory.heap
+    errdefer free(times) in memory.heap
+    var previous: usize = 0
+    var seed = initial
+    for step in 0..<points.length:
+        let at = step if forward else points.length-1-step
+        let t = stations.values[at]
+        times[at] = t
+        # Refreshes use canonical order; reverse traversal is only needed
+        # for the very first topological chart construction.
+        while previous < chain.times.length and chain.times[previous] < t-1e-12: previous += 1
+        if previous < chain.times.length and math.abs(chain.times[previous]-t) < 1e-12:
+            seed = chain.points[previous]
+        else:
+            let p = vertices[(usize)edge.start] if at == 0 else (vertices[(usize)edge.end] if at+1 == points.length else (try edge.at(t)))
+            seed = try memo_parameter(memo,s,p,seed,tolerance)
+        points[at] = seed
+    var result = UVChain()
+    result.points = points
+    result.times = times
+    return result
 
 ## A chart seam is cut in UV and stitched only after lifting. Preserve pinched
 ## vertices in the same chart, but never identify opposite periodic rails in 2D.

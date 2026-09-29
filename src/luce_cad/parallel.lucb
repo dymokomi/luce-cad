@@ -1,0 +1,208 @@
+## One persistent set of CAD worker threads, started on first use and kept for
+## the process (one fewer than the processors, at most 63). Per-call thread
+## spawns cost little against a face's meshing, but the plan phases run many
+## short batches per tessellation, and previews run one per displayed file.
+##
+## A batch is `count` independent items `entry(context, index)`. Each item runs
+## on a worker in its own runtime context (entered before, finished after), so
+## it may create ARC temporaries but must release everything it creates and
+## must not touch the caller's objects: only raw arrays cross back. The caller
+## does not work on items; it waits, reporting progress if it wants to.
+## A batch started from inside an item runs inline on that worker: nesting can
+## never wait on a pool that is busy running its parent.
+## (Later: consolidate with a luce-geocore pool once one exists.)
+import os
+import sync
+import thread
+import ownership
+
+let most_workers: usize = 63
+
+## A batch of items. Owned by its caller, who keeps it until `wait` returns.
+pub struct Job:
+    var entry: func(void*?, usize) -> unit = skip_item
+    var context: void*? = none
+    var count: usize = 0
+    var next: @usize
+    var finished: @usize
+    ## Workers on this batch now (under `lock`), and the most allowed.
+    var working: usize = 0
+    var helpers: usize = 0
+    var queued: bool = false
+    var after: Job*? = none
+
+func skip_item(context: void*?, index: usize):
+    discard(context)
+    discard(index)
+
+var lock: sync.Mutex
+var work_ready: sync.Condition
+var job_done: sync.Condition
+var first_job: Job*? = none
+var last_job: Job*? = none
+var started: bool = false
+var worker_count: usize = 0
+## Set on pool workers: a nested batch runs inline there.
+local var inside_worker: bool = false
+
+## Threads a batch can use at once (1 when there are no workers).
+pub func width() -> usize:
+    if inside_worker: return 1
+    lock.lock()
+    ensure_workers()
+    let count = worker_count
+    lock.unlock()
+    return count if count > 0 else 1
+
+## Run every item and return once all have finished.
+pub func run(count: usize, entry: func(void*?, usize) -> unit, context: void*?, limit: usize = 0):
+    var job = Job()
+    start(&job, count, entry, context, limit)
+    wait(&job)
+
+## Put a batch out on at most `limit` workers (0: all) and return at once. A
+## batch of one item, a nested batch, or one with no workers runs here first.
+pub func start(job: Job*, count: usize, entry: func(void*?, usize) -> unit, context: void*?, limit: usize = 0):
+    job.entry = entry
+    job.context = context
+    job.count = count
+    job.next.store(0, .relaxed)
+    job.finished.store(0, .relaxed)
+    job.working = 0
+    job.after = none
+    job.queued = false
+    if count <= 1 or limit == 1 or inside_worker:
+        run_inline(job)
+        return
+    lock.lock()
+    ensure_workers()
+    job.helpers = worker_count if limit == 0 or limit > worker_count else limit
+    job.queued = job.helpers > 0
+    if job.queued:
+        if let last = last_job:
+            last.after = job
+        else:
+            first_job = job
+        last_job = job
+        work_ready.broadcast()
+    lock.unlock()
+    if not job.queued:
+        run_inline(job)
+
+## Items finished so far.
+pub func completed(job: const Job*) -> usize:
+    return job.finished.load(.acquire)
+
+## Block until every item has finished and no worker holds `job`.
+pub func wait(job: Job*):
+    lock.lock()
+    while job.finished.load(.acquire) < job.count or job.working > 0:
+        job_done.wait(&lock)
+    unlink(job)
+    lock.unlock()
+
+## Inline items share the caller's runtime context, which is already entered.
+func run_inline(job: Job*):
+    while true:
+        let index = job.next.add(1, .relaxed)
+        if index >= job.count: return
+        let entry = job.entry
+        entry(job.context, index)
+        discard(job.finished.add(1, .acq_rel))
+
+func work_on(job: Job*):
+    while true:
+        let index = job.next.add(1, .relaxed)
+        if index >= job.count: return
+        let entry = job.entry
+        ownership.enter()
+        entry(job.context, index)
+        ownership.finish_task()
+        discard(job.finished.add(1, .acq_rel))
+
+## Drop `job` from the queue if it is there; under `lock`.
+func unlink(job: Job*):
+    if not job.queued: return
+    job.queued = false
+    var previous: Job*? = none
+    var cursor = first_job
+    while let current = cursor:
+        if current == job:
+            if let before = previous:
+                before.after = current.after
+            else:
+                first_job = current.after
+            if last_job == job:
+                last_job = previous
+            return
+        previous = cursor
+        cursor = current.after
+
+## Under `lock`.
+func ensure_workers():
+    if started: return
+    started = true
+    let processors = (usize)os.cpus()
+    let spare = processors - 1 if processors > 1 else 0
+    let wanted = most_workers if spare > most_workers else spare
+    for _ in 0..<wanted:
+        let handle = thread.spawn(worker_main, none, name = "CAD worker") catch failure:
+            # Fewer workers only means less parallelism: callers run inline.
+            discard(failure)
+            break
+        handle.detach()
+        worker_count += 1
+
+## A queued batch with items left and room for one more worker; under `lock`.
+func next_job() -> Job*?:
+    var cursor = first_job
+    while let job = cursor:
+        cursor = job.after
+        if job.next.load(.relaxed) >= job.count:
+            unlink(job)
+            continue
+        if job.working < job.helpers:
+            return job
+    return none
+
+func worker_main(context: void*?):
+    discard(context)
+    inside_worker = true
+    lock.lock()
+    while true:
+        if let job = next_job():
+            job.working += 1
+            lock.unlock()
+            work_on(job)
+            lock.lock()
+            job.working -= 1
+            if job.working == 0:
+                job_done.broadcast()
+        else:
+            work_ready.wait(&lock)
+
+struct Tally:
+    var hits: @usize
+    var seen: @u64
+
+func count_item(context: void*?, index: usize):
+    let tally = (Tally*)(context else return)
+    discard(tally.hits.add(1, .relaxed))
+    discard(tally.seen.add((u64)1 << (u64)(index % 64), .relaxed))
+
+func nested_item(context: void*?, index: usize):
+    discard(index)
+    run(8, count_item, context)
+
+test "a batch runs every item once; nested batches run inline":
+    var tally = Tally()
+    run(64, count_item, (void*)&tally)
+    assert(tally.hits.load(.acquire) == 64)
+    assert(tally.seen.load(.acquire) == 0xFFFFFFFFFFFFFFFF)
+    run(3, count_item, (void*)&tally, limit = 1)
+    assert(tally.hits.load(.acquire) == 67)
+    run(0, count_item, (void*)&tally)
+    assert(tally.hits.load(.acquire) == 67)
+    run(32, nested_item, (void*)&tally, limit = 4)
+    assert(tally.hits.load(.acquire) == 67 + 256)
+    assert(width() >= 1)

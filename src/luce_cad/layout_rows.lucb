@@ -8,42 +8,73 @@ from luce_cad.patch_density import patch_density
 from luce_cad.layout_types import Stations, RowIds, GridLayout
 from luce_cad.seam_flow import SeamFlow
 from luce_cad.curve_spacing import ArcMetric, raise_side
+from luce_cad.face_errors import FaceErrors
+import luce_cad.parallel as parallel
 
 ## Establish each patch's own curvature requirement before sharing any rows.
 ## Hard seams share cuts later, but cannot inflate a neighbor's interior grid.
 pub func initialize(edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], sides: const PatchSides[], baseline: const usize[], seams: const SeamFlow[], metrics: const ArcMetric[], plans: GridLayout[], divisions: i64, tolerance: f64) -> !:
-    let counts = try alloc usize[edges.length] in memory.heap
+    # Each face resets its own edges' counts from the baseline and writes only
+    # its own plan, so faces run on the pool with private count scratch.
+    var errors = try FaceErrors(faces.length)
+    defer errors.close()
+    var job = RowJob(edges = edges, surfaces = surfaces, faces = faces, sides = sides, baseline = baseline, seams = seams, metrics = metrics, plans = plans, divisions = divisions, tolerance = tolerance, errors = &errors)
+    parallel.run(faces.length, row_item, (void*)&job)
+    try errors.raise()
+
+struct RowJob:
+    let edges: const Curve[]
+    let surfaces: const Surface[]
+    let faces: const BrepFace[]
+    let sides: const PatchSides[]
+    let baseline: const usize[]
+    let seams: const SeamFlow[]
+    let metrics: const ArcMetric[]
+    let plans: GridLayout[]
+    let divisions: i64
+    let tolerance: f64
+    let errors: FaceErrors*
+
+func row_item(raw: void*?, at: usize):
+    let job = (RowJob*)(raw else return)
+    let counts = alloc usize[job.edges.length] in memory.heap catch failure:
+        job.errors.record(at,failure.code,failure.message)
+        return
     defer free(counts) in memory.heap
-    for at in 0..<faces.length:
-        let face = faces[at]
-        let plan = &plans[at]
-        let side = sides[at]
-        plan.flow = try alloc bool[face.uses.length] in memory.heap
-        for use in 0..<face.uses.length: plan.flow[use] = seams[edge_index(face.uses[use])].aligned
-        for use in face.uses:
-            let edge = edge_index(use)
-            counts[edge] = baseline[edge]
-        patch_density(face,surfaces[(usize)face.surface],edges,counts,metrics,divisions,tolerance) catch failure:
-            if failure.code != invalid: error(failure.code,failure.message)
-            recover ()
-        if side.valid:
-            for pair in 0..<(usize)2:
-                let a = side_count(face,side,pair,counts)
-                let b = side_count(face,side,pair+2,counts)
-                if a == b: continue
-                let axis = pair if a < b else pair+2
-                raise_side(face,side,axis,counts,metrics,b if a < b else a)
-        plan.method = try alloc i64[1] in memory.heap
-        plan.method[0] = 0
-        plan.rows = try alloc Stations[face.uses.length] in memory.heap
-        for use in 0..<plan.rows.length: plan.rows[use] = Stations()
-        plan.row_ids = try alloc RowIds[face.uses.length] in memory.heap
-        for use in 0..<plan.row_ids.length: plan.row_ids[use] = RowIds()
-        for use in 0..<face.uses.length:
-            let index = edge_index(face.uses[use])
-            try plan.rows[use].open(1025)
-            for step in 0..<counts[index]+1:
-                discard(try plan.rows[use].insert(metrics[index].station((f64)step/(f64)counts[index]),1e-12))
+    face_rows(job,at,counts) catch failure:
+        job.errors.record(at,failure.code,failure.message)
+
+func face_rows(job: RowJob*, at: usize, counts: usize[]) -> !:
+    let face = job.faces[at]
+    let plan = &job.plans[at]
+    let side = job.sides[at]
+    let metrics = job.metrics
+    plan.flow = try alloc bool[face.uses.length] in memory.heap
+    for use in 0..<face.uses.length: plan.flow[use] = job.seams[edge_index(face.uses[use])].aligned
+    for use in face.uses:
+        let edge = edge_index(use)
+        counts[edge] = job.baseline[edge]
+    patch_density(face,job.surfaces[(usize)face.surface],job.edges,counts,metrics,job.divisions,job.tolerance) catch failure:
+        if failure.code != invalid: error(failure.code,failure.message)
+        recover ()
+    if side.valid:
+        for pair in 0..<(usize)2:
+            let a = side_count(face,side,pair,counts)
+            let b = side_count(face,side,pair+2,counts)
+            if a == b: continue
+            let axis = pair if a < b else pair+2
+            raise_side(face,side,axis,counts,metrics,b if a < b else a)
+    plan.method = try alloc i64[1] in memory.heap
+    plan.method[0] = 0
+    plan.rows = try alloc Stations[face.uses.length] in memory.heap
+    for use in 0..<plan.rows.length: plan.rows[use] = Stations()
+    plan.row_ids = try alloc RowIds[face.uses.length] in memory.heap
+    for use in 0..<plan.row_ids.length: plan.row_ids[use] = RowIds()
+    for use in 0..<face.uses.length:
+        let index = edge_index(face.uses[use])
+        try plan.rows[use].open(1025)
+        for step in 0..<counts[index]+1:
+            discard(try plan.rows[use].insert(metrics[index].station((f64)step/(f64)counts[index]),1e-12))
 
 ## Freeze local row parameters as canonical shared point IDs, never new points.
 pub func bind(faces: const BrepFace[], cuts: const Stations[], samples: const Samples[], plans: GridLayout[]) -> !:

@@ -6,14 +6,31 @@ from luce_cad.layout_types import Stations, GridLayout
 from luce_cad.layout_phase import align_sides
 from luce_cad.curve_spacing import ArcMetric
 
+## What a face's last balance visit saw. A visit reads only the face's rows,
+## its edges' cuts (both only ever grow, so equal counts mean equal contents)
+## and its mapped state; a visit that changed nothing, repeated on the same
+## inputs, again changes nothing, so it is skipped.
+pub struct Settled:
+    var cuts: usize = 0
+    var rows: usize = 0
+    var mapped: bool = false
+    var clean: bool = false
+
 ## Preserve original stations, pair circular phases, then balance logical sides.
-pub func balance(faces: const BrepFace[], edges: const Curve[], sides: const PatchSides[], cuts: Stations[], metrics: const ArcMetric[], plans: GridLayout[], tolerance: f64) -> !:
+## `settled` (one per face, kept across calls by the planner) may start clean.
+pub func balance(faces: const BrepFace[], edges: const Curve[], sides: const PatchSides[], cuts: Stations[], metrics: const ArcMetric[], plans: GridLayout[], tolerance: f64, settled: Settled[]) -> !:
     for pass in 0..<32:
         var changed = false
         for face_id in 0..<faces.length:
             let side = sides[face_id]
             let face = faces[face_id]
             let rows = plans[face_id].rows
+            let before = changed
+            changed = false
+            let seen = signature(face,side,cuts,plans[face_id])
+            if settled[face_id].clean and seen.cuts == settled[face_id].cuts and seen.rows == settled[face_id].rows and seen.mapped == settled[face_id].mapped:
+                changed = before
+                continue
             for use in 0..<face.uses.length:
                 if not plans[face_id].flow[use]: continue
                 let shared = cuts[edge_index(face.uses[use])]
@@ -62,4 +79,15 @@ pub func balance(faces: const BrepFace[], edges: const Curve[], sides: const Pat
                 for at in 0..<rows[use].count:
                     let added = try shared.insert(rows[use].values[at],1e-9)
                     changed = changed or added
+            settled[face_id] = signature(face,side,cuts,plans[face_id])
+            settled[face_id].clean = not changed
+            changed = before or changed
         if not changed: break
+
+func signature(face: BrepFace, side: PatchSides, cuts: const Stations[], plan: GridLayout) -> Settled:
+    var result = Settled()
+    for use in 0..<face.uses.length:
+        result.cuts += cuts[edge_index(face.uses[use])].count
+        result.rows += plan.rows[use].count
+    result.mapped = side.valid and not plan.valid and not plan.cut_first
+    return result
