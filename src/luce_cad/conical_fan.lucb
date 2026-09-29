@@ -1,0 +1,80 @@
+## A cone's side closing at its apex: one loop of the base circle and a seam
+## line up to the apex, used both ways. The side is meshed as rings: one per
+## seam sample, each point at its base sample's angle, quads between rings
+## and a triangle fan at the apex, so the seam's and the base circle's
+## samples are shared with the neighbouring faces. (A general trim mesher
+## meets the apex's singular parameters with endless refinement.)
+import memory
+import math
+from geocore import Vector3, MeshBuilder, invalid
+from luce_cad.brep_types import Curve, Surface, BrepFace, Samples
+from luce_cad.patch_sides import edge_index
+
+## Whether `face` is an apex cone side: a conical support and a loop of one
+## circle and one line used twice.
+pub func apex_cone(face: BrepFace, surface: Surface, edges: const Curve[]) -> bool:
+    if surface.kind != 2 or face.sizes.length != 1 or face.uses.length != 3: return false
+    var circles = 0
+    var lines = 0
+    var seam: i64 = -1
+    for use in face.uses:
+        let index = (i64)edge_index(use)
+        let kind = edges[(usize)index].kind
+        if kind == 1: circles += 1
+        elif kind == 0:
+            if seam >= 0 and seam != index: return false
+            seam = index
+            lines += 1
+    return circles == 1 and lines == 2
+
+pub func conical_fan(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64) -> !:
+    var ring: const i64[] = samples[0].ids[..<0]
+    var seam: const i64[] = samples[0].ids[..<0]
+    for use in face.uses:
+        let index = edge_index(use)
+        if edges[index].kind == 1: ring = samples[index].ids
+        else: seam = samples[index].ids
+    if ring.length < 4 or ring[0] != ring[ring.length - 1] or seam.length < 2:
+        error(invalid, "apex cone needs a closed base circle and a sampled seam")
+    # The seam from the base ring to the apex.
+    let from_base = seam[0] == ring[0]
+    if not from_base and seam[seam.length - 1] != ring[0]:
+        error(invalid, "apex cone seam does not start on its base circle")
+    let rows = seam.length - 1
+    let steps = ring.length - 1
+    let apex = seam[rows] if from_base else seam[0]
+    let tangent = math.tan(surface.angle)
+    let grid = try alloc i64[(rows + 1) * (steps + 1)] in memory.heap
+    defer free(grid) in memory.heap
+    for row in 0..<rows + 1:
+        let along = seam[row] if from_base else seam[rows - row]
+        let axial = mesh.points[(usize)along].subtract(surface.origin).dot(surface.z)
+        let radius = surface.radius + axial * tangent
+        for column in 0..<steps + 1:
+            var id: i64 = along
+            if row == 0: id = ring[column]
+            elif row == rows: id = apex
+            elif column != 0 and column != steps:
+                let direction = try radial(mesh.points[(usize)ring[column]], surface)
+                id = try mesh.point(surface.origin.add(surface.z.multiply_scalar(axial)).add(direction.multiply_scalar(radius)))
+            grid[row * (steps + 1) + column] = id
+    # Wind the polygons so their normals leave the side as the face's do.
+    let a = mesh.points[(usize)grid[0]]
+    let b = mesh.points[(usize)grid[1]]
+    let c = mesh.points[(usize)grid[steps + 2]]
+    let outward = (try radial(a.add(b).multiply_scalar(0.5), surface)).subtract(surface.z.multiply_scalar(tangent))
+    let forward = (b.subtract(a).cross(c.subtract(a)).dot(outward) > 0.0) == face.sense
+    for row in 0..<rows:
+        for column in 0..<steps:
+            let low = row * (steps + 1) + column
+            let high = low + steps + 1
+            var corners: i64[4] = [grid[low], grid[low + 1], grid[high + 1], grid[high]]
+            let size: usize = 3 if row + 1 == rows else 4
+            try mesh.face((i64)size)
+            for at in 0..<size:
+                try mesh.corner(corners[at if forward else size - 1 - at])
+
+## The unit direction from the axis to `point`.
+func radial(point: Vector3, surface: Surface) -> Vector3!:
+    let relative = point.subtract(surface.origin)
+    return try relative.subtract(surface.z.multiply_scalar(relative.dot(surface.z))).normalized()
