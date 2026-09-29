@@ -349,11 +349,11 @@ k2 = 0, and a bore k2 = -1/r. `directions=true` adds unit principal
 directions `curvature.d1`/`d2`. Values are per corner, like `N`, so faces
 meeting at a seam keep their own. Off by default; about 0.1 s on a 2.7M-corner
 model. A CadModel placement must be a uniform scale (curvature divides by it).
-The columns are float64 until luce-geocore's public API can add float32 ones.
+The columns are float32.
 
 ## Parallel work
 
-One persistent worker pool (`luce_cad.parallel`, processors minus one) runs
+One persistent worker pool (luce-geocore's `geocore_parallel`, processors minus one, shared with the geometry kernels) runs
 the per-face work: layout seeding and row setup, speculative crossing
 computation, face meshing and normals, curvature and previews. Each item runs
 in its own runtime context and hands back raw arrays only. Layout
