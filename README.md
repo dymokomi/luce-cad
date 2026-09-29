@@ -6,7 +6,7 @@ editor commands or donor C/C++ dependencies.
 The intended ownership is:
 
 `luce-step` (file entities) → `luce-cad` (analytic faces/topology, surface
-evaluation and trimmed-surface meshing) → `luce-3d` (display mesh).
+evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
 
 Exports: `cad` (the analytic model, `luce_cad.model`) and `tessellation`
 (rational B-spline evaluation and trim/grid/recombine meshing,
@@ -42,7 +42,7 @@ Exports: `cad` (the analytic model, `luce_cad.model`) and `tessellation`
 
 Planar boundaries currently have one outer loop with 3–256 corners and absolute
 coplanarity tolerance 1e-6 in source units. Up to 1024 independent CAD faces are
-stored; generated meshes are also bounded by luce-3d's modeling budgets. A valid
+stored; generated meshes are also bounded by luce-geocore's modeling budgets. A valid
 analytic model can exceed a particular display mesh budget and fail tessellation.
 
 ## Shared boundary topology
@@ -342,7 +342,7 @@ finite and nondecreasing. The evaluator uses Cox–de Boor basis functions and a
 rational weighted sum over only the active controls, with binary span lookup.
 `sample_checked` is for immutable nets already validated by `check`; callers
 must not change the net afterward. Returns an immutable indexed polygon mesh; its quads are
-triangulated by luce-3d for rendering. No UI, File node or STEP syntax lives here.
+triangulated by luce-geocore for rendering. No UI, File node or STEP syntax lives here.
 
 `surface_normal_checked` evaluates exact rational first derivatives on an
 already validated immutable net and returns their normalized cross product.
