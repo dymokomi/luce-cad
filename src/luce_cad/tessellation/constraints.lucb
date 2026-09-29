@@ -1,0 +1,66 @@
+## Immutable index constraints for coincident chart images of authored seams.
+## Owning callers close the table; pipeline stages borrow it without copying.
+import memory
+from three import Vector3, invalid
+
+pub struct TrimConstraints:
+    var pairs: i64[]
+
+    ## Ordinary boundaries are already protected by one-face incidence. Build
+    ## a table only when matching canonical IDs also coincide in this chart.
+    pub static func build(points: const Vector3[], ids: const i64[], sizes: const i64[]) -> TrimConstraints!:
+        if ids.length == 0: return TrimConstraints()
+        if ids.length != points.length: error(invalid,"trim identities must describe every input point")
+        var count: usize = 0
+        for size in sizes:
+            if size < 3 or (usize)size > points.length-count: error(invalid,"invalid constrained trim loop size")
+            count += (usize)size
+        if count != points.length: error(invalid,"constrained trim loops do not describe every point")
+        let slots = try alloc i64[ids.length*2+1] in memory.heap
+        defer free(slots) in memory.heap
+        for at in 0..<slots.length: slots[at] = -1
+        let aliases = try alloc i64[ids.length] in memory.heap
+        defer free(aliases) in memory.heap
+        var repeated = false
+        for at in 0..<ids.length:
+            if ids[at] < 0: error(invalid,"trim identities must be nonnegative")
+            var slot = (usize)ids[at]%slots.length
+            while slots[slot] >= 0:
+                let previous = (usize)slots[slot]
+                if ids[previous] == ids[at] and points[previous] == points[at]: break
+                slot = (slot+1)%slots.length
+            if slots[slot] < 0: slots[slot] = (i64)at
+            else: repeated = true
+            aliases[at] = slots[slot]
+        if not repeated: return TrimConstraints()
+        let pairs = try alloc i64[(ids.length*2+1)*2] in memory.heap
+        for at in 0..<pairs.length: pairs[at] = -1
+        var result = TrimConstraints(pairs)
+        var offset: usize = 0
+        for size in sizes:
+            for at in 0..<(usize)size:
+                result.insert(aliases[offset+at],aliases[offset+(at+1)%(usize)size])
+            offset += (usize)size
+        return result
+
+    func insert(a: i64, b: i64):
+        let low = a if a < b else b
+        let high = b if a < b else a
+        var slot = (usize)(low*8388609+high)%(self.pairs.length//2)
+        while self.pairs[slot*2] >= 0 and (self.pairs[slot*2] != low or self.pairs[slot*2+1] != high): slot = (slot+1)%(self.pairs.length//2)
+        self.pairs[slot*2] = low
+        self.pairs[slot*2+1] = high
+
+    ## Input point indices remain stable through all refinement stages.
+    pub func contains(a: i64, b: i64) -> bool:
+        if self.pairs.length == 0: return false
+        let low = a if a < b else b
+        let high = b if a < b else a
+        var slot = (usize)(low*8388609+high)%(self.pairs.length//2)
+        while self.pairs[slot*2] >= 0:
+            if self.pairs[slot*2] == low and self.pairs[slot*2+1] == high: return true
+            slot = (slot+1)%(self.pairs.length//2)
+        return false
+
+    pub func close():
+        if self.pairs.length > 0: free(self.pairs) in memory.heap

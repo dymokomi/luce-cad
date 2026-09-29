@@ -1,0 +1,238 @@
+## Tensor-product rational B-splines, original Cox-de Boor evaluator.
+import interop
+import math
+from three import PolygonMesh, MeshBuilder, Vector3, invalid
+import luce_cad.tessellation.trim as trim
+import luce_cad.tessellation.cut_grid as grid_cut
+import luce_cad.tessellation.constraints as constraints
+pub type TrimPolygon = trim.TrimPolygon
+pub type TrimConstraints = constraints.TrimConstraints
+
+## Grid-first trimmed polygon meshing with pre-split shared boundaries.
+pub struct TrimGrid:
+    let reserved: u8 = 0
+    pub static func clip(points: const Vector3[], sizes: const i64[], us: const f64[], vs: const f64[]) -> interop.Reference[PolygonMesh]!:
+        var empty: i64[1]
+        return try grid_cut.cut_grid(points, sizes, us, vs, empty[..<0])
+
+    ## As clip(), with explicit shared-vertex identities for pinched CAD loops.
+    ## Equal positions alone never identify vertices; output point order stays
+    ## unchanged, and polygon corners reference each identity's first occurrence.
+    pub static func clip_identified(points: const Vector3[], sizes: const i64[], us: const f64[], vs: const f64[], identities: const i64[]) -> interop.Reference[PolygonMesh]!:
+        return try grid_cut.cut_grid(points, sizes, us, vs, identities)
+
+pub struct NurbsCurve:
+    let reserved: u8 = 0
+    ## Rational B-spline curve at an actual knot-domain parameter.
+    pub static func at(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], parameter: f64) -> Vector3!:
+        let count = (i64)points.length
+        if count < 2 or count > 4096 or weights.length != points.length:
+            error(invalid, "invalid B-spline curve control net")
+        try check_knots(knots, count, degree)
+        if not math.is_finite(parameter) or parameter < knots[(usize)degree] or parameter > knots[(usize)count]:
+            error(invalid, "curve parameter outside knot domain")
+        var values: f64[9]
+        let first = local_basis(knots, count, degree, parameter, &values)
+        var total: f64 = 0.0
+        var position = Vector3()
+        for index in 0..<points.length:
+            if not points[index].is_finite() or not math.is_finite(weights[index]) or weights[index] <= 0.0:
+                error(invalid, "invalid rational curve control point or weight")
+        for at in 0..<(usize)degree + 1:
+            let index = first + at
+            let weight = values[at] * weights[index]
+            total += weight
+            position = position.add(points[index].multiply_scalar(weight))
+        if total <= 0.0 or not math.is_finite(total):
+            error(invalid, "invalid rational curve denominator")
+        return position.multiply_scalar(1.0 / total)
+
+pub struct NurbsSurface:
+    let reserved: u8 = 0
+
+    ## Evaluate the retained analytic surface without generating polygons.
+    pub static func at(points: const Vector3[], weights: const f64[], nu: i64, nv: i64,
+                       du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
+        try validate(points, weights, nu, nv, du, dv, ku, kv)
+        if not math.is_finite(u) or not math.is_finite(v) or u < ku[(usize)du] or u > ku[(usize)nu] or v < kv[(usize)dv] or v > kv[(usize)nv]:
+            error(invalid, "surface parameter outside knot domain")
+        return try evaluate(points, weights, nu, nv, du, dv, ku, kv, u, v)
+
+    ## Validate an analytic control net without creating a display mesh.
+    pub static func check(points: const Vector3[], weights: const f64[], nu: i64, nv: i64,
+                          degree_u: i64, degree_v: i64, knots_u: const f64[], knots_v: const f64[]) -> !:
+        try validate(points, weights, nu, nv, degree_u, degree_v, knots_u, knots_v)
+
+    ## Sample a control net already accepted by check(). CAD retains immutable
+    ## validated nets; do not revalidate every control point per Newton iteration.
+    pub static func sample_checked(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
+        if not math.is_finite(u) or not math.is_finite(v) or u < ku[(usize)du] or u > ku[(usize)nu] or v < kv[(usize)dv] or v > kv[(usize)nv]:
+            error(invalid, "surface parameter outside knot domain")
+        return try evaluate(points, weights, nu, nv, du, dv, ku, kv, u, v)
+
+    ## Validate a rectangular subdomain, including finite and ordered bounds.
+    pub static func check_region(ku: const f64[], kv: const f64[], nu: i64, nv: i64, du: i64, dv: i64,
+                                 u0: f64, u1: f64, v0: f64, v1: f64) -> !:
+        if nu < 2 or nu > 1024 or nv < 2 or nv > 1024 or nu * nv > 262144:
+            error(invalid, "invalid NURBS dimensions")
+        try check_knots(ku, nu, du)
+        try check_knots(kv, nv, dv)
+        if not math.is_finite(u0) or not math.is_finite(u1) or not math.is_finite(v0) or not math.is_finite(v1) or u0 >= u1 or v0 >= v1:
+            error(invalid, "invalid NURBS trim rectangle")
+        if u0 < ku[(usize)du] or u1 > ku[(usize)nu] or v0 < kv[(usize)dv] or v1 > kv[(usize)nv]:
+            error(invalid, "NURBS trim rectangle is outside the surface domain")
+
+    ## Control points/weights are u-major, v-minor. Knot vectors are expanded.
+    ## Untrimmed rectangular patches only; callers own CAD trim topology.
+    pub static func tessellate(points: const Vector3[], weights: const f64[], nu: i64, nv: i64,
+                               degree_u: i64, degree_v: i64, knots_u: const f64[], knots_v: const f64[],
+                               segments: i64 = 16) -> interop.Reference[PolygonMesh]!:
+        try validate(points, weights, nu, nv, degree_u, degree_v, knots_u, knots_v)
+        return try NurbsSurface.tessellate_region(points, weights, nu, nv, degree_u, degree_v, knots_u, knots_v,
+                                                  knots_u[(usize)degree_u], knots_u[(usize)nu], knots_v[(usize)degree_v], knots_v[(usize)nv], segments)
+
+    ## Sample an exact rectangular parameter subdomain of the surface.
+    pub static func tessellate_region(points: const Vector3[], weights: const f64[], nu: i64, nv: i64,
+                                      degree_u: i64, degree_v: i64, knots_u: const f64[], knots_v: const f64[],
+                                      u0: f64, u1: f64, v0: f64, v1: f64, segments: i64 = 16) -> interop.Reference[PolygonMesh]!:
+        try validate(points, weights, nu, nv, degree_u, degree_v, knots_u, knots_v)
+        try NurbsSurface.check_region(knots_u, knots_v, nu, nv, degree_u, degree_v, u0, u1, v0, v1)
+        if segments < 1 or segments > 64:
+            error(invalid, "NURBS tessellation segments must be 1..64")
+        var mesh = try MeshBuilder()
+        defer mesh.close()
+        for iu in 0..<segments + 1:
+            let u = u0 + (u1 - u0) * (f64)iu / (f64)segments
+            for iv in 0..<segments + 1:
+                let v = v0 + (v1 - v0) * (f64)iv / (f64)segments
+                discard(try mesh.point(try evaluate(points, weights, nu, nv, degree_u, degree_v, knots_u, knots_v, u, v)))
+        for iu in 0..<segments:
+            for iv in 0..<segments:
+                let a = iu * (segments + 1) + iv
+                try mesh.face(4)
+                try mesh.corner(a)
+                try mesh.corner(a + segments + 1)
+                try mesh.corner(a + segments + 2)
+                try mesh.corner(a + 1)
+        return try mesh.finish()
+
+func validate(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[]) -> !:
+    if nu < 2 or nu > 1024 or nv < 2 or nv > 1024 or nu * nv > 262144 or points.length != (usize)(nu * nv) or weights.length != points.length:
+        error(invalid, "invalid NURBS control net")
+    try check_knots(ku, nu, du)
+    try check_knots(kv, nv, dv)
+    for index in 0..<points.length:
+        if not points[index].is_finite() or not math.is_finite(weights[index]) or weights[index] <= 0.0:
+            error(invalid, "NURBS requires finite control points and positive weights")
+
+func check_knots(knots: const f64[], count: i64, degree: i64) -> !:
+    if degree < 1 or degree > 8 or degree >= count or knots.length != (usize)(count + degree + 1):
+        error(invalid, "invalid NURBS degree or knot count")
+    for index in 0..<knots.length:
+        if not math.is_finite(knots[index]) or (index > 0 and knots[index] < knots[index - 1]):
+            error(invalid, "NURBS knots must be finite and nondecreasing")
+    if knots[(usize)count] <= knots[(usize)degree]:
+        error(invalid, "NURBS has an empty parameter interval")
+
+## Only degree+1 basis functions have support at a parameter. Binary span search
+## plus local Cox-de Boor keeps sampling independent of control-net size.
+func local_basis(knots: const f64[], count: i64, degree: i64, parameter: f64, values: f64[9]*) -> usize:
+    var low = (usize)degree
+    var high = (usize)count
+    while low + 1 < high:
+        let middle = (low + high) // 2
+        if parameter < knots[middle]: high = middle
+        else: low = middle
+    let span = low
+    var left: f64[9]
+    var right: f64[9]
+    (*values)[0] = 1.0
+    for level in 1..<(usize)degree + 1:
+        left[level] = parameter - knots[span + 1 - level]
+        right[level] = knots[span + level] - parameter
+        var saved: f64 = 0.0
+        for at in 0..<level:
+            let denominator = right[at + 1] + left[level - at]
+            let temporary = (*values)[at] / denominator if denominator > 0.0 else 0.0
+            (*values)[at] = saved + right[at + 1] * temporary
+            saved = left[level - at] * temporary
+        (*values)[level] = saved
+    return span - (usize)degree
+
+func evaluate(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
+    var bu: f64[9]
+    var bv: f64[9]
+    let first_u = local_basis(ku, nu, du, u, &bu)
+    let first_v = local_basis(kv, nv, dv, v, &bv)
+    var result = Vector3()
+    var total: f64 = 0.0
+    for iu in 0..<(usize)du + 1:
+        for iv in 0..<(usize)dv + 1:
+            let index = (first_u + iu) * (usize)nv + first_v + iv
+            let weight = bu[iu] * bv[iv] * weights[index]
+            result = result.add(points[index].multiply_scalar(weight))
+            total += weight
+    if not math.is_finite(total) or total <= 0.0:
+        error(invalid, "invalid rational surface denominator")
+    return result.multiply_scalar(1.0 / total)
+
+## Exact rational first-derivative normal on an immutable, check()-validated net.
+## Zero indicates a singular parameterization; the CAD caller handles its pole.
+pub func surface_normal_checked(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
+    if not math.is_finite(u) or not math.is_finite(v) or u < ku[(usize)du] or u > ku[(usize)nu] or v < kv[(usize)dv] or v > kv[(usize)nv]:
+        error(invalid, "normal parameter outside knot domain")
+    var bu: f64[9]
+    var bv: f64[9]
+    var ud: f64[9]
+    var vd: f64[9]
+    let first_u = local_basis(ku, nu, du, u, &bu)
+    let first_v = local_basis(kv, nv, dv, v, &bv)
+    derivatives(ku, nu, du, u, first_u, &ud)
+    derivatives(kv, nv, dv, v, first_v, &vd)
+    var p = Vector3()
+    var pu = Vector3()
+    var pv = Vector3()
+    var w: f64 = 0.0
+    var wu: f64 = 0.0
+    var wv: f64 = 0.0
+    # Derivatives are translation invariant. Accumulate in a local frame so
+    # a small patch far from the origin does not subtract large world moments.
+    let origin = points[first_u*(usize)nv+first_v]
+    for iu in 0..<(usize)du + 1:
+        for iv in 0..<(usize)dv + 1:
+            let index = (first_u + iu) * (usize)nv + first_v + iv
+            let weight = bu[iu] * bv[iv] * weights[index]
+            let uweight = ud[iu] * bv[iv] * weights[index]
+            let vweight = bu[iu] * vd[iv] * weights[index]
+            let relative = points[index].subtract(origin)
+            p = p.add(relative.multiply_scalar(weight))
+            pu = pu.add(relative.multiply_scalar(uweight))
+            pv = pv.add(relative.multiply_scalar(vweight))
+            w += weight
+            wu += uweight
+            wv += vweight
+    if w <= 0.0 or not math.is_finite(w): error(invalid, "invalid normal denominator")
+    p = p.multiply_scalar(1.0 / w)
+    let a = pu.subtract(p.multiply_scalar(wu))
+    let b = pv.subtract(p.multiply_scalar(wv))
+    let al = a.length()
+    let bl = b.length()
+    if not math.is_finite(al) or not math.is_finite(bl): error(invalid,"nonfinite surface derivative")
+    if al == 0.0 or bl == 0.0: return Vector3()
+    # Normalize tangent magnitudes before crossing. A normal is a direction,
+    # not an area in model units or knot-domain units. Generic Vector3's fixed
+    # length cutoff rejected regular tiny patches and near-pole derivatives.
+    let n = a.multiply_scalar(1.0/al).cross(b.multiply_scalar(1.0/bl))
+    let length = n.length()
+    return n.multiply_scalar(1.0/length) if length > 1e-14 else Vector3()
+
+func derivatives(knots: const f64[], count: i64, degree: i64, parameter: f64, first: usize, values: f64[9]*):
+    var lower: f64[9]
+    let start = local_basis(knots, count, degree - 1, parameter, &lower)
+    for at in 0..<(usize)degree + 1:
+        let i = first + at
+        let a = knots[i + (usize)degree] - knots[i]
+        let b = knots[i + (usize)degree + 1] - knots[i + 1]
+        let left = lower[i - start] if i >= start and i < start + (usize)degree else 0.0
+        let right = lower[i + 1 - start] if i + 1 >= start and i + 1 < start + (usize)degree else 0.0
+        (*values)[at] = (f64)degree * ((left / a if a > 0.0 else 0.0) - (right / b if b > 0.0 else 0.0))

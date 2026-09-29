@@ -1,0 +1,76 @@
+## Explicit trim identities, never proximity welding. A pinched boundary can
+## visit one CAD vertex twice while preserving every incident boundary edge.
+import memory
+from three import Vector3, PolygonMesh, invalid
+
+## Map occurrences to their first occurrence. Empty identities mean all unique.
+pub func identify(points: const Vector3[], identities: const i64[]) -> i64[]!:
+    if identities.length != 0 and identities.length != points.length:
+        error(invalid,"trim identities must cover every boundary occurrence")
+    let result = try alloc i64[points.length] in memory.heap
+    errdefer free(result) in memory.heap
+    let slots = try alloc i64[points.length*2+1] in memory.heap
+    defer free(slots) in memory.heap
+    for at in 0..<slots.length: slots[at] = -1
+    for at in 0..<points.length:
+        result[at] = (i64)at
+        if identities.length == 0: continue
+        if identities[at] < 0: error(invalid,"trim identities must be nonnegative")
+        var slot = (usize)identities[at]%slots.length
+        while slots[slot] >= 0 and identities[(usize)slots[slot]] != identities[at]: slot = (slot+1)%slots.length
+        if slots[slot] < 0: slots[slot] = (i64)at
+        else:
+            let previous = (usize)slots[slot]
+            # Identity does not authorize collapsing inconsistent projections.
+            if points[previous].subtract(points[at]).length() > 1e-12:
+                error(invalid,"one trim identity has inconsistent UV positions")
+            result[at] = (i64)previous
+    return result
+
+struct EdgeUse:
+    var a: i64 = -1
+    var b: i64 = -1
+    var expected: usize = 0
+    var found: usize = 0
+
+## Audit directed-loop boundary multiplicity, including repeated seam vertices.
+pub func audit(mesh: PolygonMesh*, sizes: const i64[], aliases: const i64[]) -> !:
+    let table = try alloc EdgeUse[aliases.length*2+1] in memory.heap
+    defer free(table) in memory.heap
+    for at in 0..<table.length: table[at] = EdgeUse()
+    var offset: usize = 0
+    for size in sizes:
+        for at in 0..<(usize)size:
+            let a = aliases[offset+at]
+            let b = aliases[offset+(at+1)%(usize)size]
+            if a == b: error(invalid,"collapsed identified trim edge")
+            let slot = find(table,a,b)
+            table[slot].a = a if a < b else b
+            table[slot].b = b if a < b else a
+            table[slot].expected += 1
+        offset += (usize)size
+    let uses = try alloc usize[(usize)mesh.edge_count()] in memory.heap
+    defer free(uses) in memory.heap
+    for at in 0..<uses.length: uses[at] = 0
+    for face in 0..<mesh.face_count():
+        for at in 0..<(try mesh.face_size(face)):
+            uses[(usize)(try mesh.face_edge(face,at))] += 1
+    for edge in 0..<uses.length:
+        if uses[edge] == 0 or uses[edge] > 2: error(invalid,"trim grid has nonmanifold interior")
+        let a = try mesh.edge_point((i64)edge,0)
+        let b = try mesh.edge_point((i64)edge,1)
+        let slot = find(table,a,b)
+        if table[slot].expected > 0:
+            if uses[edge] != table[slot].expected: error(invalid,"trim grid boundary multiplicity changed")
+            table[slot].found = uses[edge]
+        elif uses[edge] != 2:
+            error(invalid,"trim grid has an open interior edge")
+    for entry in table:
+        if entry.expected != entry.found: error(invalid,"trim grid omitted a boundary segment")
+
+func find(table: const EdgeUse[], first: i64, second: i64) -> usize:
+    let a = first if first < second else second
+    let b = second if first < second else first
+    var slot = ((usize)a*73856093+(usize)b*19349663)%table.length
+    while table[slot].a >= 0 and (table[slot].a != a or table[slot].b != b): slot = (slot+1)%table.length
+    return slot

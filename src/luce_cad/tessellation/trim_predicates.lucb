@@ -1,0 +1,112 @@
+## Planar topology predicates, separate from CAD fitting/meshing tolerances.
+## Fast orientation filter with bounded floating-expansion fallback. The normal
+## selects a dominant projection; no constructed plane or coordinate snapping.
+import math
+from three import Vector3
+
+## Sign of the projected binary64 determinant. The exact fallback uses TwoDiff,
+## TwoSum and FMA product residuals (IEEE round-to-nearest, no reassociation).
+## Mesh coordinates and nondegenerate areas keep products in the normal range.
+pub func side(a: Vector3, b: Vector3, c: Vector3, normal: Vector3) -> i64:
+    let axis = dominant(normal)
+    let direction = normal.x if axis == 0 else (normal.y if axis == 1 else normal.z)
+    return orient(project(a,axis),project(b,axis),project(c,axis))*(1 if direction > 0.0 else -1)
+
+func orient(p: Vector3, q: Vector3, r: Vector3) -> i64:
+    let ax = p.x-r.x
+    let ay = p.y-r.y
+    let bx = q.x-r.x
+    let by = q.y-r.y
+    let left = ax*by
+    let right = ay*bx
+    let determinant = left-right
+    let bound = (math.abs(left)+math.abs(right))*1e-15
+    if determinant > bound: return 1
+    if determinant < -bound: return -1
+    let dx = [tail(p.x,r.x,ax),ax]
+    let dy = [tail(p.y,r.y,ay),ay]
+    let ex = [tail(q.x,r.x,bx),bx]
+    let ey = [tail(q.y,r.y,by),by]
+    var expansion: f64[32]
+    var count: usize = 0
+    for i in 0..<(usize)2:
+        for j in 0..<(usize)2:
+            product(expansion,&count,dx[i],ey[j],1.0)
+            product(expansion,&count,dy[i],ex[j],-1.0)
+    if count == 0: return 0
+    return 1 if expansion[count-1] > 0.0 else -1
+
+## Inclusive segment intersection. Nearness is not touching; exact endpoint
+## comparisons and determinant signs decide whether two constraints intersect.
+pub func intersects(a: Vector3, b: Vector3, c: Vector3, d: Vector3, n: Vector3) -> bool:
+    let axis = dominant(n)
+    let p = project(a,axis)
+    let q = project(b,axis)
+    let r = project(c,axis)
+    let s = project(d,axis)
+    if math.max(p.x,q.x) < math.min(r.x,s.x) or math.max(r.x,s.x) < math.min(p.x,q.x) or math.max(p.y,q.y) < math.min(r.y,s.y) or math.max(r.y,s.y) < math.min(p.y,q.y): return false
+    let ac = orient(p,q,r)
+    let ad = orient(p,q,s)
+    let ca = orient(r,s,p)
+    let cb = orient(r,s,q)
+    if ac*ad < 0 and ca*cb < 0: return true
+    return (ac == 0 and between(p,q,r)) or (ad == 0 and between(p,q,s)) or (ca == 0 and between(r,s,p)) or (cb == 0 and between(r,s,q))
+
+## Inclusive membership in a positive ear, using the same projected signs as
+## boundary intersection. A nearby vertex is not automatically inside the ear.
+pub func inside_triangle(a: Vector3, b: Vector3, c: Vector3, p: Vector3, n: Vector3) -> bool:
+    let axis = dominant(n)
+    let x = project(a,axis)
+    let y = project(b,axis)
+    let z = project(c,axis)
+    let q = project(p,axis)
+    if q.x < math.min(x.x,math.min(y.x,z.x)) or q.x > math.max(x.x,math.max(y.x,z.x)) or q.y < math.min(x.y,math.min(y.y,z.y)) or q.y > math.max(x.y,math.max(y.y,z.y)): return false
+    let direction = n.x if axis == 0 else (n.y if axis == 1 else n.z)
+    let sign = 1 if direction > 0.0 else -1
+    return orient(x,y,q)*sign >= 0 and orient(y,z,q)*sign >= 0 and orient(z,x,q)*sign >= 0
+
+## Half-open ray crossing for odd/even containment; division-free at near edges.
+pub func ray_crosses(a: Vector3, b: Vector3, p: Vector3, n: Vector3) -> bool:
+    let axis = dominant(n)
+    let x = project(a,axis)
+    let y = project(b,axis)
+    let q = project(p,axis)
+    if (x.y > q.y) == (y.y > q.y): return false
+    return (orient(x,y,q) > 0) == (y.y > x.y)
+
+func dominant(n: Vector3) -> i64:
+    return 2 if math.abs(n.z) >= math.abs(n.x) and math.abs(n.z) >= math.abs(n.y) else (1 if math.abs(n.y) >= math.abs(n.x) else 0)
+
+func project(p: Vector3, axis: i64) -> Vector3:
+    return Vector3(p.y,p.z,0.0) if axis == 0 else (Vector3(p.z,p.x,0.0) if axis == 1 else Vector3(p.x,p.y,0.0))
+
+func between(a: Vector3, b: Vector3, p: Vector3) -> bool:
+    return p.x >= math.min(a.x,b.x) and p.x <= math.max(a.x,b.x) and p.y >= math.min(a.y,b.y) and p.y <= math.max(a.y,b.y)
+
+func tail(a: f64, b: f64, difference: f64) -> f64:
+    let bv = a-difference
+    return (a-(difference+bv))+(bv-b)
+
+func product(values: f64[], count: usize*, a: f64, b: f64, sign: f64):
+    let high = a*b
+    let low = math.fma(a,b,-high)
+    accumulate(values,count,sign*low)
+    accumulate(values,count,sign*high)
+
+func accumulate(values: f64[], count: usize*, value: f64):
+    if value == 0.0: return
+    var q = value
+    var written: usize = 0
+    for at in 0..<*count:
+        let term = values[at]
+        let sum = q+term
+        let virtual = sum-q
+        let residual = (q-(sum-virtual))+(term-virtual)
+        if residual != 0.0:
+            values[written] = residual
+            written += 1
+        q = sum
+    if q != 0.0:
+        values[written] = q
+        written += 1
+    *count = written

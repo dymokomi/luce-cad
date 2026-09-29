@@ -1,0 +1,41 @@
+## Interior diagonal quality must be independent of model units. Canonical
+## seam identifications still forbid a diagonal that would collapse on lifting.
+from three import Vector3, MeshBuilder, invalid
+from luce_cad.tessellation.improve import improve
+
+pub func improve_contract() -> !:
+    for scale in [1e-6,1.0,1000.0]:
+        for axis in 0..<3:
+            for reverse in [false,true]:
+                for seam in [false,true]: try check(scale,axis,reverse,seam)
+
+func place(x: f64, y: f64, axis: i64) -> Vector3:
+    if axis == 0: return Vector3(x,y,0.0)
+    if axis == 1: return Vector3(0.0,x,y)
+    return Vector3(y,0.0,x)
+
+func check(scale: f64, axis: i64, reverse: bool, seam: bool) -> !:
+    var builder = try MeshBuilder()
+    defer builder.close()
+    for p in [place(0.0,0.0,axis),place(1.0,0.0,axis),place(0.4,0.0001,axis),place(0.5,-1.0,axis)]:
+        discard(try builder.point(p.multiply_scalar(scale)))
+    let corners = [0,1,2,1,0,3]
+    for face in 0..<(usize)2:
+        try builder.face(3)
+        for at in 0..<(usize)3: try builder.corner(corners[face*3+(2-at if reverse else at)])
+    let source = try builder.finish()
+    defer source.release()
+    let normal = place(1.0,0.0,axis).cross(place(0.0,1.0,axis)).multiply_scalar(-1.0 if reverse else 1.0)
+    let ids = [0,1,2,2 if seam else 3]
+    let result = try improve(source,normal,ids)
+    defer result.release()
+    let mesh = result.value()
+    if mesh.point_count() != 4 or mesh.face_count() != 2 or mesh.edge_count() != 5: error(invalid,"quality flips changed polygon topology")
+    for at in 0..<4:
+        if (try mesh.point(at)) != builder.points[(usize)at]: error(invalid,"quality flips moved a boundary vertex")
+    var wanted = false
+    for edge in 0..<mesh.edge_count():
+        let a = try mesh.edge_point(edge,0)
+        let b = try mesh.edge_point(edge,1)
+        if a == (0 if seam else 2) and b == (1 if seam else 3): wanted = true
+    if not wanted: error(invalid,"quality flip depends on scale or violates a seam identity")
