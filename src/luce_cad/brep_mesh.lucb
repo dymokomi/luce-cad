@@ -3,6 +3,7 @@
 import interop
 import memory
 import math
+import geocore_parallel as parallel
 from luce_cad.patch_dispatch import mesh_face
 from luce_cad.face_jobs import mesh_faces
 from luce_cad.edge_sampling import curve_intervals, compact_seams
@@ -19,11 +20,12 @@ from luce_cad.trim_layout import plan_layouts
 import luce_cad.curve_spacing as spacing
 from geocore import Vector3, Mesh, MeshBuilder, invalid
 from luce_cad.brep_types import Curve, Surface, BrepFace, Samples
+from luce_cad.face_cache import FaceCache
 
 ## Plan shared boundaries, run independent face jobs, and assemble provenance.
 ## With `curvature`, corner attributes curvature.k1/k2 hold the principal
 ## curvatures (surface_curvature); `directions` adds curvature.d1/d2.
-pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]? = none, selected: i64 = -1, curvature: bool = false, directions: bool = false) -> interop.Reference[Mesh]!:
+pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]? = none, selected: i64 = -1, curvature: bool = false, directions: bool = false, cache: FaceCache*? = none) -> interop.Reference[Mesh]!:
     if divisions < 1 or divisions > 64 or faces.length == 0:
         error(invalid, "B-rep tessellation requires faces and 1..64 divisions")
     if selected < -1 or selected >= (i64)faces.length: error(invalid,"CAD face index out of range")
@@ -49,21 +51,12 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     defer spacing.close(metrics)
     let compact = try compact_seams(faces,edges.length)
     defer free(compact) in memory.heap
-    for index in 0..<edges.length:
-        let edge = edges[index]
-        var count = try curve_intervals(edge, divisions, tolerance, &metrics[index], compact[index])
-        if edge_size > 0.0:
-            var length: f64 = 0.0
-            var previous = try edge.at(0.0)
-            for step in 1..<17:
-                let current = try edge.at((f64)step / 16.0)
-                length += current.subtract(previous).length()
-                previous = current
-            let needed = math.ceil(length / edge_size)
-            if needed > 256.0:
-                error(invalid, "edge size requires more than 256 intervals on an edge; increase it")
-            count = (usize)math.max((f64)count, needed)
-        counts[index] = count
+    # Each edge's interval count on its own (in parallel); a failing edge is
+    # counted again here, so its error is the serial one.
+    var counting = EdgeCounts(edges, metrics, compact, counts, divisions, tolerance, edge_size, 0)
+    parallel.parallel_for(edges.length, 64, count_edges, (void*)&counting)
+    if counting.failed.load(.acquire) != 0:
+        for index in 0..<edges.length: counts[index] = try edge_count(edges[index], &metrics[index], compact[index], divisions, tolerance, edge_size)
     let sides = try alloc PatchSides[faces.length] in memory.heap
     defer free(sides) in memory.heap
     for at in 0..<faces.length:
@@ -111,12 +104,15 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     try bind(faces,cuts,samples,plans)
     var normals: f64[]
     defer free(normals) in memory.heap
-    if faces.length >= 16 and selected < 0:
-        normals = try mesh_faces(&mesh, edges, surfaces, faces, samples, plans, divisions, tolerance, edge_size, progress, mesh_face)
+    # Face jobs on the pool (and the per-face cache, when given); small
+    # models without a cache mesh here, in order.
+    let pooled = selected < 0 and (faces.length >= 16 or cache != none)
+    if pooled:
+        normals = try mesh_faces(&mesh, edges, surfaces, faces, samples, plans, divisions, tolerance, edge_size, progress, mesh_face, cache)
     # Planned-face diagnostics keep ALL shared sampling/layout work above.
     # Only the final face jobs are restricted, unlike independent previews.
     let first_face = (usize)selected if selected >= 0 else 0
-    let last_face = first_face+1 if selected >= 0 else (faces.length if faces.length < 16 else 0)
+    let last_face = first_face+1 if selected >= 0 else (0 if pooled else faces.length)
     for face_id in first_face..<last_face:
         if let report = progress:
             let outcome = report.invoke((f64)face_id / (f64)faces.length * 0.9)
@@ -128,7 +124,7 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
         try mesh_face(&mesh, face, surface, edges, samples, plans[face_id], divisions, tolerance, edge_size)
         for index in first..<mesh.nf:
             mesh.face_parents[index] = (i64)face_id
-    if faces.length < 16 or selected >= 0: normals = try model_normals(&mesh, faces, surfaces, plans, tolerance)
+    if not pooled: normals = try model_normals(&mesh, faces, surfaces, plans, tolerance)
     let original = try alloc Vector3[mesh.np] in memory.heap
     defer free(original) in memory.heap
     # The CAD face that last placed each point. Its own polygons would place
@@ -208,6 +204,40 @@ func with_curvature(shaded: interop.Reference[Mesh], mesh: MeshBuilder*, origina
     let major = try both.value().with_attribute("curvature.d1", 1, 3, columns.d1, false, true)
     defer major.release()
     return try major.value().with_attribute("curvature.d2", 1, 3, columns.d2, false, true)
+
+struct EdgeCounts:
+    let edges: const Curve[]
+    let metrics: spacing.ArcMetric[]
+    let compact: const bool[]
+    let counts: usize[]
+    let divisions: i64
+    let tolerance: f64
+    let edge_size: f64
+    var failed: @u32
+
+func count_edges(context: void*?, first: usize, end: usize):
+    let work = (EdgeCounts*)(context else return)
+    for index in first..<end:
+        work.counts[index] = edge_count(work.edges[index], &work.metrics[index], work.compact[index], work.divisions, work.tolerance, work.edge_size) catch failure:
+            discard(failure)
+            work.failed.store(1, .relaxed)
+            return
+
+## An edge's interval count: its curvature's, raised to the target edge size.
+func edge_count(edge: Curve, metric: spacing.ArcMetric*, compact: bool, divisions: i64, tolerance: f64, edge_size: f64) -> usize!:
+    var count = try curve_intervals(edge, divisions, tolerance, metric, compact)
+    if edge_size > 0.0:
+        var length: f64 = 0.0
+        var previous = try edge.at(0.0)
+        for step in 1..<17:
+            let current = try edge.at((f64)step / 16.0)
+            length += current.subtract(previous).length()
+            previous = current
+        let needed = math.ceil(length / edge_size)
+        if needed > 256.0:
+            error(invalid, "edge size requires more than 256 intervals on an edge; increase it")
+        count = (usize)math.max((f64)count, needed)
+    return count
 
 func release_samples(samples: const Samples[]):
     for sample in samples:

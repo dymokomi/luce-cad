@@ -1,0 +1,62 @@
+## Lines drawn over a B-rep: its edges (each once, 64 chords when curved, as
+## the display's full-circle resolution: a coarse chord sinks into the
+## shaded mesh) and its hull (each B-spline surface's control net, rows then
+## columns), both as point pairs placed by `matrix` after the faces' own
+## placements.
+
+## Every edge's polyline, placed by the first face that uses it.
+pub func boundary_lines(model: const BrepModel*, matrix: Matrix4, out: Growing[Vector3]*) -> !:
+    let edges = (usize)model.edge_count()
+    var drawn = try BitsBuilder.zeros(edges)
+    defer drawn.close()
+    let records = try model.tessellation_records()
+    for face in 0..<(usize)model.face_count():
+        let placement = matrix.multiply(model.face_placement.get(face))
+        for use in model.uses_of(face):
+            let edge = (usize)(use - 1 if use > 0 else -use - 1)
+            if drawn.view().get(edge): continue
+            drawn.set(edge)
+            let curve = records.edges[edge]
+            let chords: usize = 1 if curve.kind == 0 else 64
+            var previous = placement.transform_point(try curve.at(0.0))
+            for step in 1..<chords + 1:
+                let point = placement.transform_point(try curve.at((f64)step / (f64)chords))
+                try out.push(previous)
+                try out.push(point)
+                previous = point
+
+## Every B-spline surface's control net, once per distinct placement of the
+## faces on it.
+pub func hull_lines(model: const BrepModel*, matrix: Matrix4, out: Growing[Vector3]*) -> !:
+    let surfaces = (usize)model.surface_count()
+    # The placements a surface's net was drawn with (a few at most).
+    var drawn = Growing[i64]()
+    defer drawn.close()
+    for face in 0..<(usize)model.face_count():
+        let surface = (usize)model.face_surface.get(face)
+        if model.surface_kind.get(surface) != 3: continue
+        let placement = model.face_placement.get(face)
+        var seen = false
+        for entry in drawn.view():
+            if (usize)(entry >> 32) == surface and same_matrix(model.face_placement.get((usize)(entry & 0xFFFFFFFF)), placement): seen = true
+        if seen: continue
+        try drawn.push(((i64)surface << 32) | (i64)face)
+        let dims = model.surface_dims.range(surface * 4, surface * 4 + 4)
+        let nu = (usize)dims[0]
+        let nv = (usize)dims[1]
+        let net = model.cvs_of(surface)
+        let place = matrix.multiply(placement)
+        # Control points run v fastest: index u * nv + v.
+        for u in 0..<nu:
+            for v in 0..<nv:
+                let here = place.transform_point(net[u * nv + v])
+                if v + 1 < nv:
+                    try out.push(here)
+                    try out.push(place.transform_point(net[u * nv + v + 1]))
+                if u + 1 < nu:
+                    try out.push(here)
+                    try out.push(place.transform_point(net[(u + 1) * nv + v]))
+    discard(surfaces)
+
+func same_matrix(a: Matrix4, b: Matrix4) -> bool:
+    return a.x.subtract(b.x).length() == 0.0 and a.y.subtract(b.y).length() == 0.0 and a.z.subtract(b.z).length() == 0.0 and a.translation.subtract(b.translation).length() == 0.0

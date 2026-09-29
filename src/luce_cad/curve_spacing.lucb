@@ -2,6 +2,7 @@
 ## These tables guide spacing only; exact curves still own every output point.
 import memory
 import math
+import geocore_parallel as parallel
 from luce_cad.brep_types import Curve, BrepFace
 from luce_cad.patch_sides import PatchSides, side_count, edge_index
 
@@ -46,14 +47,35 @@ pub func measure(edges: const Curve[]) -> ArcMetric[]!:
     for at in 0..<edges.length:
         let count: usize = 2 if edges[at].kind == 0 else 65
         result[at].lengths = try alloc f64[count] in memory.heap
-        let values = result[at].lengths
-        values[0] = 0.0
-        var previous = try edges[at].at(0.0)
-        for step in 1..<count:
-            let current = try edges[at].at((f64)step/(f64)(count-1))
-            values[step] = values[step-1]+current.subtract(previous).length()
-            previous = current
+    # Sampling is pure per curve: in parallel, then serially if one failed
+    # (so the error is the serial one).
+    var sampling = Sampling(edges, result, 0)
+    parallel.parallel_for(edges.length, 32, sample_lengths, (void*)&sampling)
+    if sampling.failed.load(.acquire) != 0:
+        for at in 0..<edges.length: try lengths(edges[at], result[at].lengths)
     return result
+
+struct Sampling:
+    let edges: const Curve[]
+    let metrics: ArcMetric[]
+    var failed: @u32
+
+func sample_lengths(context: void*?, first: usize, end: usize):
+    let work = (Sampling*)(context else return)
+    for at in first..<end:
+        lengths(work.edges[at], work.metrics[at].lengths) catch failure:
+            discard(failure)
+            work.failed.store(1, .relaxed)
+            return
+
+## Cumulative chord lengths at even parameter steps.
+func lengths(edge: Curve, values: f64[]) -> !:
+    values[0] = 0.0
+    var previous = try edge.at(0.0)
+    for step in 1..<values.length:
+        let current = try edge.at((f64)step/(f64)(values.length-1))
+        values[step] = values[step-1]+current.subtract(previous).length()
+        previous = current
 
 ## Release a metric array returned by measure.
 pub func close(metrics: const ArcMetric[]):

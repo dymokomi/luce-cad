@@ -1,0 +1,105 @@
+## The cv domain: the control vertices of every B-spline surface, in surface
+## order (surface s owns cvs surface_cv_offsets[s]..<[s + 1]). Moving some
+## makes a copy of the model that shares every other column; its per-face
+## tessellation cache starts from this model's, so only faces whose inputs
+## changed (the moved surfaces' faces, and neighbours whose layout follows
+## them) are meshed again. A face stays valid while its trim edges still lie
+## on the surface: moving the boundary rows of a trimmed net needs its edges
+## moved too, which this does not do.
+
+extend BrepModel:
+    pub func cv_count() -> i64:
+        return (i64)self.cv_positions.count
+
+    ## Where cv `index` is, in B-rep space (before face placements).
+    pub func cv_position(index: i64) -> Vector3!:
+        if index < 0 or index >= self.cv_count(): error(invalid, "CAD control vertex out of range")
+        return self.cv_positions.get((usize)index)
+
+    ## The surface whose control net holds cv `index`.
+    pub func cv_surface(index: i64) -> i64!:
+        if index < 0 or index >= self.cv_count(): error(invalid, "CAD control vertex out of range")
+        var low: usize = 0
+        var high = self.surface_kind.count
+        while low + 1 < high:
+            let middle = (low + high) // 2
+            if (i64)self.surface_cv_offsets.get(middle) <= index: low = middle
+            else: high = middle
+        return (i64)low
+
+    ## Faces whose tessellation came from the per-face cache since the last
+    ## call (diagnostics and tests).
+    pub func reused_faces() -> i64:
+        let derived = self.derived
+        derived.lock.lock()
+        defer derived.lock.unlock()
+        if let cache = derived.faces: return (i64)cache.take_hits()
+        return 0
+
+    ## A copy with cvs `ids` moved by `delta` (B-rep space).
+    pub func with_cvs_moved(ids: const i64[], delta: Vector3) -> interop.Reference[BrepModel]!:
+        if not delta.is_finite(): error(invalid, "a control vertex move must be finite")
+        for id in ids:
+            if id < 0 or id >= self.cv_count(): error(invalid, "CAD control vertex out of range")
+        let copy = try self.shared_copy()
+        errdefer copy.release()
+        let positions = try copy.value().cv_positions.writable()
+        for id in ids: positions[(usize)id] = positions[(usize)id].add(delta)
+        return copy
+
+    ## Another model over the same columns (O(1) each), with copies of the
+    ## face paths and a face cache inherited from this one.
+    func shared_copy() -> interop.Reference[BrepModel]!:
+        let output = try interop.Reference[BrepModel].adopt(new BrepModel(self.tolerance) in memory.heap, brep_model_type, memory.heap)
+        errdefer output.release()
+        let target = output.value()
+        target.vertices.close()
+        target.vertices = self.vertices.share()
+        target.curve_kind = self.curve_kind.share()
+        target.curve_ends = self.curve_ends.share()
+        target.curve_frame = self.curve_frame.share()
+        target.curve_degree = self.curve_degree.share()
+        target.curve_sense = self.curve_sense.share()
+        target.curve_point_offsets.close()
+        target.curve_point_offsets = self.curve_point_offsets.share()
+        target.curve_points = self.curve_points.share()
+        target.curve_weight_offsets.close()
+        target.curve_weight_offsets = self.curve_weight_offsets.share()
+        target.curve_weights = self.curve_weights.share()
+        target.curve_knot_offsets.close()
+        target.curve_knot_offsets = self.curve_knot_offsets.share()
+        target.curve_knots = self.curve_knots.share()
+        target.surface_kind = self.surface_kind.share()
+        target.surface_frame = self.surface_frame.share()
+        target.surface_dims = self.surface_dims.share()
+        target.surface_cv_offsets.close()
+        target.surface_cv_offsets = self.surface_cv_offsets.share()
+        target.cv_positions = self.cv_positions.share()
+        target.surface_weight_offsets.close()
+        target.surface_weight_offsets = self.surface_weight_offsets.share()
+        target.cv_weights = self.cv_weights.share()
+        target.surface_knot_offsets.close()
+        target.surface_knot_offsets = self.surface_knot_offsets.share()
+        target.surface_knots = self.surface_knots.share()
+        target.face_surface = self.face_surface.share()
+        target.face_sense = self.face_sense.share()
+        target.face_use_offsets.close()
+        target.face_use_offsets = self.face_use_offsets.share()
+        target.face_uses = self.face_uses.share()
+        target.face_loop_offsets.close()
+        target.face_loop_offsets = self.face_loop_offsets.share()
+        target.loop_sizes = self.loop_sizes.share()
+        target.face_placement = self.face_placement.share()
+        target.face_color = self.face_color.share()
+        target.face_colored = self.face_colored.share()
+        for path in self.face_paths.view():
+            var copy: interop.Packet[str]? = none
+            if let text = path: copy = try interop.text_transfer.copy(text.value)
+            target.face_paths.push(copy) catch failure:
+                if let made = copy: made.release()
+                error(failure.code, failure.message)
+        let derived = self.derived
+        derived.lock.lock()
+        defer derived.lock.unlock()
+        if let cache = derived.faces: target.derived.faces = try inherited(cache)
+        return output

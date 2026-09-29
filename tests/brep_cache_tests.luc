@@ -1,0 +1,55 @@
+## The B-rep's columns and caches: the cv domain, O(1) copies with moved
+## control vertices, the kept tessellation a Tessellate node places, the
+## per-face cache that re-meshes only what a move changed, and the overlay.
+from cad import BrepModel, CadModel
+from cad_geometry import CadGeometry
+from geocore import Vector3
+from checks import near, manifold
+
+## A closed solid: a raised B-spline dome (its border rows flat, so its
+## lines stay on it) and a planar cap under it.
+func solid() -> CadModel!:
+    let b = BrepModel()
+    let knots = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    let points: list[Vector3] = []
+    for u in 0..<3:
+        for v in 0..<3:
+            points.append(Vector3(float(u), float(v), 4.0 if u == 1 and v == 1 else 0.0))
+    for p in [points[0], points[6], points[8], points[2]]: discard(b.add_vertex(p))
+    for edge in 0..<4: discard(b.add_line(edge, (edge + 1) % 4))
+    let dome = b.add_spline_surface(points, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 3, 3, 2, 2, knots, knots)
+    discard(b.add_face(dome, [1, 2, 3, 4], [4]))
+    let plane = b.add_surface(0, Vector3(), Vector3(0.0, 0.0, 1.0), Vector3(1.0, 0.0, 0.0))
+    discard(b.add_face(plane, [-4, -3, -2, -1], [4], false))
+    let model = CadModel()
+    model.attach_brep(b)
+    return model
+
+pub func brep_cache_tests() -> unit!:
+    let model = solid()
+    assert(model.cv_count() == 9)
+    near(model.cv_position(4).z, 4.0)
+    let first = model.tessellate(8)
+    manifold(first)
+    # The same settings give the kept mesh: the same columns.
+    let again = model.tessellate(8)
+    assert(again.points_id() == first.points_id())
+    # A Tessellate node places the kept mesh (curvature on: as the viewport shows it).
+    let shown = model.tessellate(8, 0.0, none, model.supports_curvature())
+    let placed = CadGeometry.tessellated(CadGeometry.of_model(model), 8, 0.0)
+    assert((placed.mesh() else trap("no mesh")).points_id() == shown.points_id())
+    # Moving the dome's middle cv: a copy; the original keeps its net.
+    let moved = model.with_cvs_moved([4], Vector3(0.0, 0.0, 1.0))
+    near(model.cv_position(4).z, 4.0)
+    near(moved.cv_position(4).z, 5.0)
+    discard(model.reused_faces())
+    let raised = moved.tessellate(8)
+    manifold(raised)
+    assert(raised.bounds().maximum.z > first.bounds().maximum.z + 0.1)
+    # Only the dome was meshed again: the cap came from the cache.
+    assert(moved.reused_faces() == 1)
+    # The overlay: 4 straight edges, the dome's 3x3 net (12 lines), 2 guides.
+    let lines = model.overlay(first)
+    assert(lines.boundary_count() == 8 and lines.hull_count() == 24 and lines.guide_count() == 4)
+    near(lines.hull_point(0).z, 0.0)
+    print("PASS B-rep columns: cv domain, O(1) moved copies, kept tessellation placed by Tessellate, per-face cache reuse and overlay")

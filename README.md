@@ -60,6 +60,43 @@ coplanarity tolerance 1e-6 in source units. Up to 1024 independent CAD faces are
 stored; generated meshes are also bounded by luce-geocore's modeling budgets. A valid
 analytic model can exceed a particular display mesh budget and fail tessellation.
 
+## B-rep storage, the cv domain and the tessellation caches
+
+`BrepModel` is a structure of arrays: vertices, curves, surfaces, faces and
+loops are columns (geocore `Column`s with change ids, `brep/model.lucb` and
+`brep_store.lucb`), so copies of a model share them by count. The control
+vertices of every B-spline surface form the **cv domain** (`cv_count`,
+`cv_position`, `cv_surface`); `with_cvs_moved(ids, delta)` returns an O(1)
+copy that shares every column but the cv positions. (A face stays valid while
+its trim edges still lie on the moved net: interior cvs, or boundary rows
+moved with their edges.)
+
+Tessellation is a cache, not a conversion:
+
+- **Per face** (`face_cache.lucb`): each face job's result is kept as a piece
+  keyed by every input it reads: its support surface, the curves of its edge
+  uses, its boundary points (by position, by which entries share a point and
+  by id rank), its layout plan and the parameters. Corners name boundary
+  points by their place in the face's boundary table, so pieces survive the
+  id shifts of unrelated edges. A moved copy inherits the pieces: only faces
+  whose inputs changed are meshed again (`reused_faces()` counts hits).
+- **Per parameters**: `mesh(...)` keeps the last four whole tessellations,
+  each with the faces' paths in `path`. `CadModel.tessellate` with an
+  identity placement returns the kept mesh, and
+  `CadGeometry.tessellated` places a single model's kept mesh in the set
+  without a copy: a Tessellate node with the viewport's settings is O(1) and
+  its GPU buffers are the ones already made for the display.
+
+`CadModel.overlay(mesh)` returns a `CadOverlay`: each edge's polyline once
+(64 chords when curved), the hull (every control net, rows then columns, per
+distinct face placement) and a normal guide per face, as point pairs.
+
+On `camera.step` (2,710 faces, 26,674 cvs; 707k points, 655k polygons) the
+kept mesh takes 1.07 s to make (1.51 s before; arc sampling, interval counts
+and seam comparison now run in parallel), a Tessellate node placing it
+0.03 ms, the overlay 46 ms; moving one cv and re-tessellating takes 0.9 s,
+most of it the global layout plan, with the untouched faces' pieces reused.
+
 ## Shared boundary topology
 
 `BrepModel` owns vertices, line/circle/rational spline edges, analytic support

@@ -11,6 +11,9 @@ from geocore import Vector3, MeshBuilder, invalid
 from luce_cad.brep_types import Surface, Curve, BrepFace, Samples
 from luce_cad.surface_normals import face_normals
 from luce_cad.layout_types import GridLayout
+from luce_cad.face_cache import FaceCache, Piece, Tables, face_tables, face_key, new_piece, release_piece
+from geocore_growing import Growing
+import math
 
 pub type FaceMesher = func(MeshBuilder*, BrepFace, Surface, const Curve[], const Samples[], GridLayout, i64, f64, f64) -> unit!
 
@@ -47,6 +50,8 @@ struct Jobs:
     let edge_size: f64
     let products: Product[]
     let mesher: FaceMesher
+    ## The faces to mesh (the rest come from the cache).
+    let order: const usize[]
 
 ## One pool item per worker: each keeps one scratch builder for all its faces.
 func run(raw: void*?, slot: usize):
@@ -66,10 +71,10 @@ func work(jobs: Jobs*) -> !:
         discard(try scratch.point(point))
     while true:
         jobs.lock.lock()
-        if jobs.stop or jobs.next == jobs.faces.length:
+        if jobs.stop or jobs.next == jobs.order.length:
             jobs.lock.unlock()
             return
-        let index = jobs.next
+        let index = jobs.order[jobs.next]
         jobs.next += 1
         jobs.lock.unlock()
         scratch.np = jobs.points.length
@@ -108,17 +113,38 @@ func prepare(jobs: Jobs*, index: usize, scratch: MeshBuilder*) -> !:
 
 ## The caller invokes progress on its own thread. Results are assembled in face
 ## order, so parallel scheduling cannot change point IDs, topology or attributes.
-pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], samples: const Samples[], plans: const GridLayout[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]?, mesher: FaceMesher) -> f64[]!:
+## With a cache, faces whose inputs are unchanged reuse their pieces and the
+## rest are kept for next time (face_cache.lucb).
+pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], samples: const Samples[], plans: const GridLayout[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]?, mesher: FaceMesher, cache: FaceCache*? = none) -> f64[]!:
     let products = try alloc Product[faces.length] in memory.heap
     defer free(products) in memory.heap
     for index in 0..<products.length:
         products[index] = Product()
     defer close_products(products)
-    var jobs = Jobs(points = mesh.points[..<mesh.np], edges = edges, surfaces = surfaces, faces = faces, samples = samples, plans = plans, divisions = divisions, tolerance = tolerance, edge_size = edge_size, products = products, mesher = mesher)
+    # Cached faces: their keys, tables and pieces.
+    var tables = Tables()
+    defer tables.close()
+    let keys = try alloc u64[faces.length] in memory.heap
+    defer free(keys) in memory.heap
+    let found = try alloc Piece*?[faces.length] in memory.heap
+    defer free(found) in memory.heap
+    for index in 0..<faces.length: found[index] = none
+    defer release_found(found)
+    var order = Growing[usize]()
+    defer order.close()
+    if let store = cache:
+        try face_tables(faces, samples, plans, &tables)
+        var keying = Keying(faces, surfaces, edges, samples, plans, mesh.points[..<mesh.np], &tables, divisions, tolerance, edge_size, keys)
+        parallel.parallel_for(faces.length, 16, key_faces, (void*)&keying)
+        for index in 0..<faces.length: found[index] = store.find(index, keys[index])
+    for index in 0..<faces.length:
+        if found[index] == none: try order.push(index)
+    var jobs = Jobs(points = mesh.points[..<mesh.np], edges = edges, surfaces = surfaces, faces = faces, samples = samples, plans = plans, divisions = divisions, tolerance = tolerance, edge_size = edge_size, products = products, mesher = mesher, order = order.view())
     defer release_failure(&jobs)
     var job = parallel.Job()
     let threads = job_threads()
-    parallel.start(&job, threads if threads < faces.length else faces.length, run, (void*)&jobs)
+    let wanted = order.count
+    parallel.start(&job, threads if threads < wanted else wanted, run, (void*)&jobs)
     var running = true
     defer:
         if running: stop_jobs(&jobs, &job)
@@ -130,11 +156,11 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         jobs.lock.unlock()
         if completed != reported:
             if let report = progress:
-                let outcome = report.invoke((f64)completed / (f64)faces.length * 0.9)
+                let outcome = report.invoke((f64)completed / (f64)math.max(1.0, (f64)wanted) * 0.9)
                 defer outcome.release()
                 try outcome.get()
             reported = completed
-        if completed == faces.length or stopped:
+        if completed == wanted or stopped:
             break
         thread.sleep(2)
     stop_jobs(&jobs, &job)
@@ -151,12 +177,24 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
             if let owner = owned.owner: discard(ownership.pool_object(owner))
             error(invalid, owned.value)
     let boundary = mesh.np
+    # New faces become pieces for next time (unless a corner falls outside
+    # the face's boundary table).
+    if let store = cache:
+        for index in order.view():
+            if let piece = try made_piece(&products[index], index, boundary, &tables, keys[index], plans[index]): try store.put(index, piece)
     var normal_count: usize = 0
-    for product in products: normal_count += product.normals.length
+    for index in 0..<products.length:
+        if let piece = found[index]: normal_count += piece.normals.length
+        else: normal_count += products[index].normals.length
     let normals = try alloc f64[normal_count] in memory.heap
     errdefer free(normals) in memory.heap
     var normal_offset: usize = 0
     for index in 0..<products.length:
+        if let piece = found[index]:
+            try place_piece(mesh, piece, index, &tables, plans[index])
+            memory.copy(normals[normal_offset..<normal_offset + piece.normals.length], piece.normals, piece.normals.length)
+            normal_offset += piece.normals.length
+            continue
         let product = products[index]
         let base = mesh.np
         for point in product.points:
@@ -179,6 +217,90 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         memory.copy(normals[normal_offset..<normal_offset + product.normals.length], product.normals, product.normals.length)
         normal_offset += product.normals.length
     return normals
+
+## Keys of every face, in parallel (pure reads).
+struct Keying:
+    let faces: const BrepFace[]
+    let surfaces: const Surface[]
+    let edges: const Curve[]
+    let samples: const Samples[]
+    let plans: const GridLayout[]
+    let points: const Vector3[]
+    let tables: const Tables*
+    let divisions: i64
+    let tolerance: f64
+    let edge_size: f64
+    let keys: u64[]
+
+func key_faces(context: void*?, first: usize, end: usize):
+    let keying = (Keying*)(context else return)
+    for index in first..<end:
+        keying.keys[index] = face_key(index, keying.faces, keying.surfaces, keying.edges, keying.samples, keying.plans, keying.points, keying.tables, keying.divisions, keying.tolerance, keying.edge_size)
+
+## Face `index`'s product as a piece: boundary corners by table entry, or
+## none when one is not in the table.
+func made_piece(product: Product*, index: usize, boundary: usize, tables: const Tables*, key: u64, plan: GridLayout) -> Piece*?!:
+    let corners = try alloc i64[product.corners.length] in memory.heap
+    for at in 0..<corners.length:
+        let id = product.corners[at]
+        if (usize)id >= boundary:
+            corners[at] = id - (i64)boundary
+            continue
+        let entry = tables.entry(index, id)
+        if entry < 0:
+            free(corners) in memory.heap
+            return none
+        corners[at] = -entry - 1
+    var points: Vector3[]
+    var sizes: i64[]
+    var display: i64[]
+    var normals: f64[]
+    errdefer:
+        free(corners) in memory.heap
+        if points.length > 0: free(points) in memory.heap
+        if sizes.length > 0: free(sizes) in memory.heap
+        if display.length > 0: free(display) in memory.heap
+        if normals.length > 0: free(normals) in memory.heap
+    points = try copied(product.points)
+    sizes = try copied(product.sizes)
+    display = try copied(product.display)
+    normals = try copied(product.normals)
+    return try new_piece(key, points, sizes, corners, display, normals, plan.method[0] if plan.method.length > 0 else 0, plan.applied.length > 0 and plan.applied[0])
+
+func copied[T](values: const T[]) -> T[]!:
+    var empty: T[]
+    if values.length == 0: return empty
+    let copy = try alloc T[values.length] in memory.heap
+    memory.copy(copy, values, values.length)
+    return copy
+
+## Append a cached face: its own points, then faces over them and its
+## boundary table's current ids; its plan gets the strategy it records.
+func place_piece(mesh: MeshBuilder*, piece: const Piece*, index: usize, tables: const Tables*, plan: GridLayout) -> !:
+    if plan.method.length > 0: plan.method[0] = piece.method
+    if plan.applied.length > 0: plan.applied[0] = piece.applied
+    let table = tables.of(index)
+    let base = mesh.np
+    for point in piece.points: discard(try mesh.point(point))
+    var corner: usize = 0
+    var display: usize = 0
+    var local_indices: i64[762]
+    for size in piece.sizes:
+        let first = corner
+        try mesh.face(size, (i64)index)
+        for at in 0..<size:
+            let id = piece.corners[corner]
+            try mesh.corner((i64)base + id if id >= 0 else table[(usize)(-id - 1)])
+            corner += 1
+        let count = ((usize)size-2)*3
+        if piece.display.length > 0 and piece.display[display] >= 0:
+            for at in 0..<count: local_indices[at] = piece.display[display+at]-(i64)first
+            try mesh.set_last_display(local_indices[..<count])
+        display += count
+
+func release_found(found: Piece*?[]):
+    for piece in found:
+        if let held = piece: release_piece(held)
 
 func stop_jobs(jobs: Jobs*, job: parallel.Job*):
     jobs.lock.lock()

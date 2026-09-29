@@ -2,6 +2,7 @@
 ## These are sampled layout decisions, not certified geometric continuity orders.
 import memory
 import math
+import geocore_parallel as parallel
 from geocore import Vector3, invalid
 from luce_cad.brep_types import Curve, Surface, BrepFace
 from luce_cad.mapped_patch import parameter, point
@@ -34,24 +35,52 @@ pub func classify(edges: const Curve[], surfaces: const Surface[], faces: const 
             if seam.uses == 0: seam.first = (i64)face
             elif seam.uses == 1: seam.second = (i64)face
             seam.uses += 1
+    # Each seam is compared on its own (in parallel); a seam whose comparison
+    # failed for another reason than invalid geometry is compared again here,
+    # so the error is the serial one.
+    var comparing = Comparing(edges, surfaces, faces, result, tolerance, 0)
+    parallel.parallel_for(edges.length, 32, compare_seams, (void*)&comparing)
+    if comparing.failed.load(.acquire) != 0:
+        for edge in 0..<edges.length: try judge(&result[edge], edges[edge], surfaces, faces, tolerance)
     for edge in 0..<edges.length:
         let seam = &result[edge]
-        if seam.uses != 2: continue
-        if seam.first == seam.second:
-            seam.smooth = true
-            seam.aligned = true
-            continue
-        compare(seam,edges[edge],surfaces,faces,tolerance) catch failure:
-            if failure.code != invalid: error(failure.code,failure.message)
-            seam.smooth = false
-            seam.aligned = false
-            recover ()
+        if seam.uses != 2 or seam.first == seam.second: continue
         if seam.aligned:
             let a = root(plans,seam.first)
             let b = root(plans,seam.second)
             plans[(usize)(a if a > b else b)].island = a if a < b else b
     for at in 0..<plans.length: plans[at].island = root(plans,(i64)at)
     return result
+
+struct Comparing:
+    let edges: const Curve[]
+    let surfaces: const Surface[]
+    let faces: const BrepFace[]
+    let seams: SeamFlow[]
+    let tolerance: f64
+    var failed: @u32
+
+func compare_seams(context: void*?, first: usize, end: usize):
+    let work = (Comparing*)(context else return)
+    for edge in first..<end:
+        judge(&work.seams[edge], work.edges[edge], work.surfaces, work.faces, work.tolerance) catch failure:
+            discard(failure)
+            work.failed.store(1, .relaxed)
+            return
+
+## Whether a two-face seam is smooth and its faces' grids aligned across it
+## (a face meeting itself always is); invalid geometry is neither.
+func judge(seam: SeamFlow*, edge: Curve, surfaces: const Surface[], faces: const BrepFace[], tolerance: f64) -> !:
+    if seam.uses != 2: return
+    if seam.first == seam.second:
+        seam.smooth = true
+        seam.aligned = true
+        return
+    compare(seam,edge,surfaces,faces,tolerance) catch failure:
+        if failure.code != invalid: error(failure.code,failure.message)
+        seam.smooth = false
+        seam.aligned = false
+        recover ()
 
 func root(plans: const GridLayout[], start: i64) -> i64:
     var at = start

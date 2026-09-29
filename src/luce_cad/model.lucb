@@ -14,6 +14,10 @@ import luce_cad.preview_set as preview_set
 from luce_cad.preview_set import PreviewPart, collect_preview
 pub type CadPreviewSet = preview_set.CadPreviewSet
 pub let cad_preview_set_type = preview_set.cad_preview_set_type
+import luce_cad.cad_overlay as cad_overlay
+pub type CadOverlay = cad_overlay.CadOverlay
+pub let cad_overlay_type = cad_overlay.cad_overlay_type
+from luce_cad.brep import boundary_lines, hull_lines
 
 struct Face:
     let points: Vector3[]
@@ -154,6 +158,76 @@ pub struct CadModel:
         self.faces[(usize)face].u1 = u1
         self.faces[(usize)face].v0 = v0
         self.faces[(usize)face].v1 = v1
+
+    ## The B-rep's control vertices (the cv domain; 0 without a B-rep).
+    pub func cv_count() -> i64:
+        if let boundary = self.boundary: return boundary.value().cv_count()
+        return 0
+
+    ## Faces the last tessellations took from the per-face cache.
+    pub func reused_faces() -> i64:
+        if let boundary = self.boundary: return boundary.value().reused_faces()
+        return 0
+
+    ## Where cv `index` is, placed as the model is.
+    pub func cv_position(index: i64) -> Vector3!:
+        let boundary = self.boundary else error(invalid, "CAD model has no B-rep")
+        return self.placement.transform_point(try boundary.value().cv_position(index))
+
+    ## A copy with cvs `ids` moved by `delta` (model space): its B-rep shares
+    ## every column but the cv positions, and its tessellation reuses every
+    ## face whose inputs did not change.
+    pub func with_cvs_moved(ids: const i64[], delta: Vector3) -> interop.Reference[CadModel]!:
+        let boundary = self.boundary else error(invalid, "CAD model has no B-rep")
+        let inner = try unplaced(self.placement, delta)
+        let moved = try boundary.value().with_cvs_moved(ids, inner)
+        defer moved.release()
+        let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
+        errdefer result.release()
+        for entry in self.faces[..<self.count]:
+            try result.value().append(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv)
+            let index = result.value().count - 1
+            result.value().faces[index].u0 = entry.u0
+            result.value().faces[index].u1 = entry.u1
+            result.value().faces[index].v0 = entry.v0
+            result.value().faces[index].v1 = entry.v1
+            result.value().faces[index].reversed = entry.reversed
+        try result.value().attach_brep(moved)
+        result.value().placement = self.placement
+        return result
+
+    ## Lines to draw over the model: its edges, its hull and a normal guide
+    ## per face of `mesh` (its tessellation).
+    pub func overlay(mesh: interop.Reference[Mesh]) -> interop.Reference[CadOverlay]!:
+        let result = try interop.Reference[CadOverlay].adopt(new CadOverlay() in memory.heap, cad_overlay_type, memory.heap)
+        errdefer result.release()
+        let boundaries = cad_overlay.boundary_list(result.value())
+        let hull = cad_overlay.hull_list(result.value())
+        if let boundary = self.boundary:
+            try boundary_lines(boundary.value(), self.placement, boundaries)
+            try hull_lines(boundary.value(), self.placement, hull)
+        for index in 0..<self.count:
+            let entry = self.faces[index]
+            let edges = try self.edge_count_in(none, (i64)index)
+            for edge in 0..<edges:
+                let chords = 1 if entry.nu == 0 else 64
+                var previous = try self.edge_point_in(none, (i64)index, edge, 0.0)
+                for step in 1..<chords + 1:
+                    let next = try self.edge_point_in(none, (i64)index, edge, (f64)step / (f64)chords)
+                    try boundaries.push(previous)
+                    try boundaries.push(next)
+                    previous = next
+            for u in 0..<(usize)entry.nu:
+                for v in 0..<(usize)entry.nv:
+                    let here = self.placement.transform_point(entry.points[u * (usize)entry.nv + v])
+                    if v + 1 < (usize)entry.nv:
+                        try hull.push(here)
+                        try hull.push(self.placement.transform_point(entry.points[u * (usize)entry.nv + v + 1]))
+                    if u + 1 < (usize)entry.nu:
+                        try hull.push(here)
+                        try hull.push(self.placement.transform_point(entry.points[(u + 1) * (usize)entry.nv + v]))
+        try cad_overlay.face_guides(mesh.value(), cad_overlay.guide_list(result.value()))
+        return result
 
     ## The B-rep, resolved on the calling thread: preview workers may use the
     ## pointer but not the reference, whose owner belongs to this thread.
@@ -302,6 +376,8 @@ pub struct CadModel:
             if let boundary = self.boundary:
                 let part = try boundary.value().mesh(segments, edge_size, progress, curvature, directions)
                 defer part.release()
+                # An identity placement shares the mesh as it is.
+                if self.placement.is_identity(): return part.clone()
                 let placed = try part.value().placed(self.placement)
                 if not analysis or self.placement.is_identity(): return placed
                 defer placed.release()
@@ -438,6 +514,17 @@ func scaled_curvature(mesh: interop.Reference[Mesh], matrix: Matrix4, directions
         current.release()
         current = next
     return current.clone()
+
+## `delta` (placed, model space) in the B-rep's own space: the placement's
+## linear part solved for it.
+func unplaced(matrix: Matrix4, delta: Vector3) -> Vector3!:
+    let determinant = matrix.determinant()
+    if not math.is_finite(determinant) or math.abs(determinant) < 0.000000000001: error(invalid, "CAD placement is singular")
+    # Cramer's rule over the columns x, y, z.
+    let x = delta.dot(matrix.y.cross(matrix.z)) / determinant
+    let y = matrix.x.dot(delta.cross(matrix.z)) / determinant
+    let z = matrix.x.dot(matrix.y.cross(delta)) / determinant
+    return Vector3(x, y, z)
 
 struct PreviewJob:
     let model: const CadModel*
