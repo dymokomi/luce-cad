@@ -22,12 +22,19 @@ Exports: `cad` (the analytic model, `luce_cad.model`) and `tessellation`
   retains the exact rational control net and expanded knot vectors.
 - `trim_rectangle(face, u0, u1, v0, v1)` changes the NURBS face's rectangular
   parameter domain. Invalid edits leave the previous domain unchanged.
-- `tessellate(segments=16, edge_size=0)` creates a display mesh without replacing
+- `tessellate(segments=16, edge_size=0, progress, curvature=false,
+  directions=false)` creates a display mesh without replacing
   analytic data. Zero disables size refinement; positive values are target
   spacing in source units, not a guaranteed minimum/maximum edge length.
 - `face_count()` counts CAD faces, not tessellated polygons.
 - `preview_face(face, divisions=8)` produces one disposable display patch,
   without requiring the entire CAD model to fit a single polygon mesh.
+- `preview(progress)` previews every face on the worker pool (8 divisions for
+  faces with more than 32 edges, else 16; then 4, then 16 on failure) and
+  returns a `CadPreviewSet`: display batches of at most 4,096 points and
+  16,000 corners merged in face order, deduplicated analytic boundary
+  segments (64 chords per curved edge), one normal guide per meshed face, and
+  the failed-face count with the first failure as `Patch N: message`.
 - `planned_face(face, segments=16, edge_size=0)` is a B-rep diagnostic: build
   the complete shared-edge/layout plan, then mesh only the selected face.
   Unlike isolated preview, this retains the full cook's neighboring station
@@ -329,6 +336,31 @@ bounded convex-hull closest-point iteration. Acceptance still requires every
 sample to lie inside the same open-hemisphere margin; antipodal domains remain
 unsupported. Scale/frame/density/reversal contracts preserve the exact sphere
 and boundary points and verify rejection of genuinely incompatible domains.
+
+## Curvature analysis
+
+`tessellate(..., curvature=true)` (and `BrepModel.mesh`) adds corner
+attributes `curvature.k1` and `curvature.k2`: the principal curvatures of the
+exact support at each corner, from its first and second fundamental forms
+(rational NURBS second derivatives, or the analytic chart's). k1 >= k2;
+positive where the surface bends away from the face's outward normal, so a
+sphere of radius r has H = 1/r and K = 1/r^2, a convex cylinder k1 = 1/r and
+k2 = 0, and a bore k2 = -1/r. `directions=true` adds unit principal
+directions `curvature.d1`/`d2`. Values are per corner, like `N`, so faces
+meeting at a seam keep their own. Off by default; about 0.1 s on a 2.7M-corner
+model. A CadModel placement must be a uniform scale (curvature divides by it).
+The columns are float64 until luce-geocore's public API can add float32 ones.
+
+## Parallel work
+
+One persistent worker pool (`luce_cad.parallel`, processors minus one) runs
+the per-face work: layout seeding and row setup, speculative crossing
+computation, face meshing and normals, curvature and previews. Each item runs
+in its own runtime context and hands back raw arrays only. Layout
+reconciliation stays serial (each face sees its neighbours' newest cuts) but
+reuses an exact per-face memo of NURBS inversions and edge/grid crossings
+that a parallel pass fills first, so output is identical to the serial order
+on any number of cores. Errors are raised in face order.
 
 ## Surface evaluation and trim meshing (`tessellation`)
 

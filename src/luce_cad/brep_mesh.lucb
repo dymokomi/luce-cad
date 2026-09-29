@@ -7,6 +7,7 @@ from luce_cad.patch_dispatch import mesh_face
 from luce_cad.face_jobs import mesh_faces
 from luce_cad.edge_sampling import curve_intervals, compact_seams
 from luce_cad.surface_normals import model_normals
+from luce_cad.surface_curvature import model_curvatures
 from luce_cad.patch_sides import PatchSides, patch_sides
 from luce_cad.layout_types import Stations, GridLayout
 from luce_cad.layout_rows import initialize, bind
@@ -20,7 +21,9 @@ from geocore import Vector3, PolygonMesh, MeshBuilder, invalid
 from luce_cad.brep_types import Curve, Surface, BrepFace, Samples
 
 ## Plan shared boundaries, run independent face jobs, and assemble provenance.
-pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]? = none, selected: i64 = -1) -> interop.Reference[PolygonMesh]!:
+## With `curvature`, corner attributes curvature.k1/k2 hold the principal
+## curvatures (surface_curvature); `directions` adds curvature.d1/d2.
+pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]? = none, selected: i64 = -1, curvature: bool = false, directions: bool = false) -> interop.Reference[PolygonMesh]!:
     if divisions < 1 or divisions > 64 or faces.length == 0:
         error(invalid, "B-rep tessellation requires faces and 1..64 divisions")
     if selected < -1 or selected >= (i64)faces.length: error(invalid,"CAD face index out of range")
@@ -128,21 +131,25 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     if faces.length < 16 or selected >= 0: normals = try model_normals(&mesh, faces, surfaces, plans, tolerance)
     let original = try alloc Vector3[mesh.np] in memory.heap
     defer free(original) in memory.heap
-    let placed = try alloc bool[mesh.np] in memory.heap
+    # The CAD face that last placed each point. Its own polygons would place
+    # it again identically, so only a different face re-transforms and checks.
+    let placed = try alloc i64[mesh.np] in memory.heap
     defer free(placed) in memory.heap
     for index in 0..<mesh.np:
         original[index] = mesh.points[index]
-        placed[index] = false
+        placed[index] = -1
     var corner: usize = 0
     for face in 0..<mesh.nf:
-        let matrix = faces[(usize)mesh.face_parents[face]].placement
+        let parent = mesh.face_parents[face]
+        let matrix = faces[(usize)parent].placement
         for at in 0..<(usize)mesh.sizes[face]:
             let point = (usize)mesh.corners[corner + at]
+            if placed[point] == parent: continue
             let p = matrix.transform_point(original[point])
-            if placed[point] and p.subtract(mesh.points[point]).length() > tolerance:
+            if placed[point] >= 0 and p.subtract(mesh.points[point]).length() > tolerance:
                 error(invalid, "shared CAD point has inconsistent assembly placements")
             mesh.points[point] = p
-            placed[point] = true
+            placed[point] = parent
         corner += (usize)mesh.sizes[face]
     if let report = progress:
         let outcome = report.invoke(0.92)
@@ -180,8 +187,26 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
             colors[index * 3 + 2] = color.z
         let colored = try islands.value().with_attribute("Cd", 2, 3, colors)
         defer colored.release()
-        return try colored.value().with_attribute("N", 1, 3, normals)
-    return try islands.value().with_attribute("N", 1, 3, normals)
+        let shaded = try colored.value().with_attribute("N", 1, 3, normals)
+        return try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions)
+    let shaded = try islands.value().with_attribute("N", 1, 3, normals)
+    return try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions)
+
+## Takes `shaded`; adds the requested curvature columns (off by default: the
+## analysis shading asks for them, ordinary tessellation pays nothing).
+func with_curvature(shaded: interop.Reference[PolygonMesh], mesh: MeshBuilder*, original: const Vector3[], faces: const BrepFace[], surfaces: const Surface[], tolerance: f64, curvature: bool, directions: bool) -> interop.Reference[PolygonMesh]!:
+    if not curvature and not directions: return shaded
+    defer shaded.release()
+    let columns = try model_curvatures(mesh, original, faces, surfaces, tolerance, directions)
+    defer columns.close()
+    let first = try shaded.value().with_attribute("curvature.k1", 1, 1, columns.k1)
+    defer first.release()
+    let both = try first.value().with_attribute("curvature.k2", 1, 1, columns.k2)
+    if not directions: return both
+    defer both.release()
+    let major = try both.value().with_attribute("curvature.d1", 1, 3, columns.d1)
+    defer major.release()
+    return try major.value().with_attribute("curvature.d2", 1, 3, columns.d2)
 
 func release_samples(samples: const Samples[]):
     for sample in samples:

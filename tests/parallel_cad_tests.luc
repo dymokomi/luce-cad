@@ -1,4 +1,4 @@
-from cad import BrepModel
+from cad import BrepModel, CadModel
 from geocore import Vector3, PolygonMesh, MeshOps
 from tessellation import TrimPolygon
 
@@ -40,7 +40,37 @@ pub func parallel_cad_tests() -> unit!:
         let point = strip.point(index)
         if point.y > 0.0 and point.y < 0.2: interior += 1
     assert(interior > 40)
-    print("PASS deterministic native parallel face meshing and anisotropic narrow-strip refinement")
+    preview_matches(boundary)
+    print("PASS deterministic native parallel face meshing, pooled previews and anisotropic narrow-strip refinement")
+
+## The pooled preview holds exactly each face's preview_face mesh, in face
+## order, batched; every shared edge outline once; one guide per face.
+func preview_matches(boundary: BrepModel) -> unit!:
+    let model = CadModel()
+    model.attach_brep(boundary)
+    let preview = model.preview()
+    assert(preview.failed_faces() == 0 and preview.first_error() == "")
+    assert(preview.guide_count() == 2 * model.face_count())
+    assert(preview.boundary_count() == 2 * model.edge_count())
+    var face = 0
+    for index in 0..<preview.mesh_count():
+        let batch = preview.mesh(index)
+        var point_base = 0
+        var polygon = 0
+        while polygon < batch.face_count():
+            let part = model.preview_face(face, 16)
+            assert(batch.find_attribute("N", 1) >= 0)
+            for local in 0..<part.face_count():
+                assert(batch.face_size(polygon + local) == part.face_size(local))
+                for corner in 0..<part.face_size(local):
+                    let a = batch.point(batch.face_point(polygon + local, corner))
+                    let b = part.point(part.face_point(local, corner))
+                    assert(a.subtract(b).length() == 0.0)
+                    assert(batch.face_point(polygon + local, corner) == point_base + part.face_point(local, corner))
+            point_base += part.point_count()
+            polygon += part.face_count()
+            face += 1
+    assert(face == model.face_count())
 
 ## Compare with extraction AFTER a full cook: independent previews cannot
 ## prove that shared stations, stopped trims and display diagonals survived.

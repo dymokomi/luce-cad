@@ -166,6 +166,15 @@ func evaluate(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, d
     var bv: f64[9]
     let first_u = local_basis(ku, nu, du, u, &bu)
     let first_v = local_basis(kv, nv, dv, v, &bv)
+    return try nurbs_combine(points, weights, nv, du, dv, first_u, &bu, first_v, &bv)
+
+## One parameter's nonzero basis, for evaluators that reuse it across points
+## sharing an isoparameter (Newton finite differences, line searches).
+pub inline func nurbs_basis(knots: const f64[], count: i64, degree: i64, parameter: f64, values: f64[9]*) -> usize:
+    return local_basis(knots, count, degree, parameter, values)
+
+## The rational point for two precomputed bases, summed exactly as evaluate().
+pub func nurbs_combine(points: const Vector3[], weights: const f64[], nv: i64, du: i64, dv: i64, first_u: usize, bu: f64[9]*, first_v: usize, bv: f64[9]*) -> Vector3!:
     var x: f64 = 0.0
     var y: f64 = 0.0
     var z: f64 = 0.0
@@ -174,10 +183,10 @@ func evaluate(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, d
     let span_v = (usize)dv + 1
     for iu in 0..<(usize)du + 1:
         let row = (first_u + iu) * columns + first_v
-        let basis = bu[iu]
+        let basis = (*bu)[iu]
         for iv in 0..<span_v:
             let index = row + iv
-            let weight = basis * bv[iv] * weights[index]
+            let weight = basis * (*bv)[iv] * weights[index]
             let p = points[index]
             x = x + p.x * weight
             y = y + p.y * weight
@@ -201,14 +210,21 @@ pub func surface_normal_checked(points: const Vector3[], weights: const f64[], n
     let first_v = local_basis(kv, nv, dv, v, &bv)
     derivatives(ku, nu, du, u, first_u, &ud)
     derivatives(kv, nv, dv, v, first_v, &vd)
-    var p = Vector3()
-    var pu = Vector3()
-    var pv = Vector3()
+    var px: f64 = 0.0
+    var py: f64 = 0.0
+    var pz: f64 = 0.0
+    var pux: f64 = 0.0
+    var puy: f64 = 0.0
+    var puz: f64 = 0.0
+    var pvx: f64 = 0.0
+    var pvy: f64 = 0.0
+    var pvz: f64 = 0.0
     var w: f64 = 0.0
     var wu: f64 = 0.0
     var wv: f64 = 0.0
     # Derivatives are translation invariant. Accumulate in a local frame so
     # a small patch far from the origin does not subtract large world moments.
+    # Scalar sums in the Vector3 form's order keep results bit-identical.
     let origin = points[first_u*(usize)nv+first_v]
     for iu in 0..<(usize)du + 1:
         for iv in 0..<(usize)dv + 1:
@@ -216,15 +232,27 @@ pub func surface_normal_checked(points: const Vector3[], weights: const f64[], n
             let weight = bu[iu] * bv[iv] * weights[index]
             let uweight = ud[iu] * bv[iv] * weights[index]
             let vweight = bu[iu] * vd[iv] * weights[index]
-            let relative = points[index].subtract(origin)
-            p = p.add(relative.multiply_scalar(weight))
-            pu = pu.add(relative.multiply_scalar(uweight))
-            pv = pv.add(relative.multiply_scalar(vweight))
+            let q = points[index]
+            let rx = q.x - origin.x
+            let ry = q.y - origin.y
+            let rz = q.z - origin.z
+            px = px + rx * weight
+            py = py + ry * weight
+            pz = pz + rz * weight
+            pux = pux + rx * uweight
+            puy = puy + ry * uweight
+            puz = puz + rz * uweight
+            pvx = pvx + rx * vweight
+            pvy = pvy + ry * vweight
+            pvz = pvz + rz * vweight
             w += weight
             wu += uweight
             wv += vweight
     if w <= 0.0 or not math.is_finite(w): error(invalid, "invalid normal denominator")
-    p = p.multiply_scalar(1.0 / w)
+    let inverse = 1.0 / w
+    let p = Vector3(px * inverse, py * inverse, pz * inverse)
+    let pu = Vector3(pux, puy, puz)
+    let pv = Vector3(pvx, pvy, pvz)
     let a = pu.subtract(p.multiply_scalar(wu))
     let b = pv.subtract(p.multiply_scalar(wv))
     let al = a.length()
