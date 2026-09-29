@@ -1,0 +1,311 @@
+## Editing a set's CAD models through what the viewport picks on. The pick
+## mesh is the models' display tessellations joined, each polygon tagged
+## with its model (`cad_model`) and B-rep face (`cad_face`), each edge with
+## the B-rep edge it lies on (`cad_edge`, -1 inside a face); group
+## expressions on it name what a step edits. Whole models move and go;
+## faces go (a model losing every face goes with them); models are added.
+import interop
+import memory
+import math
+from geocore import Mesh, Vector3, Matrix4, invalid, GeometrySet
+from geocore_growing import Growing
+from geocore_kernel import MeshPart, concatenated, group_bits_of, Domain, edge_span, corner_edge_span, offset_span, point_span, mesh_origin, attribute_entry
+from luce_cad.model import CadModel
+from luce_cad.cad_geometry import set_models, with_models
+
+## Luce's CAD editing operations (Edit CAD).
+pub struct CadEdits:
+    let reserved: u8 = 0
+
+    ## What Edit CAD's Object, Faces and Edges levels pick on (the models'
+    ## kept display tessellations, so nothing is meshed again).
+    pub static func pick_mesh(set: interop.Reference[GeometrySet]) -> interop.Reference[Mesh]!:
+        let models = set_models(try set.get())
+        if models.length == 0: error(invalid, "the geometry has no CAD models")
+        var owners = Growing[interop.Reference[Mesh]]()
+        defer:
+            for owner in owners.view(): owner.release()
+            owners.close()
+        var parts = Growing[MeshPart]()
+        defer parts.close()
+        var owning = Growing[f64]()
+        defer owning.close()
+        for index in 0..<models.length:
+            let model = models[index].value()
+            let shown = try model.tessellate(16, 0.0, none, model.supports_curvature())
+            owners.push(shown) catch failure:
+                shown.release()
+                error(failure.code, failure.message)
+            try parts.push(MeshPart(shown.value(), Matrix4()))
+            for face in 0..<shown.value().face_count(): try owning.push((f64)index)
+        let joined = try concatenated(parts.view())
+        defer joined.release()
+        let tagged = try joined.value().with_attribute("cad_model", 2, 1, owning.view(), true)
+        defer tagged.release()
+        var edges = Growing[f64]()
+        defer edges.close()
+        try edge_owners(tagged.value(), owning.view(), models, &edges)
+        return try tagged.value().with_attribute("cad_edge", 4, 1, edges.view(), true)
+
+    ## `set` with the models `group` names on `pick` (whole models only)
+    ## moved by Transform Components' numbers: translate, rotate (degrees),
+    ## scale, pivot (0 their centroid, 1 the origin, 2 the custom point).
+    pub static func transformed_parts(set: interop.Reference[GeometrySet], pick: interop.Reference[Mesh], group: str, numbers: const f64[]) -> interop.Reference[GeometrySet]!:
+        if numbers.length < 13: error(invalid, "a transform needs its thirteen numbers")
+        let source = try set.get()
+        let models = set_models(source)
+        var chosen = try Chosen.of(try pick.get(), group, models)
+        defer chosen.close()
+        for index in 0..<models.length:
+            if chosen.faces.items[index] > 0 and chosen.faces.items[index] < chosen.totals.items[index]:
+                error(invalid, "only whole CAD models move: pick them at the Object level (faces move with their control vertices)")
+        let degrees = 0.017453292519943295
+        let linear = Matrix4.compose(Vector3(), Vector3(numbers[3] * degrees, numbers[4] * degrees, numbers[5] * degrees), Vector3(numbers[6], numbers[7], numbers[8]))
+        var pivot = Vector3(numbers[10], numbers[11], numbers[12])
+        if numbers[9] == 1.0: pivot = Vector3()
+        elif numbers[9] == 0.0: pivot = chosen.centroid
+        let moved = Vector3(numbers[0], numbers[1], numbers[2]).add(pivot).subtract(linear.transform_point(pivot))
+        let matrix = Matrix4(linear.x, linear.y, linear.z, moved)
+        var result = Growing[interop.Reference[CadModel]]()
+        defer:
+            for model in result.view(): model.release()
+            result.close()
+        for index in 0..<models.length:
+            let next = (try models[index].value().placed(matrix)) if chosen.faces.items[index] > 0 else models[index].clone()
+            result.push(next) catch failure:
+                next.release()
+                error(failure.code, failure.message)
+        return try with_models(source, result.view())
+
+    ## `set` without the faces `group` names on `pick`; a model left with
+    ## none goes.
+    pub static func without_parts(set: interop.Reference[GeometrySet], pick: interop.Reference[Mesh], group: str) -> interop.Reference[GeometrySet]!:
+        let source = try set.get()
+        let models = set_models(source)
+        let mesh = try pick.get()
+        var chosen = try Chosen.of(mesh, group, models)
+        defer chosen.close()
+        var result = Growing[interop.Reference[CadModel]]()
+        defer:
+            for model in result.view(): model.release()
+            result.close()
+        var kept = Growing[i64]()
+        defer kept.close()
+        for index in 0..<models.length:
+            let model = models[index].value()
+            if chosen.faces.items[index] == 0:
+                try result.push(models[index].clone())
+                continue
+            kept.clear()
+            for face in 0..<model.face_count():
+                if not chosen.named(index, face): try kept.push(face)
+            if kept.count == 0: continue
+            let rest = try model.subset(kept.view())
+            result.push(rest) catch failure:
+                rest.release()
+                error(failure.code, failure.message)
+        return try with_models(source, result.view())
+
+    ## `set` with `model` added after its models.
+    pub static func with_model(set: interop.Reference[GeometrySet], model: interop.Reference[CadModel]) -> interop.Reference[GeometrySet]!:
+        let source = try set.get()
+        let models = set_models(source)
+        var all = Growing[interop.Reference[CadModel]]()
+        defer all.close()
+        for existing in models: try all.push(existing)
+        try all.push(model)
+        return try with_models(source, all.view())
+
+## What a face group names, per model: its polygons' models and B-rep faces.
+struct Chosen:
+    ## Selected polygons and all polygons, per model.
+    var faces: Growing[usize]
+    var totals: Growing[usize]
+    ## (model, B-rep face) pairs named, as model * 2^32 + face, sorted.
+    var named_faces: Growing[i64]
+    var centroid: Vector3
+
+    static func of(mesh: const Mesh*, group: str, models: const interop.Reference[CadModel][]) -> Chosen!:
+        var result = Chosen(Growing[usize](), Growing[usize](), Growing[i64](), Vector3())
+        errdefer result.close()
+        try result.faces.fill(models.length, 0)
+        try result.totals.fill(models.length, 0)
+        let owner = mesh.find_attribute("cad_model", 2)
+        let source = mesh.find_attribute("cad_face", 2)
+        if owner < 0 or source < 0: error(invalid, "the pick mesh lost its CAD tags")
+        var bits = try group_bits_of(mesh, group, Domain.face)
+        defer bits.bits.release()
+        let words = bits.bits.view()
+        var sum = Vector3()
+        var count = 0.0
+        for face in 0..<mesh.face_count():
+            let model = (usize)(try mesh.attribute_value(owner, face))
+            if model >= models.length: error(invalid, "the pick mesh does not match its models")
+            result.totals.items[model] += 1
+            if (words[(usize)face >> 6] >> (u64)((usize)face & 63)) & 1 == 0: continue
+            result.faces.items[model] += 1
+            try result.named_faces.push((i64)model * 4294967296 + (i64)(try mesh.attribute_value(source, face)))
+            sum = sum.add(try mesh.face_center(face))
+            count += 1.0
+        if count > 0.0: result.centroid = sum.multiply_scalar(1.0 / count)
+        sort(result.named_faces.items[..<result.named_faces.count])
+        return result
+
+    ## Whether B-rep face `face` of model `model` is named.
+    func named(model: usize, face: i64) -> bool:
+        let key = (i64)model * 4294967296 + face
+        var low: usize = 0
+        var high = self.named_faces.count
+        while low < high:
+            let middle = (low + high) // 2
+            if self.named_faces.items[middle] < key: low = middle + 1
+            else: high = middle
+        return low < self.named_faces.count and self.named_faces.items[low] == key
+
+    mutating func close():
+        self.faces.close()
+        self.totals.close()
+        self.named_faces.close()
+
+## The B-rep edge under every edge of `mesh` (-1 inside a face or on a
+## seam): an edge between polygons of two B-rep faces lies on the B-rep edge
+## those faces share, the nearest one when they share several. `owning` is
+## each polygon's model.
+func edge_owners(mesh: const Mesh*, owning: const f64[], models: const interop.Reference[CadModel][], out: Growing[f64]*) -> !:
+    let ends = try edge_span(mesh)
+    let edges = ends.length // 2
+    try out.fill(edges, -1.0)
+    let source = mesh.find_attribute("cad_face", 2)
+    if source < 0: return
+    let faces = try attribute_entry(mesh, source)
+    let offsets = offset_span(mesh)
+    let corner_edges = try corner_edge_span(mesh)
+    # The two polygons of each mesh edge.
+    let sides = try alloc i64[edges * 2] in memory.heap
+    defer free(sides) in memory.heap
+    for at in 0..<sides.length: sides[at] = -1
+    for face in 0..<offsets.length - 1:
+        for corner in (usize)offsets[face]..<(usize)offsets[face + 1]:
+            let edge = (usize)corner_edges[corner]
+            if sides[edge * 2] < 0: sides[edge * 2] = (i64)face
+            elif sides[edge * 2 + 1] < 0: sides[edge * 2 + 1] = (i64)face
+    var pairs = Growing[FacePairs]()
+    defer:
+        for at in 0..<pairs.count: pairs.items[at].close()
+        pairs.close()
+    for model in models: try pairs.push(try FacePairs.of(model.value()))
+    let points = point_span(mesh)
+    let origin = mesh_origin(mesh)
+    # Consecutive mesh edges follow one B-rep edge: the last pair's answer.
+    var last_key: i64 = -1
+    var last_edge: i64 = -1
+    for edge in 0..<edges:
+        let p = sides[edge * 2]
+        let q = sides[edge * 2 + 1]
+        if p < 0 or q < 0: continue
+        let model = (usize)owning[(usize)p]
+        if model != (usize)owning[(usize)q] or model >= models.length: continue
+        let a = (i64)faces.number((usize)p, 0)
+        let b = (i64)faces.number((usize)q, 0)
+        if a == b: continue
+        let key = (i64)model * 1099511627776 + (a if a < b else b) * 1048576 + (b if a < b else a)
+        let index = &pairs.items[model]
+        if key == last_key and index.single(a, b):
+            out.items[edge] = (f64)last_edge
+            continue
+        let middle = points[(usize)ends[edge * 2]].vector().add(points[(usize)ends[edge * 2 + 1]].vector()).multiply_scalar(0.5).add(origin)
+        last_key = key
+        last_edge = try index.nearest(models[model].value(), a, b, middle)
+        out.items[edge] = (f64)last_edge
+
+## A model's B-rep edges by the pair of faces using them: sorted keys
+## (low face * 2^20 + high face) and their edges.
+struct FacePairs:
+    var keys: Growing[i64]
+
+    static func of(model: const CadModel*) -> FacePairs!:
+        var result = FacePairs(Growing[i64]())
+        errdefer result.close()
+        let edges = (usize)model.edge_count()
+        let first = try alloc i64[edges] in memory.heap
+        defer free(first) in memory.heap
+        for at in 0..<edges: first[at] = -1
+        for face in 0..<model.face_count():
+            for use in 0..<(try model.face_edge_count(face)):
+                let id = try model.face_edge_id(face, use)
+                if id < 0 or (usize)id >= edges: continue
+                let other = first[(usize)id]
+                if other < 0:
+                    first[(usize)id] = face
+                elif other != face:
+                    let low = other if other < face else face
+                    let high = face if other < face else other
+                    # Key in the high bits, edge in the low 24.
+                    try result.keys.push((low * 1048576 + high) * 16777216 + id)
+        sort(result.keys.items[..<result.keys.count])
+        return result
+
+    ## The range of entries for faces `a` and `b`.
+    func range(a: i64, b: i64) -> (usize, usize):
+        let pair = (a if a < b else b) * 1048576 + (b if a < b else a)
+        var low: usize = 0
+        var high = self.keys.count
+        while low < high:
+            let middle = (low + high) // 2
+            if self.keys.items[middle] >> 24 < pair: low = middle + 1
+            else: high = middle
+        var end = low
+        while end < self.keys.count and self.keys.items[end] >> 24 == pair: end += 1
+        return (low, end)
+
+    ## Whether faces `a` and `b` share exactly one edge.
+    func single(a: i64, b: i64) -> bool:
+        let (low, end) = self.range(a, b)
+        return end == low + 1
+
+    ## The edge faces `a` and `b` share nearest to `point` (-1: none).
+    func nearest(model: const CadModel*, a: i64, b: i64, point: Vector3) -> i64!:
+        let (low, end) = self.range(a, b)
+        if end == low: return -1
+        if end == low + 1: return self.keys.items[low] & 16777215
+        var found: i64 = -1
+        var best = 1e300
+        for at in low..<end:
+            let id = self.keys.items[at] & 16777215
+            for use in 0..<(try model.face_edge_count(a)):
+                if (try model.face_edge_id(a, use)) != id: continue
+                var distance = 1e300
+                for step in 0..<17:
+                    distance = math.min(distance, (try model.face_edge_point(a, use, (f64)step / 16.0)).subtract(point).length())
+                if distance < best:
+                    best = distance
+                    found = id
+        return found
+
+    mutating func close():
+        self.keys.close()
+
+## Ascending order, in place (heap sort: no allocation).
+func sort(values: i64[]):
+    var end = values.length
+    var start = values.length // 2
+    while start > 0:
+        start -= 1
+        sift(values, start, end)
+    while end > 1:
+        end -= 1
+        let top = values[0]
+        values[0] = values[end]
+        values[end] = top
+        sift(values, 0, end)
+
+func sift(values: i64[], first: usize, end: usize):
+    var root = first
+    while root * 2 + 1 < end:
+        var child = root * 2 + 1
+        if child + 1 < end and values[child] < values[child + 1]: child += 1
+        if values[root] >= values[child]: return
+        let swap = values[root]
+        values[root] = values[child]
+        values[child] = swap
+        root = child
