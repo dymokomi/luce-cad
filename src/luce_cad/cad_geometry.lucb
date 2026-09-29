@@ -11,12 +11,12 @@ from geocore import Mesh, Vector3, Matrix4, Bounds, invalid, GeometrySet
 from geocore_growing import Growing
 from geocore_kernel import ComponentType, Placement, IdSet, TableBuilder, PathFilter, MeshPart, Domain, Attribute, Instances
 from geocore_kernel import adopt_set, dispose_set, empty_set, set_mesh, append_text, append_number, mesh_component, instances_component, new_instances, set_find, set_put, set_remove, set_storage, concatenated, with_attribute_entry, text_attribute, mesh_share
-from luce_cad.model import CadModel, cad_model_type
+from luce_cad.model import CadModel, cad_model_type, encode_model, decode_model, numbered
+from geocore_kernel import register_codec, GeometryWriter, GeometryReader
 
 ## The models of one set: immutable once published; every owning set has
 ## its own list of references (see share_parts).
 pub struct CadParts:
-    var users: @usize
     var models: Growing[interop.Reference[CadModel]]
 
     pub func count() -> usize:
@@ -36,7 +36,6 @@ pub struct CadParts:
 
 func new_parts() -> CadParts*!:
     let storage = try alloc CadParts[1] in memory.heap
-    storage[0].users.store(1, .relaxed)
     storage[0].models = Growing[interop.Reference[CadModel]]()
     return storage.data
 
@@ -56,7 +55,6 @@ func share_parts(data: const void*) -> void*!:
 
 func close_parts(data: void*):
     let parts = (CadParts*)data
-    if parts.users.sub(1, .acq_rel) != 1: return
     for model in parts.models.view(): model.release()
     parts.models.close()
     free(CadParts[](parts, 1)) in memory.heap
@@ -133,9 +131,43 @@ func describe_parts(data: const void*, out: Growing[u8]*) -> !:
 func trace_parts(data: const void*, visit: func(ownership.Object*, void*) -> unit, context: void*):
     for model in ((const CadParts*)data).models.view(): model.trace(visit, context)
 
+## The CAD family in geometry files: element `cad` holding one `cad_model`
+## child per model (m0, m1, …; luce_cad.model's codec).
+func encode_parts(data: const void*, writer: GeometryWriter*, path: str) -> !:
+    let parts = (const CadParts*)data
+    try writer.crate.element(path, "cad")
+    try writer.crate.integer("count", (i64)parts.models.count)
+    var base = Growing[u8]()
+    defer base.close()
+    try base.assign(path.bytes)
+    var name = Growing[u8]()
+    defer name.close()
+    for index in 0..<parts.models.count:
+        try numbered(&name, "m", index)
+        try encode_model(parts.models.items[index].value(), writer, try writer.child((str)base.view(), (str)name.view()))
+
+func decode_parts(reader: GeometryReader*, path: str) -> void*!:
+    let parts = try new_parts()
+    errdefer close_parts((void*)parts)
+    var base = Growing[u8]()
+    defer base.close()
+    try base.assign(path.bytes)
+    while let header = try reader.next_property(): discard(header)
+    while let child = try reader.next_child((str)base.view()):
+        let model = try decode_model(reader, child.0)
+        defer model.release()
+        try parts.add(model)
+    return (void*)parts
+
 ## Luce's view of the CAD family of a geometry set.
 pub struct CadGeometry:
     let reserved: u8 = 0
+
+    ## Register the CAD family's codec with geocore's geometry files (once,
+    ## at startup, before CAD is saved or loaded; again is harmless).
+    pub static func register_codec() -> i64!:
+        try register_codec(&cad_component, encode_parts, decode_parts)
+        return 0
 
     ## A set holding `model`.
     pub static func of_model(model: interop.Reference[CadModel]) -> interop.Reference[GeometrySet]!:

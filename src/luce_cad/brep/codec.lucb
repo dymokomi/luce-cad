@@ -1,0 +1,152 @@
+## A B-rep in a geometry file (geocore's prism codec): element `brep` with the
+## tolerance and every column as it is stored, so a load gives back the same
+## model bit for bit; face paths are one byte column split by offsets.
+## Derived data (records, caches, tessellations) is never written. The
+## writer borrows the stores' bytes until the file is written.
+
+## Every column of `model` under element `path`.
+pub func encode_brep(model: const BrepModel*, writer: GeometryWriter*, path: str) -> !:
+    try writer.crate.element(path, "brep")
+    try writer.crate.number("tolerance", model.tolerance)
+    try put[Vector3](writer, "vertices", dtype_float64, 3, &model.vertices)
+    try put[u8](writer, "curve_kind", dtype_uint8, 1, &model.curve_kind)
+    try put[i32](writer, "curve_ends", dtype_int32, 2, &model.curve_ends)
+    try put[f64](writer, "curve_frame", dtype_float64, curve_stride, &model.curve_frame)
+    try put[i32](writer, "curve_degree", dtype_int32, 1, &model.curve_degree)
+    try put[u8](writer, "curve_sense", dtype_uint8, 1, &model.curve_sense)
+    try put[i32](writer, "curve_point_offsets", dtype_int32, 1, &model.curve_point_offsets)
+    try put[Vector3](writer, "curve_points", dtype_float64, 3, &model.curve_points)
+    try put[i32](writer, "curve_weight_offsets", dtype_int32, 1, &model.curve_weight_offsets)
+    try put[f64](writer, "curve_weights", dtype_float64, 1, &model.curve_weights)
+    try put[i32](writer, "curve_knot_offsets", dtype_int32, 1, &model.curve_knot_offsets)
+    try put[f64](writer, "curve_knots", dtype_float64, 1, &model.curve_knots)
+    try put[u8](writer, "surface_kind", dtype_uint8, 1, &model.surface_kind)
+    try put[f64](writer, "surface_frame", dtype_float64, surface_stride, &model.surface_frame)
+    try put[i32](writer, "surface_dims", dtype_int32, 4, &model.surface_dims)
+    try put[i32](writer, "surface_cv_offsets", dtype_int32, 1, &model.surface_cv_offsets)
+    try put[Vector3](writer, "cv_positions", dtype_float64, 3, &model.cv_positions)
+    try put[i32](writer, "surface_weight_offsets", dtype_int32, 1, &model.surface_weight_offsets)
+    try put[f64](writer, "cv_weights", dtype_float64, 1, &model.cv_weights)
+    try put[i32](writer, "surface_knot_offsets", dtype_int32, 1, &model.surface_knot_offsets)
+    try put[f64](writer, "surface_knots", dtype_float64, 1, &model.surface_knots)
+    try put[i32](writer, "face_surface", dtype_int32, 1, &model.face_surface)
+    try put[u8](writer, "face_sense", dtype_uint8, 1, &model.face_sense)
+    try put[i32](writer, "face_use_offsets", dtype_int32, 1, &model.face_use_offsets)
+    try put[i32](writer, "face_uses", dtype_int32, 1, &model.face_uses)
+    try put[i32](writer, "face_loop_offsets", dtype_int32, 1, &model.face_loop_offsets)
+    try put[i32](writer, "loop_sizes", dtype_int32, 1, &model.loop_sizes)
+    try put[Matrix4](writer, "face_placement", dtype_float64, 12, &model.face_placement)
+    try put[Vector3](writer, "face_color", dtype_float64, 3, &model.face_color)
+    try put[u8](writer, "face_colored", dtype_uint8, 1, &model.face_colored)
+    # Face paths: their bytes, split by offsets.
+    var bytes = Growing[u8]()
+    defer bytes.close()
+    var offsets = Growing[i32]()
+    defer offsets.close()
+    try offsets.push(0)
+    for path_text in model.face_paths.view():
+        if let text = path_text:
+            for byte in text.value.bytes: try bytes.push(byte)
+        try offsets.push((i32)bytes.count)
+    # The writer borrows array bytes until the file is written; these are
+    # temporary, so they are copied.
+    try writer.crate.copied_array("path_bytes", dtype_uint8, bytes.count, bytes.view())
+    try writer.crate.copied_array("path_offsets", dtype_int32, offsets.count, u8[]((u8*)offsets.items.data, offsets.count * 4))
+
+func put[T](writer: GeometryWriter*, name: str, dtype: u8, columns: usize, store: const Store[T]*) -> !:
+    let values = store.view()
+    let component: usize = 8 if dtype == dtype_float64 else (4 if dtype == dtype_int32 else 1)
+    let rows = values.length * sizeof(T) // (columns * component)
+    try writer.column(name, dtype, rows, columns, u8[]((u8*)values.data, values.length * sizeof(T)))
+
+## A B-rep read back from element `path`'s properties.
+pub func decode_brep(reader: GeometryReader*, path: str) -> interop.Reference[BrepModel]!:
+    discard(path)
+    var tolerance = 0.000001
+    var model_owner: interop.Reference[BrepModel]? = none
+    defer:
+        if let made = model_owner: made.release()
+    var path_bytes: Column[u8]
+    defer path_bytes.release()
+    var path_offsets: Column[i32]
+    defer path_offsets.release()
+    # The tolerance comes first; the model is made when it is known.
+    while let header = try reader.next_property():
+        let name = header.name
+        if name == "tolerance":
+            var value = try reader.column[f64](header)
+            defer value.release()
+            if value.count() == 1: tolerance = value.view()[0]
+            continue
+        if model_owner == none:
+            model_owner = try interop.Reference[BrepModel].adopt(new BrepModel(tolerance) in memory.heap, brep_model_type, memory.heap)
+        let model = (model_owner else error(invalid, "a saved B-rep lost its model")).value()
+        let label = base_name(name)
+        if label == "path_bytes": path_bytes = try reader.column[u8](header)
+        elif label == "path_offsets": path_offsets = try reader.column[i32](header)
+        else: try read_store(reader, header, label, model)
+    let owner = model_owner else error(invalid, "a saved B-rep has no columns")
+    let model = owner.value()
+    model.changed()
+    # Paths, one per face.
+    let offsets = path_offsets.view()
+    let faces = (usize)model.face_count()
+    if offsets.length != faces + 1: error(invalid, "a saved B-rep's paths do not match its faces")
+    let bytes = path_bytes.view()
+    model.face_paths.clear()
+    for face in 0..<faces:
+        let first = (usize)offsets[face]
+        let end = (usize)offsets[face + 1]
+        if end < first or end > bytes.length: error(invalid, "a saved B-rep's path offsets are out of range")
+        var copy: interop.Packet[str]? = none
+        if end > first: copy = try interop.text_transfer.copy((str)bytes[first..<end])
+        model.face_paths.push(copy) catch failure:
+            if let made = copy: made.release()
+            error(failure.code, failure.message)
+    model_owner = none
+    return owner
+
+## `name` without a `_chunks` suffix.
+func base_name(name: str) -> str:
+    let bytes = name.bytes
+    if bytes.length > 7 and (str)bytes[bytes.length - 7..] == "_chunks": return (str)bytes[..<bytes.length - 7]
+    return name
+
+## Read one column into the store it names.
+func read_store(reader: GeometryReader*, header: PropertyHeader, label: str, model: BrepModel*) -> !:
+    if label == "vertices": try take[Vector3](reader, header, &model.vertices)
+    elif label == "curve_kind": try take[u8](reader, header, &model.curve_kind)
+    elif label == "curve_ends": try take[i32](reader, header, &model.curve_ends)
+    elif label == "curve_frame": try take[f64](reader, header, &model.curve_frame)
+    elif label == "curve_degree": try take[i32](reader, header, &model.curve_degree)
+    elif label == "curve_sense": try take[u8](reader, header, &model.curve_sense)
+    elif label == "curve_point_offsets": try take[i32](reader, header, &model.curve_point_offsets)
+    elif label == "curve_points": try take[Vector3](reader, header, &model.curve_points)
+    elif label == "curve_weight_offsets": try take[i32](reader, header, &model.curve_weight_offsets)
+    elif label == "curve_weights": try take[f64](reader, header, &model.curve_weights)
+    elif label == "curve_knot_offsets": try take[i32](reader, header, &model.curve_knot_offsets)
+    elif label == "curve_knots": try take[f64](reader, header, &model.curve_knots)
+    elif label == "surface_kind": try take[u8](reader, header, &model.surface_kind)
+    elif label == "surface_frame": try take[f64](reader, header, &model.surface_frame)
+    elif label == "surface_dims": try take[i32](reader, header, &model.surface_dims)
+    elif label == "surface_cv_offsets": try take[i32](reader, header, &model.surface_cv_offsets)
+    elif label == "cv_positions": try take[Vector3](reader, header, &model.cv_positions)
+    elif label == "surface_weight_offsets": try take[i32](reader, header, &model.surface_weight_offsets)
+    elif label == "cv_weights": try take[f64](reader, header, &model.cv_weights)
+    elif label == "surface_knot_offsets": try take[i32](reader, header, &model.surface_knot_offsets)
+    elif label == "surface_knots": try take[f64](reader, header, &model.surface_knots)
+    elif label == "face_surface": try take[i32](reader, header, &model.face_surface)
+    elif label == "face_sense": try take[u8](reader, header, &model.face_sense)
+    elif label == "face_use_offsets": try take[i32](reader, header, &model.face_use_offsets)
+    elif label == "face_uses": try take[i32](reader, header, &model.face_uses)
+    elif label == "face_loop_offsets": try take[i32](reader, header, &model.face_loop_offsets)
+    elif label == "loop_sizes": try take[i32](reader, header, &model.loop_sizes)
+    elif label == "face_placement": try take[Matrix4](reader, header, &model.face_placement)
+    elif label == "face_color": try take[Vector3](reader, header, &model.face_color)
+    elif label == "face_colored": try take[u8](reader, header, &model.face_colored)
+
+func take[T](reader: GeometryReader*, header: PropertyHeader, store: Store[T]*) -> !:
+    var column = try reader.column[T](header)
+    store.close()
+    store.count = column.count()
+    store.column = column.take()

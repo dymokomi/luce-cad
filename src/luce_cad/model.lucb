@@ -17,7 +17,10 @@ pub let cad_preview_set_type = preview_set.cad_preview_set_type
 import luce_cad.cad_overlay as cad_overlay
 pub type CadOverlay = cad_overlay.CadOverlay
 pub let cad_overlay_type = cad_overlay.cad_overlay_type
-from luce_cad.brep import boundary_lines, hull_lines
+from luce_cad.brep import boundary_lines, hull_lines, encode_brep, decode_brep
+from geocore_kernel import GeometryWriter, GeometryReader, dtype_float64, dtype_int32
+from geocore_shared import Column
+from geocore_growing import Growing
 
 struct Face:
     let points: Vector3[]
@@ -580,3 +583,107 @@ func planar_mesh(points: const Vector3[]) -> interop.Reference[Mesh]!:
     for point in points:
         try builder.corner(try builder.point(point))
     return try builder.finish()
+
+## A CAD model in a geometry file (element `cad_model`): its placement, its
+## independent faces (children `f0`, `f1`, …: control net, dimensions,
+## trim domain, reversal) and its B-rep (child `brep`, brep/codec.lucb).
+## The writer borrows array bytes until the file is written: the model's
+## own arrays are borrowed, temporaries are copied.
+pub func encode_model(model: const CadModel*, writer: GeometryWriter*, path: str) -> !:
+    try writer.crate.element(path, "cad_model")
+    try writer.column("placement", dtype_float64, 1, 12, u8[]((u8*)&model.placement, 96))
+    var base = try copied_path(path)
+    defer base.close()
+    var name = Growing[u8]()
+    defer name.close()
+    for index in 0..<model.count:
+        let face = model.faces[index]
+        try numbered(&name, "f", index)
+        try writer.crate.element(try writer.child((str)base.view(), (str)name.view()), "cad_face")
+        try writer.column("points", dtype_float64, face.points.length, 3, u8[]((u8*)face.points.data, face.points.length * 24))
+        try writer.column("weights", dtype_float64, face.weights.length, 1, u8[]((u8*)face.weights.data, face.weights.length * 8))
+        try writer.column("ku", dtype_float64, face.ku.length, 1, u8[]((u8*)face.ku.data, face.ku.length * 8))
+        try writer.column("kv", dtype_float64, face.kv.length, 1, u8[]((u8*)face.kv.data, face.kv.length * 8))
+        let dims: i32[4] = [(i32)face.nu, (i32)face.nv, (i32)face.du, (i32)face.dv]
+        try writer.crate.copied_array("dims", dtype_int32, 4, u8[]((u8*)&dims[0], 16))
+        let domain: f64[4] = [face.u0, face.u1, face.v0, face.v1]
+        try writer.crate.copied_array("domain", dtype_float64, 4, u8[]((u8*)&domain[0], 32))
+        try writer.crate.integer("reversed", 1 if face.reversed else 0)
+    if let boundary = model.boundary:
+        try encode_brep(boundary.value(), writer, try writer.child((str)base.view(), "brep"))
+
+## A CAD model read back from element `path` and its children.
+pub func decode_model(reader: GeometryReader*, path: str) -> interop.Reference[CadModel]!:
+    let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
+    errdefer result.release()
+    let model = result.value()
+    while let header = try reader.next_property():
+        if header.name == "placement":
+            var column = try reader.column[Matrix4](header)
+            defer column.release()
+            if column.count() == 1: model.placement = column.view()[0]
+    var base = try copied_path(path)
+    defer base.close()
+    while let child = try reader.next_child((str)base.view()):
+        if child.1 == "brep":
+            let boundary = try decode_brep(reader, child.0)
+            defer boundary.release()
+            try model.attach_brep(boundary)
+        elif child.1 == "cad_face":
+            try decode_face(reader, model)
+    return result
+
+func decode_face(reader: GeometryReader*, model: CadModel*) -> !:
+    var points: Column[Vector3]
+    defer points.release()
+    var weights: Column[f64]
+    defer weights.release()
+    var ku: Column[f64]
+    defer ku.release()
+    var kv: Column[f64]
+    defer kv.release()
+    var dims: Column[i32]
+    defer dims.release()
+    var domain: Column[f64]
+    defer domain.release()
+    var reversed = false
+    while let header = try reader.next_property():
+        let name = header.name
+        if name == "points": points = try reader.column[Vector3](header)
+        elif name == "weights": weights = try reader.column[f64](header)
+        elif name == "ku": ku = try reader.column[f64](header)
+        elif name == "kv": kv = try reader.column[f64](header)
+        elif name == "dims": dims = try reader.column[i32](header)
+        elif name == "domain": domain = try reader.column[f64](header)
+        elif name == "reversed": reversed = (try reader.integer(header)) != 0
+    let size = dims.view()
+    let range = domain.view()
+    if size.length != 4 or range.length != 4: error(invalid, "a saved CAD face lacks its dimensions")
+    try model.append(points.view(), weights.view(), (i64)size[0], (i64)size[1], (i64)size[2], (i64)size[3], ku.view(), kv.view())
+    let index = model.count - 1
+    model.faces[index].u0 = range[0]
+    model.faces[index].u1 = range[1]
+    model.faces[index].v0 = range[2]
+    model.faces[index].v1 = range[3]
+    model.faces[index].reversed = reversed
+
+## A copy of `path` (a writer's child paths are valid until its next call).
+func copied_path(path: str) -> Growing[u8]!:
+    var copy = Growing[u8]()
+    try copy.assign(path.bytes)
+    return copy
+
+## `prefix` followed by `number` in decimal, into `out`.
+pub func numbered(out: Growing[u8]*, prefix: str, number: usize) -> !:
+    try out.assign(prefix.bytes)
+    var digits: u8[24]
+    var count: usize = 0
+    var rest = number
+    while true:
+        digits[count] = (u8)(48 + rest % 10)
+        count += 1
+        rest = rest // 10
+        if rest == 0: break
+    while count > 0:
+        count -= 1
+        try out.push(digits[count])
