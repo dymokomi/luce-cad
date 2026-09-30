@@ -35,6 +35,14 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
 - `tessellation` (`luce_cad.tessellation.surface`): rational B-spline
   evaluation and trim/grid/recombine meshing (the separate `luce-tesselator`
   package until luce-cad 0.2.0).
+- `cad_exact` (`luce_cad.exact`, Base only): read-only exact data for
+  exporters (luce-usd writes CAD faces as USD NurbsPatch prims).
+  `face_support(model, face)` copies a face's support out (kind, frame,
+  radius or angle, a B-spline's net and knots, sense, placement), and
+  `face_trim_uv(model, face, divisions, uv, sizes)` gives its trim loops in
+  the support's UV chart, sampled at the display tessellation's baseline
+  edge stations and chained across coedges as the tessellator chains them
+  (`brep/exact.lucb`, `model/exact.lucb`).
 
 ## Analytic model API
 
@@ -535,8 +543,9 @@ oversized cut cells and rejection of unsplit trim crossings.
 `--backend native|c` narrow it):
 
 - the Base contracts in `src/luce_cad/tests/` (`layout_contract` and
-  `trim_predicates_contract` run every contract module they import), which reach
-  unexported internals;
+  `trim_predicates_contract` run every contract module they import;
+  `exact_contract` checks the exporter accessors), which reach unexported
+  internals;
 - the Luce regressions in `tests/` (`main.luc` and one `*_tests.luc` module per
   topic), which build CAD models in code, mesh them and check topology, trims,
   normals and spacing through the public `cad` and `tessellation` exports.

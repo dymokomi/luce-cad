@@ -1,0 +1,162 @@
+## Read-only exact data for exporters (luce-usd writes CAD faces as USD
+## NurbsPatch prims): a face's support surface as its record holds it, and
+## the face's trim loops in the support's UV chart. The loops are sampled
+## at the stations the display tessellation starts from (each edge's
+## baseline intervals for the same divisions and the model's tolerance) and
+## chained across coedges as the tessellator chains them (trim_chains), so
+## a periodic support keeps each loop in one chart.
+##
+## Charts (mapped_patch.parameter): a plane's (x, y) in its frame; a
+## cylinder's or cone's (angle, height); a sphere's (angle, latitude); a
+## torus's (angle, minor angle); a B-spline's normalized knot domain
+## [0, 1] x [0, 1].
+
+import luce_cad.curve_spacing as spacing
+from luce_cad.edge_sampling import compact_seams, curve_intervals
+from luce_cad.layout_types import Stations, UVChain
+from luce_cad.trim_chains import refreshed
+from luce_cad.patch_sides import edge_index
+
+## A face's support, copied out of the model.
+pub struct FaceSupport:
+    ## plane 0, cylinder 1, cone 2, rational B-spline 3, sphere 4, torus 5.
+    pub var kind: i64
+    pub var origin: Vector3
+    pub var x: Vector3
+    pub var y: Vector3
+    pub var z: Vector3
+    ## The radius (a torus's major one).
+    pub var radius: f64
+    ## A cone's semi-angle, or a torus's minor radius.
+    pub var angle: f64
+    ## A B-spline's net: nu x nv control points u-major (index u * nv + v),
+    ## weights alike, expanded knot vectors, degrees.
+    pub var points: Growing[Vector3]
+    pub var weights: Growing[f64]
+    pub var knots_u: Growing[f64]
+    pub var knots_v: Growing[f64]
+    pub var nu: i64
+    pub var nv: i64
+    pub var du: i64
+    pub var dv: i64
+    ## Whether the face's normal follows the support's (du x dv).
+    pub var sense: bool
+    ## The face's placement (applied after the support).
+    pub var placement: Matrix4
+
+    pub static func empty() -> FaceSupport:
+        return FaceSupport(kind = 0, origin = Vector3(), x = Vector3(1.0, 0.0, 0.0), y = Vector3(0.0, 1.0, 0.0), z = Vector3(0.0, 0.0, 1.0), radius = 0.0, angle = 0.0,
+                           points = Growing[Vector3](), weights = Growing[f64](), knots_u = Growing[f64](), knots_v = Growing[f64](),
+                           nu = 0, nv = 0, du = 0, dv = 0, sense = true, placement = Matrix4())
+
+    pub mutating func close():
+        self.points.close()
+        self.weights.close()
+        self.knots_u.close()
+        self.knots_v.close()
+
+# LUCE-BUG: these are meant as BrepModel methods, but a pub method whose
+# signature names a Base-only type (Growing, FaceSupport) makes the whole
+# type fail to cross into Luce ("cannot cross into Luce: its method ...
+# names a type Luce cannot take"), though only Base callers need them.
+# Free functions keep BrepModel usable from Luce.
+
+## Face `face`'s support surface.
+pub func brep_face_support(model: const BrepModel*, face: i64) -> FaceSupport!:
+    try model.check_face(face)
+    let records = try model.tessellation_records()
+    let entry = records.faces[(usize)face]
+    let surface = records.surfaces[(usize)entry.surface]
+    var made = FaceSupport.empty()
+    errdefer made.close()
+    made.kind = surface.kind
+    made.origin = surface.origin
+    made.x = surface.x
+    made.y = surface.y
+    made.z = surface.z
+    made.radius = surface.radius
+    made.angle = surface.angle
+    try made.points.assign(surface.points)
+    try made.weights.assign(surface.weights)
+    try made.knots_u.assign(surface.ku)
+    try made.knots_v.assign(surface.kv)
+    made.nu = surface.nu
+    made.nv = surface.nv
+    made.du = surface.du
+    made.dv = surface.dv
+    made.sense = entry.sense
+    made.placement = entry.placement
+    return made
+
+## Face `face`'s trim loops in its support's chart, outer loop first:
+## `uv` takes each loop's points in coedge order (the joint between two
+## coedges once, the loop closing back to its first point) and `sizes`
+## each loop's point count.
+pub func brep_face_trim_uv(model: const BrepModel*, face: i64, divisions: i64, uv: Growing[Vector3]*, sizes: Growing[i64]*) -> !:
+    try model.check_face(face)
+    if divisions < 1 or divisions > 64: error(invalid, "CAD trim sampling requires 1..64 divisions")
+    uv.clear()
+    sizes.clear()
+    let records = try model.tessellation_records()
+    let entry = records.faces[(usize)face]
+    let surface = records.surfaces[(usize)entry.surface]
+    let edges = records.edges
+    let metrics = try spacing.measure(edges)
+    defer spacing.close(metrics)
+    let compact = try compact_seams(records.faces, edges.length)
+    defer free(compact) in memory.heap
+    # Each coedge's stations, as the display tessellation's baseline has them.
+    let stations = try alloc Stations[entry.uses.length] in memory.heap
+    defer free(stations) in memory.heap
+    for at in 0..<stations.length: stations[at] = Stations()
+    defer:
+        for station in stations: station.close()
+    for at in 0..<entry.uses.length:
+        let index = edge_index(entry.uses[at])
+        let count = try curve_intervals(edges[index], divisions, model.tolerance, &metrics[index], compact[index])
+        try stations[at].open(count + 1)
+        for step in 0..<count + 1: discard(try stations[at].insert(metrics[index].station((f64)step / (f64)count), 1e-12))
+    let vertices = model.vertices.view()
+    # Seeds as trim_chains.initialize tries them: one chart for every loop.
+    for initial in [Vector3(0.5, 0.5, 0.0), Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, 0.0)]:
+        uv.clear()
+        sizes.clear()
+        if try chain_loops(entry, surface, vertices, edges, stations, model.tolerance, initial, uv, sizes): return
+    error(invalid, "trim loops do not close in one support chart")
+
+## Chain every loop of `face` from `initial`; false when a loop does not
+## close in one chart (another seed may).
+func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], edges: const Curve[], stations: const Stations[], tolerance: f64, initial: Vector3, uv: Growing[Vector3]*, sizes: Growing[i64]*) -> bool!:
+    var offset: usize = 0
+    var loop_seed = initial
+    for size in face.sizes:
+        var seed = loop_seed
+        var first = Vector3()
+        let start = uv.count
+        for entry in 0..<(usize)size:
+            let use = face.uses[offset + entry]
+            let forward = use > 0
+            let chain = try refreshed(UVChain(), surface, vertices, edges[edge_index(use)], stations[offset + entry], tolerance, seed, forward)
+            defer:
+                free(chain.points) in memory.heap
+                free(chain.times) in memory.heap
+            let points = chain.points
+            let begin = points[0 if forward else points.length - 1]
+            if entry == 0: first = begin
+            elif begin.subtract(seed).length() > 1e-4: return false
+            # Every point but the coedge's last, which the next one starts at.
+            for step in 0..<points.length - 1:
+                try uv.push(points[step if forward else points.length - 1 - step])
+            seed = points[points.length - 1 if forward else 0]
+        if seed.subtract(first).length() > 1e-4: return false
+        try sizes.push((i64)(uv.count - start))
+        # A hole on a periodic support is seeded inside the outer loop's chart.
+        if offset == 0 and (surface.kind == 1 or surface.kind == 2):
+            var low: f64 = 1e100
+            var high: f64 = -1e100
+            for point in uv.view()[start..]:
+                low = math.min(low, point.x)
+                high = math.max(high, point.x)
+            loop_seed = Vector3((low + high) * 0.5, 0.0, 0.0)
+        offset += (usize)size
+    return true
