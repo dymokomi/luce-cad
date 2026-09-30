@@ -1,0 +1,60 @@
+## Faces of any size: planar CAD faces and B-rep caps of many corners mesh
+## without a corner budget, and independent faces keep distinct edge ids.
+from cad import BrepModel, CadModel
+from geocore import Vector3
+from checks import manifold
+import math
+
+## A star of `count` corners (radii 1 and 0.8 alternating, so every other
+## corner is concave) at height `z`.
+func star(count: int, z: float) -> list[Vector3]:
+    let points: list[Vector3] = []
+    for at in 0..<count:
+        let radius = 1.0 if at % 2 == 0 else 0.8
+        let angle = 2.0 * math.pi * float(at) / float(count)
+        points.append(Vector3(radius * math.cos(angle), radius * math.sin(angle), z))
+    return points
+
+pub func big_face_tests() -> unit!:
+    # Two 1000-corner planar faces stay one face each; their edge ids are
+    # all distinct (they once collided past 256 edges per face).
+    let plane = CadModel()
+    plane.add_planar(star(1000, 0.0))
+    plane.add_planar(star(1000, 1.0))
+    let flat = plane.tessellate(4)
+    assert(flat.face_count() == 2 and flat.face_size(0) == 1000 and flat.face_size(1) == 1000)
+    let seen: set[int] = {}
+    for face in 0..<2:
+        assert(plane.face_edge_count(face) == 1000)
+        for use in 0..<1000: seen.insert(plane.face_edge_id(face, use))
+    assert(seen.length == 2000)
+    # A closed 600-sided star prism as a B-rep: two 600-edge caps and 600
+    # planar sides, meshed closed and consistently oriented.
+    let n = 600
+    let b = BrepModel()
+    for p in star(n, 0.0) + star(n, 1.0): discard(b.add_vertex(p))
+    for ring in 0..<2:
+        for at in 0..<n: discard(b.add_line(ring * n + at, ring * n + (at + 1) % n))
+    for at in 0..<n: discard(b.add_line(at, n + at))
+    let z = Vector3(0.0, 0.0, 1.0)
+    let x = Vector3(1.0, 0.0, 0.0)
+    let bottom: list[int] = []
+    let top: list[int] = []
+    for at in 0..<n:
+        bottom.append(at + 1)
+        top.append(n + at + 1)
+    discard(b.add_face(b.add_surface(0, Vector3(), z, x), bottom, [n], false))
+    discard(b.add_face(b.add_surface(0, Vector3(0.0, 0.0, 1.0), z, x), top, [n]))
+    let ring = star(n, 0.0)
+    for at in 0..<n:
+        let next = (at + 1) % n
+        let along = ring[next].subtract(ring[at]).normalized()
+        let outward = along.cross(z)
+        let side = b.add_surface(0, ring[at], outward, along)
+        discard(b.add_face(side, [at + 1, 2 * n + next + 1, -(n + at + 1), -(2 * n + at + 1)], [4]))
+    let model = CadModel()
+    model.attach_brep(b)
+    let prism = model.tessellate(4)
+    assert(prism.point_count() >= 2 * n)
+    manifold(prism)
+    print("PASS CAD faces of any size: 1000-corner planar faces, a 600-sided prism")

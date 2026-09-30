@@ -79,7 +79,7 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
   separate analytic model, retaining trim domains and preserving orientation
   under reflection.
 
-Planar boundaries currently have one outer loop with 3–256 corners and absolute
+Planar boundaries currently have one outer loop of 3 or more corners and absolute
 coplanarity tolerance 1e-6 in source units. Up to 1024 independent CAD faces are
 stored; generated meshes are also bounded by luce-geocore's modeling budgets. A valid
 analytic model can exceed a particular display mesh budget and fail tessellation.
@@ -514,8 +514,8 @@ Surface-grid sampling is uniform, not a guaranteed chord-error tolerance.
 
 `TrimGrid.clip(points, sizes, us, vs)` intersects a supplied UV grid with one
 outer polygon and holes. Whole cells stay quads; boundary cells keep their
-polygon outlines. Holes within a cell and cells over the 256-corner polygon
-limit are triangulated locally. **Input trim segments must already be split at
+polygon outlines. Holes within a cell and cells of more than 256 corners are
+triangulated locally. **Input trim segments must already be split at
 every grid crossing.** The first output points retain every input point and ID;
 the clipper neither invents CAD seam samples nor welds distinct vertices. Output
 validation requires every input trim segment exactly once and every interior
