@@ -1,0 +1,53 @@
+## Any number of independent CAD faces (planar and NURBS); `cad_face` numbers
+## a tessellation's polygons as face_count() does, independent faces first.
+from cad import BrepModel, CadModel
+from geocore import Vector3
+
+## A unit square at column `at` of a row, on z = 0.
+func square(at: int) -> list[Vector3]:
+    let x = float(at) * 2.0
+    return [Vector3(x, 0.0, 0.0), Vector3(x + 1.0, 0.0, 0.0), Vector3(x + 1.0, 1.0, 0.0), Vector3(x, 1.0, 0.0)]
+
+pub func independent_faces_tests() -> unit!:
+    # 3000 planar squares and 200 bilinear NURBS patches.
+    let model = CadModel()
+    for at in 0..<3000: model.add_planar(square(at))
+    let knots = [0.0, 0.0, 1.0, 1.0]
+    for at in 0..<200:
+        let y = 3.0 + float(at) * 2.0
+        model.add_nurbs([Vector3(0.0, y, 0.0), Vector3(0.0, y + 1.0, 0.0), Vector3(1.0, y, 0.0), Vector3(1.0, y + 1.0, 0.5)], [1.0, 1.0, 1.0, 1.0], 2, 2, 1, 1, knots, knots)
+    assert(model.face_count() == 3200)
+    let mesh = model.tessellate(4)
+    let parent = mesh.find_attribute("cad_face", 2)
+    let seen: list[int] = []
+    for face in 0..<3200: seen.append(0)
+    for face in 0..<mesh.face_count():
+        let owner = int(mesh.attribute_value(parent, face, 0))
+        assert(owner >= 0 and owner < 3200)
+        seen[owner] += 1
+    for owner in 0..<3200: assert(seen[owner] >= 1)
+    # Each square is its own polygon, in order.
+    for at in 0..<3000: assert(int(mesh.attribute_value(parent, at, 0)) == at)
+    near_x(model.face_edge_point(2999, 0, 0.0).x, 5998.0)
+    let moved = model.transformed(Vector3(0.0, 0.0, 1.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    assert(moved.face_count() == 3200)
+    # Beside a B-rep, the B-rep's faces follow the independent ones.
+    let b = BrepModel()
+    for p in square(0): discard(b.add_vertex(p.add(Vector3(0.0, -5.0, 0.0))))
+    for edge in 0..<4: discard(b.add_line(edge, (edge + 1) % 4))
+    discard(b.add_face(b.add_surface(0, Vector3(), Vector3(0.0, 0.0, 1.0), Vector3(1.0, 0.0, 0.0)), [1, 2, 3, 4], [4]))
+    let mixed = CadModel()
+    for at in 0..<1500: mixed.add_planar(square(at))
+    mixed.attach_brep(b)
+    let both = mixed.tessellate(4)
+    let owner = both.find_attribute("cad_face", 2)
+    var brep_faces = 0
+    for face in 0..<both.face_count():
+        let value = int(both.attribute_value(owner, face, 0))
+        assert(value >= 0 and value <= 1500)
+        if value == 1500: brep_faces += 1
+    assert(brep_faces >= 1 and mixed.face_count() == 1501)
+    print("PASS 3,200 independent CAD faces; cad_face in face_count() order beside a B-rep")
+
+func near_x(a: float, b: float) -> unit:
+    assert(a - b < 0.000001 and b - a < 0.000001)

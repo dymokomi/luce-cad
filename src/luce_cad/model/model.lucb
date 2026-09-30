@@ -44,13 +44,15 @@ struct Face:
         free(self.kv) in memory.heap
 
 pub struct CadModel:
-    let faces: Face[]
+    ## Independent faces: the first `count` of `faces`, which grows by
+    ## doubling (any number of faces).
+    var faces: Face[]
     var count: usize
     var boundary: interop.Reference[BrepModel]? = none
     var placement: Matrix4
 
     pub func init() -> !:
-        self.faces = try alloc Face[1024] in memory.heap
+        self.faces = try alloc Face[16] in memory.heap
         self.count = 0
         self.boundary = none
         self.placement = Matrix4()
@@ -428,12 +430,13 @@ pub struct CadModel:
                 if not analysis or self.placement.is_identity(): return placed
                 defer placed.release()
                 return try scaled_curvature(placed, self.placement, directions)
+        # `cad_face` numbers faces as face_count() does: independent faces
+        # first, then the B-rep's (after `count`).
         var output = try MeshBuilder()
         defer output.close()
-        let colors = try alloc f64[2097152 * 3] in memory.heap
-        defer free(colors) in memory.heap
-        for index in 0..<colors.length:
-            colors[index] = 1.0
+        # The B-rep's polygon colors (white for the independent faces).
+        var colors = Growing[f64]()
+        defer colors.close()
         var has_colors = false
         if let boundary = self.boundary:
             let part = try boundary.value().mesh(segments, edge_size, progress)
@@ -448,14 +451,14 @@ pub struct CadModel:
                 let count = try part.value().face_size(face)
                 if cd >= 0:
                     for component in 0..<3:
-                        colors[output.nf * 3 + (usize)component] = try part.value().attribute_value(cd, face, component)
-                try output.face(count, (i64)(try part.value().attribute_value(groups, face, 0)))
+                        try colors.push(try part.value().attribute_value(cd, face, component))
+                try output.face(count, (i64)self.count + (i64)(try part.value().attribute_value(groups, face, 0)))
                 for corner in 0..<count:
                     try output.corner(try part.value().face_point(face, count - 1 - corner if reversed else corner))
         for face_id in 0..<self.count:
             let entry = self.faces[face_id]
             if entry.nu == 0 and edge_size == 0.0:
-                try output.face((i64)entry.points.length, (i64)face_id + 1024)
+                try output.face((i64)entry.points.length, (i64)face_id)
                 for point in entry.points:
                     try output.corner(try output.point(point))
                 continue
@@ -475,14 +478,14 @@ pub struct CadModel:
                 discard(try output.point(try part.value().point(point)))
             for face in 0..<part.value().face_count():
                 let count = try part.value().face_size(face)
-                try output.face(count, (i64)face_id + 1024)
+                try output.face(count, (i64)face_id)
                 for corner in 0..<count:
                     try output.corner(offset + (try part.value().face_point(face, count - 1 - corner if entry.reversed else corner)))
         let raw = try output.finish()
         defer raw.release()
         for index in 0..<output.nf:
             if output.face_parents[index] < 0:
-                output.face_parents[index] = (i64)index + 1024
+                output.face_parents[index] = self.face_count() + (i64)index
         let values = try alloc f64[output.nf] in memory.heap
         defer free(values) in memory.heap
         for index in 0..<output.nf:
@@ -490,14 +493,18 @@ pub struct CadModel:
         let tagged = try raw.value().with_attribute("cad_face", 2, 1, values, true)
         defer tagged.release()
         if has_colors:
-            let colored = try tagged.value().with_attribute("Cd", 2, 3, colors[..<output.nf * 3])
+            try colors.extend(output.nf * 3, 1.0)
+            let colored = try tagged.value().with_attribute("Cd", 2, 3, colors.view())
             defer colored.release()
             return try MeshNormals.generate(colored, output.face_parents[..<output.nf])
         return try MeshNormals.generate(tagged, output.face_parents[..<output.nf])
 
     mutating func append(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[]) -> !:
         if self.count == self.faces.length:
-            error(invalid, "CAD model exceeds 1024 faces")
+            let grown = try alloc Face[self.faces.length * 2] in memory.heap
+            memory.copy(grown, self.faces, self.count)
+            free(self.faces) in memory.heap
+            self.faces = grown
         let copied = try alloc Vector3[points.length] in memory.heap
         errdefer free(copied) in memory.heap
         for index in 0..<points.length:

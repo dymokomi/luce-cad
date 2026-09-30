@@ -80,9 +80,9 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
   under reflection.
 
 Planar boundaries currently have one outer loop of 3 or more corners and absolute
-coplanarity tolerance 1e-6 in source units. Up to 1024 independent CAD faces are
-stored; generated meshes are also bounded by luce-geocore's modeling budgets. A valid
-analytic model can exceed a particular display mesh budget and fail tessellation.
+coplanarity tolerance 1e-6 in source units. A model holds any number of
+independent faces (their storage grows). A tessellation's `cad_face` numbers
+polygons as `face_count()` does: independent faces first, then the B-rep's.
 
 ## B-rep storage, the cv domain and the tessellation caches
 
