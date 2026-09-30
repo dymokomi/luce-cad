@@ -13,16 +13,35 @@ from luce_cad.surface_normals import face_normals
 from luce_cad.layout_types import GridLayout
 from luce_cad.face_cache import FaceCache, Piece, Tables, face_tables, face_key, new_piece, release_piece
 from geocore_growing import Growing
+from geocore_kernel import append_text
 import math
 
 pub type FaceMesher = func(MeshBuilder*, BrepFace, Surface, const Curve[], const Samples[], GridLayout, i64, f64, f64) -> unit!
 
-## Edited faces that no longer meshed, left out of the tessellation; and
-## the points shared by faces (vertices, edge samples, layout rows), which
-## come before every face's own points.
+## Faces left out of the tessellation: edited faces that no longer meshed
+## (`dropped`), and other faces no mesher could follow (`skipped`, one
+## "Skipped CAD face i: reason" line each in `lines`); and the points shared
+## by faces (vertices, edge samples, layout rows), which come before every
+## face's own points.
 pub struct FaceNotes:
     pub var dropped: usize = 0
+    pub var skipped: usize = 0
+    pub var lines: Growing[u8] = Growing[u8]()
     pub var shared_points: usize = 0
+
+    pub mutating func close():
+        self.lines.close()
+
+## Note face `index` of `faces` that failed with `message` ("CAD face i:
+## reason"): an edited one is dropped, any other skipped with a line.
+pub func note_failure(notes: FaceNotes*, edited: bool, message: str) -> !:
+    if edited:
+        notes.dropped += 1
+        return
+    notes.skipped += 1
+    try append_text(&notes.lines, "Skipped ")
+    try append_text(&notes.lines, message)
+    try notes.lines.push(10)
 
 struct Product:
     var points: Vector3[]
@@ -32,6 +51,10 @@ struct Product:
     var normals: f64[]
     var owns_normals: bool = true
     var failure: interop.Packet[str]? = none
+    ## The failure is not the face's own (running out of memory): it fails
+    ## the tessellation with this code.
+    var fatal: bool = false
+    var code: ErrorCode = invalid
     func close():
         if self.points.length > 0: free(self.points) in memory.heap
         if self.sizes.length > 0: free(self.sizes) in memory.heap
@@ -91,21 +114,19 @@ func work(jobs: Jobs*) -> !:
             var context: u8[1024]
             let message = format(context, f"CAD face {index}: {failure.message}") catch exhausted: recover failure.message
             jobs.products[index].failure = interop.text_transfer.copy(message) catch exhausted: trap(exhausted.message)
-            # Do not cook the rest of a rejected model. Lower indices have
-            # already been assigned; joining their in-flight jobs below keeps
-            # the reported first failing face deterministic across schedules.
-            # An edited face's failure is not a rejection (mesh_faces).
-            if not edited(jobs, index):
+            # A face no mesher follows is left out (mesh_faces); running out
+            # of memory stops the rest. Lower indices have already been
+            # assigned; joining their in-flight jobs keeps the reported first
+            # failure deterministic across schedules.
+            if failure.code != invalid:
+                jobs.products[index].fatal = true
+                jobs.products[index].code = failure.code
                 jobs.lock.lock()
                 jobs.stop = true
                 jobs.lock.unlock()
         jobs.lock.lock()
         jobs.completed += 1
         jobs.lock.unlock()
-
-## Whether face `index`'s surface had its cvs moved.
-func edited(jobs: const Jobs*, index: usize) -> bool:
-    return jobs.surfaces[(usize)jobs.faces[index].surface].edited
 
 func prepare(jobs: Jobs*, index: usize, scratch: MeshBuilder*) -> !:
     let face = jobs.faces[index]
@@ -128,10 +149,12 @@ func prepare(jobs: Jobs*, index: usize, scratch: MeshBuilder*) -> !:
 ## order, so parallel scheduling cannot change point IDs, topology or attributes.
 ## With a cache, faces whose inputs are unchanged reuse their pieces and the
 ## rest are kept for next time (face_cache.lucb).
-## A face whose surface's cvs were moved (Surface.edited) and that no longer
-## meshes (its trims pulled into a shape the mesher rejects) does not fail
-## the model: it is left out, and `notes` counts it.
-pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], samples: const Samples[], plans: const GridLayout[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]?, mesher: FaceMesher, cache: FaceCache*? = none, notes: FaceNotes*? = none) -> f64[]!:
+## A face that no longer meshes does not fail the model: it is left out
+## and `notes` records it (note_failure): dropped when its surface's cvs
+## were moved (Surface.edited, its trims pulled into a shape the mesher
+## rejects), else skipped with its reason. Only running out of memory, or
+## every face failing, fails the tessellation.
+pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], samples: const Samples[], plans: const GridLayout[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]?, mesher: FaceMesher, notes: FaceNotes*, cache: FaceCache*? = none) -> f64[]!:
     let products = try alloc Product[faces.length] in memory.heap
     defer free(products) in memory.heap
     for index in 0..<products.length:
@@ -187,13 +210,16 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         error(invalid, owned.value)
     # Check before allocating or assembling partial products. Unscheduled
     # faces are empty, while every assigned worker has now been joined.
+    var failed: usize = 0
+    var first_failed: usize = products.length
     for index in 0..<products.length:
         let failure = products[index].failure else continue
-        if not surfaces[(usize)faces[index].surface].edited:
-            let owned = try interop.copy_text(failure.value)
-            if let owner = owned.owner: discard(ownership.pool_object(owner))
-            error(invalid, owned.value)
-        if let counts = notes: counts.dropped += 1
+        if products[index].fatal: try fail(failure.value, products[index].code)
+        failed += 1
+        if first_failed == products.length: first_failed = index
+        try note_failure(notes, surfaces[(usize)faces[index].surface].edited, failure.value)
+    if failed == faces.length and first_failed < products.length:
+        try fail((products[first_failed].failure else error(invalid, "every CAD face failed")).value)
     let boundary = mesh.np
     # New faces become pieces for next time (unless a corner falls outside
     # the face's boundary table).
@@ -207,10 +233,21 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         elif products[index].failure == none: normal_count += products[index].normals.length
     let normals = try alloc f64[normal_count] in memory.heap
     errdefer free(normals) in memory.heap
+    # One face's display triangles, sized by the largest face (any size).
+    var largest: i64 = 3
+    for index in 0..<products.length:
+        if let piece = found[index]:
+            for size in piece.sizes:
+                if size > largest: largest = size
+        elif products[index].failure == none:
+            for size in products[index].sizes:
+                if size > largest: largest = size
+    let local_indices = try alloc i64[(usize)(largest-2)*3] in memory.heap
+    defer free(local_indices) in memory.heap
     var normal_offset: usize = 0
     for index in 0..<products.length:
         if let piece = found[index]:
-            try place_piece(mesh, piece, index, &tables, plans[index])
+            try place_piece(mesh, piece, index, &tables, plans[index], local_indices)
             memory.copy(normals[normal_offset..<normal_offset + piece.normals.length], piece.normals, piece.normals.length)
             normal_offset += piece.normals.length
             continue
@@ -221,7 +258,6 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
             discard(try mesh.point(point))
         var corner: usize = 0
         var display: usize = 0
-        var local_indices: i64[762]
         for size in product.sizes:
             let first = corner
             try mesh.face(size, (i64)index)
@@ -296,7 +332,7 @@ func copied[T](values: const T[]) -> T[]!:
 
 ## Append a cached face: its own points, then faces over them and its
 ## boundary table's current ids; its plan gets the strategy it records.
-func place_piece(mesh: MeshBuilder*, piece: const Piece*, index: usize, tables: const Tables*, plan: GridLayout) -> !:
+func place_piece(mesh: MeshBuilder*, piece: const Piece*, index: usize, tables: const Tables*, plan: GridLayout, local_indices: i64[]) -> !:
     if plan.method.length > 0: plan.method[0] = piece.method
     if plan.applied.length > 0: plan.applied[0] = piece.applied
     let table = tables.of(index)
@@ -304,7 +340,6 @@ func place_piece(mesh: MeshBuilder*, piece: const Piece*, index: usize, tables: 
     for point in piece.points: discard(try mesh.point(point))
     var corner: usize = 0
     var display: usize = 0
-    var local_indices: i64[762]
     for size in piece.sizes:
         let first = corner
         try mesh.face(size, (i64)index)
@@ -327,6 +362,12 @@ func stop_jobs(jobs: Jobs*, job: parallel.Job*):
     jobs.stop = true
     jobs.lock.unlock()
     parallel.wait(job)
+
+## Fail with a copy of a face's failure `message`.
+func fail(message: str, code: ErrorCode = invalid) -> !:
+    let owned = try interop.copy_text(message)
+    if let owner = owned.owner: discard(ownership.pool_object(owner))
+    error(code, owned.value)
 
 func close_products(products: const Product[]):
     for product in products: product.close()

@@ -14,12 +14,58 @@ struct Segment:
     var next: i64 = -1
     var used: bool = false
 
+## One cell's scratch, grown to the busiest cell: a cell may hold any number
+## of trim segments and loops.
+struct Cell:
+    var edges: Segment[]
+    var side_ids: i64[]
+    var side_values: f64[]
+    var paths: i64[]
+    var offsets: usize[]
+    var sizes: usize[]
+    var areas: f64[]
+    var mapped: i64[]
+    var loops: i64[]
+    var positions: Vector3[]
+
+    ## Room for a cell of `trim` trim segments: they, and the grid side
+    ## pieces between their endpoints (at most 1 + 2 * trim per side).
+    mutating func reserve(trim: usize) -> !:
+        let edges = trim*9+4
+        if edges <= self.edges.length: return
+        self.close()
+        let capacity = math.max((f64)edges,(f64)self.edges.length*2.0)
+        let size = (usize)math.max(64.0,capacity)
+        self.edges = try alloc Segment[size] in memory.heap
+        self.side_ids = try alloc i64[size] in memory.heap
+        self.side_values = try alloc f64[size] in memory.heap
+        self.paths = try alloc i64[size] in memory.heap
+        self.offsets = try alloc usize[size] in memory.heap
+        self.sizes = try alloc usize[size] in memory.heap
+        self.areas = try alloc f64[size] in memory.heap
+        self.mapped = try alloc i64[size] in memory.heap
+        self.loops = try alloc i64[size+1] in memory.heap
+        self.positions = try alloc Vector3[size] in memory.heap
+
+    func close():
+        if self.edges.length == 0: return
+        free(self.edges) in memory.heap
+        free(self.side_ids) in memory.heap
+        free(self.side_values) in memory.heap
+        free(self.paths) in memory.heap
+        free(self.offsets) in memory.heap
+        free(self.sizes) in memory.heap
+        free(self.areas) in memory.heap
+        free(self.mapped) in memory.heap
+        free(self.loops) in memory.heap
+        free(self.positions) in memory.heap
+
 ## Intersect an axis-aligned grid with an outer loop and holes. The first output
 ## vertices are exactly the input vertices, in order; no trim vertex is welded.
 pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], vs: const f64[], identities: const i64[]) -> interop.Reference[Mesh]!:
-    if us.length < 2 or vs.length < 2 or us.length*vs.length > 131072 or points.length > 16384:
+    if us.length < 2 or vs.length < 2 or us.length*vs.length > 131072:
         error(invalid, "trim grid exceeds layout budget")
-    if sizes.length == 0 or sizes.length > 64: error(invalid,"trim grid requires 1..64 loops")
+    if sizes.length == 0: error(invalid,"trim grid requires a loop")
     for value in us:
         if not math.is_finite(value): error(invalid,"nonfinite U grid station")
     for value in vs:
@@ -79,10 +125,8 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
                 grid[gy*us.length+gx] = aliases[ai]
         offset += count
     if offset != points.length: error(invalid, "trim grid loops do not cover vertices")
-    let edges = try alloc Segment[1024] in memory.heap
-    defer free(edges) in memory.heap
-    var side_ids: i64[1024]
-    var side_values: f64[1024]
+    var scratch = Cell()
+    defer scratch.close()
     let crossings = try alloc f64[points.length] in memory.heap
     defer free(crossings) in memory.heap
     for row in 0..<ny:
@@ -95,6 +139,15 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
             let center = corners[0].add(corners[2]).multiply_scalar(0.5)
             var length: usize = 0
             var current = heads[row*nx+col]
+            var trim: usize = 0
+            while current >= 0:
+                trim += 1
+                current = boundary[(usize)current].next
+            try scratch.reserve(trim)
+            let edges = scratch.edges
+            let side_ids = scratch.side_ids
+            let side_values = scratch.side_values
+            current = heads[row*nx+col]
             while current >= 0:
                 let segment = boundary[(usize)current]
                 try add(edges, &length, segment.a, segment.b)
@@ -142,7 +195,7 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
                     let start = try resolve(&mesh,grid,us,vs,side_ids[at])
                     let end = try resolve(&mesh,grid,us,vs,side_ids[at+1])
                     try add(edges,&length,start,end)
-            try emit(&mesh,edges[..<length],epsilon)
+            try emit(&mesh,&scratch,length,epsilon)
     let result = try mesh.finish()
     errdefer result.release()
     try topology.audit(result.value(),sizes,aliases)
@@ -228,11 +281,15 @@ func row_inside(crossings: const f64[], x: f64) -> bool:
         else: high = mid
     return (crossings.length-low)%2 == 1
 
-func emit(mesh: MeshBuilder*, edges: Segment[], epsilon: f64) -> !:
-    var paths: i64[1024]
-    var offsets: usize[64]
-    var sizes: usize[64]
-    var areas: f64[64]
+## Walk the cell's first `length` segments into loops and emit each outer
+## loop, with the holes it encloses, as faces. A loop without holes stays one
+## face of any size (geocore triangulates it for display).
+func emit(mesh: MeshBuilder*, scratch: Cell*, length: usize, epsilon: f64) -> !:
+    let edges = scratch.edges[..<length]
+    let paths = scratch.paths
+    let offsets = scratch.offsets
+    let sizes = scratch.sizes
+    let areas = scratch.areas
     var count: usize = 0
     var written: usize = 0
     for edge in 0..<edges.length:
@@ -268,10 +325,9 @@ func emit(mesh: MeshBuilder*, edges: Segment[], epsilon: f64) -> !:
         count += 1
     for loop in 0..<count:
         if areas[loop] <= epsilon*epsilon: continue
-        let positions = try alloc Vector3[written] in memory.heap
-        defer free(positions) in memory.heap
-        var mapped: i64[1024]
-        var loops: i64[64]
+        let positions = scratch.positions
+        let mapped = scratch.mapped
+        let loops = scratch.loops
         var nc: usize = 0
         var nl: usize = 0
         for candidate in 0..<count:
@@ -294,7 +350,7 @@ func emit(mesh: MeshBuilder*, edges: Segment[], epsilon: f64) -> !:
                 nc += 1
             nl += 1
         if sizes[loop] < 3: error(invalid,"trim cell cycle has fewer than three vertices")
-        if nl == 0 and sizes[loop] <= 256:
+        if nl == 0:
             try mesh.face((i64)sizes[loop])
             for at in 0..<sizes[loop]: try mesh.corner(paths[offsets[loop]+at])
         else:

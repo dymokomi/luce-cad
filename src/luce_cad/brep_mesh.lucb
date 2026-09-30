@@ -5,7 +5,7 @@ import memory
 import math
 import geocore_parallel as parallel
 from luce_cad.patch_dispatch import mesh_face
-from luce_cad.face_jobs import mesh_faces, FaceNotes
+from luce_cad.face_jobs import mesh_faces, FaceNotes, note_failure
 from luce_cad.edge_sampling import curve_intervals, compact_seams
 from luce_cad.surface_normals import model_normals
 from luce_cad.surface_curvature import model_curvatures
@@ -21,8 +21,11 @@ import luce_cad.curve_spacing as spacing
 from geocore import Vector3, Mesh, MeshBuilder, invalid
 from luce_cad.brep_types import Curve, Surface, BrepFace, Samples
 from luce_cad.face_cache import FaceCache
+from geocore_kernel import TableBuilder, Domain, text_attribute, with_attribute_entry
 
 ## Plan shared boundaries, run independent face jobs, and assemble provenance.
+## A face no mesher can follow is left out and named in the result
+## (with_notes); only running out of memory, or every face failing, fails.
 ## With `curvature`, corner attributes curvature.k1/k2 hold the principal
 ## curvatures (surface_curvature); `directions` adds curvature.d1/d2.
 pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]? = none, selected: i64 = -1, curvature: bool = false, directions: bool = false, cache: FaceCache*? = none) -> interop.Reference[Mesh]!:
@@ -105,16 +108,20 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     var normals: f64[]
     defer free(normals) in memory.heap
     var notes = FaceNotes()
+    defer notes.close()
     # Face jobs on the pool (and the per-face cache, when given); small
     # models without a cache mesh here, in order.
     let pooled = selected < 0 and (faces.length >= 16 or cache != none)
     notes.shared_points = mesh.np
     if pooled:
-        normals = try mesh_faces(&mesh, edges, surfaces, faces, samples, plans, divisions, tolerance, edge_size, progress, mesh_face, cache, &notes)
+        normals = try mesh_faces(&mesh, edges, surfaces, faces, samples, plans, divisions, tolerance, edge_size, progress, mesh_face, &notes, cache)
     # Planned-face diagnostics keep ALL shared sampling/layout work above.
     # Only the final face jobs are restricted, unlike independent previews.
     let first_face = (usize)selected if selected >= 0 else 0
     let last_face = first_face+1 if selected >= 0 else (0 if pooled else faces.length)
+    var failed: usize = 0
+    var first_buffer: u8[1024]
+    var first_failure = ""
     for face_id in first_face..<last_face:
         if let report = progress:
             let outcome = report.invoke((f64)face_id / (f64)faces.length * 0.9)
@@ -122,10 +129,27 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
             try outcome.get()
         let face = faces[face_id]
         let first = mesh.nf
+        let first_point = mesh.np
+        let first_corner = mesh.nc
         let surface = surfaces[(usize)face.surface]
-        try mesh_face(&mesh, face, surface, edges, samples, plans[face_id], divisions, tolerance, edge_size)
+        var meshed = true
+        mesh_face(&mesh, face, surface, edges, samples, plans[face_id], divisions, tolerance, edge_size) catch failure:
+            # A planned-face diagnostic reports its face's failure.
+            if selected >= 0 or failure.code != invalid: error(failure.code, failure.message)
+            mesh.np = first_point
+            mesh.nf = first
+            mesh.nc = first_corner
+            meshed = false
+            var context: u8[1024]
+            let message = format(context, f"CAD face {face_id}: {failure.message}") catch exhausted: recover failure.message
+            try note_failure(&notes, surface.edited, message)
+            if failed == 0: first_failure = format(first_buffer, f"{message}") catch exhausted: recover "a CAD face does not mesh"
+            failed += 1
+            recover ()
+        if not meshed: continue
         for index in first..<mesh.nf:
             mesh.face_parents[index] = (i64)face_id
+    if failed == faces.length: error(invalid, first_failure)
     if not pooled: normals = try model_normals(&mesh, faces, surfaces, plans, tolerance)
     let original = try alloc Vector3[mesh.np] in memory.heap
     defer free(original) in memory.heap
@@ -186,22 +210,38 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
         let colored = try islands.value().with_attribute("Cd", 2, 3, colors)
         defer colored.release()
         let shaded = try colored.value().with_attribute("N", 1, 3, normals, false, true)
-        return try with_notes(try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions), notes)
+        return try with_notes(try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions), &notes)
     let shaded = try islands.value().with_attribute("N", 1, 3, normals, false, true)
-    return try with_notes(try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions), notes)
+    return try with_notes(try with_curvature(shaded, &mesh, original, faces, surfaces, tolerance, curvature, directions), &notes)
 
 ## Takes `made`; records the shared points (.cad_shared_points: every
 ## point below it is a vertex, an edge sample or a layout row; a quick
-## preview keeps them) and how many edited faces no longer meshed
-## (.cad_dropped_faces, which CadGeometry.dropped_faces reads).
-func with_notes(made: interop.Reference[Mesh], notes: FaceNotes) -> interop.Reference[Mesh]!:
-    defer made.release()
-    var value: f64[1] = [(f64)notes.shared_points]
-    let noted = try made.value().with_attribute(".cad_shared_points", 3, 1, value[..<1], true)
-    if notes.dropped == 0: return noted
-    defer noted.release()
-    value[0] = (f64)notes.dropped
-    return try noted.value().with_attribute(".cad_dropped_faces", 3, 1, value[..<1], true)
+## preview keeps them), how many edited faces no longer meshed
+## (.cad_dropped_faces, which CadGeometry.dropped_faces reads) and the faces
+## skipped because no mesher could follow them (.cad_skipped_faces, one
+## "Skipped CAD face i: reason" line each, which CadGeometry.skipped_faces
+## reads).
+func with_notes(made: interop.Reference[Mesh], notes: const FaceNotes*) -> interop.Reference[Mesh]!:
+    let shared = try with_count(made, ".cad_shared_points", notes.shared_points, true)
+    let dropped = try with_count(shared, ".cad_dropped_faces", notes.dropped)
+    if notes.skipped == 0: return dropped
+    defer dropped.release()
+    return try with_lines(dropped.value(), ".cad_skipped_faces", (str)notes.lines.view())
+
+## Takes `mesh`; with detail attribute `name` holding `count` (unless it is
+## zero and not `always`).
+func with_count(mesh: interop.Reference[Mesh], name: str, count: usize, always: bool = false) -> interop.Reference[Mesh]!:
+    if count == 0 and not always: return mesh
+    defer mesh.release()
+    var value: f64[1] = [(f64)count]
+    return try mesh.value().with_attribute(name, 3, 1, value[..<1], true)
+
+## `mesh` with detail text attribute `name` holding `text`.
+func with_lines(mesh: const Mesh*, name: str, text: str) -> interop.Reference[Mesh]!:
+    var strings = TableBuilder()
+    defer strings.close()
+    var index: i32[1] = [try strings.intern(text)]
+    return try with_attribute_entry(mesh, try text_attribute(name, Domain.detail, 1, &strings, index[..<1]))
 
 ## Takes `shaded`; adds the requested curvature columns as f32 (off by
 ## default: the analysis shading asks for them, ordinary tessellation pays

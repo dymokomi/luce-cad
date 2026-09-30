@@ -174,34 +174,16 @@ func structured(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: con
             try periodic_band(mesh, face, surface, edges, samples, tolerance)
         recover ()
 
-func nurbs_trim(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], divisions: i64, edge_size: f64, tolerance: f64) -> !:
-    let ids = try alloc i64[16384] in memory.heap
-    defer free(ids) in memory.heap
-    var sizes: i64[64]
+## The number of boundary samples around `face` (each use's samples but its
+## last, which the next use starts with).
+func boundary_samples(face: BrepFace, samples: const Samples[]) -> usize:
     var count: usize = 0
-    var offset: usize = 0
-    for loop in 0..<face.sizes.length:
-        let first = count
-        for at in 0..<(usize)face.sizes[loop]:
-            let use = face.uses[offset + at]
-            let sample = samples[edge_index(use)].ids
-            if count + sample.length - 1 > ids.length:
-                error(invalid, "NURBS trim exceeds boundary sample budget")
-            for item in 0..<sample.length - 1:
-                ids[count] = sample[item if use > 0 else sample.length - 1 - item]
-                count += 1
-        sizes[loop] = (i64)(count - first)
-        offset += (usize)face.sizes[loop]
-    if surface.kind == 3:
-        try mesh_trim(mesh, ids[..<count], sizes[..<face.sizes.length], surface, face.sense, divisions, edge_size, tolerance)
-    else:
-        try analytic_trim(mesh, ids[..<count], sizes[..<face.sizes.length], surface, face.sense, divisions, tolerance, edge_size)
+    for use in face.uses: count += samples[edge_index(use)].ids.length - 1
+    return count
 
-func planar(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], tolerance: f64, edge_size: f64, divisions: i64) -> !:
-    let ids = try alloc i64[65536] in memory.heap
+func nurbs_trim(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], divisions: i64, edge_size: f64, tolerance: f64) -> !:
+    let ids = try alloc i64[boundary_samples(face, samples)] in memory.heap
     defer free(ids) in memory.heap
-    let points = try alloc Vector3[16384] in memory.heap
-    defer free(points) in memory.heap
     let sizes = try alloc i64[face.sizes.length] in memory.heap
     defer free(sizes) in memory.heap
     var count: usize = 0
@@ -211,8 +193,32 @@ func planar(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const
         for at in 0..<(usize)face.sizes[loop]:
             let use = face.uses[offset + at]
             let sample = samples[edge_index(use)].ids
-            if count + sample.length - 1 > points.length:
-                error(invalid, "planar trim exceeds 16384 boundary samples")
+            for item in 0..<sample.length - 1:
+                ids[count] = sample[item if use > 0 else sample.length - 1 - item]
+                count += 1
+        sizes[loop] = (i64)(count - first)
+        offset += (usize)face.sizes[loop]
+    if surface.kind == 3:
+        try mesh_trim(mesh, ids[..<count], sizes, surface, face.sense, divisions, edge_size, tolerance)
+    else:
+        try analytic_trim(mesh, ids[..<count], sizes, surface, face.sense, divisions, tolerance, edge_size)
+
+func planar(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], tolerance: f64, edge_size: f64, divisions: i64) -> !:
+    let boundary = boundary_samples(face, samples)
+    let points = try alloc Vector3[boundary] in memory.heap
+    defer free(points) in memory.heap
+    # Boundary ids, then (after triangulation) the ids of the part's own points.
+    var ids = try alloc i64[boundary] in memory.heap
+    defer free(ids) in memory.heap
+    let sizes = try alloc i64[face.sizes.length] in memory.heap
+    defer free(sizes) in memory.heap
+    var count: usize = 0
+    var offset: usize = 0
+    for loop in 0..<face.sizes.length:
+        let first = count
+        for at in 0..<(usize)face.sizes[loop]:
+            let use = face.uses[offset + at]
+            let sample = samples[edge_index(use)].ids
             for item in 0..<sample.length - 1:
                 let id = sample[item if use > 0 else sample.length - 1 - item]
                 let position = mesh.points[(usize)id]
@@ -259,6 +265,10 @@ func planar(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const
         vertical = (high.y-low.y) / resolution
     let part = try TrimPolygon.quadrangulate_seams(points[..<count], sizes, normal, ids[..<count], spacing, vertical)
     defer part.release()
+    let all = try alloc i64[(usize)part.value().point_count()] in memory.heap
+    memory.copy(all, ids, count)
+    free(ids) in memory.heap
+    ids = all
     for index in count..<(usize)part.value().point_count():
         ids[index] = try mesh.point(try part.value().point((i64)index))
     for index in 0..<part.value().face_count():

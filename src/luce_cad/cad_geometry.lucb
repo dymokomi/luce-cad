@@ -10,7 +10,7 @@ import ownership
 from geocore import Mesh, Vector3, Matrix4, Bounds, invalid, GeometrySet
 from geocore_growing import Growing
 from geocore_kernel import ComponentType, Placement, IdSet, TableBuilder, PathFilter, MeshPart, Domain, Attribute, Instances
-from geocore_kernel import adopt_set, dispose_set, empty_set, set_mesh, append_text, append_number, mesh_component, instances_component, new_instances, set_find, set_put, set_remove, set_storage, concatenated, with_attribute_entry, text_attribute, mesh_share
+from geocore_kernel import adopt_set, dispose_set, empty_set, set_mesh, append_text, append_number, mesh_component, instances_component, new_instances, set_find, set_put, set_remove, set_storage, concatenated, with_attribute_entry, text_attribute, mesh_share, attribute_entry
 from luce_cad.model import CadModel, cad_model_type, encode_model, decode_model, numbered
 from geocore_kernel import register_codec, GeometryWriter, GeometryReader
 from luce_cad.cv_cloud import cloud_mesh, is_cloud, moved_models
@@ -135,6 +135,32 @@ func trace_parts(data: const void*, visit: func(ownership.Object*, void*) -> uni
 func detail_count(mesh: const Mesh*, name: str) -> i64!:
     let index = mesh.find_attribute(name, (i64)(u8)Domain.detail)
     return (i64)(try mesh.attribute_value(index, 0)) if index >= 0 else 0
+
+## A tessellation's skipped-face lines (brep_mesh.with_notes).
+func skipped_text(mesh: const Mesh*) -> str!:
+    let index = mesh.find_attribute(".cad_skipped_faces", (i64)(u8)Domain.detail)
+    if index < 0: return ""
+    return (try attribute_entry(mesh, index)).text_at(0)
+
+## `mesh` joined from several models' tessellations (`parts`), with their
+## dropped-face counts summed and skipped-face lines joined (a joined
+## detail attribute keeps only the first part's).
+func with_joined_notes(mesh: interop.Reference[Mesh], parts: const interop.Reference[Mesh][]) -> interop.Reference[Mesh]!:
+    var dropped: i64 = 0
+    var lines = Growing[u8]()
+    defer lines.close()
+    for part in parts:
+        dropped += try detail_count(part.value(), ".cad_dropped_faces")
+        try append_text(&lines, try skipped_text(part.value()))
+    if dropped == 0 and lines.count == 0: return mesh.clone()
+    var value: f64[1] = [(f64)dropped]
+    let counted = try mesh.value().with_attribute(".cad_dropped_faces", 3, 1, value[..<1], true)
+    if lines.count == 0: return counted
+    defer counted.release()
+    var strings = TableBuilder()
+    defer strings.close()
+    var index: i32[1] = [try strings.intern((str)lines.view())]
+    return try with_attribute_entry(counted.value(), try text_attribute(".cad_skipped_faces", Domain.detail, 1, &strings, index[..<1]))
 
 ## The CAD family in geometry files: element `cad` holding one `cad_model`
 ## child per model (m0, m1, …; luce_cad.model's codec).
@@ -261,6 +287,11 @@ pub struct CadGeometry:
     pub static func dropped_faces(mesh: interop.Reference[Mesh]) -> i64!:
         return try detail_count(try mesh.get(), ".cad_dropped_faces")
 
+    ## Faces of a CAD tessellation left out because no mesher could follow
+    ## them: one "Skipped CAD face i: reason" line each ("" when none were).
+    pub static func skipped_faces(mesh: interop.Reference[Mesh]) -> interop.Owned[str]!:
+        return try interop.copy_text(try skipped_text(try mesh.get()))
+
     ## Analytic faces of the set's own CAD models.
     pub static func face_count(set: interop.Reference[GeometrySet]) -> i64!:
         let data = set_find(try set.get(), &cad_component) else return 0
@@ -297,7 +328,9 @@ func tessellated_storage(set: const GeometrySet*, segments: i64, edge_size: f64,
         if pieces.count == 1:
             try set_put(result, mesh_component(), (void*)(try mesh_share(pieces.items[0].mesh)))
         else:
-            let mesh = try concatenated(pieces.view())
+            let joined = try concatenated(pieces.view())
+            defer joined.release()
+            let mesh = try with_joined_notes(joined, owners.view())
             defer mesh.release()
             try set_put(result, mesh_component(), (void*)(try mesh_share(mesh.value())))
     try tessellate_instances(result, segments, edge_size, progress, depth)

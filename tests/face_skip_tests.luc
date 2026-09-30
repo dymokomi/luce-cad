@@ -1,0 +1,48 @@
+## A face no mesher can follow is left out of the tessellation and named;
+## the rest of the model still meshes. Every face failing fails the model.
+from cad import BrepModel, CadModel
+from cad_geometry import CadGeometry
+from geocore import Vector3
+
+## `good` unit squares on z = 0 side by side, then one square face whose
+## boundary leaves its plane (a corner 0.1 above it): no mesher takes it.
+func squares(good: int) -> BrepModel!:
+    let z = Vector3(0.0, 0.0, 1.0)
+    let x = Vector3(1.0, 0.0, 0.0)
+    let b = BrepModel()
+    let plane = b.add_surface(0, Vector3(), z, x)
+    for at in 0..<good + 1:
+        let left = float(at) * 2.0
+        let lift = 0.1 if at == good else 0.0
+        let first = b.add_vertex(Vector3(left, 0.0, 0.0))
+        discard(b.add_vertex(Vector3(left + 1.0, 0.0, 0.0)))
+        discard(b.add_vertex(Vector3(left + 1.0, 1.0, lift)))
+        discard(b.add_vertex(Vector3(left, 1.0, 0.0)))
+        let uses: list[int] = []
+        for corner in 0..<4: uses.append(b.add_line(first + corner, first + (corner + 1) % 4) + 1)
+        discard(b.add_face(plane, uses, [4]))
+    return b
+
+pub func face_skip_tests() -> unit!:
+    # Fewer than 16 faces mesh in order here; more go to the worker pool.
+    for good in [3, 20]:
+        let model = CadModel()
+        model.attach_brep(squares(good))
+        let mesh = model.tessellate(4)
+        let parent = mesh.find_attribute("cad_face", 2)
+        for face in 0..<mesh.face_count(): assert(int(mesh.attribute_value(parent, face, 0)) < good)
+        assert(mesh.face_count() >= good)
+        let skipped = CadGeometry.skipped_faces(mesh)
+        assert(skipped.starts_with(f"Skipped CAD face {good}: "))
+        assert(skipped.split("\n").length == 2)
+        assert(CadGeometry.dropped_faces(mesh) == 0)
+    # Only the bad face: the model fails, naming it.
+    let alone = BrepModel()
+    let z = Vector3(0.0, 0.0, 1.0)
+    for p in [Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.1), Vector3(0.0, 1.0, 0.0)]: discard(alone.add_vertex(p))
+    for edge in 0..<4: discard(alone.add_line(edge, (edge + 1) % 4))
+    discard(alone.add_face(alone.add_surface(0, Vector3(), z, Vector3(1.0, 0.0, 0.0)), [1, 2, 3, 4], [4]))
+    var message = ""
+    discard(alone.mesh(8)) catch failure: message = failure.message
+    assert(message.starts_with("CAD face 0: "))
+    print("PASS CAD faces no mesher follows are skipped and named; the rest mesh")

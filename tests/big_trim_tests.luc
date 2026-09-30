@@ -1,0 +1,135 @@
+## B-rep faces past the old per-face budgets (64 trim loops, 1024 edge uses,
+## 16384 boundary samples) and spline edges of thousands of control points
+## tessellate like any other face.
+from cad import BrepModel, CadModel
+from geocore import Vector3
+from checks import manifold
+import math
+
+## A closed perforated plate: a `columns` by `rows` grid of round through
+## holes (radius 0.3, pitch 1) in a block `thickness` thick. Its two caps
+## have columns * rows + 1 trim loops each.
+func perforated(columns: int, rows: int, thickness: float) -> BrepModel!:
+    let z = Vector3(0.0, 0.0, 1.0)
+    let x = Vector3(1.0, 0.0, 0.0)
+    let b = BrepModel()
+    let width = float(columns)
+    let height = float(rows)
+    let corners = [Vector3(0.0, 0.0, 0.0), Vector3(width, 0.0, 0.0), Vector3(width, height, 0.0), Vector3(0.0, height, 0.0)]
+    for level in 0..<2:
+        for c in corners: discard(b.add_vertex(c.add(z.multiply_scalar(thickness * float(level)))))
+    # Edges 1..4 the bottom square, 5..8 the top, 9..12 the verticals.
+    for level in 0..<2:
+        for at in 0..<4: discard(b.add_line(level * 4 + at, level * 4 + (at + 1) % 4))
+    for at in 0..<4: discard(b.add_line(at, 4 + at))
+    let bottom: list[int] = [1, 2, 3, 4]
+    let top: list[int] = [5, 6, 7, 8]
+    let sizes: list[int] = [4]
+    let walls: list[(Vector3, int)] = []
+    for column in 0..<columns:
+        for row in 0..<rows:
+            let center = Vector3(float(column) + 0.5, float(row) + 0.5, 0.0)
+            let low = b.add_vertex(center.add(Vector3(0.3, 0.0, 0.0)))
+            let high = b.add_vertex(center.add(Vector3(0.3, 0.0, thickness)))
+            let lower = b.add_circle(low, low, center, z, x, 0.3) + 1
+            let upper = b.add_circle(high, high, center.add(z.multiply_scalar(thickness)), z, x, 0.3) + 1
+            let seam = b.add_line(low, high) + 1
+            bottom.append(-lower)
+            top.append(-upper)
+            sizes.append(1)
+            walls.append((center, lower))
+            discard(seam)
+    discard(b.add_face(b.add_surface(0, Vector3(), z, x), bottom, sizes, false))
+    discard(b.add_face(b.add_surface(0, Vector3(0.0, 0.0, thickness), z, x), top, sizes))
+    for at in 0..<4:
+        let next = (at + 1) % 4
+        let along = corners[next].subtract(corners[at]).normalized()
+        let plane = b.add_surface(0, corners[at], along.cross(z), along)
+        discard(b.add_face(plane, [at + 1, 9 + next, -(5 + at), -(9 + at)], [4]))
+    for wall in walls:
+        let (center, lower) = wall
+        let hole = b.add_surface(1, center, z, x, 0.3)
+        discard(b.add_face(hole, [lower, lower + 2, -(lower + 1), -(lower + 2)], [4], false))
+    return b
+
+## A block 10 by 1 whose top side has a fine sawtooth of `teeth` edges
+## over its first 2 units (0.002 deep, far finer than a layout cell): an
+## outline of teeth + 4 edges, counterclockwise. Layout cells along the
+## teeth have hundreds of corners each.
+func sawtooth(teeth: int) -> list[Vector3]:
+    let points: list[Vector3] = [Vector3(), Vector3(10.0, 0.0, 0.0), Vector3(10.0, 1.0, 0.0)]
+    for at in 0..<teeth + 1:
+        points.append(Vector3(2.0 - 2.0 * float(at) / float(teeth), 1.0 + (0.002 if at % 2 == 1 else 0.0), 0.0))
+    return points
+
+## A closed prism 0.5 high over a counterclockwise `outline`: two caps of
+## one edge use per outline corner, and a planar side per outline edge.
+func prism(outline: list[Vector3]) -> BrepModel!:
+    let z = Vector3(0.0, 0.0, 1.0)
+    let x = Vector3(1.0, 0.0, 0.0)
+    let n = outline.length
+    let b = BrepModel()
+    for p in outline: discard(b.add_vertex(p))
+    for p in outline: discard(b.add_vertex(p.add(Vector3(0.0, 0.0, 0.5))))
+    for ring in 0..<2:
+        for at in 0..<n: discard(b.add_line(ring * n + at, ring * n + (at + 1) % n))
+    for at in 0..<n: discard(b.add_line(at, n + at))
+    let bottom: list[int] = []
+    let top: list[int] = []
+    for at in 0..<n:
+        bottom.append(at + 1)
+        top.append(n + at + 1)
+    discard(b.add_face(b.add_surface(0, Vector3(), z, x), bottom, [n], false))
+    discard(b.add_face(b.add_surface(0, Vector3(0.0, 0.0, 0.5), z, x), top, [n]))
+    for at in 0..<n:
+        let next = (at + 1) % n
+        let along = outline[next].subtract(outline[at]).normalized()
+        let plane = b.add_surface(0, outline[at], along.cross(z), along)
+        discard(b.add_face(plane, [at + 1, 2 * n + next + 1, -(n + at + 1), -(2 * n + at + 1)], [4]))
+    return b
+
+## A planar sheet bounded by a cubic spline edge of `count` control points
+## (a gentle wave from (0, 0) to (10, 0)) and two lines back through (5, 3).
+func wave_sheet(count: int) -> BrepModel!:
+    let z = Vector3(0.0, 0.0, 1.0)
+    let x = Vector3(1.0, 0.0, 0.0)
+    let b = BrepModel()
+    let start = b.add_vertex(Vector3())
+    let end = b.add_vertex(Vector3(10.0, 0.0, 0.0))
+    let apex = b.add_vertex(Vector3(5.0, 3.0, 0.0))
+    let controls: list[Vector3] = []
+    let weights: list[float] = []
+    for at in 0..<count:
+        let t = float(at) / float(count - 1)
+        let wave = 0.0 if at == 0 or at == count - 1 else 0.05 * math.sin(t * 37.0 * math.pi)
+        controls.append(Vector3(10.0 * t, wave, 0.0))
+        weights.append(1.0)
+    let knots: list[float] = [0.0, 0.0, 0.0, 0.0]
+    for at in 1..<count - 3: knots.append(float(at) / float(count - 3))
+    for at in 0..<4: knots.append(1.0)
+    let spline = b.add_spline_edge(start, end, controls, weights, 3, knots, true) + 1
+    let rise = b.add_line(end, apex) + 1
+    let fall = b.add_line(apex, start) + 1
+    discard(b.add_face(b.add_surface(0, Vector3(), z, x), [spline, rise, fall], [3]))
+    return b
+
+pub func big_trim_tests() -> unit!:
+    # 500 round holes: caps of 501 loops each, meshed closed with every
+    # display triangle facing out.
+    let plate = CadModel()
+    plate.attach_brep(perforated(25, 20, 0.5))
+    assert(plate.face_count() == 506)
+    let holes = plate.tessellate(8)
+    manifold(holes)
+    # 5002 edge uses on each cap of a sawtooth block.
+    let block = CadModel()
+    block.attach_brep(prism(sawtooth(4998)))
+    let teeth = block.tessellate(4)
+    assert(teeth.point_count() >= 10000)
+    manifold(teeth)
+    # A 2000-control-point spline edge bounds a face.
+    let sheet = CadModel()
+    sheet.attach_brep(wave_sheet(2000))
+    let wave = sheet.tessellate(8)
+    assert(wave.face_count() >= 1 and wave.point_count() > 3)
+    print("PASS CAD faces past the old budgets: 500 holes, 5000 edge uses, a 2000-control spline edge")

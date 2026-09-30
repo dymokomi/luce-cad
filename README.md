@@ -259,9 +259,16 @@ Supported face meshing:
   terminate interior rows rather than inheriting the full canonical sample set.
   Mapped, clipped and constrained strategies validate their output before
   committing. Unsupported layouts fall back without dropping shared seam IDs.
-- Simple support grids can clip up to 1,024 authored coedges, subject to the
-  existing 16,384 sampled-boundary and bounded station/cell budgets. A grooved
-  cylinder/cone is not forced into triangle fans solely because it has more
+  A face no strategy meshes is left out of the tessellation, not the model:
+  `CadGeometry.skipped_faces(mesh)` names each ("Skipped CAD face i: reason",
+  one line each, joined across a set's models). Only running out of memory,
+  or every face failing, fails a tessellation.
+- Support grids clip faces of any number of trim loops, coedges and boundary
+  samples (a plate with 500 holes, a cap of 5,000 coedges): the chart, the
+  cut grid and the constrained fallbacks size their scratch by the face, and
+  a cut cell without holes stays one polygon of any size (luce-geocore
+  triangulates it for display). Station/cell budgets still bound the grid. A
+  grooved cylinder/cone is not forced into triangle fans solely because it has more
   than 128 topological edges. The four-sided mapped recognizer stays separate;
   admitting a clipped chart does not pretend its jagged boundary is rectangular.
 - Support grids allow up to 1,025 stations per axis under a joint 131,072-grid-point
