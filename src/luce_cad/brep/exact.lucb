@@ -125,14 +125,22 @@ pub func brep_face_trim_uv(model: const BrepModel*, face: i64, divisions: i64, u
     error(invalid, "trim loops do not close in one support chart")
 
 ## Chain every loop of `face` from `initial`; false when a loop does not
-## close in one chart (another seed may).
+## close in one chart (another seed may). On periodic supports a seam's
+## second use takes the chart's other side, a coedge leaving a singular
+## point (a cone's apex, a sphere's pole) takes the side that closes the
+## loop, and a loop wrapping once around the period (a sphere's
+## hemisphere, bounded by its equator alone) closes along the singular
+## line on the face's side.
 func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], edges: const Curve[], stations: const Stations[], tolerance: f64, initial: Vector3, uv: Growing[Vector3]*, sizes: Growing[i64]*) -> bool!:
+    let period = 2.0 * math.pi if surface.kind == 1 or surface.kind == 2 or surface.kind == 4 or surface.kind == 5 else 0.0
     var offset: usize = 0
     var loop_seed = initial
+    var junctions = Growing[usize]()
+    defer junctions.close()
     for size in face.sizes:
         var seed = loop_seed
-        var first = Vector3()
         let start = uv.count
+        junctions.clear()
         for entry in 0..<(usize)size:
             let use = face.uses[offset + entry]
             let forward = use > 0
@@ -142,13 +150,23 @@ func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], ed
                 free(chain.times) in memory.heap
             let points = chain.points
             let begin = points[0 if forward else points.length - 1]
-            if entry == 0: first = begin
-            elif begin.subtract(seed).length() > 1e-4: return false
+            var shift = 0.0
+            let at_singular = entry > 0 and singular(surface, seed, tolerance)
+            if at_singular: try junctions.push(uv.count)
+            if entry > 0 and not at_singular and begin.subtract(seed).length() > 1e-4:
+                if period > 0.0 and begin.add(Vector3(period, 0.0, 0.0)).subtract(seed).length() <= 1e-4:
+                    shift = period
+                elif period > 0.0 and begin.subtract(Vector3(period, 0.0, 0.0)).subtract(seed).length() <= 1e-4:
+                    shift = -period
+                else:
+                    return false
             # Every point but the coedge's last, which the next one starts at.
             for step in 0..<points.length - 1:
-                try uv.push(points[step if forward else points.length - 1 - step])
-            seed = points[points.length - 1 if forward else 0]
-        if seed.subtract(first).length() > 1e-4: return false
+                try uv.push(points[step if forward else points.length - 1 - step].add(Vector3(shift, 0.0, 0.0)))
+            seed = points[points.length - 1 if forward else 0].add(Vector3(shift, 0.0, 0.0))
+        let first = uv.items[start]
+        if seed.subtract(first).length() > 1e-4 and not (try close_loop(face, surface, tolerance, period, uv, start, seed, junctions.view())):
+            return false
         try sizes.push((i64)(uv.count - start))
         # A hole on a periodic support is seeded inside the outer loop's chart.
         if offset == 0 and (surface.kind == 1 or surface.kind == 2):
@@ -160,3 +178,43 @@ func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], ed
             loop_seed = Vector3((low + high) * 0.5, 0.0, 0.0)
         offset += (usize)size
     return true
+
+## Close the loop from `start` whose last coedge ended at `end`: by moving
+## the coedges after a singular junction to the chart's other side, or,
+## for a loop wrapping once around the period, along the singular line on
+## the face's side. False when neither closes it.
+func close_loop(face: BrepFace, surface: Surface, tolerance: f64, period: f64, uv: Growing[Vector3]*, start: usize, end: Vector3, junctions: const usize[]) -> bool!:
+    if period <= 0.0: return false
+    let first = uv.items[start]
+    for junction in junctions:
+        for side in [-period, period]:
+            if end.add(Vector3(side, 0.0, 0.0)).subtract(first).length() <= 1e-4:
+                for at in junction..<uv.count: uv.items[at] = uv.items[at].add(Vector3(side, 0.0, 0.0))
+                return true
+    let wrap = end.x - first.x
+    if math.abs(math.abs(wrap) - period) > 1e-4 or math.abs(end.y - first.y) > 1e-4: return false
+    # Left of the loop's direction in (u, v) is the face when it follows
+    # the support's normal.
+    let upward = (wrap > 0.0) == face.sense
+    let edge = singular_height(surface, upward, end.y) else return false
+    try uv.push(end)
+    try uv.push(Vector3(end.x, edge, 0.0))
+    try uv.push(Vector3(first.x, edge, 0.0))
+    return true
+
+## Whether chart point `p` is singular: a cone's apex or a sphere's pole.
+func singular(surface: Surface, p: Vector3, tolerance: f64) -> bool:
+    if surface.kind == 4: return math.abs(math.abs(p.y) - math.pi * 0.5) < 1e-6
+    if surface.kind == 2: return math.abs(surface.radius + p.y * math.tan(surface.angle)) <= tolerance
+    return false
+
+## The singular line's v above `level` (`upward`) or below it: a sphere's
+## pole, a cone's apex on that side; none elsewhere.
+func singular_height(surface: Surface, upward: bool, level: f64) -> f64?:
+    if surface.kind == 4: return math.pi * 0.5 if upward else -math.pi * 0.5
+    if surface.kind == 2:
+        let slope = math.tan(surface.angle)
+        if slope == 0.0: return none
+        let apex = -surface.radius / slope
+        if (apex > level) == upward: return apex
+    return none
