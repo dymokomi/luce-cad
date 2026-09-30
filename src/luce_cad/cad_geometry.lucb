@@ -10,7 +10,7 @@ import ownership
 from geocore import Mesh, Vector3, Matrix4, Bounds, invalid, GeometrySet
 from geocore_growing import Growing
 from geocore_kernel import ComponentType, Placement, IdSet, TableBuilder, PathFilter, MeshPart, Domain, Attribute, Instances
-from geocore_kernel import adopt_set, dispose_set, empty_set, set_mesh, append_text, append_number, mesh_component, instances_component, new_instances, set_find, set_put, set_remove, set_storage, concatenated, with_attribute_entry, text_attribute, mesh_share, attribute_entry
+from geocore_kernel import adopt_set, dispose_set, empty_set, set_mesh, append_text, append_number, mesh_component, instances_component, new_instances, concatenated, text_attribute, mesh_share
 from luce_cad.model import CadModel, cad_model_type, encode_model, decode_model, numbered
 from geocore_kernel import register_codec, GeometryWriter, GeometryReader
 from luce_cad.cv_cloud import cloud_mesh, is_cloud, moved_models
@@ -140,7 +140,7 @@ func detail_count(mesh: const Mesh*, name: str) -> i64!:
 func skipped_text(mesh: const Mesh*) -> str!:
     let index = mesh.find_attribute(".cad_skipped_faces", (i64)(u8)Domain.detail)
     if index < 0: return ""
-    return (try attribute_entry(mesh, index)).text_at(0)
+    return (try mesh.attribute_entry(index)).text_at(0)
 
 ## `mesh` joined from several models' tessellations (`parts`), with their
 ## dropped-face counts summed and skipped-face lines joined (a joined
@@ -160,7 +160,7 @@ func with_joined_notes(mesh: interop.Reference[Mesh], parts: const interop.Refer
     var strings = TableBuilder()
     defer strings.close()
     var index: i32[1] = [try strings.intern((str)lines.view())]
-    return try with_attribute_entry(counted.value(), try text_attribute(".cad_skipped_faces", Domain.detail, 1, &strings, index[..<1]))
+    return try counted.value().with_attribute_entry(try text_attribute(".cad_skipped_faces", Domain.detail, 1, &strings, index[..<1]))
 
 ## The CAD family in geometry files: element `cad` holding one `cad_model`
 ## child per model (m0, m1, …; luce_cad.model's codec).
@@ -192,7 +192,7 @@ func decode_parts(reader: GeometryReader*, path: str) -> void*!:
 
 ## The set's own models (Base editors: cad_edits.lucb); none without CAD.
 pub func set_models(set: const GeometrySet*) -> const interop.Reference[CadModel][]:
-    let data = set_find(set, &cad_component) else return empty_models()
+    let data = set.find(&cad_component) else return empty_models()
     return ((const CadParts*)data).models.view()
 
 func empty_models() -> const interop.Reference[CadModel][]:
@@ -202,8 +202,8 @@ func empty_models() -> const interop.Reference[CadModel][]:
 ## `set` with `models` in place of its CAD models (without CAD when there
 ## are none); every other component shared.
 pub func with_models(set: const GeometrySet*, models: const interop.Reference[CadModel][]) -> interop.Reference[GeometrySet]!:
-    let result = try set_storage(set)
-    set_remove(result, &cad_component)
+    let result = try set.storage()
+    result.remove(&cad_component)
     if models.length > 0:
         let parts = new_parts() catch failure:
             dispose_set(result)
@@ -213,7 +213,7 @@ pub func with_models(set: const GeometrySet*, models: const interop.Reference[Ca
                 close_parts((void*)parts)
                 dispose_set(result)
                 error(failure.code, failure.message)
-        set_put(result, &cad_component, (void*)parts) catch failure:
+        result.put(&cad_component, (void*)parts) catch failure:
             close_parts((void*)parts)
             dispose_set(result)
             error(failure.code, failure.message)
@@ -238,18 +238,18 @@ pub struct CadGeometry:
         let storage = empty_set() catch failure:
             close_parts((void*)parts)
             error(failure.code, failure.message)
-        set_put(storage, &cad_component, (void*)parts) catch failure:
+        storage.put(&cad_component, (void*)parts) catch failure:
             dispose_set(storage)
             error(failure.code, failure.message)
         return try adopt_set(storage)
 
     ## The set's CAD models (not its instances').
     pub static func model_count(set: interop.Reference[GeometrySet]) -> i64!:
-        let data = set_find(try set.get(), &cad_component) else return 0
+        let data = (try set.get()).find(&cad_component) else return 0
         return (i64)((const CadParts*)data).count()
 
     pub static func model(set: interop.Reference[GeometrySet], index: i64) -> interop.Reference[CadModel]!:
-        let data = set_find(try set.get(), &cad_component) else error(invalid, "the geometry has no CAD models")
+        let data = (try set.get()).find(&cad_component) else error(invalid, "the geometry has no CAD models")
         let parts = (const CadParts*)data
         if index < 0 or (usize)index >= parts.count(): error(invalid, "CAD model index out of range")
         return parts.models.items[(usize)index].clone()
@@ -257,7 +257,7 @@ pub struct CadGeometry:
     ## The set's own models' control vertices as a point cloud (placed; no
     ## faces), which point verbs edit (cv_cloud.lucb).
     pub static func cv_cloud(set: interop.Reference[GeometrySet]) -> interop.Reference[Mesh]!:
-        let data = set_find(try set.get(), &cad_component) else error(invalid, "the geometry has no CAD models")
+        let data = (try set.get()).find(&cad_component) else error(invalid, "the geometry has no CAD models")
         return try cloud_mesh(((const CadParts*)data).models.view())
 
     pub static func is_cv_cloud(mesh: interop.Reference[Mesh]) -> bool!:
@@ -266,17 +266,17 @@ pub struct CadGeometry:
     ## The set with the cvs `after` moved relative to `before` (its clouds).
     pub static func with_cv_cloud(set: interop.Reference[GeometrySet], before: interop.Reference[Mesh], after: interop.Reference[Mesh]) -> interop.Reference[GeometrySet]!:
         let source = try set.get()
-        let data = set_find(source, &cad_component) else error(invalid, "the geometry has no CAD models")
+        let data = source.find(&cad_component) else error(invalid, "the geometry has no CAD models")
         let parts = try new_parts()
-        let result = set_storage(source) catch failure:
+        let result = source.storage() catch failure:
             close_parts((void*)parts)
             error(failure.code, failure.message)
         moved_models(((const CadParts*)data).models.view(), try before.get(), try after.get(), &parts.models) catch failure:
             close_parts((void*)parts)
             dispose_set(result)
             error(failure.code, failure.message)
-        set_remove(result, &cad_component)
-        set_put(result, &cad_component, (void*)parts) catch failure:
+        result.remove(&cad_component)
+        result.put(&cad_component, (void*)parts) catch failure:
             close_parts((void*)parts)
             dispose_set(result)
             error(failure.code, failure.message)
@@ -294,7 +294,7 @@ pub struct CadGeometry:
 
     ## Analytic faces of the set's own CAD models.
     pub static func face_count(set: interop.Reference[GeometrySet]) -> i64!:
-        let data = set_find(try set.get(), &cad_component) else return 0
+        let data = (try set.get()).find(&cad_component) else return 0
         return (i64)((const CadParts*)data).faces()
 
     ## The set with its CAD models tessellated into its mesh, instances
@@ -305,9 +305,9 @@ pub struct CadGeometry:
 
 func tessellated_storage(set: const GeometrySet*, segments: i64, edge_size: f64, progress: interop.Callback[f64, unit]?, depth: usize) -> GeometrySet*!:
     if depth > 64: error(invalid, "instances nest more than 64 deep")
-    let result = try set_storage(set)
+    let result = try set.storage()
     errdefer dispose_set(result)
-    if let data = set_find(set, &cad_component):
+    if let data = set.find(&cad_component):
         let parts = (const CadParts*)data
         var owners = Growing[interop.Reference[Mesh]]()
         defer:
@@ -322,17 +322,17 @@ func tessellated_storage(set: const GeometrySet*, segments: i64, edge_size: f64,
                 owner.release()
                 error(failure.code, failure.message)
             try pieces.push(MeshPart(owner.value(), Matrix4()))
-        set_remove(result, &cad_component)
+        result.remove(&cad_component)
         # One model's tessellation is placed as it is: the set shares the
         # model's kept mesh (and the GPU buffers already made for it).
         if pieces.count == 1:
-            try set_put(result, mesh_component(), (void*)(try mesh_share(pieces.items[0].mesh)))
+            try result.put(mesh_component(), (void*)(try mesh_share(pieces.items[0].mesh)))
         else:
             let joined = try concatenated(pieces.view())
             defer joined.release()
             let mesh = try with_joined_notes(joined, owners.view())
             defer mesh.release()
-            try set_put(result, mesh_component(), (void*)(try mesh_share(mesh.value())))
+            try result.put(mesh_component(), (void*)(try mesh_share(mesh.value())))
     try tessellate_instances(result, segments, edge_size, progress, depth)
     return result
 
@@ -362,12 +362,12 @@ func tessellate_with_paths(model: const CadModel*, segments: i64, edge_size: f64
         let original = (i64)(try mesh.attribute_value(source, (i64)face))
         values[face] = face_paths[(usize)original] if original >= 0 and original < face_count else -1
     let attribute = try text_attribute("path", Domain.face, faces, &strings, values)
-    return try with_attribute_entry(mesh, attribute)
+    return try mesh.with_attribute_entry(attribute)
 
 ## The set's instances with each prototype tessellated once: every
 ## instance keeps its prototype index and placement.
 func tessellate_instances(result: GeometrySet*, segments: i64, edge_size: f64, progress: interop.Callback[f64, unit]?, depth: usize) -> !:
-    let data = set_find(result, instances_component()) else return
+    let data = result.find(instances_component()) else return
     let source = (const Instances*)data
     let rebuilt = try new_instances()
     let close = instances_component().close
@@ -385,6 +385,6 @@ func tessellate_instances(result: GeometrySet*, segments: i64, edge_size: f64, p
         rebuilt.add_instance((usize)row.prototype, &placement, row.visible) catch failure:
             close((void*)rebuilt)
             error(failure.code, failure.message)
-    set_put(result, instances_component(), (void*)rebuilt) catch failure:
+    result.put(instances_component(), (void*)rebuilt) catch failure:
         close((void*)rebuilt)
         error(failure.code, failure.message)

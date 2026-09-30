@@ -55,75 +55,6 @@ pub struct FaceSupport:
         self.knots_u.close()
         self.knots_v.close()
 
-# LUCE-BUG: these are meant as BrepModel methods, but a pub method whose
-# signature names a Base-only type (Growing, FaceSupport) makes the whole
-# type fail to cross into Luce ("cannot cross into Luce: its method ...
-# names a type Luce cannot take"), though only Base callers need them.
-# Free functions keep BrepModel usable from Luce.
-
-## Face `face`'s support surface.
-pub func brep_face_support(model: const BrepModel*, face: i64) -> FaceSupport!:
-    try model.check_face(face)
-    let records = try model.tessellation_records()
-    let entry = records.faces[(usize)face]
-    let surface = records.surfaces[(usize)entry.surface]
-    var made = FaceSupport.empty()
-    errdefer made.close()
-    made.kind = surface.kind
-    made.origin = surface.origin
-    made.x = surface.x
-    made.y = surface.y
-    made.z = surface.z
-    made.radius = surface.radius
-    made.angle = surface.angle
-    try made.points.assign(surface.points)
-    try made.weights.assign(surface.weights)
-    try made.knots_u.assign(surface.ku)
-    try made.knots_v.assign(surface.kv)
-    made.nu = surface.nu
-    made.nv = surface.nv
-    made.du = surface.du
-    made.dv = surface.dv
-    made.sense = entry.sense
-    made.placement = entry.placement
-    return made
-
-## Face `face`'s trim loops in its support's chart, outer loop first:
-## `uv` takes each loop's points in coedge order (the joint between two
-## coedges once, the loop closing back to its first point) and `sizes`
-## each loop's point count.
-pub func brep_face_trim_uv(model: const BrepModel*, face: i64, divisions: i64, uv: Growing[Vector3]*, sizes: Growing[i64]*) -> !:
-    try model.check_face(face)
-    if divisions < 1 or divisions > 64: error(invalid, "CAD trim sampling requires 1..64 divisions")
-    uv.clear()
-    sizes.clear()
-    let records = try model.tessellation_records()
-    let entry = records.faces[(usize)face]
-    let surface = records.surfaces[(usize)entry.surface]
-    let edges = records.edges
-    let metrics = try spacing.measure(edges)
-    defer spacing.close(metrics)
-    let compact = try compact_seams(records.faces, edges.length)
-    defer free(compact) in memory.heap
-    # Each coedge's stations, as the display tessellation's baseline has them.
-    let stations = try alloc Stations[entry.uses.length] in memory.heap
-    defer free(stations) in memory.heap
-    for at in 0..<stations.length: stations[at] = Stations()
-    defer:
-        for station in stations: station.close()
-    for at in 0..<entry.uses.length:
-        let index = edge_index(entry.uses[at])
-        let count = try curve_intervals(edges[index], divisions, model.tolerance, &metrics[index], compact[index])
-        try stations[at].open(count + 1)
-        for step in 0..<count + 1: discard(try stations[at].insert(metrics[index].station((f64)step / (f64)count), 1e-12))
-    let vertices = model.vertices.view()
-    # Seeds as trim_chains.initialize tries them: one chart for every loop.
-    for initial in [Vector3(0.5, 0.5, 0.0), Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, 0.0)]:
-        uv.clear()
-        sizes.clear()
-        if try chain_loops(entry, surface, vertices, edges, stations, model.tolerance, initial, uv, sizes): return
-    error(invalid, "trim loops do not close in one support chart")
-
 ## Chain every loop of `face` from `initial`; false when a loop does not
 ## close in one chart (another seed may). On periodic supports a seam's
 ## second use takes the chart's other side, a coedge leaving a singular
@@ -218,3 +149,67 @@ func singular_height(surface: Surface, upward: bool, level: f64) -> f64?:
         let apex = -surface.radius / slope
         if (apex > level) == upward: return apex
     return none
+
+extend BrepModel:
+    ## Face `face`'s support surface, copied out of the model.
+    pub func face_support(face: i64) -> FaceSupport!:
+        try self.check_face(face)
+        let records = try self.tessellation_records()
+        let entry = records.faces[(usize)face]
+        let surface = records.surfaces[(usize)entry.surface]
+        var made = FaceSupport.empty()
+        errdefer made.close()
+        made.kind = surface.kind
+        made.origin = surface.origin
+        made.x = surface.x
+        made.y = surface.y
+        made.z = surface.z
+        made.radius = surface.radius
+        made.angle = surface.angle
+        try made.points.assign(surface.points)
+        try made.weights.assign(surface.weights)
+        try made.knots_u.assign(surface.ku)
+        try made.knots_v.assign(surface.kv)
+        made.nu = surface.nu
+        made.nv = surface.nv
+        made.du = surface.du
+        made.dv = surface.dv
+        made.sense = entry.sense
+        made.placement = entry.placement
+        return made
+
+    ## Face `face`'s trim loops in its support's chart, outer loop first:
+    ## `uv` takes each loop's points in coedge order (the joint between two
+    ## coedges once, the loop closing back to its first point) and `sizes`
+    ## each loop's point count.
+    pub func face_trim_uv(face: i64, divisions: i64, uv: Growing[Vector3]*, sizes: Growing[i64]*) -> !:
+        try self.check_face(face)
+        if divisions < 1 or divisions > 64: error(invalid, "CAD trim sampling requires 1..64 divisions")
+        uv.clear()
+        sizes.clear()
+        let records = try self.tessellation_records()
+        let entry = records.faces[(usize)face]
+        let surface = records.surfaces[(usize)entry.surface]
+        let edges = records.edges
+        let metrics = try spacing.measure(edges)
+        defer spacing.close(metrics)
+        let compact = try compact_seams(records.faces, edges.length)
+        defer free(compact) in memory.heap
+        # Each coedge's stations, as the display tessellation's baseline has them.
+        let stations = try alloc Stations[entry.uses.length] in memory.heap
+        defer free(stations) in memory.heap
+        for at in 0..<stations.length: stations[at] = Stations()
+        defer:
+            for station in stations: station.close()
+        for at in 0..<entry.uses.length:
+            let index = edge_index(entry.uses[at])
+            let count = try curve_intervals(edges[index], divisions, self.tolerance, &metrics[index], compact[index])
+            try stations[at].open(count + 1)
+            for step in 0..<count + 1: discard(try stations[at].insert(metrics[index].station((f64)step / (f64)count), 1e-12))
+        let vertices = self.vertices.view()
+        # Seeds as trim_chains.initialize tries them: one chart for every loop.
+        for initial in [Vector3(0.5, 0.5, 0.0), Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, 0.0)]:
+            uv.clear()
+            sizes.clear()
+            if try chain_loops(entry, surface, vertices, edges, stations, self.tolerance, initial, uv, sizes): return
+        error(invalid, "trim loops do not close in one support chart")

@@ -4,73 +4,71 @@
 ## face's support takes the model's placement before its own; standalone
 ## patches are already placed.
 
-# LUCE-BUG: free functions rather than CadModel methods, as for
-# brep_face_support: a pub method naming a Base-only type keeps CadModel
-# out of Luce.
-
-## Face `face`'s support surface (brep.FaceSupport).
-pub func face_support(model: const CadModel*, face: i64) -> brep.FaceSupport!:
-    if face < 0 or face >= model.face_count(): error(invalid, "CAD face index out of range")
-    if face >= (i64)model.count:
-        let boundary = model.boundary else error(invalid, "CAD face index out of range")
-        var support = try brep.brep_face_support(boundary.value(), face - (i64)model.count)
-        support.placement = model.placement.multiply(support.placement)
-        return support
-    let entry = model.faces[(usize)face]
-    var made = brep.FaceSupport.empty()
-    errdefer made.close()
-    if entry.nu == 0:
-        # A polygon: the plane of its Newell normal, x along its first side.
-        var normal = Vector3()
-        for at in 0..<entry.points.length:
-            normal = normal.add(entry.points[at].subtract(entry.points[0]).cross(entry.points[(at + 1) % entry.points.length].subtract(entry.points[0])))
-        made.z = try normal.normalized()
-        made.x = try entry.points[1].subtract(entry.points[0]).normalized()
-        made.y = made.z.cross(made.x)
-        made.origin = entry.points[0]
+extend CadModel:
+    ## Face `face`'s support surface, standalone patches first, then the B-rep's
+    ## faces under the model's placement.
+    pub func face_support(face: i64) -> brep.FaceSupport!:
+        if face < 0 or face >= self.face_count(): error(invalid, "CAD face index out of range")
+        if face >= (i64)self.count:
+            let boundary = self.boundary else error(invalid, "CAD face index out of range")
+            var support = try boundary.value().face_support(face - (i64)self.count)
+            support.placement = self.placement.multiply(support.placement)
+            return support
+        let entry = self.faces[(usize)face]
+        var made = brep.FaceSupport.empty()
+        errdefer made.close()
+        if entry.nu == 0:
+            # A polygon: the plane of its Newell normal, x along its first side.
+            var normal = Vector3()
+            for at in 0..<entry.points.length:
+                normal = normal.add(entry.points[at].subtract(entry.points[0]).cross(entry.points[(at + 1) % entry.points.length].subtract(entry.points[0])))
+            made.z = try normal.normalized()
+            made.x = try entry.points[1].subtract(entry.points[0]).normalized()
+            made.y = made.z.cross(made.x)
+            made.origin = entry.points[0]
+            return made
+        made.kind = 3
+        try made.points.assign(entry.points)
+        try made.weights.assign(entry.weights)
+        try made.knots_u.assign(entry.ku)
+        try made.knots_v.assign(entry.kv)
+        made.nu = entry.nu
+        made.nv = entry.nv
+        made.du = entry.du
+        made.dv = entry.dv
+        made.sense = not entry.reversed
         return made
-    made.kind = 3
-    try made.points.assign(entry.points)
-    try made.weights.assign(entry.weights)
-    try made.knots_u.assign(entry.ku)
-    try made.knots_v.assign(entry.kv)
-    made.nu = entry.nu
-    made.nv = entry.nv
-    made.du = entry.du
-    made.dv = entry.dv
-    made.sense = not entry.reversed
-    return made
 
-## Face `face`'s trim loops in its support's chart (brep_face_trim_uv):
-## a polygon's corners in its plane, a B-spline patch's trim rectangle in
-## the normalized knot domain.
-pub func face_trim_uv(model: const CadModel*, face: i64, divisions: i64, uv: Growing[Vector3]*, sizes: Growing[i64]*) -> !:
-    if face < 0 or face >= model.face_count(): error(invalid, "CAD face index out of range")
-    if face >= (i64)model.count:
-        let boundary = model.boundary else error(invalid, "CAD face index out of range")
-        try brep.brep_face_trim_uv(boundary.value(), face - (i64)model.count, divisions, uv, sizes)
-        return
-    uv.clear()
-    sizes.clear()
-    let entry = model.faces[(usize)face]
-    if entry.nu == 0:
-        var support = try face_support(model, face)
-        defer support.close()
-        for point in entry.points:
-            let relative = point.subtract(support.origin)
-            try uv.push(Vector3(relative.dot(support.x), relative.dot(support.y), 0.0))
-        try sizes.push((i64)entry.points.length)
-        return
-    let u_low = entry.ku[(usize)entry.du]
-    let u_span = entry.ku[(usize)entry.nu] - u_low
-    let v_low = entry.kv[(usize)entry.dv]
-    let v_span = entry.kv[(usize)entry.nv] - v_low
-    let u0 = (entry.u0 - u_low) / u_span
-    let u1 = (entry.u1 - u_low) / u_span
-    let v0 = (entry.v0 - v_low) / v_span
-    let v1 = (entry.v1 - v_low) / v_span
-    try uv.push(Vector3(u0, v0, 0.0))
-    try uv.push(Vector3(u1, v0, 0.0))
-    try uv.push(Vector3(u1, v1, 0.0))
-    try uv.push(Vector3(u0, v1, 0.0))
-    try sizes.push(4)
+    ## Face `face`'s trim loops in its support's chart, as BrepModel.face_trim_uv
+    ## lays them out: a polygon's corners in its plane, a B-spline patch's trim
+    ## rectangle in the normalized knot domain.
+    pub func face_trim_uv(face: i64, divisions: i64, uv: Growing[Vector3]*, sizes: Growing[i64]*) -> !:
+        if face < 0 or face >= self.face_count(): error(invalid, "CAD face index out of range")
+        if face >= (i64)self.count:
+            let boundary = self.boundary else error(invalid, "CAD face index out of range")
+            try boundary.value().face_trim_uv(face - (i64)self.count, divisions, uv, sizes)
+            return
+        uv.clear()
+        sizes.clear()
+        let entry = self.faces[(usize)face]
+        if entry.nu == 0:
+            var support = try self.face_support(face)
+            defer support.close()
+            for point in entry.points:
+                let relative = point.subtract(support.origin)
+                try uv.push(Vector3(relative.dot(support.x), relative.dot(support.y), 0.0))
+            try sizes.push((i64)entry.points.length)
+            return
+        let u_low = entry.ku[(usize)entry.du]
+        let u_span = entry.ku[(usize)entry.nu] - u_low
+        let v_low = entry.kv[(usize)entry.dv]
+        let v_span = entry.kv[(usize)entry.nv] - v_low
+        let u0 = (entry.u0 - u_low) / u_span
+        let u1 = (entry.u1 - u_low) / u_span
+        let v0 = (entry.v0 - v_low) / v_span
+        let v1 = (entry.v1 - v_low) / v_span
+        try uv.push(Vector3(u0, v0, 0.0))
+        try uv.push(Vector3(u1, v0, 0.0))
+        try uv.push(Vector3(u1, v1, 0.0))
+        try uv.push(Vector3(u0, v1, 0.0))
+        try sizes.push(4)
