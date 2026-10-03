@@ -1,0 +1,82 @@
+## Prove simple mapped-count contradictions before propagating interval counts.
+## Shared flow and opposite single-coedge sides identify count variables. A
+## compound side requiring N=N+K with K>0 cannot be repaired by subdivision.
+## This is a conservative proof pass, not a general integer interval solver.
+import memory
+from brep_types import Surface, BrepFace
+from patch_sides import PatchSides, edge_index
+from layout_types import GridLayout
+
+## Give a provably inconsistent mapped face to the supported cut-cell mesher.
+## No geometry, row station, canonical vertex or seam classification is changed.
+## Rebuild after each choice so removing a constraint never causes unnecessary
+## cuts on other faces whose apparent conflict has already disappeared.
+pub func cut_impossible(faces: const BrepFace[], surfaces: const Surface[], sides: const PatchSides[], plans: GridLayout[], edge_count: usize) -> usize!:
+    let offsets = try alloc usize[faces.length+1] in memory.heap
+    defer free(offsets) in memory.heap
+    offsets[0] = 0
+    for face in 0..<faces.length: offsets[face+1] = offsets[face]+faces[face].uses.length
+    let parents = try alloc usize[offsets[faces.length]] in memory.heap
+    defer free(parents) in memory.heap
+    let owners = try alloc usize[edge_count] in memory.heap
+    defer free(owners) in memory.heap
+    var changed: usize = 0
+    for pass in 0..<faces.length:
+        for at in 0..<parents.length: parents[at] = at
+        for at in 0..<owners.length: owners[at] = parents.length
+        for at in 0..<faces.length:
+            let face = faces[at]
+            let side = sides[at]
+            for use in 0..<face.uses.length:
+                if not plans[at].flow[use]: continue
+                let index = edge_index(face.uses[use])
+                let node = offsets[at]+use
+                if owners[index] == parents.length: owners[index] = node
+                else: join(parents,node,owners[index])
+            if not side.valid or plans[at].cut_first: continue
+            for axis in 0..<(usize)2:
+                if side.lengths[axis] == 1 and side.lengths[axis+2] == 1:
+                    join(parents,offsets[at]+side.starts[axis],offsets[at]+side.starts[axis+2])
+        var found = false
+        for at in 0..<faces.length:
+            let kind = surfaces[(usize)faces[at].surface].kind
+            # Sphere/torus charts do not yet have this cut-grid path.
+            if kind < 0 or kind > 3 or not sides[at].valid or plans[at].cut_first: continue
+            if contradictory(parents,offsets[at],faces[at].uses.length,sides[at]):
+                plans[at].cut_first = true
+                changed += 1
+                found = true
+                break
+        if not found: break
+    return changed
+
+func root(parents: usize[], node: usize) -> usize:
+    var at = node
+    while parents[at] != at:
+        parents[at] = parents[parents[at]]
+        at = parents[at]
+    return at
+
+func join(parents: usize[], a: usize, b: usize):
+    let first = root(parents,a)
+    let second = root(parents,b)
+    parents[second if first < second else first] = first if first < second else second
+
+func contradictory(parents: usize[], offset: usize, count: usize, sides: PatchSides) -> bool:
+    for axis in 0..<(usize)2:
+        if sides.lengths[axis] == 1 and sides.lengths[axis+2] == 1: continue
+        var positive = false
+        var negative = false
+        for use in 0..<count:
+            let family = root(parents,offset+use)
+            var coefficient: i64 = 0
+            for side in [axis,axis+2]:
+                for segment in 0..<sides.lengths[side]:
+                    let node = offset+(sides.starts[side]+segment)%count
+                    if root(parents,node) == family: coefficient += 1 if side == axis else -1
+            positive = positive or coefficient > 0
+            negative = negative or coefficient < 0
+        # Every coedge has a strictly positive interval count. After cancelling
+        # identical families, a nonempty one-sign sum cannot equal zero.
+        if positive != negative: return true
+    return false

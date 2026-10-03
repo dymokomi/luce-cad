@@ -1,0 +1,139 @@
+## The exporter accessors, face_support and face_trim_uv (brep/exact.lucb): a
+## face's support copied out, and its trim loops in the support's chart. A
+## cylinder band with a window (analytic and as a closed rational B-spline,
+## each coedge order and seam start of periodic_grid_tests) keeps both loops
+## in one chart; every loop point lies on the face's own edges; the outer loop
+## spans one turn.
+import luce_std.math
+from luce_geocore.geocore import Vector3, invalid
+from luce_geocore.core.growing import Growing
+from brep import BrepModel, FaceSupport
+from model import CadModel
+from solids import CadSolids
+from mapped_patch import point
+from brep_types import Surface
+
+pub func main(arguments: str[]) -> i32!:
+    for variant in 0..<4:
+        try band(variant % 2 == 1, variant >= 2)
+    try standalone()
+    try solids()
+    return 0
+
+## Every face of the analytic solids charts into loops enclosing area: a
+## pointed cone's side closes through its apex, a hemisphere bounded by its
+## equator alone through its pole, a torus over its whole period.
+func solids() -> !:
+    for which in 0..<6:
+        let solid = try (CadSolids.box(1.0, 2.0, 3.0) if which == 0 else (CadSolids.cylinder(1.0, 2.0) if which == 1 else (CadSolids.cone(1.0, 2.0, 0.0) if which == 2 else (CadSolids.cone(1.0, 2.0, 0.5) if which == 3 else (CadSolids.sphere(1.5) if which == 4 else CadSolids.torus(2.0, 0.5))))))
+        defer solid.release()
+        let model = solid.value()
+        var uv = Growing[Vector3]()
+        defer uv.close()
+        var loops = Growing[i64]()
+        defer loops.close()
+        for face in 0..<model.face_count():
+            try model.face_trim_uv(face, 16, &uv, &loops)
+            let count = (usize)loops.items[0]
+            var area = 0.0
+            for k in 0..<count:
+                let p = uv.items[k]
+                let q = uv.items[(k + 1) % count]
+                area += p.x * q.y - q.x * p.y
+            if math.abs(area) < 0.001: error(invalid, "a solid's face charts into a loop without area")
+
+## A model's standalone patches: a planar polygon in its own plane, and a
+## B-spline patch's trim rectangle in the normalized knot domain.
+func standalone() -> !:
+    var model = try CadModel()
+    let square: Vector3[4] = [Vector3(1.0, 0.0, 2.0), Vector3(3.0, 0.0, 2.0), Vector3(3.0, 2.0, 2.0), Vector3(1.0, 2.0, 2.0)]
+    try model.add_planar(square[..<4])
+    let net: Vector3[4] = [Vector3(0.0, 0.0, 0.0), Vector3(0.0, 4.0, 0.0), Vector3(4.0, 0.0, 0.0), Vector3(4.0, 4.0, 1.0)]
+    let ones: f64[4] = [1.0, 1.0, 1.0, 1.0]
+    let knots: f64[4] = [0.0, 0.0, 2.0, 2.0]
+    try model.add_nurbs(net[..<4], ones[..<4], 2, 2, 1, 1, knots[..<4], knots[..<4])
+    try model.trim_rectangle(1, 0.5, 1.5, 0.0, 1.0)
+    if model.face_count() != 2: error(invalid, "standalone patches were not counted")
+    var uv = Growing[Vector3]()
+    defer uv.close()
+    var loops = Growing[i64]()
+    defer loops.close()
+    var plane = try model.face_support(0)
+    defer plane.close()
+    if plane.kind != 0 or math.abs(plane.z.z - 1.0) > 0.000001: error(invalid, "a polygon's plane is wrong")
+    try model.face_trim_uv(0, 8, &uv, &loops)
+    if loops.count != 1 or loops.items[0] != 4 or math.abs(uv.items[2].x - 2.0) > 0.000001 or math.abs(uv.items[2].y - 2.0) > 0.000001: error(invalid, "a polygon's loop is wrong")
+    var patch = try model.face_support(1)
+    defer patch.close()
+    if patch.kind != 3 or patch.nu != 2 or patch.points.count != 4: error(invalid, "a patch's net is wrong")
+    try model.face_trim_uv(1, 8, &uv, &loops)
+    if loops.items[0] != 4 or math.abs(uv.items[0].x - 0.25) > 0.000001 or math.abs(uv.items[1].x - 0.75) > 0.000001 or math.abs(uv.items[2].y - 0.5) > 0.000001: error(invalid, "a patch's trim rectangle is wrong")
+    model.close()
+
+func band(reverse: bool, analytic: bool) -> !:
+    var model = try BrepModel()
+    defer model.close()
+    discard(try model.add_vertex(Vector3(1.0, 0.0, 0.0)))
+    discard(try model.add_vertex(Vector3(1.0, 0.0, 1.0)))
+    let corners: f64[8] = [0.3, 0.3, 0.7, 0.3, 0.7, 0.7, 0.3, 0.7]
+    for at in 0..<(usize)4: discard(try model.add_vertex(Vector3(math.cos(corners[at * 2]), math.sin(corners[at * 2]), corners[at * 2 + 1])))
+    let z = Vector3(0.0, 0.0, 1.0)
+    let x = Vector3(1.0, 0.0, 0.0)
+    discard(try model.add_circle(0, 0, Vector3(), z, x, 1.0))
+    discard(try model.add_line(0, 1))
+    discard(try model.add_circle(1, 1, z, z, x, 1.0))
+    discard(try model.add_circle(2, 3, Vector3(0.0, 0.0, 0.3), z, x, 1.0))
+    discard(try model.add_line(3, 4))
+    discard(try model.add_circle(5, 4, Vector3(0.0, 0.0, 0.7), z, x, 1.0))
+    discard(try model.add_line(2, 5))
+    if analytic:
+        discard(try model.add_surface(1, Vector3(), z, x, 1.0))
+    else:
+        var controls = Growing[Vector3]()
+        defer controls.close()
+        var weights = Growing[f64]()
+        defer weights.close()
+        let ring: Vector3[9] = [Vector3(1.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(-1.0, 1.0, 0.0), Vector3(-1.0, 0.0, 0.0), Vector3(-1.0, -1.0, 0.0), Vector3(0.0, -1.0, 0.0), Vector3(1.0, -1.0, 0.0), Vector3(1.0, 0.0, 0.0)]
+        for at in 0..<(usize)9:
+            for v in [0.0, 1.0]:
+                try controls.push(ring[at].add(z.multiply_scalar(v)))
+                try weights.push(1.0 if at % 2 == 0 else math.sqrt(0.5))
+        let ku: f64[12] = [0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0]
+        let kv: f64[4] = [0.0, 0.0, 1.0, 1.0]
+        discard(try model.add_spline_surface(controls.view(), weights.view(), 9, 2, 2, 1, ku[..<12], kv[..<4]))
+    let forward: i64[8] = [1, 2, -3, -2, 7, 6, -5, -4]
+    let backward: i64[8] = [-2, 1, 2, -3, 7, 6, -5, -4]
+    let sizes: i64[2] = [4, 4]
+    discard(try model.add_face(0, backward[..<8] if reverse else forward[..<8], sizes[..<2]))
+    var support = try model.face_support(0)
+    defer support.close()
+    if support.kind != (1 if analytic else 3) or not support.sense: error(invalid, "face support kind or sense changed")
+    if not analytic and (support.nu != 9 or support.nv != 2 or support.points.count != 18 or support.knots_u.count != 12): error(invalid, "face support net changed")
+    var uv = Growing[Vector3]()
+    defer uv.close()
+    var loops = Growing[i64]()
+    defer loops.close()
+    try model.face_trim_uv(0, 8, &uv, &loops)
+    if loops.count != 2 or (usize)(loops.items[0] + loops.items[1]) != uv.count: error(invalid, "trim loops lost a loop")
+    # Every point on the cylinder, and the window inside the band.
+    let record = try Surface(support.kind, support.origin, support.x, support.z, support.radius, support.angle, support.points.view(), support.weights.view(),
+                             support.knots_u.view(), support.knots_v.view(), support.nu, support.nv, support.du, support.dv)
+    defer record.close()
+    for at in 0..<uv.count:
+        let p = try point(record, uv.items[at])
+        if math.abs(p.x * p.x + p.y * p.y - 1.0) > 0.000001 or p.z < -0.000001 or p.z > 1.000001: error(invalid, "a trim point is off its face")
+    # The outer loop covers one turn of the chart; the window's is 0.4 wide.
+    let period = 2.0 * math.pi if analytic else 1.0
+    if math.abs(width(uv.view()[..<(usize)loops.items[0]]) - period) > 0.000001: error(invalid, "outer trim loop is not one turn")
+    let window = width(uv.view()[(usize)loops.items[0]..])
+    let expected = 0.4 if analytic else -1.0
+    if expected > 0.0 and math.abs(window - expected) > 0.000001: error(invalid, "window trim loop has the wrong width")
+    if window <= 0.0 or window >= period * 0.5: error(invalid, "window trim loop crosses the chart seam")
+
+func width(points: const Vector3[]) -> f64:
+    var low: f64 = 1e100
+    var high: f64 = -1e100
+    for p in points:
+        low = math.min(low, p.x)
+        high = math.max(high, p.x)
+    return high - low

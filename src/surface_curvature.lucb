@@ -1,0 +1,325 @@
+## Principal curvatures of the exact CAD support at tessellated corners, from
+## the surface's first and second fundamental forms (rational NURBS second
+## derivatives, or the analytic chart's), for curvature analysis shading.
+##
+## Sign: positive where the surface bends away from its oriented normal, the
+## face's outward shading normal. A sphere seen from outside has k1 = k2 = 1/r
+## (H = 1/r, K = 1/r^2); a convex cylinder has k1 = 1/r, k2 = 0; the inside
+## of a hole is negative. k1 >= k2. Directions are unit tangents (d1 for k1).
+import luce_std.math
+import memory
+from luce_geocore.geocore import Vector3, MeshBuilder, invalid
+from face_errors import FaceErrors
+import luce_geocore.core.parallel
+from brep_types import Surface, BrepFace
+from mapped_patch import parameter
+
+pub struct Curvature:
+    pub var k1: f64 = 0.0
+    pub var k2: f64 = 0.0
+    pub var d1: Vector3 = Vector3()
+    pub var d2: Vector3 = Vector3()
+
+## First and second partial derivatives of a surface chart at one point.
+struct Chart:
+    var su: Vector3 = Vector3()
+    var sv: Vector3 = Vector3()
+    var suu: Vector3 = Vector3()
+    var suv: Vector3 = Vector3()
+    var svv: Vector3 = Vector3()
+
+## Curvature at `point` of support `s` oriented by `sense`. `seed` carries the
+## previous normalized NURBS parameter between neighbouring corners.
+pub func curvature_at(s: Surface, point: Vector3, sense: bool, seed: Vector3*, tolerance: f64) -> Curvature!:
+    if s.kind == 0: return flat(s)
+    var chart = Chart()
+    var ok = false
+    if s.kind == 3:
+        let uv = try parameter(s, point, *seed, tolerance)
+        *seed = uv
+        ok = try nurbs_chart(s, uv, &chart)
+        if not ok:
+            # A collapsed domain edge: use the limiting interior value, as the
+            # shading normals do.
+            ok = try nurbs_chart(s, Vector3(math.clamp(uv.x, 1e-7, 1.0 - 1e-7), math.clamp(uv.y, 1e-7, 1.0 - 1e-7), 0.0), &chart)
+    else:
+        let uv = try parameter(s, point, *seed, tolerance, false)
+        ok = analytic_chart(s, uv, &chart)
+        if not ok:
+            # A sphere or torus pole: step off it along the meridian.
+            ok = analytic_chart(s, Vector3(uv.x, uv.y - math.copysign(1e-6, uv.y), 0.0), &chart)
+    if not ok: return flat(s)
+    return principal(chart, sense)
+
+func flat(s: Surface) -> Curvature:
+    var result = Curvature()
+    result.d1 = s.x
+    result.d2 = s.y
+    return result
+
+## Shape-operator eigenvalues and eigenvectors of one chart point.
+func principal(c: Chart, sense: bool) -> Curvature:
+    let area = c.su.cross(c.sv)
+    let length = area.length()
+    var result = Curvature()
+    let e = c.su.dot(c.su)
+    let f = c.su.dot(c.sv)
+    let g = c.sv.dot(c.sv)
+    let det = e * g - f * f
+    if not (length > 0.0) or not (det > 0.0): return result
+    let n = area.multiply_scalar((1.0 if sense else -1.0) / length)
+    # Second fundamental form with the sign flipped so convex is positive.
+    let l = -c.suu.dot(n)
+    let m = -c.suv.dot(n)
+    let o = -c.svv.dot(n)
+    let mean = (e * o - 2.0 * f * m + g * l) / (2.0 * det)
+    let gaussian = (l * o - m * m) / det
+    let spread = math.sqrt(math.max(mean * mean - gaussian, 0.0))
+    result.k1 = mean + spread
+    result.k2 = mean - spread
+    result.d1 = direction(c, n, l, m, o, e, f, g, result.k1)
+    result.d2 = n.cross(result.d1)
+    return result
+
+## Eigenvector of (II - k I) as a unit tangent; any tangent at an umbilic.
+func direction(c: Chart, n: Vector3, l: f64, m: f64, o: f64, e: f64, f: f64, g: f64, k: f64) -> Vector3:
+    let first = c.su.multiply_scalar(m - k * f).subtract(c.sv.multiply_scalar(l - k * e))
+    let second = c.su.multiply_scalar(o - k * g).subtract(c.sv.multiply_scalar(m - k * f))
+    let pick = first if first.length() >= second.length() else second
+    let size = pick.length()
+    let scale = math.max(c.su.length(), c.sv.length())
+    if size > 1e-12 * scale * scale * math.max(math.abs(k), 1.0):
+        return pick.multiply_scalar(1.0 / size)
+    let fallback = c.su.length()
+    if fallback > 0.0: return c.su.multiply_scalar(1.0 / fallback)
+    return n.cross(c.sv).multiply_scalar(1.0 / math.max(n.cross(c.sv).length(), 1e-300))
+
+## Native analytic charts, as mapped_patch.point evaluates them.
+func analytic_chart(s: Surface, uv: Vector3, c: Chart*) -> bool:
+    let radial = s.x.multiply_scalar(math.cos(uv.x)).add(s.y.multiply_scalar(math.sin(uv.x)))
+    let tangent = s.x.multiply_scalar(-math.sin(uv.x)).add(s.y.multiply_scalar(math.cos(uv.x)))
+    if s.kind == 1 or s.kind == 2:
+        let slope = math.tan(s.angle) if s.kind == 2 else 0.0
+        let rho = s.radius + uv.y * slope
+        c.su = tangent.multiply_scalar(rho)
+        c.sv = radial.multiply_scalar(slope).add(s.z)
+        c.suu = radial.multiply_scalar(-rho)
+        c.suv = tangent.multiply_scalar(slope)
+        c.svv = Vector3()
+    elif s.kind == 4 or s.kind == 5:
+        # Sphere: tube radius = radius about the centre; torus: minor radius
+        # `angle` about a circle of radius `radius`.
+        let minor = s.radius if s.kind == 4 else s.angle
+        let major = 0.0 if s.kind == 4 else s.radius
+        let ring = major + minor * math.cos(uv.y)
+        c.su = tangent.multiply_scalar(ring)
+        c.sv = radial.multiply_scalar(-minor * math.sin(uv.y)).add(s.z.multiply_scalar(minor * math.cos(uv.y)))
+        c.suu = radial.multiply_scalar(-ring)
+        c.suv = tangent.multiply_scalar(-minor * math.sin(uv.y))
+        c.svv = radial.multiply_scalar(-minor * math.cos(uv.y)).add(s.z.multiply_scalar(-minor * math.sin(uv.y)))
+    else:
+        return false
+    return c.su.cross(c.sv).length() > 1e-12 * math.max(c.su.dot(c.su), c.sv.dot(c.sv))
+
+## Rational tensor-product derivatives up to second order at normalized `uv`.
+func nurbs_chart(s: Surface, uv: Vector3, c: Chart*) -> bool!:
+    let u0 = s.ku[(usize)s.du]
+    let u1 = s.ku[(usize)s.nu]
+    let v0 = s.kv[(usize)s.dv]
+    let v1 = s.kv[(usize)s.nv]
+    let u = math.clamp(u0 + (u1 - u0) * uv.x, u0, u1)
+    let v = math.clamp(v0 + (v1 - v0) * uv.y, v0, v1)
+    var bu: f64[27]
+    var bv: f64[27]
+    let first_u = basis_derivatives(s.ku, s.nu, s.du, u, &bu)
+    let first_v = basis_derivatives(s.kv, s.nv, s.dv, v, &bv)
+    # Homogeneous sums in a local frame: derivatives are translation invariant.
+    let origin = s.points[first_u * (usize)s.nv + first_v]
+    var a: Vector3[6] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    var w: f64[6]
+    for iu in 0..<(usize)s.du + 1:
+        for iv in 0..<(usize)s.dv + 1:
+            let index = (first_u + iu) * (usize)s.nv + first_v + iv
+            let p = s.points[index].subtract(origin)
+            let weight = s.weights[index]
+            # (0,0) (1,0) (0,1) (2,0) (1,1) (0,2) partial orders in u, v.
+            let factors = [bu[iu] * bv[iv], bu[9 + iu] * bv[iv], bu[iu] * bv[9 + iv], bu[18 + iu] * bv[iv], bu[9 + iu] * bv[9 + iv], bu[iu] * bv[18 + iv]]
+            for at in 0..<(usize)6:
+                let scaled = factors[at] * weight
+                a[at] = a[at].add(p.multiply_scalar(scaled))
+                w[at] += scaled
+    if not (w[0] > 0.0) or not math.is_finite(w[0]): error(invalid, "invalid rational surface denominator")
+    let inverse = 1.0 / w[0]
+    let point = a[0].multiply_scalar(inverse)
+    c.su = a[1].subtract(point.multiply_scalar(w[1])).multiply_scalar(inverse)
+    c.sv = a[2].subtract(point.multiply_scalar(w[2])).multiply_scalar(inverse)
+    c.suu = a[3].subtract(c.su.multiply_scalar(2.0 * w[1])).subtract(point.multiply_scalar(w[3])).multiply_scalar(inverse)
+    c.suv = a[4].subtract(c.su.multiply_scalar(w[2])).subtract(c.sv.multiply_scalar(w[1])).subtract(point.multiply_scalar(w[4])).multiply_scalar(inverse)
+    c.svv = a[5].subtract(c.sv.multiply_scalar(2.0 * w[2])).subtract(point.multiply_scalar(w[5])).multiply_scalar(inverse)
+    let scale = math.max(c.su.dot(c.su), c.sv.dot(c.sv))
+    return scale > 0.0 and c.su.cross(c.sv).length() > 1e-12 * scale
+
+## Nonzero basis functions and their first two derivatives at `t` (Piegl and
+## Tiller, The NURBS Book, A2.3): `ders[k * 9 + j]` is the k-th derivative of
+## basis function first + j. Returns `first`.
+func basis_derivatives(knots: const f64[], count: i64, degree: i64, t: f64, ders: f64[27]*) -> usize:
+    var low = (usize)degree
+    var high = (usize)count
+    while low + 1 < high:
+        let middle = (low + high) // 2
+        if t < knots[middle]: high = middle
+        else: low = middle
+    let span = low
+    let p = (usize)degree
+    var ndu: f64[81]
+    var left: f64[9]
+    var right: f64[9]
+    ndu[0] = 1.0
+    for j in 1..<p + 1:
+        left[j] = t - knots[span + 1 - j]
+        right[j] = knots[span + j] - t
+        var saved: f64 = 0.0
+        for r in 0..<j:
+            ndu[j * 9 + r] = right[r + 1] + left[j - r]
+            let temporary = ndu[r * 9 + j - 1] / ndu[j * 9 + r] if ndu[j * 9 + r] != 0.0 else 0.0
+            ndu[r * 9 + j] = saved + right[r + 1] * temporary
+            saved = left[j - r] * temporary
+        ndu[j * 9 + j] = saved
+    for j in 0..<27: (*ders)[j] = 0.0
+    for j in 0..<p + 1: (*ders)[j] = ndu[j * 9 + p]
+    var a: f64[18]
+    for r in 0..<p + 1:
+        var s1: usize = 0
+        var s2: usize = 1
+        a[0] = 1.0
+        for k in 1..<(usize)3:
+            if k > p: break
+            var d: f64 = 0.0
+            let rk = (i64)r - (i64)k
+            let pk = p - k
+            if r >= k:
+                let denominator = ndu[(pk + 1) * 9 + (usize)rk]
+                a[s2 * 9] = a[s1 * 9] / denominator if denominator != 0.0 else 0.0
+                d = a[s2 * 9] * ndu[(usize)rk * 9 + pk]
+            let j1: i64 = 1 if rk >= -1 else -rk
+            let j2: i64 = (i64)k - 1 if (i64)r - 1 <= (i64)pk else (i64)(p - r)
+            var j = j1
+            while j <= j2:
+                let denominator = ndu[(pk + 1) * 9 + (usize)(rk + j)]
+                a[s2 * 9 + (usize)j] = (a[s1 * 9 + (usize)j] - a[s1 * 9 + (usize)j - 1]) / denominator if denominator != 0.0 else 0.0
+                d += a[s2 * 9 + (usize)j] * ndu[(usize)(rk + j) * 9 + pk]
+                j += 1
+            if r <= pk:
+                let denominator = ndu[(pk + 1) * 9 + r]
+                a[s2 * 9 + k] = -a[s1 * 9 + k - 1] / denominator if denominator != 0.0 else 0.0
+                d += a[s2 * 9 + k] * ndu[r * 9 + pk]
+            (*ders)[k * 9 + r] = d
+            let swap = s1
+            s1 = s2
+            s2 = swap
+    var factor = (f64)p
+    for k in 1..<(usize)3:
+        if k > p: break
+        for j in 0..<p + 1: (*ders)[k * 9 + j] *= factor
+        factor *= (f64)(p - k)
+    return span - p
+
+## Corner curvatures for one face's contiguous corner range: k1 and k2 per
+## corner, and with `directions` d1 and d2 (xyz each). Corners sharing a point
+## share its value; placement is rigid, so only directions are transformed.
+pub func face_curvatures(points: const Vector3[], corners: const i64[], face: BrepFace, s: Surface, tolerance: f64, k1: f64[], k2: f64[], d1: f64[], d2: f64[]) -> !:
+    var capacity: usize = 16
+    while capacity < corners.length * 2: capacity *= 2
+    let keys = try alloc i64[capacity] in memory.heap
+    defer free(keys) in memory.heap
+    let values = try alloc Curvature[capacity] in memory.heap
+    defer free(values) in memory.heap
+    for at in 0..<capacity: keys[at] = -1
+    var seed = Vector3(0.5, 0.5, 0.0)
+    for corner in 0..<corners.length:
+        let id = corners[corner]
+        var slot = (usize)((id * 2654435761) ^ (id >> 11)) % capacity
+        while keys[slot] >= 0 and keys[slot] != id: slot = (slot + 1) % capacity
+        if keys[slot] < 0:
+            var value = try curvature_at(s, points[(usize)id], face.sense, &seed, tolerance)
+            value.d1 = face.placement.transform_direction(value.d1)
+            value.d2 = face.placement.transform_direction(value.d2)
+            values[slot] = value
+            keys[slot] = id
+        let value = values[slot]
+        k1[corner] = value.k1
+        k2[corner] = value.k2
+        if d1.length > 0:
+            d1[corner * 3] = value.d1.x
+            d1[corner * 3 + 1] = value.d1.y
+            d1[corner * 3 + 2] = value.d1.z
+            d2[corner * 3] = value.d2.x
+            d2[corner * 3 + 1] = value.d2.y
+            d2[corner * 3 + 2] = value.d2.z
+
+## Corner curvature columns of a whole tessellation.
+pub struct CurvatureColumns:
+    pub var k1: f64[]
+    pub var k2: f64[]
+    pub var d1: f64[]
+    pub var d2: f64[]
+
+    pub func close():
+        if self.k1.length > 0: free(self.k1) in memory.heap
+        if self.k2.length > 0: free(self.k2) in memory.heap
+        if self.d1.length > 0: free(self.d1) in memory.heap
+        if self.d2.length > 0: free(self.d2) in memory.heap
+
+struct CurvatureJob:
+    let points: const Vector3[]
+    let corners: const i64[]
+    let starts: const usize[]
+    let parents: const i64[]
+    let faces: const BrepFace[]
+    let surfaces: const Surface[]
+    let tolerance: f64
+    let columns: CurvatureColumns*
+    let errors: FaceErrors*
+
+func curvature_item(raw: void*?, group: usize):
+    let job = (CurvatureJob*)(raw else return)
+    let first = job.starts[group]
+    let end = job.starts[group + 1]
+    let face = job.faces[(usize)job.parents[group]]
+    let c = job.columns
+    var none_d: f64[]
+    let d1 = c.d1[first * 3..<end * 3] if c.d1.length > 0 else none_d
+    let d2 = c.d2[first * 3..<end * 3] if c.d2.length > 0 else none_d
+    face_curvatures(job.points, job.corners[first..<end], face, job.surfaces[(usize)face.surface], job.tolerance, c.k1[first..<end], c.k2[first..<end], d1, d2) catch failure:
+        job.errors.record(group, failure.code, failure.message)
+
+## Corner curvatures of an assembled tessellation, per CAD face on the pool.
+## `points` are the unplaced support positions; polygons of one CAD face are
+## contiguous, as the tessellator assembles them.
+pub func model_curvatures(mesh: MeshBuilder*, points: const Vector3[], faces: const BrepFace[], surfaces: const Surface[], tolerance: f64, directions: bool) -> CurvatureColumns!:
+    var result = CurvatureColumns()
+    errdefer result.close()
+    result.k1 = try alloc f64[mesh.nc] in memory.heap
+    result.k2 = try alloc f64[mesh.nc] in memory.heap
+    if directions:
+        result.d1 = try alloc f64[mesh.nc * 3] in memory.heap
+        result.d2 = try alloc f64[mesh.nc * 3] in memory.heap
+    let starts = try alloc usize[mesh.nf + 1] in memory.heap
+    defer free(starts) in memory.heap
+    let parents = try alloc i64[mesh.nf + 1] in memory.heap
+    defer free(parents) in memory.heap
+    var groups: usize = 0
+    var corner: usize = 0
+    for polygon in 0..<mesh.nf:
+        if polygon == 0 or mesh.face_parents[polygon] != mesh.face_parents[polygon - 1]:
+            starts[groups] = corner
+            parents[groups] = mesh.face_parents[polygon]
+            groups += 1
+        corner += (usize)mesh.sizes[polygon]
+    starts[groups] = corner
+    var errors = try FaceErrors(groups)
+    defer errors.close()
+    var job = CurvatureJob(points = points, corners = mesh.corners[..<mesh.nc], starts = starts[..<groups + 1], parents = parents[..<groups], faces = faces, surfaces = surfaces, tolerance = tolerance, columns = &result, errors = &errors)
+    parallel.run(groups, curvature_item, (void*)&job)
+    try errors.raise()
+    return result

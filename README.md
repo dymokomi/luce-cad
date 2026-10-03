@@ -452,7 +452,7 @@ on any number of cores. Errors are raised in face order.
 ## Surface evaluation and trim meshing (`tessellation`)
 
 Rational tensor-product B-spline evaluation and mesh tessellation in
-`src/luce_cad/tessellation/`. `tessellation.NurbsSurface.tessellate(points,
+`src/tessellation/`. `tessellation.NurbsSurface.tessellate(points,
 weights, nu, nv, degree_u, degree_v, knots_u, knots_v, segments=16)` samples a
 whole patch.
 
@@ -550,7 +550,7 @@ oversized cut cells and rejection of unsplit trim crossings.
 `./test.sh` builds and runs, native and through the C backend (`--opt N`,
 `--backend native|c` narrow it):
 
-- the Base contracts in `src/luce_cad/tests/` (`layout_contract` and
+- the Base contracts in `src/tests/` (`layout_contract` and
   `trim_predicates_contract` run every contract module they import;
   `exact_contract` checks the exporter accessors), which reach unexported
   internals;

@@ -1,0 +1,43 @@
+## Tessellating a set whose instances share a CAD prototype meshes that
+## prototype once: the result keeps one prototype, now polygons, and every
+## instance's index and placement.
+import interop
+from luce_geocore.geocore import Vector3, Matrix4, GeometrySet, invalid
+from luce_geocore.kernel import Instances, Placement, new_instances, instances_component, empty_set, dispose_set, adopt_set, set_mesh
+from solids import CadSolids
+from cad_geometry import CadGeometry
+
+pub func instances_contract() -> !:
+    let box = try CadSolids.box(1.0, 1.0, 1.0)
+    defer box.release()
+    let part = try CadGeometry.of_model(box)
+    defer part.release()
+    let instances = try new_instances()
+    let storage = empty_set() catch failure:
+        let close = instances_component().close
+        close((void*)instances)
+        error(failure.code, failure.message)
+    let prototype = instances.add_prototype(try (try part.get()).storage()) catch failure:
+        let close = instances_component().close
+        close((void*)instances)
+        dispose_set(storage)
+        error(failure.code, failure.message)
+    for at in 0..<3:
+        let offset = Vector3((f64)at * 2.0, 0.0, 0.0)
+        let placement = Placement(offset, Vector3(), Vector3(1.0, 1.0, 1.0), Matrix4.compose(offset, Vector3(), Vector3(1.0, 1.0, 1.0)))
+        try instances.add_instance(prototype, &placement, true)
+    storage.put(instances_component(), (void*)instances) catch failure:
+        let close = instances_component().close
+        close((void*)instances)
+        dispose_set(storage)
+        error(failure.code, failure.message)
+    let assembly = try adopt_set(storage)
+    defer assembly.release()
+    let meshed = try CadGeometry.tessellated(assembly, 8, 0.0)
+    defer meshed.release()
+    let data = (try meshed.get()).find(instances_component()) else error(invalid, "the instances went missing")
+    let result = (const Instances*)data
+    assert(result.prototype_count() == 1 and result.count() == 3)
+    assert(result.row(2).prototype == 0 and result.row(2).translation.x == 4.0)
+    let mesh = set_mesh(result.prototype(0)) else error(invalid, "the prototype was not tessellated")
+    assert(mesh.face_count() == 6)

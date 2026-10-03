@@ -1,0 +1,134 @@
+## Curvature-driven interior refinement. Boundary IDs never change; both faces
+## incident to a split UV edge consume its one shared midpoint. No T-junctions.
+import interop
+import memory
+import luce_std.math
+from luce_geocore.geocore import Mesh, MeshBuilder, Vector3, invalid, squared_triangle_distance
+from tessellation.surface import TrimConstraints
+from brep_types import Surface
+from analytic_eval import evaluate
+from adaptive_cells import split_triangle, center_conditioned
+from support_normals import support_normal
+
+func sample(s: Surface, p: Vector3, uscale: f64, vscale: f64) -> Vector3!:
+    if s.kind != 3: return evaluate(s,p.x/uscale,p.y/vscale)
+    let u0 = s.ku[(usize)s.du]
+    let v0 = s.kv[(usize)s.dv]
+    return try s.at(math.clamp(u0 + (s.ku[(usize)s.nu] - u0) * p.x / uscale, u0, s.ku[(usize)s.nu]), math.clamp(v0 + (s.kv[(usize)s.nv] - v0) * p.y / vscale, v0, s.kv[(usize)s.nv]))
+
+pub func refine_uv(source: interop.Reference[Mesh], surface: Surface, uscale: f64, vscale: f64, tolerance: f64, constraints: TrimConstraints = TrimConstraints()) -> interop.Reference[Mesh]!:
+    var current = source.clone()
+    errdefer current.release()
+    for pass in 0..<8:
+        let next = try refine_pass(current, surface, uscale, vscale, tolerance, constraints)
+        let finished = next.value().point_count() == current.value().point_count()
+        current.release()
+        current = next
+        if finished: break
+    return current
+
+func refine_pass(source: interop.Reference[Mesh], surface: Surface, uscale: f64, vscale: f64, tolerance: f64, constraints: TrimConstraints) -> interop.Reference[Mesh]!:
+    let input = source.value()
+    if input.face_count() > 131072: error(invalid, "adaptive patch exceeds face budget")
+    let worlds = try alloc Vector3[(usize)input.point_count()] in memory.heap
+    defer free(worlds) in memory.heap
+    for at in 0..<worlds.length: worlds[at] = try sample(surface, try input.point((i64)at), uscale, vscale)
+    let uses = try alloc usize[(usize)(try input.edge_count())] in memory.heap
+    defer free(uses) in memory.heap
+    let splits = try alloc i64[uses.length] in memory.heap
+    defer free(splits) in memory.heap
+    let adjacent = try alloc i64[uses.length * 2] in memory.heap
+    defer free(adjacent) in memory.heap
+    for at in 0..<uses.length:
+        uses[at] = 0
+        splits[at] = -1
+    for face in 0..<input.face_count():
+        for at in 0..<(try input.face_size(face)):
+            let edge = (usize)(try input.face_edge(face, at))
+            if uses[edge] < 2: adjacent[edge * 2 + uses[edge]] = face
+            uses[edge] += 1
+    var output = try MeshBuilder(precise = true)
+    defer output.close()
+    try output.copy_points(input)
+    for edge in 0..<(try input.edge_count()):
+        if uses[(usize)edge] != 2: continue
+        let a = try input.edge_point(edge, 0)
+        let b = try input.edge_point(edge, 1)
+        if constraints.contains(a,b): continue
+        let midpoint = (try input.point(a)).add(try input.point(b)).multiply_scalar(0.5)
+        let p = try sample(surface, midpoint, uscale, vscale)
+        # Measure geometric deflection, not parameterization speed. Comparing
+        # positions at equal parameters over-refines even a flat skewed patch.
+        let squared = math.min(try deviation(input, worlds, adjacent[(usize)edge * 2], p), try deviation(input, worlds, adjacent[(usize)edge * 2 + 1], p))
+        if squared > tolerance * tolerance:
+            splits[(usize)edge] = try output.point(midpoint)
+    for face in 0..<input.face_count():
+        let count = try input.face_size(face)
+        let center = try input.face_center(face)
+        let world = try sample(surface, center, uscale, vscale)
+        var split = false
+        var all = true
+        for at in 0..<count:
+            let exists = splits[(usize)(try input.face_edge(face, at))] >= 0
+            split = split or exists
+            all = all and exists
+        split = split or (try deviation(input, worlds, face, world)) > tolerance * tolerance
+        if count == 4:
+            let a = try input.face_point(face, 0)
+            let b = try input.face_point(face, 2)
+            let uv = (try input.point(a)).add(try input.point(b)).multiply_scalar(0.5)
+            split = split or (try deviation(input, worlds, face, try sample(surface, uv, uscale, vscale))) > tolerance * tolerance
+        if not split:
+            try output.copy_face(input, face)
+            continue
+        if count == 3:
+            let vertices = [try input.face_point(face,0),try input.face_point(face,1),try input.face_point(face,2)]
+            let cuts = [splits[(usize)(try input.face_edge(face,0))],splits[(usize)(try input.face_edge(face,1))],splits[(usize)(try input.face_edge(face,2))]]
+            let nf = output.nf
+            let nc = output.nc
+            if not center_conditioned(&output,vertices,cuts,center) and (try split_triangle(&output,vertices,cuts)):
+                # A good UV diagonal need not be good on a curved support.
+                # Keep edge-only refinement only when every lifted child has
+                # the support's orientation; otherwise retain the centre path.
+                if try oriented(&output,nc,surface,uscale,vscale): continue
+                output.nf = nf
+                output.nc = nc
+        let middle = try output.point(center)
+        for at in 0..<count:
+            let a = try input.face_point(face, at)
+            let b = try input.face_point(face, (at + 1) % count)
+            let cut = splits[(usize)(try input.face_edge(face, at))]
+            if all and count == 4:
+                try output.face(4)
+                for id in [a, cut, middle, splits[(usize)(try input.face_edge(face, (at + count - 1) % count))]]: try output.corner(id)
+            elif cut >= 0:
+                try triangle(&output, a, cut, middle)
+                try triangle(&output, cut, b, middle)
+            else:
+                try triangle(&output, a, b, middle)
+    if output.np == (usize)input.point_count(): return source.clone()
+    return try output.finish()
+
+func deviation(mesh: Mesh*, points: const Vector3[], face: i64, p: Vector3) -> f64!:
+    let a = points[(usize)(try mesh.face_point(face, 0))]
+    var distance: f64 = 1e100
+    for at in 1..<(try mesh.face_size(face)) - 1:
+        distance = math.min(distance, squared_triangle_distance(p, a, points[(usize)(try mesh.face_point(face, at))], points[(usize)(try mesh.face_point(face, at + 1))]))
+    return distance
+
+func triangle(mesh: MeshBuilder*, a: i64, b: i64, c: i64) -> !:
+    try mesh.face(3)
+    for id in [a, b, c]: try mesh.corner(id)
+
+func oriented(mesh: const MeshBuilder*, start: usize, surface: Surface, uscale: f64, vscale: f64) -> bool!:
+    for at in 0..<(mesh.nc-start)//3:
+        var uv = [Vector3(),Vector3(),Vector3()]
+        var p = uv
+        for i in 0..<(usize)3:
+            uv[i] = mesh.points[(usize)mesh.corners[start+at*3+i]]
+            p[i] = try sample(surface,uv[i],uscale,vscale)
+        let cross = p[1].subtract(p[0]).cross(p[2].subtract(p[0]))
+        for q in uv:
+            let n = try support_normal(surface,Vector3(q.x/uscale,q.y/vscale,0.0))
+            if cross.dot(n) <= cross.length()*1e-10: return false
+    return true

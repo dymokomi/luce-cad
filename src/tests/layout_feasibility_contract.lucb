@@ -1,0 +1,156 @@
+## Mapped count cycles must terminate without raising counts indefinitely.
+import memory
+from luce_geocore.geocore import Vector3, invalid
+from brep_types import Surface, Curve, BrepFace
+from patch_sides import PatchSides, edge_index
+from layout_types import GridLayout, Stations
+from layout_feasibility import cut_impossible
+from layout_counts import equalize_counts
+from layout_balance import balance, Settled
+from trim_layout import plan_layouts
+import curve_spacing as spacing
+
+pub func layout_feasibility_contract() -> !:
+    try retain_cut_owner()
+    for rotation in 0..<(usize)6:
+        for reverse in [false,true]:
+            for hard in [false,true]:
+                for variant in 0..<4: try cycle(rotation,reverse,hard,variant)
+
+func cycle(rotation: usize, reverse: bool, hard: bool, variant: i64) -> !:
+    var numbers: f64[]
+    var points: Vector3[]
+    let surface = try Surface(4 if variant == 3 else 0,Vector3(),Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),1.0,0.0,points,numbers,numbers,numbers,0,0,0,0)
+    defer surface.close()
+    let compound = variant == 1 or variant == 2
+    let first_uses = [1,2,3,4,5,6]
+    let second_uses = [-2,7,-6,8] if compound else [-2,7,-5,8]
+    let third_uses = [-3,9,-5,10]
+    let faces = [try oriented(first_uses[..<(6 if compound else (usize)5)],rotation,reverse),
+                 try oriented(second_uses,rotation,reverse),try oriented(third_uses,rotation,reverse)]
+    defer:
+        for face in faces: face.close()
+    var original = PatchSides()
+    original.valid = true
+    original.starts = [0,1,3,4] if compound else [0,1,2,3]
+    original.lengths = [1,2,1,2] if compound else [1,1,1,2]
+    var simple = PatchSides()
+    simple.valid = true
+    simple.starts = [0,1,2,3]
+    simple.lengths = [1,1,1,1]
+    var sides = [reindex(original,faces[0].uses.length,rotation,reverse),
+                 reindex(simple,4,rotation,reverse),reindex(simple,4,rotation,reverse)]
+    # Variant 1 leaves N+A=N+B, which is feasible and must not be cut.
+    # Variant 2 also joins A/B through the third patch: exact cancellation.
+    if variant != 2: sides[2].valid = false
+    var plans = [GridLayout(),GridLayout(),GridLayout()]
+    defer:
+        for plan in plans: plan.close()
+    for at in 0..<(usize)3:
+        plans[at].flow = try alloc bool[faces[at].uses.length] in memory.heap
+        plans[at].rows = try alloc Stations[faces[at].uses.length] in memory.heap
+        for use in 0..<faces[at].uses.length: plans[at].rows[use] = Stations()
+        for use in 0..<faces[at].uses.length:
+            let index = edge_index(faces[at].uses[use])
+            plans[at].flow[use] = not (hard and index == 1) and (at != 2 or variant == 2)
+            try plans[at].rows[use].open(1025)
+            for t in [0.0,0.5,1.0]: discard(try plans[at].rows[use].insert(t,1e-12))
+    let expected = variant == 0 and not hard
+    let changed = try cut_impossible(faces,[surface],sides,plans,10)
+    if changed != (1 if expected else (usize)0) or plans[0].cut_first != expected:
+        error(invalid,"mapped count proof confused a positive cycle with feasible or stopped flow")
+    if plans[1].cut_first or plans[2].cut_first: error(invalid,"mapped count proof cut an unrelated patch")
+    if try cut_impossible(faces,[surface],sides,plans,10) != 0: error(invalid,"mapped count proof is not idempotent")
+    for at in 0..<(usize)3:
+        for use in 0..<faces[at].uses.length:
+            let row = plans[at].rows[use]
+            let index = edge_index(faces[at].uses[use])
+            let flow = not (hard and index == 1) and (at != 2 or variant == 2)
+            if plans[at].flow[use] != flow or row.count != 3 or row.values[0] != 0.0 or row.values[1] != 0.5 or row.values[2] != 1.0:
+                error(invalid,"mapped feasibility changed a seam classification or existing station")
+    if not expected: return
+    let edges = try alloc Curve[10] in memory.heap
+    defer free(edges) in memory.heap
+    var created: usize = 0
+    defer close_edges(edges[..<created])
+    let cuts = try alloc Stations[10] in memory.heap
+    defer free(cuts) in memory.heap
+    var counts: usize[10]
+    for at in 0..<(usize)10: cuts[at] = Stations()
+    defer:
+        for row in cuts: row.close()
+    for at in 0..<(usize)10:
+        edges[at] = try Curve(0,(i64)at,(i64)at+1,Vector3(),Vector3(),Vector3(),0.0,[Vector3(),Vector3(1.0,0.0,0.0)],numbers,numbers,0,true)
+        created += 1
+        counts[at] = 2
+        try cuts[at].open(1025)
+        for t in [0.0,0.5,1.0]: discard(try cuts[at].insert(t,1e-12))
+    let metrics = try spacing.measure(edges)
+    defer spacing.close(metrics)
+    try equalize_counts(edges,faces,sides,metrics,plans,counts)
+    let settled = try alloc Settled[faces.length] in memory.heap
+    defer free(settled) in memory.heap
+    for at in 0..<settled.length: settled[at] = Settled()
+    try balance(faces,edges,sides,cuts,metrics,plans,1e-6,settled)
+    for at in 0..<(usize)10:
+        if counts[at] != 2 or cuts[at].count != 3: error(invalid,"a rejected count cycle resumed during count/phase propagation")
+
+func oriented(uses: const i64[], rotation: usize, reverse: bool) -> BrepFace!:
+    let shifted = try alloc i64[uses.length] in memory.heap
+    defer free(shifted) in memory.heap
+    for at in 0..<uses.length:
+        shifted[at] = -uses[(rotation+uses.length-at)%uses.length] if reverse else uses[(rotation+at)%uses.length]
+    return try BrepFace(0,shifted,[(i64)uses.length],not reverse)
+
+func reindex(original: PatchSides, count: usize, rotation: usize, reverse: bool) -> PatchSides:
+    var result = original
+    for axis in 0..<(usize)4:
+        let old = (original.starts[axis]+original.lengths[axis]-1)%count if reverse else original.starts[axis]
+        let new_axis = (4-axis)%4 if reverse else axis
+        result.starts[new_axis] = (rotation+count-old)%count if reverse else (old+count-rotation%count)%count
+        result.lengths[new_axis] = original.lengths[axis]
+    return result
+
+func close_edges(edges: const Curve[]):
+    for edge in edges: edge.close()
+
+func retain_cut_owner() -> !:
+    # A prior topology decision owns the cut path even if the later local
+    # geometry-only policy considers this rectangle perfectly mappable.
+    let p = [Vector3(),Vector3(1.0,0.0,0.0),Vector3(1.0,1.0,0.0),Vector3(0.0,1.0,0.0)]
+    var numbers: f64[]
+    var no_points: Vector3[]
+    let surface = try Surface(0,Vector3(),Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),0.0,0.0,no_points,numbers,numbers,numbers,0,0,0,0)
+    defer surface.close()
+    let face = try BrepFace(0,[1,2,3,4],[4],true)
+    defer face.close()
+    let edges = try alloc Curve[4] in memory.heap
+    defer free(edges) in memory.heap
+    var created: usize = 0
+    defer close_edges(edges[..<created])
+    var cuts = [Stations(),Stations(),Stations(),Stations()]
+    defer:
+        for cut in cuts: cut.close()
+    var plans = [GridLayout()]
+    defer plans[0].close()
+    plans[0].cut_first = true
+    plans[0].flow = try alloc bool[4] in memory.heap
+    plans[0].rows = try alloc Stations[4] in memory.heap
+    for at in 0..<(usize)4: plans[0].rows[at] = Stations()
+    for at in 0..<(usize)4:
+        edges[at] = try Curve(0,(i64)at,(i64)((at+1)%4),Vector3(),Vector3(),Vector3(),0.0,[p[at],p[(at+1)%4]],numbers,numbers,0,true)
+        created += 1
+        plans[0].flow[at] = false
+        try plans[0].rows[at].open(1025)
+        try cuts[at].open(1025)
+        for t in [0.0,0.5,1.0]:
+            discard(try plans[0].rows[at].insert(t,1e-12))
+            discard(try cuts[at].insert(t,1e-12))
+    var side = PatchSides()
+    side.valid = true
+    side.starts = [0,1,2,3]
+    side.lengths = [1,1,1,1]
+    let metrics = try spacing.measure(edges)
+    defer spacing.close(metrics)
+    try plan_layouts(p,edges,[surface],[face],[side],cuts,metrics,plans,16,1e-6,0.0)
+    if not plans[0].valid or not plans[0].cut_first: error(invalid,"local chart policy discarded an existing topology cut owner")

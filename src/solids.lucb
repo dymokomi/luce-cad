@@ -1,0 +1,158 @@
+## Analytic solids as closed B-reps, the way STEP describes them: a box of
+## six planes, a cylinder (two planar caps and a seamed cylindrical side), a
+## cone or frustum (a conical side closing at its apex, or capped), a sphere
+## (two hemispheres on one spherical surface) and a torus (one face with
+## its two seams). Each is centered on the origin with its axis along +Y,
+## every face's normal outward and every loop counterclockwise around it,
+## so each edge is used twice in opposite directions.
+import interop
+import memory
+import luce_std.math
+from luce_geocore.geocore import Vector3, invalid
+from brep import BrepModel, brep_model_type
+from model import CadModel, cad_model_type
+
+## Luce's constructors of analytic solids.
+pub struct CadSolids:
+    let reserved: u8 = 0
+
+    ## A box of `width` (X), `height` (Y) and `depth` (Z).
+    pub static func box(width: f64, height: f64, depth: f64) -> interop.Reference[CadModel]!:
+        try positive(width)
+        try positive(height)
+        try positive(depth)
+        let size = Vector3(width, height, depth)
+        let solid = try new_brep(math.max(width, math.max(height, depth)))
+        defer solid.release()
+        let b = solid.value()
+        # Corner i + 2j + 4k sits at the (i, j, k) end of each axis.
+        for k in 0..<2:
+            for j in 0..<2:
+                for i in 0..<2:
+                    discard(try b.add_vertex(Vector3(((f64)i - 0.5) * size.x, ((f64)j - 0.5) * size.y, ((f64)k - 0.5) * size.z)))
+        # The edge between corners a < b (one bit apart) runs from a to b.
+        var edges: i64[64]
+        for at in 0..<(usize)64: edges[at] = -1
+        for a in 0..<8:
+            for shift in 0..<3:
+                let bit = 1 << (usize)shift
+                if a & bit == 0: edges[(usize)(a * 8 + (a | bit))] = try b.add_line((i64)a, (i64)(a | bit))
+        for axis in 0..<3:
+            let first = 1 << (usize)((axis + 1) % 3)
+            let second = 1 << (usize)((axis + 2) % 3)
+            let bit = 1 << (usize)axis
+            for side in 0..<2:
+                let base = bit if side == 1 else 0
+                # Counterclockwise around the outward normal: (first, second)
+                # turns positively about +axis.
+                var corners: i64[4] = [base, base | first, base | first | second, base | second]
+                if side == 0: corners = [base, base | second, base | first | second, base | first]
+                var normal = Vector3()
+                if axis == 0: normal = Vector3(1.0, 0.0, 0.0)
+                elif axis == 1: normal = Vector3(0.0, 1.0, 0.0)
+                else: normal = Vector3(0.0, 0.0, 1.0)
+                if side == 0: normal = normal.multiply_scalar(-1.0)
+                var reference = Vector3(1.0, 0.0, 0.0) if axis != 0 else Vector3(0.0, 1.0, 0.0)
+                let plane = try b.add_surface(0, Vector3(normal.x * size.x * 0.5, normal.y * size.y * 0.5, normal.z * size.z * 0.5), normal, reference)
+                var uses: i64[4]
+                for at in 0..<(usize)4:
+                    let p = corners[at]
+                    let q = corners[(at + 1) % 4]
+                    let low = p if p < q else q
+                    let high = q if p < q else p
+                    let edge = edges[(usize)(low * 8 + high)]
+                    uses[at] = (edge + 1) if p == low else -(edge + 1)
+                discard(try face(b, plane, uses[..<4]))
+        return try model_of(solid)
+
+    ## A cylinder of `radius` and `height`.
+    pub static func cylinder(radius: f64, height: f64) -> interop.Reference[CadModel]!:
+        return try CadSolids.cone(radius, height, radius)
+
+    ## A cone of base `radius` and `height`, pointed (`top` 0) or cut off at
+    ## radius `top` (a frustum; equal radii: a cylinder).
+    pub static func cone(radius: f64, height: f64, top: f64 = 0.0) -> interop.Reference[CadModel]!:
+        try positive(radius)
+        try positive(height)
+        if not math.is_finite(top) or top < 0.0: error(invalid, "a cone's top radius must be finite and not negative")
+        let solid = try new_brep(math.max(radius, height))
+        defer solid.release()
+        let b = solid.value()
+        let up = Vector3(0.0, 1.0, 0.0)
+        let x = Vector3(1.0, 0.0, 0.0)
+        let low = Vector3(0.0, -height * 0.5, 0.0)
+        let high = Vector3(0.0, height * 0.5, 0.0)
+        let bottom = try b.add_vertex(low.add(x.multiply_scalar(radius)))
+        let apex = try b.add_vertex(high.add(x.multiply_scalar(top)))
+        # The seam up the side, and the base circle (counterclockwise about +Y).
+        let seam = try b.add_line(bottom, apex)
+        let base = try b.add_circle(bottom, bottom, low, up, x, radius)
+        let floor = try b.add_surface(0, low, up.multiply_scalar(-1.0), x)
+        let down: i64[1] = [-(base + 1)]
+        discard(try face(b, floor, down[..<1]))
+        let side = (try b.add_surface(1, low, up, x, radius)) if top == radius else (try b.add_surface(2, low, up, x, radius, math.atan2(top - radius, height)))
+        if top == 0.0:
+            let around: i64[3] = [base + 1, seam + 1, -(seam + 1)]
+            discard(try face(b, side, around[..<3]))
+        else:
+            let rim = try b.add_circle(apex, apex, high, up, x, top)
+            let roof = try b.add_surface(0, high, up, x)
+            let lid: i64[1] = [rim + 1]
+            discard(try face(b, roof, lid[..<1]))
+            let around: i64[4] = [base + 1, seam + 1, -(rim + 1), -(seam + 1)]
+            discard(try face(b, side, around[..<4]))
+        return try model_of(solid)
+
+    ## A sphere of `radius`: two hemispheres meeting at the equator.
+    pub static func sphere(radius: f64) -> interop.Reference[CadModel]!:
+        try positive(radius)
+        let solid = try new_brep(radius)
+        defer solid.release()
+        let b = solid.value()
+        let up = Vector3(0.0, 1.0, 0.0)
+        let x = Vector3(1.0, 0.0, 0.0)
+        let east = try b.add_vertex(x.multiply_scalar(radius))
+        let equator = try b.add_circle(east, east, Vector3(), up, x, radius)
+        let ball = try b.add_surface(4, Vector3(), up, x, radius)
+        let north: i64[1] = [equator + 1]
+        discard(try face(b, ball, north[..<1]))
+        let south: i64[1] = [-(equator + 1)]
+        discard(try face(b, ball, south[..<1]))
+        return try model_of(solid)
+
+    ## A torus: its ring of `radius` about +Y, its tube of radius `tube`.
+    pub static func torus(radius: f64, tube: f64) -> interop.Reference[CadModel]!:
+        try positive(radius)
+        try positive(tube)
+        if tube >= radius: error(invalid, "a torus's tube must be thinner than its ring")
+        let solid = try new_brep(radius + tube)
+        defer solid.release()
+        let b = solid.value()
+        let up = Vector3(0.0, 1.0, 0.0)
+        let x = Vector3(1.0, 0.0, 0.0)
+        let outer = try b.add_vertex(x.multiply_scalar(radius + tube))
+        # The outer equator (u runs along it) and the meridian at u = 0 (v).
+        let ring = try b.add_circle(outer, outer, Vector3(), up, x, radius + tube)
+        let meridian = try b.add_circle(outer, outer, x.multiply_scalar(radius), Vector3(0.0, 0.0, 1.0), x, tube)
+        let surface = try b.add_surface(5, Vector3(), up, x, radius, tube)
+        let around: i64[4] = [ring + 1, meridian + 1, -(ring + 1), -(meridian + 1)]
+        discard(try face(b, surface, around[..<4]))
+        return try model_of(solid)
+
+## A face of one loop, its normal the surface's.
+func face(b: BrepModel*, surface: i64, uses: const i64[]) -> i64!:
+    let sizes: i64[1] = [(i64)uses.length]
+    return try b.add_face(surface, uses, sizes[..<1])
+
+func positive(value: f64) -> !:
+    if not math.is_finite(value) or value <= 0.0: error(invalid, "a solid's dimensions must be positive")
+
+## An empty B-rep with a tolerance for `size`.
+func new_brep(size: f64) -> interop.Reference[BrepModel]!:
+    return try interop.Reference[BrepModel].adopt(new BrepModel(math.max(0.000000001, size * 0.000001)) in memory.heap, brep_model_type, memory.heap)
+
+func model_of(solid: interop.Reference[BrepModel]) -> interop.Reference[CadModel]!:
+    let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
+    errdefer result.release()
+    try result.value().attach_brep(solid)
+    return result

@@ -1,0 +1,83 @@
+## Recognize four logical UV sides even when STEP splits a side into many edges.
+import luce_std.math
+import memory
+from luce_geocore.geocore import Vector3
+from brep_types import Surface, Curve, BrepFace
+from surface_trim import project
+
+pub struct PatchSides:
+    pub var starts: usize[4] = [0, 0, 0, 0]
+    pub var lengths: usize[4] = [0, 0, 0, 0]
+    pub var valid: bool = false
+
+## Only single-loop, nonsingular four-corner domains qualify for mapped grids.
+pub func patch_sides(face: BrepFace, s: Surface, edges: const Curve[], tolerance: f64) -> PatchSides!:
+    var result = PatchSides()
+    if face.sizes.length != 1 or face.uses.length < 4 or face.uses.length > 128: return result
+    if face.uses.length == 4:
+        for side in 0..<(usize)4:
+            result.starts[side] = side
+            result.lengths[side] = 1
+        result.valid = true
+        return result
+    let incoming = try alloc Vector3[face.uses.length] in memory.heap
+    defer free(incoming) in memory.heap
+    let outgoing = try alloc Vector3[face.uses.length] in memory.heap
+    defer free(outgoing) in memory.heap
+    for at in 0..<face.uses.length:
+        let use = face.uses[at]
+        let edge = edges[edge_index(use)]
+        var seed = Vector3(0.5, 0.5, 0.0)
+        var ends = [Vector3(), Vector3(), Vector3(), Vector3()]
+        let fractions = [0.0, 0.001, 0.999, 1.0]
+        for i in 0..<(usize)4:
+            let p = try edge.at(fractions[i] if use > 0 else 1.0-fractions[i])
+            if s.kind == 3: seed = try project(s, p, seed, tolerance)
+            else:
+                let relative = p.subtract(s.origin)
+                let x = relative.dot(s.x)
+                let y = relative.dot(s.y)
+                let z = relative.dot(s.z)
+                let radius = math.sqrt(x*x+y*y)
+                var u = math.atan2(y, x)
+                var v = math.atan2(z, radius) if s.kind == 4 else (math.atan2(z, radius-s.radius) if s.kind == 5 else z)
+                if s.kind == 0:
+                    u = x
+                    v = y
+                if i > 0 and s.kind != 0:
+                    u = wrap(u, seed.x)
+                    if s.kind == 5: v = wrap(v, seed.y)
+                seed = Vector3(u, v, 0.0)
+            ends[i] = seed
+        outgoing[at] = ends[1].subtract(ends[0])
+        incoming[at] = ends[3].subtract(ends[2])
+    var corners: usize = 0
+    for at in 0..<face.uses.length:
+        let a = incoming[(at + face.uses.length - 1) % face.uses.length]
+        let b = outgoing[at]
+        if a.length() <= 1e-14 or b.length() <= 1e-14: return result
+        if a.dot(b) < 0.99 * a.length() * b.length():
+            if corners == 4: return result
+            result.starts[corners] = at
+            corners += 1
+    if corners != 4: return result
+    for side in 0..<(usize)4:
+        result.lengths[side] = (result.starts[(side+1)%4] + face.uses.length - result.starts[side]) % face.uses.length
+    result.valid = true
+    return result
+
+## Sum the independently owned edge intervals composing one logical side.
+pub func side_count(face: BrepFace, sides: PatchSides, side: usize, counts: const usize[]) -> usize:
+    var result: usize = 0
+    for at in 0..<sides.lengths[side]: result += counts[edge_index(face.uses[(sides.starts[side]+at)%face.uses.length])]
+    return result
+
+## Decode an oriented one-based edge use into its shared zero-based edge ID.
+pub func edge_index(use: i64) -> usize:
+    return (usize)(use-1 if use > 0 else -use-1)
+
+func wrap(value: f64, previous: f64) -> f64:
+    var result = value
+    while result - previous > math.pi: result -= 2.0*math.pi
+    while result - previous < -math.pi: result += 2.0*math.pi
+    return result

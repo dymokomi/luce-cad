@@ -1,0 +1,117 @@
+## A near-grid endpoint must not depend on whether its crossing was visited first.
+import luce_std.math
+from luce_geocore.geocore import Vector3, invalid
+from tessellation.surface import TrimGrid
+from brep_types import Surface
+from layout_types import GridLayout
+from trim_alignment import align
+
+pub func trim_alignment_contract() -> !:
+    for delta in [2e-12,8e-12,15e-12]:
+        for swap in [false,true]:
+            for reverse in [false,true]:
+                for origin in 0..<(usize)8: try endpoint(delta,swap,reverse,origin)
+                for origin in 0..<(usize)8: try straight_rail(delta,swap,reverse,origin)
+    for swap in [false,true]:
+        for reverse in [false,true]:
+            for origin in 0..<(usize)8:
+                try straight_rail(17e-12,swap,reverse,origin)
+                try straight_rail(2e-12,swap,reverse,origin,true)
+
+## A nearly incident middle trim vertex may become collinear, but cannot be
+## welded to a neighbor or replaced by an independently lifted grid vertex.
+func straight_rail(delta: f64, swap: bool, reverse: bool, origin: usize, backtrack: bool = false) -> !:
+    let original = [Vector3(0.5,0.0,0.0),Vector3(0.5-delta,0.2 if backtrack else 0.1,0.0),Vector3(0.5,0.1 if backtrack else 0.2,0.0),Vector3(0.5,1.0,0.0),Vector3(1.0,1.0,0.0),Vector3(1.0,0.2,0.0),Vector3(1.0,0.1,0.0),Vector3(1.0,0.0,0.0)]
+    var uv = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+    var canonical = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+    let ids = [0,1,2,3,4,5,6,7]
+    for at in 0..<(usize)8:
+        let source = (origin+(7-at if reverse else at))%8
+        let p = original[source]
+        uv[at] = Vector3(p.y,p.x,0.0) if swap else p
+        let exact = Vector3(p.x-2e-5 if source == 1 else p.x,p.y,0.0)
+        canonical[at] = Vector3(exact.y,exact.x,0.0) if swap else exact
+    var points: Vector3[]
+    var numbers: f64[]
+    let surface = try Surface(0,Vector3(),Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),0.0,0.0,points,numbers,numbers,numbers,0,0,0,0)
+    defer surface.close()
+    var plan = GridLayout()
+    defer plan.close()
+    plan.epsilon = 1e-7
+    try plan.u.open(8)
+    try plan.v.open(8)
+    for value in [0.0,0.5,1.0]:
+        discard(try (plan.v.insert(value,1e-15) if swap else plan.u.insert(value,1e-15)))
+    for value in [0.0,0.1,0.2,1.0]:
+        discard(try (plan.u.insert(value,1e-15) if swap else plan.v.insert(value,1e-15)))
+    try align(uv,[8],ids,canonical,surface,plan,0.01)
+    for at in 0..<(usize)8:
+        let source = (origin+(7-at if reverse else at))%8
+        let p = original[source]
+        if source == 1:
+            let wanted = p.x if backtrack or delta > 16e-12 else 0.5
+            if (uv[at].y if swap else uv[at].x) != wanted: error(invalid,"straight-rail incidence did not respect its bound or no-backtracking guard")
+        let exact = Vector3(p.x-2e-5 if source == 1 else p.x,p.y,0.0)
+        if canonical[at].subtract(Vector3(exact.y,exact.x,0.0) if swap else exact).length() != 0.0: error(invalid,"straight-rail alignment moved a canonical position")
+    if backtrack or delta > 16e-12: return
+    let mesh = try TrimGrid.clip_identified(uv,[8],plan.u.values[..<plan.u.count],plan.v.values[..<plan.v.count],ids)
+    defer mesh.release()
+    for at in 0..<(usize)8:
+        if (try mesh.value().point((i64)at)).subtract(uv[at]).length() != 0.0: error(invalid,"straight-rail alignment lost a distinct trim ID")
+    for at in 0..<mesh.value().point_count():
+        let p = try mesh.value().point(at)
+        let across = p.y if swap else p.x
+        if across < 0.5: error(invalid,"aligned grid allocated a numerical boundary ribbon")
+
+func endpoint(delta: f64, swap: bool, reverse: bool, origin: usize) -> !:
+    let original = [Vector3(0.5,0.0,0.0),Vector3(0.5+4.8e-10,0.002,0.0),Vector3(0.55,0.5,0.0),Vector3(0.55,1.0,0.0),Vector3(1.0,1.0,0.0),Vector3(1.0,0.5,0.0),Vector3(1.0,0.0,0.0),Vector3(0.55,0.0,0.0)]
+    var uv = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+    var canonical = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+    let ids = [0,1,2,3,4,5,6,7]
+    for at in 0..<(usize)8:
+        let source = (origin+(7-at if reverse else at))%8
+        let p = original[source]
+        uv[at] = Vector3(p.y,p.x,0.0) if swap else p
+        canonical[at] = uv[at]
+    var points: Vector3[]
+    var numbers: f64[]
+    let surface = try Surface(0,Vector3(),Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),0.0,0.0,points,numbers,numbers,numbers,0,0,0,0)
+    defer surface.close()
+    var plan = GridLayout()
+    defer plan.close()
+    plan.epsilon = 1e-7
+    try plan.u.open(8)
+    try plan.v.open(8)
+    for value in [0.0,0.5+delta,0.55,1.0]:
+        if swap: discard(try plan.v.insert(value,1e-15))
+        else: discard(try plan.u.insert(value,1e-15))
+    for value in [0.0,0.5,1.0]:
+        if swap: discard(try plan.u.insert(value,1e-15))
+        else: discard(try plan.v.insert(value,1e-15))
+    try align(uv,[8],ids,canonical,surface,plan,1e-6)
+    var wanted_area: f64 = 0.0
+    for at in 0..<(usize)8:
+        let source = (origin+(7-at if reverse else at))%8
+        let p = original[source]
+        let untouched = Vector3(p.y,p.x,0.0) if swap else p
+        if canonical[at].subtract(untouched).length() != 0.0: error(invalid,"alignment moved a canonical CAD vertex")
+        if source < 2 and (uv[at].y if swap else uv[at].x) != 0.5+delta:
+            error(invalid,"endpoint incidence depends on trim traversal order")
+        wanted_area += uv[at].cross(uv[(at+1)%8]).z*0.5
+    # clip_identified audits every directed trim segment. Both near-grid IDs
+    # must survive; they are not duplicates despite sharing one UV coordinate.
+    let mesh = try TrimGrid.clip_identified(uv,[8],plan.u.values[..<plan.u.count],plan.v.values[..<plan.v.count],ids)
+    defer mesh.release()
+    for at in 0..<(usize)8:
+        if (try mesh.value().point((i64)at)).subtract(uv[at]).length() != 0.0: error(invalid,"alignment welded distinct trim vertices")
+    var area: f64 = 0.0
+    for triangle in 0..<mesh.value().index_count()//3:
+        var p = [Vector3(),Vector3(),Vector3()]
+        for at in 0..<(usize)3:
+            let index = mesh.value().index(triangle*3+(i64)at)
+            defer index.release()
+            p[at] = try mesh.value().point(try mesh.value().corner_point(try index.get()))
+        let signed = p[1].subtract(p[0]).cross(p[2].subtract(p[0])).z*0.5
+        if signed <= 0.0: error(invalid,"aligned cell has an inverted display triangle")
+        area += signed
+    if math.abs(area-math.abs(wanted_area)) > 1e-12: error(invalid,"aligned cells changed trim area")

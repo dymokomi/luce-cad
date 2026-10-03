@@ -1,0 +1,100 @@
+## Bounded global triangulation fallback for a lifted cut polygon. Local flips
+## can stall when repairing one bad ear first requires changing a valid one.
+## Only visible UV diagonals and support-normal-consistent triangles qualify.
+import luce_std.math
+import memory
+from luce_geocore.geocore import Vector3, MeshBuilder, Mesh
+from clipped_display import folded
+
+pub func solve(mesh: const MeshBuilder*, part: const Mesh*, face: i64, forward: bool, indices: i64[], normals: const Vector3[]) -> bool!:
+    let count = (usize)(try part.face_size(face))
+    if count < 4 or count > 256: return false
+    let uv = try alloc Vector3[count] in memory.heap
+    defer free(uv) in memory.heap
+    let positions = try alloc Vector3[count] in memory.heap
+    defer free(positions) in memory.heap
+    var extent2: f64 = 0.0
+    for at in 0..<count:
+        uv[at] = try part.point(try part.face_point(face,(i64)(at if forward else count-1-at)))
+        positions[at] = mesh.points[(usize)mesh.corners[mesh.nc-count+at]]
+        let delta = uv[at].subtract(uv[0])
+        extent2 = math.max(extent2,delta.dot(delta))
+    let epsilon = math.max(1e-30,extent2*1e-14)
+    let sign = (try part.face_normal(face)).z*(1.0 if forward else -1.0)
+    let visible = try alloc bool[count*count] in memory.heap
+    defer free(visible) in memory.heap
+    let cost = try alloc f64[count*count] in memory.heap
+    defer free(cost) in memory.heap
+    let split = try alloc i64[count*count] in memory.heap
+    defer free(split) in memory.heap
+    for i in 0..<count:
+        for j in i..<count:
+            visible[i*count+j] = j == i+1 or (i == 0 and j == count-1) or (j > i+1 and diagonal(uv,i,j,epsilon))
+            cost[i*count+j] = 0.0 if j <= i+1 else 1e300
+            split[i*count+j] = -1
+    for gap in 2..<count:
+        for i in 0..<count-gap:
+            let j = i+gap
+            if not visible[i*count+j]: continue
+            for k in i+1..<j:
+                if cost[i*count+k] >= 1e300 or cost[k*count+j] >= 1e300: continue
+                if sign*orient(uv[i],uv[k],uv[j]) <= epsilon: continue
+                if folded(mesh,(i64)i,(i64)k,(i64)j,normals): continue
+                let a = positions[k].subtract(positions[i])
+                let b = positions[j].subtract(positions[i])
+                let c = positions[j].subtract(positions[k])
+                let quality = (a.dot(a)+b.dot(b)+c.dot(c))/a.cross(b).length()
+                let candidate = cost[i*count+k]+cost[k*count+j]+quality
+                if candidate < cost[i*count+j]:
+                    cost[i*count+j] = candidate
+                    split[i*count+j] = (i64)k
+    if split[count-1] < 0: return false
+    var first: usize[256]
+    var last: usize[256]
+    first[0] = 0
+    last[0] = count-1
+    var pending: usize = 1
+    var written: usize = 0
+    while pending > 0:
+        pending -= 1
+        let i = first[pending]
+        let j = last[pending]
+        let k = (usize)split[i*count+j]
+        indices[written] = (i64)i
+        indices[written+1] = (i64)k
+        indices[written+2] = (i64)j
+        written += 3
+        for interval in [i,k]:
+            let end = k if interval == i else j
+            if end > interval+1:
+                first[pending] = interval
+                last[pending] = end
+                pending += 1
+    return written == indices.length
+
+func orient(a: Vector3, b: Vector3, c: Vector3) -> f64:
+    return (b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x)
+
+func diagonal(uv: const Vector3[], i: usize, j: usize, epsilon: f64) -> bool:
+    let a = uv[i]
+    let b = uv[j]
+    for at in 0..<uv.length:
+        let next = (at+1)%uv.length
+        if at == i or at == j or next == i or next == j: continue
+        let c = uv[at]
+        let d = uv[next]
+        let ac = orient(a,b,c)
+        let ad = orient(a,b,d)
+        let ca = orient(c,d,a)
+        let cb = orient(c,d,b)
+        # A diagonal cannot pass through another trim vertex or overlap it.
+        if math.abs(ac) <= epsilon and c.subtract(a).dot(c.subtract(b)) <= 0.0: return false
+        if math.abs(ad) <= epsilon and d.subtract(a).dot(d.subtract(b)) <= 0.0: return false
+        if ((ac > epsilon and ad < -epsilon) or (ac < -epsilon and ad > epsilon)) and ((ca > epsilon and cb < -epsilon) or (ca < -epsilon and cb > epsilon)): return false
+    let p = a.add(b).multiply_scalar(0.5)
+    var inside = false
+    for at in 0..<uv.length:
+        let c = uv[at]
+        let d = uv[(at+1)%uv.length]
+        if (c.y > p.y) != (d.y > p.y) and p.x < c.x+(d.x-c.x)*(p.y-c.y)/(d.y-c.y): inside = not inside
+    return inside

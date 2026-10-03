@@ -1,0 +1,58 @@
+## Isolated face display meshing, independent of whole-model polygon budgets.
+import interop
+import memory
+from luce_geocore.geocore import Vector3, Mesh
+from brep_types import Curve, Surface, BrepFace
+from brep_mesh import tessellate
+
+pub func face_mesh(vertices: const Vector3[], edges: const Curve[], surface: Surface, face: BrepFace, divisions: i64, tolerance: f64) -> interop.Reference[Mesh]!:
+    let points = try alloc Vector3[face.uses.length * 2] in memory.heap
+    defer free(points) in memory.heap
+    let point_ids = try alloc i64[points.length] in memory.heap
+    defer free(point_ids) in memory.heap
+    let curves = try alloc Curve[face.uses.length] in memory.heap
+    defer free(curves) in memory.heap
+    let edge_ids = try alloc i64[curves.length] in memory.heap
+    defer free(edge_ids) in memory.heap
+    let uses = try alloc i64[face.uses.length] in memory.heap
+    defer free(uses) in memory.heap
+    var np: usize = 0
+    var ne: usize = 0
+    defer release_curves(curves[..<ne])
+    for at in 0..<face.uses.length:
+        let use = face.uses[at]
+        let id = use - 1 if use > 0 else -use - 1
+        var found: i64 = -1
+        for index in 0..<ne:
+            if edge_ids[index] == id:
+                found = (i64)index
+        if found < 0:
+            let edge = edges[(usize)id]
+            let endpoints = [edge.start, edge.end]
+            var mapped: i64[2]
+            for end in 0..<(usize)2:
+                var point: i64 = -1
+                for index in 0..<np:
+                    if point_ids[index] == endpoints[end]:
+                        point = (i64)index
+                if point < 0:
+                    point = (i64)np
+                    point_ids[np] = endpoints[end]
+                    points[np] = vertices[(usize)endpoints[end]]
+                    np += 1
+                mapped[end] = point
+            found = (i64)ne
+            curves[ne] = try Curve(edge.kind, mapped[0], mapped[1], edge.origin, edge.x, edge.y, edge.radius, edge.points, edge.weights, edge.knots, edge.degree, edge.sense, edge.angle, edge.sweep)
+            edge_ids[ne] = id
+            ne += 1
+        uses[at] = found + 1 if use > 0 else -found - 1
+    var patch = try BrepFace(0, uses, face.sizes, face.sense)
+    defer patch.close()
+    patch.color = face.color
+    patch.colored = face.colored
+    patch.placement = face.placement
+    return try tessellate(points[..<np], curves[..<ne], [surface], [patch], divisions, tolerance, 0.0)
+
+func release_curves(curves: const Curve[]):
+    for curve in curves:
+        curve.close()

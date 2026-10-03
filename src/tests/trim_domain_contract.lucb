@@ -1,0 +1,82 @@
+## End-to-end trims keep distinct close boundary vertices without confusing
+## them with crossings, and still reject genuinely crossing/touching loops.
+import luce_std.math
+from luce_geocore.geocore import Vector3, invalid
+from tessellation.trim import TrimPolygon
+
+pub func trim_domains() -> !:
+    for scale in [0.00000095367431640625,1.0,524288.0]:
+        for axis in 0..<3:
+            for reverse in [false,true]:
+                for start in 0..<(usize)8: try boundary(scale,axis,reverse,start)
+                try holes(scale,axis,reverse)
+                try crossings(scale,axis)
+
+func embed(p: Vector3, axis: i64, scale: f64) -> Vector3:
+    return (Vector3(0.0,p.x,p.y) if axis == 0 else (Vector3(p.y,0.0,p.x) if axis == 1 else p)).multiply_scalar(scale)
+
+func normal(axis: i64) -> Vector3:
+    return Vector3(1.0,0.0,0.0) if axis == 0 else (Vector3(0.0,1.0,0.0) if axis == 1 else Vector3(0.0,0.0,1.0))
+
+func boundary(scale: f64, axis: i64, reverse: bool, start: usize) -> !:
+    let close = 1.0/1073741824.0
+    let input = [Vector3(),Vector3(0.25,0.0,0.0),Vector3(0.25+close,0.0,0.0),Vector3(0.75,0.0,0.0),Vector3(1.0,0.0,0.0),Vector3(1.0,1.0,0.0),Vector3(0.5,1.0,0.0),Vector3(0.0,1.0,0.0)]
+    var points = input
+    for at in 0..<points.length: points[at] = embed(input[(start+(7-at if reverse else at))%8],axis,scale)
+    let mesh = try TrimPolygon.triangulate(points,[8],normal(axis))
+    defer mesh.release()
+    let m = mesh.value()
+    if m.point_count() != 8 or m.face_count() != 6: error(invalid,"close trim vertices were discarded")
+    for at in 0..<8:
+        if (try m.point(at)) != points[(usize)at]: error(invalid,"trim triangulation moved a boundary vertex")
+    var boundary_count: i64 = 0
+    for edge in 0..<(try m.edge_count()):
+        let a = try m.edge_point(edge,0)
+        let b = try m.edge_point(edge,1)
+        var uses: i64 = 0
+        for face in 0..<m.face_count():
+            for corner in 0..<3:
+                let x = try m.face_point(face,corner)
+                let y = try m.face_point(face,(corner+1)%3)
+                if (x == a and y == b) or (x == b and y == a): uses += 1
+        if uses == 2: continue
+        if uses != 1: error(invalid,"trim triangulation has a nonmanifold edge")
+        boundary_count += 1
+        if (a+1)%8 != b and (b+1)%8 != a: error(invalid,"triangulation changed the constrained boundary")
+    if boundary_count != 8: error(invalid,"trim triangulation has a missing or internal boundary")
+    var area: f64 = 0.0
+    for face in 0..<m.face_count():
+        let a = try m.point(try m.face_point(face,0))
+        let b = try m.point(try m.face_point(face,1))
+        let c = try m.point(try m.face_point(face,2))
+        let signed = b.subtract(a).cross(c.subtract(a)).dot(normal(axis))*0.5
+        if signed <= 0.0: error(invalid,"trim triangulation flipped a triangle")
+        area += signed
+    if math.abs(area-scale*scale) > scale*scale*1e-12: error(invalid,"trim triangulation changed the domain area")
+
+func holes(scale: f64, axis: i64, reverse: bool) -> !:
+    let close = 1.0/1073741824.0
+    let input = [Vector3(),Vector3(1.0,0.0,0.0),Vector3(1.0,1.0,0.0),Vector3(0.0,1.0,0.0),Vector3(close,0.25,0.0),Vector3(0.5,0.25,0.0),Vector3(0.5,0.75,0.0),Vector3(close,0.75,0.0)]
+    var points = input
+    for at in 0..<points.length:
+        let index = at//4*4+(3-at%4 if reverse else at%4)
+        points[at] = embed(input[index],axis,scale)
+    let mesh = try TrimPolygon.triangulate(points,[4,4],normal(axis))
+    defer mesh.release()
+    if mesh.value().face_count() != 8: error(invalid,"close but disjoint hole failed its domain triangulation")
+
+func crossings(scale: f64, axis: i64) -> !:
+    for touch in [false,true]:
+        let input = [Vector3(),Vector3(1.0,1.0,0.0),Vector3(0.0,1.0,0.0),Vector3(0.5,0.5,0.0) if touch else Vector3(1.0,0.0,0.0)]
+        var points = input
+        for at in 0..<points.length: points[at] = embed(input[at],axis,scale)
+        var rejected = false
+        reject_domain(points,axis) catch failure:
+            if failure.code != invalid: error(failure.code,failure.message)
+            rejected = true
+            recover ()
+        if not rejected: error(invalid,"true crossing or touching trim must remain invalid")
+
+func reject_domain(points: const Vector3[], axis: i64) -> !:
+    let mesh = try TrimPolygon.triangulate(points,[4],normal(axis))
+    mesh.release()

@@ -1,0 +1,113 @@
+## Insert a regular planar lattice without changing the constrained boundary.
+import interop
+import memory
+import luce_std.math
+from luce_geocore.geocore import Mesh, MeshBuilder, Vector3, invalid
+from tessellation.constraints import TrimConstraints
+
+pub func insert_grid(source: interop.Reference[Mesh], normal: Vector3, spacing: f64, second_spacing: f64 = 0.0, constraints: TrimConstraints = TrimConstraints()) -> interop.Reference[Mesh]!:
+    if spacing == 0.0:
+        return source.clone()
+    if not math.is_finite(spacing) or spacing < 0.0:
+        error(invalid, "edge size must be finite and nonnegative")
+    let vertical = second_spacing if second_spacing > 0.0 else spacing
+    if not math.is_finite(vertical):
+        error(invalid, "second grid spacing must be finite")
+    let n = try normal.normalized()
+    let reference = Vector3(1.0, 0.0, 0.0) if math.abs(n.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+    let u = try reference.subtract(n.multiply_scalar(reference.dot(n))).normalized()
+    let v = n.cross(u)
+    let input = source.value()
+    let origin = try input.point(0)
+    var umin: f64 = 0.0
+    var umax: f64 = 0.0
+    var vmin: f64 = 0.0
+    var vmax: f64 = 0.0
+    var mesh = try MeshBuilder(precise = true)
+    defer mesh.close()
+    try mesh.copy_points(input)
+    for face in 0..<input.face_count():
+        try mesh.copy_face(input, face)
+    for index in 0..<input.point_count():
+        let p = (try input.point(index)).subtract(origin)
+        umin = math.min(umin, p.dot(u))
+        umax = math.max(umax, p.dot(u))
+        vmin = math.min(vmin, p.dot(v))
+        vmax = math.max(vmax, p.dot(v))
+    let nx = math.ceil((umax - umin) / spacing)
+    let ny = math.ceil((vmax - vmin) / vertical)
+    if nx * ny > 8192.0:
+        error(invalid, "edge size produces more than 8192 grid cells on a face; increase it")
+    let epsilon = math.max(0.000000000001, spacing * vertical * 0.000000001)
+    for iy in 0..<(usize)ny:
+        for ix in 0..<(usize)nx:
+            let p = origin.add(u.multiply_scalar(umin + ((f64)ix + 0.5) * spacing)).add(v.multiply_scalar(vmin + ((f64)iy + 0.5) * vertical))
+            # Avoid near-duplicate samples. Boundary-edge insertions below are
+            # rejected so a face cannot independently split a shared CAD edge.
+            var near = false
+            for point in mesh.points[..<mesh.np]:
+                let relative = point.subtract(p)
+                if math.abs(relative.dot(u)) < spacing * 0.2 and math.abs(relative.dot(v)) < vertical * 0.2:
+                    near = true
+                    break
+            if near:
+                continue
+            for face in 0..<mesh.nf:
+                let a = mesh.corners[face * 3]
+                let b = mesh.corners[face * 3 + 1]
+                let c = mesh.corners[face * 3 + 2]
+                let pa = mesh.points[(usize)a]
+                let pb = mesh.points[(usize)b]
+                let pc = mesh.points[(usize)c]
+                let ab = pb.subtract(pa).cross(p.subtract(pa)).dot(n)
+                let bc = pc.subtract(pb).cross(p.subtract(pb)).dot(n)
+                let ca = pa.subtract(pc).cross(p.subtract(pc)).dot(n)
+                if ab < -epsilon or bc < -epsilon or ca < -epsilon:
+                    continue
+                if ab <= epsilon or bc <= epsilon or ca <= epsilon:
+                    let x = a if ab <= epsilon else (b if bc <= epsilon else c)
+                    let y = b if ab <= epsilon else (c if bc <= epsilon else a)
+                    if constraints.contains(x,y): break
+                    let opposite = c if ab <= epsilon else (a if bc <= epsilon else b)
+                    var neighbor: i64 = -1
+                    var other: i64 = -1
+                    for nf in 0..<mesh.nf:
+                        if nf == face:
+                            continue
+                        for at in 0..<(usize)3:
+                            if mesh.corners[nf * 3 + at] == y and mesh.corners[nf * 3 + (at + 1) % 3] == x:
+                                neighbor = (i64)nf
+                                other = mesh.corners[nf * 3 + (at + 2) % 3]
+                    if neighbor < 0:
+                        break
+                    let px = mesh.points[(usize)x]
+                    let py = mesh.points[(usize)y]
+                    let po = mesh.points[(usize)opposite]
+                    let pq = mesh.points[(usize)other]
+                    # An almost-on-edge point must not create zero-area slivers
+                    # on either side, especially in anisotropic UV lattices.
+                    if p.subtract(px).cross(po.subtract(px)).dot(n) <= epsilon or py.subtract(p).cross(po.subtract(p)).dot(n) <= epsilon or p.subtract(py).cross(pq.subtract(py)).dot(n) <= epsilon or px.subtract(p).cross(pq.subtract(p)).dot(n) <= epsilon:
+                        break
+                    let id = try mesh.point(p)
+                    replace(&mesh, face, x, id, opposite)
+                    try append(&mesh, id, y, opposite)
+                    replace(&mesh, (usize)neighbor, y, id, other)
+                    try append(&mesh, id, x, other)
+                else:
+                    let id = try mesh.point(p)
+                    replace(&mesh, face, a, b, id)
+                    try append(&mesh, b, c, id)
+                    try append(&mesh, c, a, id)
+                break
+    return try mesh.finish()
+
+func replace(mesh: MeshBuilder*, face: usize, a: i64, b: i64, c: i64):
+    mesh.corners[face * 3] = a
+    mesh.corners[face * 3 + 1] = b
+    mesh.corners[face * 3 + 2] = c
+
+func append(mesh: MeshBuilder*, a: i64, b: i64, c: i64) -> !:
+    try mesh.face(3)
+    try mesh.corner(a)
+    try mesh.corner(b)
+    try mesh.corner(c)

@@ -1,0 +1,70 @@
+## Conforming triangle edge refinement without repeatedly inserting centroids.
+## One/two/three marked sides produce two/three/four children. Canonical trim
+## vertices and the single shared midpoint of each interior edge never change.
+import luce_std.math
+from luce_geocore.geocore import MeshBuilder, Vector3
+
+## Detect a centre fan that would violate the polygon engine's triangle
+## conditioning contract. Edge-only subdivision is a bounded alternative.
+pub func center_conditioned(mesh: const MeshBuilder*, vertices: const i64[], cuts: const i64[], center: Vector3) -> bool:
+    for at in 0..<(usize)3:
+        let a = mesh.points[(usize)vertices[at]]
+        let b = mesh.points[(usize)vertices[(at+1)%3]]
+        if cuts[at] < 0:
+            if not conditioned(a,b,center): return false
+        else:
+            let cut = mesh.points[(usize)cuts[at]]
+            if not conditioned(a,cut,center) or not conditioned(cut,b,center): return false
+    return true
+
+func conditioned(a: Vector3, b: Vector3, c: Vector3) -> bool:
+    let ab = b.subtract(a)
+    let ac = c.subtract(a)
+    return ab.cross(ac).z > math.max(1e-30,math.max(ab.dot(ab),ac.dot(ac))*1e-14)
+
+pub func split_triangle(mesh: MeshBuilder*, vertices: const i64[], cuts: const i64[]) -> bool!:
+    var count: usize = 0
+    for cut in cuts:
+        if cut >= 0: count += 1
+    if count == 0: return false
+    if count == 3:
+        for at in 0..<(usize)3: try triangle(mesh,vertices[at],cuts[at],cuts[(at+2)%3])
+        try triangle(mesh,cuts[0],cuts[1],cuts[2])
+        return true
+    var start: usize = 0
+    for at in 0..<(usize)3:
+        if cuts[at] >= 0 and (count == 1 or cuts[(at+1)%3] >= 0):
+            start = at
+            break
+    let a = vertices[start]
+    let b = vertices[(start+1)%3]
+    let c = vertices[(start+2)%3]
+    let ab = cuts[start]
+    if count == 1:
+        try triangle(mesh,a,ab,c)
+        try triangle(mesh,ab,b,c)
+        return true
+    let bc = cuts[(start+1)%3]
+    try triangle(mesh,b,bc,ab)
+    # The remaining convex quad admits two diagonals. Maximize the weaker
+    # child's area/longest-side², rather than selecting an arbitrary fan.
+    let first = math.min(quality(mesh,a,ab,c),quality(mesh,ab,bc,c))
+    let second = math.min(quality(mesh,a,ab,bc),quality(mesh,a,bc,c))
+    if first >= second:
+        try triangle(mesh,a,ab,c)
+        try triangle(mesh,ab,bc,c)
+    else:
+        try triangle(mesh,a,ab,bc)
+        try triangle(mesh,a,bc,c)
+    return true
+
+func quality(mesh: MeshBuilder*, a: i64, b: i64, c: i64) -> f64:
+    let ab = mesh.points[(usize)b].subtract(mesh.points[(usize)a])
+    let ac = mesh.points[(usize)c].subtract(mesh.points[(usize)a])
+    let bc = mesh.points[(usize)c].subtract(mesh.points[(usize)b])
+    let longest = math.max(ab.dot(ab),math.max(ac.dot(ac),bc.dot(bc)))
+    return ab.cross(ac).length()/longest if longest > 0.0 else 0.0
+
+func triangle(mesh: MeshBuilder*, a: i64, b: i64, c: i64) -> !:
+    try mesh.face(3)
+    for id in [a,b,c]: try mesh.corner(id)

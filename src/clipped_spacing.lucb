@@ -1,0 +1,174 @@
+## Physical spacing for crowded interior chains of an already valid clipped
+## NURBS patch. Exact trim positions, identities and polygon topology are fixed.
+import memory
+import interop
+import luce_std.math
+from luce_geocore.geocore import Vector3, Mesh, MeshBuilder, invalid
+from brep_types import Surface
+from mapped_patch import point
+from surface_normals import support_normal
+from clipped_rows import Rows
+from clipped_cells import append_cells
+from display_error import validate_display_error
+
+## Return an owned chart snapshot. Commit lifted positions and normals only
+## with a validated spacing improvement; otherwise preserve the source exactly.
+pub func redistribute(lifted: MeshBuilder*, source: interop.Reference[Mesh], boundary: usize, surface: Surface, forward: bool, normals: Vector3[], tolerance: f64, divisions: i64) -> interop.Reference[Mesh]!:
+    if surface.kind != 3: return source.clone()
+    var shape = try quad_quality(source.value(),lifted.points[..<lifted.np])
+    let shape_limit = shape
+    let rows = try Rows(source.value(),boundary,lifted.points[..<lifted.np])
+    defer rows.close()
+    if not rows.crowded(): return source.clone()
+    var current = source.clone()
+    errdefer current.release()
+    let count = lifted.np
+    let uv = try alloc Vector3[count] in memory.heap
+    defer free(uv) in memory.heap
+    let target = try alloc Vector3[count] in memory.heap
+    defer free(target) in memory.heap
+    let candidate = try alloc Vector3[count] in memory.heap
+    defer free(candidate) in memory.heap
+    let lengths = try alloc f64[count] in memory.heap
+    defer free(lengths) in memory.heap
+    let next_normals = try alloc Vector3[count] in memory.heap
+    defer free(next_normals) in memory.heap
+    var quality = rows.quality(lifted.points[..<count])
+    # Chord-length redistribution is a proposal, not permission to erase
+    # curvature support. Backtrack under the existing display-error budget.
+    for pass in 0..<(usize)3:
+        var moved = false
+        for axis in 0..<(usize)2:
+            for at in 0..<count: uv[at] = try current.value().point((i64)at)
+            rows.propose(axis,uv,lifted.points[..<count],target,lengths)
+            var movement: f64 = 0.0
+            for at in boundary..<count: movement = math.max(movement,target[at].subtract(uv[at]).length())
+            if movement <= 1e-12: continue
+            for factor in [1.0,0.5,0.25,0.125,0.0625]:
+                for at in 0..<count: candidate[at] = uv[at].add(target[at].subtract(uv[at]).multiply_scalar(factor))
+                if not (try oriented(current.value(),candidate)): continue
+                var proposed = try MeshBuilder(precise = true)
+                defer proposed.close()
+                var accepted = true
+                lift_candidate(&proposed,lifted,candidate,boundary,surface,forward,normals,next_normals) catch failure:
+                    if failure.code != invalid: error(failure.code,failure.message)
+                    accepted = false
+                    recover ()
+                if not accepted: continue
+                let updated = rows.quality(proposed.points[..<count])
+                if updated.x >= quality.x*(1.0-1e-6) or updated.y > quality.y*(1.0+1e-6): continue
+                let next_shape = try quad_quality(current.value(),proposed.points[..<count])
+                if next_shape.cost > shape.cost or next_shape.worst > shape_limit.worst*(1.0+1e-6) or next_shape.skewed > shape_limit.skewed or next_shape.stretched > shape_limit.stretched or next_shape.sine < math.min(shape_limit.sine,0.5)*(1.0-1e-6):
+                    continue
+                let chart = make_chart(current.value(),candidate) catch failure:
+                    if failure.code != invalid: error(failure.code,failure.message)
+                    accepted = false
+                    recover current.clone()
+                defer chart.release()
+                if not accepted: continue
+                append_cells(&proposed,chart.value(),forward,next_normals) catch failure:
+                    if failure.code != invalid: error(failure.code,failure.message)
+                    accepted = false
+                    recover ()
+                if not accepted: continue
+                let display = proposed.finish() catch failure:
+                    if failure.code != invalid: error(failure.code,failure.message)
+                    accepted = false
+                    recover current.clone()
+                defer display.release()
+                if not accepted: continue
+                validate_display_error(display.value(),chart.value(),surface,tolerance,divisions) catch failure:
+                    if failure.code != invalid: error(failure.code,failure.message)
+                    accepted = false
+                    recover ()
+                if not accepted: continue
+                let previous = *lifted
+                *lifted = proposed
+                proposed = previous
+                memory.copy(normals,next_normals,count)
+                current.release()
+                current = chart.clone()
+                quality = updated
+                shape = next_shape
+                moved = true
+                break
+        if not moved: break
+    return current
+
+func lift_candidate(proposed: MeshBuilder*, original: const MeshBuilder*, candidate: const Vector3[], boundary: usize, surface: Surface, forward: bool, normals: const Vector3[], output: Vector3[]) -> !:
+    for at in 0..<candidate.length:
+        discard(try proposed.point(original.points[at] if at < boundary else (try point(surface,candidate[at]))))
+        output[at] = normals[at] if at < boundary else (try support_normal(surface,candidate[at])).multiply_scalar(1.0 if forward else -1.0)
+
+struct ShapeQuality:
+    let cost: f64
+    let worst: f64
+    let skewed: usize
+    let stretched: usize
+    let sine: f64
+
+func quad_quality(chart: const Mesh*, points: const Vector3[]) -> ShapeQuality!:
+    var energy: f64 = 0.0
+    var maximum: f64 = 1.0
+    var skewed: usize = 0
+    var stretched: usize = 0
+    var minimum_sine: f64 = 1.0
+    for face in 0..<chart.face_count():
+        if try chart.face_size(face) != 4: continue
+        var low: f64 = 1e100
+        var high: f64 = 0.0
+        var sine: f64 = 1.0
+        for at in 0..<4:
+            let p = points[(usize)(try chart.face_point(face,at))]
+            let next = points[(usize)(try chart.face_point(face,(at+1)%4))].subtract(p)
+            let previous = points[(usize)(try chart.face_point(face,(at+3)%4))].subtract(p)
+            let length = next.length()
+            low = math.min(low,length)
+            high = math.max(high,length)
+            sine = math.min(sine,next.cross(previous).length()/math.max(1e-30,length*previous.length()))
+        let ratio = high/math.max(low,1e-30)
+        energy += ratio+1.0/math.max(sine,1e-30)
+        maximum = math.max(maximum,ratio)
+        if sine < 0.1: skewed += 1
+        if ratio > 20.0: stretched += 1
+        minimum_sine = math.min(minimum_sine,sine)
+    return ShapeQuality(energy,maximum,skewed,stretched,minimum_sine)
+
+func make_chart(source: const Mesh*, uv: const Vector3[]) -> interop.Reference[Mesh]!:
+    var builder = try MeshBuilder(precise = true)
+    defer builder.close()
+    for p in uv: discard(try builder.point(p))
+    for face in 0..<source.face_count():
+        let count = try source.face_size(face)
+        try builder.face(count)
+        for at in 0..<count: try builder.corner(try source.face_point(face,at))
+    return try builder.finish()
+
+## Preserve an embedding of every original UV triangle. This is stronger than
+## checking polygon area alone: cut cells may be concave or surround holes.
+func oriented(source: const Mesh*, candidate: const Vector3[]) -> bool!:
+    for face in 0..<source.face_count():
+        if try source.face_size(face) != 4: continue
+        for at in 0..<4:
+            let ai = (usize)(try source.face_point(face,at))
+            let bi = (usize)(try source.face_point(face,(at+1)%4))
+            let ci = (usize)(try source.face_point(face,(at+2)%4))
+            let a = try source.point((i64)ai)
+            let b = try source.point((i64)bi)
+            let third = try source.point((i64)ci)
+            let before = b.subtract(a).cross(third.subtract(b)).z
+            let after = candidate[bi].subtract(candidate[ai]).cross(candidate[ci].subtract(candidate[bi])).z
+            if before != 0.0 and before*after <= 0.0: return false
+    for triangle in 0..<source.index_count()//3:
+        var ids: usize[3]
+        for at in 0..<(usize)3:
+            let index = source.index(triangle*3+(i64)at)
+            defer index.release()
+            ids[at] = (usize)(try source.corner_point(try index.get()))
+        let a = try source.point((i64)ids[0])
+        let b = try source.point((i64)ids[1])
+        let third = try source.point((i64)ids[2])
+        let before = b.subtract(a).cross(third.subtract(a)).z
+        let after = candidate[ids[1]].subtract(candidate[ids[0]]).cross(candidate[ids[2]].subtract(candidate[ids[0]])).z
+        if before*after <= 0.0 or math.abs(after) < math.abs(before)*1e-6: return false
+    return true

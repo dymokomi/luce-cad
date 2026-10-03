@@ -1,0 +1,456 @@
+## Original bounded planar trim triangulation: visible hole bridges + ear clipping.
+## Preserves every supplied boundary vertex; no tolerance welding of close loops.
+import interop
+import memory
+import luce_std.math
+from luce_geocore.geocore import Vector3, Mesh, MeshBuilder, invalid
+from tessellation.recombine import recombine
+from tessellation.improve import improve
+from tessellation.grid import insert_grid
+from tessellation.trim_predicates import side, intersects, inside_triangle, ray_crosses
+from tessellation.constraints import TrimConstraints
+
+pub struct TrimPolygon:
+    let reserved: u8 = 0
+    ## Preserve trim boundaries and merge only convex, quality-checked pairs.
+    pub static func quadrangulate(points: const Vector3[], sizes: const i64[], normal: Vector3, edge_size: f64 = 0.0, second_spacing: f64 = 0.0) -> interop.Reference[Mesh]!:
+        var empty: i64[1]
+        return try TrimPolygon.quadrangulate_seams(points, sizes, normal, empty[..<0], edge_size, second_spacing)
+
+    ## Preserve identifications across periodic CAD seams during edge flips.
+    pub static func quadrangulate_seams(points: const Vector3[], sizes: const i64[], normal: Vector3, boundary_ids: const i64[], edge_size: f64 = 0.0, second_spacing: f64 = 0.0) -> interop.Reference[Mesh]!:
+        let triangles = try TrimPolygon.triangulate_seams(points, sizes, normal, boundary_ids)
+        defer triangles.release()
+        let constraints = try TrimConstraints.build(points,boundary_ids,sizes)
+        defer constraints.close()
+        let gridded = try insert_grid(triangles, normal, edge_size, second_spacing, constraints)
+        defer gridded.release()
+        let improved = try improve(gridded, normal, boundary_ids, constraints)
+        defer improved.release()
+        return try recombine(improved, normal, constraints)
+
+    ## First loop is outer, subsequent loops are holes; winding is normalized.
+    pub static func triangulate(points: const Vector3[], sizes: const i64[], normal: Vector3) -> interop.Reference[Mesh]!:
+        var empty: i64[]
+        return try TrimPolygon.triangulate_seams(points,sizes,normal,empty)
+
+    ## An opposite-use seam in one loop may retrace a segment only when both
+    ## endpoints carry identical canonical IDs and exact chart coordinates.
+    ## Other overlapping edges and touching/crossing loops remain errors.
+    pub static func triangulate_seams(points: const Vector3[], sizes: const i64[], normal: Vector3, boundary_ids: const i64[]) -> interop.Reference[Mesh]!:
+        if sizes.length == 0: error(invalid, "trim domain has no loops")
+        if boundary_ids.length != 0 and boundary_ids.length != points.length: error(invalid,"trim identities must describe every input point")
+        for id in boundary_ids:
+            if id < 0: error(invalid,"trim identities must be nonnegative")
+        let n = try normal.normalized()
+        let offsets = try alloc usize[sizes.length + 1] in memory.heap
+        defer free(offsets) in memory.heap
+        offsets[0] = 0
+        for loop in 0..<sizes.length:
+            if sizes[loop] < 3 or (usize)sizes[loop] > points.length - offsets[loop]:
+                error(invalid, "invalid trim loop size")
+            offsets[loop + 1] = offsets[loop] + (usize)sizes[loop]
+        if offsets[sizes.length] != points.length:
+            error(invalid, "trim loops do not describe every vertex")
+        var extent: f64 = 0.0
+        for point in points:
+            if not point.is_finite():
+                error(invalid, "nonfinite trim point")
+            extent = math.max(extent, point.subtract(points[0]).length())
+            if math.abs(point.subtract(points[0]).dot(n)) > 0.000001:
+                error(invalid, "trim polygon is not planar")
+        # Area accounting has squared-distance units. Topological predicates
+        # below instead use determinant signs, not a domain-sized proximity band.
+        let epsilon = math.max(1e-30,extent*extent*1e-14)
+        # Reject touching/crossing boundaries before making weakly-simple bridges.
+        for loop in 0..<sizes.length:
+            let start = offsets[loop]
+            let end = offsets[loop + 1]
+            for a in start..<end:
+                let b = start + (a - start + 1) % (end - start)
+                if same(points[a],points[b]):
+                    error(invalid, "collapsed trim edge")
+                for other in loop..<sizes.length:
+                    let os = offsets[other]
+                    let oe = offsets[other + 1]
+                    for c in os..<oe:
+                        if loop == other and c <= a:
+                            continue
+                        let d = os + (c - os + 1) % (oe - os)
+                        if loop == other and boundary_ids.length > 0 and boundary_ids[a] == boundary_ids[d] and boundary_ids[b] == boundary_ids[c] and same(points[a],points[d]) and same(points[b],points[c]):
+                            continue
+                        if loop == other and (a == c or a == d or b == c or b == d):
+                            if not shared_endpoint_only(points[a],points[b],points[c],points[d],n):
+                                error(invalid,"adjacent trim segments overlap without a canonical seam")
+                            continue
+                        if loop == other and shared_endpoint_only(points[a], points[b], points[c], points[d], n):
+                            continue
+                        if intersects(points[a], points[b], points[c], points[d], n):
+                            error(invalid, "trim loops cross or touch")
+        var expected: f64 = 0.0
+        for loop in 0..<sizes.length:
+            let area = math.abs(loop_area(points, offsets[loop], offsets[loop + 1], n))
+            if area <= epsilon:
+                error(invalid, "trim loop has no area")
+            expected += area if loop == 0 else -area
+            if loop > 0 and not contains(points, offsets[0], offsets[1], points[offsets[loop]], n):
+                error(invalid, "trim hole is outside outer boundary")
+            for other in 1..<loop:
+                if contains(points, offsets[other], offsets[other + 1], points[offsets[loop]], n) or contains(points, offsets[loop], offsets[loop + 1], points[offsets[other]], n):
+                    error(invalid, "nested trim holes are not supported")
+        if expected <= epsilon:
+            error(invalid, "trim domain has no area")
+        let path = try alloc usize[points.length + sizes.length * 2] in memory.heap
+        defer free(path) in memory.heap
+        let distances = try alloc f64[path.length] in memory.heap
+        defer free(distances) in memory.heap
+        let aliases = try alloc usize[points.length] in memory.heap
+        defer free(aliases) in memory.heap
+        for at in 0..<points.length:
+            aliases[at] = at
+            for previous in 0..<at:
+                if same(points[at], points[previous]) and (boundary_ids.length == 0 or boundary_ids[at] == boundary_ids[previous]):
+                    aliases[at] = aliases[previous]
+                    break
+        # Bridge rightmost holes first. A late large hole can otherwise hide all
+        # legal connectors behind an already constructed weakly-simple path.
+        let order = try alloc usize[sizes.length] in memory.heap
+        defer free(order) in memory.heap
+        let extreme = try alloc f64[sizes.length] in memory.heap
+        defer free(extreme) in memory.heap
+        for loop in 0..<sizes.length:
+            order[loop] = loop
+            extreme[loop] = -1e100
+            for at in offsets[loop]..<offsets[loop + 1]:
+                extreme[loop] = math.max(extreme[loop], points[at].x if math.abs(n.x) < 0.9 else points[at].y)
+        for at in 2..<sizes.length:
+            var position = at
+            while position > 1 and extreme[order[position]] > extreme[order[position - 1]]:
+                let previous = order[position - 1]
+                order[position - 1] = order[position]
+                order[position] = previous
+                position -= 1
+        var length = offsets[1]
+        let outer_ccw = loop_area(points, 0, offsets[1], n) > 0.0
+        for at in 0..<length:
+            path[at] = aliases[at if outer_ccw else length - 1 - at]
+        for loop_index in 1..<sizes.length:
+            let loop = order[loop_index]
+            let start = offsets[loop]
+            let count = offsets[loop + 1] - start
+            var best: f64 = 1e100
+            var outer: usize = path.length
+            var hole: usize = 0
+            var rightmost = start
+            for at in start + 1..<start + count:
+                if (points[at].x if math.abs(n.x) < 0.9 else points[at].y) > (points[rightmost].x if math.abs(n.x) < 0.9 else points[rightmost].y):
+                    rightmost = at
+            # One extremal vertex normally suffices. Fall back to the others
+            # when other holes obscure all existing path vertices from it.
+            for attempt in 0..<count:
+                if attempt > 0 and outer != path.length:
+                    break
+                let hi = start + (rightmost - start + attempt) % count
+                for pi in 0..<length:
+                    distances[pi] = points[path[pi]].subtract(points[hi]).length()
+                for candidate in 0..<length:
+                    var pi: usize = length
+                    var nearest: f64 = 1e100
+                    for index in 0..<length:
+                        if distances[index] >= 0.0 and distances[index] < nearest:
+                            pi = index
+                            nearest = distances[index]
+                    if pi == length:
+                        break
+                    distances[pi] = -1.0
+                    let a = points[hi]
+                    let b = points[path[pi]]
+                    let distance = b.subtract(a).length()
+                    if distance >= best:
+                        continue
+                    var clear = true
+                    let previous = points[path[(pi + length - 1) % length]]
+                    let following = points[path[(pi + 1) % length]]
+                    let left = side(previous,b,a,n) >= 0
+                    let right = side(b,following,a,n) >= 0
+                    if not ((left and right) if side(previous,b,following,n) > 0 else (left or right)):
+                        continue
+                    for original in 0..<sizes.length:
+                        let os = offsets[original]
+                        let oe = offsets[original + 1]
+                        for c in os..<oe:
+                            let d = os + (c - os + 1) % (oe - os)
+                            if c == hi or d == hi or c == path[pi] or d == path[pi]:
+                                continue
+                            if intersects(a, b, points[c], points[d], n):
+                                clear = false
+                    for edge in 0..<length:
+                        let c = path[edge]
+                        let d = path[(edge + 1) % length]
+                        if c != path[pi] and d != path[pi] and intersects(a, b, points[c], points[d], n):
+                            clear = false
+                    let middle = a.add(b).multiply_scalar(0.5)
+                    if not contains(points, offsets[0], offsets[1], middle, n):
+                        clear = false
+                    for original in 1..<sizes.length:
+                        if contains(points, offsets[original], offsets[original + 1], middle, n):
+                            clear = false
+                    if clear:
+                        best = distance
+                        outer = pi
+                        hole = hi
+                        break
+            if outer == path.length:
+                error(invalid, "cannot find a visible trim-hole bridge")
+            var at = length
+            while at > outer + 1:
+                at -= 1
+                path[at + count + 2] = path[at]
+            let clockwise = loop_area(points, start, start + count, n) < 0.0
+            for item in 0..<count + 1:
+                let offset = (hole - start + (item if clockwise else count - item % count)) % count
+                path[outer + 1 + item] = aliases[start + offset]
+            path[outer + count + 2] = path[outer]
+            length += count + 2
+        if sizes.length == 1 and boundary_ids.length > 0:
+            let separated = split_slit(points,path[..<length],n,boundary_ids) catch failure:
+                if failure.code != invalid: error(failure.code,failure.message)
+                recover none
+            if let result = separated: return result
+        var mesh = try MeshBuilder(precise = true)
+        defer mesh.close()
+        for point in points:
+            discard(try mesh.point(point))
+        var area: f64 = 0.0
+        var scan: usize = 0
+        var candidates: i64 = 0
+        for at in 0..<length:
+            if eligible(points[path[(at+length-1)%length]],points[path[at]],points[path[(at+1)%length]],n): candidates += 1
+        while length > 3:
+            var clipped = false
+            for step in 0..<length:
+                let at = (scan + step) % length
+                let ai = path[(at + length - 1) % length]
+                let bi = path[at]
+                let ci = path[(at + 1) % length]
+                let a = points[ai]
+                let b = points[bi]
+                let c = points[ci]
+                let turn = orientation(a, b, c, n)
+                if not eligible(a,b,c,n):
+                    continue
+                if length == 4:
+                    let x = points[path[1 if at == 0 else 0]]
+                    let y = points[path[2 if at <= 1 else 1]]
+                    let z = points[path[3 if at <= 2 else 2]]
+                    if not eligible(x,y,z,n): continue
+                # A rounded straight boundary can contain tiny positive turns.
+                # Do not consume the last healthy interior ear and strand all
+                # its sampled constraints in an unconditioned residual strip.
+                # Removing b changes only its two neighboring corners: retain
+                # a necessary next-ear condition in constant work per attempt.
+                # No boundary vertex is removed, snapped, or tolerance-welded.
+                let previous = points[path[(at+length-2)%length]]
+                let following = points[path[(at+2)%length]]
+                let remaining = candidates - 1 - (1 if eligible(previous,a,b,n) else 0) - (1 if eligible(b,c,following,n) else 0) + (1 if eligible(previous,a,c,n) else 0) + (1 if eligible(a,c,following,n) else 0)
+                if remaining == 0:
+                    continue
+                var blocked = false
+                for index in 0..<length:
+                    let id = path[index]
+                    if id == ai or id == bi or id == ci:
+                        continue
+                    let p = points[id]
+                    if inside_triangle(a,b,c,p,n):
+                        blocked = true
+                        break
+                if blocked:
+                    continue
+                try triangle(&mesh, ai, bi, ci)
+                area += turn * 0.5
+                for index in at..<length - 1:
+                    path[index] = path[index + 1]
+                length -= 1
+                candidates = remaining
+                scan = (at+length-1)%length
+                clipped = true
+                break
+            if not clipped:
+                if sizes.length == 1 and (try star_seed(&mesh,points,n,expected,epsilon)):
+                    return try mesh.finish()
+                error(invalid, "trim triangulation stalled; no boundary vertices were discarded")
+        let tail = orientation(points[path[0]], points[path[1]], points[path[2]], n)
+        if not usable(points[path[0]],points[path[1]],points[path[2]],n):
+            error(invalid, "trim triangulation has a degenerate final triangle")
+        try triangle(&mesh, path[0], path[1], path[2])
+        area += tail * 0.5
+        if math.abs(area - expected) > math.max(epsilon * 10.0, expected * 0.00000001):
+            error(invalid, "trim triangulation did not preserve the domain area")
+        return try mesh.finish()
+
+# Close a retraced slit with a visible interior diagonal before ear clipping.
+# Each side then owns one use of the authored seam. This prevents a greedy
+# ear path from leaving a roundoff-width spike along a sampled interior slit.
+# Only canonical aliases can create a tip; accidental overlaps were rejected
+# above. Every recursive child has fewer tips, with at most 32 in any input.
+func split_slit(points: const Vector3[], path: const usize[], n: Vector3, ids: const i64[]) -> interop.Reference[Mesh]?!:
+    var tips: usize = 0
+    var tip: usize = 0
+    for at in 0..<path.length:
+        if path[(at+path.length-1)%path.length] == path[(at+1)%path.length]:
+            if tips == 0: tip = at
+            tips += 1
+    if tips == 0: return none
+    if tips > 32: error(invalid,"trim exceeds 32 retraced seam tips")
+    let a = points[path[tip]]
+    let previous = points[path[(tip+path.length-1)%path.length]]
+    var selected: usize = path.length
+    var best: f64 = 1e100
+    for at in 0..<path.length:
+        let b = points[path[at]]
+        let delta = b.subtract(a)
+        let squared = delta.dot(delta)
+        if squared >= best or same(a,b) or same(previous,b): continue
+        let pa = previous.subtract(a)
+        if math.abs(pa.cross(delta).dot(n)) <= math.max(1e-30,math.max(pa.dot(pa),squared)*1e-12): continue
+        var clear = true
+        for edge in 0..<path.length:
+            let c = points[path[edge]]
+            let d = points[path[(edge+1)%path.length]]
+            if shared_endpoint_only(a,b,c,d,n): continue
+            if intersects(a,b,c,d,n):
+                clear = false
+                break
+        if not clear: continue
+        var inside = false
+        let middle = a.add(b).multiply_scalar(0.5)
+        for edge in 0..<path.length:
+            if ray_crosses(points[path[edge]],points[path[(edge+1)%path.length]],middle,n): inside = not inside
+        if not inside: continue
+        let first = (at+path.length-tip)%path.length+1
+        let second = path.length-first+2
+        if first < 3 or second < 3: continue
+        if path_area(points,path,tip,first,n) <= 0.0 or path_area(points,path,at,second,n) <= 0.0: continue
+        selected = at
+        best = squared
+    if selected == path.length: return none
+    var mesh = try MeshBuilder(precise = true)
+    defer mesh.close()
+    for p in points: discard(try mesh.point(p))
+    let count = (selected+path.length-tip)%path.length+1
+    try slit_part(&mesh,points,path,ids,tip,count,n)
+    try slit_part(&mesh,points,path,ids,selected,path.length-count+2,n)
+    return try mesh.finish()
+
+func path_area(points: const Vector3[], path: const usize[], start: usize, count: usize, n: Vector3) -> f64:
+    let origin = points[path[start]]
+    var area: f64 = 0.0
+    for at in 1..<count-1:
+        area += orientation(origin,points[path[(start+at)%path.length]],points[path[(start+at+1)%path.length]],n)*0.5
+    return area
+
+func slit_part(mesh: MeshBuilder*, points: const Vector3[], path: const usize[], ids: const i64[], start: usize, count: usize, n: Vector3) -> !:
+    let vertices = try alloc Vector3[count] in memory.heap
+    defer free(vertices) in memory.heap
+    let identities = try alloc i64[count] in memory.heap
+    defer free(identities) in memory.heap
+    for at in 0..<count:
+        let index = path[(start+at)%path.length]
+        vertices[at] = points[index]
+        identities[at] = ids[index]
+    let part = try TrimPolygon.triangulate_seams(vertices,[(i64)count],n,identities)
+    defer part.release()
+    let input = part.value()
+    let mapped = try alloc i64[(usize)input.point_count()] in memory.heap
+    defer free(mapped) in memory.heap
+    for at in 0..<mapped.length:
+        mapped[at] = (i64)path[(start+at)%path.length] if at < count else (try mesh.point(try input.point((i64)at)))
+    for face in 0..<input.face_count():
+        try mesh.face(3)
+        for corner in 0..<3: try mesh.corner(mapped[(usize)(try input.face_point(face,corner))])
+
+func triangle(mesh: MeshBuilder*, a: usize, b: usize, c: usize) -> !:
+    try mesh.face(3)
+    try mesh.corner((i64)a)
+    try mesh.corner((i64)b)
+    try mesh.corner((i64)c)
+
+func orientation(a: Vector3, b: Vector3, c: Vector3, n: Vector3) -> f64:
+    return b.subtract(a).cross(c.subtract(a)).dot(n)
+
+# A positive topological ear can still be numerically unusable as a display
+# triangle. Prefer another legal diagonal, using that triangle's own extent
+# (not the whole trim domain) and the polygon engine's conditioning contract.
+func usable(a: Vector3, b: Vector3, c: Vector3, n: Vector3) -> bool:
+    let ab = b.subtract(a)
+    let ac = c.subtract(a)
+    return ab.cross(ac).dot(n) > math.max(1e-30,math.max(ab.dot(ab),ac.dot(ac))*1e-14)
+
+func eligible(a: Vector3, b: Vector3, c: Vector3, n: Vector3) -> bool:
+    return side(a,b,c,n) > 0 and usable(a,b,c,n)
+
+# A nearly straight sampled boundary may admit no usable ear-only path even
+# though a well-conditioned triangulation with an interior vertex exists. For
+# one loop only, try its area centroid as a kernel point. Every original edge
+# must see it with a positive, conditioned wedge; otherwise leave the failure
+# explicit. This is only a seed: lattice insertion, flips and pairing still
+# follow in quadrangulate. Never use this construction on a polygon with holes.
+func star_seed(mesh: MeshBuilder*, points: const Vector3[], n: Vector3, expected: f64, epsilon: f64) -> bool!:
+    let origin = points[0]
+    var centroid = Vector3()
+    var total: f64 = 0.0
+    for at in 0..<points.length:
+        let a = points[at].subtract(origin)
+        let b = points[(at+1)%points.length].subtract(origin)
+        let weight = a.cross(b).dot(n)
+        centroid = centroid.add(a.add(b).multiply_scalar(weight))
+        total += weight
+    if total == 0.0: return false
+    let center = origin.add(centroid.multiply_scalar(1.0/(3.0*total)))
+    if not center.is_finite(): return false
+    var area: f64 = 0.0
+    for at in 0..<points.length:
+        let ai = at if total > 0.0 else points.length-1-at
+        let bi = (at+1)%points.length if total > 0.0 else (points.length+points.length-2-at)%points.length
+        let a = points[ai]
+        let b = points[bi]
+        if not eligible(a,b,center,n): return false
+        area += orientation(a,b,center,n)*0.5
+    if math.abs(area-expected) > math.max(epsilon*10.0,expected*1e-8): return false
+    mesh.nf = 0
+    mesh.nc = 0
+    let middle = try mesh.point(center)
+    for at in 0..<points.length:
+        let a = at if total > 0.0 else points.length-1-at
+        let b = (at+1)%points.length if total > 0.0 else (points.length+points.length-2-at)%points.length
+        try triangle(mesh,a,b,(usize)middle)
+    return true
+
+func same(a: Vector3, b: Vector3) -> bool:
+    return a.x == b.x and a.y == b.y and a.z == b.z
+
+func shared_endpoint_only(a: Vector3, b: Vector3, c: Vector3, d: Vector3, n: Vector3) -> bool:
+    if same(a, c):
+        return side(a,b,d,n) != 0 or b.subtract(a).dot(d.subtract(a)) <= 0.0
+    if same(a, d):
+        return side(a,b,c,n) != 0 or b.subtract(a).dot(c.subtract(a)) <= 0.0
+    if same(b, c):
+        return side(b,a,d,n) != 0 or a.subtract(b).dot(d.subtract(b)) <= 0.0
+    if same(b, d):
+        return side(b,a,c,n) != 0 or a.subtract(b).dot(c.subtract(b)) <= 0.0
+    return false
+
+func loop_area(points: const Vector3[], start: usize, end: usize, n: Vector3) -> f64:
+    var sum: f64 = 0.0
+    for at in start..<end:
+        sum += orientation(points[start], points[at], points[start + (at - start + 1) % (end - start)], n) * 0.5
+    return sum
+
+func contains(points: const Vector3[], start: usize, end: usize, point: Vector3, n: Vector3) -> bool:
+    var inside = false
+    for at in start..<end:
+        let a = points[at]
+        let b = points[start + (at - start + 1) % (end - start)]
+        if ray_crosses(a,b,point,n):
+            inside = not inside
+    return inside

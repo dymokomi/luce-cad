@@ -1,0 +1,78 @@
+## Aspect-oriented extrusion refinement preserves inherited phases and skips
+## optional work atomically when the axis or total grid budget cannot fit it.
+import luce_std.math
+from luce_geocore.geocore import Vector3, invalid
+from brep_types import Surface
+from layout_types import Stations
+from layout_pitch import refine_pitch, accept_pitch_row
+from mapped_patch import point
+
+pub func layout_pitch_contract() -> !:
+    for scale in [0.001,1.0,1000.0]:
+        var rows = Stations()
+        try rows.open(8)
+        defer rows.close()
+        for value in [0.0,scale,2.0*scale]: discard(try rows.insert(value,scale*1e-12))
+        for t in [0.01,0.399,0.4,0.5,0.6,0.601,0.99]:
+            let expected = t >= 0.4 and t <= 0.6
+            for value in [t*scale,(2.0-t)*scale]:
+                if accept_pitch_row(rows,value,scale*1e-12) != expected: error(invalid,"pitch phase ownership differs under parameter reversal")
+    for scale in [0.001,1.0,1000.0]:
+        for swapped in [false,true]:
+            for reverse in [false,true]:
+                for variant in 0..<5: try pitch(scale,swapped,reverse,variant)
+
+func pitch(scale: f64, swapped: bool, reverse: bool, variant: i64) -> !:
+    var points = [Vector3(),Vector3(),Vector3(),Vector3(),Vector3(),Vector3()]
+    var weights = [1.0,1.0,1.0,1.0,1.0,1.0]
+    let length = 1e12 if variant == 3 else (8.0 if variant == 4 else 20.0)
+    for u in 0..<(usize)3:
+        for v in 0..<(usize)2:
+            let at = v*3+u if swapped else u*2+v
+            points[at] = Vector3((f64)u*0.5,length*(f64)(1-v if reverse else v),0.3 if u == 1 else 0.0).multiply_scalar(scale)
+            weights[at] = 0.7 if u == 1 else 1.0
+            if variant == 1 and u == 1 and v == 1: points[at].z += 0.1*scale
+    let linear = [0.0,0.0,1.0,1.0]
+    let quadratic = [0.0,0.0,0.0,1.0,1.0,1.0]
+    let s = try Surface(3,Vector3(),Vector3(),Vector3(),0.0,0.0,points,weights,
+        linear[..<4] if swapped else quadratic[..<6],quadratic[..<6] if swapped else linear[..<4],
+        2 if swapped else 3,3 if swapped else 2,1 if swapped else 2,2 if swapped else 1)
+    defer s.close()
+    var u = Stations()
+    var v = Stations()
+    try u.open(4 if variant == 2 and swapped else 1025)
+    defer u.close()
+    try v.open(4 if variant == 2 and not swapped else 1025)
+    defer v.close()
+    let along = &u if swapped else &v
+    let across = &v if swapped else &u
+    let cross_count: usize = 1025 if variant == 4 else 9
+    for row in 0..<cross_count: discard(try across.insert((f64)row/(f64)(cross_count-1),1e-12))
+    for value in [0.1,0.3,0.7,0.9]: discard(try along.insert(value,1e-12))
+    along.separation = 0.1
+    let changed = try refine_pitch(&u,&v,s,1e-12)
+    if changed[0 if swapped else 1] != (variant == 0) or changed[1 if swapped else 0]: error(invalid,"pitch ownership did not match actual optional refinement")
+    if across.count != cross_count or along.separation != 0.1: error(invalid,"pitch refinement changed the curved station family or row spacing policy")
+    for row in 0..<cross_count:
+        if across.values[row] != (f64)row/(f64)(cross_count-1): error(invalid,"pitch refinement relocated a curved row")
+    for value in [0.1,0.3,0.7,0.9]:
+        var found = false
+        for row in along.values[..<along.count]: found = found or row == value
+        if not found: error(invalid,"pitch refinement moved an inherited station")
+    if variant != 0:
+        if along.count != 4: error(invalid,"unsupported or over-budget pitch refinement was not atomic")
+        return
+    if along.count <= 4: error(invalid,"long affine extrusion cells were not refined")
+    var transverse: f64 = 0.0
+    for at in 0..<across.count-1:
+        let a = try sample(s,swapped,0.5,across.values[at])
+        let b = try sample(s,swapped,0.5,across.values[at+1])
+        transverse += b.subtract(a).length()
+    let target = transverse/(f64)(across.count-1)*16.0
+    for at in 0..<along.count-1:
+        let a = try sample(s,swapped,along.values[at],0.5)
+        let b = try sample(s,swapped,along.values[at+1],0.5)
+        if b.subtract(a).length() > target*(1.0+1e-12): error(invalid,"extrusion pitch still exceeds mean transverse aspect target")
+
+func sample(s: Surface, swapped: bool, along: f64, across: f64) -> Vector3!:
+    return try point(s,Vector3(along,across,0.0) if swapped else Vector3(across,along,0.0))

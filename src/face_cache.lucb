@@ -1,0 +1,322 @@
+## The per-face tessellation cache. A face's mesh is a function of its
+## support surface, the curves of its edge uses, the shared boundary points
+## it sits on (its edges' samples and its frozen interior-row points), its
+## layout plan and the tessellation parameters. Each face job's result is
+## kept as a piece whose corners name those boundary points by their place
+## in the face's boundary table, not by global point id, so the piece stays
+## valid when unrelated edges gain or lose samples and every id after them
+## shifts. The key hashes all the inputs (boundary points by position, and
+## by which table entries share a point and how their ids rank), so a hit
+## rebuilds exactly what a fresh face job would.
+import memory
+import luce_std.math
+import sync
+from luce_geocore.geocore import Vector3
+from luce_geocore.core.growing import Growing
+from brep_types import Curve, Surface, BrepFace, Samples
+from layout_types import GridLayout, Stations
+
+## A 64-bit running hash of numbers.
+pub struct Hasher:
+    var value: u64 = 0x9E3779B97F4A7C15
+
+    pub mutating func mix(input: u64):
+        var h = (self.value ^ input) *% 0x100000001B3
+        h = h ^ (h >> 29)
+        self.value = h *% 0xBF58476D1CE4E5B9
+
+    ## The value's bits (-0 and +0 alike).
+    pub mutating func number(input: f64):
+        var value = input + 0.0
+        self.mix(u64[]((u64*)&value, 1)[0])
+
+    pub mutating func integer(input: i64):
+        self.mix((u64)input)
+
+    pub mutating func point(input: Vector3):
+        self.number(input.x)
+        self.number(input.y)
+        self.number(input.z)
+
+## One face's cached tessellation. Corners >= 0 are the piece's own points;
+## corners < 0 are boundary-table entries, -(entry + 1). Shared by count.
+pub struct Piece:
+    var users: @usize
+    pub var key: u64
+    pub var points: Vector3[]
+    pub var sizes: i64[]
+    pub var corners: i64[]
+    pub var display: i64[]
+    pub var normals: f64[]
+    ## What the face job recorded in its plan: strategy and grid use.
+    pub var method: i64
+    pub var applied: bool
+
+pub func release_piece(piece: Piece*):
+    if piece.users.sub(1, .acq_rel) != 1: return
+    if piece.points.length > 0: free(piece.points) in memory.heap
+    if piece.sizes.length > 0: free(piece.sizes) in memory.heap
+    if piece.corners.length > 0: free(piece.corners) in memory.heap
+    if piece.display.length > 0: free(piece.display) in memory.heap
+    if piece.normals.length > 0: free(piece.normals) in memory.heap
+    free(piece) in memory.heap
+
+## A new piece holding these arrays (moved in), with one user.
+pub func new_piece(key: u64, points: Vector3[], sizes: i64[], corners: i64[], display: i64[], normals: f64[], method: i64, applied: bool) -> Piece*!:
+    let storage = try alloc Piece[1] in memory.heap
+    let piece = &storage[0]
+    piece.users.store(1, .relaxed)
+    piece.key = key
+    piece.points = points
+    piece.sizes = sizes
+    piece.corners = corners
+    piece.display = display
+    piece.normals = normals
+    piece.method = method
+    piece.applied = applied
+    return piece
+
+## Pieces by face, one model's. Faces keep their slot while their key holds.
+pub struct FaceCache:
+    var lock: sync.Mutex
+    var pieces: Growing[Piece*?]
+    var hits: usize = 0
+
+    pub func init():
+        self.lock = sync.Mutex()
+        self.pieces = Growing[Piece*?]()
+        self.hits = 0
+
+    ## The piece of `face` when its key is `key`, shared; else none.
+    pub mutating func find(face: usize, key: u64) -> Piece*?:
+        self.lock.lock()
+        defer self.lock.unlock()
+        if face >= self.pieces.count: return none
+        let piece = self.pieces.items[face] else return none
+        if piece.key != key: return none
+        discard(piece.users.add(1, .relaxed))
+        self.hits += 1
+        return piece
+
+    ## Keep `piece` for `face` (its share moves in), replacing another.
+    pub mutating func put(face: usize, piece: Piece*) -> !:
+        self.lock.lock()
+        defer self.lock.unlock()
+        if face >= self.pieces.count:
+            let old = self.pieces.count
+            try self.pieces.reserve(face + 1)
+            for at in old..<face + 1: self.pieces.items[at] = none
+            self.pieces.count = face + 1
+        if let previous = self.pieces.items[face]: release_piece(previous)
+        self.pieces.items[face] = piece
+
+    ## Faces answered from the cache since the last call.
+    pub mutating func take_hits() -> usize:
+        self.lock.lock()
+        defer self.lock.unlock()
+        let hits = self.hits
+        self.hits = 0
+        return hits
+
+    pub mutating func close():
+        for piece in self.pieces.view():
+            if let held = piece: release_piece(held)
+        self.pieces.close()
+
+## A copy of `source`'s pieces for a model derived from it (its faces in the
+## same order): every piece shared.
+pub func inherited(source: FaceCache*) -> FaceCache*!:
+    let copy = try new FaceCache() in memory.heap
+    errdefer:
+        copy.close()
+        free(copy) in memory.heap
+    source.lock.lock()
+    defer source.lock.unlock()
+    try copy.pieces.reserve(source.pieces.count)
+    for piece in source.pieces.view():
+        if let held = piece: discard(held.users.add(1, .relaxed))
+        copy.pieces.items[copy.pieces.count] = piece
+        copy.pieces.count += 1
+    return copy
+
+pub func dispose_cache(cache: FaceCache*):
+    cache.close()
+    free(cache) in memory.heap
+
+## Every face's boundary table: its edge uses' samples in order, then its
+## interior-row points, as global point ids (`ids`, face f's entries from
+## `starts[f]`); `sorted` holds each table's (id, entry) pairs by id.
+pub struct Tables:
+    pub var ids: Growing[i64]
+    pub var starts: Growing[u32]
+    pub var sorted: Growing[i64]
+
+    pub func init():
+        self.ids = Growing[i64]()
+        self.starts = Growing[u32]()
+        self.sorted = Growing[i64]()
+
+    pub func of(face: usize) -> const i64[]:
+        return self.ids.items[(usize)self.starts.items[face]..<(usize)self.starts.items[face + 1]]
+
+    ## The entry of global point `id` in `face`'s table, or -1.
+    pub func entry(face: usize, id: i64) -> i64:
+        let first = (usize)self.starts.items[face]
+        var low = first
+        var high = (usize)self.starts.items[face + 1]
+        while low < high:
+            let middle = (low + high) // 2
+            if self.sorted.items[middle] >> 20 < id: low = middle + 1
+            else: high = middle
+        if low < (usize)self.starts.items[face + 1] and self.sorted.items[low] >> 20 == id: return self.sorted.items[low] & 0xFFFFF
+        return -1
+
+    pub mutating func close():
+        self.ids.close()
+        self.starts.close()
+        self.sorted.close()
+
+## The tables of every face.
+pub func face_tables(faces: const BrepFace[], samples: const Samples[], plans: const GridLayout[], tables: Tables*) -> !:
+    try tables.starts.push(0)
+    for index in 0..<faces.length:
+        let first = tables.ids.count
+        for use in faces[index].uses:
+            let edge = (usize)(use - 1 if use > 0 else -use - 1)
+            for id in samples[edge].ids: try tables.ids.push(id)
+        for row in plans[index].row_ids:
+            for id in row.values: try tables.ids.push(id)
+        let count = tables.ids.count - first
+        if count >= 0xFFFFF: error(memory.exhausted, "a CAD face's boundary table is too large to cache")
+        for entry in 0..<count: try tables.sorted.push((tables.ids.items[first + entry] << 20) | (i64)entry)
+        sort_range(tables.sorted.items[first..<first + count])
+        try tables.starts.push((u32)tables.ids.count)
+
+## Ascending order of a short range (insertion sort for small ones).
+func sort_range(values: i64[]):
+    if values.length < 2: return
+    if values.length <= 32:
+        for at in 1..<values.length:
+            let value = values[at]
+            var place = at
+            while place > 0 and values[place - 1] > value:
+                values[place] = values[place - 1]
+                place -= 1
+            values[place] = value
+        return
+    # Heap sort: in place, no allocation.
+    var end = values.length
+    var start = values.length // 2
+    while start > 0:
+        start -= 1
+        sift(values, start, end)
+    while end > 1:
+        end -= 1
+        let top = values[0]
+        values[0] = values[end]
+        values[end] = top
+        sift(values, 0, end)
+
+func sift(values: i64[], first: usize, end: usize):
+    var root = first
+    while root * 2 + 1 < end:
+        var child = root * 2 + 1
+        if child + 1 < end and values[child] < values[child + 1]: child += 1
+        if values[root] >= values[child]: return
+        let swap = values[root]
+        values[root] = values[child]
+        values[child] = swap
+        root = child
+
+## The key of face `index`: every input its face job reads.
+pub func face_key(index: usize, faces: const BrepFace[], surfaces: const Surface[], edges: const Curve[], samples: const Samples[], plans: const GridLayout[], points: const Vector3[], tables: const Tables*, divisions: i64, tolerance: f64, edge_size: f64) -> u64:
+    var h = Hasher()
+    h.integer(divisions)
+    h.number(tolerance)
+    h.number(edge_size)
+    let face = faces[index]
+    h.integer(1 if face.sense else 0)
+    for size in face.sizes: h.integer(size)
+    hash_surface(&h, surfaces[(usize)face.surface])
+    for use in face.uses:
+        h.integer(1 if use > 0 else -1)
+        let edge = (usize)(use - 1 if use > 0 else -use - 1)
+        hash_curve(&h, edges[edge])
+        # Baseline samples by their table entries.
+        for id in samples[edge].baseline: h.integer(tables.entry(index, id))
+    # Boundary points: position, first entry naming the same point, and the
+    # rank of their ids (a renumbering that keeps the order keeps the key).
+    let table = tables.of(index)
+    for entry in 0..<table.length:
+        let id = table[entry]
+        h.point(points[(usize)id])
+        h.integer(tables.entry(index, id))
+    let first = (usize)tables.starts.items[index]
+    for at in first..<(usize)tables.starts.items[index + 1]: h.integer(tables.sorted.items[at] & 0xFFFFF)
+    hash_plan(&h, plans[index], tables, index)
+    return h.value
+
+func hash_surface(h: Hasher*, surface: Surface):
+    h.integer(surface.kind)
+    h.integer(1 if surface.edited else 0)
+    h.point(surface.origin)
+    h.point(surface.x)
+    h.point(surface.z)
+    h.number(surface.radius)
+    h.number(surface.angle)
+    h.integer(surface.nu)
+    h.integer(surface.nv)
+    h.integer(surface.du)
+    h.integer(surface.dv)
+    for point in surface.points: h.point(point)
+    for weight in surface.weights: h.number(weight)
+    for knot in surface.ku: h.number(knot)
+    for knot in surface.kv: h.number(knot)
+
+func hash_curve(h: Hasher*, curve: Curve):
+    h.integer(curve.kind)
+    h.point(curve.origin)
+    h.point(curve.x)
+    h.point(curve.y)
+    h.number(curve.radius)
+    h.integer(curve.degree)
+    h.integer(1 if curve.sense else 0)
+    h.number(curve.angle)
+    h.number(curve.sweep)
+    for point in curve.points: h.point(point)
+    for weight in curve.weights: h.number(weight)
+    for knot in curve.knots: h.number(knot)
+
+func hash_stations(h: Hasher*, stations: Stations):
+    h.integer((i64)stations.count)
+    h.number(stations.epsilon)
+    h.number(stations.separation)
+    h.integer((i64)stations.baseline)
+    h.integer((i64)stations.limit)
+    for value in stations.values[..<stations.count]: h.number(value)
+
+## The plan as the face job reads it (its own rows' points by table entry).
+func hash_plan(h: Hasher*, plan: GridLayout, tables: const Tables*, face: usize):
+    h.integer(1 if plan.valid else 0)
+    h.integer(1 if plan.cut_first else 0)
+    h.number(plan.epsilon)
+    h.point(plan.trim_low)
+    h.point(plan.trim_high)
+    h.integer(1 if plan.independent_phase else 0)
+    h.integer(1 if plan.pitch_axes[0] else 0)
+    h.integer(1 if plan.pitch_axes[1] else 0)
+    hash_stations(h, plan.u)
+    hash_stations(h, plan.v)
+    h.integer((i64)plan.rows.length)
+    for row in plan.rows: hash_stations(h, row)
+    for row in plan.row_ids:
+        h.integer((i64)row.values.length)
+        for id in row.values: h.integer(tables.entry(face, id))
+    for flow in plan.flow: h.integer(1 if flow else 0)
+    for applied in plan.applied: h.integer(1 if applied else 0)
+    for method in plan.method: h.integer(method)
+    h.integer((i64)plan.seen)
+    for chain in plan.chains:
+        h.integer((i64)chain.points.length)
+        for point in chain.points: h.point(point)
+        for time in chain.times: h.number(time)

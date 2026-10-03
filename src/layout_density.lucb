@@ -1,0 +1,88 @@
+## Directional grid support from physical-space chord error, not uniform UV size.
+import luce_std.math
+from luce_geocore.geocore import Vector3, invalid
+from brep_types import Surface
+from mapped_patch import point
+from layout_types import Stations
+
+func position(s: Surface, low: Vector3, high: Vector3, t: f64, other: f64, axis: usize) -> Vector3!:
+    return try point(s,Vector3(low.x+(high.x-low.x)*(t if axis == 0 else other),low.y+(high.y-low.y)*(other if axis == 0 else t),0.0))
+
+## Preserve inherited seam phase; only fill gaps that exceed required spacing.
+pub func fill(stations: Stations*, required: usize, epsilon: f64) -> !:
+    let low = stations.values[0]
+    let high = stations.values[stations.count-1]
+    let spacing = (high-low)/(f64)required
+    var at: usize = 0
+    while at+1 < stations.count:
+        let a = stations.values[at]
+        let b = stations.values[at+1]
+        let count = (usize)math.max(1.0,math.ceil((b-a)/spacing-1e-6))
+        for step in 1..<count: discard(try stations.insert(a+(b-a)*(f64)step/(f64)count,epsilon))
+        at += count
+
+## Endpoint-only smooth joins impose no interior phase. A long planar strip
+## may use physical pitch unless a rail actually contributed interior stations.
+## Compact domains retain their existing initial resolution policy. Returns
+## whether the chart owns an independent phase for later flow admission.
+pub func fill_plane(u: Stations*, v: Stations*, trim_low: Vector3, trim_high: Vector3, required: usize, epsilon: f64) -> bool!:
+    let x = u.values[u.count-1]-u.values[0]
+    let y = v.values[v.count-1]-v.values[0]
+    let longest = math.max(x,y)
+    let independent = longest > 4.0*math.min(x,y) and not interior(*u,trim_low.x,trim_high.x,epsilon) and not interior(*v,trim_low.y,trim_high.y,epsilon)
+    let nu = (usize)math.max(1.0,math.ceil((f64)required*x/longest)) if independent else required
+    let nv = (usize)math.max(1.0,math.ceil((f64)required*y/longest)) if independent else required
+    try fill(u,nu,epsilon)
+    try fill(v,nv,epsilon)
+    return independent
+
+func interior(stations: Stations, low: f64, high: f64, epsilon: f64) -> bool:
+    for value in stations.values[..<stations.count]:
+        if value > low+epsilon and value < high-epsilon: return true
+    return false
+
+## Insert complete rows only where directional deviation needs them. This
+## resolves narrow knot spans without doubling an entire patch's resolution.
+pub func refine_axis(stations: Stations*, s: Surface, low: Vector3, high: Vector3, axis: usize, divisions: i64, tolerance: f64, edge_size: f64, epsilon: f64) -> !:
+    var at: usize = 0
+    let start = low.x if axis == 0 else low.y
+    let span = (high.x-low.x) if axis == 0 else (high.y-low.y)
+    var targets: f64[5]
+    for cross in 0..<(usize)5:
+        let other = (f64)cross/4.0
+        let first = try position(s,low,high,0.0,other,axis)
+        let last = try position(s,low,high,1.0,other,axis)
+        var extent = last.subtract(first).length()
+        # Endpoint chords understate the scale of closed AND nearly closed
+        # isocurves (including analytic charts with exterior guard cells).
+        # Use sampled extent before refining against the deflection budget.
+        for sample in 1..<8:
+            extent = math.max(extent,(try position(s,low,high,(f64)sample/8.0,other,axis)).subtract(first).length())
+        targets[cross] = math.max(tolerance*0.5,extent/((f64)divisions*(f64)divisions*32.0))
+    while at+1 < stations.count:
+        let a = stations.values[at]
+        let b = stations.values[at+1]
+        var accepted = true
+        for cross in 0..<(usize)5:
+            let other = (f64)cross/4.0
+            let pa = try position(s,low,high,(a-start)/span,other,axis)
+            let pb = try position(s,low,high,(b-start)/span,other,axis)
+            let delta = pb.subtract(pa)
+            if edge_size > 0.0 and delta.length() > edge_size: accepted = false
+            for sample in 1..<(usize)4:
+                let t = (a+(b-a)*(f64)sample/4.0-start)/span
+                let p = try position(s,low,high,t,other,axis)
+                let projection = math.clamp(p.subtract(pa).dot(delta)/delta.dot(delta),0.0,1.0) if delta.dot(delta) > 1e-30 else 0.0
+                if p.subtract(pa.add(delta.multiply_scalar(projection))).length() > targets[cross]: accepted = false
+            if not accepted: break
+        if accepted:
+            at += 1
+            continue
+        # Curvature is a hard requirement: bypass optional row-phase spacing.
+        let separation = stations.separation
+        stations.separation = 0.0
+        let added = stations.insert((a+b)*0.5,epsilon) catch failure:
+            stations.separation = separation
+            error(failure.code,failure.message)
+        stations.separation = separation
+        if not added: error(invalid,"curvature cannot be resolved within parameter precision")

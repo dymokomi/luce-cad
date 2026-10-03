@@ -1,0 +1,43 @@
+## Errors from parallel per-face loops, kept per face and raised in face order,
+## so the reported failure never depends on worker scheduling. Messages are
+## copied into packets because a worker's error text dies with its context.
+import memory
+import interop
+import ownership
+from luce_geocore.geocore import invalid
+
+struct Failure:
+    var code: ErrorCode
+    var message: interop.Packet[str]? = none
+
+pub struct FaceErrors:
+    var failures: Failure[]
+
+    pub func init(count: usize) -> !:
+        let failures = try alloc Failure[count] in memory.heap
+        for at in 0..<count: failures[at] = Failure(invalid)
+        self.failures = failures
+
+    ## Keep face `index`'s error. Each face has one writer, so no lock is needed.
+    pub func record(index: usize, code: ErrorCode, message: str):
+        let copied = interop.text_transfer.copy(message) catch exhausted: trap(exhausted.message)
+        self.failures[index] = Failure(code, copied)
+
+    pub func failed(index: usize) -> bool:
+        if let message = self.failures[index].message:
+            discard(message)
+            return true
+        return false
+
+    ## Raise the first recorded error in face order, if any.
+    pub func raise() -> !:
+        for failure in self.failures:
+            if let message = failure.message:
+                let owned = try interop.copy_text(message.value)
+                if let owner = owned.owner: discard(ownership.pool_object(owner))
+                error(failure.code, owned.value)
+
+    pub func close():
+        for failure in self.failures:
+            if let message = failure.message: message.release()
+        free(self.failures) in memory.heap

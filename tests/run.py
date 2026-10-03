@@ -29,7 +29,7 @@ def main():
             for contract in CONTRACTS:
                 print(f"TEST {contract} {backend}", flush=True)
                 binary = Path(temporary) / contract
-                subprocess.run([str(base), "build", str(ROOT / f"src/luce_cad/tests/{contract}.lucb"), *flags, "-o", str(binary)],
+                subprocess.run([str(base), "build", str(ROOT / f"src/tests/{contract}.lucb"), *flags, "-o", str(binary)],
                                check=True, env=env, timeout=600)
                 subprocess.run([str(binary)], check=True, timeout=120)
             print(f"TEST regressions {backend}", flush=True)
