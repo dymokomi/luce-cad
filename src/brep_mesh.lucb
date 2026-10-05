@@ -22,6 +22,7 @@ from luce_geocore.geocore import Vector3, Mesh, MeshBuilder, invalid
 from brep_types import Curve, Surface, BrepFace, Samples
 from face_cache import FaceCache
 from luce_geocore.kernel import TableBuilder, Domain, text_attribute
+from strings import format
 
 ## Plan shared boundaries, run independent face jobs, and assemble provenance.
 ## A face no mesher can follow is left out and named in the result
@@ -31,28 +32,28 @@ from luce_geocore.kernel import TableBuilder, Domain, text_attribute
 pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]? = none, selected: i64 = -1, curvature: bool = false, directions: bool = false, cache: FaceCache*? = none) -> interop.Reference[Mesh]!:
     if divisions < 1 or divisions > 64 or faces.length == 0:
         error(invalid, "B-rep tessellation requires faces and 1..64 divisions")
-    if selected < -1 or selected >= (i64)faces.length: error(invalid,"CAD face index out of range")
+    if selected < -1 or selected >= (i64)faces.length: error(invalid, "CAD face index out of range")
     var mesh = try MeshBuilder(precise = true)
     defer mesh.close()
     for point in vertices:
-        discard(try mesh.point(point))
-    let samples = try alloc Samples[edges.length] in memory.heap
+        _ = try mesh.point(point)
+    let samples = try new Samples[edges.length] --- in memory.heap
     defer free(samples) in memory.heap
     var allocated: usize = 0
     defer release_samples(samples[..<allocated])
-    let counts = try alloc usize[edges.length] in memory.heap
+    let counts = try new usize[edges.length] --- in memory.heap
     defer free(counts) in memory.heap
-    let cuts = try alloc Stations[edges.length] in memory.heap
+    let cuts = try new Stations[edges.length] --- in memory.heap
     defer free(cuts) in memory.heap
     for at in 0..<cuts.length: cuts[at] = Stations()
     defer close_cuts(cuts)
-    let plans = try alloc GridLayout[faces.length] in memory.heap
+    let plans = try new GridLayout[faces.length] --- in memory.heap
     defer free(plans) in memory.heap
     for at in 0..<plans.length: plans[at] = GridLayout()
     defer close_plans(plans)
     let metrics = try spacing.measure(edges)
     defer spacing.close(metrics)
-    let compact = try compact_seams(faces,edges.length)
+    let compact = try compact_seams(faces, edges.length)
     defer free(compact) in memory.heap
     # Each edge's interval count on its own (in parallel); a failing edge is
     # counted again here, so its error is the serial one.
@@ -60,39 +61,39 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     parallel.parallel_for(edges.length, 64, count_edges, (void*)&counting)
     if counting.failed.load(.acquire) != 0:
         for index in 0..<edges.length: counts[index] = try edge_count(edges[index], &metrics[index], compact[index], divisions, tolerance, edge_size)
-    let sides = try alloc PatchSides[faces.length] in memory.heap
+    let sides = try new PatchSides[faces.length] --- in memory.heap
     defer free(sides) in memory.heap
     for at in 0..<faces.length:
         sides[at] = patch_sides(faces[at], surfaces[(usize)faces[at].surface], edges, tolerance) catch failure:
             if failure.code != invalid: error(failure.code, failure.message)
             recover PatchSides()
-    let seams = try classify(edges,surfaces,faces,plans,tolerance)
+    let seams = try classify(edges, surfaces, faces, plans, tolerance)
     defer free(seams) in memory.heap
-    try initialize(edges,surfaces,faces,sides,counts,seams,metrics,plans,divisions,tolerance)
-    discard(try cut_impossible(faces,surfaces,sides,plans,edges.length))
-    try equalize_counts(edges,faces,sides,metrics,plans,counts)
-    let baseline_cuts = try alloc Stations[edges.length] in memory.heap
+    try initialize(edges, surfaces, faces, sides, counts, seams, metrics, plans, divisions, tolerance)
+    _ = try cut_impossible(faces, surfaces, sides, plans, edges.length)
+    try equalize_counts(edges, faces, sides, metrics, plans, counts)
+    let baseline_cuts = try new Stations[edges.length] --- in memory.heap
     defer free(baseline_cuts) in memory.heap
     for at in 0..<baseline_cuts.length: baseline_cuts[at] = Stations()
     defer close_cuts(baseline_cuts)
     for at in 0..<edges.length:
         try baseline_cuts[at].open(1025)
-        for step in 0..<counts[at]+1: discard(try baseline_cuts[at].insert(metrics[at].station((f64)step/(f64)counts[at]),1e-12))
-    try regularize(edges,surfaces,faces,sides,plans,baseline_cuts,divisions,tolerance)
+        for step in 0..<counts[at] + 1: _ = try baseline_cuts[at].insert(metrics[at].station((f64)step / (f64)counts[at]), 1e-12)
+    try regularize(edges, surfaces, faces, sides, plans, baseline_cuts, divisions, tolerance)
     for at in 0..<edges.length:
         try cuts[at].open(1025)
-        counts[at] = baseline_cuts[at].count-1
+        counts[at] = baseline_cuts[at].count - 1
         cuts[at].baseline = counts[at]
-        for value in baseline_cuts[at].values[..<baseline_cuts[at].count]: discard(try cuts[at].insert(value,1e-12))
-    try plan_layouts(vertices,edges,surfaces,faces,sides,cuts,metrics,plans,divisions,tolerance,edge_size)
+        for value in baseline_cuts[at].values[..<baseline_cuts[at].count]: _ = try cuts[at].insert(value, 1e-12)
+    try plan_layouts(vertices, edges, surfaces, faces, sides, cuts, metrics, plans, divisions, tolerance, edge_size)
     for index in 0..<edges.length:
         let edge = edges[index]
-        let count = cuts[index].count-1
-        let ids = try alloc i64[count + 1] in memory.heap
-        let baseline = alloc i64[counts[index]+1] in memory.heap catch failure:
+        let count = cuts[index].count - 1
+        let ids = try new i64[count + 1] --- in memory.heap
+        let baseline = new i64[counts[index] + 1] --- in memory.heap catch failure:
             free(ids) in memory.heap
-            error(failure.code,failure.message)
-        samples[index] = Samples(ids,baseline)
+            error(failure.code, failure.message)
+        samples[index] = Samples(ids, baseline)
         allocated += 1
         ids[0] = edge.start
         ids[count] = edge.end
@@ -101,10 +102,10 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
         var station: usize = 0
         for at in 0..<baseline.length:
             let t = baseline_cuts[index].values[at]
-            while station+1 < cuts[index].count and cuts[index].values[station] < t-1e-12: station += 1
-            if math.abs(cuts[index].values[station]-t) > 1e-12: error(invalid,"layout lost an original edge sample")
+            while station + 1 < cuts[index].count and cuts[index].values[station] < t - 1e-12: station += 1
+            if math.abs(cuts[index].values[station] - t) > 1e-12: error(invalid, "layout lost an original edge sample")
             baseline[at] = ids[station]
-    try bind(faces,cuts,samples,plans)
+    try bind(faces, cuts, samples, plans)
     var normals: f64[]
     defer free(normals) in memory.heap
     var notes = FaceNotes()
@@ -118,7 +119,7 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     # Planned-face diagnostics keep ALL shared sampling/layout work above.
     # Only the final face jobs are restricted, unlike independent previews.
     let first_face = (usize)selected if selected >= 0 else 0
-    let last_face = first_face+1 if selected >= 0 else (0 if pooled else faces.length)
+    let last_face = first_face + 1 if selected >= 0 else (0 if pooled else faces.length)
     var failed: usize = 0
     var first_buffer: u8[1024]
     var first_failure = ""
@@ -151,11 +152,11 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
             mesh.face_parents[index] = (i64)face_id
     if failed == faces.length: error(invalid, first_failure)
     if not pooled: normals = try model_normals(&mesh, faces, surfaces, plans, tolerance)
-    let original = try alloc Vector3[mesh.np] in memory.heap
+    let original = try new Vector3[mesh.np] --- in memory.heap
     defer free(original) in memory.heap
     # The CAD face that last placed each point. Its own polygons would place
     # it again identically, so only a different face re-transforms and checks.
-    let placed = try alloc i64[mesh.np] in memory.heap
+    let placed = try new i64[mesh.np] --- in memory.heap
     defer free(placed) in memory.heap
     for index in 0..<mesh.np:
         original[index] = mesh.points[index]
@@ -179,7 +180,7 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
         try outcome.get()
     let raw = try mesh.finish()
     defer raw.release()
-    let values = try alloc f64[mesh.nf] in memory.heap
+    let values = try new f64[mesh.nf] --- in memory.heap
     defer free(values) in memory.heap
     for index in 0..<mesh.nf:
         values[index] = (f64)mesh.face_parents[index]
@@ -200,7 +201,7 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     for face in faces:
         has_colors = has_colors or face.colored
     if has_colors:
-        let colors = try alloc f64[mesh.nf * 3] in memory.heap
+        let colors = try new f64[mesh.nf * 3] --- in memory.heap
         defer free(colors) in memory.heap
         for index in 0..<mesh.nf:
             let color = faces[(usize)mesh.face_parents[index]].color
@@ -274,7 +275,7 @@ func count_edges(context: void*?, first: usize, end: usize):
     let work = (EdgeCounts*)(context else return)
     for index in first..<end:
         work.counts[index] = edge_count(work.edges[index], &work.metrics[index], work.compact[index], work.divisions, work.tolerance, work.edge_size) catch failure:
-            discard(failure)
+            _ = failure
             work.failed.store(1, .relaxed)
             return
 

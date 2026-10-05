@@ -15,6 +15,7 @@ from face_cache import FaceCache, Piece, Tables, face_tables, face_key, new_piec
 from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import append_text
 from luce_std import math
+import strings
 
 pub type FaceMesher = func(MeshBuilder*, BrepFace, Surface, const Curve[], const Samples[], GridLayout, i64, f64, f64) -> unit!
 
@@ -29,7 +30,7 @@ pub struct FaceNotes:
     pub var lines: Growing[u8] = Growing[u8]()
     pub var shared_points: usize = 0
 
-    pub mutating func close():
+    pub func close():
         self.lines.close()
 
 ## Note face `index` of `faces` that failed with `message` ("CAD face i:
@@ -55,6 +56,7 @@ struct Product:
     ## the tessellation with this code.
     var fatal: bool = false
     var code: ErrorCode = invalid
+
     func close():
         if self.points.length > 0: free(self.points) in memory.heap
         if self.sizes.length > 0: free(self.sizes) in memory.heap
@@ -85,7 +87,7 @@ struct Jobs:
 
 ## One pool item per worker: each keeps one scratch builder for all its faces.
 func run(raw: void*?, slot: usize):
-    discard(slot)
+    _ = slot
     let jobs = (Jobs*)(raw else return)
     work(jobs) catch failure:
         jobs.lock.lock()
@@ -98,7 +100,7 @@ func work(jobs: Jobs*) -> !:
     var scratch = try MeshBuilder(precise = true)
     defer scratch.close()
     for point in jobs.points:
-        discard(try scratch.point(point))
+        _ = try scratch.point(point)
     while true:
         jobs.lock.lock()
         if jobs.stop or jobs.next == jobs.order.length:
@@ -112,7 +114,7 @@ func work(jobs: Jobs*) -> !:
         scratch.nc = 0
         prepare(jobs, index, &scratch) catch failure:
             var context: u8[1024]
-            let message = format(context, f"CAD face {index}: {failure.message}") catch exhausted: recover failure.message
+            let message = strings.format(context, f"CAD face {index}: {failure.message}") catch exhausted: recover failure.message
             jobs.products[index].failure = interop.text_transfer.copy(message) catch exhausted: trap(exhausted.message)
             # A face no mesher follows is left out (mesh_faces); running out
             # of memory stops the rest. Lower indices have already been
@@ -133,15 +135,15 @@ func prepare(jobs: Jobs*, index: usize, scratch: MeshBuilder*) -> !:
     let plan = jobs.plans[index]
     try jobs.mesher(scratch, face, jobs.surfaces[(usize)face.surface], jobs.edges, jobs.samples, plan, jobs.divisions, jobs.tolerance, jobs.edge_size)
     let product = &jobs.products[index]
-    product.points = try alloc Vector3[scratch.np - jobs.points.length] in memory.heap
-    product.sizes = try alloc i64[scratch.nf] in memory.heap
-    product.corners = try alloc i64[scratch.nc] in memory.heap
+    product.points = try new Vector3[scratch.np - jobs.points.length] --- in memory.heap
+    product.sizes = try new i64[scratch.nf] --- in memory.heap
+    product.corners = try new i64[scratch.nc] --- in memory.heap
     memory.copy(product.points, scratch.points[jobs.points.length..<scratch.np], product.points.length)
     memory.copy(product.sizes, scratch.sizes, scratch.nf)
     memory.copy(product.corners, scratch.corners, scratch.nc)
     if scratch.display.length > 0:
-        product.display = try alloc i64[(scratch.nc-scratch.nf*2)*3] in memory.heap
-        memory.copy(product.display,scratch.display,product.display.length)
+        product.display = try new i64[(scratch.nc - scratch.nf * 2) * 3] --- in memory.heap
+        memory.copy(product.display, scratch.display, product.display.length)
     product.owns_normals = not (plan.applied.length > 0 and plan.applied[0])
     product.normals = (try face_normals(scratch, 0, scratch.nc, face, jobs.surfaces[(usize)face.surface], jobs.tolerance)) if product.owns_normals else plan.normals[0].values
 
@@ -155,7 +157,7 @@ func prepare(jobs: Jobs*, index: usize, scratch: MeshBuilder*) -> !:
 ## rejects), else skipped with its reason. Only running out of memory, or
 ## every face failing, fails the tessellation.
 pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], samples: const Samples[], plans: const GridLayout[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]?, mesher: FaceMesher, notes: FaceNotes*, cache: FaceCache*? = none) -> f64[]!:
-    let products = try alloc Product[faces.length] in memory.heap
+    let products = try new Product[faces.length] --- in memory.heap
     defer free(products) in memory.heap
     for index in 0..<products.length:
         products[index] = Product()
@@ -163,9 +165,9 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
     # Cached faces: their keys, tables and pieces.
     var tables = Tables()
     defer tables.close()
-    let keys = try alloc u64[faces.length] in memory.heap
+    let keys = try new u64[faces.length] --- in memory.heap
     defer free(keys) in memory.heap
-    let found = try alloc Piece*?[faces.length] in memory.heap
+    let found = try new Piece*?[faces.length] --- in memory.heap
     defer free(found) in memory.heap
     for index in 0..<faces.length: found[index] = none
     defer release_found(found)
@@ -206,7 +208,7 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
     running = false
     if let failure = jobs.failure:
         let owned = try interop.copy_text(failure.value)
-        if let owner = owned.owner: discard(ownership.pool_object(owner))
+        if let owner = owned.owner: _ = ownership.pool_object(owner)
         error(invalid, owned.value)
     # Check before allocating or assembling partial products. Unscheduled
     # faces are empty, while every assigned worker has now been joined.
@@ -231,7 +233,7 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
     for index in 0..<products.length:
         if let piece = found[index]: normal_count += piece.normals.length
         elif products[index].failure == none: normal_count += products[index].normals.length
-    let normals = try alloc f64[normal_count] in memory.heap
+    let normals = try new f64[normal_count] --- in memory.heap
     errdefer free(normals) in memory.heap
     # One face's display triangles, sized by the largest face (any size).
     var largest: i64 = 3
@@ -242,7 +244,7 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         elif products[index].failure == none:
             for size in products[index].sizes:
                 if size > largest: largest = size
-    let local_indices = try alloc i64[(usize)(largest-2)*3] in memory.heap
+    let local_indices = try new i64[(usize)(largest - 2) * 3] --- in memory.heap
     defer free(local_indices) in memory.heap
     var normal_offset: usize = 0
     for index in 0..<products.length:
@@ -255,7 +257,7 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
         if product.failure != none: continue
         let base = mesh.np
         for point in product.points:
-            discard(try mesh.point(point))
+            _ = try mesh.point(point)
         var corner: usize = 0
         var display: usize = 0
         for size in product.sizes:
@@ -265,9 +267,9 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
                 let id = product.corners[corner]
                 try mesh.corner(id if (usize)id < boundary else (i64)(base + (usize)id - boundary))
                 corner += 1
-            let count = ((usize)size-2)*3
+            let count = ((usize)size - 2) * 3
             if product.display.length > 0 and product.display[display] >= 0:
-                for at in 0..<count: local_indices[at] = product.display[display+at]-(i64)first
+                for at in 0..<count: local_indices[at] = product.display[display + at] - (i64)first
                 try mesh.set_last_display(local_indices[..<count])
             display += count
         memory.copy(normals[normal_offset..<normal_offset + product.normals.length], product.normals, product.normals.length)
@@ -296,7 +298,7 @@ func key_faces(context: void*?, first: usize, end: usize):
 ## Face `index`'s product as a piece: boundary corners by table entry, or
 ## none when one is not in the table.
 func made_piece(product: Product*, index: usize, boundary: usize, tables: const Tables*, key: u64, plan: GridLayout) -> Piece*?!:
-    let corners = try alloc i64[product.corners.length] in memory.heap
+    let corners = try new i64[product.corners.length] --- in memory.heap
     for at in 0..<corners.length:
         let id = product.corners[at]
         if (usize)id >= boundary:
@@ -326,7 +328,7 @@ func made_piece(product: Product*, index: usize, boundary: usize, tables: const 
 func copied[T](values: const T[]) -> T[]!:
     var empty: T[]
     if values.length == 0: return empty
-    let copy = try alloc T[values.length] in memory.heap
+    let copy = try new T[values.length] --- in memory.heap
     memory.copy(copy, values, values.length)
     return copy
 
@@ -337,7 +339,7 @@ func place_piece(mesh: MeshBuilder*, piece: const Piece*, index: usize, tables: 
     if plan.applied.length > 0: plan.applied[0] = piece.applied
     let table = tables.of(index)
     let base = mesh.np
-    for point in piece.points: discard(try mesh.point(point))
+    for point in piece.points: _ = try mesh.point(point)
     var corner: usize = 0
     var display: usize = 0
     for size in piece.sizes:
@@ -347,9 +349,9 @@ func place_piece(mesh: MeshBuilder*, piece: const Piece*, index: usize, tables: 
             let id = piece.corners[corner]
             try mesh.corner((i64)base + id if id >= 0 else table[(usize)(-id - 1)])
             corner += 1
-        let count = ((usize)size-2)*3
+        let count = ((usize)size - 2) * 3
         if piece.display.length > 0 and piece.display[display] >= 0:
-            for at in 0..<count: local_indices[at] = piece.display[display+at]-(i64)first
+            for at in 0..<count: local_indices[at] = piece.display[display + at] - (i64)first
             try mesh.set_last_display(local_indices[..<count])
         display += count
 
@@ -366,7 +368,7 @@ func stop_jobs(jobs: Jobs*, job: parallel.Job*):
 ## Fail with a copy of a face's failure `message`.
 func fail(message: str, code: ErrorCode = invalid) -> !:
     let owned = try interop.copy_text(message)
-    if let owner = owned.owner: discard(ownership.pool_object(owner))
+    if let owner = owned.owner: _ = ownership.pool_object(owner)
     error(code, owned.value)
 
 func close_products(products: const Product[]):

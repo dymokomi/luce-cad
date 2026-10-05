@@ -10,167 +10,167 @@ from trim_layout import reconcile
 from trim_alignment import align
 
 pub func intersection_contract() -> !:
-    for delta in [1e-8,4e-8,1e-7]:
-        for swap in [false,true]:
-            for reverse in [false,true]:
-                for tolerance in [1e-9,0.01,0.1]: try shallow_crossing(delta,swap,reverse,tolerance)
-    for scale in [0.001,1.0,1000.0]:
-        for delta in [-2e-8,2e-8]: try monotone_crossing(scale,delta)
+    for delta in [1e-8, 4e-8, 1e-7]:
+        for swap in [false, true]:
+            for reverse in [false, true]:
+                for tolerance in [1e-9, 0.01, 0.1]: try shallow_crossing(delta, swap, reverse, tolerance)
+    for scale in [0.001, 1.0, 1000.0]:
+        for delta in [-2e-8, 2e-8]: try monotone_crossing(scale, delta)
 
 ## A nearby point on a monotone run remains the crossing representative.
 ## Blindly admitting every sub-tolerance root creates duplicate row phases.
 func monotone_crossing(scale: f64, delta: f64) -> !:
     var empty_points: Vector3[]
     var empty_numbers: f64[]
-    let vertices = [Vector3(),Vector3(scale,0.0,0.0),Vector3(scale,scale,0.0),Vector3(0.0,scale,0.0)]
-    let edges = try alloc Curve[4] in memory.heap
+    let vertices = [Vector3(), Vector3(scale, 0.0, 0.0), Vector3(scale, scale, 0.0), Vector3(0.0, scale, 0.0)]
+    let edges = try new Curve[4] --- in memory.heap
     var built: usize = 0
     defer:
         for at in 0..<built: edges[at].close()
         free(edges) in memory.heap
     for at in 0..<(usize)4:
-        edges[at] = try Curve(0,(i64)at,(i64)((at+1)%4),Vector3(),Vector3(),Vector3(),0.0,[vertices[at],vertices[(at+1)%4]],empty_numbers,empty_numbers,0,true)
+        edges[at] = try Curve(0, (i64)at, (i64)((at + 1) % 4), Vector3(), Vector3(), Vector3(), 0.0, [vertices[at], vertices[(at + 1) % 4]], empty_numbers, empty_numbers, 0, true)
         built += 1
-    let face = try BrepFace(0,[1,2,3,4],[4],true)
+    let face = try BrepFace(0, [1, 2, 3, 4], [4], true)
     defer face.close()
-    let s = try Surface(0,Vector3(),Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),0.0,0.0,empty_points,empty_numbers,empty_numbers,empty_numbers,0,0,0,0)
+    let s = try Surface(0, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0)
     defer s.close()
-    var cuts = [Stations(),Stations(),Stations(),Stations()]
+    var cuts = [Stations(), Stations(), Stations(), Stations()]
     defer:
         for cut in cuts: cut.close()
     for at in 0..<(usize)4:
         try cuts[at].open(16)
         cuts[at].epsilon = 1e-12
-        for t in [0.0,1.0]: discard(try cuts[at].insert(t,1e-12))
-    discard(try cuts[0].insert(0.5+delta,1e-12))
+        for t in [0.0, 1.0]: _ = try cuts[at].insert(t, 1e-12)
+    _ = try cuts[0].insert(0.5 + delta, 1e-12)
     var plan = GridLayout()
     defer plan.close()
-    plan.epsilon = scale*1e-7
-    plan.chains = try alloc UVChain[4] in memory.heap
+    plan.epsilon = scale * 1e-7
+    plan.chains = try new UVChain[4] --- in memory.heap
     for at in 0..<(usize)4: plan.chains[at] = UVChain()
     try plan.u.open(8)
     try plan.v.open(8)
-    for x in [-0.1,0.5,1.1]: discard(try plan.u.insert(x*scale,scale*1e-12))
-    for y in [-0.1,1.1]: discard(try plan.v.insert(y*scale,scale*1e-12))
-    let tolerance = scale*1e-4
-    discard(try reconcile(&plan,face,s,vertices,edges,cuts,tolerance,false))
-    if cuts[0].count != 3 or cuts[0].values[1] != 0.5+delta:
-        error(invalid,"a monotone crossing introduced a redundant near-coincident root")
-    let points = try alloc Vector3[6] in memory.heap
+    for x in [-0.1, 0.5, 1.1]: _ = try plan.u.insert(x * scale, scale * 1e-12)
+    for y in [-0.1, 1.1]: _ = try plan.v.insert(y * scale, scale * 1e-12)
+    let tolerance = scale * 1e-4
+    _ = try reconcile(&plan, face, s, vertices, edges, cuts, tolerance, false)
+    if cuts[0].count != 3 or cuts[0].values[1] != 0.5 + delta:
+        error(invalid, "a monotone crossing introduced a redundant near-coincident root")
+    let points = try new Vector3[6] --- in memory.heap
     defer free(points) in memory.heap
-    let canonical = try alloc Vector3[6] in memory.heap
+    let canonical = try new Vector3[6] --- in memory.heap
     defer free(canonical) in memory.heap
-    let ids = [0,1,2,3,4,5]
+    let ids = [0, 1, 2, 3, 4, 5]
     var count: usize = 0
     for at in 0..<(usize)4:
-        let chain = try cached(&plan.chains[at],s,vertices,edges[at],cuts[at],tolerance)
-        for p in chain[..<chain.length-1]:
-            if count >= 6: error(invalid,"monotone crossing duplicated a boundary point")
+        let chain = try cached(&plan.chains[at], s, vertices, edges[at], cuts[at], tolerance)
+        for p in chain[..<chain.length - 1]:
+            if count >= 6: error(invalid, "monotone crossing duplicated a boundary point")
             points[count] = p
             canonical[count] = p
             count += 1
-    if count != 6: error(invalid,"monotone crossing lost a boundary point")
-    try align(points,[6],ids,canonical,s,plan,tolerance)
-    if points[1].x != scale*0.5 or canonical[1].x != scale*(0.5+delta):
-        error(invalid,"monotone incidence must align only the chart, not canonical geometry")
-    let mesh = try TrimGrid.clip_identified(points,[6],plan.u.values[..<plan.u.count],plan.v.values[..<plan.v.count],ids)
+    if count != 6: error(invalid, "monotone crossing lost a boundary point")
+    try align(points, [6], ids, canonical, s, plan, tolerance)
+    if points[1].x != scale * 0.5 or canonical[1].x != scale * (0.5 + delta):
+        error(invalid, "monotone incidence must align only the chart, not canonical geometry")
+    let mesh = try TrimGrid.clip_identified(points, [6], plan.u.values[..<plan.u.count], plan.v.values[..<plan.v.count], ids)
     defer mesh.release()
     if mesh.value().face_count() != 2 or mesh.value().point_count() != 6:
-        error(invalid,"monotone incidence did not produce the two regular cells")
+        error(invalid, "monotone incidence did not produce the two regular cells")
 
 func shallow_crossing(delta: f64, swap: bool, reverse: bool, tolerance: f64) -> !:
     var empty_points: Vector3[]
     var empty_numbers: f64[]
-    let radius = 0.5+delta
-    let vertices = [Vector3(0.0,-delta,0.0),Vector3(1.0,-delta,0.0),Vector3(1.0,1.0+delta,0.0),Vector3(0.0,1.0+delta,0.0)]
-    let line0 = try Curve(0,0,1,Vector3(),Vector3(),Vector3(),0.0,[vertices[0],vertices[1]],empty_numbers,empty_numbers,0,true)
+    let radius = 0.5 + delta
+    let vertices = [Vector3(0.0, -delta, 0.0), Vector3(1.0, -delta, 0.0), Vector3(1.0, 1.0 + delta, 0.0), Vector3(0.0, 1.0 + delta, 0.0)]
+    let line0 = try Curve(0, 0, 1, Vector3(), Vector3(), Vector3(), 0.0, [vertices[0], vertices[1]], empty_numbers, empty_numbers, 0, true)
     defer line0.close()
-    let arc = try Curve(1,1,2,Vector3(1.0,0.5,0.0),Vector3(1.0,0.0,0.0),Vector3(0.0,1.0,0.0),radius,empty_points,empty_numbers,empty_numbers,0,true,-math.pi*0.5,-math.pi)
+    let arc = try Curve(1, 1, 2, Vector3(1.0, 0.5, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), radius, empty_points, empty_numbers, empty_numbers, 0, true, -math.pi * 0.5, -math.pi)
     defer arc.close()
-    let line2 = try Curve(0,2,3,Vector3(),Vector3(),Vector3(),0.0,[vertices[2],vertices[3]],empty_numbers,empty_numbers,0,true)
+    let line2 = try Curve(0, 2, 3, Vector3(), Vector3(), Vector3(), 0.0, [vertices[2], vertices[3]], empty_numbers, empty_numbers, 0, true)
     defer line2.close()
-    let line3 = try Curve(0,3,0,Vector3(),Vector3(),Vector3(),0.0,[vertices[3],vertices[0]],empty_numbers,empty_numbers,0,true)
+    let line3 = try Curve(0, 3, 0, Vector3(), Vector3(), Vector3(), 0.0, [vertices[3], vertices[0]], empty_numbers, empty_numbers, 0, true)
     defer line3.close()
-    let edges = [line0,arc,line2,line3]
-    let uses = [-4,-3,-2,-1] if reverse else [1,2,3,4]
-    let face = try BrepFace(0,uses,[4],not reverse)
+    let edges = [line0, arc, line2, line3]
+    let uses = [-4, -3, -2, -1] if reverse else [1, 2, 3, 4]
+    let face = try BrepFace(0, uses, [4], not reverse)
     defer face.close()
-    let s = try Surface(0,Vector3(),Vector3(0.0,1.0,0.0) if swap else Vector3(1.0,0.0,0.0),Vector3(0.0,0.0,1.0),0.0,0.0,empty_points,empty_numbers,empty_numbers,empty_numbers,0,0,0,0)
+    let s = try Surface(0, Vector3(), Vector3(0.0, 1.0, 0.0) if swap else Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0)
     defer s.close()
-    var cuts = [Stations(),Stations(),Stations(),Stations()]
+    var cuts = [Stations(), Stations(), Stations(), Stations()]
     defer:
         for cut in cuts: cut.close()
     for at in 0..<(usize)4:
         try cuts[at].open(128)
         cuts[at].epsilon = 1e-12
-        for t in [0.0,1.0]: discard(try cuts[at].insert(t,1e-12))
-    for t in [0.25,0.5,0.75]: discard(try cuts[1].insert(t,1e-12))
+        for t in [0.0, 1.0]: _ = try cuts[at].insert(t, 1e-12)
+    for t in [0.25, 0.5, 0.75]: _ = try cuts[1].insert(t, 1e-12)
     var plan = GridLayout()
     defer plan.close()
     plan.epsilon = 1e-6
-    plan.chains = try alloc UVChain[4] in memory.heap
+    plan.chains = try new UVChain[4] --- in memory.heap
     for at in 0..<(usize)4: plan.chains[at] = UVChain()
     try plan.u.open(16)
     try plan.v.open(16)
-    let xs = [-0.1,0.0,0.5,1.0,1.1]
-    let ys = [-0.1,-delta,0.25,0.75,1.0+delta,1.1]
+    let xs = [-0.1, 0.0, 0.5, 1.0, 1.1]
+    let ys = [-0.1, -delta, 0.25, 0.75, 1.0 + delta, 1.1]
     # Swapping the chart's X direction rotates V to negative world X.
     for value in xs:
-        if swap: discard(try plan.v.insert(-value,1e-12))
-        else: discard(try plan.u.insert(value,1e-12))
+        if swap: _ = try plan.v.insert(-value, 1e-12)
+        else: _ = try plan.u.insert(value, 1e-12)
     for value in ys:
-        if swap: discard(try plan.u.insert(value,1e-12))
-        else: discard(try plan.v.insert(value,1e-12))
+        if swap: _ = try plan.u.insert(value, 1e-12)
+        else: _ = try plan.v.insert(value, 1e-12)
     # Both roots are compulsory even if the modelling tolerance's sample
     # separation is larger than their distance to the intervening extremum.
     # A root and the extremum are not two estimates of the same incidence.
-    discard(try reconcile(&plan,face,s,vertices,edges,cuts,tolerance,false))
+    _ = try reconcile(&plan, face, s, vertices, edges, cuts, tolerance, false)
     let frozen = cuts[1].count
-    discard(try reconcile(&plan,face,s,vertices,edges,cuts,tolerance,false))
-    if cuts[1].count != frozen: error(invalid,"reconciling exact arc intersections must be idempotent")
+    _ = try reconcile(&plan, face, s, vertices, edges, cuts, tolerance, false)
+    if cuts[1].count != frozen: error(invalid, "reconciling exact arc intersections must be idempotent")
     var before: usize = 0
     var after: usize = 0
     for t in cuts[1].values[..<cuts[1].count]:
         let p = try arc.at(t)
-        if math.abs(p.x-0.5) < 1e-11:
+        if math.abs(p.x - 0.5) < 1e-11:
             if t < 0.5: before += 1
             else: after += 1
-    if before != 1 or after != 1: error(invalid,"shallow trim crossings must register on both sides of the tangent")
+    if before != 1 or after != 1: error(invalid, "shallow trim crossings must register on both sides of the tangent")
     # Use the frozen shared chain unchanged. Clipping must produce a valid cell
     # arrangement, not force the entire patch through the constrained fallback.
-    let points = try alloc Vector3[512] in memory.heap
+    let points = try new Vector3[512] --- in memory.heap
     defer free(points) in memory.heap
     var length: usize = 0
     for use in 0..<(usize)4:
         let signed = uses[use]
-        let index = (usize)(-signed-1 if signed < 0 else signed-1)
-        let uv = try cached(&plan.chains[use],s,vertices,edges[index],cuts[index],tolerance)
-        for at in 0..<uv.length-1:
-            var p = uv[at if signed > 0 else uv.length-1-at]
+        let index = (usize)(-signed - 1 if signed < 0 else signed - 1)
+        let uv = try cached(&plan.chains[use], s, vertices, edges[index], cuts[index], tolerance)
+        for at in 0..<uv.length - 1:
+            var p = uv[at if signed > 0 else uv.length - 1 - at]
             # Same incidence-only endpoint alignment as clipped_patch. Do not
             # flatten the tangent extremum onto the nearby grid side.
             for axis in 0..<(usize)2:
                 let lines = plan.u if axis == 0 else plan.v
                 for value in lines.values[..<lines.count]:
-                    if axis == 0 and math.abs(p.x-value) < 1e-11: p = Vector3(value,p.y,0.0)
-                    if axis == 1 and math.abs(p.y-value) < 1e-11: p = Vector3(p.x,value,0.0)
+                    if axis == 0 and math.abs(p.x - value) < 1e-11: p = Vector3(value, p.y, 0.0)
+                    if axis == 1 and math.abs(p.y - value) < 1e-11: p = Vector3(p.x, value, 0.0)
             points[length] = p
             length += 1
-    let mesh = try TrimGrid.clip(points[..<length],[(i64)length],plan.u.values[..<plan.u.count],plan.v.values[..<plan.v.count])
+    let mesh = try TrimGrid.clip(points[..<length], [(i64)length], plan.u.values[..<plan.u.count], plan.v.values[..<plan.v.count])
     defer mesh.release()
     for at in 0..<length:
         if (try mesh.value().point((i64)at)).subtract(points[at]).length() != 0.0:
-            error(invalid,"cut cells must not weld the shallow trim crossings")
+            error(invalid, "cut cells must not weld the shallow trim crossings")
     var expected: f64 = 0.0
-    for at in 0..<length: expected += points[at].cross(points[(at+1)%length]).z*0.5
+    for at in 0..<length: expected += points[at].cross(points[(at + 1) % length]).z * 0.5
     var area: f64 = 0.0
-    for triangle in 0..<mesh.value().index_count()//3:
-        var p = [Vector3(),Vector3(),Vector3()]
+    for triangle in 0..<mesh.value().index_count() // 3:
+        var p = [Vector3(), Vector3(), Vector3()]
         for at in 0..<(usize)3:
-            let index = mesh.value().index(triangle*3+(i64)at)
+            let index = mesh.value().index(triangle * 3 + (i64)at)
             defer index.release()
             p[at] = try mesh.value().point(try mesh.value().corner_point(try index.get()))
-        let signed = p[1].subtract(p[0]).cross(p[2].subtract(p[0])).z*0.5
-        if signed <= 0.0: error(invalid,"shallow crossing produced a reversed display triangle")
+        let signed = p[1].subtract(p[0]).cross(p[2].subtract(p[0])).z * 0.5
+        if signed <= 0.0: error(invalid, "shallow crossing produced a reversed display triangle")
         area += signed
-    if math.abs(area-math.abs(expected)) > 1e-11: error(invalid,"shallow crossing changed polygon area")
+    if math.abs(area - math.abs(expected)) > 1e-11: error(invalid, "shallow crossing changed polygon area")

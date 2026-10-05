@@ -10,6 +10,7 @@ import interop
 import ownership
 from luce_geocore.geocore import Vector3, Mesh, MeshBuilder, invalid
 from luce_geocore.core import parallel
+import strings
 
 ## Batch limits: small retained meshes keep partial redraws cheap.
 let batch_points: usize = 4096
@@ -49,19 +50,19 @@ pub struct PreviewPart:
     var failure: interop.Packet[str]? = none
     var fatal_failure: bool = false
 
-    pub mutating func open_boundaries(uses: usize) -> !:
-        self.ids = try alloc i64[uses] in memory.heap
-        self.starts = try alloc usize[uses + 1] in memory.heap
-        self.polyline = try alloc Vector3[uses * 65 + 1] in memory.heap
+    pub func open_boundaries(uses: usize) -> !:
+        self.ids = try new i64[uses] --- in memory.heap
+        self.starts = try new usize[uses + 1] --- in memory.heap
+        self.polyline = try new Vector3[uses * 65 + 1] --- in memory.heap
         self.starts[0] = 0
 
-    pub mutating func begin_use(id: i64) -> !:
+    pub func begin_use(id: i64) -> !:
         if self.uses == self.ids.length: error(invalid, "preview boundary use overflow")
         self.ids[self.uses] = id
         self.uses += 1
         self.starts[self.uses] = self.used
 
-    pub mutating func boundary_point(point: Vector3) -> !:
+    pub func boundary_point(point: Vector3) -> !:
         if self.used == self.polyline.length: error(invalid, "preview boundary overflow")
         self.polyline[self.used] = point
         self.used += 1
@@ -69,29 +70,29 @@ pub struct PreviewPart:
 
     pub func failed() -> bool:
         if let failure = self.failure:
-            discard(failure)
+            _ = failure
             return true
         return false
 
     ## The preview failed; the face is counted and keeps its boundaries.
-    pub mutating func fail(message: str):
+    pub func fail(message: str):
         self.failure = interop.text_transfer.copy(message) catch exhausted: trap(exhausted.message)
 
     ## The whole preview fails, as the serial boundary sampling did.
-    pub mutating func fatal(message: str):
+    pub func fatal(message: str):
         self.fail(message)
         self.fatal_failure = true
 
     ## Copy `mesh` into raw arrays and its normal guide (as luced-3d drew it).
-    pub mutating func adopt(mesh: interop.Reference[Mesh]) -> !:
+    pub func adopt(mesh: interop.Reference[Mesh]) -> !:
         let m = mesh.value()
         let point_count = (usize)m.point_count()
         let face_count = (usize)m.face_count()
-        self.points = try alloc Vector3[point_count] in memory.heap
+        self.points = try new Vector3[point_count] --- in memory.heap
         for at in 0..<point_count: self.points[at] = try m.point((i64)at)
-        self.sizes = try alloc i64[face_count] in memory.heap
-        self.corners = try alloc i64[(usize)m.vertex_count()] in memory.heap
-        self.display = try alloc i64[(usize)m.index_count()] in memory.heap
+        self.sizes = try new i64[face_count] --- in memory.heap
+        self.corners = try new i64[(usize)m.vertex_count()] --- in memory.heap
+        self.display = try new i64[(usize)m.index_count()] --- in memory.heap
         var corner: usize = 0
         var triangle: usize = 0
         for face in 0..<face_count:
@@ -109,7 +110,7 @@ pub struct PreviewPart:
                 triangle += 1
         var kept: usize = 0
         let count = (usize)m.attribute_count()
-        self.columns = try alloc Column[count] in memory.heap
+        self.columns = try new Column[count] --- in memory.heap
         for index in 0..<count:
             let domain = try m.attribute_domain((i64)index)
             if domain > 2: continue
@@ -122,7 +123,7 @@ pub struct PreviewPart:
             column.domain = domain
             column.width = width
             column.integer = try m.attribute_integer((i64)index)
-            column.values = try alloc f64[(usize)(elements * width)] in memory.heap
+            column.values = try new f64[(usize)(elements * width)] --- in memory.heap
             for element in 0..<elements:
                 for component in 0..<width:
                     column.values[(usize)(element * width + component)] = try m.attribute_value((i64)index, element, component)
@@ -170,7 +171,7 @@ func part_item(raw: void*?, index: usize):
 ## Make every face's part on the pool and assemble the preview. `edges` bounds
 ## the shared edge IDs; other IDs belong to one face use and always show.
 pub func collect_preview(faces: usize, edges: usize, make: PartMaker, context: void*?, progress: interop.Callback[f64, unit]?) -> interop.Reference[CadPreviewSet]!:
-    let parts = try alloc PreviewPart[faces] in memory.heap
+    let parts = try new PreviewPart[faces] --- in memory.heap
     defer free(parts) in memory.heap
     for at in 0..<faces: parts[at] = PreviewPart()
     defer close_parts(parts)
@@ -199,7 +200,7 @@ pub func collect_preview(faces: usize, edges: usize, make: PartMaker, context: v
         if part.fatal_failure:
             if let failure = part.failure:
                 let owned = try interop.copy_text(failure.value)
-                if let owner = owned.owner: discard(ownership.pool_object(owner))
+                if let owner = owned.owner: _ = ownership.pool_object(owner)
                 error(invalid, owned.value)
     let set = try new CadPreviewSet(faces) in memory.heap
     let result = try interop.Reference[CadPreviewSet].adopt(set, cad_preview_set_type, memory.heap)
@@ -221,9 +222,9 @@ pub struct CadPreviewSet:
     var error_text: interop.Packet[str]? = none
 
     func init(faces: usize) -> !:
-        self.meshes = try alloc interop.Reference[Mesh][faces + 1] in memory.heap
+        self.meshes = try new interop.Reference[Mesh][faces + 1] --- in memory.heap
         errdefer free(self.meshes) in memory.heap
-        self.guides = try alloc Vector3[faces * 2 + 1] in memory.heap
+        self.guides = try new Vector3[faces * 2 + 1] --- in memory.heap
         var empty: Vector3[]
         self.boundaries = empty
         self.mesh_total = 0
@@ -234,34 +235,41 @@ pub struct CadPreviewSet:
 
     pub func mesh_count() -> i64:
         return (i64)self.mesh_total
+
     pub func mesh(index: i64) -> interop.Reference[Mesh]!:
         if index < 0 or (usize)index >= self.mesh_total: error(invalid, "preview mesh index out of range")
         return self.meshes[(usize)index].clone()
+
     ## Boundary segments as point pairs.
     pub func boundary_count() -> i64:
         return (i64)self.boundary_total
+
     pub func boundary(index: i64) -> Vector3!:
         if index < 0 or (usize)index >= self.boundary_total: error(invalid, "preview boundary index out of range")
         return self.boundaries[(usize)index]
+
     ## Normal guides as (start, end) pairs, one per meshed face.
     pub func guide_count() -> i64:
         return (i64)self.guide_total
+
     pub func guide(index: i64) -> Vector3!:
         if index < 0 or (usize)index >= self.guide_total: error(invalid, "preview guide index out of range")
         return self.guides[(usize)index]
+
     pub func failed_faces() -> i64:
         return self.failures
+
     ## "Patch N: message" for the first failed face in order, or empty.
     pub func first_error() -> str:
         return (self.error_text else interop.Packet[str]("")).value
 
-    mutating func assemble(parts: const PreviewPart[], edges: usize) -> !:
+    func assemble(parts: const PreviewPart[], edges: usize) -> !:
         var total: usize = 0
         for part in parts:
             for use in 0..<part.uses:
                 total += (part.starts[use + 1] - part.starts[use] - 1) * 2
-        self.boundaries = try alloc Vector3[total + 1] in memory.heap
-        let shown = try alloc bool[edges + 1] in memory.heap
+        self.boundaries = try new Vector3[total + 1] --- in memory.heap
+        let shown = try new bool[edges + 1] --- in memory.heap
         defer free(shown) in memory.heap
         for at in 0..<shown.length: shown[at] = false
         var batch_start: usize = 0
@@ -283,7 +291,7 @@ pub struct CadPreviewSet:
                 self.failures += 1
                 if self.failures == 1:
                     var buffer: u8[1024]
-                    let text = format(buffer, f"Patch {face + 1}: {failure.value}") catch exhausted: recover failure.value
+                    let text = strings.format(buffer, f"Patch {face + 1}: {failure.value}") catch exhausted: recover failure.value
                     self.error_text = try interop.text_transfer.copy(text)
                 continue
             if part.guide:
@@ -307,13 +315,13 @@ pub struct CadPreviewSet:
     ## One display mesh from consecutive parts; failed parts in the range are
     ## skipped. Attributes join by (name, domain) in first-seen order, zeros
     ## where a part lacks one, as Mesh.merged does.
-    mutating func flush(parts: const PreviewPart[]) -> !:
+    func flush(parts: const PreviewPart[]) -> !:
         var builder = try MeshBuilder()
         defer builder.close()
         for part in parts:
             if part.failed(): continue
             let base = (i64)builder.np
-            for point in part.points: discard(try builder.point(point))
+            for point in part.points: _ = try builder.point(point)
             var corner: usize = 0
             var triangle: usize = 0
             for size in part.sizes:
@@ -338,7 +346,7 @@ pub struct CadPreviewSet:
         self.meshes[self.mesh_total] = mesh
         self.mesh_total += 1
 
-    pub mutating func close():
+    pub func close():
         for mesh in self.meshes[..<self.mesh_total]: mesh.release()
         free(self.meshes) in memory.heap
         if self.boundaries.length > 0: free(self.boundaries) in memory.heap
@@ -356,7 +364,7 @@ func joined(parts: const PreviewPart[], like: Column) -> f64[]!:
     for part in parts:
         if part.failed(): continue
         total += domain_size(part, like.domain) * (usize)like.width
-    let values = try alloc f64[total] in memory.heap
+    let values = try new f64[total] --- in memory.heap
     var at: usize = 0
     for part in parts:
         if part.failed(): continue
