@@ -559,4 +559,4 @@ oversized cut cells and rejection of unsplit trim crossings.
   normals and spacing through the public `cad` and `tessellation` exports.
 
 STEP-file regressions live in luce-step; editor behavior stays in luced-3d. CI
-pins the compilers and sibling packages in `bootstrap/PACKAGES`.
+builds the compilers and checks out the sibling packages at main.
