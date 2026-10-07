@@ -547,16 +547,15 @@ oversized cut cells and rejection of unsplit trim crossings.
 
 ## Tests
 
-`./test.sh` builds and runs, native and through the C backend (`--opt N`,
-`--backend native|c` narrow it):
+`luc test` builds and runs two test programs:
 
-- the Base contracts in `src/tests/` (`layout_contract` and
+- `tests/contracts`, the Base contracts (`layout_contract` and
   `trim_predicates_contract` run every contract module they import;
-  `exact_contract` checks the exporter accessors), which reach unexported
+  `exact_contract` checks the exporter accessors), which reach the package's
   internals;
-- the Luce regressions in `tests/` (`main.luc` and one `*_tests.luc` module per
-  topic), which build CAD models in code, mesh them and check topology, trims,
-  normals and spacing through the public `cad` and `tessellation` exports.
+- `tests/regressions`, the Luce regressions (`main.luc` and one `*_tests.luc`
+  module per topic), which build CAD models in code, mesh them and check
+  topology, trims, normals and spacing through the public `cad` and
+  `tessellation` exports.
 
-STEP-file regressions live in luce-step; editor behavior stays in luced-3d. CI
-builds the compilers and checks out the sibling packages at main.
+STEP-file regressions live in luce-step; editor behavior stays in luced-3d.
