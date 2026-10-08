@@ -1,0 +1,295 @@
+## Where a ray meets a B-spline surface, without meshing it. The surface
+## is cut once into Bezier patches: knots inserted until each span is a
+## whole patch, on homogeneous points (x w, y w, z w, w). For a ray, each
+## patch's points are put in the ray's frame: across it on two planes
+## through it (a, b) and along it (c). A patch lies in its points' hull,
+## so one whose a (or b) are all of one sign misses the ray, and one whose
+## c are all negative lies behind it. A patch that may be hit is halved
+## until small, then Newton finds where a = b = 0 (the weight is
+## positive, so these are the surface's own crossings).
+
+## The largest degree a patch may have (the bases are nine long).
+let most_degree: i64 = 8
+## Halvings of a patch before Newton takes over from its middle.
+let deepest = 12
+
+## Surfaces' Bezier patches, made the first time a ray meets the surface:
+## surface s's patches are firsts[s]..<firsts[s] + counts[s]; patch p's
+## (du + 1)(dv + 1) homogeneous points (four numbers each, u-major) start
+## at starts[p] in values, over fractions lows[p]..highs[p] of the
+## surface's domain (u, v in x, y).
+struct Nets:
+    var values: Growing[f64]
+    var starts: Growing[usize]
+    var lows: Growing[Vector3]
+    var highs: Growing[Vector3]
+    var firsts: Growing[i64]
+    var counts: Growing[usize]
+
+    func close():
+        self.values.close()
+        self.starts.close()
+        self.lows.close()
+        self.highs.close()
+        self.firsts.close()
+        self.counts.close()
+
+func new_nets(surfaces: usize) -> Nets!:
+    var made = Nets(Growing[f64](), Growing[usize](), Growing[Vector3](), Growing[Vector3](), Growing[i64](), Growing[usize]())
+    errdefer made.close()
+    for _ in 0..<surfaces:
+        try made.firsts.push(-1)
+        try made.counts.push(0)
+    return made
+
+## A ray's hit on a B-spline surface: its distance along the ray, and the
+## surface's parameters there (fractions of its domain, as its chart).
+struct SplineHit:
+    let t: f64
+    let u: f64
+    let v: f64
+
+## Where the ray from `o` along unit `d` meets B-spline surface `index` of
+## `w` ahead of it, onto `out`.
+func spline_hits(nets: Nets*, w: const Shape*, index: usize, o: Vector3, d: Vector3, out: Growing[SplineHit]*) -> !:
+    out.clear()
+    let s = &w.surfaces.items[index]
+    if nets.firsts.items[index] < 0: try cut_patches(nets, s, index)
+    # Two planes through the ray.
+    let n1 = try (Vector3(1.0, 0.0, 0.0) if math.abs(d.x) < 0.6 else Vector3(0.0, 1.0, 0.0)).cross(d).normalized()
+    let n2 = d.cross(n1)
+    let size = (usize)((s.du + 1) * (s.dv + 1))
+    var net: f64[324]
+    let first = (usize)nets.firsts.items[index]
+    for p in first..<first + nets.counts.items[index]:
+        let at = nets.starts.items[p]
+        for k in 0..<size:
+            let x = nets.values.items[at + k * 4]
+            let y = nets.values.items[at + k * 4 + 1]
+            let z = nets.values.items[at + k * 4 + 2]
+            let weight = nets.values.items[at + k * 4 + 3]
+            let q = Vector3(x - o.x * weight, y - o.y * weight, z - o.z * weight)
+            net[k * 4] = q.dot(n1)
+            net[k * 4 + 1] = q.dot(n2)
+            net[k * 4 + 2] = q.dot(d)
+            net[k * 4 + 3] = weight
+        let low = nets.lows.items[p]
+        let high = nets.highs.items[p]
+        try patch_hits(&net, s.du, s.dv, 0.0, 1.0, 0.0, 1.0, 0, low, high, out)
+
+## Hits in the part u0..u1, v0..v1 (of a patch over `low`..`high`) whose
+## net in the ray's frame is `net`.
+func patch_hits(net: f64[324]*, du: i64, dv: i64, u0: f64, u1: f64, v0: f64, v1: f64, depth: i64, low: Vector3, high: Vector3, out: Growing[SplineHit]*) -> !:
+    let size = (usize)((du + 1) * (dv + 1))
+    if misses(net, size): return
+    if depth >= deepest:
+        try polish(net, du, dv, u0, u1, v0, v1, low, high, out)
+        return
+    # Halve across the longer side, in turn when even.
+    let across_u = (u1 - u0) >= (v1 - v0)
+    var left: f64[324]
+    var right: f64[324]
+    halve(net, du, dv, across_u, &left, &right)
+    if across_u:
+        let middle = (u0 + u1) * 0.5
+        try patch_hits(&left, du, dv, u0, middle, v0, v1, depth + 1, low, high, out)
+        try patch_hits(&right, du, dv, middle, u1, v0, v1, depth + 1, low, high, out)
+    else:
+        let middle = (v0 + v1) * 0.5
+        try patch_hits(&left, du, dv, u0, u1, v0, middle, depth + 1, low, high, out)
+        try patch_hits(&right, du, dv, u0, u1, middle, v1, depth + 1, low, high, out)
+
+## Whether a net's hull keeps clear of the ray ahead: a or b of one sign
+## throughout, or c all behind.
+func misses(net: f64[324]*, size: usize) -> bool:
+    for axis in 0..<(usize)3:
+        var below = false
+        var above = false
+        for k in 0..<size:
+            let value = (*net)[k * 4 + axis]
+            if value <= 0.0: below = true
+            if value >= 0.0: above = true
+        if axis < 2 and not (below and above): return true
+        if axis == 2 and not above: return true
+    return false
+
+## De Casteljau at one half, across u (each column of the net) or v.
+func halve(net: f64[324]*, du: i64, dv: i64, across_u: bool, left: f64[324]*, right: f64[324]*):
+    let columns = (usize)dv + 1
+    let lines = columns if across_u else (usize)du + 1
+    let n = (usize)du if across_u else (usize)dv
+    var row: f64[36]
+    for line in 0..<lines:
+        for c in 0..<(usize)4:
+            for i in 0..<n + 1:
+                let k = i * columns + line if across_u else line * columns + i
+                row[i * 4 + c] = (*net)[k * 4 + c]
+            for level in 0..<n + 1:
+                let first_k = level * columns + line if across_u else line * columns + level
+                let last_k = (n - level) * columns + line if across_u else line * columns + n - level
+                (*left)[first_k * 4 + c] = row[c]
+                (*right)[last_k * 4 + c] = row[(n - level) * 4 + c]
+                for i in 0..<n - level: row[i * 4 + c] = (row[i * 4 + c] + row[(i + 1) * 4 + c]) * 0.5
+
+## Newton from the middle of a small part: where a = b = 0, onto `out`
+## when it lands in the part (its far sides only at the patch's own) and
+## ahead of the ray.
+func polish(net: f64[324]*, du: i64, dv: i64, u0: f64, u1: f64, v0: f64, v1: f64, low: Vector3, high: Vector3, out: Growing[SplineHit]*) -> !:
+    var u = 0.5
+    var v = 0.5
+    var bu: f64[36]
+    var bv: f64[36]
+    for _ in 0..<24:
+        bernstein(du, u, bu[..<36])
+        bernstein(dv, v, bv[..<36])
+        let (a, au, av) = net_value(net, du, dv, &bu, &bv, 0)
+        let (b, bu_, bv_) = net_value(net, du, dv, &bu, &bv, 1)
+        let det = au * bv_ - av * bu_
+        if math.abs(det) < 1e-300: return
+        let su = (a * bv_ - av * b) / det
+        let sv = (au * b - a * bu_) / det
+        u -= su
+        v -= sv
+        if math.abs(su) + math.abs(sv) < 1e-14: break
+    # Within the part (a little beyond, rounding), the next part's when
+    # on its near side.
+    let slack = 1e-9
+    if u < -slack or v < -slack or u > 1.0 + slack or v > 1.0 + slack: return
+    if (u >= 1.0 and u1 < 1.0) or (v >= 1.0 and v1 < 1.0): return
+    u = math.clamp(u, 0.0, 1.0)
+    v = math.clamp(v, 0.0, 1.0)
+    bernstein(du, u, bu[..<36])
+    bernstein(dv, v, bv[..<36])
+    let (a, _, _) = net_value(net, du, dv, &bu, &bv, 0)
+    let (b, _, _) = net_value(net, du, dv, &bu, &bv, 1)
+    let (c, _, _) = net_value(net, du, dv, &bu, &bv, 2)
+    let (weight, _, _) = net_value(net, du, dv, &bu, &bv, 3)
+    if weight <= 0.0: return
+    # Not converged onto the ray: no hit.
+    let reach = math.abs(c) + 1e-300
+    if math.abs(a) + math.abs(b) > reach * 1e-9 + weight * 1e-12: return
+    let t = c / weight
+    if t <= 0.0: return
+    let pu = u0 + (u1 - u0) * u
+    let pv = v0 + (v1 - v0) * v
+    let hit = SplineHit(t, low.x + (high.x - low.x) * pu, low.y + (high.y - low.y) * pv)
+    # The same crossing found from a neighbouring part.
+    for other in out.view():
+        if math.abs(other.u - hit.u) + math.abs(other.v - hit.v) < 1e-9: return
+    try out.push(hit)
+
+## Coordinate `axis` of the net at the bases `bu`, `bv` (from bernstein),
+## and its derivatives along u and v.
+func net_value(net: f64[324]*, du: i64, dv: i64, bu: f64[36]*, bv: f64[36]*, axis: usize) -> (f64, f64, f64):
+    var value = 0.0
+    var along_u = 0.0
+    var along_v = 0.0
+    let columns = (usize)dv + 1
+    for i in 0..<(usize)du + 1:
+        for j in 0..<columns:
+            let x = (*net)[(i * columns + j) * 4 + axis]
+            value += (*bu)[i] * (*bv)[j] * x
+            along_u += (*bu)[9 + i] * (*bv)[j] * x
+            along_v += (*bu)[i] * (*bv)[9 + j] * x
+    return (value, along_u, along_v)
+
+## Surface `s` (number `index`) cut into Bezier patches, onto `nets`.
+func cut_patches(nets: Nets*, s: const Surface*, index: usize) -> !:
+    if s.du > most_degree or s.dv > most_degree: error(invalid, "rays through B-splines of degree above 8 are not supported")
+    let nu = (usize)s.nu
+    let nv = (usize)s.nv
+    # Homogeneous points, u-major.
+    var grid = Growing[f64]()
+    defer grid.close()
+    for k in 0..<nu * nv:
+        let weight = s.weights[k]
+        let p = s.points[k]
+        try grid.push(p.x * weight)
+        try grid.push(p.y * weight)
+        try grid.push(p.z * weight)
+        try grid.push(weight)
+    # Along u, every column at once (a line of nv points per u row).
+    var breaks_u = Growing[f64]()
+    defer breaks_u.close()
+    try to_bezier(&grid, s.ku, s.du, nv * 4, &breaks_u)
+    let rows_u = grid.count // (nv * 4)
+    # Then along v: transposed, so each v line is one row.
+    var turned = Growing[f64]()
+    defer turned.close()
+    for j in 0..<nv:
+        for i in 0..<rows_u:
+            for c in 0..<(usize)4: try turned.push(grid.items[(i * nv + j) * 4 + c])
+    var breaks_v = Growing[f64]()
+    defer breaks_v.close()
+    try to_bezier(&turned, s.kv, s.dv, rows_u * 4, &breaks_v)
+    # Patches.
+    let low_u = s.ku[(usize)s.du]
+    let span_u = s.ku[nu] - low_u
+    let low_v = s.kv[(usize)s.dv]
+    let span_v = s.kv[nv] - low_v
+    nets.firsts.items[index] = (i64)nets.starts.count
+    let du = (usize)s.du
+    let dv = (usize)s.dv
+    for pi in 0..<breaks_u.count - 1:
+        for pj in 0..<breaks_v.count - 1:
+            try nets.starts.push(nets.values.count)
+            for i in 0..<du + 1:
+                for j in 0..<dv + 1:
+                    # turned holds v line j' = pj * dv + j, entry i' = pi * du + i.
+                    let at = ((pj * dv + j) * rows_u + pi * du + i) * 4
+                    for c in 0..<(usize)4: try nets.values.push(turned.items[at + c])
+            try nets.lows.push(Vector3((breaks_u.items[pi] - low_u) / span_u, (breaks_v.items[pj] - low_v) / span_v, 0.0))
+            try nets.highs.push(Vector3((breaks_u.items[pi + 1] - low_u) / span_u, (breaks_v.items[pj + 1] - low_v) / span_v, 0.0))
+    nets.counts.items[index] = (breaks_u.count - 1) * (breaks_v.count - 1)
+
+## Knots inserted into the B-spline whose rows of `stride` numbers are
+## `rows` (one row per control point along the direction, knots `knots`,
+## `degree`) until every span is a Bezier segment; the domain's breaks onto
+## `breaks`.
+func to_bezier(rows: Growing[f64]*, knots: const f64[], degree: i64, stride: usize, breaks: Growing[f64]*) -> !:
+    let p = (usize)degree
+    var u = Growing[f64]()
+    defer u.close()
+    for k in knots: try u.push(k)
+    let count = rows.count // stride
+    let low = knots[p]
+    let high = knots[count]
+    try breaks.push(low)
+    var next = Growing[f64]()
+    defer next.close()
+    var at = p + 1
+    while at < u.count and u.items[at] < high:
+        let value = u.items[at]
+        var multiplicity: usize = 0
+        while at + multiplicity < u.count and u.items[at + multiplicity] == value: multiplicity += 1
+        if value > low:
+            try breaks.push(value)
+            for _ in multiplicity..<p:
+                try insert_knot(rows, &u, &next, p, stride, value)
+                multiplicity += 1
+        at += multiplicity
+    try breaks.push(high)
+
+## One knot `value` inserted (Boehm), its rows rebuilt through `scratch`.
+func insert_knot(rows: Growing[f64]*, u: Growing[f64]*, scratch: Growing[f64]*, p: usize, stride: usize, value: f64) -> !:
+    let count = rows.count // stride
+    # The span: u[k] <= value < u[k + 1].
+    var k = p
+    while k + 1 < count and u.items[k + 1] <= value: k += 1
+    scratch.clear()
+    for i in 0..<count + 1:
+        if i + p <= k:
+            for c in 0..<stride: try scratch.push(rows.items[i * stride + c])
+        elif i > k:
+            for c in 0..<stride: try scratch.push(rows.items[(i - 1) * stride + c])
+        else:
+            let a = (value - u.items[i]) / (u.items[i + p] - u.items[i])
+            for c in 0..<stride: try scratch.push((1.0 - a) * rows.items[(i - 1) * stride + c] + a * rows.items[i * stride + c])
+    try rows.assign(scratch.view())
+    # The knot itself, after u[k].
+    try u.push(value)
+    var i = u.count - 1
+    while i > k + 1:
+        u.items[i] = u.items[i - 1]
+        i -= 1
+    u.items[k + 1] = value

@@ -3,7 +3,8 @@
 ## spheres; sampled and bisected on a torus), and whether the hit lies
 ## inside the face (its chart's winding). Three rays, the majority
 ## deciding. No tessellation: classification used to mesh both solids on
-## every boolean. A solid with B-spline faces is classified by its mesh.
+## every boolean. B-spline faces are met through their Bezier patches
+## (spline_rays.lucb).
 
 ## Faces' charts, made the first time a ray meets the face: face f's loops
 ## are starts[firsts[f]..<firsts[f] + loops[f] + 1] into points.
@@ -95,7 +96,7 @@ func ray_roots(s: const Surface*, o: Vector3, d: Vector3, out: Growing[f64]*) ->
                 try out.push((a + b) * 0.5)
             previous = value
         return
-    error(invalid, "rays through B-spline faces are not supported")
+    error(invalid, "B-spline faces are met by spline_hits")
 
 func torus_value(s: const Surface*, q: Vector3, d: Vector3, t: f64) -> f64:
     let p = q.add(d.multiply_scalar(t))
@@ -125,16 +126,26 @@ func quadratic(a: f64, b: f64, c: f64, out: Growing[f64]*) -> !:
 ## Whether `point` lies inside the solid made of faces `first..<last` of
 ## `w`: three rays through its faces, the majority deciding. `size` is the
 ## model's extent (a hit closer than a billionth of it is the start).
-func inside_faces(w: const Shape*, charts: Charts*, first: usize, last: usize, point: Vector3, size: f64) -> bool!:
+func inside_faces(w: const Shape*, charts: Charts*, nets: Nets*, first: usize, last: usize, point: Vector3, size: f64) -> bool!:
     let rays: Vector3[3] = [Vector3(0.5377, 0.8319, 0.1373), Vector3(-0.3271, 0.2491, 0.9116), Vector3(0.7713, -0.5129, -0.3772)]
     var roots = Growing[f64]()
     defer roots.close()
+    var spline = Growing[SplineHit]()
+    defer spline.close()
     var votes = 0
     for ray in rays:
         let d = try ray.normalized()
         var hits = 0
         for f in first..<last:
-            let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+            let index = (usize)w.faces.items[f].surface
+            let s = &w.surfaces.items[index]
+            if s.kind == 3:
+                try spline_hits(nets, w, index, point, d, &spline)
+                for hit in spline.view():
+                    if hit.t <= size * 1e-9: continue
+                    let (points, starts) = try chart_of(charts, w, f)
+                    if chart_winding(points, starts, hit.u, hit.v, false, false) != 0: hits += 1
+                continue
             try ray_roots(s, point, d, &roots)
             for t in roots.view():
                 if t <= size * 1e-9: continue
@@ -145,8 +156,3 @@ func inside_faces(w: const Shape*, charts: Charts*, first: usize, last: usize, p
         if hits % 2 == 1: votes += 1
     return votes >= 2
 
-## Whether faces `first..<last` of `w` are all analytic (rays can meet them).
-func analytic_faces(w: const Shape*, first: usize, last: usize) -> bool:
-    for f in first..<last:
-        if w.surfaces.items[(usize)w.faces.items[f].surface].kind == 3: return false
-    return true

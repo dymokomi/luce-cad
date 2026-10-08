@@ -27,19 +27,29 @@ pub struct NurbsCurve:
 
     ## Rational B-spline curve at an actual knot-domain parameter.
     pub static func at(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], parameter: f64) -> Vector3!:
+        try NurbsCurve.check(points, weights, degree, knots)
+        return try NurbsCurve.at_checked(points, weights, degree, knots, parameter)
+
+    ## Validate a curve's control net and knots once.
+    pub static func check(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[]) -> !:
         let count = (i64)points.length
         if count < 2 or weights.length != points.length:
             error(invalid, "invalid B-spline curve control net")
         try check_knots(knots, count, degree)
+        for index in 0..<points.length:
+            if not points[index].is_finite() or not math.is_finite(weights[index]) or weights[index] <= 0.0:
+                error(invalid, "invalid rational curve control point or weight")
+
+    ## A curve already accepted by check(), at a parameter: only the
+    ## parameter is checked, so stored curves are not revalidated per point.
+    pub static func at_checked(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], parameter: f64) -> Vector3!:
+        let count = (i64)points.length
         if not math.is_finite(parameter) or parameter < knots[(usize)degree] or parameter > knots[(usize)count]:
             error(invalid, "curve parameter outside knot domain")
         var values: f64[9]
         let first = local_basis(knots, count, degree, parameter, &values)
         var total: f64 = 0.0
         var position = Vector3()
-        for index in 0..<points.length:
-            if not points[index].is_finite() or not math.is_finite(weights[index]) or weights[index] <= 0.0:
-                error(invalid, "invalid rational curve control point or weight")
         for at in 0..<(usize)degree + 1:
             let index = first + at
             let weight = values[at] * weights[index]
@@ -48,6 +58,30 @@ pub struct NurbsCurve:
         if total <= 0.0 or not math.is_finite(total):
             error(invalid, "invalid rational curve denominator")
         return position.multiply_scalar(1.0 / total)
+
+    ## A curve already accepted by check(): its point and first and second
+    ## derivatives (by parameter) at `parameter`, exactly (the rational
+    ## quotient rule on the bases' derivatives).
+    pub static func derivatives_checked(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], parameter: f64) -> (Vector3, Vector3, Vector3)!:
+        let count = (i64)points.length
+        if not math.is_finite(parameter) or parameter < knots[(usize)degree] or parameter > knots[(usize)count]:
+            error(invalid, "curve parameter outside knot domain")
+        var ders: f64[27]
+        let first = basis_derivatives(knots, count, degree, parameter, &ders)
+        var a = [Vector3(), Vector3(), Vector3()]
+        var w: f64[3] = [0.0, 0.0, 0.0]
+        for k in 0..<(usize)3:
+            for at in 0..<(usize)degree + 1:
+                let index = first + at
+                let weight = ders[k * 9 + at] * weights[index]
+                w[k] += weight
+                a[k] = a[k].add(points[index].multiply_scalar(weight))
+        if w[0] <= 0.0 or not math.is_finite(w[0]):
+            error(invalid, "invalid rational curve denominator")
+        let p = a[0].multiply_scalar(1.0 / w[0])
+        let d1 = a[1].subtract(p.multiply_scalar(w[1])).multiply_scalar(1.0 / w[0])
+        let d2 = a[2].subtract(d1.multiply_scalar(2.0 * w[1])).subtract(p.multiply_scalar(w[2])).multiply_scalar(1.0 / w[0])
+        return (p, d1, d2)
 
 pub struct NurbsSurface:
     let reserved: u8 = 0
@@ -160,6 +194,68 @@ inline func local_basis(knots: const f64[], count: i64, degree: i64, parameter: 
             saved = left[level - at] * temporary
         (*values)[level] = saved
     return span - (usize)degree
+
+## The nonzero bases at `parameter` and their first and second
+## derivatives (order k at (*out)[k * 9 + i]; zero beyond the degree), as
+## The NURBS Book's A2.3. Returns the first basis's index.
+func basis_derivatives(knots: const f64[], count: i64, degree: i64, parameter: f64, out: f64[27]*) -> usize:
+    var low = (usize)degree
+    var high = (usize)count
+    while low + 1 < high:
+        let middle = (low + high) // 2
+        if parameter < knots[middle]: high = middle
+        else: low = middle
+    let span = low
+    let p = (usize)degree
+    # ndu[j * 9 + r]: bases (upper triangle) and knot differences (lower).
+    var ndu: f64[81]
+    var left: f64[9]
+    var right: f64[9]
+    ndu[0] = 1.0
+    for j in 1..<p + 1:
+        left[j] = parameter - knots[span + 1 - j]
+        right[j] = knots[span + j] - parameter
+        var saved = 0.0
+        for r in 0..<j:
+            ndu[j * 9 + r] = right[r + 1] + left[j - r]
+            let temporary = ndu[r * 9 + j - 1] / ndu[j * 9 + r]
+            ndu[r * 9 + j] = saved + right[r + 1] * temporary
+            saved = left[j - r] * temporary
+        ndu[j * 9 + j] = saved
+    for k in 0..<(usize)27: (*out)[k] = 0.0
+    for j in 0..<p + 1: (*out)[j] = ndu[j * 9 + p]
+    let most: i64 = 2 if degree >= 2 else degree
+    var a: f64[18]
+    for r in 0..<(i64)p + 1:
+        var s1: i64 = 0
+        var s2: i64 = 1
+        a[0] = 1.0
+        for k in 1..<most + 1:
+            var d = 0.0
+            let rk = r - k
+            let pk = degree - k
+            if r >= k:
+                a[(usize)(s2 * 9)] = a[(usize)(s1 * 9)] / ndu[(usize)((pk + 1) * 9 + rk)]
+                d = a[(usize)(s2 * 9)] * ndu[(usize)(rk * 9 + pk)]
+            let j1: i64 = 1 if rk >= -1 else -rk
+            let j2: i64 = k - 1 if r - 1 <= pk else degree - r
+            var j = j1
+            while j <= j2:
+                a[(usize)(s2 * 9 + j)] = (a[(usize)(s1 * 9 + j)] - a[(usize)(s1 * 9 + j - 1)]) / ndu[(usize)((pk + 1) * 9 + rk + j)]
+                d += a[(usize)(s2 * 9 + j)] * ndu[(usize)((rk + j) * 9 + pk)]
+                j += 1
+            if r <= pk:
+                a[(usize)(s2 * 9 + k)] = -a[(usize)(s1 * 9 + k - 1)] / ndu[(usize)((pk + 1) * 9 + r)]
+                d += a[(usize)(s2 * 9 + k)] * ndu[(usize)(r * 9 + pk)]
+            (*out)[(usize)(k * 9 + r)] = d
+            let swap = s1
+            s1 = s2
+            s2 = swap
+    var factor = (f64)degree
+    for k in 1..<most + 1:
+        for j in 0..<(i64)p + 1: (*out)[(usize)(k * 9 + j)] *= factor
+        factor *= (f64)(degree - k)
+    return span - p
 
 ## The hottest function of CAD import: scalar sums in the same order as the
 ## Vector3 form (fp contraction is off), so results are bit-identical.

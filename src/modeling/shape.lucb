@@ -109,21 +109,27 @@ pub struct Shape:
         let (points, weights, knots, degree) = self.spline_net(carrier.spline)
         let low = knots[(usize)degree]
         let high = knots[points.length]
-        return try NurbsCurve.at(points, weights, degree, knots, math.clamp(t, low, high))
+        return try NurbsCurve.at_checked(points, weights, degree, knots, math.clamp(t, low, high))
 
     ## Carrier `c`'s derivative at `t` (by parameter).
     pub func tangent(c: i64, t: f64) -> Vector3!:
+        let (_, d1, _) = try self.derivatives(c, t)
+        return d1
+
+    ## Carrier `c` at `t`, and its first and second derivatives, exactly.
+    pub func derivatives(c: i64, t: f64) -> (Vector3, Vector3, Vector3)!:
         let carrier = self.carriers.items[(usize)c]
-        if carrier.kind == 0: return carrier.x
-        if carrier.kind == 1: return carrier.x.multiply_scalar(-carrier.a * math.sin(t)).add(carrier.y.multiply_scalar(carrier.a * math.cos(t)))
-        if carrier.kind == 3: return carrier.x.multiply_scalar(-carrier.a * math.sin(t)).add(carrier.y.multiply_scalar(carrier.b * math.cos(t)))
+        if carrier.kind == 0: return (carrier.origin.add(carrier.x.multiply_scalar(t)), carrier.x, Vector3())
+        if carrier.kind == 1 or carrier.kind == 3:
+            let b = carrier.a if carrier.kind == 1 else carrier.b
+            let cx = carrier.x.multiply_scalar(carrier.a * math.cos(t))
+            let sy = carrier.y.multiply_scalar(b * math.sin(t))
+            let d1 = carrier.x.multiply_scalar(-carrier.a * math.sin(t)).add(carrier.y.multiply_scalar(b * math.cos(t)))
+            return (carrier.origin.add(cx).add(sy), d1, cx.add(sy).multiply_scalar(-1.0))
         let (points, weights, knots, degree) = self.spline_net(carrier.spline)
         let low = knots[(usize)degree]
         let high = knots[points.length]
-        let h = (high - low) * 1e-6
-        let a = math.clamp(t - h, low, high)
-        let b = math.clamp(t + h, low, high)
-        return (try NurbsCurve.at(points, weights, degree, knots, b)).subtract(try NurbsCurve.at(points, weights, degree, knots, a)).multiply_scalar(1.0 / (b - a))
+        return try NurbsCurve.derivatives_checked(points, weights, degree, knots, math.clamp(t, low, high))
 
     ## Edge `e` at `fraction` of its interval.
     pub func edge_at(e: usize, fraction: f64) -> Vector3!:
@@ -172,6 +178,8 @@ pub struct Shape:
 
     ## A copy of spline net `points` (moved by `matrix`) in the store.
     func store_spline(points: const Vector3[], weights: const f64[], knots: const f64[], degree: i64, matrix: Matrix4) -> i64!:
+        # Checked once here: evaluations skip it (NurbsCurve.at_checked).
+        try NurbsCurve.check(points, weights, degree, knots)
         let first = self.spline_points.count
         let knot_first = self.spline_knots.count
         for at in 0..<points.length:

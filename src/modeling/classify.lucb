@@ -98,14 +98,11 @@ func surface_point(s: const Surface*, u: f64, v: f64) -> Vector3!:
     return s.origin.add(around.multiply_scalar(s.radius + s.angle * math.cos(v))).add(s.z.multiply_scalar(s.angle * math.sin(v)))
 
 ## What pieces are classified against: both solids' faces (their charts,
-## for exact rays, and boxes), the meshes of solids with B-spline faces,
-## made when first needed, and each block's class once a ray found it.
+## for exact rays, and boxes), B-spline surfaces' Bezier patches, and
+## each block's class once a ray found it.
 struct Others:
     var charts: Charts
-    var a: const CadModel*
-    var b: const CadModel*
-    var mesh_a: interop.Reference[Mesh]?
-    var mesh_b: interop.Reference[Mesh]?
+    var nets: Nets
     var lows: Growing[Vector3]
     var highs: Growing[Vector3]
     ## Each solid's box: [0] the first's, [1] the second's.
@@ -117,16 +114,15 @@ struct Others:
 
     func close():
         self.charts.close()
-        if let m = self.mesh_a: m.release()
-        if let m = self.mesh_b: m.release()
+        self.nets.close()
         self.lows.close()
         self.highs.close()
         self.block.close()
         self.block_class.close()
 
-func new_others(work: const Work*, a: const CadModel*, b: const CadModel*) -> Others!:
+func new_others(work: const Work*) -> Others!:
     let w = &work.w
-    var made = Others(try new_charts(w.faces.count), a, b, none, none, Growing[Vector3](), Growing[Vector3](),
+    var made = Others(try new_charts(w.faces.count), try new_nets(w.surfaces.count), Growing[Vector3](), Growing[Vector3](),
                       [Vector3(1.0e300, 1.0e300, 1.0e300), Vector3(1.0e300, 1.0e300, 1.0e300)],
                       [Vector3(-1.0e300, -1.0e300, -1.0e300), Vector3(-1.0e300, -1.0e300, -1.0e300)], Growing[usize](), Growing[i64]())
     errdefer made.close()
@@ -236,14 +232,7 @@ func ray_class(work: Work*, f: usize, point: Vector3, others: Others*) -> i64!:
     # The other solid's faces.
     let first = work.faces_a if work.is_a(f) else 0
     let last = work.w.faces.count if work.is_a(f) else work.faces_a
-    if analytic_faces(&work.w, first, last):
-        return class_in if try inside_faces(&work.w, &others.charts, first, last, point, work.size) else class_out
-    if work.is_a(f):
-        if others.mesh_b == none: others.mesh_b = try others.b.tessellate(16)
-    elif others.mesh_a == none:
-        others.mesh_a = try others.a.tessellate(16)
-    let mesh = (others.mesh_b if work.is_a(f) else others.mesh_a) else error(invalid, "a solid lost its mesh")
-    return class_in if try inside_mesh(mesh.value(), point, work.size) else class_out
+    return class_in if try inside_faces(&work.w, &others.charts, &others.nets, first, last, point, work.size) else class_out
 
 ## Whether `point` is inside the closed `mesh` (of extent `size`): crossings
 ## of three rays through it, the majority deciding.
