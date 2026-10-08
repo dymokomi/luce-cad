@@ -457,7 +457,18 @@ point, and gives the curves Extrude and Revolve read. Lengths are millimeters, a
   quadratic arcs, on the plane given by an origin and the sketch's x and y axes. Construction
   entities make none.
 
-Not yet: ellipses, splines, slots and text; curvature (G2) and polygon constraints.
+- **Modify** (`modify.lucb`), Fusion's MODIFY tools: Trim takes away the piece of a curve between
+  the nearest crossings round where it is picked (the whole curve when nothing crosses it; a
+  circle becomes the arc left); Extend runs a line's or arc's nearest end on to the next curve in its
+  way; Break splits a curve at the crossings round the pick. A new end lies on the curve it was cut at
+  (point-on-curve), a piece split off a line stays collinear, one off an arc keeps its circle.
+  Fillet rounds the corner of two lines sharing a point (an arc tangent to both, its radius
+  dimensioned, the lines shortened); Chamfer cuts it. Offset copies a chain of lines and arcs to one
+  side, the copies meeting where they cross (lines kept parallel). Move/Copy and Scale act on
+  entities (Scale scales their dimensions too). Ends left over are reused, not removed, so only
+  trimming a curve away whole renumbers entities.
+
+Not yet: ellipses, splines, slots and text; curvature (G2) and polygon constraints; Blend Curve.
 
 ## Limits, and what comes next
 

@@ -1,0 +1,125 @@
+## The sketch's MODIFY tools (sketch/modify.lucb): Trim (an arm past a
+## crossing, a middle piece, a circle down to an arc), Extend (a line on to
+## the next one), Break (a line in two), Fillet and Chamfer (a square corner,
+## then solved: the fillet's arc tangent at its radius), Offset (an L, its
+## copies joined), Move/Copy and Scale.
+from luce_std import math
+from luce_geocore.geocore import invalid
+from luce_geocore.core.growing import Growing
+from sketch import Sketch, new_sketch, solve_sketch, ConstraintKind, EntityKind, trim_curve, extend_curve, break_curve, fillet_corner, chamfer_corner, offset_chain, move_entities, scale_entities
+
+pub func sketch_modify_contracts() -> !:
+    try trims()
+    try extends_and_breaks()
+    try corners()
+    try offsets_moves_scales()
+
+## Lines crossing like an X at (5, 5); a line crossed twice; a circle cut by
+## a line.
+func trims() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let a = try s.add_line(try s.add_point(0.0, 0.0), try s.add_point(10.0, 10.0))
+    let b = try s.add_line(try s.add_point(0.0, 10.0), try s.add_point(10.0, 0.0))
+    # The arm of `a` past the crossing, picked near (8, 8), goes.
+    try trim_curve(&s, a, 8.0, 8.0)
+    let end = s.entity(a).second
+    try near(s.x(end), 5.0)
+    try near(s.y(end), 5.0)
+    if not has_on_curve(&s, end, b): error(invalid, "a trimmed end does not stay on the curve it was cut at")
+    # A line crossed at x 3 and x 7: its middle goes, two collinear pieces
+    # stay.
+    var m = new_sketch()
+    defer m.close()
+    let line = try m.add_line(try m.add_point(0.0, 0.0), try m.add_point(10.0, 0.0))
+    _ = try m.add_line(try m.add_point(3.0, -1.0), try m.add_point(3.0, 1.0))
+    _ = try m.add_line(try m.add_point(7.0, -1.0), try m.add_point(7.0, 1.0))
+    let lines_before = count_of(&m, EntityKind.line)
+    try trim_curve(&m, line, 5.0, 0.0)
+    if count_of(&m, EntityKind.line) != lines_before + 1: error(invalid, "trimming a middle piece does not leave two pieces")
+    try near(m.x(m.entity(line).second), 3.0)
+    # A circle crossed by a line: the arc left runs round the other side.
+    var c = new_sketch()
+    defer c.close()
+    let circle = try c.add_circle(try c.add_point(0.0, 0.0), 5.0)
+    _ = try c.add_line(try c.add_point(-10.0, 3.0), try c.add_point(10.0, 3.0))
+    try trim_curve(&c, circle, 0.0, 5.0)
+    if count_of(&c, EntityKind.circle) != 0 or count_of(&c, EntityKind.arc) != 1: error(invalid, "a trimmed circle is not an arc")
+
+## A line stopping short of an upright: extended to it; then broken where
+## another crosses it.
+func extends_and_breaks() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let short = try s.add_line(try s.add_point(0.0, 0.0), try s.add_point(4.0, 0.0))
+    _ = try s.add_line(try s.add_point(10.0, -5.0), try s.add_point(10.0, 5.0))
+    try extend_curve(&s, short, 3.5, 0.0)
+    try near(s.x(s.entity(short).second), 10.0)
+    _ = try s.add_line(try s.add_point(6.0, -5.0), try s.add_point(6.0, 5.0))
+    let lines = count_of(&s, EntityKind.line)
+    try break_curve(&s, short, 8.0, 0.0)
+    if count_of(&s, EntityKind.line) <= lines: error(invalid, "a broken line is not in pieces")
+
+## A square corner at the origin: a fillet of 2 (lines shortened by 2, the
+## arc tangent at radius 2 after a solve), and a chamfer of 1.
+func corners() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let corner = try s.add_point(0.0, 0.0)
+    let a = try s.add_line(corner, try s.add_point(10.0, 0.0))
+    let b = try s.add_line(corner, try s.add_point(0.0, 10.0))
+    let arc = try fillet_corner(&s, a, b, 2.0)
+    let solved = try solve_sketch(&s)
+    if not solved.converged: error(invalid, "a filleted corner does not solve")
+    try near(s.radius_of(arc), 2.0)
+    let ea = s.entity(arc)
+    try near(math.hypot(s.x(ea.third) - s.x(ea.first), s.y(ea.third) - s.y(ea.first)), 2.0)
+    if count_of(&s, EntityKind.point) != 5: error(invalid, "a fillet left the corner point behind")
+    var c = new_sketch()
+    defer c.close()
+    let k = try c.add_point(0.0, 0.0)
+    let p = try c.add_line(k, try c.add_point(10.0, 0.0))
+    let q = try c.add_line(k, try c.add_point(0.0, 10.0))
+    let cut = try chamfer_corner(&c, p, q, 1.0)
+    let e = c.entity(cut)
+    try near(math.hypot(c.x(e.second) - c.x(e.first), c.y(e.second) - c.y(e.first)), math.sqrt(2.0))
+
+## An L of two lines offset 1 inward: its copies meet at (1, 1); a line
+## copied 5 up; a circle scaled 2 about its center.
+func offsets_moves_scales() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let corner = try s.add_point(0.0, 0.0)
+    let a = try s.add_line(try s.add_point(0.0, 10.0), corner)
+    let b = try s.add_line(corner, try s.add_point(10.0, 0.0))
+    var made = Growing[i64]()
+    defer made.close()
+    try offset_chain(&s, [a, b], 1.0, 3.0, 3.0, &made)
+    if made.count != 2: error(invalid, "an offset L is not two lines")
+    let joint = s.entity(made.items[0]).second
+    if joint != s.entity(made.items[1]).first: error(invalid, "an offset L's copies do not share their corner")
+    try near(s.x(joint), 1.0)
+    try near(s.y(joint), 1.0)
+    var copies = Growing[i64]()
+    defer copies.close()
+    try move_entities(&s, [b], 0.0, 5.0, true, &copies)
+    if copies.count != 1: error(invalid, "a copied line is not one line")
+    try near(s.y(s.entity(copies.items[0]).first), 5.0)
+    let circle = try s.add_circle(try s.add_point(20.0, 0.0), 3.0)
+    try scale_entities(&s, [circle], 20.0, 0.0, 2.0)
+    try near(s.radius_of(circle), 6.0)
+
+func has_on_curve(s: const Sketch*, point: i64, curve: i64) -> bool:
+    for k in s.constraints.view():
+        if k.kind == ConstraintKind.on_curve and k.first == point and k.second == curve: return true
+    return false
+
+func count_of(s: const Sketch*, kind: EntityKind) -> usize:
+    var n: usize = 0
+    for e in s.entities.view():
+        if e.kind == kind: n += 1
+    return n
+
+func near(value: f64, expected: f64) -> !:
+    if math.abs(value - expected) > 1e-7 * math.max(1.0, math.abs(expected)):
+        error(invalid, "a modified sketch is not where it should be")
