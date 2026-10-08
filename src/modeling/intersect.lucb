@@ -1,0 +1,138 @@
+## Where two analytic surfaces meet, exactly, as full curves (carriers): the
+## table of cases Fusion-style parts need (docs/research/CAD-MODELING-STUDY.md
+## §5 Phase 3), every one closed form. Lines are unbounded here; the caller
+## bounds and clips them to the faces.
+##
+##   plane / plane        a line, or coincident (same or opposite facing)
+##   plane / cylinder     a circle (axis across the plane), two lines or one
+##                        (axis along it), an ellipse (at an angle)
+##   plane / cone         a circle (axis across the plane)
+##   plane / sphere       a circle
+##   cylinder / cylinder  lines (parallel axes), coincident (one axis, one
+##                        radius)
+##   sphere / sphere      a circle
+## Anything else is not supported yet: the operation says which surfaces.
+
+## What two surfaces share: 0 curves (`out`, maybe none), 1 the same surface
+## facing the same way, 2 the same surface facing opposite ways.
+pub let meet_curves: i64 = 0
+pub let meet_same: i64 = 1
+pub let meet_opposite: i64 = 2
+
+## A unit vector across `n`.
+func across(n: Vector3) -> Vector3!:
+    let seed = Vector3(1.0, 0.0, 0.0) if math.abs(n.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+    return try seed.subtract(n.multiply_scalar(seed.dot(n))).normalized()
+
+## Where `s1` and `s2` meet (see above); `tol` is the model's tolerance.
+pub func meet(s1: const Surface*, s2: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    if s1.kind > s2.kind: return try meet(s2, s1, tol, out)
+    let k1 = s1.kind
+    let k2 = s2.kind
+    if k1 == 0 and k2 == 0: return try plane_plane(s1, s2, tol, out)
+    if k1 == 0 and k2 == 1: return try plane_cylinder(s1, s2, tol, out)
+    if k1 == 0 and k2 == 2: return try plane_cone(s1, s2, tol, out)
+    if k1 == 0 and k2 == 4: return try plane_sphere(s1, s2, tol, out)
+    if k1 == 1 and k2 == 1: return try cylinder_cylinder(s1, s2, tol, out)
+    if k1 == 4 and k2 == 4: return try sphere_sphere(s1, s2, tol, out)
+    if k2 == 3: error(invalid, "booleans with B-spline surfaces (swept splines) are not supported yet")
+    if k2 == 5: error(invalid, "booleans with tori are not supported yet")
+    error(invalid, "where a cone or a sphere meets this surface is not supported yet")
+
+func plane_plane(a: const Surface*, b: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    let direction = a.z.cross(b.z)
+    if direction.length() < 1e-9:
+        if math.abs(b.origin.subtract(a.origin).dot(a.z)) > tol: return meet_curves
+        return meet_same if a.z.dot(b.z) > 0.0 else meet_opposite
+    let d = try direction.normalized()
+    # The point of both planes nearest the first's origin.
+    let h1 = a.z.dot(a.origin)
+    let h2 = b.z.dot(b.origin)
+    let n12 = a.z.dot(b.z)
+    let det = 1.0 - n12 * n12
+    let c1 = (h1 - h2 * n12) / det
+    let c2 = (h2 - h1 * n12) / det
+    let point = a.z.multiply_scalar(c1).add(b.z.multiply_scalar(c2))
+    try out.push(Carrier(0, point, d, Vector3(), 0.0, 0.0, -1))
+    return meet_curves
+
+func plane_cylinder(p: const Surface*, c: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    let n = p.z
+    let axis = c.z
+    let tilt = n.dot(axis)
+    if math.abs(tilt) > 1.0 - 1e-12:
+        # Across: the circle where the plane cuts the axis.
+        let center = c.origin.add(axis.multiply_scalar(p.origin.subtract(c.origin).dot(n) / tilt))
+        try out.push(Carrier(1, center, c.x, axis.cross(c.x), c.radius, c.radius, -1))
+        return meet_curves
+    if math.abs(tilt) < 1e-12:
+        # Along: lines where the plane cuts the cross-section circle.
+        let d = c.origin.subtract(p.origin).dot(n)
+        if math.abs(d) > c.radius + tol: return meet_curves
+        let foot = c.origin.subtract(n.multiply_scalar(d))
+        let side = try axis.cross(n).normalized()
+        if math.abs(math.abs(d) - c.radius) <= tol:
+            try out.push(Carrier(0, foot, axis, Vector3(), 0.0, 0.0, -1))
+            return meet_curves
+        let half = math.sqrt(c.radius * c.radius - d * d)
+        try out.push(Carrier(0, foot.add(side.multiply_scalar(half)), axis, Vector3(), 0.0, 0.0, -1))
+        try out.push(Carrier(0, foot.subtract(side.multiply_scalar(half)), axis, Vector3(), 0.0, 0.0, -1))
+        return meet_curves
+    # At an angle: an ellipse, its major axis the axis's shadow on the plane.
+    let center = c.origin.add(axis.multiply_scalar(p.origin.subtract(c.origin).dot(n) / tilt))
+    let major_axis = try axis.subtract(n.multiply_scalar(tilt)).normalized()
+    let minor_axis = n.cross(major_axis)
+    try out.push(Carrier(3, center, major_axis, minor_axis, c.radius / math.abs(tilt), c.radius, -1))
+    return meet_curves
+
+func plane_cone(p: const Surface*, c: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    let tilt = p.z.dot(c.z)
+    if math.abs(tilt) < 1.0 - 1e-12:
+        error(invalid, "a plane cutting a cone at an angle is not supported yet")
+    let height = p.origin.subtract(c.origin).dot(c.z)
+    let radius = c.radius + height * math.tan(c.angle)
+    if radius <= tol: return meet_curves
+    try out.push(Carrier(1, c.origin.add(c.z.multiply_scalar(height)), c.x, c.z.cross(c.x), radius, radius, -1))
+    return meet_curves
+
+func plane_sphere(p: const Surface*, s: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    let d = s.origin.subtract(p.origin).dot(p.z)
+    if math.abs(d) >= s.radius - tol: return meet_curves
+    let x = try across(p.z)
+    try out.push(Carrier(1, s.origin.subtract(p.z.multiply_scalar(d)), x, p.z.cross(x), math.sqrt(s.radius * s.radius - d * d), 0.0, -1))
+    return meet_curves
+
+func cylinder_cylinder(a: const Surface*, b: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    if a.z.cross(b.z).length() > 1e-9:
+        error(invalid, "cylinders meeting at an angle are not supported yet")
+    # Parallel: circles meeting in the cross-section through a's origin.
+    let offset = b.origin.subtract(a.origin)
+    let planar = offset.subtract(a.z.multiply_scalar(offset.dot(a.z)))
+    let distance = planar.length()
+    if distance <= tol:
+        # One axis and radius: one surface, its normals both outward.
+        if math.abs(a.radius - b.radius) <= tol: return meet_same
+        return meet_curves
+    if distance > a.radius + b.radius + tol or distance < math.abs(a.radius - b.radius) - tol: return meet_curves
+    let toward = try planar.normalized()
+    let along = (distance * distance + a.radius * a.radius - b.radius * b.radius) / (2.0 * distance)
+    let half = math.sqrt(math.max(0.0, a.radius * a.radius - along * along))
+    let side = a.z.cross(toward)
+    let foot = a.origin.add(toward.multiply_scalar(along))
+    try out.push(Carrier(0, foot.add(side.multiply_scalar(half)), a.z, Vector3(), 0.0, 0.0, -1))
+    if half > tol:
+        try out.push(Carrier(0, foot.subtract(side.multiply_scalar(half)), a.z, Vector3(), 0.0, 0.0, -1))
+    return meet_curves
+
+func sphere_sphere(a: const Surface*, b: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    let offset = b.origin.subtract(a.origin)
+    let distance = offset.length()
+    if distance <= tol:
+        if math.abs(a.radius - b.radius) <= tol: return meet_same
+        return meet_curves
+    if distance >= a.radius + b.radius - tol or distance <= math.abs(a.radius - b.radius) + tol: return meet_curves
+    let toward = try offset.normalized()
+    let along = (distance * distance + a.radius * a.radius - b.radius * b.radius) / (2.0 * distance)
+    let x = try across(toward)
+    try out.push(Carrier(1, a.origin.add(toward.multiply_scalar(along)), x, toward.cross(x), math.sqrt(a.radius * a.radius - along * along), 0.0, -1))
+    return meet_curves

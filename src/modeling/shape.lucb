@@ -1,0 +1,278 @@
+## The modeling form of a B-rep: everything in world space (placements
+## applied), each edge a parameter interval of a full curve (a carrier), so
+## operations can split edges, find where curves meet and evaluate them
+## anywhere. Read from a CadModel's B-rep, written back as a new BrepModel.
+
+## A full curve: kind 0 a line (origin + x t, t a length), 1 a circle
+## (origin + a (x cos t + y sin t)), 3 an ellipse (origin + x a cos t +
+## y b sin t), 2 a B-spline of the shape's store (t its knot parameter).
+pub struct Carrier:
+    pub var kind: i64
+    pub var origin: Vector3
+    pub var x: Vector3
+    pub var y: Vector3
+    pub var a: f64
+    pub var b: f64
+    pub var spline: i64
+
+## An edge: its carrier's interval from t0 to t1 (t1 < t0 runs backwards),
+## between vertices start and end.
+pub struct ShapeEdge:
+    pub var carrier: i64
+    pub var t0: f64
+    pub var t1: f64
+    pub var start: i64
+    pub var end: i64
+
+## A face: its surface, whether its normal is the surface's, and its loops:
+## uses[first..<first + count] (signed: +(edge + 1) forward), loop sizes
+## sizes[loop_first..<loop_first + loops], the outer loop first.
+pub struct ShapeFace:
+    pub var surface: i64
+    pub var sense: bool
+    pub var first: usize
+    pub var count: usize
+    pub var loop_first: usize
+    pub var loops: usize
+
+pub struct ShapeSpline:
+    pub var first: usize
+    pub var count: usize
+    pub var knot_first: usize
+    pub var degree: i64
+
+pub struct Shape:
+    pub var tolerance: f64
+    pub var points: Growing[Vector3]
+    pub var carriers: Growing[Carrier]
+    pub var edges: Growing[ShapeEdge]
+    pub var surfaces: Growing[Surface]
+    pub var faces: Growing[ShapeFace]
+    pub var uses: Growing[i64]
+    pub var sizes: Growing[i64]
+    pub var splines: Growing[ShapeSpline]
+    pub var spline_points: Growing[Vector3]
+    pub var spline_weights: Growing[f64]
+    pub var spline_knots: Growing[f64]
+
+    pub func close():
+        self.points.close()
+        self.carriers.close()
+        self.edges.close()
+        for surface in self.surfaces.view():
+            var owned = surface
+            owned.close()
+        self.surfaces.close()
+        self.faces.close()
+        self.uses.close()
+        self.sizes.close()
+        self.splines.close()
+        self.spline_points.close()
+        self.spline_weights.close()
+        self.spline_knots.close()
+
+    pub func spline_net(index: i64) -> (const Vector3[], const f64[], const f64[], i64):
+        let s = self.splines.items[(usize)index]
+        return (self.spline_points.view()[s.first..<s.first + s.count], self.spline_weights.view()[s.first..<s.first + s.count],
+                self.spline_knots.view()[s.knot_first..<s.knot_first + s.count + (usize)s.degree + 1], s.degree)
+
+    ## Carrier `c` at parameter `t`.
+    pub func at(c: i64, t: f64) -> Vector3!:
+        let carrier = self.carriers.items[(usize)c]
+        if carrier.kind == 0: return carrier.origin.add(carrier.x.multiply_scalar(t))
+        if carrier.kind == 1: return carrier.origin.add(carrier.x.multiply_scalar(carrier.a * math.cos(t))).add(carrier.y.multiply_scalar(carrier.a * math.sin(t)))
+        if carrier.kind == 3: return carrier.origin.add(carrier.x.multiply_scalar(carrier.a * math.cos(t))).add(carrier.y.multiply_scalar(carrier.b * math.sin(t)))
+        let (points, weights, knots, degree) = self.spline_net(carrier.spline)
+        let low = knots[(usize)degree]
+        let high = knots[points.length]
+        return try NurbsCurve.at(points, weights, degree, knots, math.clamp(t, low, high))
+
+    ## Carrier `c`'s derivative at `t` (by parameter).
+    pub func tangent(c: i64, t: f64) -> Vector3!:
+        let carrier = self.carriers.items[(usize)c]
+        if carrier.kind == 0: return carrier.x
+        if carrier.kind == 1: return carrier.x.multiply_scalar(-carrier.a * math.sin(t)).add(carrier.y.multiply_scalar(carrier.a * math.cos(t)))
+        if carrier.kind == 3: return carrier.x.multiply_scalar(-carrier.a * math.sin(t)).add(carrier.y.multiply_scalar(carrier.b * math.cos(t)))
+        let (points, weights, knots, degree) = self.spline_net(carrier.spline)
+        let low = knots[(usize)degree]
+        let high = knots[points.length]
+        let h = (high - low) * 1e-6
+        let a = math.clamp(t - h, low, high)
+        let b = math.clamp(t + h, low, high)
+        return (try NurbsCurve.at(points, weights, degree, knots, b)).subtract(try NurbsCurve.at(points, weights, degree, knots, a)).multiply_scalar(1.0 / (b - a))
+
+    ## Edge `e` at `fraction` of its interval.
+    pub func edge_at(e: usize, fraction: f64) -> Vector3!:
+        let edge = self.edges.items[e]
+        return try self.at(edge.carrier, edge.t0 + (edge.t1 - edge.t0) * fraction)
+
+    ## The unit direction edge `e` leaves vertex end `which` (0 its start, 1
+    ## its end) along, going into the edge.
+    pub func leaving(e: usize, which: i64) -> Vector3!:
+        let edge = self.edges.items[e]
+        let t = edge.t0 if which == 0 else edge.t1
+        let sign = 1.0 if (edge.t1 > edge.t0) == (which == 0) else -1.0
+        return try self.tangent(edge.carrier, t).multiply_scalar(sign).normalized()
+
+    pub func add_point(p: Vector3) -> i64!:
+        try self.points.push(p)
+        return (i64)self.points.count - 1
+
+    pub func add_carrier(c: Carrier) -> i64!:
+        try self.carriers.push(c)
+        return (i64)self.carriers.count - 1
+
+    pub func add_edge(edge: ShapeEdge) -> i64!:
+        try self.edges.push(edge)
+        return (i64)self.edges.count - 1
+
+    ## A face of surface `surface` with `uses` in loops of `sizes`.
+    pub func add_face(surface: i64, sense: bool, uses: const i64[], sizes: const i64[]) -> !:
+        try self.faces.push(ShapeFace(surface, sense, self.uses.count, uses.length, self.sizes.count, sizes.length))
+        for use in uses: try self.uses.push(use)
+        for size in sizes: try self.sizes.push(size)
+
+    pub func face_uses(f: usize) -> const i64[]:
+        let face = self.faces.items[f]
+        return self.uses.view()[face.first..<face.first + face.count]
+
+    pub func face_sizes(f: usize) -> const i64[]:
+        let face = self.faces.items[f]
+        return self.sizes.view()[face.loop_first..<face.loop_first + face.loops]
+
+    ## The outward normal of face `f` at `p` (on its surface).
+    pub func face_normal(f: usize, p: Vector3) -> Vector3!:
+        let face = self.faces.items[f]
+        let n = try surface_normal(&self.surfaces.items[(usize)face.surface], p)
+        return n if face.sense else n.multiply_scalar(-1.0)
+
+    ## A copy of spline net `points` (moved by `matrix`) in the store.
+    func store_spline(points: const Vector3[], weights: const f64[], knots: const f64[], degree: i64, matrix: Matrix4) -> i64!:
+        let first = self.spline_points.count
+        let knot_first = self.spline_knots.count
+        for at in 0..<points.length:
+            try self.spline_points.push(matrix.transform_point(points[at]))
+            try self.spline_weights.push(weights[at])
+        for k in knots: try self.spline_knots.push(k)
+        try self.splines.push(ShapeSpline(first, points.length, knot_first, degree))
+        return (i64)self.splines.count - 1
+
+pub func empty_shape(tolerance: f64) -> Shape:
+    return Shape(tolerance, Growing[Vector3](), Growing[Carrier](), Growing[ShapeEdge](), Growing[Surface](), Growing[ShapeFace](),
+                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+
+## Surface `s`'s unit normal at `p`.
+pub func surface_normal(s: const Surface*, p: Vector3) -> Vector3!:
+    let d = p.subtract(s.origin)
+    if s.kind == 0: return s.z
+    if s.kind == 1:
+        return try d.subtract(s.z.multiply_scalar(d.dot(s.z))).normalized()
+    if s.kind == 4: return try d.normalized()
+    if s.kind == 2:
+        # A cone opening by its half angle: radial out, tilted against the axis.
+        let radial = try d.subtract(s.z.multiply_scalar(d.dot(s.z))).normalized()
+        return try radial.multiply_scalar(math.cos(s.angle)).subtract(s.z.multiply_scalar(math.sin(s.angle))).normalized()
+    if s.kind == 5:
+        let radial = try d.subtract(s.z.multiply_scalar(d.dot(s.z))).normalized()
+        return try p.subtract(s.origin.add(radial.multiply_scalar(s.radius))).normalized()
+    error(invalid, "modeling on B-spline surfaces is not supported yet")
+
+## Surface coordinates of `p` on `s`: a plane's (x, y); an angle about the
+## axis and a height (cylinder, cone); longitude and latitude (sphere).
+pub func surface_uv(s: const Surface*, p: Vector3) -> (f64, f64):
+    let d = p.subtract(s.origin)
+    if s.kind == 0: return (d.dot(s.x), d.dot(s.y))
+    let angle = math.atan2(d.dot(s.y), d.dot(s.x))
+    if s.kind == 4: return (angle, math.asin(math.clamp(d.dot(s.z) / math.max(s.radius, 1e-300), -1.0, 1.0)))
+    if s.kind == 5:
+        let ring = math.sqrt(d.dot(s.x) * d.dot(s.x) + d.dot(s.y) * d.dot(s.y)) - s.radius
+        return (angle, math.atan2(d.dot(s.z), ring))
+    return (angle, d.dot(s.z))
+
+## Whether `s`'s first coordinate is an angle (it wraps).
+pub func periodic(s: const Surface*) -> bool:
+    return s.kind != 0
+
+## The shape of `model` (its B-rep, placed). Independent faces are not
+## solids: they are refused.
+pub func shape_of(model: const CadModel*) -> Shape!:
+    if model.independent_faces() > 0: error(invalid, "modeling needs a solid B-rep, not independent faces")
+    let b = model.brep() else error(invalid, "modeling needs a solid B-rep")
+    var shape = empty_shape(b.model_tolerance())
+    errdefer shape.close()
+    let top = model.brep_placement()
+    # Vertices and edges are shared; faces may carry their own placement,
+    # so a face whose placement differs from the first face's is refused.
+    var placement = top
+    if b.face_count() > 0:
+        let first = try b.face_record(0)
+        defer:
+            var owned = first
+            owned.close()
+        placement = top.multiply(first.placement)
+    let scale = placement.transform_direction(Vector3(1.0, 0.0, 0.0)).length()
+    for v in 0..<b.vertex_count():
+        _ = try shape.add_point(placement.transform_point(try b.vertex_at(v)))
+    for e in 0..<b.edge_count():
+        var curve = try b.edge_record(e)
+        defer curve.close()
+        if curve.kind == 0:
+            let a = placement.transform_point(curve.points[0])
+            let z = placement.transform_point(curve.points[1])
+            let along = z.subtract(a)
+            let c = try shape.add_carrier(Carrier(0, a, try along.normalized(), Vector3(), 0.0, 0.0, -1))
+            _ = try shape.add_edge(ShapeEdge(c, 0.0, along.length(), curve.start, curve.end))
+        elif curve.kind == 1 or curve.kind == 3:
+            let x = try placement.transform_direction(curve.x).normalized()
+            let y = try placement.transform_direction(curve.y).normalized()
+            let minor = curve.weights[0] * scale if curve.kind == 3 else curve.radius * scale
+            let c = try shape.add_carrier(Carrier(curve.kind, placement.transform_point(curve.origin), x, y, curve.radius * scale, minor, -1))
+            _ = try shape.add_edge(ShapeEdge(c, curve.angle, curve.angle + curve.sweep, curve.start, curve.end))
+        else:
+            let spline = try shape.store_spline(curve.points, curve.weights, curve.knots, curve.degree, placement)
+            let c = try shape.add_carrier(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline))
+            _ = try shape.add_edge(ShapeEdge(c, curve.angle, curve.angle + curve.sweep, curve.start, curve.end))
+    for s in 0..<b.surface_count():
+        var record = try b.surface_record(s)
+        defer record.close()
+        var moved = Growing[Vector3]()
+        defer moved.close()
+        for p in record.points: try moved.push(placement.transform_point(p))
+        let radius = record.radius * scale
+        # A torus keeps its minor radius in `angle`.
+        let angle = record.angle * scale if record.kind == 5 else record.angle
+        try shape.surfaces.push(try Surface(record.kind, placement.transform_point(record.origin), try placement.transform_direction(record.x).normalized(),
+                                            try placement.transform_direction(record.z).normalized(), radius, angle, moved.view(), record.weights,
+                                            record.ku, record.kv, record.nu, record.nv, record.du, record.dv))
+    for f in 0..<b.face_count():
+        var face = try b.face_record(f)
+        defer face.close()
+        try shape.add_face(face.surface, face.sense, face.uses, face.sizes)
+    return shape
+
+## `shape` as a new B-rep: its points, edges, surfaces and faces as they are.
+pub func brep_of(shape: const Shape*) -> interop.Reference[BrepModel]!:
+    let output = try interop.Reference[BrepModel].adopt(new BrepModel(math.max(shape.tolerance, 1e-9)) in memory.heap, brep_model_type, memory.heap)
+    errdefer output.release()
+    let b = output.value()
+    for p in shape.points.view(): _ = try b.add_vertex(p)
+    for edge in shape.edges.view():
+        let c = shape.carriers.items[(usize)edge.carrier]
+        let forward = edge.t1 > edge.t0
+        if c.kind == 0:
+            _ = try b.add_line(edge.start, edge.end)
+        elif c.kind == 1:
+            _ = try b.add_circle(edge.start, edge.end, c.origin, c.x.cross(c.y), c.x, c.a, forward)
+        elif c.kind == 3:
+            _ = try b.add_ellipse(edge.start, edge.end, c.origin, c.x.cross(c.y), c.x, c.a, c.b, forward)
+        else:
+            let (points, weights, knots, degree) = shape.spline_net(c.spline)
+            _ = try b.add_spline_edge(edge.start, edge.end, points, weights, degree, knots, forward)
+    for s in shape.surfaces.view():
+        if s.kind == 3:
+            _ = try b.add_spline_surface(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv)
+        else:
+            _ = try b.add_surface(s.kind, s.origin, s.z, s.x, s.radius, s.angle)
+    for f in 0..<shape.faces.count:
+        _ = try b.add_face(shape.faces.items[f].surface, shape.face_uses(f), shape.face_sizes(f), shape.faces.items[f].sense)
+    return output

@@ -1,0 +1,692 @@
+## Booleans of two closed solids, OpenCASCADE's General Fuse structure in
+## a lean form (docs/research/CAD-MODELING-STUDY.md §3.1):
+##
+## 1. Both solids in one shape; vertices closer than the tolerance merged.
+## 2. For each pair of faces whose boxes meet, where their surfaces meet
+##    (intersect.lucb), each curve clipped to both faces: its crossings with
+##    either face's boundary split it and the boundary edges (clip.lucb);
+##    the stretches inside both faces become new edges across both. Faces on
+##    one surface (coplanar ones above all: a sketch on a face extruded onto
+##    it) imprint each other's boundaries instead.
+## 3. Every edge cut at its split points; pieces with the same ends and the
+##    same middle are one edge, so faces meeting along new edges share them.
+## 4. Every face split along its new edges (split.lucb).
+## 5. Each piece classified at a point well inside it: on the other solid's
+##    coincident face (facing the same way or not), else inside or outside
+##    the other solid by counting crossings of rays through its mesh.
+## 6. The pieces the operation keeps: union, the outside ones; subtract,
+##    the first's outside and the second's inside, turned; intersect, the
+##    inside ones. Of coincident pieces one is kept or none.
+## 7. Written as a new B-rep; an edge not used exactly twice, once each
+##    way, means the result is not closed: an error, never a broken solid.
+
+pub let op_union: i64 = 0
+pub let op_subtract: i64 = 1
+pub let op_intersect: i64 = 2
+
+## Piece classes.
+let class_out: i64 = 0
+let class_in: i64 = 1
+let class_same: i64 = 2
+let class_opposite: i64 = 3
+
+## Where an original edge is cut, by parameter.
+struct Cut:
+    var edge: usize
+    var t: f64
+
+## A new edge: an interval of a carrier between merged vertices, lying
+## across faces fa and fb (fb -1 for one face).
+struct Section:
+    var edge: ShapeEdge
+    var fa: i64
+    var fb: i64
+
+## Original edge `edge`'s pieces lie across face `face` where inside it.
+struct Imprint:
+    var face: usize
+    var edge: usize
+
+## Two faces on one surface; `same` when their normals agree.
+struct Coincident:
+    var fa: usize
+    var fb: usize
+    var same: bool
+
+## The working state of one boolean.
+struct Work:
+    var w: Shape
+    var faces_a: usize
+    var size: f64
+    var tol: f64
+    ## Merged vertices, and each shape point's merged vertex.
+    var vertices: Growing[Vector3]
+    var point_vertex: Growing[i64]
+    var cuts: Growing[Cut]
+    var sections: Growing[Section]
+    var imprints: Growing[Imprint]
+    var coincident: Growing[Coincident]
+    ## Final edges (vertices merged), and each original edge's pieces:
+    ## piece_ids[piece_starts[e]..<piece_starts[e + 1]], from its start.
+    var finals: Growing[ShapeEdge]
+    var piece_ids: Growing[i64]
+    var piece_starts: Growing[usize]
+    var section_ids: Growing[i64]
+
+    func close():
+        self.w.close()
+        self.vertices.close()
+        self.point_vertex.close()
+        self.cuts.close()
+        self.sections.close()
+        self.imprints.close()
+        self.coincident.close()
+        self.finals.close()
+        self.piece_ids.close()
+        self.piece_starts.close()
+        self.section_ids.close()
+
+    ## The merged vertex at `p`.
+    func vertex(p: Vector3) -> i64!:
+        for at in 0..<self.vertices.count:
+            if self.vertices.items[at].subtract(p).length() <= self.tol * 10.0: return (i64)at
+        try self.vertices.push(p)
+        return (i64)self.vertices.count - 1
+
+    ## The final edge for `edge` (vertices merged): an existing one with the
+    ## same ends and middle, or a new one; and whether `edge` runs its way.
+    func final_edge(edge: ShapeEdge) -> (i64, bool)!:
+        let middle = try self.w.at(edge.carrier, (edge.t0 + edge.t1) * 0.5)
+        for at in 0..<self.finals.count:
+            let other = self.finals.items[at]
+            let same_ends = (other.start == edge.start and other.end == edge.end) or (other.start == edge.end and other.end == edge.start)
+            if not same_ends: continue
+            if (try self.w.at(other.carrier, (other.t0 + other.t1) * 0.5)).subtract(middle).length() > self.tol * 100.0: continue
+            var forward = other.start == edge.start
+            if edge.start == edge.end:
+                # A closed edge: its way by the tangent in its middle.
+                let mine = (try self.w.tangent(edge.carrier, (edge.t0 + edge.t1) * 0.5)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
+                let theirs = (try self.w.tangent(other.carrier, (other.t0 + other.t1) * 0.5)).multiply_scalar(1.0 if other.t1 > other.t0 else -1.0)
+                forward = mine.dot(theirs) > 0.0
+            return ((i64)at, forward)
+        try self.finals.push(edge)
+        return ((i64)self.finals.count - 1, true)
+
+    func is_a(f: usize) -> bool:
+        return f < self.faces_a
+
+## The faces of `w` as boxes: points along their edges (a sphere's whole
+## ball, its rims leave its dome out).
+func face_box(w: const Shape*, f: usize) -> (Vector3, Vector3)!:
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for use in w.face_uses(f):
+        let e = (usize)(use - 1 if use > 0 else -use - 1)
+        for step in 0..<17:
+            let p = try w.edge_at(e, (f64)step / 16.0)
+            low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+            high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+    if s.kind == 4:
+        let r = Vector3(s.radius, s.radius, s.radius)
+        low = s.origin.subtract(r)
+        high = s.origin.add(r)
+    return (low, high)
+
+func boxes_meet(a: (Vector3, Vector3), b: (Vector3, Vector3), pad: f64) -> bool:
+    let (al, ah) = a
+    let (bl, bh) = b
+    return al.x <= bh.x + pad and bl.x <= ah.x + pad and al.y <= bh.y + pad and bl.y <= ah.y + pad and al.z <= bh.z + pad and bl.z <= ah.z + pad
+
+## `source` appended to `into`: indices moved past what `into` has.
+func append_shape(into: Shape*, source: const Shape*) -> !:
+    let points = (i64)into.points.count
+    let carriers = (i64)into.carriers.count
+    let edges = (i64)into.edges.count
+    let surfaces = (i64)into.surfaces.count
+    let splines = (i64)into.splines.count
+    let spline_points = into.spline_points.count
+    let spline_knots = into.spline_knots.count
+    for p in source.points.view(): try into.points.push(p)
+    for s in source.splines.view(): try into.splines.push(ShapeSpline(s.first + spline_points, s.count, s.knot_first + spline_knots, s.degree))
+    for p in source.spline_points.view(): try into.spline_points.push(p)
+    for w in source.spline_weights.view(): try into.spline_weights.push(w)
+    for k in source.spline_knots.view(): try into.spline_knots.push(k)
+    for c in source.carriers.view():
+        var moved = c
+        if moved.spline >= 0: moved.spline += splines
+        try into.carriers.push(moved)
+    for e in source.edges.view(): try into.edges.push(ShapeEdge(e.carrier + carriers, e.t0, e.t1, e.start + points, e.end + points))
+    for s in source.surfaces.view():
+        try into.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
+    var uses = Growing[i64]()
+    defer uses.close()
+    for f in 0..<source.faces.count:
+        uses.clear()
+        for use in source.face_uses(f): try uses.push(use + edges if use > 0 else use - edges)
+        try into.add_face(source.faces.items[f].surface + surfaces, source.faces.items[f].sense, uses.view(), source.face_sizes(f))
+
+## `a` combined with `b` by `op` (op_union, op_subtract, op_intersect).
+pub func combine(a: const CadModel*, b: const CadModel*, op: i64) -> interop.Reference[CadModel]!:
+    var first = try shape_of(a)
+    let faces_a = first.faces.count
+    var second = try shape_of(b)
+    defer second.close()
+    try append_shape(&first, &second)
+    var work = Work(first, faces_a, 1.0, 1e-9, Growing[Vector3](), Growing[i64](), Growing[Cut](), Growing[Section](), Growing[Imprint](),
+                    Growing[Coincident](), Growing[ShapeEdge](), Growing[i64](), Growing[usize](), Growing[i64]())
+    defer work.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<work.w.faces.count:
+        let (l, h) = try face_box(&work.w, f)
+        low = Vector3(math.min(low.x, l.x), math.min(low.y, l.y), math.min(low.z, l.z))
+        high = Vector3(math.max(high.x, h.x), math.max(high.y, h.y), math.max(high.z, h.z))
+    work.size = math.max(1e-6, high.subtract(low).length())
+    work.tol = math.max(work.w.tolerance, second.tolerance)
+    for p in work.w.points.view(): try work.point_vertex.push(try work.vertex(p))
+    try intersect_faces(&work)
+    try cut_edges(&work)
+    let mesh_a = try a.tessellate(16)
+    defer mesh_a.release()
+    let mesh_b = try b.tessellate(16)
+    defer mesh_b.release()
+    return try assemble(&work, op, mesh_a.value(), mesh_b.value())
+
+## Steps 2: new edges where faces of the two solids meet.
+func intersect_faces(work: Work*) -> !:
+    let w = &work.w
+    var lows = Growing[Vector3]()
+    defer lows.close()
+    var highs = Growing[Vector3]()
+    defer highs.close()
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(w, f)
+        try lows.push(l)
+        try highs.push(h)
+    var curves = Growing[Carrier]()
+    defer curves.close()
+    var hits = Growing[Hit]()
+    defer hits.close()
+    var ts = Growing[f64]()
+    defer ts.close()
+    for fa in 0..<work.faces_a:
+        for fb in work.faces_a..<w.faces.count:
+            if not boxes_meet((lows.items[fa], highs.items[fa]), (lows.items[fb], highs.items[fb]), work.tol * 10.0): continue
+            let sa = w.faces.items[fa]
+            let sb = w.faces.items[fb]
+            curves.clear()
+            let met = try meet(&w.surfaces.items[(usize)sa.surface], &w.surfaces.items[(usize)sb.surface], work.tol, &curves)
+            if met != meet_curves:
+                let same = (met == meet_same) == (sa.sense == sb.sense)
+                try work.coincident.push(Coincident(fa, fb, same))
+                try imprint(work, fa, fb)
+                try imprint(work, fb, fa)
+                continue
+            for carrier in curves.view():
+                let c = try w.add_carrier(carrier)
+                var lowest = 0.0
+                var highest = 2.0 * math.pi
+                let closed = carrier.kind != 0
+                if not closed:
+                    # The line across the two faces' boxes, and a margin.
+                    lowest = 1.0e300
+                    highest = -1.0e300
+                    let al = lows.items[fa]
+                    let ah = highs.items[fa]
+                    for corner in 0..<8:
+                        let p = Vector3(ah.x if corner % 2 == 1 else al.x, ah.y if (corner // 2) % 2 == 1 else al.y, ah.z if corner >= 4 else al.z)
+                        let t = p.subtract(carrier.origin).dot(carrier.x)
+                        lowest = math.min(lowest, t)
+                        highest = math.max(highest, t)
+                    lowest -= work.size * 0.1
+                    highest += work.size * 0.1
+                hits.clear()
+                ts.clear()
+                for side in 0..<2:
+                    let f = fa if side == 0 else fb
+                    for use in w.face_uses(f):
+                        let e = (usize)(use - 1 if use > 0 else -use - 1)
+                        let before = hits.count
+                        try crossings(w, c, lowest, highest, e, work.size, work.tol, &hits)
+                        for at in before..<hits.count: try work.cuts.push(Cut(e, hits.items[at].s))
+                for hit in hits.view(): try ts.push(hit.t)
+                try sort(&ts)
+                try add_sections(work, c, closed, lowest, highest, ts.view(), fa, fb)
+
+## The stretches of carrier `c` between consecutive crossings `ts` that lie
+## inside both faces, as sections.
+func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: const f64[], fa: usize, fb: usize) -> !:
+    let w = &work.w
+    var bounds = Growing[f64]()
+    defer bounds.close()
+    for t in ts:
+        if bounds.count > 0 and (try w.at(c, t)).subtract(try w.at(c, bounds.items[bounds.count - 1])).length() <= work.tol * 10.0: continue
+        try bounds.push(t)
+    if closed:
+        if bounds.count > 1 and (try w.at(c, bounds.items[0])).subtract(try w.at(c, bounds.items[bounds.count - 1])).length() <= work.tol * 10.0:
+            bounds.count -= 1
+        if bounds.count == 0: try bounds.push(try seam_parameter(work, c, fa, fb))
+        try bounds.push(bounds.items[0] + 2.0 * math.pi)
+    let count = bounds.count
+    if count < 2: return
+    for at in 0..<count - 1:
+        let t0 = bounds.items[at]
+        let t1 = bounds.items[at + 1]
+        let middle = try w.at(c, (t0 + t1) * 0.5)
+        let ia = try face_contains(w, fa, middle, work.tol)
+        let ib = try face_contains(w, fb, middle, work.tol)
+        if ia == outside or ib == outside or (ia == on_boundary and ib == on_boundary): continue
+        let start = try work.vertex(try w.at(c, t0))
+        let end = try work.vertex(try w.at(c, t1))
+        try work.sections.push(Section(ShapeEdge(c, t0, t1, start, end), (i64)fa, (i64)fb))
+    _ = low
+    _ = high
+
+## Face `onto` and coincident face `source`: where `source`'s boundary
+## crosses `onto`'s, both cut; `source`'s boundary inside `onto` imprints it.
+func imprint(work: Work*, onto: usize, source: usize) -> !:
+    let w = &work.w
+    var hits = Growing[Hit]()
+    defer hits.close()
+    for use in w.face_uses(source):
+        let e = (usize)(use - 1 if use > 0 else -use - 1)
+        let edge = w.edges.items[e]
+        for other in w.face_uses(onto):
+            let o = (usize)(other - 1 if other > 0 else -other - 1)
+            hits.clear()
+            try crossings(w, edge.carrier, edge.t0, edge.t1, o, work.size, work.tol, &hits)
+            for hit in hits.view():
+                try work.cuts.push(Cut(e, hit.t))
+                try work.cuts.push(Cut(o, hit.s))
+        try work.imprints.push(Imprint(onto, e))
+
+## Step 3: every original edge cut where it was crossed, into final edges.
+func cut_edges(work: Work*) -> !:
+    let w = &work.w
+    var ts = Growing[f64]()
+    defer ts.close()
+    try work.piece_starts.push(0)
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        ts.clear()
+        let span = edge.t1 - edge.t0
+        for cut in work.cuts.view():
+            if cut.edge != e: continue
+            let f = (cut.t - edge.t0) / span
+            if f > 1e-9 and f < 1.0 - 1e-9: try ts.push(f)
+        try sort(&ts)
+        var previous_fraction = 0.0
+        var previous_vertex = work.point_vertex.items[(usize)edge.start]
+        for at in 0..<ts.count + 1:
+            let fraction = ts.items[at] if at < ts.count else 1.0
+            let vertex = (try work.vertex(try w.edge_at(e, fraction))) if at < ts.count else work.point_vertex.items[(usize)edge.end]
+            if vertex == previous_vertex and at < ts.count: continue
+            if vertex == previous_vertex and fraction - previous_fraction < 1e-9: continue
+            let piece = ShapeEdge(edge.carrier, edge.t0 + span * previous_fraction, edge.t0 + span * fraction, previous_vertex, vertex)
+            let (id, forward) = try work.final_edge(piece)
+            try work.piece_ids.push((id + 1) * (1 if forward else -1))
+            previous_fraction = fraction
+            previous_vertex = vertex
+        try work.piece_starts.push(work.piece_ids.count)
+    for section in work.sections.view():
+        let (id, forward) = try work.final_edge(section.edge)
+        try work.section_ids.push((id + 1) * (1 if forward else -1))
+
+## Steps 4 to 7: split, classify, select and write.
+func assemble(work: Work*, op: i64, mesh_a: const Mesh*, mesh_b: const Mesh*) -> interop.Reference[CadModel]!:
+    let w = &work.w
+    var traced = try final_shape(work)
+    defer traced.close()
+    var halves = Growing[HalfEdge]()
+    defer halves.close()
+    var kept = Growing[(usize, usize, bool)]()
+    defer kept.close()
+    var pieces = try new_pieces()
+    defer pieces.close()
+    var piece_face = Growing[usize]()
+    defer piece_face.close()
+    for f in 0..<w.faces.count:
+        halves.clear()
+        # The boundary, piece by piece, the way the face uses each edge.
+        for use in w.face_uses(f):
+            let e = (usize)(use - 1 if use > 0 else -use - 1)
+            let first = work.piece_starts.items[e]
+            let last = work.piece_starts.items[e + 1]
+            for k in 0..<last - first:
+                let id = work.piece_ids.items[first + k if use > 0 else last - 1 - k]
+                let forward = (id > 0) == (use > 0)
+                try halves.push(HalfEdge((id if id > 0 else -id) - 1, forward))
+        let boundary = halves.count
+        # New edges across it, both ways, unless already on its boundary.
+        for at in 0..<work.sections.count:
+            let section = work.sections.items[at]
+            if section.fa != (i64)f and section.fb != (i64)f: continue
+            try add_both(&halves, boundary, work.section_ids.items[at])
+        for mark in work.imprints.view():
+            if mark.face != f: continue
+            let first = work.piece_starts.items[mark.edge]
+            let last = work.piece_starts.items[mark.edge + 1]
+            for k in first..<last:
+                let id = work.piece_ids.items[k]
+                let final = work.finals.items[(usize)((id if id > 0 else -id) - 1)]
+                let middle = try w.at(final.carrier, (final.t0 + final.t1) * 0.5)
+                if try face_contains(w, f, middle, work.tol) == inside_face: try add_both(&halves, boundary, id)
+        let before = pieces.piece_count()
+        try split_face(&traced, f, halves.view(), try face_pole(w, f), &pieces)
+        for _ in before..<pieces.piece_count(): try piece_face.push(f)
+    # Classify and select.
+    var keep = Growing[bool]()
+    defer keep.close()
+    var turn = Growing[bool]()
+    defer turn.close()
+    for p in 0..<pieces.piece_count():
+        let f = piece_face.items[p]
+        let class = try classify(work, &traced, f, &pieces, p, mesh_b if work.is_a(f) else mesh_a)
+        let first = work.is_a(f)
+        var take = false
+        var flip = false
+        if op == op_union:
+            take = class == class_out or (class == class_same and first)
+        elif op == op_subtract:
+            if first: take = class == class_out or class == class_opposite
+            else:
+                take = class == class_in
+                flip = true
+        else:
+            take = class == class_in or (class == class_same and first)
+        try keep.push(take)
+        try turn.push(flip)
+    try seam_zones(work, &traced, &pieces, piece_face.view(), keep.view())
+    return try write_result(work, &pieces, piece_face.view(), keep.view(), turn.view())
+
+## Where closed curve `c` crosses the seam meridian (chart angle 0) of
+## whichever of faces fa and fb lies on a sphere (0 when neither does), so
+## a closed edge on a sphere has its vertex where seam_zones can join it.
+func seam_parameter(work: Work*, c: i64, fa: usize, fb: usize) -> f64!:
+    let w = &work.w
+    var surface: i64 = -1
+    if w.surfaces.items[(usize)w.faces.items[fa].surface].kind == 4: surface = w.faces.items[fa].surface
+    if w.surfaces.items[(usize)w.faces.items[fb].surface].kind == 4: surface = w.faces.items[fb].surface
+    if surface < 0: return 0.0
+    let s = &w.surfaces.items[(usize)surface]
+    let steps = 256
+    var previous = surface_uv(s, try w.at(c, 0.0)).0
+    for at in 1..<steps + 1:
+        let t = 2.0 * math.pi * (f64)at / (f64)steps
+        let u = surface_uv(s, try w.at(c, t)).0
+        # Through angle 0, not across the far side's wrap.
+        if (previous <= 0.0) != (u <= 0.0) and math.abs(u - previous) < math.pi:
+            var low = t - 2.0 * math.pi / (f64)steps
+            var high = t
+            for _ in 0..<60:
+                let middle = (low + high) * 0.5
+                if (surface_uv(s, try w.at(c, middle)).0 <= 0.0) == (previous <= 0.0): low = middle
+                else: high = middle
+            return (low + high) * 0.5
+        previous = u
+    return 0.0
+
+## A kept piece on a sphere bounded by two loops each going once around (a
+## zone between two latitudes, which the tessellator meshes only as a seamed
+## patch) gets a seam: a meridian edge from a vertex at angle 0 on one loop
+## to one on the other, both loops and the seam both ways becoming one loop.
+func seam_zones(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face: const usize[], keep: const bool[]) -> !:
+    let w = &work.w
+    var chart = Growing[Vector3]()
+    defer chart.close()
+    var wrapping = Growing[usize]()
+    defer wrapping.close()
+    var joined = Growing[i64]()
+    defer joined.close()
+    for p in 0..<pieces.piece_count():
+        if not keep[p]: continue
+        let face = w.faces.items[piece_face[p]]
+        let s = &w.surfaces.items[(usize)face.surface]
+        if s.kind != 4: continue
+        wrapping.clear()
+        let first = pieces.piece_starts.items[p]
+        let last = pieces.piece_starts.items[p + 1]
+        for k in first..<last:
+            chart.clear()
+            try loop_chart(traced, face.surface, 0.0, pieces.cycle(pieces.pieces.items[k]), &chart)
+            if math.abs(chart.items[chart.count - 1].x - chart.items[0].x) > math.pi: try wrapping.push(k)
+        if wrapping.count < 2: continue
+        if wrapping.count > 2: error(invalid, "a piece of a sphere between more than two circles is not supported yet")
+        let outer = pieces.pieces.items[wrapping.items[0]]
+        let hole = pieces.pieces.items[wrapping.items[1]]
+        let (outer_at, v_outer) = try seam_vertex(work, s, pieces.cycle(outer))
+        let (hole_at, v_hole) = try seam_vertex(work, s, pieces.cycle(hole))
+        let lat_outer = surface_uv(s, work.vertices.items[(usize)v_outer]).1
+        let lat_hole = surface_uv(s, work.vertices.items[(usize)v_hole]).1
+        let c = try w.add_carrier(Carrier(1, s.origin, s.x, s.z, s.radius, s.radius, -1))
+        let (id, forward) = try work.final_edge(ShapeEdge(c, lat_outer, lat_hole, v_outer, v_hole))
+        let seam = (id + 1) * (1 if forward else -1)
+        joined.clear()
+        let outer_uses = pieces.cycle(outer)
+        let hole_uses = pieces.cycle(hole)
+        for k in 0..<outer_uses.length: try joined.push(outer_uses[(outer_at + k) % outer_uses.length])
+        try joined.push(seam)
+        for k in 0..<hole_uses.length: try joined.push(hole_uses[(hole_at + k) % hole_uses.length])
+        try joined.push(-seam)
+        for use in joined.view(): try pieces.uses.push(use)
+        try pieces.cycle_starts.push(pieces.uses.count)
+        pieces.pieces.items[wrapping.items[0]] = pieces.cycle_starts.count - 2
+        # The hole's place holds an empty cycle now.
+        try pieces.cycle_starts.push(pieces.uses.count)
+        pieces.pieces.items[wrapping.items[1]] = pieces.cycle_starts.count - 2
+
+## The use of `cycle` that leaves a vertex at chart angle 0 of sphere `s`,
+## and that vertex.
+func seam_vertex(work: Work*, s: const Surface*, cycle: const i64[]) -> (usize, i64)!:
+    for k in 0..<cycle.length:
+        let use = cycle[k]
+        let edge = work.finals.items[(usize)((use if use > 0 else -use) - 1)]
+        let v = edge.start if use > 0 else edge.end
+        let d = work.vertices.items[(usize)v].subtract(s.origin)
+        if math.abs(d.dot(s.y)) <= work.tol * 10.0 and d.dot(s.x) > 0.0: return (k, v)
+    error(invalid, "a zone of a sphere has no vertex on its seam to join")
+
+## Add final edge `id` (signed) to `halves` both ways, unless one of the
+## first `boundary` halves is it.
+func add_both(halves: Growing[HalfEdge]*, boundary: usize, id: i64) -> !:
+    let edge = (id if id > 0 else -id) - 1
+    for at in 0..<boundary:
+        if halves.items[at].edge == edge: return
+    for at in boundary..<halves.count:
+        if halves.items[at].edge == edge: return
+    try halves.push(HalfEdge(edge, true))
+    try halves.push(HalfEdge(edge, false))
+
+## The shape faces are split in: the final edges over the merged
+## vertices, with the work shape's carriers, surfaces and faces (their
+## surfaces and senses; their loops are what is being split).
+func final_shape(work: Work*) -> Shape!:
+    var s = empty_shape(work.tol)
+    errdefer s.close()
+    for p in work.vertices.view(): try s.points.push(p)
+    for c in work.w.carriers.view(): try s.carriers.push(c)
+    for sp in work.w.splines.view(): try s.splines.push(sp)
+    for p in work.w.spline_points.view(): try s.spline_points.push(p)
+    for x in work.w.spline_weights.view(): try s.spline_weights.push(x)
+    for k in work.w.spline_knots.view(): try s.spline_knots.push(k)
+    for e in work.finals.view(): try s.edges.push(e)
+    for su in work.w.surfaces.view():
+        try s.surfaces.push(try Surface(su.kind, su.origin, su.x, su.z, su.radius, su.angle, su.points, su.weights, su.ku, su.kv, su.nu, su.nv, su.du, su.dv))
+    for face in work.w.faces.view():
+        try s.faces.push(ShapeFace(face.surface, face.sense, 0, 0, 0, 0))
+    return s
+
+## A point well inside piece `p` of face `f`: across the middle of its
+## chart, the middle of the widest stretch inside it, on the surface.
+func piece_point(work: Work*, traced: const Shape*, f: usize, pieces: const Pieces*, p: usize) -> Vector3!:
+    let face = work.w.faces.items[f]
+    var chart = Growing[Vector3]()
+    defer chart.close()
+    var starts = Growing[usize]()
+    defer starts.close()
+    for c in pieces.piece_cycles(p):
+        try starts.push(chart.count)
+        try loop_chart(traced, face.surface, try face_pole(&work.w, f), pieces.cycle(c), &chart)
+    try starts.push(chart.count)
+    var low = Vector3(1.0e300, 1.0e300, 0.0)
+    var high = Vector3(-1.0e300, -1.0e300, 0.0)
+    for q in chart.view():
+        low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), 0.0)
+        high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), 0.0)
+    # Angles count by the radius, so clearances compare like lengths.
+    let s = &work.w.surfaces.items[(usize)face.surface]
+    let wraps = periodic(s)
+    let scale = 1.0 if s.kind == 0 else math.max(s.radius, 1e-300)
+    var best_u = 0.0
+    var best_v = 0.0
+    var best_width = -1.0
+    var best_clearance = -1.0
+    # A grid of candidates off the vertices (an irrational step); of those
+    # inside, the one farthest from every boundary segment.
+    for row in 0..<24:
+        let v = low.y + (high.y - low.y) * (((f64)row + 0.5) / 24.0 + 0.0123456789)
+        for column in 0..<48:
+            let u = low.x + (high.x - low.x) * (((f64)column + 0.5) / 48.0 + 0.0098765432)
+            if chart_winding(chart.view(), starts.view(), u, v, wraps) == 0: continue
+            var clearance = 1.0e300
+            for loop in 0..<starts.count - 1:
+                let first = starts.items[loop]
+                let last = starts.items[loop + 1]
+                for k in first..<last:
+                    let a = chart.items[k]
+                    let b = chart.items[first if k + 1 == last else k + 1]
+                    let d = segment_distance(Vector3(a.x * scale, a.y, 0.0), Vector3(b.x * scale, b.y, 0.0), Vector3(u * scale, v, 0.0), Vector3(u * scale, v, 0.0))
+                    clearance = math.min(clearance, d)
+            if clearance > best_clearance:
+                best_clearance = clearance
+                best_width = clearance
+                best_u = u
+                best_v = v
+    if best_width < 0.0: error(invalid, "a face piece has no inside to classify")
+    return surface_point(&work.w.surfaces.items[(usize)face.surface], best_u, best_v)
+
+## The point of `s` at chart coordinates (u, v) (surface_uv's inverse).
+func surface_point(s: const Surface*, u: f64, v: f64) -> Vector3:
+    if s.kind == 0: return s.origin.add(s.x.multiply_scalar(u)).add(s.y.multiply_scalar(v))
+    let around = s.x.multiply_scalar(math.cos(u)).add(s.y.multiply_scalar(math.sin(u)))
+    if s.kind == 1: return s.origin.add(around.multiply_scalar(s.radius)).add(s.z.multiply_scalar(v))
+    if s.kind == 2: return s.origin.add(around.multiply_scalar(s.radius + v * math.tan(s.angle))).add(s.z.multiply_scalar(v))
+    if s.kind == 4: return s.origin.add(around.multiply_scalar(s.radius * math.cos(v))).add(s.z.multiply_scalar(s.radius * math.sin(v)))
+    return s.origin.add(around.multiply_scalar(s.radius + s.angle * math.cos(v))).add(s.z.multiply_scalar(s.angle * math.sin(v)))
+
+## Piece `p` of face `f` against the other solid (`other` its mesh).
+func classify(work: Work*, traced: const Shape*, f: usize, pieces: const Pieces*, p: usize, other: const Mesh*) -> i64!:
+    let point = try piece_point(work, traced, f, pieces, p)
+    for pair in work.coincident.view():
+        let partner = pair.fb if pair.fa == f else (pair.fa if pair.fb == f else f)
+        if partner == f: continue
+        if try face_contains(&work.w, partner, point, work.tol) != outside:
+            return class_same if pair.same else class_opposite
+    # Crossings of three rays through the other mesh; the majority decides.
+    let rays: Vector3[3] = [Vector3(0.5377, 0.8319, 0.1373), Vector3(-0.3271, 0.2491, 0.9116), Vector3(0.7713, -0.5129, -0.3772)]
+    var inside_votes = 0
+    for ray in rays:
+        let direction = try ray.normalized()
+        var origin = point
+        var crossings_count = 0
+        for _ in 0..<10000:
+            let distance = try other.ray_distance(origin, direction)
+            if distance < 0.0: break
+            crossings_count += 1
+            origin = origin.add(direction.multiply_scalar(distance + work.size * 1e-7))
+        if crossings_count % 2 == 1: inside_votes += 1
+    return class_in if inside_votes >= 2 else class_out
+
+## Step 7: the kept pieces as a new B-rep.
+func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[], keep: const bool[], turn: const bool[]) -> interop.Reference[CadModel]!:
+    let w = &work.w
+    var uses_count = Growing[i64]()
+    defer uses_count.close()
+    var direction = Growing[i64]()
+    defer direction.close()
+    for _ in 0..<work.finals.count:
+        try uses_count.push(0)
+        try direction.push(0)
+    for p in 0..<pieces.piece_count():
+        if not keep[p]: continue
+        for c in pieces.piece_cycles(p):
+            for use in pieces.cycle(c):
+                let e = (usize)((use if use > 0 else -use) - 1)
+                uses_count.items[e] += 1
+                direction.items[e] += (1 if use > 0 else -1) * (-1 if turn[p] else 1)
+    var open_edges = 0
+    for e in 0..<work.finals.count:
+        if uses_count.items[e] != 0 and (uses_count.items[e] != 2 or direction.items[e] != 0):
+            open_edges += 1
+            let fe = work.finals.items[e]
+    if open_edges > 0:
+        error(invalid, "the result is not a closed solid (some edges are not shared by two faces); this operation is not supported for these shapes yet")
+    let output = try interop.Reference[BrepModel].adopt(new BrepModel(math.max(work.tol * 20.0, 1e-9)) in memory.heap, brep_model_type, memory.heap)
+    defer output.release()
+    let b = output.value()
+    var vertex_ids = Growing[i64]()
+    defer vertex_ids.close()
+    for _ in work.vertices.view(): try vertex_ids.push(-1)
+    var edge_ids = Growing[i64]()
+    defer edge_ids.close()
+    for e in 0..<work.finals.count:
+        if uses_count.items[e] == 0:
+            try edge_ids.push(-1)
+            continue
+        let edge = work.finals.items[e]
+        if vertex_ids.items[(usize)edge.start] < 0: vertex_ids.items[(usize)edge.start] = try b.add_vertex(work.vertices.items[(usize)edge.start])
+        if vertex_ids.items[(usize)edge.end] < 0: vertex_ids.items[(usize)edge.end] = try b.add_vertex(work.vertices.items[(usize)edge.end])
+        let start = vertex_ids.items[(usize)edge.start]
+        let end = vertex_ids.items[(usize)edge.end]
+        let c = w.carriers.items[(usize)edge.carrier]
+        let forward = edge.t1 > edge.t0
+        var id: i64 = -1
+        if c.kind == 0: id = try b.add_line(start, end)
+        elif c.kind == 1: id = try b.add_circle(start, end, c.origin, c.x.cross(c.y), c.x, c.a, forward)
+        elif c.kind == 3: id = try b.add_ellipse(start, end, c.origin, c.x.cross(c.y), c.x, c.a, c.b, forward)
+        else:
+            let (points, weights, knots, degree) = w.spline_net(c.spline)
+            id = try b.add_spline_edge(start, end, points, weights, degree, knots, forward)
+        try edge_ids.push(id)
+    var surface_ids = Growing[i64]()
+    defer surface_ids.close()
+    for _ in w.surfaces.view(): try surface_ids.push(-1)
+    var uses = Growing[i64]()
+    defer uses.close()
+    var sizes = Growing[i64]()
+    defer sizes.close()
+    for p in 0..<pieces.piece_count():
+        if not keep[p]: continue
+        let face = w.faces.items[piece_face[p]]
+        let si = (usize)face.surface
+        if surface_ids.items[si] < 0:
+            let s = w.surfaces.items[si]
+            surface_ids.items[si] = (try b.add_spline_surface(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv)) if s.kind == 3 else (try b.add_surface(s.kind, s.origin, s.z, s.x, s.radius, s.angle))
+        uses.clear()
+        sizes.clear()
+        for c in pieces.piece_cycles(p):
+            let cycle = pieces.cycle(c)
+            if cycle.length == 0: continue
+            for k in 0..<cycle.length:
+                # A turned piece runs each loop backwards.
+                var use = cycle[k]
+                if turn[p]: use = -cycle[cycle.length - 1 - k]
+                let e = (usize)((use if use > 0 else -use) - 1)
+                try uses.push((edge_ids.items[e] + 1) * (1 if use > 0 else -1))
+            try sizes.push((i64)cycle.length)
+        _ = try b.add_face(surface_ids.items[si], uses.view(), sizes.view(), face.sense != turn[p])
+    let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
+    errdefer result.release()
+    try result.value().attach_brep(output)
+    return result
+
+## Insertion sort (the lists are short).
+func sort(values: Growing[f64]*) -> !:
+    for i in 1..<values.count:
+        let value = values.items[i]
+        var j = i
+        while j > 0 and values.items[j - 1] > value:
+            values.items[j] = values.items[j - 1]
+            j -= 1
+        values.items[j] = value

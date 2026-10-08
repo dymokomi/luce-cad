@@ -1,0 +1,262 @@
+## Curves against faces: where a curve crosses an edge (both on one
+## surface), the point of a curve nearest a point, and whether a point of a
+## face's surface lies inside the face, on its boundary or outside. Crossings
+## are found on sampled segments, then refined on the exact curves (Newton
+## on the distance between them), so a hit is exact to the tolerance.
+
+## A crossing: parameter `t` on the curve, `s` on the edge's carrier.
+pub struct Hit:
+    pub var t: f64
+    pub var s: f64
+
+## Samples a carrier interval is cut into for a search: lines by length
+## against `size`, conics by angle, splines evenly.
+func sample_count(w: const Shape*, c: i64, low: f64, high: f64, size: f64) -> usize:
+    let kind = w.carriers.items[(usize)c].kind
+    if kind == 0: return (usize)math.clamp(math.abs(high - low) / size * 64.0, 4.0, 4096.0)
+    if kind == 1 or kind == 3: return (usize)math.clamp(math.abs(high - low) / 0.05, 8.0, 512.0)
+    return 96
+
+## The parameter of carrier `c` in [low, high] nearest `p`.
+pub func nearest_on(w: const Shape*, c: i64, p: Vector3, low: f64, high: f64) -> f64!:
+    let carrier = w.carriers.items[(usize)c]
+    let a = math.min(low, high)
+    let b = math.max(low, high)
+    if carrier.kind == 0: return math.clamp(p.subtract(carrier.origin).dot(carrier.x), a, b)
+    var best = a
+    var best_distance = 1.0e300
+    let count = 64
+    for at in 0..<count + 1:
+        let t = a + (b - a) * (f64)at / (f64)count
+        let d = (try w.at(c, t)).subtract(p).length()
+        if d < best_distance:
+            best_distance = d
+            best = t
+    # Newton on the derivative of the squared distance.
+    var t = best
+    for _ in 0..<30:
+        let r = (try w.at(c, t)).subtract(p)
+        let d1 = try w.tangent(c, t)
+        let h = (b - a) * 1e-7 + 1e-12
+        let d2 = (try w.tangent(c, math.min(b, t + h))).subtract(try w.tangent(c, math.max(a, t - h))).multiply_scalar(1.0 / (math.min(b, t + h) - math.max(a, t - h)))
+        let g = r.dot(d1)
+        let curvature = d1.dot(d1) + r.dot(d2)
+        if math.abs(curvature) < 1e-300: break
+        let next = math.clamp(t - g / curvature, a, b)
+        if math.abs(next - t) < (b - a) * 1e-14: break
+        t = next
+    if (try w.at(c, t)).subtract(p).length() > best_distance: return best
+    return t
+
+## Where carrier `c` on [low, high] crosses edge `e`, both on one surface,
+## onto `out`; an edge lying along the curve gives its two ends. `size` is
+## the model's extent, `tol` its tolerance.
+pub func crossings(w: const Shape*, c: i64, low: f64, high: f64, e: usize, size: f64, tol: f64, out: Growing[Hit]*) -> !:
+    let edge = w.edges.items[e]
+    let ec = edge.carrier
+    # Along the curve: the edge's ends and middle all on it.
+    let start = try w.at(ec, edge.t0)
+    let end = try w.at(ec, edge.t1)
+    let middle = try w.at(ec, (edge.t0 + edge.t1) * 0.5)
+    let ts = try nearest_on(w, c, start, low, high)
+    let te = try nearest_on(w, c, end, low, high)
+    let tm = try nearest_on(w, c, middle, low, high)
+    if (try w.at(c, ts)).subtract(start).length() <= tol * 10.0 and (try w.at(c, te)).subtract(end).length() <= tol * 10.0 and (try w.at(c, tm)).subtract(middle).length() <= tol * 10.0:
+        try out.push(Hit(ts, edge.t0))
+        try out.push(Hit(te, edge.t1))
+        return
+    let n = sample_count(w, c, low, high, size)
+    let m = sample_count(w, ec, edge.t0, edge.t1, size)
+    var curve = Growing[Vector3]()
+    defer curve.close()
+    var other = Growing[Vector3]()
+    defer other.close()
+    for at in 0..<n + 1: try curve.push(try w.at(c, low + (high - low) * (f64)at / (f64)n))
+    for at in 0..<m + 1: try other.push(try w.at(ec, edge.t0 + (edge.t1 - edge.t0) * (f64)at / (f64)m))
+    for i in 0..<n:
+        let a0 = curve.items[i]
+        let a1 = curve.items[i + 1]
+        let reach_a = a1.subtract(a0).length()
+        for j in 0..<m:
+            let b0 = other.items[j]
+            let b1 = other.items[j + 1]
+            let reach = (reach_a + b1.subtract(b0).length()) * 0.6 + tol * 10.0
+            if segment_distance(a0, a1, b0, b1) > reach: continue
+            let t_guess = low + (high - low) * ((f64)i + 0.5) / (f64)n
+            let s_guess = edge.t0 + (edge.t1 - edge.t0) * ((f64)j + 0.5) / (f64)m
+            let (t, s, distance) = try refine(w, c, low, high, ec, edge.t0, edge.t1, t_guess, s_guess)
+            if distance > tol * 10.0: continue
+            var known = false
+            for hit in out.view():
+                if (try w.at(c, hit.t)).subtract(try w.at(c, t)).length() <= tol * 10.0 and math.abs(hit.s - s) <= math.abs(edge.t1 - edge.t0) * 1e-6 + 1e-12: known = true
+            if not known: try out.push(Hit(t, s))
+
+## Gauss-Newton on |C(t) - E(s)|: the nearest pair of parameters from a
+## guess, kept in their intervals, and their distance.
+func refine(w: const Shape*, c: i64, low: f64, high: f64, ec: i64, s0: f64, s1: f64, t_guess: f64, s_guess: f64) -> (f64, f64, f64)!:
+    let tl = math.min(low, high)
+    let th = math.max(low, high)
+    let sl = math.min(s0, s1)
+    let sh = math.max(s0, s1)
+    var t = t_guess
+    var s = s_guess
+    for _ in 0..<40:
+        let r = (try w.at(c, t)).subtract(try w.at(ec, s))
+        let dc = try w.tangent(c, t)
+        let de = (try w.tangent(ec, s)).multiply_scalar(-1.0)
+        let a11 = dc.dot(dc)
+        let a12 = dc.dot(de)
+        let a22 = de.dot(de)
+        let b1 = -dc.dot(r)
+        let b2 = -de.dot(r)
+        let det = a11 * a22 - a12 * a12
+        if math.abs(det) < 1e-300: break
+        let dt = (b1 * a22 - b2 * a12) / det
+        let ds = (a11 * b2 - a12 * b1) / det
+        t = math.clamp(t + dt, tl, th)
+        s = math.clamp(s + ds, sl, sh)
+        if math.abs(dt) <= (th - tl) * 1e-15 and math.abs(ds) <= (sh - sl) * 1e-15: break
+    return (t, s, (try w.at(c, t)).subtract(try w.at(ec, s)).length())
+
+## The least distance between segments ab and cd.
+func segment_distance(a: Vector3, b: Vector3, c: Vector3, d: Vector3) -> f64:
+    let u = b.subtract(a)
+    let v = d.subtract(c)
+    let w0 = a.subtract(c)
+    let uu = u.dot(u)
+    let uv = u.dot(v)
+    let vv = v.dot(v)
+    let uw = u.dot(w0)
+    let vw = v.dot(w0)
+    let det = uu * vv - uv * uv
+    var sc = 0.0
+    var tc = 0.0
+    if det > 1e-300:
+        sc = math.clamp((uv * vw - vv * uw) / det, 0.0, 1.0)
+    tc = math.clamp((uv * sc + vw) / math.max(vv, 1e-300), 0.0, 1.0)
+    sc = math.clamp((uv * tc - uw) / math.max(uu, 1e-300), 0.0, 1.0)
+    return a.add(u.multiply_scalar(sc)).subtract(c.add(v.multiply_scalar(tc))).length()
+
+## Where a point of a face's surface lies: outside, inside, on its boundary.
+pub let outside: i64 = 0
+pub let inside_face: i64 = 1
+pub let on_boundary: i64 = 2
+
+## Face `f`'s loops in its surface's chart (loop_chart), and where each
+## loop starts.
+pub func face_chart(w: const Shape*, f: usize, points: Growing[Vector3]*, starts: Growing[usize]*) -> !:
+    points.clear()
+    starts.clear()
+    let face = w.faces.items[f]
+    let uses = w.face_uses(f)
+    var at: usize = 0
+    for size in w.face_sizes(f):
+        try starts.push(points.count)
+        try loop_chart(w, face.surface, try face_pole(w, f), uses[at..<at + (usize)size], points)
+        at += (usize)size
+    try starts.push(points.count)
+
+## The pole a face on a sphere closes its loops over (its latitude), so a
+## loop going once around bounds a region: the one its outer loop turns
+## about (north when it turns positively on an outward face); 0 elsewhere.
+## Every piece of the face closes over the same pole, so holes still turn
+## the other way.
+pub func face_pole(w: const Shape*, f: usize) -> f64!:
+    let face = w.faces.items[f]
+    if w.surfaces.items[(usize)face.surface].kind != 4: return 0.0
+    var points = Growing[Vector3]()
+    defer points.close()
+    let sizes = w.face_sizes(f)
+    try loop_chart(w, face.surface, 0.0, w.face_uses(f)[..<(usize)sizes[0]], &points)
+    let turned = points.items[points.count - 1].x - points.items[0].x
+    return 0.5 * math.pi if (turned > 0.0) == face.sense else -0.5 * math.pi
+
+## A loop of edge uses in its surface's chart onto `points`, unwrapped to run
+## on continuously (a wrapping angle keeps going past a turn). On a sphere a
+## loop going once around is closed over `pole` (face_pole; 0: left open).
+pub func loop_chart(w: const Shape*, surface: i64, pole: f64, uses: const i64[], points: Growing[Vector3]*) -> !:
+    let s = &w.surfaces.items[(usize)surface]
+    let wraps = periodic(s)
+    let first_point = points.count
+    var previous = 0.0
+    var first = true
+    for use in uses:
+        let e = (usize)(use - 1 if use > 0 else -use - 1)
+        let edge = w.edges.items[e]
+        let kind = w.carriers.items[(usize)edge.carrier].kind
+        var steps: usize = 1
+        if kind == 1 or kind == 3: steps = (usize)math.clamp(math.abs(edge.t1 - edge.t0) / 0.05, 2.0, 512.0)
+        if kind == 2: steps = 48
+        if kind == 0 and wraps: steps = 8
+        for step in 0..<steps:
+            let fraction = (f64)step / (f64)steps
+            let p = try w.edge_at(e, fraction if use > 0 else 1.0 - fraction)
+            let (raw, v) = surface_uv(s, p)
+            var u = raw
+            if wraps and not first:
+                while u - previous > math.pi: u -= 2.0 * math.pi
+                while previous - u > math.pi: u += 2.0 * math.pi
+            previous = u
+            first = false
+            try points.push(Vector3(u, v, 0.0))
+    if s.kind == 4 and points.count > first_point and pole != 0.0:
+        let turned = previous - points.items[first_point].x
+        if math.abs(turned) > math.pi:
+            # Back to the start a whole turn on, then over the pole.
+            let start = points.items[first_point]
+            let around = start.x + (2.0 * math.pi if turned > 0.0 else -2.0 * math.pi)
+            try points.push(Vector3(around, start.y, 0.0))
+            try points.push(Vector3(around, pole, 0.0))
+            try points.push(Vector3(start.x, pole, 0.0))
+
+## The winding number of the chart's loops about (u, v).
+func winding(points: const Vector3[], starts: const usize[], u: f64, v: f64) -> i64:
+    var total: i64 = 0
+    for loop in 0..<starts.length - 1:
+        let first = starts[loop]
+        let last = starts[loop + 1]
+        for at in first..<last:
+            let a = points[at]
+            let b = points[first if at + 1 == last else at + 1]
+            let side = (b.x - a.x) * (v - a.y) - (u - a.x) * (b.y - a.y)
+            if a.y <= v:
+                if b.y > v and side > 0.0: total += 1
+            elif b.y <= v and side < 0.0:
+                total -= 1
+    return total
+
+## The winding number of the chart's loops about (u, v); with `wraps` (an
+## angle chart) each loop sees (u, v) moved by whole turns into its own
+## range, since a loop's unwrapped angles start wherever its curve does.
+pub func chart_winding(points: const Vector3[], starts: const usize[], u: f64, v: f64, wraps: bool) -> i64:
+    var total: i64 = 0
+    for loop in 0..<starts.length - 1:
+        let first = starts[loop]
+        let last = starts[loop + 1]
+        if last <= first: continue
+        var shifted = u
+        if wraps:
+            var low = points[first].x
+            for at in first..<last: low = math.min(low, points[at].x)
+            while shifted < low: shifted += 2.0 * math.pi
+            while shifted >= low + 2.0 * math.pi: shifted -= 2.0 * math.pi
+        let range: usize[2] = [first, last]
+        total += winding(points, range[..<2], shifted, v)
+    return total
+
+## Where `p` (on face `f`'s surface) lies against the face.
+pub func face_contains(w: const Shape*, f: usize, p: Vector3, tol: f64) -> i64!:
+    let uses = w.face_uses(f)
+    for use in uses:
+        let e = (usize)(use - 1 if use > 0 else -use - 1)
+        let edge = w.edges.items[e]
+        let t = try nearest_on(w, edge.carrier, p, edge.t0, edge.t1)
+        if (try w.at(edge.carrier, t)).subtract(p).length() <= tol * 10.0: return on_boundary
+    var points = Growing[Vector3]()
+    defer points.close()
+    var starts = Growing[usize]()
+    defer starts.close()
+    try face_chart(w, f, &points, &starts)
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    let (u, v) = surface_uv(s, p)
+    return inside_face if chart_winding(points.view(), starts.view(), u, v, periodic(s)) != 0 else outside

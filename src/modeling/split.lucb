@@ -1,0 +1,167 @@
+## Splitting a face: its boundary's edge pieces (each the way the face uses
+## it) and the new edges across it (both ways) traced into the regions they
+## enclose. From each half-edge the trace turns, at its end, to the first
+## edge clockwise from where it came (in the tangent plane, about the face's
+## outward normal), so the region on its left is followed. A cycle turning
+## positively in the surface's chart bounds a region; one turning negatively
+## is a hole, put in the smallest region around it.
+
+## A directed use of an edge in a face being split.
+pub struct HalfEdge:
+    pub var edge: i64
+    pub var forward: bool
+
+## The regions of a split face: piece p's loops are cycles
+## pieces[piece_starts[p]..<piece_starts[p + 1]], each cycle's uses
+## uses[cycle_starts[c]..<cycle_starts[c + 1]] (signed), the outer first.
+pub struct Pieces:
+    pub var uses: Growing[i64]
+    pub var cycle_starts: Growing[usize]
+    pub var pieces: Growing[usize]
+    pub var piece_starts: Growing[usize]
+
+    pub func close():
+        self.uses.close()
+        self.cycle_starts.close()
+        self.pieces.close()
+        self.piece_starts.close()
+
+    pub func piece_count() -> usize:
+        return self.piece_starts.count - 1
+
+    pub func cycle(c: usize) -> const i64[]:
+        return self.uses.view()[self.cycle_starts.items[c]..<self.cycle_starts.items[c + 1]]
+
+    pub func piece_cycles(p: usize) -> const usize[]:
+        return self.pieces.view()[self.piece_starts.items[p]..<self.piece_starts.items[p + 1]]
+
+pub func new_pieces() -> Pieces!:
+    var made = Pieces(Growing[i64](), Growing[usize](), Growing[usize](), Growing[usize]())
+    try made.cycle_starts.push(0)
+    try made.piece_starts.push(0)
+    return made
+
+func start_of(w: const Shape*, h: HalfEdge) -> i64:
+    let edge = w.edges.items[(usize)h.edge]
+    return edge.start if h.forward else edge.end
+
+func end_of(w: const Shape*, h: HalfEdge) -> i64:
+    let edge = w.edges.items[(usize)h.edge]
+    return edge.end if h.forward else edge.start
+
+## The direction `h` leaves (`leaving`) or arrives back from (not leaving)
+## the vertex at its start or end: a short chord, so curves leaving along
+## one tangent still order by how they bend.
+func half_direction(w: const Shape*, h: HalfEdge, at_start: bool) -> Vector3!:
+    let e = (usize)h.edge
+    let edge = w.edges.items[e]
+    # The edge's own end the half-edge is at.
+    let own_start = at_start == h.forward
+    let fraction = 0.001
+    let here = try w.edge_at(e, 0.0 if own_start else 1.0)
+    let near = try w.edge_at(e, fraction if own_start else 1.0 - fraction)
+    let chord = near.subtract(here)
+    if chord.length() > 1e-300: return chord
+    return try w.leaving(e, 0 if own_start else 1)
+
+## The clockwise turn from `back` to `to` about `n`, in (0, 2 pi].
+func clockwise(back: Vector3, to: Vector3, n: Vector3) -> f64:
+    let a = back.subtract(n.multiply_scalar(back.dot(n)))
+    let b = to.subtract(n.multiply_scalar(to.dot(n)))
+    let counter = math.atan2(n.dot(a.cross(b)), a.dot(b))
+    var turn = -counter
+    if turn <= 1e-12: turn += 2.0 * math.pi
+    return turn
+
+## Face `f` of `w` split along `halves` (its boundary pieces and the new
+## edges, both ways) into `out`.
+## `pole` is the face's (face_pole).
+pub func split_face(w: const Shape*, f: usize, halves: const HalfEdge[], pole: f64, out: Pieces*) -> !:
+    var used = Growing[bool]()
+    defer used.close()
+    for _ in halves: try used.push(false)
+    var cycle = Growing[i64]()
+    defer cycle.close()
+    let first_cycle = out.cycle_starts.count - 1
+    for first in 0..<halves.length:
+        if used.items[first]: continue
+        cycle.clear()
+        var at = first
+        var steps: usize = 0
+        while not used.items[at]:
+            used.items[at] = true
+            let h = halves[at]
+            try cycle.push((h.edge + 1) * (1 if h.forward else -1))
+            let vertex = end_of(w, h)
+            let point = w.points.items[(usize)vertex]
+            let n = try w.face_normal(f, point)
+            let back = try half_direction(w, h, false)
+            var best: i64 = -1
+            var best_turn = 1.0e300
+            for k in 0..<halves.length:
+                if start_of(w, halves[k]) != vertex: continue
+                # Its own reverse comes last.
+                var turn = clockwise(back, try half_direction(w, halves[k], true), n)
+                if halves[k].edge == h.edge and halves[k].forward != h.forward: turn = 2.0 * math.pi + 1.0
+                if turn < best_turn:
+                    best_turn = turn
+                    best = (i64)k
+            if best < 0: error(invalid, "a face being split has a loose edge end")
+            at = (usize)best
+            steps += 1
+            if steps > halves.length: error(invalid, "a face being split does not close")
+        if at != first: error(invalid, "a face being split traced into another loop")
+        for use in cycle.view(): try out.uses.push(use)
+        try out.cycle_starts.push(out.uses.count)
+    try group_cycles(w, f, out, first_cycle, pole)
+
+## Turn the cycles just traced (those after the last piece) into pieces:
+## positive ones bound pieces, negative ones are holes in the smallest
+## piece around them.
+func group_cycles(w: const Shape*, f: usize, out: Pieces*, first_cycle: usize, pole: f64) -> !:
+    let face = w.faces.items[f]
+    let cycle_count = out.cycle_starts.count - 1
+    # The cycles of this face are those not yet in a piece.
+    var areas = Growing[f64]()
+    defer areas.close()
+    var charts = Growing[Vector3]()
+    defer charts.close()
+    var chart_starts = Growing[usize]()
+    defer chart_starts.close()
+    var mine = Growing[usize]()
+    defer mine.close()
+    for c in first_cycle..<cycle_count:
+        try mine.push(c)
+        try chart_starts.push(charts.count)
+        try loop_chart(w, face.surface, pole, out.cycle(c), &charts)
+        let area = signed_area(charts.view()[chart_starts.items[chart_starts.count - 1]..<charts.count])
+        try areas.push(area if face.sense else -area)
+    try chart_starts.push(charts.count)
+    var owner = Growing[i64]()
+    defer owner.close()
+    for k in 0..<mine.count:
+        var best: i64 = -1
+        if areas.items[k] < 0.0:
+            # The smallest positive cycle holding a point just left of the
+            # hole's first segment (the side its region is on: the twin
+            # cycle of the same edges, running the other way, is right of it).
+            let a = charts.items[chart_starts.items[k]]
+            let next = charts.items[chart_starts.items[k] + 1] if chart_starts.items[k + 1] - chart_starts.items[k] > 1 else a
+            let along = next.subtract(a)
+            let left = Vector3(-along.y, along.x, 0.0).multiply_scalar(0.001 * (1.0 if face.sense else -1.0))
+            let probe = a.add(along.multiply_scalar(0.5)).add(left)
+            var best_area = 1.0e300
+            for j in 0..<mine.count:
+                if areas.items[j] <= 0.0: continue
+                let loop: usize[2] = [chart_starts.items[j], chart_starts.items[j + 1]]
+                let hit = chart_winding(charts.view(), loop[..<2], probe.x, probe.y, periodic(&w.surfaces.items[(usize)face.surface])) != 0
+                if hit and areas.items[j] < best_area:
+                    best_area = areas.items[j]
+                    best = (i64)j
+        try owner.push(best)
+    for k in 0..<mine.count:
+        if areas.items[k] <= 0.0: continue
+        try out.pieces.push(mine.items[k])
+        for j in 0..<mine.count:
+            if owner.items[j] == (i64)k: try out.pieces.push(mine.items[j])
+        try out.piece_starts.push(out.pieces.count)
