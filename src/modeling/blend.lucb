@@ -284,6 +284,8 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             if not try blendable(&w, e): error(invalid, "only straight edges between flat faces, and rims (a circle or arc between a flat face and a cylinder about it), can be blended yet")
         if chain: try tangent_chains(&w, &chosen)
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
+    # Each edge's blend must fit its faces: said precisely, before any tool.
+    for e in chosen.view(): try check_fits(&w, e, size, round)
     # Inside and outside fillets meeting at a corner: one side first, the
     # other then runs around it (a torus), by name on the result.
     if round and not every:
@@ -372,6 +374,16 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             elif corner.subtract(high).length() <= w.tolerance * 10.0:
                 high = foot
                 exact_high = true
+        # The balls at both ends must leave the edge some length.
+        if exact_low or exact_high:
+            let original = try w.edge_at(e, 1.0).subtract(try w.edge_at(e, 0.0)).length()
+            let left = high.subtract(low).dot(along)
+            if left <= w.tolerance * 10.0:
+                let most = size * original / (original - left)
+                var buffer: u8[256]
+                let owned = try interop.copy_text(try strings.format(buffer, f"a fillet radius of {rounded_text(size)} is too large for this edge between its rounded corners: it must be less than {rounded_text(most)}"))
+                if let owner = owned.owner: _ = ownership.pool_object(owner)
+                error(invalid, owned.value)
         for v in joints.view():
             let corner = w.points.items[(usize)v]
             if corner.subtract(low).length() <= w.tolerance * 10.0: exact_low = true
@@ -394,6 +406,77 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             result.release()
             result = next
     return result
+
+## How far along each face from edge `e` a blend of `size` reaches (a
+## fillet's contact distance, a chamfer's own size).
+func reach_of(w: const Shape*, e: usize, size: f64, round: bool) -> f64!:
+    if not round: return size
+    let (fa, fb) = try edge_faces(w, e)
+    let along = try along_edge(w, e)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    return size / math.tan(angle * 0.5)
+
+## How far into face `f` from edge `e` the blend's contact can reach before
+## leaving it: over samples along the edge, the least distance to the
+## face's boundary going straight in.
+func room(w: const Shape*, e: usize, f: usize, limit: f64) -> f64!:
+    let edge = w.edges.items[e]
+    var least = limit
+    for k in 1..<8:
+        let fraction = (f64)k / 8.0
+        let p = try w.edge_at(e, fraction)
+        let t = edge.t0 + (edge.t1 - edge.t0) * fraction
+        let along = (try w.tangent(edge.carrier, t)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
+        let n = try w.face_normal(f, p)
+        var side = try n.cross(try along.normalized()).normalized()
+        let probe = p.add(side.multiply_scalar(least * 1e-3 + w.tolerance * 100.0))
+        if try face_contains(w, f, probe, w.tolerance) != inside_face: side = side.multiply_scalar(-1.0)
+        # On a curved face (a rim's cylinder) the straight step leaves the
+        # surface: the step is taken on the face's plane or along the axis.
+        if try face_contains(w, f, p.add(side.multiply_scalar(least)), w.tolerance) != outside and try on_face_surface(w, f, p.add(side.multiply_scalar(least))): continue
+        var inside_at = 0.0
+        var outside_at = least
+        for _ in 0..<40:
+            let middle = (inside_at + outside_at) * 0.5
+            let q = p.add(side.multiply_scalar(middle))
+            if try on_face_surface(w, f, q) and try face_contains(w, f, q, w.tolerance) != outside: inside_at = middle
+            else: outside_at = middle
+        least = inside_at
+    return least
+
+func on_face_surface(w: const Shape*, f: usize, p: Vector3) -> bool!:
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    if s.kind == 3: return true
+    return surface_distance(s, p) <= w.tolerance * 10.0
+
+## A blend of `size` on edge `e` must reach less far than its faces go
+## (all the way, a face would vanish): else an error saying so, and the
+## size it must stay under.
+func check_fits(w: const Shape*, e: usize, size: f64, round: bool) -> !:
+    let edge = w.edges.items[e]
+    # A rim's contact runs around a circle: the planar face's room is
+    # measured straight in, the cylinder's along its axis; both are lines
+    # from the rim, which the straight probe follows.
+    let reach = try reach_of(w, e, size, round)
+    let (fa, fb) = try edge_faces(w, e)
+    let probe = reach * 1.01 + w.tolerance * 100.0
+    let least = math.min(try room(w, e, fa, probe), try room(w, e, fb, probe))
+    if least > reach + w.tolerance * 10.0: return
+    _ = edge
+    let most = size * least / reach
+    var buffer: u8[256]
+    let text = try strings.format(buffer, f"a fillet radius of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}") if round else try strings.format(buffer, f"a chamfer of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}")
+    let owned = try interop.copy_text(text)
+    if let owner = owned.owner: _ = ownership.pool_object(owner)
+    error(invalid, owned.value)
+
+## `value` to four significant places, for messages.
+func rounded_text(value: f64) -> f64:
+    if value == 0.0 or not math.is_finite(value): return value
+    let scale = math.pow(10.0, 3.0 - math.floor(math.log10(math.abs(value))))
+    return math.round(value * scale) / scale
 
 func edge_in(edges: const usize[], e: usize) -> bool:
     for known in edges:

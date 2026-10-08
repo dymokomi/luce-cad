@@ -8,16 +8,28 @@
 ## two flush faces joined are one, named by all of the faces' names.
 func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face: Growing[usize]*, piece_name: Growing[i64]*, keep: Growing[bool]*, turn: Growing[bool]*) -> !:
     let original = pieces.piece_count()
-    # Faces on one surface facing one way share a group (its first face).
+    # Faces on one surface share a group (its first face), facing either
+    # way: a piece is merged by the way it faces once kept (a solid's face
+    # turned by a subtraction faces as the other's).
     var group = Growing[usize]()
     defer group.close()
     for f in 0..<work.w.faces.count: try group.push(f)
     for pair in work.coincident.view():
-        if not pair.same: continue
         let a = root(&group, pair.fa)
         let b = root(&group, pair.fb)
         if a < b: group.items[b] = a
         elif b < a: group.items[a] = b
+    # Whether each face faces against its group's first face.
+    var against = Growing[bool]()
+    defer against.close()
+    for f in 0..<work.w.faces.count:
+        let r = root(&group, f)
+        var differs = false
+        if r != f:
+            let use = work.w.face_uses(f)[0]
+            let point = try work.w.edge_at((usize)((use if use > 0 else -use) - 1), 0.5)
+            differs = (try work.w.face_normal(f, point)).dot(try work.w.face_normal(r, point)) < 0.0
+        try against.push(differs)
     var halves = Growing[HalfEdge]()
     defer halves.close()
     var owner = Growing[usize]()
@@ -38,11 +50,15 @@ func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face
             owner.clear()
             var count = 0
             for p in 0..<original:
-                if not keep.items[p] or turn.items[p] != flip or root(&group, piece_face.items[p]) != f: continue
+                if not keep.items[p] or root(&group, piece_face.items[p]) != f: continue
+                # Its loops in the first face's terms (reversed when its own
+                # face faces against it), and which way it ends up facing.
+                let reversed = against.items[piece_face.items[p]]
+                if (turn.items[p] != reversed) != flip: continue
                 count += 1
                 for c in pieces.piece_cycles(p):
                     for use in pieces.cycle(c):
-                        try halves.push(HalfEdge((use if use > 0 else -use) - 1, use > 0))
+                        try halves.push(HalfEdge((use if use > 0 else -use) - 1, (use > 0) != reversed))
                         try owner.push(p)
             if count < 2: continue
             # Drop both ways of edges two different pieces share.
@@ -63,7 +79,7 @@ func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face
             try split_face(traced, f, remaining.view(), try face_pole(&work.w, f), pieces)
             names.clear()
             for p in 0..<original:
-                if keep.items[p] and turn.items[p] == flip and root(&group, piece_face.items[p]) == f:
+                if keep.items[p] and root(&group, piece_face.items[p]) == f and (turn.items[p] != against.items[piece_face.items[p]]) == flip:
                     keep.items[p] = false
                     try names.push(work.w.name(piece_name.items[p]))
             try joined_names(names.view(), &joined)

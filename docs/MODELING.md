@@ -191,7 +191,8 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    - intersect keeps the inside pieces;
    - of coincident pieces, one or none is kept.
 8. **Merging and output.** Kept pieces of one face, or of flush faces, that share an edge nobody
-   else uses are merged. A sphere zone gets a seam meridian, because the tessellator meshes a band
+   else uses and end up facing the same way are merged. That includes a subtracted solid's turned
+   face lying flush on the other's. A sphere zone gets a seam meridian, because the tessellator meshes a band
    on a sphere only with a seam. The result is written as a new B-rep. If any edge isn't used
    exactly twice, the operation fails rather than producing a broken solid.
 
@@ -250,6 +251,16 @@ keep that stretch from producing false crossings:
   them further along to see which turns first.
 
 G2 and G3 fillets meeting at a corner, and those of rims, are refused for now.
+
+**Too large.** Before any tool, each edge's blend must fit:
+- **Its faces:** samples along the edge step into each face by the contact distance, and must stay
+  on it.
+- **Its rounded corners:** must leave the edge some length.
+- **The whole-body rounding:** must leave each shrunk edge some length.
+
+Otherwise the error gives the size the blend must stay under, for example "a fillet radius of 1.5
+is too large for this edge's faces: it must be less than 1.0". Rolling on onto the next face, as
+Parasolid's overflow does, is not done.
 
 **Tangent chains.** Like Fusion's Tangent Chain, a referenced edge brings the edges that continue
 it tangentially with the same convexity, such as a rounded slot's rim or the edges around an
