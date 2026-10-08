@@ -126,7 +126,7 @@ pub func fillet_tests() -> unit!:
     cone_rims()
     flats()
     smooth()
-    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim); G2 and G3 fillets outside and inside, alone, apart, mitered, and on a hole's rim; a pocket's inside corners, mitered and balled; tangent chains around a slot's rim and an earlier fillet; inside and outside fillets meeting (a boss on a plate, an L's inside corner); sizes too large, said with the size that fits; a cone's rims; a D-shaft's flat meeting its cylinder")
+    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim); G2 and G3 fillets outside and inside, alone, apart, mitered, on a hole's rim, and three at a corner (setback corners: a box's, every edge, a pocket's, slanted); a pocket's inside corners, mitered and balled; tangent chains around a slot's rim and an earlier fillet; inside and outside fillets meeting (a boss on a plate, an L's inside corner); sizes too large, said with the size that fits; a cone's rims; a D-shaft's flat meeting its cylinder")
 
 func blend(model: CadModel, edges: list[int], r: float, round: bool, faces: int, expected: float, tolerance: float) -> unit!:
     let refs = CadModeling.edge_references(model, edges)
@@ -230,11 +230,7 @@ func smooth() -> unit!:
     let mitered = CadModeling.filleted(box, CadModeling.edge_references(box, ring), r, "#f", 2)
     assert(mitered.face_count() == 10)
     closed(mitered.tessellate(32))
-    # Three meeting at a corner: refused, clearly.
-    var refused = false
-    _ = CadModeling.filleted(box, CadModeling.edge_references(box, edges_where(box, at(Vector3(1.0, 1.0, 1.0)))), r, "#f", 2) catch failure:
-        refused = failure.message.contains("G2 and G3")
-    assert(refused)
+    setback_corners()
     # A hole's rim (radius 0.5, r 0.2): the profile turned in two halves
     # (two faces of revolution), by Pappus, the regions' centroids 0.20313 r
     # (G2) and 0.19605 r (G3) out from the hole.
@@ -448,3 +444,45 @@ func flats() -> unit!:
     blend(d, edges, 0.2, true, 6, before - 2.0 * 2.0 * 0.0018792, 0.001)
     blend(d, [edges[0]], 0.2, true, 5, before - 2.0 * 0.0018792, 0.001)
     blend(d, edges, 0.2, false, 6, -1.0, -1.0)
+
+## Three G2 or G3 fillets meeting at a corner: each stops at its setback
+## (1.5 r at a square corner) and six quads fill the hole between them
+## (setback.lucb). The corner tool takes r^3 times 0.9000294 (G2) or
+## 0.8471005 (G3): the fit's own region, integrated over the quads.
+pub func setback_corners() -> unit!:
+    let g2 = 0.17678573604910766
+    let g3 = 0.16566435913024405
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#b")
+    let r = 0.4
+    let corner = edges_where(box, at(Vector3(1.0, 1.0, 1.0)))
+    smoothed(box, corner, r, 2, 15, 8.0 - 3.0 * r * r * (2.0 - 1.5 * r) * g2 - 0.9000294 * r * r * r)
+    smoothed(box, corner, r, 3, 15, 8.0 - 3.0 * r * r * (2.0 - 1.5 * r) * g3 - 0.8471005 * r * r * r)
+    # Every edge: twelve fillets between eight setback corners.
+    let s = 0.3
+    smoothed(box, edges_where(box, any), s, 2, 66, 8.0 - 12.0 * s * s * (2.0 - 3.0 * s) * g2 - 8.0 * 0.9000294 * s * s * s)
+    # A pocket's inside corners: material added, the same regions.
+    let block = CadModeling.tagged(CadSolids.box(4.0, 2.0, 4.0), "#k")
+    let cut = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#c").transformed(Vector3(0.0, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let pocket = CadModeling.combined(block, cut, 1)
+    smoothed(pocket, edges_where(pocket, pocket_floor_and_walls), s, 2, 43, 28.0 + s * s * g2 * (4.0 * (2.0 - 3.0 * s) + 4.0 * (1.0 - 1.5 * s)) + 4.0 * 0.9000294 * s * s * s)
+    # A slanted box's corner (faces at 104 and 76 degrees): the fit's own
+    # volume is unknown, but it lies between the ball corner's body and
+    # the body with the G2 fillets alone.
+    let cutter = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0), "#c").transformed(Vector3(2.6, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)).transformed(Vector3(), Vector3(0.0, 0.25, 0.0), Vector3(1.0, 1.0, 1.0))
+    let slanted = CadModeling.combined(box, cutter, 1)
+    for corner_at in [Vector3(1.0, 1.0, 1.0), Vector3(1.0, 1.0, -1.0)]:
+        var slant_corner = Vector3(-10.0, 0.0, 0.0)
+        for face in 0..<slanted.face_count():
+            for use in 0..<slanted.face_edge_count(face):
+                let p = slanted.face_edge_point(face, use, 0.0)
+                if p.y > 0.99 and p.z * corner_at.z > 0.99 and p.x > slant_corner.x:
+                    slant_corner = p
+        let three = CadModeling.edge_references(slanted, edges_where(slanted, at(slant_corner)))
+        let smooth_corner = CadModeling.filleted(slanted, three, 0.2, "#f", 2)
+        assert(smooth_corner.face_count() == 15)
+        # Closed: a G2 contact line on a slanted face can leave a display
+        # sliver facing either way.
+        let mesh = smooth_corner.tessellate(32)
+        closed(mesh)
+        let v = volume(mesh)
+        assert(v < volume(slanted.tessellate(32)) - 0.001 and v > volume(CadModeling.filleted(slanted, three, 0.2, "#f").tessellate(32)) - 0.05)

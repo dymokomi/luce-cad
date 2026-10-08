@@ -1,0 +1,259 @@
+## Three G2 or G3 fillets meeting at a corner of three flat faces. No ball
+## is tangent to such fillets: their sections are not circles. So, as
+## Fusion and SolidWorks do, each fillet stops short of the corner, at its
+## setback: a plane square to its edge. The hole between the fillets' end
+## sections and the faces is filled by a patch with the fillets'
+## continuity (patch_fit.lucb). The corner tool is the region between the
+## sharp corner and the patch, cut off by the setback planes. It is taken
+## away after the edges' tools (added, at an inside corner), and it leaves
+## the patch. Its sides meet the body's faces only along curves both
+## carry, which the booleans take as touching (splines.lucb).
+
+## A setback corner: its vertex; its three edges, ordered so that face i
+## holds edges i and i + 1; each edge's unit way from the corner; how far
+## along it the fillets stop. `inside` marks an inside corner, whose tool
+## is added.
+struct Setback:
+    var vertex: i64
+    var edges: usize[3]
+    var ways: Vector3[3]
+    var distances: f64[3]
+    var inside: bool
+
+## A setback corner of fillets of `radius` at vertex `v`, where `edges`
+## (three, one per line through it) meet. Each fillet stops past where the
+## next fillets' contacts cross on the faces, by half the largest contact
+## distance. That is 1.5 times the radius at a square corner, Fusion's
+## default. `hollow` marks an inside corner.
+func setback_at(w: const Shape*, v: i64, edges: const usize[], radius: f64, hollow: bool) -> Setback!:
+    if edges.length != 3: error(invalid, "a setback corner needs three edges")
+    # Ordered so edges i and i + 1 share a face.
+    var ordered: usize[3] = [edges[0], edges[1], edges[2]]
+    if try shared_face(w, ordered[0], ordered[1]) < 0:
+        ordered[1] = edges[2]
+        ordered[2] = edges[1]
+    var corner = Setback(v, ordered, [Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0], hollow)
+    for i in 0..<(usize)3:
+        let edge = w.edges.items[ordered[i]]
+        corner.ways[i] = try w.leaving(ordered[i], 0 if edge.start == v else 1)
+    let frame = try setback_frame(w, &corner, radius)
+    let p = w.points.items[(usize)v]
+    var most = 0.0
+    for r in frame.reaches: most = math.max(most, r)
+    for i in 0..<(usize)3:
+        let before = (i + 2) % 3
+        let next = (i + 1) % 3
+        let after = try contacts_cross(p, corner.ways[i], frame.intos[i * 2 + 1], frame.reaches[i], corner.ways[next], frame.intos[next * 2], frame.reaches[next])
+        let behind = try contacts_cross(p, corner.ways[before], frame.intos[before * 2 + 1], frame.reaches[before], corner.ways[i], frame.intos[i * 2], frame.reaches[i])
+        corner.distances[i] = math.max(after.subtract(p).dot(corner.ways[i]), behind.subtract(p).dot(corner.ways[i])) + most * 0.5
+    return corner
+
+## Of a setback corner: each edge's contact distance (reaches[i]); its
+## ways into its faces, perpendicular to it (into face i - 1 at
+## intos[2 i], into face i at intos[2 i + 1]); and the faces (face i holds
+## edges i and i + 1).
+struct Frame:
+    var reaches: f64[3]
+    var intos: Vector3[6]
+    var faces: usize[3]
+
+func setback_frame(w: const Shape*, corner: const Setback*, radius: f64) -> Frame!:
+    var faces: usize[3] = [0, 0, 0]
+    for i in 0..<(usize)3:
+        let f = try shared_face(w, corner.edges[i], corner.edges[(i + 1) % 3])
+        if f < 0 or w.surfaces.items[(usize)w.faces.items[(usize)f].surface].kind != 0: error(invalid, "fillets meeting at a corner need flat faces there")
+        faces[i] = (usize)f
+    var reaches: f64[3] = [0.0, 0.0, 0.0]
+    var intos: Vector3[6] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    for i in 0..<(usize)3:
+        let along = corner.ways[i]
+        intos[i * 2] = try into_face(w, faces[(i + 2) % 3], corner.edges[i], along)
+        intos[i * 2 + 1] = try into_face(w, faces[i], corner.edges[i], along)
+        let angle = math.acos(math.clamp(intos[i * 2].dot(intos[i * 2 + 1]), -1.0, 1.0))
+        reaches[i] = radius / math.tan(angle * 0.5)
+    return Frame(reaches, intos, faces)
+
+## The face edges `a` and `b` share, or -1.
+func shared_face(w: const Shape*, a: usize, b: usize) -> i64!:
+    let (fa, fb) = try edge_faces(w, a)
+    let (ga, gb) = try edge_faces(w, b)
+    if fa == ga or fa == gb: return (i64)fa
+    if fb == ga or fb == gb: return (i64)fb
+    return -1
+
+## Where two fillets' contact lines cross on the face they share: fillet
+## `a` runs along `way_a` from corner `p`, its contact `reach_a` into the
+## face along `into_a`; likewise `b`.
+func contacts_cross(p: Vector3, way_a: Vector3, into_a: Vector3, reach_a: f64, way_b: Vector3, into_b: Vector3, reach_b: f64) -> Vector3!:
+    let pa = p.add(into_a.multiply_scalar(reach_a))
+    let pb = p.add(into_b.multiply_scalar(reach_b))
+    let k = way_a.dot(way_b)
+    let det = 1.0 - k * k
+    if det < 1e-12: error(invalid, "fillets meeting at a corner run along one line")
+    let r = pa.subtract(pb)
+    let s = (k * r.dot(way_b) - r.dot(way_a)) / det
+    return pa.add(way_a.multiply_scalar(s))
+
+## A setback corner's tool for fillets of `radius` and `continuity` (2 or
+## 3): the region between the sharp corner and the patch, within the
+## setback planes. The patch's quads are named `name`.
+func setback_tool(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, name: str) -> interop.Reference[CadModel]!:
+    let frame = try setback_frame(w, corner, radius)
+    let reaches = frame.reaches
+    let intos = frame.intos
+    let faces = frame.faces
+    let p = w.points.items[(usize)corner.vertex]
+    # The hole's six curves: each fillet's end section (as its tool's
+    # profile makes it) from face i - 1 to face i, then the curve on face i
+    # to the next fillet's contact, legs along the contact lines.
+    let g2: f64[3] = [0.0, 0.3, 0.6]
+    let g3: f64[4] = [0.0, 0.2, 0.4, 0.6]
+    let half: usize = 3 if continuity == 2 else 4
+    let degree = (i64)half * 2 - 1
+    let m = half * 2
+    var curves = Growing[Vector3]()
+    defer curves.close()
+    var sides = Growing[HoleSide]()
+    defer sides.close()
+    for i in 0..<(usize)3:
+        let next = (i + 1) % 3
+        let foot = p.add(corner.ways[i].multiply_scalar(corner.distances[i]))
+        let ta = foot.add(intos[i * 2].multiply_scalar(reaches[i]))
+        let tb = foot.add(intos[i * 2 + 1].multiply_scalar(reaches[i]))
+        for k in 0..<half: try curves.push(ta.add(foot.subtract(ta).multiply_scalar(g2[k] if half == 3 else g3[k])))
+        for k in 0..<half: try curves.push(tb.add(foot.subtract(tb).multiply_scalar(g2[half - 1 - k] if half == 3 else g3[half - 1 - k])))
+        try sides.push(HoleSide(true, corner.ways[i]))
+        let cross = try contacts_cross(p, corner.ways[i], intos[i * 2 + 1], reaches[i], corner.ways[next], intos[next * 2], reaches[next])
+        let foot_next = p.add(corner.ways[next].multiply_scalar(corner.distances[next]))
+        let tc = foot_next.add(intos[next * 2].multiply_scalar(reaches[next]))
+        for k in 0..<half: try curves.push(tb.add(cross.subtract(tb).multiply_scalar(g2[k] if half == 3 else g3[k])))
+        for k in 0..<half: try curves.push(tc.add(cross.subtract(tc).multiply_scalar(g2[half - 1 - k] if half == 3 else g3[half - 1 - k])))
+        try sides.push(HoleSide(false, face_outward(w, faces[i])))
+    var quads = Growing[Vector3]()
+    defer quads.close()
+    try corner_patch(curves.view(), sides.view(), degree, &quads)
+    # The patch must stay within the corner: on the solid's side of each
+    # face, and short of each setback plane. Its control points' hull
+    # holds it, so the booleans can take it as touching there.
+    let slack = radius * 1e-9
+    var cone: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+    for i in 0..<(usize)3:
+        let n = face_outward(w, faces[i])
+        cone[i] = n if n.dot(corner.ways[(i + 2) % 3]) > 0.0 else n.multiply_scalar(-1.0)
+    for q in quads.view():
+        for i in 0..<(usize)3:
+            if q.subtract(p).dot(cone[i]) < -slack or q.subtract(p).dot(corner.ways[i]) > corner.distances[i] + slack:
+                error(invalid, "the G2 corner patch would leave its corner: use G1 there")
+    return try corner_solid(p, corner, quads.view(), cone[..<3], degree, m, name)
+
+## The corner tool's B-rep: the six quads, a cap on each setback plane and
+## a piece of each face, between corner `p` and the patch.
+func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], cone: const Vector3[], degree: i64, m: usize, name: str) -> interop.Reference[CadModel]!:
+    let size = (quads[0].subtract(p)).length() * 4.0
+    let solid = try new_solid(size)
+    defer solid.release()
+    let b = solid.value()
+    let mm = m * m
+    let apex = try b.add_vertex(p)
+    var feet: i64[3] = [0, 0, 0]
+    for i in 0..<(usize)3: feet[i] = try b.add_vertex(p.add(corner.ways[i].multiply_scalar(corner.distances[i])))
+    # The hole's corners (quad k's corner (0, 0)), its curves' middles
+    # (quad k's (1, 0)) and the center.
+    var corners: i64[6] = [0, 0, 0, 0, 0, 0]
+    var middles: i64[6] = [0, 0, 0, 0, 0, 0]
+    for k in 0..<(usize)6:
+        corners[k] = try b.add_vertex(quads[k * mm])
+        middles[k] = try b.add_vertex(quads[k * mm + (m - 1) * m])
+    let center = try b.add_vertex(quads[mm - 1])
+    var lines: i64[3] = [0, 0, 0]
+    var toward_before: i64[3] = [0, 0, 0]
+    var toward_after: i64[3] = [0, 0, 0]
+    for i in 0..<(usize)3:
+        lines[i] = try b.add_line(apex, feet[i])
+        toward_before[i] = try b.add_line(feet[i], corners[i * 2])
+        toward_after[i] = try b.add_line(feet[i], corners[i * 2 + 1])
+    # Each curve's halves and each seam, from the quads' own rows.
+    var knots = Growing[f64]()
+    defer knots.close()
+    for k in 0..<m * 2: try knots.push(0.0 if k < m else 1.0)
+    var weights = Growing[f64]()
+    defer weights.close()
+    try weights.fill(mm, 1.0)
+    var net = Growing[Vector3]()
+    defer net.close()
+    var firsts: i64[6] = [0, 0, 0, 0, 0, 0]
+    var seconds: i64[6] = [0, 0, 0, 0, 0, 0]
+    var seams: i64[6] = [0, 0, 0, 0, 0, 0]
+    for k in 0..<(usize)6:
+        let next = (k + 1) % 6
+        net.clear()
+        for a in 0..<m: try net.push(quads[k * mm + a * m])
+        firsts[k] = try b.add_spline_edge(corners[k], middles[k], net.view(), weights.view()[..<m], degree, knots.view(), true)
+        net.clear()
+        for b_ in 0..<m: try net.push(quads[next * mm + m - 1 - b_])
+        seconds[k] = try b.add_spline_edge(middles[k], corners[next], net.view(), weights.view()[..<m], degree, knots.view(), true)
+        net.clear()
+        for b_ in 0..<m: try net.push(quads[k * mm + (m - 1) * m + b_])
+        seams[k] = try b.add_spline_edge(middles[k], center, net.view(), weights.view()[..<m], degree, knots.view(), true)
+    # The quads: outward (away from the corner) is du x dv or against it.
+    var bu: f64[36]
+    var bv: f64[36]
+    bernstein(degree, 0.75, bu[..<36])
+    bernstein(degree, 0.75, bv[..<36])
+    let sizes: i64[1] = [4]
+    for k in 0..<(usize)6:
+        let before = (k + 5) % 6
+        var du = Vector3()
+        var dv = Vector3()
+        var at = Vector3()
+        for a in 0..<m:
+            for b_ in 0..<m:
+                let q = quads[k * mm + a * m + b_]
+                du = du.add(q.multiply_scalar(bu[9 + a] * bv[b_]))
+                dv = dv.add(q.multiply_scalar(bu[a] * bv[9 + b_]))
+                at = at.add(q.multiply_scalar(bu[a] * bv[b_]))
+        let surface = try b.add_spline_surface(quads[k * mm..<(k + 1) * mm], weights.view(), (i64)m, (i64)m, degree, degree, knots.view(), knots.view())
+        let outward = du.cross(dv).dot(at.subtract(p)) > 0.0
+        let forward: i64[4] = [firsts[k] + 1, seams[k] + 1, -(seams[before] + 1), seconds[before] + 1]
+        let backward: i64[4] = [-(seconds[before] + 1), seams[before] + 1, -(seams[k] + 1), -(firsts[k] + 1)]
+        var face: i64 = 0
+        if outward: face = try b.add_face(surface, forward[..<4], sizes[..<1], true)
+        else: face = try b.add_face(surface, backward[..<4], sizes[..<1], false)
+        try b.set_face_name(face, name)
+    # The caps, outward along each edge, and the faces' pieces, outward
+    # away from the corner's inside.
+    for i in 0..<(usize)3:
+        let foot = p.add(corner.ways[i].multiply_scalar(corner.distances[i]))
+        let uses: i64[4] = [toward_before[i] + 1, firsts[i * 2] + 1, seconds[i * 2] + 1, -(toward_after[i] + 1)]
+        let around: Vector3[4] = [foot, quads[i * 2 * mm], quads[i * 2 * mm + (m - 1) * m], quads[(i * 2 + 1) * mm]]
+        try flat_face(b, foot, corner.ways[i], uses[..<4], around[..<4])
+    for i in 0..<(usize)3:
+        let next = (i + 1) % 3
+        let uses: i64[6] = [lines[i] + 1, toward_after[i] + 1, firsts[i * 2 + 1] + 1, seconds[i * 2 + 1] + 1, -(toward_before[next] + 1), -(lines[next] + 1)]
+        let around: Vector3[6] = [p, p.add(corner.ways[i].multiply_scalar(corner.distances[i])), quads[(i * 2 + 1) * mm], quads[(i * 2 + 1) * mm + (m - 1) * m],
+                                  quads[(i * 2 + 2) % 6 * mm], p.add(corner.ways[next].multiply_scalar(corner.distances[next]))]
+        try flat_face(b, p, cone[i].multiply_scalar(-1.0), uses[..<6], around[..<6])
+    return try model_of(solid)
+
+## A flat face of `b` through `origin`, outward `normal`, bounded by
+## `uses`: their order reversed when the points `around` them (their
+## starts) turn the other way about the normal.
+func flat_face(b: BrepModel*, origin: Vector3, normal: Vector3, uses: const i64[], around: const Vector3[]) -> !:
+    # Newell's normal of the loop.
+    var turn = Vector3()
+    for k in 0..<around.length:
+        let a = around[k]
+        let c = around[(k + 1) % around.length]
+        turn = turn.add(Vector3((a.y - c.y) * (a.z + c.z), (a.z - c.z) * (a.x + c.x), (a.x - c.x) * (a.y + c.y)))
+    var loop = Growing[i64]()
+    defer loop.close()
+    if turn.dot(normal) > 0.0:
+        try loop.assign(uses)
+    else:
+        var k = uses.length
+        while k > 0:
+            k -= 1
+            try loop.push(-uses[k])
+    let plane = try b.add_surface(0, origin, normal, try across(normal))
+    let sizes: i64[1] = [(i64)uses.length]
+    _ = try b.add_face(plane, loop.view(), sizes[..<1])

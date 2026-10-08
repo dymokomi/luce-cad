@@ -216,6 +216,14 @@ This is the case that matters for G2 fillets.
 
 ### 1.3 A G2 corner where three G2 fillets meet
 
+> **As built (2026-10-08):** the single trimmed patch below was tried and did not converge closely
+> enough. A numpy prototype gave boundary errors of 1e-3 to 1e-4 of the corner's size at m = 8–16,
+> and 1e-6 only at m = 24 for G0 alone. luce-cad instead fills the hole with six Bezier quads, one
+> per hole corner, with exact outer sides (rows on the sweep or in the face's plane). The seams are
+> G1 by fixed coefficients (μ = 1, ν = t, the six-valent vertex's 2 cos 60°), and G2 is held by
+> least squares. See MODELING.md, "Setback corners".
+
+
 A ball corner is only G1 against G2 fillets: the fillets' end sections are not circular arcs, so no
 sphere is tangent to them. A smooth G2 corner needs a **setback**.
 

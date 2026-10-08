@@ -420,10 +420,13 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
     # Where three fillets meet, a ball rounds the corner.
     var balls = Growing[Ball]()
     defer balls.close()
+    # Where three G2 or G3 fillets meet, a setback corner.
+    var setbacks = Growing[Setback]()
+    defer setbacks.close()
     # Where chained edges meet tangentially, their tools end square.
     var joints = Growing[i64]()
     defer joints.close()
-    try fillet_corners(&w, chosen.view(), size, continuity, round, &balls, &joints)
+    try fillet_corners(&w, chosen.view(), size, continuity, round, &balls, &setbacks, &joints)
     let body = try model.tessellate(16)
     defer body.release()
     var tools = Growing[interop.Reference[CadModel]]()
@@ -481,7 +484,19 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             elif corner.subtract(high).length() <= w.tolerance * 10.0:
                 high = foot
                 exact_high = true
-        # The balls at both ends must leave the edge some length.
+        # An end at a setback corner stops at its setback.
+        for corner in setbacks.view():
+            let apex = w.points.items[(usize)corner.vertex]
+            for k in 0..<(usize)3:
+                if math.abs(corner.ways[k].dot(along)) < 1.0 - 1e-9: continue
+                let foot = apex.add(corner.ways[k].multiply_scalar(corner.distances[k]))
+                if apex.subtract(low).length() <= w.tolerance * 10.0:
+                    low = foot
+                    exact_low = true
+                elif apex.subtract(high).length() <= w.tolerance * 10.0:
+                    high = foot
+                    exact_high = true
+        # The corners at both ends must leave the edge some length.
         if exact_low or exact_high:
             let original = try w.edge_at(e, 1.0).subtract(try w.edge_at(e, 0.0)).length()
             let left = high.subtract(low).dot(along)
@@ -502,6 +517,10 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
         try corner_name(&w, (usize)ball.vertex, tag, &name)
         try tools.push(try corner_tool(&w, &ball, size, (str)name.view()))
         try adds.push(ball.inside)
+    for corner in setbacks.view():
+        try corner_name(&w, (usize)corner.vertex, tag, &name)
+        try tools.push(try setback_tool(&w, &corner, size, continuity, (str)name.view()))
+        try adds.push(corner.inside)
     # Material taken away first, then added.
     var result = try copy_model(model)
     for pass in 0..<2:

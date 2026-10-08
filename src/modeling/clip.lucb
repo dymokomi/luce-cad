@@ -37,8 +37,14 @@ pub func nearest_on(w: const Shape*, c: i64, p: Vector3, low: f64, high: f64) ->
         if d < best_distance:
             best_distance = d
             best = t
-    # Newton on the derivative of the squared distance.
-    var t = best
+    let t = try nearest_from(w, c, p, a, b, best)
+    if (try w.at(c, t)).subtract(p).length() > best_distance: return best
+    return t
+
+## The parameter of carrier `c` in [a, b] nearest `p` near `seed`: Newton
+## on the derivative of the squared distance, from the seed.
+func nearest_from(w: const Shape*, c: i64, p: Vector3, a: f64, b: f64, seed: f64) -> f64!:
+    var t = seed
     for _ in 0..<30:
         let r = (try w.at(c, t)).subtract(p)
         let d1 = try w.tangent(c, t)
@@ -50,7 +56,6 @@ pub func nearest_on(w: const Shape*, c: i64, p: Vector3, low: f64, high: f64) ->
         let next = math.clamp(t - g / curvature, a, b)
         if math.abs(next - t) < (b - a) * 1e-14: break
         t = next
-    if (try w.at(c, t)).subtract(p).length() > best_distance: return best
     return t
 
 ## Where carrier `c` on [low, high] crosses edge `e`, both on one surface,
@@ -81,15 +86,33 @@ pub func crossings(w: const Shape*, c: i64, low: f64, high: f64, e: usize, size:
     let (ol, oh) = box_of(other.view())
     let pad = (ch.subtract(cl).length() / (f64)n + oh.subtract(ol).length() / (f64)m) + tol * 10.0
     if cl.x > oh.x + pad or ol.x > ch.x + pad or cl.y > oh.y + pad or ol.y > ch.y + pad or cl.z > oh.z + pad or ol.z > ch.z + pad: return
+    # Where the hits found are (on the curve), and the stretches of the
+    # curve found running along the edge, to skip the segments by them.
+    var found = Growing[Vector3]()
+    defer found.close()
+    var along = Growing[(f64, f64)]()
+    defer along.close()
+    let first_hit = out.count
     for i in 0..<n:
         let a0 = curve.items[i]
         let a1 = curve.items[i + 1]
         let reach_a = a1.subtract(a0).length()
+        let ti = low + (high - low) * (f64)i / (f64)n
+        let tj = low + (high - low) * (f64)(i + 1) / (f64)n
+        var covered = false
+        for stretch in along.view():
+            let (start, finish) = stretch
+            if math.min(ti, tj) >= math.min(start, finish) and math.max(ti, tj) <= math.max(start, finish): covered = true
+        if covered: continue
         for j in 0..<m:
             let b0 = other.items[j]
             let b1 = other.items[j + 1]
             let reach = (reach_a + b1.subtract(b0).length()) * 0.6 + tol * 10.0
             if segment_distance(a0, a1, b0, b1) > reach: continue
+            var near_hit = false
+            for q in found.view():
+                if segment_distance(a0, a1, q, q) <= reach and segment_distance(b0, b1, q, q) <= reach: near_hit = true
+            if near_hit: continue
             let t_guess = low + (high - low) * ((f64)i + 0.5) / (f64)n
             let s_guess = edge.t0 + (edge.t1 - edge.t0) * ((f64)j + 0.5) / (f64)m
             let (t, s, distance) = try refine(w, c, low, high, ec, edge.t0, edge.t1, t_guess, s_guess)
@@ -103,28 +126,59 @@ pub func crossings(w: const Shape*, c: i64, low: f64, high: f64, e: usize, size:
             # where they meet.
             let ends: f64[2] = [low, high]
             for end in ends:
-                if try runs_along(w, c, t, end, ec, edge.t0, edge.t1, tol):
+                if try runs_along(w, c, t, end, ec, edge.t0, edge.t1, tol, s, other.view()):
+                    try along.push((t, end))
                     at_t = end
                     at_s = try nearest_on(w, ec, try w.at(c, end), edge.t0, edge.t1)
             # Or to the edge's end, the curve running along it there.
             let its_ends: f64[2] = [edge.t0, edge.t1]
             for end in its_ends:
-                if at_t == t and try runs_along(w, ec, s, end, c, low, high, tol):
+                if at_t == t and try runs_along(w, ec, s, end, c, low, high, tol, t, curve.view()):
                     at_s = end
                     at_t = try nearest_on(w, c, try w.at(ec, end), low, high)
+                    try along.push((t, at_t))
             var known = false
             for hit in out.view():
                 if (try w.at(c, hit.t)).subtract(try w.at(c, at_t)).length() <= tol * 10.0 and math.abs(hit.s - at_s) <= math.abs(edge.t1 - edge.t0) * 1e-6 + 1e-12: known = true
             if not known: try out.push(Hit(at_t, at_s))
+            if out.count > first_hit and not known: try found.push(try w.at(c, at_t))
 
 ## Whether carrier `c` from `t` to `end` stays within reach (ten
-## tolerances) of carrier `ec` on [s0, s1]: sampled, ends included.
-func runs_along(w: const Shape*, c: i64, t: f64, end: f64, ec: i64, s0: f64, s1: f64, tol: f64) -> bool!:
+## tolerances) of carrier `ec` on [s0, s1], `seed` its nearest parameter
+## to `c` at `t` (where they are within reach): sampled, the far end first
+## (a crossing leaves at once), then on from `t`, each nearest point found
+## from the last.
+## `samples` are `ec` at even steps from s0 to s1 (crossings has them),
+## where each nearest search starts.
+func runs_along(w: const Shape*, c: i64, t: f64, end: f64, ec: i64, s0: f64, s1: f64, tol: f64, seed: f64, samples: const Vector3[]) -> bool!:
     if t == end: return false
-    for k in 0..<9:
+    let a = math.min(s0, s1)
+    let b = math.max(s0, s1)
+    let far = try w.at(c, end)
+    if (try w.at(ec, try nearest_sampled(w, ec, far, s0, s1, samples))).subtract(far).length() > tol * 10.0: return false
+    var s = seed
+    for k in 1..<8:
         let p = try w.at(c, t + (end - t) * (f64)k / 8.0)
-        if (try w.at(ec, try nearest_on(w, ec, p, s0, s1))).subtract(p).length() > tol * 10.0: return false
+        s = try nearest_from(w, ec, p, a, b, s)
+        if (try w.at(ec, s)).subtract(p).length() > tol * 10.0:
+            s = try nearest_sampled(w, ec, p, s0, s1, samples)
+            if (try w.at(ec, s)).subtract(p).length() > tol * 10.0: return false
     return true
+
+## nearest_on, its search started at the nearest of `samples` (carrier
+## `c` at even steps from s0 to s1).
+func nearest_sampled(w: const Shape*, c: i64, p: Vector3, s0: f64, s1: f64, samples: const Vector3[]) -> f64!:
+    var best: usize = 0
+    var best_distance = 1.0e300
+    for k in 0..<samples.length:
+        let d = samples[k].subtract(p).length()
+        if d < best_distance:
+            best_distance = d
+            best = k
+    let seed = s0 + (s1 - s0) * (f64)best / (f64)(samples.length - 1)
+    let t = try nearest_from(w, c, p, math.min(s0, s1), math.max(s0, s1), seed)
+    if (try w.at(c, t)).subtract(p).length() > best_distance: return seed
+    return t
 
 ## Where line `c` on [low, high] crosses line edge `e` (not along it):
 ## their nearest points, when within reach and inside both ranges.

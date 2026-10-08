@@ -1,0 +1,335 @@
+## The surface where three G2 or G3 fillets meet at a corner of three flat
+## faces (setback.lucb). The fillets stop short of the corner (the
+## setback). Between their end sections (A curves, each on a fillet swept
+## straight) and curves on the faces (B curves) is a six-sided hole. Six
+## Bezier quads fill it, one at each of its corners. Their outer sides are
+## halves of its curves; their inner sides (seams) run from the curves'
+## middles to a center.
+## The outer sides are exact. Next to an A curve, a quad's first rows are
+## the curve's control points moved along the sweep; next to a B curve
+## they lie in its plane. So the patch meets the fillets and faces with
+## their own continuity: two rows beyond the side for G2, three for G3.
+## Across the seams the quads meet in G1 exactly, with the fixed
+## coefficients of a vertex where six meet: one quad's cross derivative is
+## the next one's turned back, plus t times the seam's. They meet in G2 by
+## least squares. Their remaining freedom goes to the smoothest surface
+## (least thin-plate energy). It is one linear solve, with no iteration.
+## The literature fits one trimmed surface into the hole instead. Its
+## sides are then only near the curves (1e-5 of the corner at best),
+## which the booleans cannot use.
+
+## A side of the hole: how the surface beyond its curve goes on. Either
+## swept straight along `direction` (`swept`: a fillet's end section), or
+## flat, in the plane of normal `direction` (a face).
+struct HoleSide:
+    var swept: bool
+    var direction: Vector3
+
+## A control point of the quads: `base`, plus unknowns `first..<first + count`
+## times `axes`.
+struct Slot:
+    var base: Vector3
+    var first: usize
+    var count: usize
+    var axes: Vector3[3]
+
+## The normal equations of the fit, built a row at a time. A row is a
+## combination of control points dotted with one direction.
+struct Rows:
+    var size: usize
+    var matrix: Growing[f64]
+    var rhs: Growing[f64]
+    var row: Growing[f64]
+    var marked: Growing[bool]
+    var touched: Growing[usize]
+    var constant: f64
+
+    func close():
+        self.matrix.close()
+        self.rhs.close()
+        self.row.close()
+        self.marked.close()
+        self.touched.close()
+
+    ## Control point `slot`, times `weight`, dotted with `axis`, in this row.
+    func add(slot: const Slot*, weight: f64, axis: Vector3) -> !:
+        if weight == 0.0: return
+        self.constant += weight * slot.base.dot(axis)
+        for j in 0..<slot.count:
+            let at = slot.first + j
+            if not self.marked.items[at]:
+                self.marked.items[at] = true
+                try self.touched.push(at)
+            self.row.items[at] += weight * slot.axes[j].dot(axis)
+
+    ## The row, which should equal `target`, weighted `weight`.
+    func commit(target: f64, weight: f64):
+        let n = self.size
+        let goal = target - self.constant
+        for i in self.touched.view():
+            let wi = weight * self.row.items[i]
+            for j in self.touched.view(): self.matrix.items[i * n + j] += wi * self.row.items[j]
+            self.rhs.items[i] += wi * goal
+        for i in self.touched.view():
+            self.row.items[i] = 0.0
+            self.marked.items[i] = false
+        self.touched.clear()
+        self.constant = 0.0
+
+## The Bernstein basis of `degree` at `t`, and its derivatives to the
+## third (order k at out[k * 9 + i]).
+func bernstein(degree: i64, t: f64, out: f64[]):
+    let n = (usize)degree
+    # The basis of each degree from n - 3 up to n (level d - n + 3).
+    var levels: f64[36]
+    var b: f64[9]
+    for i in 0..<(usize)9: b[i] = 0.0
+    for i in 0..<(usize)36: levels[i] = 0.0
+    b[0] = 1.0
+    for d in 0..<n + 1:
+        if d > 0:
+            var i = d
+            while i > 0:
+                b[i] = (1.0 - t) * b[i] + t * b[i - 1]
+                i -= 1
+            b[0] = (1.0 - t) * b[0]
+        if d + 3 >= n:
+            for i in 0..<d + 1: levels[(d + 3 - n) * 9 + i] = b[i]
+    let binomial: f64[4] = [1.0, 3.0, 3.0, 1.0]
+    for k in 0..<(usize)4:
+        var factor = 1.0
+        for f in 0..<k: factor *= (f64)(n - f)
+        for i in 0..<n + 1:
+            var sum = 0.0
+            for j in 0..<k + 1:
+                if j > i or i - j > n - k: continue
+                # (-1)^(k - j) C(k, j), C(k, j) from the row of k.
+                let c = binomial[j] if k == 3 else (1.0 if j == 0 or j == k else 2.0)
+                sum += (c if (k - j) % 2 == 0 else -c) * levels[(3 - k) * 9 + i - j]
+            out[k * 9 + i] = factor * sum
+
+## Bezier `points` split at its middle: the first half onto `first`, the
+## second onto `second`, each from its start.
+func split_bezier(points: const Vector3[], first: Growing[Vector3]*, second: Growing[Vector3]*) -> !:
+    var work = Growing[Vector3]()
+    defer work.close()
+    try work.assign(points)
+    let n = points.length
+    var ends = Growing[Vector3]()
+    defer ends.close()
+    try first.push(work.items[0])
+    try ends.push(work.items[n - 1])
+    for r in 1..<n:
+        for i in 0..<n - r: work.items[i] = work.items[i].add(work.items[i + 1]).multiply_scalar(0.5)
+        try first.push(work.items[0])
+        try ends.push(work.items[n - 1 - r])
+    var i = n
+    while i > 0:
+        i -= 1
+        try second.push(ends.items[i])
+
+## The six quads filling the hole bounded by `curves`, onto `out`.
+## `curves` are six Bezier curves of `degree` in a loop: curve k's control
+## points are curves[k * (degree + 1)..], each curve starting where the
+## one before ends. The surface beyond curve k goes on as `sides[k]` says.
+## Quad k sits at the hole's corner where curve k starts. Its side v = 0
+## is the first half of curve k; its side u = 0 is the second half of
+## curve k - 1, from that corner back. Its corner (1, 1) is the center.
+## Its (degree + 1)^2 control points are u-major (point (a, b) at
+## a * (degree + 1) + b).
+func corner_patch(curves: const Vector3[], sides: const HoleSide[], degree: i64, out: Growing[Vector3]*) -> !:
+    let m = (usize)degree + 1
+    let h = m // 2
+    if sides.length != 6 or curves.length != 6 * m or (degree != 5 and degree != 7): error(invalid, "a corner patch needs six curves of degree 5 or 7")
+    # Unit size about the curves' middle, so the weights mean the same at
+    # any scale.
+    var origin = Vector3()
+    for p in curves: origin = origin.add(p)
+    origin = origin.multiply_scalar(1.0 / (f64)curves.length)
+    var scale = 0.0
+    for p in curves: scale = math.max(scale, p.subtract(origin).length())
+    if scale <= 0.0: error(invalid, "a corner patch's curves are a point")
+    var first = Growing[Vector3]()
+    defer first.close()
+    var second = Growing[Vector3]()
+    defer second.close()
+    var local = Growing[Vector3]()
+    defer local.close()
+    for k in 0..<(usize)6:
+        local.clear()
+        for i in 0..<m: try local.push(curves[k * m + i].subtract(origin).multiply_scalar(1.0 / scale))
+        try split_bezier(local.view(), &first, &second)
+    # What each control point is: kind 1 fixed (on a side), 2 a side's
+    # point moved along its sweep, 3 in a side's plane, 0 free. Keys are
+    # quad points (k * m + a) * m + b, a seam's points under the quad whose
+    # side u = 1 it is, the center last.
+    let center = 6 * m * m
+    var kinds = Growing[i64]()
+    defer kinds.close()
+    try kinds.fill(center + 1, 0)
+    var bases = Growing[Vector3]()
+    defer bases.close()
+    try bases.fill(center + 1, Vector3())
+    var ways = Growing[Vector3]()
+    defer ways.close()
+    try ways.fill(center + 1, Vector3())
+    for k in 0..<(usize)6:
+        let before = (k + 5) % 6
+        for a in 0..<m:
+            let key = patch_key(k, a, 0, m)
+            kinds.items[key] = 1
+            bases.items[key] = first.items[k * m + a]
+        for b in 0..<m:
+            let key = patch_key(k, 0, b, m)
+            kinds.items[key] = 1
+            bases.items[key] = second.items[before * m + m - 1 - b]
+    for k in 0..<(usize)6:
+        let before = (k + 5) % 6
+        for a in 1..<m:
+            for b in 1..<h: set_rule(&kinds, &bases, &ways, patch_key(k, a, b, m), first.items[k * m + a], &sides[k])
+        for a in 1..<h:
+            for b in 1..<m: set_rule(&kinds, &bases, &ways, patch_key(k, a, b, m), second.items[before * m + m - 1 - b], &sides[before])
+    # The unknowns behind each control point (keys no quad uses get none).
+    var used = Growing[bool]()
+    defer used.close()
+    try used.fill(center + 1, false)
+    for k in 0..<(usize)6:
+        for a in 0..<m:
+            for b in 0..<m: used.items[patch_key(k, a, b, m)] = true
+    var slots = Growing[Slot]()
+    defer slots.close()
+    var size: usize = 0
+    for key in 0..<center + 1:
+        let kind = kinds.items[key]
+        var slot = Slot(bases.items[key], size, 0, [Vector3(), Vector3(), Vector3()])
+        if not used.items[key]: slot.count = 0
+        elif kind == 2:
+            slot.count = 1
+            slot.axes[0] = ways.items[key]
+        elif kind == 3:
+            slot.count = 2
+            slot.axes[0] = try across(ways.items[key])
+            slot.axes[1] = ways.items[key].cross(slot.axes[0])
+        elif kind == 0:
+            slot.count = 3
+            slot.axes = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+        size += slot.count
+        try slots.push(slot)
+    var rows = Rows(size, Growing[f64](), Growing[f64](), Growing[f64](), Growing[bool](), Growing[usize](), 0.0)
+    defer rows.close()
+    try rows.matrix.fill(size * size, 0.0)
+    try rows.rhs.fill(size, 0.0)
+    try rows.row.fill(size, 0.0)
+    try rows.marked.fill(size, false)
+    try fairness_rows(&rows, slots.view(), degree)
+    try seam_rows(&rows, slots.view(), degree)
+    try cholesky_solve(rows.matrix.items[..<size * size], rows.rhs.items[..<size], size)
+    for k in 0..<(usize)6:
+        for a in 0..<m:
+            for b in 0..<m:
+                let slot = slots.items[patch_key(k, a, b, m)]
+                var p = slot.base
+                for j in 0..<slot.count: p = p.add(slot.axes[j].multiply_scalar(rows.rhs.items[slot.first + j]))
+                try out.push(origin.add(p.multiply_scalar(scale)))
+
+## Quad k's control point (a, b) as a key: a seam's points under the quad
+## whose side u = 1 it is (quad k's side v = 1 is quad k - 1's side u = 1,
+## run the same way), the center last.
+func patch_key(k: usize, a: usize, b: usize, m: usize) -> usize:
+    if a == m - 1 and b == m - 1: return 6 * m * m
+    if b == m - 1: return (((k + 5) % 6) * m + m - 1) * m + a
+    return (k * m + a) * m + b
+
+## The rule of a side for control point `key` (moved from `base` along
+## its sweep, or in its plane), unless it is fixed. A sweep's rule wins:
+## where a fillet's rows meet a face's, the fillet's lie in the face.
+func set_rule(kinds: Growing[i64]*, bases: Growing[Vector3]*, ways: Growing[Vector3]*, key: usize, base: Vector3, side: const HoleSide*):
+    let kind = kinds.items[key]
+    if kind == 1 or kind == 2: return
+    if kind == 3 and not side.swept: return
+    kinds.items[key] = 2 if side.swept else 3
+    bases.items[key] = base
+    ways.items[key] = side.direction
+
+## The thin-plate energy of every quad (S_uu^2 + 2 S_uv^2 + S_vv^2 over
+## its square), as rows at Gauss points, weighted lightly: it only
+## chooses among the surfaces the seams allow.
+func fairness_rows(rows: Rows*, slots: const Slot[], degree: i64) -> !:
+    let m = (usize)degree + 1
+    let nodes: f64[8] = [0.019855071751231856, 0.10166676129318664, 0.2372337950418355, 0.4082826787521751, 0.5917173212478249, 0.7627662049581645, 0.8983332387068134, 0.9801449282487681]
+    let weights: f64[8] = [0.05061426814518813, 0.11119051722668724, 0.15685332293894364, 0.18134189168918100, 0.18134189168918100, 0.15685332293894364, 0.11119051722668724, 0.05061426814518813]
+    let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+    let orders: usize[6] = [2, 0, 1, 1, 0, 2]
+    let factors: f64[3] = [1.0, 2.0, 1.0]
+    var bu: f64[36]
+    var bv: f64[36]
+    for qu in 0..<(usize)8:
+        bernstein(degree, nodes[qu], bu[..<36])
+        for qv in 0..<(usize)8:
+            bernstein(degree, nodes[qv], bv[..<36])
+            let weight = 1e-5 * weights[qu] * weights[qv]
+            for k in 0..<(usize)6:
+                for term in 0..<(usize)3:
+                    let du = orders[term * 2]
+                    let dv = orders[term * 2 + 1]
+                    for axis in axes:
+                        for a in 0..<m:
+                            for b in 0..<m:
+                                try rows.add(&slots[patch_key(k, a, b, m)], bu[du * 9 + a] * bv[dv * 9 + b], axis)
+                        rows.commit(0.0, weight * factors[term])
+
+## The seams' rows. Seam k is quad k's side u = 1 and quad k + 1's side
+## v = 1, both from a curve's middle (t = 0) to the center. G1, weighted
+## to hold: Q_k,u(1, t) + Q_k+1,v(t, 1) = t Q_k,v(1, t). That is C1 at the
+## curve (where the halves meet smoothly) and, at the center, the six
+## quads' corners an affine regular hexagon about it (2 cos 60 = 1).
+## G2, by least squares: Q_k+1,vv = Q_k,uu - 2t Q_k,uv + t^2 Q_k,vv.
+func seam_rows(rows: Rows*, slots: const Slot[], degree: i64) -> !:
+    let m = (usize)degree + 1
+    let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+    var at_end: f64[36]
+    bernstein(degree, 1.0, at_end[..<36])
+    var bt: f64[36]
+    let samples = 24
+    for s in 0..<samples:
+        let t = ((f64)s + 0.5) / (f64)samples
+        bernstein(degree, t, bt[..<36])
+        for k in 0..<(usize)6:
+            let next = (k + 1) % 6
+            for axis in axes:
+                for a in 0..<m:
+                    for b in 0..<m:
+                        try rows.add(&slots[patch_key(k, a, b, m)], at_end[9 + a] * bt[b] - t * at_end[a] * bt[9 + b], axis)
+                        try rows.add(&slots[patch_key(next, a, b, m)], bt[a] * at_end[9 + b], axis)
+                rows.commit(0.0, 1e3)
+            for axis in axes:
+                for a in 0..<m:
+                    for b in 0..<m:
+                        try rows.add(&slots[patch_key(next, a, b, m)], bt[a] * at_end[18 + b], axis)
+                        let w = -at_end[18 + a] * bt[b] + 2.0 * t * at_end[9 + a] * bt[9 + b] - t * t * at_end[a] * bt[18 + b]
+                        try rows.add(&slots[patch_key(k, a, b, m)], w, axis)
+                rows.commit(0.0, 1.0)
+
+## Solves symmetric positive definite `matrix` (n x n) x = `rhs`, in
+## place: the solution replaces `rhs`.
+func cholesky_solve(matrix: f64[], rhs: f64[], n: usize) -> !:
+    for j in 0..<n:
+        var d = matrix[j * n + j]
+        for k in 0..<j: d -= matrix[j * n + k] * matrix[j * n + k]
+        if d <= 0.0: error(invalid, "a corner patch's fit is singular")
+        let diagonal = math.sqrt(d)
+        matrix[j * n + j] = diagonal
+        for i in j + 1..<n:
+            var s = matrix[i * n + j]
+            for k in 0..<j: s -= matrix[i * n + k] * matrix[j * n + k]
+            matrix[i * n + j] = s / diagonal
+    for i in 0..<n:
+        var s = rhs[i]
+        for k in 0..<i: s -= matrix[i * n + k] * rhs[k]
+        rhs[i] = s / matrix[i * n + i]
+    var i = n
+    while i > 0:
+        i -= 1
+        var s = rhs[i]
+        for k in i + 1..<n: s -= matrix[k * n + i] * rhs[k]
+        rhs[i] = s / matrix[i * n + i]

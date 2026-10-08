@@ -268,8 +268,32 @@ is theirs. Revolve turns sketch splines the same way.
 
 Two G2 or G3 fillets meeting where a third edge stays sharp meet in a miter. Their swept profiles
 meet in the plane bisecting their sweeps, through where their contact lines cross, as that plane's
-affine copy of either profile. It is checked to lie on the other. Three meeting at a corner need a
-corner patch, which isn't made yet (the study's §1.3), so they are refused.
+affine copy of either profile. It is checked to lie on the other.
+
+**Setback corners.** Three G2 or G3 fillets meeting at a corner of three flat faces can't be rounded
+by a ball: no sphere is tangent to them, since their sections aren't circles. So each fillet stops
+short of the corner, at its setback (setback.lucb), as Fusion and SolidWorks do. That is a plane
+square to its edge, past where the next fillets' contacts cross on the faces, by half the largest
+contact distance (1.5 r at a square corner).
+
+The hole left is six-sided. Its sides alternate between the fillets' end sections (A curves) and
+curves on the faces (B curves). A B curve runs between two fillets' contacts, its legs along their
+contact lines, built like the profile. Six Bezier quads fill the hole, one at each of its corners,
+meeting at a center (patch_fit.lucb):
+- **Outer sides:** exact. Next to an A curve, a quad's first rows are the curve's control points
+  moved along the sweep. Next to a B curve, they lie in its plane. So the corner meets the fillets
+  and faces with their own continuity: two rows beyond the side for G2, three for G3.
+- **Seams:** G1 exactly, with the fixed coefficients of a vertex where six meet (one quad's cross
+  derivative is the next one's turned back, plus t times the seam's). G2 holds by least squares, and
+  thin-plate energy picks among what's left. It is one linear solve, measured at 1e-4 degrees and
+  0.01% in curvature across the seams.
+
+The study's single trimmed surface was tried first. Its sides only came within 1e-5 of the corner's
+size, which the booleans can't use. The corner tool is the region between the sharp corner and the
+patch, inside the setback planes. It is taken away after the edges' tools, which end exactly at the
+setbacks, and added at an inside corner. Its patch's control points stay between the faces and the
+setback planes, which is checked. So it meets the body only along curves both carry: a B-spline
+whose control points a plane keeps apart from the other surface (kept_apart) adds no curves.
 
 **Too large.** Before any tool, each edge's blend must fit:
 - **Its faces:** samples along the edge step into each face by the contact distance, and must stay
@@ -338,11 +362,12 @@ tessellation even.
 
 Roughly in order of usefulness:
 
-1. **Fillet corners beyond three edges,** and setback corners (an n-sided patch, Fusion's other
-   corner type).
+1. **Fillet corners beyond three edges,** and G1 setback corners (the same patch with one row:
+   unequal radii, Fusion's other corner type).
 2. **Blends on other curved edges:** ellipses, and edges between two curved faces.
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
-   surfaces. That would also bring G2 and G3 corners and rims.
+   surfaces, and rays through them (classifying a body with B-spline faces meshes it now, most of a
+   G2 corner's time).
 4. **Sweep and loft;** tapered extrudes; Extrude "to object".
 5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
 6. **Shell,** offset, draft and press/pull.
