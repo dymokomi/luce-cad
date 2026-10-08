@@ -50,7 +50,8 @@ pub struct CadEdits:
         defer edge_models.close()
         try edge_owners(tagged.value(), owning.view(), models, &edges, &edge_models)
         let numbered = try tagged.value().with_attribute("cad_edge", 4, 1, edges.view(), true)
-        return try with_references(numbered, models, edges.view(), edge_models.view())
+        let referenced = try with_references(numbered, models, edges.view(), edge_models.view())
+        return try with_face_names(referenced, models, owning.view())
 
     ## `set` with the models `group` names on `pick` (whole models only)
     ## moved by Transform Components' numbers: translate, rotate (degrees),
@@ -258,6 +259,39 @@ func with_references(mesh: interop.Reference[Mesh], models: const interop.Refere
         let model = edge_models[at]
         values[at] = ids.items[firsts.items[(usize)model] + (usize)edges[at]] if model >= 0 and edges[at] >= 0.0 else -1
     return try mesh.value().with_attribute_entry(try text_attribute("cad_edge_reference", Domain.edge, edges.length, &strings, values))
+
+## Takes `mesh`: with each polygon's B-rep face name (modeling's: what made
+## it) in text attribute `cad_face_name`, when a model has names: what a
+## sketch on a picked face keeps, as its number changes with anything
+## upstream. `owning` is each polygon's model.
+func with_face_names(mesh: interop.Reference[Mesh], models: const interop.Reference[CadModel][], owning: const f64[]) -> interop.Reference[Mesh]!:
+    let source = mesh.value().find_attribute("cad_face", 2)
+    if source < 0: return mesh
+    var strings = TableBuilder()
+    defer strings.close()
+    # Each model's B-rep face's string (-1 none), after the earlier models'.
+    var ids = Growing[i32]()
+    defer ids.close()
+    var firsts = Growing[usize]()
+    defer firsts.close()
+    var any = false
+    for model in models:
+        try firsts.push(ids.count)
+        for face in 0..<model.value().face_count():
+            let name = try model.value().face_name(face)
+            try ids.push((try strings.intern(name)) if name != "" else -1)
+            any = any or name != ""
+    if not any: return mesh
+    defer mesh.release()
+    let faces = try mesh.value().attribute_entry(source)
+    let count = (usize)mesh.value().face_count()
+    let values = try new i32[count] --- in memory.heap
+    defer free(values) in memory.heap
+    for at in 0..<count:
+        let model = (usize)owning[at]
+        let face = (usize)faces.number(at, 0)
+        values[at] = ids.items[firsts.items[model] + face] if model < models.length and firsts.items[model] + face < ids.count else -1
+    return try mesh.value().with_attribute_entry(try text_attribute("cad_face_name", Domain.face, count, &strings, values))
 
 ## A model's B-rep edges by the pair of faces using them: sorted keys
 ## (low face * 2^20 + high face) and their edges.
