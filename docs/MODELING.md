@@ -118,6 +118,9 @@ edge itself, used both ways. A part turn has an arc for each vertex, the profile
 and its turned copy at the end, and the profile region as a planar cap at each end. A line on the
 axis stays put, so both caps share it.
 
+A spline turns as a rational surface of revolution, at most a half turn per face. A full turn is
+then two halves, each with a turned copy of the profile at the half-way angle.
+
 A sphere's pole is kept off its faces: along the axis on the face's side, leaning away from the turn's
 middle. A pole on a face makes the tessellator flip triangles.
 
@@ -257,7 +260,13 @@ keep that stretch from producing false crossings:
 - **Splitting looks further:** where two edges leave a vertex along one tangent, the split compares
   them further along to see which turns first.
 
-G2 and G3 fillets meeting at a corner, and those of rims, are refused for now.
+On a rim, the G2 or G3 profile is turned about the rim's axis. A spline turns as a rational surface
+of revolution: two rational quadratic arcs around, each at most a quarter turn. A full turn is two
+halves, so each face's chart opens without a seam. Booleans meet such a surface with a plane across
+its axis, and with a cylinder or cone about it, in circles: where the profile's height, or radius,
+is theirs. Revolve turns sketch splines the same way.
+
+G2 and G3 fillets meeting at a corner are refused for now.
 
 **Too large.** Before any tool, each edge's blend must fit:
 - **Its faces:** samples along the edge step into each face by the contact distance, and must stay

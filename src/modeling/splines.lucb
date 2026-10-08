@@ -96,12 +96,97 @@ func plane_extrusion(w: Shape*, p: const Surface*, s: const Surface*, sweep: Vec
 
 ## Where faces `fa` and `fb` of `w` meet when one lies on a B-spline
 ## surface, onto `out`: a plane and a profile swept straight, in closed
-## form (plane_extrusion); anything else is not supported yet.
+## form (plane_extrusion); a profile turned about an axis and a plane
+## across it, or a cylinder or cone about it, in circles (coaxial_spline);
+## anything else is not supported yet.
 func spline_meet(w: Shape*, fa: usize, fb: usize, tol: f64, out: Growing[Carrier]*) -> !:
     let sa = &w.surfaces.items[(usize)w.faces.items[fa].surface]
     let sb = &w.surfaces.items[(usize)w.faces.items[fb].surface]
-    let plane = sa if sa.kind == 0 else sb
-    let other = sb if sa.kind == 0 else sa
-    let (swept, sweep) = extrusion_of(other)
-    if plane.kind != 0 or not swept: error(invalid, "booleans of B-spline surfaces with anything but planes are not supported yet")
-    try plane_extrusion(w, plane, other, sweep, tol, out)
+    let spline = sa if sa.kind == 3 else sb
+    let other = sb if sa.kind == 3 else sa
+    if other.kind == 0:
+        let (swept, sweep) = extrusion_of(spline)
+        if swept:
+            try plane_extrusion(w, other, spline, sweep, tol, out)
+            return
+    let (turned, center, axis) = revolution_of(spline, tol)
+    if turned and other.kind != 3:
+        if try coaxial_spline(spline, center, axis, other, tol, out): return
+    error(invalid, "booleans of these B-spline surfaces with these faces are not supported yet")
+
+## Whether `s` is a profile turned about an axis (the surfaces Revolve and
+## rim blends make of splines: rows of five control points, two rational
+## quadratic arcs), and that axis: a point on it and its direction.
+func revolution_of(s: const Surface*, tol: f64) -> (bool, Vector3, Vector3):
+    if s.kind != 3 or s.nv != 5 or s.dv != 2: return (false, Vector3(), Vector3())
+    for u in 0..<(usize)s.nu:
+        let q0 = s.points[u * 5]
+        let q2 = s.points[u * 5 + 2]
+        let q4 = s.points[u * 5 + 4]
+        let n = q2.subtract(q0).cross(q4.subtract(q0))
+        if n.length() <= tol * tol: continue
+        let axis = n.normalized() catch failure:
+            _ = failure
+            recover Vector3()
+        # The circle's center: where the chords' bisectors meet, in its plane.
+        let m1 = q0.add(q2).multiply_scalar(0.5)
+        let m2 = q2.add(q4).multiply_scalar(0.5)
+        let d1 = axis.cross(q2.subtract(q0))
+        let d2 = axis.cross(q4.subtract(q2))
+        let det = d1.cross(d2).dot(axis)
+        if math.abs(det) < 1e-300: continue
+        let t = m2.subtract(m1).cross(d2).dot(axis) / det
+        return (true, m1.add(d1.multiply_scalar(t)), axis)
+    return (false, Vector3(), Vector3())
+
+## Where a turned profile (`s`, about `center` along `axis`) meets `other`:
+## a plane across the axis, where the profile's height is the plane's; a
+## cylinder or cone about the axis, where its radius is theirs. Each place
+## along the profile (its ends found exactly) is a circle onto `out`. False
+## when `other` is none of these.
+func coaxial_spline(s: const Surface*, center: Vector3, axis: Vector3, other: const Surface*, tol: f64, out: Growing[Carrier]*) -> bool!:
+    let kind = other.kind
+    if kind == 0:
+        if math.abs(math.abs(other.z.dot(axis)) - 1.0) > 1e-9: return false
+    elif kind == 1 or kind == 2:
+        if math.abs(math.abs(other.z.dot(axis)) - 1.0) > 1e-9: return false
+        let offset = other.origin.subtract(center)
+        if offset.subtract(axis.multiply_scalar(offset.dot(axis))).length() > tol: return false
+    else: return false
+    let x = try across(axis)
+    let samples = 64 * (usize)s.nu
+    var previous = 0.0
+    for k in 0..<samples + 1:
+        let u = (f64)k / (f64)samples
+        let p = try evaluate(*s, Vector3(u, 0.0, 0.0))
+        let value = coaxial_gap(p, center, axis, other)
+        var at = -1.0
+        if math.abs(value) <= tol:
+            # On it at an end (a blend's contact); inside, only crossings.
+            if k == 0 or k == samples: at = u
+        elif k > 0 and math.abs(previous) > tol and (previous < 0.0) != (value < 0.0):
+            var low = u - 1.0 / (f64)samples
+            var high = u
+            for _ in 0..<60:
+                let middle = (low + high) * 0.5
+                if (coaxial_gap(try evaluate(*s, Vector3(middle, 0.0, 0.0)), center, axis, other) < 0.0) == (previous < 0.0): low = middle
+                else: high = middle
+            at = (low + high) * 0.5
+        if at >= 0.0:
+            let q = try evaluate(*s, Vector3(at, 0.0, 0.0))
+            let h = q.subtract(center).dot(axis)
+            let foot = center.add(axis.multiply_scalar(h))
+            let radius = q.subtract(foot).length()
+            if radius > tol: try out.push(Carrier(1, foot, x, axis.cross(x), radius, radius, -1))
+        previous = value
+    return true
+
+## How far profile point `p` is from `other` (a plane across the axis: in
+## height; a cylinder or cone about it: in radius), signed.
+func coaxial_gap(p: Vector3, center: Vector3, axis: Vector3, other: const Surface*) -> f64:
+    if other.kind == 0: return p.subtract(other.origin).dot(other.z)
+    let d = p.subtract(other.origin)
+    let h = d.dot(other.z)
+    let radial = d.subtract(other.z.multiply_scalar(h)).length()
+    if other.kind == 1: return radial - other.radius
+    return radial - (other.radius + h * math.tan(other.angle))

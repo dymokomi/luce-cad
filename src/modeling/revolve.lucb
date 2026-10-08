@@ -35,6 +35,11 @@ pub func revolve_into(b: BrepModel*, p: Profiles*, origin: Vector3, axis: Vector
         let offset = e.start.subtract(origin)
         let r = offset.subtract(axis.multiply_scalar(offset.dot(axis)))
         if r.length() > tol * 10.0 and r.dot(side) < 0.0: error(invalid, "a revolved profile must lie on one side of its axis")
+    # Splines turn by parts of at most a half turn (each face's chart then
+    # opens without a seam), a full turn as two halves.
+    var splines = false
+    for e in p.edges.view():
+        if e.kind == 2: splines = true
     var edges = Growing[ProfileEdge]()
     defer edges.close()
     var halves = Growing[bool]()
@@ -59,8 +64,8 @@ pub func revolve_into(b: BrepModel*, p: Profiles*, origin: Vector3, axis: Vector
                 else:
                     try edges.push(e)
                     try halves.push(false)
-            if partial:
-                try revolve_part(b, p, edges.view(), origin, a, tol, tag, angle, &caps)
+            if partial or splines:
+                try revolve_parts(b, p, edges.view(), origin, a, tol, tag, angle, partial, &caps)
             else:
                 try revolve_loop(b, p, edges.view(), halves.view(), origin, a, tol, tag)
         if partial: try close_part(b, p, &caps, origin, a, angle, tag, p.loop_edges(p.region(region)[0]))
@@ -197,47 +202,71 @@ func turned_direction(d: Vector3, a: Vector3, angle: f64) -> Vector3:
     let s = math.sin(angle)
     return d.multiply_scalar(c).add(a.cross(d).multiply_scalar(s)).add(a.multiply_scalar(a.dot(d) * (1.0 - c)))
 
-## One loop turned part way: each vertex's arc (none on the axis), each
-## edge at the start and turned to the end, and the face each sweeps;
-## the start and end edges onto `caps` for close_part.
-func revolve_part(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[], origin: Vector3, a: Vector3, tol: f64, tag: str, angle: f64, caps: Caps*) -> !:
+## A loop's vertices and edges at one angle of a turn (its profile, or a
+## part's end).
+struct Ring:
+    var vertices: Growing[i64]
+    var edges: Growing[i64]
+
+    func close():
+        self.vertices.close()
+        self.edges.close()
+
+func new_ring() -> Ring:
+    return Ring(Growing[i64](), Growing[i64]())
+
+## The loop's ring at angle 0: its vertices and edges as they lie.
+func profile_ring(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[], ring: Ring*) -> !:
+    ring.vertices.clear()
+    ring.edges.clear()
+    for e in edges: try ring.vertices.push(try b.add_vertex(e.start))
+    for at in 0..<edges.length:
+        try ring.edges.push(try edge_curve(b, p, &edges[at], Vector3(), p.normal, ring.vertices.items[at], ring.vertices.items[(at + 1) % edges.length]))
+
+## One loop turned from angle `begin` (its ring `start` there) to `finish`:
+## each vertex's arc (none on the axis), each edge turned to the end, and
+## the face each sweeps. The end ring onto `end`, or (`closing`, a full
+## turn's last part) the given ring there.
+func revolve_turn(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[], origin: Vector3, a: Vector3, tol: f64, tag: str, begin: f64, finish: f64, start: const Ring*, closing: const Ring*?, end: Ring*) -> !:
     let count = edges.length
-    var first = Growing[i64]()
-    defer first.close()
-    var last = Growing[i64]()
-    defer last.close()
+    end.vertices.clear()
+    end.edges.clear()
     var arcs = Growing[i64]()
     defer arcs.close()
     for at in 0..<count:
         let point = edges[at].start
-        let v0 = try b.add_vertex(point)
-        try first.push(v0)
+        let v0 = start.vertices.items[at]
         let (r, foot) = axis_distance(point, origin, a)
         if r <= tol * 10.0:
-            try last.push(v0)
+            try end.vertices.push(v0)
             try arcs.push(-1)
             continue
-        let v1 = try b.add_vertex(turned_point(point, origin, a, angle))
-        try last.push(v1)
-        try arcs.push(try b.add_circle(v0, v1, foot, a, point.subtract(foot), r, true))
+        var v1: i64 = -1
+        if let ring = closing: v1 = ring.vertices.items[at]
+        else: v1 = try b.add_vertex(turned_point(point, origin, a, finish))
+        try end.vertices.push(v1)
+        try arcs.push(try b.add_circle(v0, v1, foot, a, turned_direction(point.subtract(foot), a, begin), r, true))
     var name = Growing[u8]()
     defer name.close()
-    let normal_end = turned_direction(p.normal, a, angle)
+    let normal_end = turned_direction(p.normal, a, finish)
     for at in 0..<count:
         let next = (at + 1) % count
         let e = &edges[at]
         let a0 = arcs.items[at]
         let a1 = arcs.items[next]
-        let at_start = try edge_curve(b, p, e, Vector3(), p.normal, first.items[at], first.items[next])
-        # A line on the axis stays where it is: both caps share it.
+        let at_start = start.edges.items[at]
+        # A line on the axis stays where it is: both ends share it.
         let on_axis = a0 < 0 and a1 < 0 and e.kind == 0
-        let at_end = at_start if on_axis else try turned_edge(b, p, e, origin, a, angle, normal_end, last.items[at], last.items[next])
-        try caps.start.push(at_start)
-        try caps.end.push(at_end)
+        var at_end = at_start
+        if not on_axis:
+            if let ring = closing: at_end = ring.edges.items[at]
+            else: at_end = try turned_edge(b, p, e, origin, a, finish, normal_end, end.vertices.items[at], end.vertices.items[next])
+        try end.edges.push(at_end)
         if on_axis: continue
         let middle = try p.edge_at(e, 0.5)
         let tangent = try (try p.edge_at(e, 0.501)).subtract(try p.edge_at(e, 0.499)).normalized()
-        let outward = tangent.cross(p.normal)
+        let outward = turned_direction(tangent.cross(p.normal), a, begin)
+        let middle_here = turned_point(middle, origin, a, begin)
         # A sphere's poles both off its face: the face (half a profile arc
         # turned) lies on one side of the axis's middle plane and toward
         # the turn's middle, so its pole leans along the axis that side
@@ -246,10 +275,14 @@ func revolve_part(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[],
         var pole = Vector3()
         if e.kind == 1 and radial.length() > tol:
             let side = 1.0 if middle.subtract(e.center).dot(a) >= 0.0 else -1.0
-            pole = try a.multiply_scalar(side).subtract(turned_direction(try radial.normalized(), a, angle * 0.5)).normalized()
-        let (surface, cap) = try swept_surface(b, p, e, origin, a, tol, pole)
-        _ = cap
-        let sense = (try surface_normal_at(b, surface, middle)).dot(outward) > 0.0
+            pole = try a.multiply_scalar(side).subtract(turned_direction(try radial.normalized(), a, (begin + finish) * 0.5)).normalized()
+        var surface: i64 = -1
+        if e.kind == 2: surface = try spline_revolution(b, p, e, origin, a, begin, finish - begin)
+        else:
+            let (made, cap) = try swept_surface(b, p, e, origin, a, tol, pole)
+            _ = cap
+            surface = made
+        let sense = (try surface_normal_at(b, surface, middle_here)).dot(outward) > 0.0
         var uses = Growing[i64]()
         defer uses.close()
         try uses.push(at_start + 1)
@@ -260,7 +293,38 @@ func revolve_part(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[],
         let face = try b.add_face(surface, uses.view(), sizes[..<1], sense)
         try side_name(&name, tag, e, "")
         try b.set_face_name(face, (str)name.view())
-    try caps.sizes.push((i64)count)
+
+## Spline edge `e` turned from `begin` through `sweep` (at most a half turn)
+## as a rational surface of revolution: u along the edge, v around in two
+## spans of rational quadratic arcs (each a quarter turn at most, its middle
+## weight the cosine of half its angle).
+func spline_revolution(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, origin: Vector3, a: Vector3, begin: f64, sweep: f64) -> i64!:
+    if sweep > math.pi + 1e-9: error(invalid, "a spline is turned at most a half turn per face")
+    let (points, weights, knots, degree) = p.spline_net(e.spline)
+    let half = sweep * 0.25
+    let middle_weight = math.cos(half)
+    var net = Growing[Vector3]()
+    defer net.close()
+    var w = Growing[f64]()
+    defer w.close()
+    for at in 0..<points.length:
+        let start = turned_point(points[at], origin, a, begin)
+        let (r, foot) = axis_distance(start, origin, a)
+        let radial = start.subtract(foot)
+        for k in 0..<5:
+            let angle = half * (f64)k
+            let reach = 1.0 if k % 2 == 0 else 1.0 / middle_weight
+            _ = r
+            try net.push(foot.add(turned_direction(radial, a, angle).multiply_scalar(reach)))
+            try w.push(weights[at] * (1.0 if k % 2 == 0 else middle_weight))
+    # Knots from 0 to 1 both ways (inversion expects it).
+    var ku = Growing[f64]()
+    defer ku.close()
+    let low = knots[0]
+    let span = knots[knots.length - 1] - low
+    for k in knots: try ku.push((k - low) / span)
+    let kv: f64[8] = [0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0]
+    return try b.add_spline_surface(net.view(), w.view(), (i64)points.length, 5, degree, 2, ku.view(), kv[..<8])
 
 ## Profile edge `e` turned `angle` about the axis, between vertices
 ## `start` and `end` of `b` (its plane's normal turned: `normal`).
@@ -273,6 +337,35 @@ func turned_edge(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, origi
     defer moved.close()
     for point in points: try moved.push(turned_point(point, origin, a, angle))
     return try b.add_spline_edge(start, end, moved.view(), weights, degree, knots, true)
+
+## A loop turned through `angle` in parts (a half turn at most each, with
+## splines; one part otherwise), the start and end rings' edges onto `caps`
+## when `partial` (a full turn's last part closes on its first ring).
+func revolve_parts(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[], origin: Vector3, a: Vector3, tol: f64, tag: str, angle: f64, partial: bool, caps: Caps*) -> !:
+    var splines = false
+    for e in edges:
+        if e.kind == 2: splines = true
+    let parts = (usize)math.max(1.0, math.ceil(angle / math.pi - 1e-9)) if splines else 1
+    var first = new_ring()
+    defer first.close()
+    try profile_ring(b, p, edges, &first)
+    var current = new_ring()
+    defer current.close()
+    var next = new_ring()
+    defer next.close()
+    try current.vertices.assign(first.vertices.view())
+    try current.edges.assign(first.edges.view())
+    for part in 0..<parts:
+        let begin = angle * (f64)part / (f64)parts
+        let finish = angle * (f64)(part + 1) / (f64)parts
+        let closing: const Ring*? = (&first) if not partial and part + 1 == parts else none
+        try revolve_turn(b, p, edges, origin, a, tol, tag, begin, finish, &current, closing, &next)
+        try current.vertices.assign(next.vertices.view())
+        try current.edges.assign(next.edges.view())
+    if partial:
+        for e in first.edges.view(): try caps.start.push(e)
+        for e in current.edges.view(): try caps.end.push(e)
+        try caps.sizes.push((i64)edges.length)
 
 ## A part revolve's caps: the profile region at the start (facing back
 ## against the turn) and turned to the end (facing on).
