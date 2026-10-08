@@ -111,8 +111,9 @@ pub func fillet_tests() -> unit!:
     _ = filleted(slanted, edges_where(slanted, at(slant_corner)), 0.2, 10, 0.0, -1.0, false)
     inside_corners()
     pocket_corners()
+    chains()
     smooth()
-    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim); G2 and G3 fillets outside and inside, alone and apart; a pocket's inside corners, mitered and balled")
+    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim); G2 and G3 fillets outside and inside, alone and apart; a pocket's inside corners, mitered and balled; tangent chains around a slot's rim and an earlier fillet")
 
 func blend(model: CadModel, edges: list[int], r: float, round: bool, faces: int, expected: float, tolerance: float) -> unit!:
     let refs = CadModeling.edge_references(model, edges)
@@ -245,3 +246,54 @@ func pocket_corners() -> unit!:
     let a = r * r * (1.0 - math.pi * 0.25)
     blend(pocket, edges_where(pocket, pocket_floor), r, true, 15, 28.0 + 8.0 * a - 4.0 * r * r * r * (5.0 / 3.0 - math.pi * 0.5), 0.001)
     blend(pocket, edges_where(pocket, pocket_floor_and_walls), r, true, 23, 28.0 + 4.0 * (2.0 - 2.0 * r) * a + 4.0 * (1.0 - r) * a + 4.0 * r * r * r * (1.0 - math.pi / 6.0), 0.001)
+
+## The first straight edge `keep` takes.
+func first_edge(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> int!:
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            if model.face_edge_linear(face, use) and keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)):
+                return model.face_edge_id(face, use)
+    assert(false)
+    return -1
+
+func slot_top(a: Vector3, b: Vector3) -> bool:
+    return a.y > 0.49 and b.y > 0.49 and math.abs(a.z - 0.5) < 1e-6 and math.abs(b.z - 0.5) < 1e-6
+
+func top_front(a: Vector3, b: Vector3) -> bool:
+    return a.y > 0.99 and b.y > 0.99 and a.z > 0.99 and b.z > 0.99
+
+func front_right(a: Vector3, b: Vector3) -> bool:
+    return a.x > 0.99 and b.x > 0.99 and a.z > 0.99 and b.z > 0.99
+
+## One edge picked brings its tangent chain: a rounded slot's rim (two
+## lines, two half circles: their tools part-way tori and cones, ending
+## square where they meet), filleted and chamfered, by Pappus; a box's top
+## front edge after its front right upright was rounded, the chain running
+## around the earlier fillet's arc to the side.
+func chains() -> unit!:
+    let plate = CadModeling.tagged(CadSolids.box(6.0, 1.0, 4.0), "#p")
+    let middle = CadModeling.tagged(CadSolids.box(2.0, 2.0, 1.0), "#m")
+    let end0 = CadModeling.tagged(CadSolids.cylinder(0.5, 2.0), "#e0").transformed(Vector3(-1.0, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let end1 = CadModeling.tagged(CadSolids.cylinder(0.5, 2.0), "#e1").transformed(Vector3(1.0, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let slotted = CadModeling.combined(plate, CadModeling.combined(CadModeling.combined(middle, end0, 0), end1, 0), 1)
+    let before = volume(slotted.tessellate(32))
+    let r = 0.2
+    let a = r * r * (1.0 - math.pi * 0.25)
+    let reach = r * (10.0 - 3.0 * math.pi) / (3.0 * (4.0 - math.pi))
+    let edge = [first_edge(slotted, slot_top)]
+    blend(slotted, edge, r, true, 14, before - 4.0 * a - 2.0 * math.pi * (0.5 + reach) * a, 0.001)
+    blend(slotted, edge, r, false, 14, before - 2.0 * r * r - 2.0 * math.pi * (0.5 + r / 3.0) * r * r * 0.5, 0.001)
+    # Unchained: that line alone, its fillet ending in a wall at each end
+    # where the rim curves on.
+    let alone = CadModeling.filleted(slotted, CadModeling.edge_references(slotted, edge), r, "#f", 1, false)
+    assert(alone.face_count() == 13)
+    closed(alone.tessellate(16))
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#b")
+    let rounded = CadModeling.filleted(box, CadModeling.edge_references(box, [first_edge(box, front_right)]), 0.5, "#r")
+    let around = CadModeling.filleted(rounded, CadModeling.edge_references(rounded, [first_edge(rounded, top_front)]), r, "#f")
+    assert(around.face_count() == 10)
+    let mesh = around.tessellate(32)
+    # Closed; its bottom face may mesh a sliver (a tessellation matter).
+    closed(mesh)
+    let expected = volume(rounded.tessellate(64)) - 2.0 * 1.5 * a - 0.5 * math.pi * (0.5 - reach) * a
+    assert(math.abs(volume(mesh) - expected) < 0.001)

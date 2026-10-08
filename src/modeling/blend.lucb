@@ -26,12 +26,13 @@ func along_edge(w: const Shape*, e: usize) -> Vector3!:
     let t = (edge.t0 + edge.t1) * 0.5
     return try (try w.tangent(edge.carrier, t)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0).normalized()
 
-## A full circle between a flat face across its axis and a cylinder about
-## it (a hole's rim, a boss's edge).
+## A circle, or an arc of one, between a flat face across its axis and a
+## cylinder about it (a hole's rim, a boss's edge, the edge around an
+## earlier fillet).
 func is_rim(w: const Shape*, e: usize, fa: usize, fb: usize) -> bool:
     let edge = w.edges.items[e]
     let c = w.carriers.items[(usize)edge.carrier]
-    if c.kind != 1 or edge.start != edge.end: return false
+    if c.kind != 1: return false
     let axis = c.x.cross(c.y)
     let sa = w.surfaces.items[(usize)w.faces.items[fa].surface]
     let sb = w.surfaces.items[(usize)w.faces.items[fb].surface]
@@ -77,7 +78,7 @@ func convex(w: const Shape*, e: usize) -> bool!:
 ## An end marked exact (where a corner ball takes over) stops right there.
 ## Its blend face is named `name`.
 func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: const Mesh*, name: str) -> interop.Reference[CadModel]!:
-    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 1: return try rim_tool(w, e, size, round, continuity, name)
+    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 1: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -212,22 +213,47 @@ func name_tool(b: BrepModel*, name: str) -> !:
     for face in 0..<b.face_count():
         try b.set_face_name(face, name if face == 1 else "")
 
-## A rim's tool: the corner profile at its middle (a triangle `size` along
-## each face, or the region between them and the circle of radius `size`
-## touching both) turned about the rim's axis: a cone, or a torus.
-func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, name: str) -> interop.Reference[CadModel]!:
-    let carrier = w.carriers.items[(usize)w.edges.items[e].carrier]
+## A rim's tool: the corner profile (a triangle `size` along each face,
+## or the region between them and the circle of radius `size` touching
+## both) turned about the rim's axis: a cone, or a torus. A whole circle's
+## turns all the way; an arc's turns along it, reaching past an end where
+## the corner beyond is empty and stopping at an exact one (a tangent
+## joint with the next edge of a chain).
+func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, exact_start: bool, exact_end: bool, body: const Mesh*, name: str) -> interop.Reference[CadModel]!:
+    let edge = w.edges.items[e]
+    let carrier = w.carriers.items[(usize)edge.carrier]
     let (fa, fb) = try edge_faces(w, e)
     let along = try along_edge(w, e)
     let p = try w.edge_at(e, 0.5)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     if round and continuity > 1: error(invalid, "G2 and G3 fillets of rims are not supported yet")
-    var profile = try corner_profile(p, along, ua, ub, size, round, continuity)
-    defer profile.close()
+    let normal = carrier.x.cross(carrier.y)
     let solid = try new_solid(carrier.a + size * 4.0)
     defer solid.release()
-    try revolve_into(solid.value(), &profile, carrier.origin, carrier.x.cross(carrier.y), (carrier.a + size) * 1e-7, "")
+    if edge.start == edge.end:
+        var profile = try corner_profile(p, along, ua, ub, size, round, continuity)
+        defer profile.close()
+        try revolve_into(solid.value(), &profile, carrier.origin, normal, (carrier.a + size) * 1e-7, "")
+        try name_tool(solid.value(), name)
+        return try model_of(solid)
+    # The axis turning the way the edge runs.
+    var a = normal
+    if a.cross(p.subtract(carrier.origin)).dot(along) < 0.0: a = normal.multiply_scalar(-1.0)
+    let sweep = math.abs(edge.t1 - edge.t0)
+    # Past a free end, by a margin where the corner beyond is empty.
+    let margin = math.min(math.pi * 0.25, size * 2.0 / carrier.a)
+    let corner = try ua.add(ub).normalized().multiply_scalar(size * 0.25)
+    let extent = (carrier.a + size) * 4.0
+    let first = try w.edge_at(e, 0.0)
+    let last = try w.edge_at(e, 1.0)
+    let before = 0.0 if exact_start or try inside_mesh(body, turned_point(first, carrier.origin, a, -size * 0.5 / carrier.a).add(turned_direction(corner, a, -sweep * 0.5)), extent) else margin
+    let after = 0.0 if exact_end or try inside_mesh(body, turned_point(last, carrier.origin, a, size * 0.5 / carrier.a).add(turned_direction(corner, a, sweep * 0.5)), extent) else margin
+    # The profile where the tool starts: the middle's turned back.
+    let back = -(sweep * 0.5 + before)
+    var profile = try corner_profile(turned_point(p, carrier.origin, a, back), turned_direction(along, a, back), turned_direction(ua, a, back), turned_direction(ub, a, back), size, round, continuity)
+    defer profile.close()
+    try revolve_into(solid.value(), &profile, carrier.origin, a, (carrier.a + size) * 1e-7, "", sweep + before + after)
     try name_tool(solid.value(), name)
     return try model_of(solid)
 
@@ -236,7 +262,10 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
 ## `size` when `round`, else chamfered `size` along each face. The blend
 ## faces are named for feature `tag`. A fillet's `continuity` is 1 (G1,
 ## circular), 2 (G2) or 3 (G3): see corner_profile.
-pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1) -> interop.Reference[CadModel]!:
+## With `chain`, each referenced edge brings the edges that continue it
+## tangentially (Fusion's Tangent Chain): a slot's rim, the edges around an
+## earlier fillet.
+pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true) -> interop.Reference[CadModel]!:
     if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     var w = try shape_of(model)
@@ -252,7 +281,8 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
     else:
         try resolve_edges(&w, references, &chosen)
         for e in chosen.view():
-            if not try blendable(&w, e): error(invalid, "only straight edges between flat faces, and rims (a circle between a flat face and a cylinder about it), can be blended yet")
+            if not try blendable(&w, e): error(invalid, "only straight edges between flat faces, and rims (a circle or arc between a flat face and a cylinder about it), can be blended yet")
+        if chain: try tangent_chains(&w, &chosen)
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
     # Every edge of a convex polyhedron rounded: built whole.
     if round and every and continuity == 1:
@@ -260,7 +290,10 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
     # Where three fillets meet, a ball rounds the corner.
     var balls = Growing[Ball]()
     defer balls.close()
-    if round: try fillet_corners(&w, chosen.view(), size, continuity, &balls)
+    # Where chained edges meet tangentially, their tools end square.
+    var joints = Growing[i64]()
+    defer joints.close()
+    try fillet_corners(&w, chosen.view(), size, continuity, round, &balls, &joints)
     let body = try model.tessellate(16)
     defer body.release()
     var tools = Growing[interop.Reference[CadModel]]()
@@ -287,7 +320,10 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
         let adding = not try convex(&w, e)
         # A rim is its own tool.
         if w.carriers.items[(usize)w.edges.items[e].carrier].kind != 0:
-            try tools.push(try edge_tool(&w, e, size, round, continuity, low, high, false, false, body.value(), (str)name.view()))
+            let edge = w.edges.items[e]
+            let at_start = vertex_in(joints.view(), edge.start)
+            let at_end = vertex_in(joints.view(), edge.end)
+            try tools.push(try edge_tool(&w, e, size, round, continuity, low, high, at_start, at_end, body.value(), (str)name.view()))
             try adds.push(adding)
             continue
         let (fa, fb) = try edge_faces(&w, e)
@@ -315,6 +351,10 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             elif corner.subtract(high).length() <= w.tolerance * 10.0:
                 high = foot
                 exact_high = true
+        for v in joints.view():
+            let corner = w.points.items[(usize)v]
+            if corner.subtract(low).length() <= w.tolerance * 10.0: exact_low = true
+            elif corner.subtract(high).length() <= w.tolerance * 10.0: exact_high = true
         if adding: try tools.push(try concave_tool(&w, e, size, round, continuity, low, high, exact_low, exact_high, (str)name.view()))
         else: try tools.push(try edge_tool(&w, e, size, round, continuity, low, high, exact_low, exact_high, body.value(), (str)name.view()))
         try adds.push(adding)
@@ -333,6 +373,37 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             result.release()
             result = next
     return result
+
+func vertex_in(vertices: const i64[], v: i64) -> bool:
+    for known in vertices:
+        if known == v: return true
+    return false
+
+## `chosen` with the edges that continue its edges tangentially, of the
+## same convexity, through vertices where nothing else could be blended
+## (a slot's rim around its ends, the edges around an earlier fillet).
+func tangent_chains(w: const Shape*, chosen: Growing[usize]*) -> !:
+    var at: usize = 0
+    while at < chosen.count:
+        let e = chosen.items[at]
+        at += 1
+        let outward = try convex(w, e)
+        for end in 0..<2:
+            let v = w.edges.items[e].start if end == 0 else w.edges.items[e].end
+            # Arriving at v along e.
+            let arriving = (try w.leaving(e, (i64)end)).multiply_scalar(-1.0)
+            for f in 0..<w.edges.count:
+                if f == e: continue
+                let other = w.edges.items[f]
+                if other.start != v and other.end != v: continue
+                var known = false
+                for c in chosen.view():
+                    if c == f: known = true
+                if known: continue
+                let leaving = try w.leaving(f, 0 if other.start == v else 1)
+                if leaving.dot(arriving) < 1.0 - 1e-6: continue
+                if not try blendable(w, f) or try convex(w, f) != outward: continue
+                try chosen.push(f)
 
 ## The name of edge `e`'s blend, `tag/blend[A&B]`, into `out` (empty
 ## when its faces have no names).

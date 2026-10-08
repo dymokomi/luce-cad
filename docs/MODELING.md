@@ -131,23 +131,27 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    (`intersect.lucb`). The table:
    - plane/plane: a line;
    - plane/cylinder: a circle, one or two lines, or an ellipse;
-   - plane/cone with the axis across the plane: a circle;
+   - plane/cone with the axis across the plane: a circle; through the axis: two lines;
    - plane/sphere: a circle;
    - parallel cylinders: lines;
    - cylinders of one radius whose axes cross: two ellipses, one in each plane bisecting the axes;
    - cylinder/sphere with the center on the axis: circles, or one where they touch;
    - sphere/sphere: a circle;
-   - plane/torus with the axis across the plane: circles;
+   - plane/torus with the axis across the plane: circles; through the axis: the tube's two
+     sections;
    - surfaces of revolution about one axis (cylinder, cone, sphere, torus): circles, where their
      radii agree along the axis.
 
    Coincident surfaces are reported as such, facing the same way or opposite.
 
+   Planes within 1e-7 radians of parallel are treated as parallel: noise, not a crossing.
+
    Analytic pairs the table doesn't cover are traced (`march.lucb`). This covers cylinders at an
    angle, cones at an angle and tori. Each surface is an implicit function, and a curve on both runs
    along the cross product of their gradients. Start points are where one face's boundary, or a grid
    over the face, crosses the other surface. Each start is traced both ways: a step along the curve,
-   then Newton back onto both surfaces. Each traced curve becomes an interpolating cubic B-spline
+   then Newton back onto both surfaces. A trace ends where the surfaces touch (their gradients
+   parallel). Each traced curve becomes an interpolating cubic B-spline
    through points exactly on both surfaces.
 3. **Clipping to faces.** Each curve is clipped to both faces (`clip.lucb`). Its crossings with
    either face's boundary are found on samples, then refined by Newton steps on the exact curves.
@@ -246,6 +250,15 @@ keep that stretch from producing false crossings:
   them further along to see which turns first.
 
 G2 and G3 fillets meeting at a corner, and those of rims, are refused for now.
+
+**Tangent chains.** Like Fusion's Tangent Chain, a referenced edge brings the edges that continue
+it tangentially with the same convexity, such as a rounded slot's rim or the edges around an
+earlier fillet. Pass `chain = false` to blend only the edges named.
+
+Arcs of rims (an arc between a flat face and a cylinder about it) are blended by a corner profile
+turned part way along them, a part torus or cone. Where chained edges meet, each tool ends square
+at the joint, so neighbouring tools share their end planes. A free end of an arc reaches past, as a
+line's does, when the corner beyond is empty.
 
 ### Fillets meeting at corners (`corners.lucb`)
 

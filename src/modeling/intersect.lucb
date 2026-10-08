@@ -6,7 +6,8 @@
 ##   plane / plane        a line, or coincident (same or opposite facing)
 ##   plane / cylinder     a circle (axis across the plane), two lines or one
 ##                        (axis along it), an ellipse (at an angle)
-##   plane / cone         a circle (axis across the plane)
+##   plane / cone         a circle (axis across the plane), two lines (the
+##                        plane through the axis)
 ##   plane / sphere       a circle
 ##   cylinder / cylinder  lines (parallel axes), coincident (one axis, one
 ##                        radius), two ellipses (one radius, axes crossing:
@@ -14,6 +15,8 @@
 ##   cylinder / sphere    circles (the center on the axis), one where they
 ##                        touch (a fillet ending in a rounded corner)
 ##   sphere / sphere      a circle
+##   plane / torus        circles (axis across the plane), the tube's two
+##                        sections (the plane through the axis)
 ## Anything else is not supported yet: the operation says which surfaces.
 
 ## What two surfaces share: 0 curves (`out`, maybe none), 1 the same surface
@@ -49,7 +52,9 @@ pub func meet(s1: const Surface*, s2: const Surface*, tol: f64, out: Growing[Car
 
 func plane_plane(a: const Surface*, b: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
     let direction = a.z.cross(b.z)
-    if direction.length() < 1e-9:
+    # Parallel within noise (a plane turned to where another is): a tilt
+    # of 1e-7 moves a model-sized plane less than its tolerance.
+    if direction.length() < 1e-7:
         if math.abs(b.origin.subtract(a.origin).dot(a.z)) > tol: return meet_curves
         return meet_same if a.z.dot(b.z) > 0.0 else meet_opposite
     let d = try direction.normalized()
@@ -95,6 +100,14 @@ func plane_cylinder(p: const Surface*, c: const Surface*, tol: f64, out: Growing
 
 func plane_cone(p: const Surface*, c: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
     let tilt = p.z.dot(c.z)
+    if math.abs(tilt) < 1e-12 and math.abs(c.origin.subtract(p.origin).dot(p.z)) <= tol:
+        # Through the axis: the two lines of the cone in the plane, radius
+        # r + h tan(angle) either side.
+        let side = p.z.cross(c.z)
+        let k = math.tan(c.angle)
+        try out.push(Carrier(0, c.origin.add(side.multiply_scalar(c.radius)), try c.z.add(side.multiply_scalar(k)).normalized(), Vector3(), 0.0, 0.0, -1))
+        try out.push(Carrier(0, c.origin.subtract(side.multiply_scalar(c.radius)), try c.z.subtract(side.multiply_scalar(k)).normalized(), Vector3(), 0.0, 0.0, -1))
+        return meet_curves
     if math.abs(tilt) < 1.0 - 1e-12: return meet_march
     let height = p.origin.subtract(c.origin).dot(c.z)
     let radius = c.radius + height * math.tan(c.angle)
@@ -184,6 +197,13 @@ func sphere_sphere(a: const Surface*, b: const Surface*, tol: f64, out: Growing[
 
 ## Where a plane across a torus's axis cuts it: circles (two, one, none).
 func plane_torus(p: const Surface*, t: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    if math.abs(p.z.dot(t.z)) < 1e-12 and math.abs(t.origin.subtract(p.origin).dot(p.z)) <= tol:
+        # Through the axis: the tube's two sections, circles of the minor
+        # radius about the ring either side.
+        let side = p.z.cross(t.z)
+        try out.push(Carrier(1, t.origin.add(side.multiply_scalar(t.radius)), side, t.z, t.angle, t.angle, -1))
+        try out.push(Carrier(1, t.origin.subtract(side.multiply_scalar(t.radius)), side, t.z, t.angle, t.angle, -1))
+        return meet_curves
     if math.abs(math.abs(p.z.dot(t.z)) - 1.0) > 1e-12: return meet_march
     let h = p.origin.subtract(t.origin).dot(t.z)
     if math.abs(h) >= t.angle - tol: return meet_curves
