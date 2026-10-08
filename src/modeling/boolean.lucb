@@ -397,8 +397,77 @@ func assemble(work: Work*, op: i64, mesh_a: const Mesh*, mesh_b: const Mesh*) ->
             take = class == class_in or (class == class_same and first)
         try keep.push(take)
         try turn.push(flip)
+    try merge_pieces(work, &traced, &pieces, &piece_face, &keep, &turn)
     try seam_zones(work, &traced, &pieces, piece_face.view(), keep.view())
     return try write_result(work, &pieces, piece_face.view(), keep.view(), turn.view())
+
+## Kept pieces of one face, or of faces on one surface facing one way
+## (coincident pairs), that share edges no other face uses are one region:
+## each such group is traced again without those edges (a seam, one
+## piece's both ways, stays), so a face cut and kept whole is one face and
+## two flush faces joined are one.
+func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face: Growing[usize]*, keep: Growing[bool]*, turn: Growing[bool]*) -> !:
+    let original = pieces.piece_count()
+    # Faces on one surface facing one way share a group (its first face).
+    var group = Growing[usize]()
+    defer group.close()
+    for f in 0..<work.w.faces.count: try group.push(f)
+    for pair in work.coincident.view():
+        if not pair.same: continue
+        let a = root(&group, pair.fa)
+        let b = root(&group, pair.fb)
+        if a < b: group.items[b] = a
+        elif b < a: group.items[a] = b
+    var halves = Growing[HalfEdge]()
+    defer halves.close()
+    var owner = Growing[usize]()
+    defer owner.close()
+    var dropped = Growing[bool]()
+    defer dropped.close()
+    var remaining = Growing[HalfEdge]()
+    defer remaining.close()
+    for f in 0..<work.w.faces.count:
+        if root(&group, f) != f: continue
+        for side in 0..<2:
+            let flip = side == 1
+            halves.clear()
+            owner.clear()
+            var count = 0
+            for p in 0..<original:
+                if not keep.items[p] or turn.items[p] != flip or root(&group, piece_face.items[p]) != f: continue
+                count += 1
+                for c in pieces.piece_cycles(p):
+                    for use in pieces.cycle(c):
+                        try halves.push(HalfEdge((use if use > 0 else -use) - 1, use > 0))
+                        try owner.push(p)
+            if count < 2: continue
+            # Drop both ways of edges two different pieces share.
+            dropped.clear()
+            for _ in 0..<halves.count: try dropped.push(false)
+            var shared = false
+            for i in 0..<halves.count:
+                for j in i + 1..<halves.count:
+                    if halves.items[i].edge == halves.items[j].edge and halves.items[i].forward != halves.items[j].forward and owner.items[i] != owner.items[j]:
+                        dropped.items[i] = true
+                        dropped.items[j] = true
+                        shared = true
+            if not shared: continue
+            remaining.clear()
+            for i in 0..<halves.count:
+                if not dropped.items[i]: try remaining.push(halves.items[i])
+            let before = pieces.piece_count()
+            try split_face(traced, f, remaining.view(), try face_pole(&work.w, f), pieces)
+            for p in 0..<original:
+                if keep.items[p] and turn.items[p] == flip and root(&group, piece_face.items[p]) == f: keep.items[p] = false
+            for _ in before..<pieces.piece_count():
+                try piece_face.push(f)
+                try keep.push(true)
+                try turn.push(flip)
+
+func root(group: Growing[usize]*, f: usize) -> usize:
+    var at = f
+    while group.items[at] != at: at = group.items[at]
+    return at
 
 ## Where closed curve `c` crosses the seam meridian (chart angle 0) of
 ## whichever of faces fa and fb lies on a sphere (0 when neither does), so
