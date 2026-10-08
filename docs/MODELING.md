@@ -266,7 +266,10 @@ halves, so each face's chart opens without a seam. Booleans meet such a surface 
 its axis, and with a cylinder or cone about it, in circles: where the profile's height, or radius,
 is theirs. Revolve turns sketch splines the same way.
 
-G2 and G3 fillets meeting at a corner are refused for now.
+Two G2 or G3 fillets meeting where a third edge stays sharp meet in a miter. Their swept profiles
+meet in the plane bisecting their sweeps, through where their contact lines cross, as that plane's
+affine copy of either profile. It is checked to lie on the other. Three meeting at a corner need a
+corner patch, which isn't made yet (the study's §1.3), so they are refused.
 
 **Too large.** Before any tool, each edge's blend must fit:
 - **Its faces:** samples along the edge step into each face by the contact distance, and must stay

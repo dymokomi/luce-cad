@@ -109,6 +109,14 @@ func spline_meet(w: Shape*, fa: usize, fb: usize, tol: f64, out: Growing[Carrier
         if swept:
             try plane_extrusion(w, other, spline, sweep, tol, out)
             return
+    # Two profiles swept straight along different ways (two G2 fillets
+    # meeting at a corner): their curve lies in a plane bisecting the
+    # sweeps, as an affine copy of either profile.
+    if sa.kind == 3 and sb.kind == 3:
+        let (swept_a, sweep_a) = extrusion_of(sa)
+        let (swept_b, sweep_b) = extrusion_of(sb)
+        if swept_a and swept_b:
+            if try extrusion_pair(w, sa, sweep_a, sb, sweep_b, tol, out): return
     let (turned, center, axis) = revolution_of(spline, tol)
     if turned and other.kind != 3:
         if try coaxial_spline(spline, center, axis, other, tol, out): return
@@ -190,3 +198,54 @@ func coaxial_gap(p: Vector3, center: Vector3, axis: Vector3, other: const Surfac
     let radial = d.subtract(other.z.multiply_scalar(h)).length()
     if other.kind == 1: return radial - other.radius
     return radial - (other.radius + h * math.tan(other.angle))
+
+## Where profiles swept straight `a` (along `sweep_a`) and `b` meet, when
+## that is in a plane bisecting their sweeps (equal fillets meeting at a
+## symmetric corner): the plane through where their profiles' end lines
+## (the contacts) cross, its copy of `a`'s profile checked to lie on `b`.
+## False when no such plane holds the curve.
+func extrusion_pair(w: Shape*, a: const Surface*, sweep_a: Vector3, b: const Surface*, sweep_b: Vector3, tol: f64, out: Growing[Carrier]*) -> bool!:
+    let da = try sweep_a.normalized()
+    let db = try sweep_b.normalized()
+    if da.cross(db).length() < 1e-9: return false
+    let ends: f64[2] = [0.0, 1.0]
+    let signs: f64[2] = [-1.0, 1.0]
+    for ea in ends:
+        let pa = try evaluate(*a, Vector3(ea, 0.0, 0.0))
+        for eb in ends:
+            let pb = try evaluate(*b, Vector3(eb, 0.0, 0.0))
+            # Where the end lines pa + s da and pb + t db cross.
+            let k = da.dot(db)
+            let r = pa.subtract(pb)
+            let det = 1.0 - k * k
+            let s = (k * r.dot(db) - r.dot(da)) / det
+            let t = (r.dot(db) - k * r.dot(da)) / det
+            let x = pa.add(da.multiply_scalar(s))
+            if x.subtract(pb.add(db.multiply_scalar(t))).length() > tol * 10.0: continue
+            for sign in signs:
+                let n = try da.add(db.multiply_scalar(sign)).normalized()
+                let plane = try Surface(0, x, try across(n), n, 0.0, 0.0, a.points[..<0], a.weights[..<0], a.ku[..<0], a.kv[..<0], 0, 0, 0, 0)
+                defer:
+                    var owned = plane
+                    owned.close()
+                var curves = Growing[Carrier]()
+                defer curves.close()
+                try plane_extrusion(w, &plane, a, sweep_a, tol, &curves)
+                if curves.count != 1 or curves.items[0].kind != 2: continue
+                # On `b` too, sampled.
+                var on = true
+                for step in 0..<9:
+                    let q = try spline_point(w, curves.items[0].spline, (f64)step / 8.0)
+                    let (u, v) = spline_uv(b, q)
+                    if not math.is_finite(u) or (try evaluate(*b, Vector3(u, v, 0.0))).subtract(q).length() > tol * 100.0:
+                        on = false
+                        break
+                if on:
+                    try out.push(curves.items[0])
+                    return true
+    return false
+
+## Stored spline `index` of `w` at parameter `t` (0 to 1).
+func spline_point(w: const Shape*, index: i64, t: f64) -> Vector3!:
+    let (points, weights, knots, degree) = w.spline_net(index)
+    return try NurbsCurve.at(points, weights, degree, knots, knots[(usize)degree] + (knots[points.length] - knots[(usize)degree]) * t)
