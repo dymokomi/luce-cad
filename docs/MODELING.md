@@ -21,7 +21,8 @@ does today.
 | `filleted(model, edges, radius)` | Edges filleted to `radius`. |
 
 `edges` are the body's B-rep edge numbers. An empty list means every straight convex edge between
-two flat faces.
+two flat faces. Rims are blended only when named: a rim is a full circle between a flat face and a
+cylinder about it, such as a hole's rim or a boss's edge.
 
 ## How each works
 
@@ -65,7 +66,10 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    - plane/cone with the axis across the plane: a circle;
    - plane/sphere: a circle;
    - parallel cylinders: lines;
-   - sphere/sphere: a circle.
+   - sphere/sphere: a circle;
+   - plane/torus with the axis across the plane: circles;
+   - surfaces of revolution about one axis (cylinder, cone, sphere, torus): circles, where their
+     radii agree along the axis.
 
    Coincident surfaces are reported as such, facing the same way or opposite.
 
@@ -109,6 +113,9 @@ grow from one operation to the next.
 
 ### Chamfer and fillet (`blend.lucb`)
 
+A rim's tool is its corner profile turned about the rim's axis: a cone for a chamfer, a torus for a
+fillet.
+
 These are the first rows of OpenCASCADE's ChFiKPart table, made with booleans. Each edge (or chain
 of collinear pieces) between two flat faces gets a tool solid and has it subtracted:
 
@@ -136,9 +143,7 @@ Roughly in order of usefulness:
    whose axes meet intersect in a doubly singular way (the curves cross where the gradients are
    parallel), which tracing can't follow. Fusion avoids this with a corner patch: a sphere where
    three fillets meet (KPart's `Rotule`), with each edge's tool stopping at the corner.
-2. **Blends on curved edges.**
-   - A circle between a plane and a cylinder (a hole's rim) chamfers to a cone and fillets to a
-     torus. Booleans would then need cylinder/cone, plane/torus and cylinder/torus.
+2. **Blends on other curved edges:** a cone's rims, ellipses, and edges between two curved faces.
 3. **B-spline surfaces in booleans.** Swept spline sides need marching on parametric surfaces.
    Tangent intersections between curved faces need care as well.
 4. **Partial revolves,** sweep and loft; tapered extrudes; Extrude "to object".

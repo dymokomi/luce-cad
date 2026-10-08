@@ -215,8 +215,11 @@ pub func face_pole(w: const Shape*, f: usize) -> f64!:
 pub func loop_chart(w: const Shape*, surface: i64, pole: f64, uses: const i64[], points: Growing[Vector3]*) -> !:
     let s = &w.surfaces.items[(usize)surface]
     let wraps = periodic(s)
+    # A torus's tube angle wraps too.
+    let wraps_v = s.kind == 5
     let first_point = points.count
     var previous = 0.0
+    var previous_v = 0.0
     var first = true
     for use in uses:
         let e = (usize)(use - 1 if use > 0 else -use - 1)
@@ -234,12 +237,17 @@ pub func loop_chart(w: const Shape*, surface: i64, pole: f64, uses: const i64[],
         for step in 0..<steps:
             let fraction = (f64)step / (f64)steps
             let p = try w.edge_at(e, fraction if use > 0 else 1.0 - fraction)
-            let (raw, v) = surface_uv(s, p)
+            let (raw, raw_v) = surface_uv(s, p)
             var u = raw
+            var v = raw_v
             if wraps and not first:
                 while u - previous > math.pi: u -= 2.0 * math.pi
                 while previous - u > math.pi: u += 2.0 * math.pi
+            if wraps_v and not first:
+                while v - previous_v > math.pi: v -= 2.0 * math.pi
+                while previous_v - v > math.pi: v += 2.0 * math.pi
             previous = u
+            previous_v = v
             first = false
             try points.push(Vector3(u, v, 0.0))
     if s.kind == 4 and points.count > first_point and pole != 0.0:
@@ -271,20 +279,27 @@ func winding(points: const Vector3[], starts: const usize[], u: f64, v: f64) -> 
 ## The winding number of the chart's loops about (u, v); with `wraps` (an
 ## angle chart) each loop sees (u, v) moved by whole turns into its own
 ## range, since a loop's unwrapped angles start wherever its curve does.
-pub func chart_winding(points: const Vector3[], starts: const usize[], u: f64, v: f64, wraps: bool) -> i64:
+## (A torus wraps its second coordinate too: `wraps_v`.)
+pub func chart_winding(points: const Vector3[], starts: const usize[], u: f64, v: f64, wraps: bool, wraps_v: bool = false) -> i64:
     var total: i64 = 0
     for loop in 0..<starts.length - 1:
         let first = starts[loop]
         let last = starts[loop + 1]
         if last <= first: continue
         var shifted = u
+        var shifted_v = v
         if wraps:
             var low = points[first].x
             for at in first..<last: low = math.min(low, points[at].x)
             while shifted < low: shifted += 2.0 * math.pi
             while shifted >= low + 2.0 * math.pi: shifted -= 2.0 * math.pi
+        if wraps_v:
+            var low_v = points[first].y
+            for at in first..<last: low_v = math.min(low_v, points[at].y)
+            while shifted_v < low_v: shifted_v += 2.0 * math.pi
+            while shifted_v >= low_v + 2.0 * math.pi: shifted_v -= 2.0 * math.pi
         let range: usize[2] = [first, last]
-        total += winding(points, range[..<2], shifted, v)
+        total += winding(points, range[..<2], shifted, shifted_v)
     return total
 
 ## Where `p` (on face `f`'s surface) lies against the face.
@@ -302,4 +317,4 @@ pub func face_contains(w: const Shape*, f: usize, p: Vector3, tol: f64) -> i64!:
     try face_chart(w, f, &points, &starts)
     let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
     let (u, v) = surface_uv(s, p)
-    return inside_face if chart_winding(points.view(), starts.view(), u, v, periodic(s)) != 0 else outside
+    return inside_face if chart_winding(points.view(), starts.view(), u, v, periodic(s), s.kind == 5) != 0 else outside

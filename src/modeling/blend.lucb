@@ -24,24 +24,49 @@ func edge_faces(w: const Shape*, e: usize) -> (usize, usize)!:
 ## The unit direction across face `f` from the middle of edge `e`, into the
 ## face, perpendicular to the edge.
 func into_face(w: const Shape*, f: usize, e: usize, along: Vector3) -> Vector3!:
-    let n = w.surfaces.items[(usize)w.faces.items[f].surface].z
-    let side = try n.cross(along).normalized()
     let middle = try w.edge_at(e, 0.5)
-    let reach = (try w.edge_at(e, 0.0)).subtract(try w.edge_at(e, 1.0)).length() * 0.01
+    let n = try w.face_normal(f, middle)
+    let side = try n.cross(along).normalized()
+    let reach = math.max((try w.edge_at(e, 0.0)).subtract(try w.edge_at(e, 1.0)).length(), (try w.edge_at(e, 0.0)).subtract(middle).length()) * 0.01
     if try face_contains(w, f, middle.add(side.multiply_scalar(reach)), w.tolerance) == inside_face: return side
     return side.multiply_scalar(-1.0)
 
-## Whether edge `e` can be blended: a line between two planar faces,
-## convex (the faces turn away from each other).
+## The unit direction along edge `e` at its middle.
+func along_edge(w: const Shape*, e: usize) -> Vector3!:
+    let edge = w.edges.items[e]
+    let t = (edge.t0 + edge.t1) * 0.5
+    return try (try w.tangent(edge.carrier, t)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0).normalized()
+
+## A full circle between a flat face across its axis and a cylinder about
+## it (a hole's rim, a boss's edge).
+func is_rim(w: const Shape*, e: usize, fa: usize, fb: usize) -> bool:
+    let edge = w.edges.items[e]
+    let c = w.carriers.items[(usize)edge.carrier]
+    if c.kind != 1 or edge.start != edge.end: return false
+    let axis = c.x.cross(c.y)
+    let sa = w.surfaces.items[(usize)w.faces.items[fa].surface]
+    let sb = w.surfaces.items[(usize)w.faces.items[fb].surface]
+    let plane = sa if sa.kind == 0 else sb
+    let cylinder = sb if sa.kind == 0 else sa
+    if plane.kind != 0 or cylinder.kind != 1: return false
+    if math.abs(math.abs(plane.z.dot(axis)) - 1.0) > 1e-9 or math.abs(math.abs(cylinder.z.dot(axis)) - 1.0) > 1e-9: return false
+    let offset = c.origin.subtract(cylinder.origin)
+    return offset.subtract(cylinder.z.multiply_scalar(offset.dot(cylinder.z))).length() < c.a * 1e-6 and math.abs(cylinder.radius - c.a) < c.a * 1e-6
+
+## Whether edge `e` can be blended: a line between two planar faces, or a
+## rim (is_rim), convex (the faces turn away from each other).
 func blendable(w: const Shape*, e: usize) -> bool!:
     let edge = w.edges.items[e]
-    if w.carriers.items[(usize)edge.carrier].kind != 0: return false
+    let kind = w.carriers.items[(usize)edge.carrier].kind
+    if kind != 0 and kind != 1: return false
     # A seam (one face's both ways) is no edge between two faces.
     let (fa, fb) = edge_faces(w, e) catch failure:
         _ = failure
         return false
-    if w.surfaces.items[(usize)w.faces.items[fa].surface].kind != 0 or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != 0: return false
-    let along = try (try w.edge_at(e, 1.0)).subtract(try w.edge_at(e, 0.0)).normalized()
+    if kind == 1:
+        if not is_rim(w, e, fa, fb): return false
+    elif w.surfaces.items[(usize)w.faces.items[fa].surface].kind != 0 or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != 0: return false
+    let along = try along_edge(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     # Convex: the other face runs below this one's outward normal.
@@ -54,6 +79,7 @@ func blendable(w: const Shape*, e: usize) -> bool!:
 ## nothing is there (an outside corner), and stops flush where the solid
 ## goes on (a wall the edge runs into).
 func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3, end: Vector3, body: const Mesh*) -> interop.Reference[CadModel]!:
+    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 1: return try rim_tool(w, e, size, round)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -95,6 +121,43 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3
     try extrude_into(solid.value(), &profile, length + before + after)
     return try model_of(solid)
 
+## A rim's tool: the corner profile at its middle (a triangle `size` along
+## each face, or the region between them and the circle of radius `size`
+## touching both) turned about the rim's axis: a cone, or a torus.
+func rim_tool(w: const Shape*, e: usize, size: f64, round: bool) -> interop.Reference[CadModel]!:
+    let carrier = w.carriers.items[(usize)w.edges.items[e].carrier]
+    let (fa, fb) = try edge_faces(w, e)
+    let along = try along_edge(w, e)
+    let p = try w.edge_at(e, 0.5)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    var reach = size
+    if round: reach = size / math.tan(angle * 0.5)
+    let ta = p.add(ua.multiply_scalar(reach))
+    let tb = p.add(ub.multiply_scalar(reach))
+    var profile = Profiles(p, along, ua, along.cross(ua), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+                           Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+    defer profile.close()
+    try profile.loop_offsets.push(0)
+    try profile.edges.push(line_edge(p, ta))
+    if round:
+        let bisector = try ua.add(ub).normalized()
+        let center = p.add(bisector.multiply_scalar(size / math.sin(angle * 0.5)))
+        let leaving = ta.subtract(center)
+        let arriving = tb.subtract(center)
+        let sweep = math.atan2(along.dot(leaving.cross(arriving)), leaving.dot(arriving))
+        try profile.edges.push(ProfileEdge(1, ta, tb, center, size, sweep, -1))
+    else:
+        try profile.edges.push(line_edge(ta, tb))
+    try profile.edges.push(line_edge(tb, p))
+    try profile.loop_offsets.push(profile.edges.count)
+    try nest(&profile)
+    let solid = try new_solid(carrier.a + size * 4.0)
+    defer solid.release()
+    try revolve_into(solid.value(), &profile, carrier.origin, carrier.x.cross(carrier.y), (carrier.a + size) * 1e-7)
+    return try model_of(solid)
+
 ## `model` with `edges` (B-rep edge numbers; empty: every straight convex
 ## edge between two planes) blended: filleted to `size` when `round`, else
 ## chamfered `size` along each face.
@@ -105,12 +168,13 @@ pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: b
     var chosen = Growing[usize]()
     defer chosen.close()
     if edges.length == 0:
+        # Every straight edge between flat faces; rims only when named.
         for e in 0..<w.edges.count:
-            if try blendable(&w, e): try chosen.push(e)
+            if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 0 and try blendable(&w, e): try chosen.push(e)
     else:
         for e in edges:
             if e < 0 or e >= (i64)w.edges.count: error(invalid, "a blended edge number is not an edge of the body")
-            if not try blendable(&w, (usize)e): error(invalid, "only straight convex edges between flat faces can be blended yet")
+            if not try blendable(&w, (usize)e): error(invalid, "only convex straight edges between flat faces, and rims (a circle between a flat face and a cylinder about it), can be blended yet")
             try chosen.push((usize)e)
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
     # Every edge of a convex polyhedron rounded: built whole.
@@ -141,9 +205,13 @@ pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: b
         if done.items[i]: continue
         done.items[i] = true
         let e = chosen.items[i]
-        let (fa, fb) = try edge_faces(&w, e)
         var low = try w.edge_at(e, 0.0)
         var high = try w.edge_at(e, 1.0)
+        # A rim is its own tool.
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != 0:
+            try tools.push(try edge_tool(&w, e, size, round, low, high, body.value()))
+            continue
+        let (fa, fb) = try edge_faces(&w, e)
         let along = try high.subtract(low).normalized()
         for j in i + 1..<chosen.count:
             if done.items[j]: continue
