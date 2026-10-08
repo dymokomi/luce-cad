@@ -50,16 +50,23 @@ func blendable(w: const Shape*, e: usize) -> bool!:
 ## The tool that blends edge `e` from `start` to `end` (its chain's ends),
 ## a fillet of `size` radius when `round`, else a chamfer `size` along each
 ## face, as a closed solid.
-func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3, end: Vector3) -> interop.Reference[CadModel]!:
+## `body` is the solid's mesh: the tool reaches past an end only where
+## nothing is there (an outside corner), and stops flush where the solid
+## goes on (a wall the edge runs into).
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3, end: Vector3, body: const Mesh*) -> interop.Reference[CadModel]!:
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
-    # The tool reaches past both ends by a margin, starting on its plane.
+    # Past each end by a margin, where the corner beyond is empty.
     let margin = size * 2.0 + length * 0.01
-    let p = start.subtract(along.multiply_scalar(margin))
+    let corner = try ua.add(ub).normalized().multiply_scalar(size * 0.25)
+    let extent = math.max(length, size) * 4.0
+    let before = 0.0 if try inside_mesh(body, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
+    let after = 0.0 if try inside_mesh(body, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
+    let p = start.subtract(along.multiply_scalar(before))
     var reach = size
     if round: reach = size / math.tan(angle * 0.5)
     let ta = p.add(ua.multiply_scalar(reach))
@@ -85,7 +92,7 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3
     try nest(&profile)
     let solid = try new_solid(length + margin * 2.0)
     defer solid.release()
-    try extrude_into(solid.value(), &profile, length + margin * 2.0)
+    try extrude_into(solid.value(), &profile, length + before + after)
     return try model_of(solid)
 
 ## `model` with `edges` (B-rep edge numbers; empty: every straight convex
@@ -106,6 +113,8 @@ pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: b
             if not try blendable(&w, (usize)e): error(invalid, "only straight convex edges between flat faces can be blended yet")
             try chosen.push((usize)e)
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
+    let body = try model.tessellate(16)
+    defer body.release()
     var tools = Growing[interop.Reference[CadModel]]()
     defer:
         for tool in tools.view(): tool.release()
@@ -134,7 +143,7 @@ pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: b
                 let p = try w.edge_at(other, (f64)k)
                 if p.subtract(low).dot(along) < 0.0: low = p
                 if p.subtract(high).dot(along) > 0.0: high = p
-        try tools.push(try edge_tool(&w, e, size, round, low, high))
+        try tools.push(try edge_tool(&w, e, size, round, low, high, body.value()))
     var result = try copy_model(model)
     for tool in tools.view():
         let next = combine(result.value(), tool.value(), op_subtract) catch failure:
