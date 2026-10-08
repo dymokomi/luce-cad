@@ -1,0 +1,152 @@
+## Inside or outside a solid by rays through its exact faces: where a ray
+## meets each face's surface (closed form for planes, cylinders, cones and
+## spheres; sampled and bisected on a torus), and whether the hit lies
+## inside the face (its chart's winding). Three rays, the majority
+## deciding. No tessellation: classification used to mesh both solids on
+## every boolean. A solid with B-spline faces is classified by its mesh.
+
+## Faces' charts, made the first time a ray meets the face: face f's loops
+## are starts[firsts[f]..<firsts[f] + loops[f] + 1] into points.
+struct Charts:
+    var points: Growing[Vector3]
+    var starts: Growing[usize]
+    var firsts: Growing[i64]
+    var loops: Growing[usize]
+
+    func close():
+        self.points.close()
+        self.starts.close()
+        self.firsts.close()
+        self.loops.close()
+
+func new_charts(faces: usize) -> Charts!:
+    var made = Charts(Growing[Vector3](), Growing[usize](), Growing[i64](), Growing[usize]())
+    errdefer made.close()
+    for _ in 0..<faces:
+        try made.firsts.push(-1)
+        try made.loops.push(0)
+    return made
+
+## Face `f`'s chart, made once.
+func chart_of(charts: Charts*, w: const Shape*, f: usize) -> (const Vector3[], const usize[])!:
+    if charts.firsts.items[f] < 0:
+        var points = Growing[Vector3]()
+        defer points.close()
+        var starts = Growing[usize]()
+        defer starts.close()
+        try face_chart(w, f, &points, &starts)
+        let offset = charts.points.count
+        for p in points.view(): try charts.points.push(p)
+        charts.firsts.items[f] = (i64)charts.starts.count
+        charts.loops.items[f] = starts.count - 1
+        for s in starts.view(): try charts.starts.push(s + offset)
+    let first = (usize)charts.firsts.items[f]
+    return (charts.points.view(), charts.starts.view()[first..<first + charts.loops.items[f] + 1])
+
+## Where the ray from `o` along unit `d` meets surface `s` ahead of it
+## (parameters onto `out`).
+func ray_roots(s: const Surface*, o: Vector3, d: Vector3, out: Growing[f64]*) -> !:
+    out.clear()
+    let q = o.subtract(s.origin)
+    if s.kind == 0:
+        let along = d.dot(s.z)
+        if math.abs(along) < 1e-15: return
+        try out.push(-q.dot(s.z) / along)
+        return
+    if s.kind == 4:
+        try quadratic(d.dot(d), 2.0 * q.dot(d), q.dot(q) - s.radius * s.radius, out)
+        return
+    if s.kind == 1 or s.kind == 2:
+        # |radial|^2 = (r + h tan a)^2, h along the axis (a cylinder: a = 0).
+        let k = math.tan(s.angle) if s.kind == 2 else 0.0
+        let dz = d.dot(s.z)
+        let qz = q.dot(s.z)
+        let a = d.dot(d) - dz * dz - k * k * dz * dz
+        let b = 2.0 * (q.dot(d) - qz * dz) - 2.0 * k * dz * (s.radius + k * qz)
+        let c = q.dot(q) - qz * qz - (s.radius + k * qz) * (s.radius + k * qz)
+        var roots = Growing[f64]()
+        defer roots.close()
+        try quadratic(a, b, c, &roots)
+        for t in roots.view():
+            # One nappe: where the radius is not negative.
+            if s.kind == 1 or s.radius + k * (qz + t * dz) >= 0.0: try out.push(t)
+        return
+    if s.kind == 5:
+        # A torus: its implicit function along the ray, within its ball.
+        let reach = s.radius + s.angle
+        var span = Growing[f64]()
+        defer span.close()
+        try quadratic(d.dot(d), 2.0 * q.dot(d), q.dot(q) - reach * reach * 1.0001, &span)
+        if span.count < 2: return
+        let low = span.items[0]
+        let high = span.items[1]
+        let steps = 256
+        var previous = torus_value(s, q, d, low)
+        for k in 1..<steps + 1:
+            let t = low + (high - low) * (f64)k / (f64)steps
+            let value = torus_value(s, q, d, t)
+            if (previous < 0.0) != (value < 0.0):
+                var a = t - (high - low) / (f64)steps
+                var b = t
+                for _ in 0..<60:
+                    let m = (a + b) * 0.5
+                    if (torus_value(s, q, d, m) < 0.0) == (previous < 0.0): a = m
+                    else: b = m
+                try out.push((a + b) * 0.5)
+            previous = value
+        return
+    error(invalid, "rays through B-spline faces are not supported")
+
+func torus_value(s: const Surface*, q: Vector3, d: Vector3, t: f64) -> f64:
+    let p = q.add(d.multiply_scalar(t))
+    let h = p.dot(s.z)
+    let ring = math.sqrt(math.max(0.0, p.dot(p) - h * h)) - s.radius
+    return ring * ring + h * h - s.angle * s.angle
+
+## The real roots of a t^2 + b t + c onto `out`, smaller first.
+func quadratic(a: f64, b: f64, c: f64, out: Growing[f64]*) -> !:
+    if math.abs(a) < 1e-300:
+        if math.abs(b) > 1e-300: try out.push(-c / b)
+        return
+    let disc = b * b - 4.0 * a * c
+    if disc < 0.0: return
+    let spread = math.sqrt(disc)
+    # The stable form.
+    let q = -0.5 * (b + (spread if b >= 0.0 else -spread))
+    var t0 = q / a
+    var t1 = c / q if math.abs(q) > 1e-300 else t0
+    if t1 < t0:
+        let swap = t0
+        t0 = t1
+        t1 = swap
+    try out.push(t0)
+    try out.push(t1)
+
+## Whether `point` lies inside the solid made of faces `first..<last` of
+## `w`: three rays through its faces, the majority deciding. `size` is the
+## model's extent (a hit closer than a billionth of it is the start).
+func inside_faces(w: const Shape*, charts: Charts*, first: usize, last: usize, point: Vector3, size: f64) -> bool!:
+    let rays: Vector3[3] = [Vector3(0.5377, 0.8319, 0.1373), Vector3(-0.3271, 0.2491, 0.9116), Vector3(0.7713, -0.5129, -0.3772)]
+    var roots = Growing[f64]()
+    defer roots.close()
+    var votes = 0
+    for ray in rays:
+        let d = try ray.normalized()
+        var hits = 0
+        for f in first..<last:
+            let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+            try ray_roots(s, point, d, &roots)
+            for t in roots.view():
+                if t <= size * 1e-9: continue
+                let x = point.add(d.multiply_scalar(t))
+                let (u, v) = surface_uv(s, x)
+                let (points, starts) = try chart_of(charts, w, f)
+                if chart_winding(points, starts, u, v, periodic(s), s.kind == 5) != 0: hits += 1
+        if hits % 2 == 1: votes += 1
+    return votes >= 2
+
+## Whether faces `first..<last` of `w` are all analytic (rays can meet them).
+func analytic_faces(w: const Shape*, first: usize, last: usize) -> bool:
+    for f in first..<last:
+        if w.surfaces.items[(usize)w.faces.items[f].surface].kind == 3: return false
+    return true

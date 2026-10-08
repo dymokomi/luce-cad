@@ -64,6 +64,10 @@ pub func crossings(w: const Shape*, c: i64, low: f64, high: f64, e: usize, size:
     if try same_curve(w, c, e, tol):
         try overlap_ends(w, c, low, high, e, tol, out)
         return
+    # Two lines: where they come closest, in closed form.
+    if w.carriers.items[(usize)c].kind == 0 and w.carriers.items[(usize)ec].kind == 0:
+        try line_crossing(w, c, low, high, e, tol, out)
+        return
     let n = sample_count(w, c, low, high, size)
     let m = sample_count(w, ec, edge.t0, edge.t1, size)
     var curve = Growing[Vector3]()
@@ -72,6 +76,11 @@ pub func crossings(w: const Shape*, c: i64, low: f64, high: f64, e: usize, size:
     defer other.close()
     for at in 0..<n + 1: try curve.push(try w.at(c, low + (high - low) * (f64)at / (f64)n))
     for at in 0..<m + 1: try other.push(try w.at(ec, edge.t0 + (edge.t1 - edge.t0) * (f64)at / (f64)m))
+    # Boxes apart (by more than a sample's reach): no crossing.
+    let (cl, ch) = box_of(curve.view())
+    let (ol, oh) = box_of(other.view())
+    let pad = (ch.subtract(cl).length() / (f64)n + oh.subtract(ol).length() / (f64)m) + tol * 10.0
+    if cl.x > oh.x + pad or ol.x > ch.x + pad or cl.y > oh.y + pad or ol.y > ch.y + pad or cl.z > oh.z + pad or ol.z > ch.z + pad: return
     for i in 0..<n:
         let a0 = curve.items[i]
         let a1 = curve.items[i + 1]
@@ -116,6 +125,38 @@ func runs_along(w: const Shape*, c: i64, t: f64, end: f64, ec: i64, s0: f64, s1:
         let p = try w.at(c, t + (end - t) * (f64)k / 8.0)
         if (try w.at(ec, try nearest_on(w, ec, p, s0, s1))).subtract(p).length() > tol * 10.0: return false
     return true
+
+## Where line `c` on [low, high] crosses line edge `e` (not along it):
+## their nearest points, when within reach and inside both ranges.
+func line_crossing(w: const Shape*, c: i64, low: f64, high: f64, e: usize, tol: f64, out: Growing[Hit]*) -> !:
+    let a = w.carriers.items[(usize)c]
+    let edge = w.edges.items[e]
+    let b = w.carriers.items[(usize)edge.carrier]
+    let k = a.x.dot(b.x)
+    let det = 1.0 - k * k
+    if det < 1e-18: return
+    let r = a.origin.subtract(b.origin)
+    let t = (k * r.dot(b.x) - r.dot(a.x)) / det
+    let u = (r.dot(b.x) - k * r.dot(a.x)) / det
+    let reach = tol * 10.0
+    if t < math.min(low, high) - reach or t > math.max(low, high) + reach: return
+    if u < math.min(edge.t0, edge.t1) - reach or u > math.max(edge.t0, edge.t1) + reach: return
+    let pa = a.origin.add(a.x.multiply_scalar(t))
+    let pb = b.origin.add(b.x.multiply_scalar(u))
+    if pa.subtract(pb).length() > reach: return
+    let tc = math.clamp(t, math.min(low, high), math.max(low, high))
+    let uc = math.clamp(u, math.min(edge.t0, edge.t1), math.max(edge.t0, edge.t1))
+    for hit in out.view():
+        if math.abs(hit.t - tc) <= reach and math.abs(hit.s - uc) <= reach: return
+    try out.push(Hit(tc, uc))
+
+func box_of(points: const Vector3[]) -> (Vector3, Vector3):
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for p in points:
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    return (low, high)
 
 ## The parameter range of carrier `c` to search all of it (a line: far).
 func full_range(w: const Shape*, c: i64) -> (f64, f64):

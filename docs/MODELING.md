@@ -147,7 +147,15 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    turns into the loop's range. A sphere's loops close over one pole per face.
 6. **Classification.** Each piece is classified at a point well inside it: on a coincident face,
    facing the same way or opposite; otherwise inside or outside the other solid. Inside/outside is
-   decided by three rays through the other solid's tessellation, majority wins.
+   decided by three rays, majority wins (`rays.lucb`).
+
+   Rays meet the other solid's exact faces: closed form for planes, cylinders, cones and spheres,
+   sampled and bisected on a torus. A hit counts when it lies inside the face, by the winding of
+   the face's chart. Nothing is tessellated, except a solid with B-spline faces, which is meshed
+   for its rays.
+
+   The point inside a piece is the best of a coarse grid over its chart, refined about the best
+   three times.
 7. **Selection:**
    - union keeps the outside pieces;
    - subtract keeps the first solid's outside pieces and the second solid's inside pieces, turned;

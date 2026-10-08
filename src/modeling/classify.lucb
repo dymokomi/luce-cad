@@ -23,33 +23,69 @@ func piece_point(work: Work*, traced: const Shape*, f: usize, pieces: const Piec
     let s = &work.w.surfaces.items[(usize)face.surface]
     let wraps = periodic(s)
     let scale = 1.0 if s.kind == 0 or s.kind == 3 else math.max(s.radius, 1e-300)
+    # The chart with angles scaled, for clearances.
+    var scaled = Growing[Vector3]()
+    defer scaled.close()
+    for q in chart.view(): try scaled.push(Vector3(q.x * scale, q.y, 0.0))
     var best_u = 0.0
     var best_v = 0.0
-    var best_width = -1.0
-    var best_clearance = -1.0
-    # A grid of candidates off the vertices (an irrational step); of those
-    # inside, the one farthest from every boundary segment.
-    for row in 0..<24:
-        let v = low.y + (high.y - low.y) * (((f64)row + 0.5) / 24.0 + 0.0123456789)
-        for column in 0..<48:
-            let u = low.x + (high.x - low.x) * (((f64)column + 0.5) / 48.0 + 0.0098765432)
-            if chart_winding(chart.view(), starts.view(), u, v, wraps, s.kind == 5) == 0: continue
-            var clearance = 1.0e300
-            for loop in 0..<starts.count - 1:
-                let first = starts.items[loop]
-                let last = starts.items[loop + 1]
-                for k in first..<last:
-                    let a = chart.items[k]
-                    let b = chart.items[first if k + 1 == last else k + 1]
-                    let d = segment_distance(Vector3(a.x * scale, a.y, 0.0), Vector3(b.x * scale, b.y, 0.0), Vector3(u * scale, v, 0.0), Vector3(u * scale, v, 0.0))
-                    clearance = math.min(clearance, d)
-            if clearance > best_clearance:
-                best_clearance = clearance
-                best_width = clearance
-                best_u = u
-                best_v = v
-    if best_width < 0.0: error(invalid, "a face piece has no inside to classify")
+    var best = -1.0
+    # A coarse grid of candidates off the vertices (an irrational step); of
+    # those inside, the one farthest from every boundary segment; then
+    # finer grids about the best so far.
+    var cell_u = (high.x - low.x) / 24.0
+    var cell_v = (high.y - low.y) / 12.0
+    var from_u = low.x + cell_u * (0.5 + 0.0098765432)
+    var from_v = low.y + cell_v * (0.5 + 0.0123456789)
+    var columns = 24
+    var rows = 12
+    for round in 0..<4:
+        for row in 0..<rows:
+            let v = from_v + cell_v * (f64)row
+            for column in 0..<columns:
+                let u = from_u + cell_u * (f64)column
+                if chart_winding(chart.view(), starts.view(), u, v, wraps, s.kind == 5) == 0: continue
+                let clearance = nearest_segment(scaled.view(), starts.view(), u * scale, v, best)
+                if clearance > best:
+                    best = clearance
+                    best_u = u
+                    best_v = v
+        if best < 0.0: break
+        # Next: a 7 x 7 grid over the cells about the best.
+        cell_u = cell_u * 2.0 / 7.0
+        cell_v = cell_v * 2.0 / 7.0
+        from_u = best_u - cell_u * 3.0
+        from_v = best_v - cell_v * 3.0
+        columns = 7
+        rows = 7
+        _ = round
+    if best < 0.0: error(invalid, "a face piece has no inside to classify")
     return try surface_point(&work.w.surfaces.items[(usize)face.surface], best_u, best_v)
+
+## The distance from (`u`, `v`) to the nearest segment of the loops of
+## `points` (from `starts`), or a smaller one as soon as it is below
+## `enough` (the candidate cannot win).
+func nearest_segment(points: const Vector3[], starts: const usize[], u: f64, v: f64, enough: f64) -> f64:
+    var nearest = 1.0e300
+    let floor = enough * enough if enough > 0.0 else -1.0
+    for loop in 0..<starts.length - 1:
+        let first = starts[loop]
+        let last = starts[loop + 1]
+        for k in first..<last:
+            let a = points[k]
+            let b = points[first if k + 1 == last else k + 1]
+            let dx = b.x - a.x
+            let dy = b.y - a.y
+            let length = dx * dx + dy * dy
+            var t = 0.0
+            if length > 0.0: t = math.clamp(((u - a.x) * dx + (v - a.y) * dy) / length, 0.0, 1.0)
+            let ex = a.x + dx * t - u
+            let ey = a.y + dy * t - v
+            let d = ex * ex + ey * ey
+            if d < nearest:
+                nearest = d
+                if nearest <= floor: return math.sqrt(nearest)
+    return math.sqrt(nearest)
 
 ## The point of `s` at chart coordinates (u, v) (surface_uv's inverse).
 func surface_point(s: const Surface*, u: f64, v: f64) -> Vector3!:
@@ -61,15 +97,43 @@ func surface_point(s: const Surface*, u: f64, v: f64) -> Vector3!:
     if s.kind == 4: return s.origin.add(around.multiply_scalar(s.radius * math.cos(v))).add(s.z.multiply_scalar(s.radius * math.sin(v)))
     return s.origin.add(around.multiply_scalar(s.radius + s.angle * math.cos(v))).add(s.z.multiply_scalar(s.angle * math.sin(v)))
 
-## Piece `p` of face `f` against the other solid (`other` its mesh).
-func classify(work: Work*, traced: const Shape*, f: usize, pieces: const Pieces*, p: usize, other: const Mesh*) -> i64!:
+## What pieces are classified against: both solids' faces (their charts,
+## for exact rays), and the meshes of solids with B-spline faces, made when
+## first needed.
+struct Others:
+    var charts: Charts
+    var a: const CadModel*
+    var b: const CadModel*
+    var mesh_a: interop.Reference[Mesh]?
+    var mesh_b: interop.Reference[Mesh]?
+
+    func close():
+        self.charts.close()
+        if let m = self.mesh_a: m.release()
+        if let m = self.mesh_b: m.release()
+
+func new_others(w: const Shape*, a: const CadModel*, b: const CadModel*) -> Others!:
+    return Others(try new_charts(w.faces.count), a, b, none, none)
+
+## Piece `p` of face `f` against the other solid.
+func classify(work: Work*, traced: const Shape*, f: usize, pieces: const Pieces*, p: usize, others: Others*) -> i64!:
     let point = try piece_point(work, traced, f, pieces, p)
     for pair in work.coincident.view():
         let partner = pair.fb if pair.fa == f else (pair.fa if pair.fb == f else f)
         if partner == f: continue
         if try face_contains(&work.w, partner, point, work.tol) != outside:
             return class_same if pair.same else class_opposite
-    return class_in if try inside_mesh(other, point, work.size) else class_out
+    # The other solid's faces.
+    let first = work.faces_a if work.is_a(f) else 0
+    let last = work.w.faces.count if work.is_a(f) else work.faces_a
+    if analytic_faces(&work.w, first, last):
+        return class_in if try inside_faces(&work.w, &others.charts, first, last, point, work.size) else class_out
+    if work.is_a(f):
+        if others.mesh_b == none: others.mesh_b = try others.b.tessellate(16)
+    elif others.mesh_a == none:
+        others.mesh_a = try others.a.tessellate(16)
+    let mesh = (others.mesh_b if work.is_a(f) else others.mesh_a) else error(invalid, "a solid lost its mesh")
+    return class_in if try inside_mesh(mesh.value(), point, work.size) else class_out
 
 ## Whether `point` is inside the closed `mesh` (of extent `size`): crossings
 ## of three rays through it, the majority deciding.
