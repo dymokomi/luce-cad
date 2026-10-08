@@ -418,6 +418,40 @@ edge becomes a cylinder band about the shrunk edge, and each corner becomes a sp
 by its edges' arcs. A box comes out with 26 faces. Each sphere patch's pole sits in its middle, which keeps its
 tessellation even.
 
+## Sketches (`sketch/`)
+
+A sketch is points, lines, circles and arcs on a plane, and the constraints between them, as in
+Fusion 360. `CadSketch` holds one for the editor: it reads and writes the sketch's text (what a
+Sketch node keeps), adds and removes entities and constraints, edits dimensions, solves, drags a
+point, and gives the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
+`docs/research/SKETCH-SOLVER-STUDY.md` has the design, after SolveSpace's and FreeCAD's solvers.
+
+- **Parameters.** One array: a point owns x and y; a circle or arc owns its radius, and an arc's
+  ends are real points that two rows keep on its circle. No angles are unknowns, so nothing wraps.
+- **Constraints.** Coincident, horizontal, vertical, concentric, equal radii, fix, radius and
+  diameter only say parameters are equal or constant: they merge parameters into classes
+  (union-find, `substitution.lucb`) and are never solved for. Two different constants meeting
+  in a class conflict at once. Point on curve, parallel, perpendicular, angle, equal length,
+  tangent (line–circle, circle–circle, inside or out), midpoint, collinear, symmetry and the
+  distance dimensions are rows (`residuals.lucb`): each computes its residual and every partial in
+  one pass; ratio and angle rows are scaled by the sketch's size so all rows are lengths.
+- **Solving** (`solver.lucb`). Unknowns tied by rows form components, each solved alone. A step is
+  the least motion that satisfies the rows to first order, weighted so a dragged point hardly
+  moves: (J W⁻¹ Jᵀ + μI) z = F, step −W⁻¹ Jᵀ z, Gauss–Newton with Levenberg damping only when a
+  step does not help. An under-constrained sketch so moves as little as it can; one that does not
+  converge is left as it was. A drag passes its target apart from the parameters, so a fixed point
+  stays fixed.
+- **Freedom** (`freedom.lucb`), after a change rather than per drag frame: one column-pivoted QR of
+  Jᵀ gives the rank (degrees of freedom left), the null space (which entities are fully
+  constrained, for coloring) and the rows that depend on others (redundant when they hold,
+  conflicting when they do not).
+- **Curves** (`curves.lucb`): lines as two-point polylines, circles and arcs as exact rational
+  quadratic arcs, on the plane given by an origin and the sketch's x and y axes. Construction
+  entities make none.
+
+Not yet: ellipses, splines, slots and text; curvature (G2) and polygon constraints; crossing
+curves split into profiles.
+
 ## Limits, and what comes next
 
 Roughly in order of usefulness:
@@ -428,5 +462,5 @@ Roughly in order of usefulness:
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
    surfaces. Rays through them are exact (`spline_rays.lucb`).
 4. **Sweep and loft;** tapered extrudes; Extrude "to object".
-5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
+5. **Sketch arrangement.** Crossing curves split into regions (the solver is in; see Sketches).
 6. **Shell,** offset, draft and press/pull.

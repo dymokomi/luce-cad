@@ -1,0 +1,80 @@
+## Sketches through Luce (sketch/api.lucb), as the editor uses them: a 40
+## by 20 mm plate with a 5 mm hole, drawn roughly, constrained and
+## dimensioned until nothing is free, solved, kept as text and read back,
+## then extruded 10 mm into a solid of the right volume; a dimension
+## changed re-solves; a free corner dragged moves, a fixed one does not.
+from luce_cad.sketch import CadSketch
+from luce_cad.modeling import CadModeling
+from luce_geocore.geocore import Vector3, Mesh
+from checks import manifold
+from luce_std import math
+
+## ConstraintKind's order (sketch/entities.lucb).
+let horizontal = 2
+let vertical = 3
+let fix = 8
+let distance = 13
+let horizontal_distance = 15
+let vertical_distance = 16
+let radius = 18
+
+func volume(mesh: Mesh) -> float!:
+    var total = 0.0
+    for triangle in 0..<mesh.index_count() // 3:
+        let a = mesh.vertex(mesh.index(triangle * 3)).position
+        let b = mesh.vertex(mesh.index(triangle * 3 + 1)).position
+        let c = mesh.vertex(mesh.index(triangle * 3 + 2)).position
+        total += a.dot(b.cross(c)) / 6.0
+    return total
+
+func near(a: float, b: float) -> bool:
+    return math.abs(a - b) <= 1e-6 * math.max(1.0, math.abs(b))
+
+pub func sketch_tests() -> unit!:
+    let s = CadSketch.parse("")
+    let a = s.add_point(0.0, 0.0)
+    let b = s.add_point(38.0, 1.0)
+    let c = s.add_point(41.0, 22.0)
+    let d = s.add_point(2.0, 19.0)
+    let lines = [s.add_line(a, b), s.add_line(b, c), s.add_line(c, d), s.add_line(d, a)]
+    _ = s.constrain(horizontal, lines[0])
+    _ = s.constrain(horizontal, lines[2])
+    _ = s.constrain(vertical, lines[1])
+    _ = s.constrain(vertical, lines[3])
+    _ = s.constrain(fix, a)
+    let width = s.constrain(distance, a, b, value = 40.0)
+    _ = s.constrain(distance, b, c, value = 20.0)
+    let center = s.add_point(12.0, 9.0)
+    let hole = s.add_circle(center, 4.0)
+    _ = s.constrain(radius, hole, value = 5.0)
+    _ = s.constrain(horizontal_distance, a, center, value = 10.0)
+    _ = s.constrain(vertical_distance, a, center, value = 10.0)
+    assert(s.solve())
+    assert(near(s.x(c), 40.0) and near(s.y(c), 20.0) and near(s.x(center), 10.0) and near(s.radius(hole), 5.0))
+    s.analyze()
+    assert(s.degrees() == 0 and s.fixed(c) and s.fixed(hole) and s.conflicting_count() == 0)
+    # Kept as text and read back: the same sketch.
+    let back = CadSketch.parse(s.text())
+    assert(back.text() == s.text() and back.entity_count() == s.entity_count())
+    # Extruded 10 mm: the plate less the hole.
+    let body = CadModeling.extruded(back.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 10.0, 0.0, "e")
+    let mesh = body.tessellate(32)
+    manifold(mesh)
+    let expected = 40.0 * 20.0 * 10.0 - math.pi * 25.0 * 10.0
+    assert(math.abs(volume(mesh) - expected) < expected * 0.002)
+    # A dimension changed: solved again, the plate 50 wide.
+    s.set_value(width, 50.0)
+    assert(s.solve() and near(s.x(b), 50.0))
+    # The width dimension removed: the far side drags; the fixed corner
+    # does not.
+    s.unconstrain(width)
+    assert(s.drag(b, 60.0, 5.0) and near(s.x(b), 60.0) and near(s.y(b), 0.0) and near(s.x(c), 60.0))
+    assert(s.drag(a, 5.0, 5.0) and near(s.x(a), 0.0) and near(s.y(a), 0.0))
+    s.analyze()
+    assert(s.degrees() == 1 and not s.fixed(b))
+    # Picking: the corner itself, else the line under the point.
+    assert(s.pick(60.2, 0.1, 1.0) == b and s.pick(30.0, 0.3, 1.0) == lines[0] and s.pick(30.0, 9.0, 1.0) < 0)
+    # Removing a line keeps its corners (other lines use them).
+    s.remove(lines[0])
+    assert(s.entity_count() == 9 and s.kind(a) == 0)
+    print("PASS sketch: a plate drawn roughly, constrained and dimensioned to no freedom, solved, kept as text, extruded to its volume; a dimension changed, a corner dragged, picking, a line removed")

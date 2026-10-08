@@ -1,0 +1,107 @@
+## Dense linear algebra for the solver, on row-major `f64` arrays: a
+## Cholesky factorization and solve for its normal equations, and a
+## Householder QR with column pivoting for rank, null spaces and dependent
+## rows (freedom.lucb). Sketch components are small (tens to a few hundred
+## unknowns), where dense is fast and simple.
+
+## Factor the `n` by `n` symmetric matrix `a` in place into L Lᵀ (L in the
+## lower triangle). False when it is not positive definite to `tolerance`
+## (a pivot at or below it, relative to the largest diagonal entry).
+pub func cholesky(a: f64[], n: usize, tolerance: f64) -> bool:
+    var largest = 0.0
+    for i in 0..<n:
+        largest = math.max(largest, math.abs(a[i * n + i]))
+    let floor = tolerance * math.max(largest, 1e-300)
+    for j in 0..<n:
+        var d = a[j * n + j]
+        for k in 0..<j:
+            d -= a[j * n + k] * a[j * n + k]
+        if not (d > floor): return false
+        let root = math.sqrt(d)
+        a[j * n + j] = root
+        for i in (j + 1)..<n:
+            var s = a[i * n + j]
+            for k in 0..<j:
+                s -= a[i * n + k] * a[j * n + k]
+            a[i * n + j] = s / root
+    return true
+
+## Solve L Lᵀ x = b in place in `b`, with `l` from `cholesky`.
+pub func cholesky_solve(l: const f64[], n: usize, b: f64[]):
+    for i in 0..<n:
+        var s = b[i]
+        for k in 0..<i:
+            s -= l[i * n + k] * b[k]
+        b[i] = s / l[i * n + i]
+    var i = n
+    while i > 0:
+        i -= 1
+        var s = b[i]
+        for k in (i + 1)..<n:
+            s -= l[k * n + i] * b[k]
+        b[i] = s / l[i * n + i]
+
+## A Householder QR with column pivoting of the `rows` by `columns` matrix
+## `a` (row-major, overwritten by R in its upper triangle): A P = Q R.
+## `q` gets Q (`rows` by `rows`), `order` the columns' order P (the
+## independent first) and the result is the rank: the pivots above
+## `tolerance` times the first.
+pub func pivoted_qr(a: f64[], rows: usize, columns: usize, q: f64[], order: i64[], tolerance: f64) -> usize:
+    for i in 0..<rows:
+        for j in 0..<rows:
+            q[i * rows + j] = 1.0 if i == j else 0.0
+    for j in 0..<columns:
+        order[j] = (i64)j
+    let steps = rows if rows < columns else columns
+    var rank: usize = 0
+    var first = 0.0
+    for step in 0..<steps:
+        # The remaining column of largest norm comes next.
+        var best = step
+        var best_norm = -1.0
+        for j in step..<columns:
+            var s = 0.0
+            for i in step..<rows:
+                s += a[i * columns + j] * a[i * columns + j]
+            if s > best_norm:
+                best_norm = s
+                best = j
+        if best != step:
+            for i in 0..<rows:
+                let t = a[i * columns + step]
+                a[i * columns + step] = a[i * columns + best]
+                a[i * columns + best] = t
+            let o = order[step]
+            order[step] = order[best]
+            order[best] = o
+        let norm = math.sqrt(math.max(best_norm, 0.0))
+        if step == 0: first = norm
+        if norm <= tolerance * math.max(first, 1e-300): break
+        rank += 1
+        # The reflector v = x + sign(x0)|x| e0 on rows step..
+        let x0 = a[step * columns + step]
+        let alpha = -norm if x0 >= 0.0 else norm
+        var vnorm = 0.0
+        a[step * columns + step] = x0 - alpha
+        for i in step..<rows:
+            vnorm += a[i * columns + step] * a[i * columns + step]
+        if vnorm > 0.0:
+            # Apply H = I - 2 v vᵀ / vᵀv to the later columns and to Q.
+            for j in (step + 1)..<columns:
+                var s = 0.0
+                for i in step..<rows:
+                    s += a[i * columns + step] * a[i * columns + j]
+                let f = 2.0 * s / vnorm
+                for i in step..<rows:
+                    a[i * columns + j] -= f * a[i * columns + step]
+            for k in 0..<rows:
+                var s = 0.0
+                for i in step..<rows:
+                    s += q[k * rows + i] * a[i * columns + step]
+                let f = 2.0 * s / vnorm
+                for i in step..<rows:
+                    q[k * rows + i] -= f * a[i * columns + step]
+        a[step * columns + step] = alpha
+        for i in (step + 1)..<rows:
+            a[i * columns + step] = 0.0
+    return rank

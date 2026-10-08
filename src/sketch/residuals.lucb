@@ -1,0 +1,292 @@
+## The solver's rows: each constraint that is not a substitution becomes
+## one or two residuals, zero when it holds, and each arc two internal rows
+## keeping its ends on its circle. A row reads up to eight parameters and
+## computes its residual and every partial in one pass (`evaluate`), no
+## expression trees. Lengths are millimeters; rows that are ratios or
+## angles are multiplied by the sketch's size `scale`, so every row is a
+## length and the rows weigh alike in the solve.
+
+pub enum RowKind as u8:
+    ## Point (0, 1) on the line through (2, 3) and (4, 5), off it by
+    ## `side` times parameter 6 (or the constant `value` when 6 is -1).
+    on_line = 0
+    ## Point (0, 1) at parameter 4 (or `value`) from (2, 3), plus `side`
+    ## times parameter 5 when there is one (two circles touching).
+    on_circle = 1
+    ## The directions (2, 3) - (0, 1) and (6, 7) - (4, 5): parallel,
+    ## perpendicular, at angle `value`, or of equal lengths.
+    parallel = 2
+    perpendicular = 3
+    angle = 4
+    equal_length = 5
+    ## `value` plus the sum of `weights` times parameters 0..3.
+    linear = 6
+    ## Points (0, 1) and (2, 3) mirrored about the line through (4, 5) and
+    ## (6, 7): halfway along it, then on either side alike.
+    mirror_along = 7
+    mirror_across = 8
+
+pub struct Row:
+    pub var kind: RowKind
+    ## The user constraint it comes from, or -1 for an arc's own rows.
+    pub var constraint: i64
+    pub var at: i64[8]
+    pub var value: f64
+    pub var side: f64
+    pub var weights: f64[4]
+
+## One row's residual and its partials by `at`'s parameters.
+pub struct Evaluated:
+    pub var residual: f64
+    pub var partial: f64[8]
+
+## The rows of `sketch`: its constraints that are not substitutions, and
+## each arc's own.
+pub func rows_of(sketch: const Sketch*, out: Growing[Row]*) -> !:
+    out.clear()
+    for index in 0..<sketch.entities.count:
+        let e = sketch.entities.items[index]
+        if e.kind != EntityKind.arc: continue
+        for end in [e.third, e.fourth]:
+            try out.push(row(RowKind.on_circle, -1, [px(sketch, end), px(sketch, end) + 1, px(sketch, e.first), px(sketch, e.first) + 1, e.second, -1, -1, -1]))
+    for index in 0..<sketch.constraints.count:
+        let k = sketch.constraints.items[index]
+        if k.driven: continue
+        try rows_for(sketch, k, (i64)index, out)
+
+func rows_for(sketch: const Sketch*, k: SketchConstraint, index: i64, out: Growing[Row]*) -> !:
+    if k.kind == ConstraintKind.on_curve:
+        let curve = sketch.entity(k.second)
+        if curve.kind == EntityKind.line:
+            try out.push(row(RowKind.on_line, index, point_line(sketch, k.first, k.second, -1)))
+        else:
+            try out.push(row(RowKind.on_circle, index, [px(sketch, k.first), px(sketch, k.first) + 1, px(sketch, curve.first), px(sketch, curve.first) + 1, curve.second, -1, -1, -1]))
+    elif k.kind == ConstraintKind.parallel or k.kind == ConstraintKind.perpendicular or k.kind == ConstraintKind.angle or (k.kind == ConstraintKind.equal and sketch.entity(k.first).kind == EntityKind.line):
+        let kind = RowKind.parallel if k.kind == ConstraintKind.parallel else (RowKind.perpendicular if k.kind == ConstraintKind.perpendicular else (RowKind.angle if k.kind == ConstraintKind.angle else RowKind.equal_length))
+        var r = row(kind, index, two_lines(sketch, k.first, k.second))
+        r.value = k.value
+        try out.push(r)
+    elif k.kind == ConstraintKind.tangent:
+        try out.push(tangent_row(sketch, k, index))
+    elif k.kind == ConstraintKind.midpoint:
+        let line = sketch.entity(k.second)
+        for axis in 0..<(i64)2:
+            var r = row(RowKind.linear, index, [px(sketch, k.first) + axis, px(sketch, line.first) + axis, px(sketch, line.second) + axis, -1, -1, -1, -1, -1])
+            r.weights = [1.0, -0.5, -0.5, 0.0]
+            try out.push(r)
+    elif k.kind == ConstraintKind.collinear:
+        let other = sketch.entity(k.second)
+        try out.push(row(RowKind.on_line, index, point_line(sketch, other.first, k.first, -1)))
+        try out.push(row(RowKind.on_line, index, point_line(sketch, other.second, k.first, -1)))
+    elif k.kind == ConstraintKind.symmetric:
+        let axis = sketch.entity(k.third)
+        let at = [px(sketch, k.first), px(sketch, k.first) + 1, px(sketch, k.second), px(sketch, k.second) + 1, px(sketch, axis.first), px(sketch, axis.first) + 1, px(sketch, axis.second), px(sketch, axis.second) + 1]
+        try out.push(row(RowKind.mirror_along, index, at))
+        try out.push(row(RowKind.mirror_across, index, at))
+    elif k.kind == ConstraintKind.distance:
+        var r = row(RowKind.on_circle, index, [px(sketch, k.second), px(sketch, k.second) + 1, px(sketch, k.first), px(sketch, k.first) + 1, -1, -1, -1, -1])
+        r.value = k.value
+        try out.push(r)
+    elif k.kind == ConstraintKind.line_distance:
+        var r = row(RowKind.on_line, index, point_line(sketch, k.first, k.second, -1))
+        r.value = k.value
+        r.side = k.side
+        try out.push(r)
+    elif k.kind == ConstraintKind.horizontal_distance or k.kind == ConstraintKind.vertical_distance:
+        let axis = 0 if k.kind == ConstraintKind.horizontal_distance else 1
+        var r = row(RowKind.linear, index, [px(sketch, k.second) + axis, px(sketch, k.first) + axis, -1, -1, -1, -1, -1, -1])
+        r.weights = [1.0, -1.0, 0.0, 0.0]
+        r.value = -k.side * k.value
+        try out.push(r)
+
+## A line, arc or circle touching a circle or arc: a line's distance from
+## the center is the radius; two circles' centers are the sum (`side` +1)
+## or difference (-1) of their radii apart.
+func tangent_row(sketch: const Sketch*, k: SketchConstraint, index: i64) -> Row:
+    var a = sketch.entity(k.first)
+    var b = sketch.entity(k.second)
+    if b.kind == EntityKind.line:
+        let swap = a
+        a = b
+        b = swap
+    if a.kind == EntityKind.line:
+        var r = row(RowKind.on_line, index, [px(sketch, b.first), px(sketch, b.first) + 1, px(sketch, a.first), px(sketch, a.first) + 1, px(sketch, a.second), px(sketch, a.second) + 1, b.second, -1])
+        r.side = k.side
+        return r
+    var r = row(RowKind.on_circle, index, [px(sketch, b.first), px(sketch, b.first) + 1, px(sketch, a.first), px(sketch, a.first) + 1, a.second, b.second, -1, -1])
+    r.side = k.side
+    return r
+
+## Point `point` against line `line`, offset by parameter `offset`.
+func point_line(sketch: const Sketch*, point: i64, line: i64, offset: i64) -> i64[8]:
+    let l = sketch.entity(line)
+    return [px(sketch, point), px(sketch, point) + 1, px(sketch, l.first), px(sketch, l.first) + 1, px(sketch, l.second), px(sketch, l.second) + 1, offset, -1]
+
+func two_lines(sketch: const Sketch*, first: i64, second: i64) -> i64[8]:
+    let a = sketch.entity(first)
+    let b = sketch.entity(second)
+    return [px(sketch, a.first), px(sketch, a.first) + 1, px(sketch, a.second), px(sketch, a.second) + 1, px(sketch, b.first), px(sketch, b.first) + 1, px(sketch, b.second), px(sketch, b.second) + 1]
+
+func row(kind: RowKind, constraint: i64, at: i64[8]) -> Row:
+    return Row(kind, constraint, at, 0.0, 1.0, [0.0, 0.0, 0.0, 0.0])
+
+## Point `point`'s x parameter.
+func px(sketch: const Sketch*, point: i64) -> i64:
+    return sketch.entity(point).first
+
+## Row `r`'s residual and partials, its parameters read by `read` from
+## `context` (the solver's current values), scaled by `scale`.
+pub func evaluate(r: const Row*, read: func(i64, void*) -> f64, context: void*, scale: f64) -> Evaluated:
+    var v: f64[8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    for i in 0..<(usize)8:
+        if r.at[i] >= 0: v[i] = read(r.at[i], context)
+    var e = Evaluated(0.0, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    if r.kind == RowKind.on_line:
+        # Signed distance cross(b - a, p - a) / |b - a| minus the offset.
+        let dx = v[4] - v[2]
+        let dy = v[5] - v[3]
+        let wx = v[0] - v[2]
+        let wy = v[1] - v[3]
+        let length = math.max(math.hypot(dx, dy), 1e-12 * scale)
+        let cross = dx * wy - dy * wx
+        let d = cross / length
+        let offset = v[6] if r.at[6] >= 0 else r.value
+        e.residual = d - r.side * offset
+        # d/dp = (-dy, dx)/len; d/db = (wy, -wx)/len - d (b - a)/len^2;
+        # d/da = -(d/dp + d/db).
+        let l2 = length * length
+        e.partial[0] = -dy / length
+        e.partial[1] = dx / length
+        e.partial[4] = wy / length - d * dx / l2
+        e.partial[5] = -wx / length - d * dy / l2
+        e.partial[2] = -(e.partial[0] + e.partial[4])
+        e.partial[3] = -(e.partial[1] + e.partial[5])
+        if r.at[6] >= 0: e.partial[6] = -r.side
+    elif r.kind == RowKind.on_circle:
+        # |p - c| minus the radius (and `side` times a second radius).
+        let dx = v[0] - v[2]
+        let dy = v[1] - v[3]
+        let length = math.max(math.hypot(dx, dy), 1e-12 * scale)
+        let radius = v[4] if r.at[4] >= 0 else r.value
+        let other = v[5] if r.at[5] >= 0 else 0.0
+        e.residual = length - (radius + r.side * other)
+        e.partial[0] = dx / length
+        e.partial[1] = dy / length
+        e.partial[2] = -dx / length
+        e.partial[3] = -dy / length
+        if r.at[4] >= 0: e.partial[4] = -1.0
+        if r.at[5] >= 0: e.partial[5] = -r.side
+    elif r.kind == RowKind.linear:
+        e.residual = r.value
+        for i in 0..<(usize)4:
+            if r.at[i] < 0: continue
+            e.residual += r.weights[i] * v[i]
+            e.partial[i] = r.weights[i]
+    elif r.kind == RowKind.mirror_along or r.kind == RowKind.mirror_across:
+        mirror_row(v[..<8], r.kind == RowKind.mirror_along, scale, &e)
+    else:
+        two_directions(v[..<8], r, scale, &e)
+    return e
+
+## Parallel, perpendicular, angle and equal-length rows: from the two
+## directions d1 = (2, 3) - (0, 1) and d2 = (6, 7) - (4, 5).
+func two_directions(v: const f64[], r: const Row*, scale: f64, e: Evaluated*):
+    let ax = v[2] - v[0]
+    let ay = v[3] - v[1]
+    let bx = v[6] - v[4]
+    let by = v[7] - v[5]
+    let la = math.max(math.hypot(ax, ay), 1e-12 * scale)
+    let lb = math.max(math.hypot(bx, by), 1e-12 * scale)
+    # Partials by d1 (ga) and d2 (gb); the points' are ± these.
+    var gax = 0.0
+    var gay = 0.0
+    var gbx = 0.0
+    var gby = 0.0
+    if r.kind == RowKind.equal_length:
+        e.residual = la - lb
+        gax = ax / la
+        gay = ay / la
+        gbx = -bx / lb
+        gby = -by / lb
+    else:
+        let cross = ax * by - ay * bx
+        let dot = ax * bx + ay * by
+        let n = la * lb
+        if r.kind == RowKind.parallel:
+            # sin of the angle between them: cross / (|a||b|).
+            e.residual = scale * cross / n
+            gax = scale * (by / n - cross * ax / (la * la * n))
+            gay = scale * (-bx / n - cross * ay / (la * la * n))
+            gbx = scale * (-ay / n - cross * bx / (lb * lb * n))
+            gby = scale * (ax / n - cross * by / (lb * lb * n))
+        elif r.kind == RowKind.perpendicular:
+            e.residual = scale * dot / n
+            gax = scale * (bx / n - dot * ax / (la * la * n))
+            gay = scale * (by / n - dot * ay / (la * la * n))
+            gbx = scale * (ax / n - dot * bx / (lb * lb * n))
+            gby = scale * (ay / n - dot * by / (lb * lb * n))
+        else:
+            # The angle from d1 to d2, atan2(cross, dot), minus the target,
+            # wrapped to (-pi, pi]: d(angle)/d(d1) = (ay, -ax)/|a|^2 and
+            # d(angle)/d(d2) = (-by, bx)/|b|^2.
+            var delta = math.atan2(cross, dot) - r.value
+            while delta > math.pi: delta -= 2.0 * math.pi
+            while delta <= -math.pi: delta += 2.0 * math.pi
+            e.residual = scale * delta
+            gax = scale * ay / (la * la)
+            gay = -scale * ax / (la * la)
+            gbx = -scale * by / (lb * lb)
+            gby = scale * bx / (lb * lb)
+    e.partial[0] = -gax
+    e.partial[1] = -gay
+    e.partial[2] = gax
+    e.partial[3] = gay
+    e.partial[4] = -gbx
+    e.partial[5] = -gby
+    e.partial[6] = gbx
+    e.partial[7] = gby
+
+## Points p (0, 1) and q (2, 3) mirrored about the line through a (4, 5)
+## and b (6, 7), with d = b - a. Along: q - p is square to the line,
+## dot(q - p, d) / |d|. Across: they are equally far either side, the sum
+## of their signed distances (cross(d, p - a) + cross(d, q - a)) / |d|.
+func mirror_row(v: const f64[], along: bool, scale: f64, e: Evaluated*):
+    let dx = v[6] - v[4]
+    let dy = v[7] - v[5]
+    let length = math.max(math.hypot(dx, dy), 1e-12 * scale)
+    let l2 = length * length
+    if along:
+        let wx = v[2] - v[0]
+        let wy = v[3] - v[1]
+        let dot = wx * dx + wy * dy
+        e.residual = dot / length
+        e.partial[0] = -dx / length
+        e.partial[1] = -dy / length
+        e.partial[2] = dx / length
+        e.partial[3] = dy / length
+        # By d: w / |d| - dot d / |d|^3; b gets it, a its negative.
+        let gx = wx / length - dot * dx / (l2 * length)
+        let gy = wy / length - dot * dy / (l2 * length)
+        e.partial[6] = gx
+        e.partial[7] = gy
+        e.partial[4] = -gx
+        e.partial[5] = -gy
+        return
+    let pxa = v[0] - v[4]
+    let pya = v[1] - v[5]
+    let qxa = v[2] - v[4]
+    let qya = v[3] - v[5]
+    let cross = dx * (pya + qya) - dy * (pxa + qxa)
+    e.residual = cross / length
+    e.partial[0] = -dy / length
+    e.partial[1] = dx / length
+    e.partial[2] = -dy / length
+    e.partial[3] = dx / length
+    # By d = b - a: (sy, -sx)/|d| - cross d/|d|^3 with s = (p - a) + (q - a);
+    # a also moves both p - a and q - a.
+    let gx = (pya + qya) / length - cross * dx / (l2 * length)
+    let gy = -(pxa + qxa) / length - cross * dy / (l2 * length)
+    e.partial[6] = gx
+    e.partial[7] = gy
+    e.partial[4] = -gx + 2.0 * dy / length
+    e.partial[5] = -gy - 2.0 * dx / length

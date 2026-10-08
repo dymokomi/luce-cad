@@ -1,0 +1,265 @@
+## Solving a sketch: its substitutions make the unknowns (substitution.lucb),
+## its other constraints the rows (residuals.lucb). Unknowns tied by rows
+## form components, each solved alone, so a drag moves only what the
+## dragged point is tied to and a component already satisfied costs one
+## evaluation. Each step is the least motion that satisfies the rows to
+## first order, weighted so pinned (dragged) unknowns hardly move: with J
+## the rows' Jacobian, F their residuals and W the weights,
+##     (J W⁻¹ Jᵀ + μ I) z = F,   step = -W⁻¹ Jᵀ z,
+## Gauss–Newton with Levenberg damping μ raised only when a step does not
+## lower the residuals. An under-constrained sketch so moves as little as it
+## can. A sketch that does not converge keeps its parameters as they were.
+
+## How a solve went.
+pub struct Solved:
+    pub var converged: bool
+    ## The largest row residual left (mm).
+    pub var residual: f64
+    pub var iterations: i64
+    ## Substitutions that conflict: pairs of constraint indices.
+    pub var conflicts: i64
+
+## The pinned unknowns' weight: they move this much less than others.
+let pinned_weight: f64 = 1000.0
+
+## Solve `sketch` in place. At most `limit` steps per component.
+pub func solve_sketch(sketch: Sketch*, limit: i64 = 50) -> Solved!:
+    var nothing: i64[1] = [0]
+    var none_targets: f64[1] = [0.0]
+    return try drag_sketch(sketch, nothing[..<0], none_targets[..<0], limit)
+
+## Solve `sketch` in place with parameters `pins` (a drag's point) moved
+## to `targets` (where the pointer is) and held there where they can be. A
+## pin whose class is a constant (a fixed point) stays.
+pub func drag_sketch(sketch: Sketch*, pins: const i64[], targets: const f64[], limit: i64 = 50) -> Solved!:
+    if pins.length != targets.length: error(invalid, "a drag needs a target per pinned parameter")
+    var classes = try classes_of(sketch, pins)
+    defer classes.close()
+    var rows = Growing[Row]()
+    defer rows.close()
+    try rows_of(sketch, &rows)
+    let scale = size_of(sketch)
+    let unknowns = classes.source.count
+    var values = Growing[f64]()
+    defer values.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    for u in 0..<unknowns:
+        let root = classes.source.items[u]
+        try values.push(sketch.params.items[(usize)root])
+        try weights.push(pinned_weight if classes.pinned.items[(usize)root] else 1.0)
+    for at in 0..<pins.length:
+        let u = classes.variable.items[(usize)pins[at]]
+        if u >= 0: values.items[(usize)u] = targets[at]
+    var result = Solved(true, 0.0, 0, (i64)(classes.conflicts.count // 2))
+    # Components: unknowns joined by the rows that read them.
+    var parent = Growing[i64]()
+    defer parent.close()
+    for u in 0..<unknowns: try parent.push((i64)u)
+    for r in rows.view():
+        var first: i64 = -1
+        for p in r.at:
+            if p < 0: continue
+            let u = classes.variable.items[(usize)p]
+            if u < 0: continue
+            if first < 0: first = u
+            else: join(&parent, first, u)
+    var context = Reading(&classes, values.view())
+    var columns = Growing[i64]()
+    defer columns.close()
+    var members = Growing[usize]()
+    defer members.close()
+    var work = Work(Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64]())
+    defer work.close()
+    var done = Growing[bool]()
+    defer done.close()
+    try done.fill(unknowns, false)
+    for u in 0..<unknowns:
+        let root = find(&parent, (i64)u)
+        if done.items[(usize)root]: continue
+        done.items[(usize)root] = true
+        columns.clear()
+        members.clear()
+        for v in 0..<unknowns:
+            if find(&parent, (i64)v) == root: try columns.push((i64)v)
+        for at in 0..<rows.count:
+            if component_of(&rows.items[at], &classes, &parent) == root: try members.push(at)
+        if members.count == 0: continue
+        let solved = try solve_component(&rows, members.view(), columns.view(), &classes, &values, weights.view(), scale, limit, &work)
+        result.iterations = (i64)math.max((f64)result.iterations, (f64)solved.iterations)
+        result.residual = math.max(result.residual, solved.residual)
+        result.converged = result.converged and solved.converged
+    # Rows on constants alone: they hold or they conflict.
+    for r in rows.view():
+        if component_of(&r, &classes, &parent) >= 0: continue
+        context.values = values.view()
+        let e = evaluate(&r, read_value, (void*)&context, scale)
+        if math.abs(e.residual) > 1e-7 * scale:
+            result.converged = false
+            result.residual = math.max(result.residual, math.abs(e.residual))
+    if result.converged:
+        for p in 0..<sketch.params.count:
+            sketch.params.items[p] = classes.value((i64)p, values.view())
+    return result
+
+## The scratch arrays of a component's solve, reused across components.
+struct Work:
+    var jacobian: Growing[f64]
+    var normal: Growing[f64]
+    var residual: Growing[f64]
+    var trial: Growing[f64]
+    var step: Growing[f64]
+    var z: Growing[f64]
+
+    func close():
+        self.jacobian.close()
+        self.normal.close()
+        self.residual.close()
+        self.trial.close()
+        self.step.close()
+        self.z.close()
+
+## The solver's current values, as rows read their parameters.
+struct Reading:
+    var classes: const Classes*
+    var values: const f64[]
+
+func read_value(param: i64, context: void*) -> f64:
+    let reading = (const Reading*)context
+    return reading.classes.value(param, reading.values)
+
+## One component's rows `members` over unknowns `columns`.
+func solve_component(rows: const Growing[Row]*, members: const usize[], columns: const i64[], classes: const Classes*, values: Growing[f64]*, weights: const f64[], scale: f64, limit: i64, work: Work*) -> Solved!:
+    let m = members.length
+    let n = columns.length
+    try sized(&work.jacobian, m * n)
+    try sized(&work.normal, m * m)
+    try sized(&work.residual, m)
+    try sized(&work.trial, m)
+    try sized(&work.step, n)
+    try sized(&work.z, m)
+    let tolerance = 1e-10 * scale
+    var mu = 0.0
+    var current = try residuals_and_jacobian(rows, members, columns, classes, values.view(), scale, work.residual.items[..<(m)], work.jacobian.items[..<(m * n)])
+    var iteration: i64 = 0
+    while iteration < limit:
+        if current <= tolerance: return Solved(true, current, iteration, 0)
+        iteration += 1
+        # A = J W⁻¹ Jᵀ + μ I.
+        let a = work.normal.items[..<(m * m)]
+        let j = work.jacobian.items[..<(m * n)]
+        for r in 0..<m:
+            for s in 0..<(r + 1):
+                var sum = 0.0
+                for c in 0..<n:
+                    sum += j[r * n + c] * j[s * n + c] / weights[(usize)columns[c]]
+                a[r * m + s] = sum
+                a[s * m + r] = sum
+        var largest = 0.0
+        for r in 0..<m: largest = math.max(largest, a[r * m + r])
+        for r in 0..<m: a[r * m + r] += mu * math.max(largest, 1e-300)
+        if not cholesky(a, m, 1e-14):
+            # Dependent rows: damp, and try again.
+            mu = 1e-9 if mu == 0.0 else mu * 10.0
+            if mu > 1e6: return Solved(false, current, iteration, 0)
+            continue
+        let z = work.z.items[..<(m)]
+        for r in 0..<m: z[r] = work.residual.items[r]
+        cholesky_solve(a, m, z)
+        let step = work.step.items[..<(n)]
+        for c in 0..<n:
+            var sum = 0.0
+            for r in 0..<m: sum += j[r * n + c] * z[r]
+            step[c] = -sum / weights[(usize)columns[c]]
+        # Take the step; keep it if the residuals fall, else damp and retry.
+        for c in 0..<n: values.items[(usize)columns[c]] += step[c]
+        let trial = try largest_residual(rows, members, classes, values.view(), scale)
+        if trial < current or trial <= tolerance:
+            current = try residuals_and_jacobian(rows, members, columns, classes, values.view(), scale, work.residual.items[..<(m)], work.jacobian.items[..<(m * n)])
+            mu = mu * 0.1 if mu > 1e-12 else 0.0
+        else:
+            for c in 0..<n: values.items[(usize)columns[c]] -= step[c]
+            mu = 1e-9 if mu == 0.0 else mu * 10.0
+            if mu > 1e6: return Solved(false, current, iteration, 0)
+    return Solved(current <= tolerance, current, iteration, 0)
+
+## Fill the residuals and the Jacobian by `columns`; the largest residual.
+func residuals_and_jacobian(rows: const Growing[Row]*, members: const usize[], columns: const i64[], classes: const Classes*, values: const f64[], scale: f64, residual: f64[], jacobian: f64[]) -> f64!:
+    let n = columns.length
+    var context = Reading(classes, values)
+    var largest = 0.0
+    for r in 0..<members.length:
+        let row_at = &rows.items[members[r]]
+        let e = evaluate(row_at, read_value, (void*)&context, scale)
+        residual[r] = e.residual
+        largest = math.max(largest, math.abs(e.residual))
+        for c in 0..<n: jacobian[r * n + c] = 0.0
+        for i in 0..<(usize)8:
+            let p = row_at.at[i]
+            if p < 0: continue
+            let u = classes.variable.items[(usize)p]
+            if u < 0: continue
+            let c = column_of(columns, u)
+            if c >= 0: jacobian[r * n + (usize)c] += e.partial[i]
+    return largest
+
+func largest_residual(rows: const Growing[Row]*, members: const usize[], classes: const Classes*, values: const f64[], scale: f64) -> f64!:
+    var context = Reading(classes, values)
+    var largest = 0.0
+    for r in 0..<members.length:
+        let e = evaluate(&rows.items[members[r]], read_value, (void*)&context, scale)
+        largest = math.max(largest, math.abs(e.residual))
+    return largest
+
+## Unknown `u`'s column among `columns` (sorted), or -1.
+func column_of(columns: const i64[], u: i64) -> i64:
+    var low: usize = 0
+    var high = columns.length
+    while low < high:
+        let middle = (low + high) // 2
+        if columns[middle] < u: low = middle + 1
+        else: high = middle
+    if low < columns.length and columns[low] == u: return (i64)low
+    return -1
+
+## The component (its root unknown) of row `r`, or -1 when it reads
+## constants alone.
+func component_of(r: const Row*, classes: const Classes*, parent: Growing[i64]*) -> i64:
+    for p in r.at:
+        if p < 0: continue
+        let u = classes.variable.items[(usize)p]
+        if u >= 0: return find(parent, u)
+    return -1
+
+func find(parent: Growing[i64]*, at: i64) -> i64:
+    var x = at
+    while parent.items[(usize)x] != x:
+        parent.items[(usize)x] = parent.items[(usize)parent.items[(usize)x]]
+        x = parent.items[(usize)x]
+    return x
+
+func join(parent: Growing[i64]*, a: i64, b: i64):
+    let ra = find(parent, a)
+    let rb = find(parent, b)
+    if ra != rb: parent.items[(usize)ra] = rb
+
+func sized(g: Growing[f64]*, count: usize) -> !:
+    if g.count < count: try g.extend(count - g.count, 0.0)
+
+## The sketch's size: its points' extent (at least 1 mm), which scales
+## the rows that are ratios or angles and the tolerance.
+pub func size_of(sketch: const Sketch*) -> f64:
+    var low_x = math.infinity
+    var low_y = math.infinity
+    var high_x = -math.infinity
+    var high_y = -math.infinity
+    for e in sketch.entities.view():
+        if e.kind != EntityKind.point: continue
+        let x = sketch.params.items[(usize)e.first]
+        let y = sketch.params.items[(usize)e.first + 1]
+        low_x = math.min(low_x, x)
+        low_y = math.min(low_y, y)
+        high_x = math.max(high_x, x)
+        high_y = math.max(high_y, y)
+    if not (high_x >= low_x): return 1.0
+    return math.max(1.0, math.hypot(high_x - low_x, high_y - low_y))

@@ -1,0 +1,123 @@
+## A sketch as text, how the editor keeps it on its node: a line per
+## entity, then a line per constraint, fields apart by spaces, numbers in
+## their shortest exact form (they read back to the same bits):
+##
+##   p <x> <y> [c]                    a point; `c`: construction
+##   l <start> <end> [c]              a line between two points
+##   o <center> <radius> [c]          a circle
+##   a <center> <start> <end> <radius> [c]   an arc
+##   k <kind> <first> <second> <third> <value> <side> [d]
+##                                    a constraint; `d`: driven
+##
+## Entities are numbered in order from 0 and refer to earlier ones; a
+## constraint's kind is its ConstraintKind name. Points hold where the last
+## solve left them.
+
+## `sketch` as text, added to `out`.
+pub func write_sketch(sketch: const Sketch*, out: Growing[u8]*) -> !:
+    for e in sketch.entities.view():
+        if e.kind == EntityKind.point:
+            try put_text(out, "p")
+            try put_number(out, sketch.params.items[(usize)e.first])
+            try put_number(out, sketch.params.items[(usize)e.first + 1])
+        elif e.kind == EntityKind.line:
+            try put_text(out, "l")
+            try put_index(out, e.first)
+            try put_index(out, e.second)
+        elif e.kind == EntityKind.circle:
+            try put_text(out, "o")
+            try put_index(out, e.first)
+            try put_number(out, sketch.params.items[(usize)e.second])
+        else:
+            try put_text(out, "a")
+            try put_index(out, e.first)
+            try put_index(out, e.third)
+            try put_index(out, e.fourth)
+            try put_number(out, sketch.params.items[(usize)e.second])
+        if e.construction: try put_text(out, " c")
+        try out.push(10)
+    for k in sketch.constraints.view():
+        try put_text(out, "k ")
+        try put_text(out, kind_names()[(usize)(u8)k.kind])
+        try put_index(out, k.first)
+        try put_index(out, k.second)
+        try put_index(out, k.third)
+        try put_number(out, k.value)
+        try put_number(out, k.side)
+        if k.driven: try put_text(out, " d")
+        try out.push(10)
+
+## The sketch `text` describes (empty text: an empty sketch).
+pub func read_sketch(text: str) -> Sketch!:
+    var s = new_sketch()
+    errdefer s.close()
+    var fields: str[8] = ["", "", "", "", "", "", "", ""]
+    var start: usize = 0
+    let bytes = text.bytes
+    while start < bytes.length:
+        var end = start
+        while end < bytes.length and bytes[end] != 10: end += 1
+        let count = split((str)bytes[start..<end], fields[0..])
+        start = end + 1
+        if count == 0: continue
+        let tag = fields[0]
+        let marked = fields[count - 1] == "c" or fields[count - 1] == "d"
+        let given = count - 1 if marked else count
+        if tag == "p" and given == 3:
+            _ = try s.add_point(try strings.parse_f64(fields[1]), try strings.parse_f64(fields[2]), marked)
+        elif tag == "l" and given == 3:
+            _ = try s.add_line(try whole(fields[1]), try whole(fields[2]), marked)
+        elif tag == "o" and given == 3:
+            _ = try s.add_circle(try whole(fields[1]), try strings.parse_f64(fields[2]), marked)
+        elif tag == "a" and given == 5:
+            let arc = try s.add_arc(try whole(fields[1]), try whole(fields[2]), try whole(fields[3]), marked)
+            s.params.items[(usize)s.entity(arc).second] = try strings.parse_f64(fields[4])
+        elif tag == "k" and given == 7:
+            let kind = try kind_named(fields[1])
+            _ = try s.constrain(kind, try whole(fields[2]), try whole(fields[3]), try whole(fields[4]), try strings.parse_f64(fields[5]), try strings.parse_f64(fields[6]), marked)
+        else:
+            error(invalid, "a sketch's text has a line it does not know")
+    return s
+
+## The names of ConstraintKind's values, in order.
+func kind_names() -> str[20]:
+    return ["coincident", "on_curve", "horizontal", "vertical", "parallel", "perpendicular", "tangent", "equal", "fix", "midpoint",
+            "concentric", "collinear", "symmetric", "distance", "line_distance", "horizontal_distance", "vertical_distance", "angle", "radius", "diameter"]
+
+func kind_named(name: str) -> ConstraintKind!:
+    let names = kind_names()
+    for at in 0..<(usize)20:
+        if names[at] == name: return ConstraintKind((u8)at)
+    error(invalid, "a sketch constraint has a kind it does not know")
+
+## Split `line` at spaces into `fields`; how many there were (at most
+## its length).
+func split(line: str, fields: str[]) -> usize:
+    var count: usize = 0
+    var at: usize = 0
+    let bytes = line.bytes
+    while at < bytes.length and count < fields.length:
+        while at < bytes.length and bytes[at] == 32: at += 1
+        if at >= bytes.length: break
+        var end = at
+        while end < bytes.length and bytes[end] != 32: end += 1
+        fields[count] = (str)bytes[at..<end]
+        count += 1
+        at = end
+    return count
+
+func whole(text: str) -> i64!:
+    return strings.parse_i64(text) else error(invalid, "a sketch's text has an index that is not a whole number")
+
+func put_text(out: Growing[u8]*, text: str) -> !:
+    for byte in text.bytes: try out.push(byte)
+
+func put_index(out: Growing[u8]*, value: i64) -> !:
+    var buffer: u8[32] = ---
+    try put_text(out, " ")
+    try put_text(out, try strings.format_f64((f64)value, buffer[0..]))
+
+func put_number(out: Growing[u8]*, value: f64) -> !:
+    var buffer: u8[32] = ---
+    try put_text(out, " ")
+    try put_text(out, try strings.format_f64(value, buffer[0..]))

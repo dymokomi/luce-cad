@@ -1,0 +1,64 @@
+## A sketch as curves on its plane, what Extrude and Revolve read
+## (modeling/profile.lucb): each line a two-point polyline, each circle and
+## arc exact rational quadratic arcs of at most 120 degrees (the form
+## profiles recognise as circular), in entity order. Construction entities
+## and lone points make no curves. The plane is the set's detail
+## attributes, as an Edit Sketch's was.
+
+## `sketch`'s curves on the plane through `origin` whose sketch x and y
+## run along `u` and `v` (unit and square to each other; the normal is
+## u × v).
+pub func sketch_curves(sketch: const Sketch*, origin: Vector3, u: Vector3, v: Vector3) -> interop.Reference[GeometrySet]!:
+    let normal = u.cross(v)
+    let plane = SketchPlane(origin, normal, u, v)
+    var out = CurvesBuilder()
+    defer out.close()
+    for e in sketch.entities.view():
+        if e.construction: continue
+        if e.kind == EntityKind.line:
+            try out.begin(CurveType.poly)
+            try out.point(plane.at(sketch.x(e.first), sketch.y(e.first)))
+            try out.point(plane.at(sketch.x(e.second), sketch.y(e.second)))
+        elif e.kind == EntityKind.circle or e.kind == EntityKind.arc:
+            let cx = sketch.x(e.first)
+            let cy = sketch.y(e.first)
+            let radius = sketch.params.items[(usize)e.second]
+            var start = 0.0
+            var sweep = 2.0 * math.pi
+            if e.kind == EntityKind.arc:
+                start = math.atan2(sketch.y(e.third) - cy, sketch.x(e.third) - cx)
+                sweep = math.atan2(sketch.y(e.fourth) - cy, sketch.x(e.fourth) - cx) - start
+                while sweep <= 0.0: sweep += 2.0 * math.pi
+            try arc_onto(&out, &plane, cx, cy, radius, start, sweep)
+    let made = try out.finish()
+    let blank = try empty_set()
+    defer dispose_set(blank)
+    let set = try adopt_set(try with_curves(blank, made))
+    defer set.release()
+    let placed = try set.value().with_detail("sketch.plane_origin", [plane.origin.x, plane.origin.y, plane.origin.z], 1)
+    defer placed.release()
+    return try placed.value().with_detail("sketch.plane_normal", [plane.normal.x, plane.normal.y, plane.normal.z], 3)
+
+## A circular arc about (`cx`, `cy`) of `radius` from angle `start`
+## sweeping `sweep` radians counterclockwise, as rational quadratic arcs
+## of at most 120 degrees joined by double knots (The NURBS Book, A7.1).
+func arc_onto(out: CurvesBuilder*, plane: const SketchPlane*, cx: f64, cy: f64, radius: f64, start: f64, sweep: f64) -> !:
+    let full = sweep >= 2.0 * math.pi - 1e-9
+    let arcs = (usize)math.max(3.0 if full else 1.0, math.ceil(sweep / (2.0 * math.pi / 3.0) - 1e-9))
+    let step = sweep / (f64)arcs
+    let middle = radius / math.cos(step * 0.5)
+    try out.begin(CurveType.nurbs, order = 3)
+    for arc in 0..<arcs:
+        let angle = start + step * (f64)arc
+        try out.point(plane.at(cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+        try out.point(plane.at(cx + middle * math.cos(angle + step * 0.5), cy + middle * math.sin(angle + step * 0.5)))
+        out.weight(math.cos(step * 0.5))
+    try out.point(plane.at(cx + radius * math.cos(start + sweep), cy + radius * math.sin(start + sweep)))
+    var knots = Growing[f64]()
+    defer knots.close()
+    for at in 0..<(usize)3: try knots.push(0.0)
+    for arc in 1..<arcs:
+        try knots.push((f64)arc)
+        try knots.push((f64)arc)
+    for at in 0..<(usize)3: try knots.push((f64)arcs)
+    try out.custom_knots(knots.view())
