@@ -156,6 +156,11 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
 
    The point inside a piece is the best of a coarse grid over its chart, refined about the best
    three times.
+
+   Two shortcuts keep rays to a minimum:
+   - **Faces far away:** a face whose box misses the other solid's box is outside it, with no ray.
+   - **Connected blocks** (OpenCASCADE's connexity blocks): pieces of one solid sharing an edge
+     that keeps clear of the other solid's surfaces are on the same side, so one ray serves them all.
 7. **Selection:**
    - union keeps the outside pieces;
    - subtract keeps the first solid's outside pieces and the second solid's inside pieces, turned;

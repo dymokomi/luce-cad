@@ -98,31 +98,141 @@ func surface_point(s: const Surface*, u: f64, v: f64) -> Vector3!:
     return s.origin.add(around.multiply_scalar(s.radius + s.angle * math.cos(v))).add(s.z.multiply_scalar(s.angle * math.sin(v)))
 
 ## What pieces are classified against: both solids' faces (their charts,
-## for exact rays), and the meshes of solids with B-spline faces, made when
-## first needed.
+## for exact rays, and boxes), the meshes of solids with B-spline faces,
+## made when first needed, and each block's class once a ray found it.
 struct Others:
     var charts: Charts
     var a: const CadModel*
     var b: const CadModel*
     var mesh_a: interop.Reference[Mesh]?
     var mesh_b: interop.Reference[Mesh]?
+    var lows: Growing[Vector3]
+    var highs: Growing[Vector3]
+    ## Each solid's box: [0] the first's, [1] the second's.
+    var solid_low: Vector3[2]
+    var solid_high: Vector3[2]
+    ## Each piece's block, and each block's class (-1 not yet known).
+    var block: Growing[usize]
+    var block_class: Growing[i64]
 
     func close():
         self.charts.close()
         if let m = self.mesh_a: m.release()
         if let m = self.mesh_b: m.release()
+        self.lows.close()
+        self.highs.close()
+        self.block.close()
+        self.block_class.close()
 
-func new_others(w: const Shape*, a: const CadModel*, b: const CadModel*) -> Others!:
-    return Others(try new_charts(w.faces.count), a, b, none, none)
+func new_others(work: const Work*, a: const CadModel*, b: const CadModel*) -> Others!:
+    let w = &work.w
+    var made = Others(try new_charts(w.faces.count), a, b, none, none, Growing[Vector3](), Growing[Vector3](),
+                      [Vector3(1.0e300, 1.0e300, 1.0e300), Vector3(1.0e300, 1.0e300, 1.0e300)],
+                      [Vector3(-1.0e300, -1.0e300, -1.0e300), Vector3(-1.0e300, -1.0e300, -1.0e300)], Growing[usize](), Growing[i64]())
+    errdefer made.close()
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(w, f)
+        try made.lows.push(l)
+        try made.highs.push(h)
+        let k: usize = 0 if work.is_a(f) else 1
+        let sl = made.solid_low[k]
+        let sh = made.solid_high[k]
+        made.solid_low[k] = Vector3(math.min(sl.x, l.x), math.min(sl.y, l.y), math.min(sl.z, l.z))
+        made.solid_high[k] = Vector3(math.max(sh.x, h.x), math.max(sh.y, h.y), math.max(sh.z, h.z))
+    return made
+
+## Pieces in blocks: pieces of one solid sharing an edge that keeps clear of
+## the other solid's surfaces are on the same side of it, so one ray serves
+## the block (OpenCASCADE's connexity blocks).
+func find_blocks(work: const Work*, traced: const Shape*, pieces: const Pieces*, piece_face: const usize[], others: Others*) -> !:
+    let count = pieces.piece_count()
+    others.block.clear()
+    others.block_class.clear()
+    for p in 0..<count:
+        try others.block.push(p)
+        try others.block_class.push(-1)
+    # The first piece found using each final edge, per solid.
+    let edges = traced.edges.count
+    var seen = Growing[i64]()
+    defer seen.close()
+    for _ in 0..<edges * 2: try seen.push(-1)
+    var clear = Growing[i64]()
+    defer clear.close()
+    for _ in 0..<edges: try clear.push(-1)
+    for p in 0..<count:
+        let solid: usize = 0 if work.is_a(piece_face[p]) else 1
+        for c in pieces.piece_cycles(p):
+            for use in pieces.cycle(c):
+                let e = (usize)((use if use > 0 else -use) - 1)
+                if clear.items[e] < 0: clear.items[e] = 1 if try keeps_clear(work, traced, e, solid) else 0
+                if clear.items[e] == 0: continue
+                let other = seen.items[e * 2 + solid]
+                if other < 0:
+                    seen.items[e * 2 + solid] = (i64)p
+                    continue
+                let ra = block_root(&others.block, p)
+                let rb = block_root(&others.block, (usize)other)
+                if ra < rb: others.block.items[rb] = ra
+                elif rb < ra: others.block.items[ra] = rb
+
+func block_root(block: Growing[usize]*, p: usize) -> usize:
+    var at = p
+    while block.items[at] != at: at = block.items[at]
+    return at
+
+## Whether final edge `e`'s middle is well clear of every surface of the
+## solid other than `solid` (B-spline surfaces: never assumed).
+func keeps_clear(work: const Work*, traced: const Shape*, e: usize, solid: usize) -> bool!:
+    let edge = traced.edges.items[e]
+    let middle = try traced.at(edge.carrier, (edge.t0 + edge.t1) * 0.5)
+    let w = &work.w
+    let first = work.faces_a if solid == 0 else 0
+    let last = w.faces.count if solid == 0 else work.faces_a
+    for f in first..<last:
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind == 3: return false
+        if surface_distance(s, middle) <= work.tol * 1000.0: return false
+    return true
+
+## How far `p` is from surface `s` (analytic).
+func surface_distance(s: const Surface*, p: Vector3) -> f64:
+    let d = p.subtract(s.origin)
+    if s.kind == 0: return math.abs(d.dot(s.z))
+    if s.kind == 4: return math.abs(d.length() - s.radius)
+    let h = d.dot(s.z)
+    let radial = math.sqrt(math.max(0.0, d.dot(d) - h * h))
+    if s.kind == 1: return math.abs(radial - s.radius)
+    if s.kind == 2:
+        # Across the cone's line: the radial gap, foreshortened.
+        return math.abs(radial - (s.radius + h * math.tan(s.angle))) * math.cos(s.angle)
+    let ring = radial - s.radius
+    return math.abs(math.sqrt(ring * ring + h * h) - s.angle)
 
 ## Piece `p` of face `f` against the other solid.
 func classify(work: Work*, traced: const Shape*, f: usize, pieces: const Pieces*, p: usize, others: Others*) -> i64!:
+    # A face whose box misses the other solid's lies outside it.
+    let other: usize = 1 if work.is_a(f) else 0
+    let pad = work.tol * 10.0
+    let l = others.lows.items[f]
+    let h = others.highs.items[f]
+    let ol = others.solid_low[other]
+    let oh = others.solid_high[other]
+    if l.x > oh.x + pad or l.y > oh.y + pad or l.z > oh.z + pad or ol.x > h.x + pad or ol.y > h.y + pad or ol.z > h.z + pad: return class_out
     let point = try piece_point(work, traced, f, pieces, p)
     for pair in work.coincident.view():
         let partner = pair.fb if pair.fa == f else (pair.fa if pair.fb == f else f)
         if partner == f: continue
         if try face_contains(&work.w, partner, point, work.tol) != outside:
             return class_same if pair.same else class_opposite
+    # Its block's, once known.
+    let block = block_root(&others.block, p)
+    if others.block_class.items[block] >= 0: return others.block_class.items[block]
+    let class = try ray_class(work, f, point, others)
+    others.block_class.items[block] = class
+    return class
+
+## Inside or outside the other solid at `point` (on face `f`), by rays.
+func ray_class(work: Work*, f: usize, point: Vector3, others: Others*) -> i64!:
     # The other solid's faces.
     let first = work.faces_a if work.is_a(f) else 0
     let last = work.w.faces.count if work.is_a(f) else work.faces_a
