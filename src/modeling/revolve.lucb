@@ -1,0 +1,140 @@
+## Revolution: each profile region turned a full turn about an axis in its
+## plane into a closed solid. Each profile edge sweeps a face and each vertex
+## a circle (none on the axis, where the vertex is a pole):
+##
+##   a line along the axis      a cylinder        a line across it  a plane
+##   a line at an angle         a cone            a line on it      nothing
+##   an arc centered on it      a sphere          an arc off it     a torus
+##
+## The profile edge itself is its face's seam, used both ways, as CadSolids'
+## cylinders, cones and tori have it; planes and sphere caps (which reach the
+## axis) need none. The profile must not cross the axis.
+
+## The profile's faces turned about the line through `origin` along `axis`
+## (unit, in the plane), into `b`.
+pub func revolve_into(b: BrepModel*, p: Profiles*, origin: Vector3, axis: Vector3, tol: f64) -> !:
+    # Turn the way that sweeps the profile's plane toward its normal at
+    # angle 0, so loops counterclockwise about the normal give outward faces.
+    var a = axis
+    var side = Vector3()
+    # Which side of the axis the profile is on: from its edges' middles
+    # (a half disc's vertices are all on the axis).
+    for e in p.edges.view():
+        let offset = (try p.edge_at(&e, 0.5)).subtract(origin)
+        let r = offset.subtract(axis.multiply_scalar(offset.dot(axis)))
+        if r.length() > tol * 10.0:
+            side = r
+            break
+    if side.length() == 0.0: error(invalid, "the profile lies on the axis")
+    if a.cross(side).dot(p.normal) < 0.0: a = axis.multiply_scalar(-1.0)
+    for e in p.edges.view():
+        let offset = e.start.subtract(origin)
+        let r = offset.subtract(axis.multiply_scalar(offset.dot(axis)))
+        if r.length() > tol * 10.0 and r.dot(side) < 0.0: error(invalid, "a revolved profile must lie on one side of its axis")
+    var edges = Growing[ProfileEdge]()
+    defer edges.close()
+    for region in 0..<p.region_count():
+        for loop in p.region(region):
+            # An arc from the axis back to it (a sphere's) is two halves,
+            # each a cap.
+            edges.clear()
+            for e in p.loop_edges(loop):
+                let ends_on_axis = axis_distance(e.start, origin, a).0 <= tol * 10.0 and axis_distance(e.end, origin, a).0 <= tol * 10.0
+                if e.kind == 1 and ends_on_axis:
+                    let middle = try p.edge_at(&e, 0.5)
+                    try edges.push(ProfileEdge(1, e.start, middle, e.center, e.radius, e.sweep * 0.5, -1))
+                    try edges.push(ProfileEdge(1, middle, e.end, e.center, e.radius, e.sweep * 0.5, -1))
+                else:
+                    try edges.push(e)
+            try revolve_loop(b, p, edges.view(), origin, a, tol)
+
+## How far `point` is from the axis, and where it projects onto it.
+func axis_distance(point: Vector3, origin: Vector3, a: Vector3) -> (f64, Vector3):
+    let foot = origin.add(a.multiply_scalar(point.subtract(origin).dot(a)))
+    return (point.subtract(foot).length(), foot)
+
+func revolve_loop(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[], origin: Vector3, a: Vector3, tol: f64) -> !:
+    let count = edges.length
+    # Vertex i (edge i's start), its circle (-1 on the axis), each edge's seam.
+    var vertices = Growing[i64]()
+    defer vertices.close()
+    var circles = Growing[i64]()
+    defer circles.close()
+    for at in 0..<count:
+        let point = edges[at].start
+        let v = try b.add_vertex(point)
+        try vertices.push(v)
+        let (r, foot) = axis_distance(point, origin, a)
+        if r <= tol * 10.0: try circles.push(-1)
+        else: try circles.push(try b.add_circle(v, v, foot, a, point.subtract(foot), r, true))
+    for at in 0..<count:
+        let next = (at + 1) % count
+        let e = &edges[at]
+        let c0 = circles.items[at]
+        let c1 = circles.items[next]
+        if c0 < 0 and c1 < 0 and e.kind == 0: continue
+        # The face's outward normal at the seam: right of the edge.
+        let middle = try p.edge_at(e, 0.5)
+        let tangent = try (try p.edge_at(e, 0.501)).subtract(try p.edge_at(e, 0.499)).normalized()
+        let outward = tangent.cross(p.normal)
+        let (surface, cap) = try swept_surface(b, p, e, origin, a, tol)
+        let sense = (try surface_normal_at(b, surface, middle)).dot(outward) > 0.0
+        var uses = Growing[i64]()
+        defer uses.close()
+        var sizes = Growing[i64]()
+        defer sizes.close()
+        if cap:
+            # A plane or a sphere cap: its circles, no seam; the larger first.
+            let r0 = axis_distance(e.start, origin, a).0
+            let r1 = axis_distance(e.end, origin, a).0
+            if c1 >= 0 and (c0 < 0 or r1 >= r0):
+                try uses.push(c1 + 1)
+                try sizes.push(1)
+                if c0 >= 0:
+                    try uses.push(-(c0 + 1))
+                    try sizes.push(1)
+            else:
+                try uses.push(-(c0 + 1))
+                try sizes.push(1)
+                if c1 >= 0:
+                    try uses.push(c1 + 1)
+                    try sizes.push(1)
+        else:
+            let seam = (try edge_curve(b, p, e, Vector3(), p.normal, vertices.items[at], vertices.items[next])) + 1
+            try uses.push(seam)
+            if c1 >= 0: try uses.push(c1 + 1)
+            try uses.push(-seam)
+            if c0 >= 0: try uses.push(-(c0 + 1))
+            try sizes.push((i64)uses.count)
+        _ = try b.add_face(surface, uses.view(), sizes.view(), sense)
+
+## The surface edge `e` sweeps about the axis, and whether its face is a cap
+## (a plane, or a sphere reaching the axis: bounded by circles alone).
+func swept_surface(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, origin: Vector3, a: Vector3, tol: f64) -> (i64, bool)!:
+    let (r0, f0) = axis_distance(e.start, origin, a)
+    let (r1, f1) = axis_distance(e.end, origin, a)
+    if e.kind == 0:
+        let h0 = e.start.subtract(origin).dot(a)
+        let h1 = e.end.subtract(origin).dot(a)
+        if math.abs(h1 - h0) <= tol:
+            return (try b.add_surface(0, e.start, a, e.start.subtract(f0) if r0 > tol else e.end.subtract(f1)), true)
+        if math.abs(r1 - r0) <= tol:
+            return (try b.add_surface(1, f0, a, e.start.subtract(f0), r0), false)
+        # A cone: its base where the edge is farther out, opening toward the other end.
+        let angle = math.atan((r1 - r0) / (h1 - h0))
+        if r0 >= r1: return (try b.add_surface(2, f0, a, e.start.subtract(f0), r0, angle), false)
+        return (try b.add_surface(2, f1, a, e.end.subtract(f1), r1, angle), false)
+    if e.kind == 1:
+        let (rc, fc) = axis_distance(e.center, origin, a)
+        if rc <= tol * 10.0:
+            let reference = e.start.subtract(f0) if r0 > tol else e.end.subtract(f1)
+            return (try b.add_surface(4, e.center, a, reference, e.radius), r0 <= tol * 10.0 or r1 <= tol * 10.0)
+        if e.radius >= rc: error(invalid, "an arc revolved about an axis it reaches past would make a torus through itself")
+        return (try b.add_surface(5, fc, a, e.center.subtract(fc), rc, e.radius), false)
+    error(invalid, "revolving splines is not supported yet")
+
+## Surface `s` of `b`'s unit normal at `p`.
+func surface_normal_at(b: const BrepModel*, s: i64, p: Vector3) -> Vector3!:
+    var record = try b.surface_record(s)
+    defer record.close()
+    return try surface_normal(&record, p)
