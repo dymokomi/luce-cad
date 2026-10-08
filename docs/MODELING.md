@@ -24,10 +24,10 @@ does today.
 | `tagged(model, tag)` | Unnamed faces named `tag/f<i>`, for bodies made without names, such as primitives. |
 | `prefixed(model, prefix)` | Every name with `prefix` in front, so a pattern's or mirror's copy is distinct. |
 
-`tag` names the feature (luced-3d passes the node). Edges may be outside (convex) or inside (concave)
-corners. Empty `references` mean every straight convex
-edge between two flat faces. Rims are blended only when referenced: a rim is a full circle between a
-flat face and a cylinder about it, such as a hole's rim or a boss's edge.
+`tag` names the feature (luced-3d passes the node). Edges may be outside (convex) or inside
+(concave) corners. Empty `references` mean every straight convex edge between two flat faces. Rims
+are blended only when referenced. A rim is a circle, or an arc of one, between a flat face and a
+cylinder or cone about it: a hole's rim, a boss's edge, a countersink's rim.
 
 ## Names
 
@@ -142,7 +142,8 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    - surfaces of revolution about one axis (cylinder, cone, sphere, torus): circles, where their
      radii agree along the axis.
 
-   Coincident surfaces are reported as such, facing the same way or opposite.
+   Coincident surfaces are reported as such, facing the same way or opposite: planes, cylinders,
+   spheres, cones and tori, each found twice.
 
    Planes within 1e-7 radians of parallel are treated as parallel: noise, not a crossing.
 
@@ -321,7 +322,8 @@ Roughly in order of usefulness:
 
 1. **Fillet corners beyond three edges,** and setback corners (an n-sided patch, Fusion's other
    corner type).
-2. **Blends on other curved edges:** a cone's rims, ellipses, and edges between two curved faces.
+2. **Blends on other curved edges:** a plane meeting a cylinder along its length, ellipses, and
+   edges between two curved faces.
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
    surfaces. That would also bring G2 and G3 corners and rims.
 4. **Sweep and loft;** tapered extrudes; Extrude "to object".
