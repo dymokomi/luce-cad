@@ -1,0 +1,261 @@
+## Where two analytic surfaces meet when no closed form does (cylinders at
+## an angle, cones at an angle, tori): marching, after OpenCASCADE's IntWalk
+## and SolveSpace's surfinter. Each surface is an implicit function f = 0;
+## a curve on both runs along the cross product of their gradients. Start
+## points are where one face's boundary or a grid over it crosses the other
+## surface; each is traced both ways (a step along the curve, then Newton
+## back onto both surfaces) until it leaves the faces' box or closes. Each
+## traced curve becomes a cubic B-spline through its points (all on both
+## surfaces), a carrier like any other.
+
+## Surface `s`'s implicit value at `p` (zero on it) and its gradient.
+func implicit(s: const Surface*, p: Vector3) -> (f64, Vector3)!:
+    let d = p.subtract(s.origin)
+    if s.kind == 0: return (d.dot(s.z), s.z)
+    if s.kind == 4: return (d.dot(d) - s.radius * s.radius, d.multiply_scalar(2.0))
+    let h = d.dot(s.z)
+    let q = d.subtract(s.z.multiply_scalar(h))
+    if s.kind == 1: return (q.dot(q) - s.radius * s.radius, q.multiply_scalar(2.0))
+    let length = math.max(q.length(), 1e-300)
+    if s.kind == 2:
+        let slope = math.tan(s.angle)
+        return (length - (s.radius + h * slope), q.multiply_scalar(1.0 / length).subtract(s.z.multiply_scalar(slope)))
+    if s.kind == 5:
+        let ring = s.origin.add(q.multiply_scalar(s.radius / length))
+        let offset = p.subtract(ring)
+        return (offset.dot(offset) - s.angle * s.angle, offset.multiply_scalar(2.0))
+    error(invalid, "marching on B-spline surfaces is not supported yet")
+
+## `p` moved onto both surfaces (Gauss-Newton, the least move), or none.
+func onto_both(s1: const Surface*, s2: const Surface*, start: Vector3, tol: f64) -> Vector3?!:
+    var p = start
+    for _ in 0..<50:
+        let (f1, g1) = try implicit(s1, p)
+        let (f2, g2) = try implicit(s2, p)
+        # Solve J J^T y = f for the 2x2, move by -J^T y.
+        let a11 = g1.dot(g1)
+        let a12 = g1.dot(g2)
+        let a22 = g2.dot(g2)
+        let det = a11 * a22 - a12 * a12
+        if math.abs(det) < 1e-300: return none
+        let y1 = (f1 * a22 - f2 * a12) / det
+        let y2 = (a11 * f2 - a12 * f1) / det
+        let delta = g1.multiply_scalar(y1).add(g2.multiply_scalar(y2))
+        p = p.subtract(delta)
+        if delta.length() <= tol * 1e-3: return p
+    let (f1, g1) = try implicit(s1, p)
+    let (f2, g2) = try implicit(s2, p)
+    if math.abs(f1) / math.max(g1.length(), 1e-300) <= tol and math.abs(f2) / math.max(g2.length(), 1e-300) <= tol: return p
+    return none
+
+## The curve's direction at `p`: across both gradients.
+func curve_direction(s1: const Surface*, s2: const Surface*, p: Vector3) -> Vector3?!:
+    let (_, g1) = try implicit(s1, p)
+    let (_, g2) = try implicit(s2, p)
+    let t = g1.cross(g2)
+    if t.length() < 1e-300: return none
+    return try t.normalized()
+
+func in_box(p: Vector3, low: Vector3, high: Vector3) -> bool:
+    return p.x >= low.x and p.y >= low.y and p.z >= low.z and p.x <= high.x and p.y <= high.y and p.z <= high.z
+
+## Trace from `seed` along `heading` (or against it) onto `out`: false when
+## it came back to its start (a closed curve).
+func trace(s1: const Surface*, s2: const Surface*, seed: Vector3, heading: Vector3, step: f64, low: Vector3, high: Vector3, tol: f64, out: Growing[Vector3]*) -> bool!:
+    var p = seed
+    var t = heading
+    for count in 0..<20000:
+        let guess = p.add(t.multiply_scalar(step))
+        let next = (try onto_both(s1, s2, guess, tol)) else return true
+        let direction = (try curve_direction(s1, s2, next)) else return true
+        try out.push(next)
+        if count > 3 and next.subtract(seed).length() < step * 0.75: return false
+        if not in_box(next, low, high): return true
+        t = direction if direction.dot(t) > 0.0 else direction.multiply_scalar(-1.0)
+        p = next
+    return true
+
+## Cubic B-spline through `points` (chord-length parameters, clamped ends,
+## knots by averaging; the Piegl-Tiller interpolation): its net and knots.
+func interpolate(points: const Vector3[], net: Growing[Vector3]*, knots: Growing[f64]*) -> !:
+    let n = points.length
+    if n < 4: error(invalid, "a traced curve needs more points")
+    var u = Growing[f64]()
+    defer u.close()
+    var total = 0.0
+    for at in 1..<n: total += points[at].subtract(points[at - 1]).length()
+    try u.push(0.0)
+    var run = 0.0
+    for at in 1..<n:
+        run += points[at].subtract(points[at - 1]).length()
+        try u.push(run / total)
+    knots.clear()
+    for _ in 0..<(usize)4: try knots.push(0.0)
+    for j in 1..<n - 3:
+        try knots.push((u.items[j] + u.items[j + 1] + u.items[j + 2]) / 3.0)
+    for _ in 0..<(usize)4: try knots.push(1.0)
+    # The banded system N P = Q, solved by Gaussian elimination on rows of
+    # four basis values (each row's nonzero span).
+    var rows = Growing[f64]()
+    defer rows.close()
+    var first = Growing[usize]()
+    defer first.close()
+    for k in 0..<n:
+        var values: f64[9]
+        let span = basis_at(knots.view(), n, u.items[k], &values)
+        try first.push(span - 3)
+        for c in 0..<(usize)4: try rows.push(values[c])
+    # Dense solve over a band of width 4: small enough (n under a few
+    # thousand) as forward elimination with the band.
+    var a = Growing[f64]()
+    defer a.close()
+    for _ in 0..<n * n: try a.push(0.0)
+    for k in 0..<n:
+        for c in 0..<(usize)4:
+            let column = first.items[k] + c
+            if column < n: a.items[k * n + column] = rows.items[k * 4 + c]
+    net.clear()
+    for p in points: try net.push(p)
+    for k in 0..<n:
+        # Pivot on the diagonal (the system is totally positive and banded).
+        let pivot = a.items[k * n + k]
+        if math.abs(pivot) < 1e-300: error(invalid, "a traced curve could not be fitted")
+        for r in k + 1..<lesser(n, k + 4):
+            let factor = a.items[r * n + k] / pivot
+            if factor == 0.0: continue
+            for c in k..<lesser(n, k + 4): a.items[r * n + c] -= factor * a.items[k * n + c]
+            net.items[r] = net.items[r].subtract(net.items[k].multiply_scalar(factor))
+    var k = n
+    while k > 0:
+        k -= 1
+        var value = net.items[k]
+        for c in k + 1..<lesser(n, k + 4): value = value.subtract(net.items[c].multiply_scalar(a.items[k * n + c]))
+        net.items[k] = value.multiply_scalar(1.0 / a.items[k * n + k])
+
+func lesser(a: usize, b: usize) -> usize:
+    return a if a < b else b
+
+## The cubic basis values at `t` (into values[0..4]) and the span index.
+func basis_at(knots: const f64[], count: usize, t: f64, values: f64[9]*) -> usize:
+    var span: usize = 3
+    while span + 1 < count and knots[span + 1] <= t: span += 1
+    # Cox-de Boor, degree 3.
+    var left: f64[4]
+    var right: f64[4]
+    (*values)[0] = 1.0
+    for j in 1..<(usize)4:
+        left[j] = t - knots[span + 1 - j]
+        right[j] = knots[span + j] - t
+        var saved = 0.0
+        for r in 0..<j:
+            let denominator = right[r + 1] + left[j - r]
+            let temp = 0.0 if denominator == 0.0 else (*values)[r] / denominator
+            (*values)[r] = saved + right[r + 1] * temp
+            saved = left[j - r] * temp
+        (*values)[j] = saved
+    return span
+
+## The curves where faces fa and fb of `w` meet, traced, as spline
+## carriers onto `out`; `low`..`high` bounds where both faces are.
+pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, size: f64, tol: f64, out: Growing[Carrier]*) -> !:
+    let s1 = &w.surfaces.items[(usize)w.faces.items[fa].surface]
+    let s2 = &w.surfaces.items[(usize)w.faces.items[fb].surface]
+    let step = size * 0.004
+    # Start points: sign changes of each surface's function along the
+    # other face's boundary and across a grid over it.
+    var seeds = Growing[Vector3]()
+    defer seeds.close()
+    try boundary_seeds(w, fa, s2, s1, tol, &seeds)
+    try boundary_seeds(w, fb, s1, s2, tol, &seeds)
+    try grid_seeds(w, fa, s2, s1, tol, &seeds)
+    try grid_seeds(w, fb, s1, s2, tol, &seeds)
+    var traced = Growing[Vector3]()
+    defer traced.close()
+    var back = Growing[Vector3]()
+    defer back.close()
+    var line = Growing[Vector3]()
+    defer line.close()
+    var net = Growing[Vector3]()
+    defer net.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    for seed in seeds.view():
+        # A seed on a curve already traced adds nothing.
+        var known = false
+        for p in traced.view():
+            if p.subtract(seed).length() < step * 2.0: known = true
+        if known: continue
+        let heading = (try curve_direction(s1, s2, seed)) else continue
+        line.clear()
+        back.clear()
+        try line.push(seed)
+        let open = try trace(s1, s2, seed, heading, step, low, high, tol, &line)
+        if open:
+            _ = try trace(s1, s2, seed, heading.multiply_scalar(-1.0), step, low, high, tol, &back)
+            # The backward run reversed, then the forward one.
+            var joined = Growing[Vector3]()
+            defer joined.close()
+            var at = back.count
+            while at > 0:
+                at -= 1
+                try joined.push(back.items[at])
+            for p in line.view(): try joined.push(p)
+            line.clear()
+            for p in joined.view(): try line.push(p)
+        else:
+            # Closed: end on the start exactly.
+            try line.push(seed)
+        if line.count < 4: continue
+        for p in line.view(): try traced.push(p)
+        try interpolate(line.view(), &net, &knots)
+        weights.clear()
+        for _ in net.view(): try weights.push(1.0)
+        let spline = try w.store_spline(net.view(), weights.view(), knots.view(), 3, Matrix4())
+        try out.push(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline))
+
+## Where `other`'s function changes sign along face `f`'s boundary (which
+## lies on `own`), refined onto both, onto `seeds`.
+func boundary_seeds(w: const Shape*, f: usize, other: const Surface*, own: const Surface*, tol: f64, seeds: Growing[Vector3]*) -> !:
+    for use in w.face_uses(f):
+        let e = (usize)(use - 1 if use > 0 else -use - 1)
+        let count = 128
+        var previous = (try implicit(other, try w.edge_at(e, 0.0))).0
+        for k in 1..<count + 1:
+            let fraction = (f64)k / (f64)count
+            let value = (try implicit(other, try w.edge_at(e, fraction))).0
+            if (previous <= 0.0) != (value <= 0.0):
+                var a = fraction - 1.0 / (f64)count
+                var b = fraction
+                for _ in 0..<60:
+                    let m = (a + b) * 0.5
+                    if ((try implicit(other, try w.edge_at(e, m))).0 <= 0.0) == (previous <= 0.0): a = m
+                    else: b = m
+                if let p = try onto_both(own, other, try w.edge_at(e, (a + b) * 0.5), tol): try seeds.push(p)
+            previous = value
+
+## Where `other`'s function changes sign between neighbours of a grid over
+## face `f`'s chart (closed curves inside it), onto `seeds`.
+func grid_seeds(w: const Shape*, f: usize, other: const Surface*, own: const Surface*, tol: f64, seeds: Growing[Vector3]*) -> !:
+    var chart = Growing[Vector3]()
+    defer chart.close()
+    var starts = Growing[usize]()
+    defer starts.close()
+    try face_chart(w, f, &chart, &starts)
+    var low = Vector3(1.0e300, 1.0e300, 0.0)
+    var high = Vector3(-1.0e300, -1.0e300, 0.0)
+    for q in chart.view():
+        low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), 0.0)
+        high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), 0.0)
+    let n = 32
+    for i in 0..<n + 1:
+        var previous = 0.0
+        for j in 0..<n + 1:
+            let u = low.x + (high.x - low.x) * (f64)i / (f64)n
+            let v = low.y + (high.y - low.y) * (f64)j / (f64)n
+            let p = surface_point(own, u, v)
+            let value = (try implicit(other, p)).0
+            if j > 0 and (previous <= 0.0) != (value <= 0.0):
+                if let q = try onto_both(own, other, p, tol): try seeds.push(q)
+            previous = value

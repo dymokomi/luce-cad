@@ -55,8 +55,9 @@ pub func modeling_tests() -> unit!:
     revolves()
     booleans()
     blends()
+    marched()
     slotted_block()
-    print("PASS modeling: sketch profiles extruded and revolved into closed solids; booleans (union, subtract, intersect) of boxes, cylinders and spheres with coplanar faces, holes across and at an angle, a cut sphere and a lens; chamfers and fillets of box edges, a slotted, drilled block chamfered; all closed and of the right volume")
+    print("PASS modeling: sketch profiles extruded and revolved into closed solids; booleans (union, subtract, intersect) of boxes, cylinders and spheres with coplanar faces, holes across and at an angle, a cut sphere and a lens; chamfers and fillets of box edges, a slotted, drilled block chamfered; cylinders crossing at right angles (traced); all closed and of the right volume")
 
 ## Booleans of solids, checked by volume: a box drilled through by a
 ## cylinder, two boxes overlapping (coplanar faces) joined and intersected.
@@ -119,6 +120,11 @@ func blends() -> unit!:
     _ = solid(CadModeling.chamfered(box, uprights, d), 10, 8.0 - 4.0 * d * d * 0.5 * 2.0, 0.002)
     let r = 0.3
     _ = solid(CadModeling.filleted(box, uprights, r), 10, 8.0 - 8.0 * (r * r - math.pi * r * r * 0.25), 0.01)
+    # Fillets meeting at a corner: refused, clearly.
+    var cornered = false
+    _ = CadModeling.filleted(box, [], r) catch failure:
+        cornered = failure.message.contains("corner")
+    assert(cornered)
     # Each corner is where three chamfer planes meet (mitered).
     _ = solid(CadModeling.chamfered(box, [], d), 18, 8.0 - 6.0 * 2.0 * d * d + 6.0 * d * d * d, 0.002)
 
@@ -149,3 +155,24 @@ func revolves() -> unit!:
     _ = solid(CadModeling.revolved(ring, 0), 1, 2.0 * math.pi * math.pi * 2.0 * 0.25, 0.05)
     let half = Sketches.with_shape(Sketches.with_shape(empty, 2, [1.0, 0.0, 180.0], 0.0, 0.0), 0, [2.0], 0.0, 0.0)
     _ = solid(CadModeling.revolved(half, 0), 2, 4.0 / 3.0 * math.pi, 0.05)
+
+## Where no closed form meets: cylinders crossing at right angles (a cross
+## of pipes, and one drilled across another) traced and fitted.
+func marched() -> unit!:
+    let upright = CadSolids.cylinder(0.5, 3.0)
+    let lying = CadSolids.cylinder(0.3, 3.0).transformed(Vector3(), Vector3(math.pi * 0.5, 0.0, 0.0), Vector3(1.0, 1.0, 1.0))
+    # The union and the intersection together hold both parts' volumes.
+    let both = CadModeling.combined(upright, lying, 0)
+    let shared = CadModeling.combined(upright, lying, 2)
+    let a = math.pi * 0.25 * 3.0
+    let b = math.pi * 0.09 * 3.0
+    let joined = solid(both, both.face_count(), 0.0, 1000.0)
+    let common = solid(shared, shared.face_count(), 0.0, 1000.0)
+    let total = volume(joined) + volume(common)
+    if math.abs(total - (a + b)) > 0.02: print(f"union + intersection {total}, parts {a + b}")
+    assert(math.abs(total - (a + b)) < 0.02)
+    # The shared part of a rod through a thicker post: less than the rod
+    # across the post's width, more than the square in the rod's section
+    # along the shortest chord through the post.
+    assert(volume(common) < math.pi * 0.09 * 1.0 and volume(common) > 0.18 * 0.8)
+    _ = solid(CadModeling.combined(upright, lying, 1), CadModeling.combined(upright, lying, 1).face_count(), a - volume(common), 0.02)

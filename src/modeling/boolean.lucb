@@ -219,7 +219,18 @@ func intersect_faces(work: Work*) -> !:
             let sa = w.faces.items[fa]
             let sb = w.faces.items[fb]
             curves.clear()
-            let met = try meet(&w.surfaces.items[(usize)sa.surface], &w.surfaces.items[(usize)sb.surface], work.tol, &curves)
+            var met = try meet(&w.surfaces.items[(usize)sa.surface], &w.surfaces.items[(usize)sb.surface], work.tol, &curves)
+            if met == meet_march:
+                # Where both faces are, a little more.
+                let pad = Vector3(work.size * 0.01, work.size * 0.01, work.size * 0.01)
+                let la = lows.items[fa]
+                let lb = lows.items[fb]
+                let ha = highs.items[fa]
+                let hb = highs.items[fb]
+                let box_low = Vector3(math.max(la.x, lb.x), math.max(la.y, lb.y), math.max(la.z, lb.z)).subtract(pad)
+                let box_high = Vector3(math.min(ha.x, hb.x), math.min(ha.y, hb.y), math.min(ha.z, hb.z)).add(pad)
+                try marched(w, fa, fb, box_low, box_high, work.size, work.tol, &curves)
+                met = meet_curves
             if met != meet_curves:
                 let same = (met == meet_same) == (sa.sense == sb.sense)
                 try work.coincident.push(Coincident(fa, fb, same))
@@ -230,7 +241,12 @@ func intersect_faces(work: Work*) -> !:
                 let c = try w.add_carrier(carrier)
                 var lowest = 0.0
                 var highest = 2.0 * math.pi
-                let closed = carrier.kind != 0
+                var closed = carrier.kind != 0
+                if carrier.kind == 2:
+                    # A traced curve: its knots' range; closed when it ends
+                    # where it starts.
+                    highest = 1.0
+                    closed = (try w.at(c, 0.0)).subtract(try w.at(c, 1.0)).length() <= work.tol * 10.0
                 if not closed:
                     # The line across the two faces' boxes, and a margin.
                     lowest = 1.0e300
@@ -269,17 +285,23 @@ func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: co
     if closed:
         if bounds.count > 1 and (try w.at(c, bounds.items[0])).subtract(try w.at(c, bounds.items[bounds.count - 1])).length() <= work.tol * 10.0:
             bounds.count -= 1
-        if bounds.count == 0: try bounds.push(try seam_parameter(work, c, fa, fb))
-        try bounds.push(bounds.items[0] + 2.0 * math.pi)
+        if bounds.count == 0: try bounds.push(low if w.carriers.items[(usize)c].kind == 2 else try seam_parameter(work, c, fa, fb))
+        try bounds.push(bounds.items[0] + (high - low))
     let count = bounds.count
     if count < 2: return
     for at in 0..<count - 1:
         let t0 = bounds.items[at]
         let t1 = bounds.items[at + 1]
-        let middle = try w.at(c, (t0 + t1) * 0.5)
+        var halfway = (t0 + t1) * 0.5
+        if halfway > high and w.carriers.items[(usize)c].kind == 2: halfway -= high - low
+        let middle = try w.at(c, halfway)
         let ia = try face_contains(w, fa, middle, work.tol)
         let ib = try face_contains(w, fb, middle, work.tol)
         if ia == outside or ib == outside or (ia == on_boundary and ib == on_boundary): continue
+        # A closed traced curve's stretch may run past its end: wrap it.
+        if t1 > high and w.carriers.items[(usize)c].kind == 2:
+            try add_wrapped(work, c, t0, t1, low, high, fa, fb)
+            continue
         # Along a boundary edge of one face: that edge, cut at the stretch's
         # ends, lies across the other face (no second edge on the same line).
         if ia == on_boundary or ib == on_boundary:
@@ -304,8 +326,16 @@ func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: co
         # once around is its own loop).
         if start == end and not (closed and count == 2): continue
         try work.sections.push(Section(ShapeEdge(c, t0, t1, start, end), (i64)fa, (i64)fb))
-    _ = low
-    _ = high
+
+## A stretch of closed traced curve `c` (parameters low..high) from t0
+## past its end to t1: two sections meeting at its ends' vertex.
+func add_wrapped(work: Work*, c: i64, t0: f64, t1: f64, low: f64, high: f64, fa: usize, fb: usize) -> !:
+    let w = &work.w
+    let start = try work.vertex(try w.at(c, t0))
+    let seam = try work.vertex(try w.at(c, high))
+    let end = try work.vertex(try w.at(c, t1 - (high - low)))
+    if start != seam: try work.sections.push(Section(ShapeEdge(c, t0, high, start, seam), (i64)fa, (i64)fb))
+    if seam != end: try work.sections.push(Section(ShapeEdge(c, low, t1 - (high - low), seam, end), (i64)fa, (i64)fb))
 
 ## Face `onto` and coincident face `source`: where `source`'s boundary
 ## crosses `onto`'s, both cut; `source`'s boundary inside `onto` imprints it.

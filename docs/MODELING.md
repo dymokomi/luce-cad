@@ -13,7 +13,8 @@ does today.
 
 | `CadModeling.` | What it does |
 |---|---|
-| `extruded(set, distance)` | The sketch's closed curves in `set`, as profile regions, each swept `distance` along the plane's normal. |
+| `extruded(set, distance, start)` | The sketch's closed curves in `set`, as profile regions, each swept `distance` along the plane's normal from `start` along it. |
+| `revolved(set, axis)` | Each region turned a full turn about the plane's u (`0`) or v (`1`) axis. |
 | `profile_count(set)` | How many regions the sketch has. |
 | `combined(a, b, operation)` | `0` union, `1` `a` without `b`, `2` intersection. |
 | `chamfered(model, edges, distance)` | Edges chamfered `distance` along each face. |
@@ -67,6 +68,13 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    - sphere/sphere: a circle.
 
    Coincident surfaces are reported as such, facing the same way or opposite.
+
+   Analytic pairs the table doesn't cover are traced (`march.lucb`). This covers cylinders at an
+   angle, cones at an angle and tori. Each surface is an implicit function, and a curve on both runs
+   along the cross product of their gradients. Start points are where one face's boundary, or a grid
+   over the face, crosses the other surface. Each start is traced both ways: a step along the curve,
+   then Newton back onto both surfaces. Each traced curve becomes an interpolating cubic B-spline
+   through points exactly on both surfaces.
 3. **Clipping to faces.** Each curve is clipped to both faces (`clip.lucb`). Its crossings with
    either face's boundary are found on samples, then refined by Newton steps on the exact curves.
    Those crossings cut the curve and the boundary edges. The stretches inside both faces become new
@@ -118,16 +126,16 @@ Fusion's setback triangle is not made.
 
 Roughly in order of usefulness:
 
-1. **Fillets meeting at a corner.** Two fillet cylinders meeting at an angle need cylinder/cylinder
-   intersection, which is a marching case. A sphere patch at a three-edge corner would follow the
-   KPart table.
+1. **Fillets meeting at a corner.** These are refused today. Two fillet cylinders of one radius
+   whose axes meet intersect in a doubly singular way (the curves cross where the gradients are
+   parallel), which tracing can't follow. Fusion avoids this with a corner patch: a sphere where
+   three fillets meet (KPart's `Rotule`), with each edge's tool stopping at the corner.
 2. **Blends on curved edges.**
    - A circle between a plane and a cylinder (a hole's rim) chamfers to a cone and fillets to a
      torus. Booleans would then need cylinder/cone, plane/torus and cylinder/torus.
-3. **General surface intersection.** Marching with start points from boundary crossings or a mesh
-   pre-pass, as truck does. That gives cylinders at any angle, cones at an angle, tori and
-   B-spline sides.
-4. **Revolve, sweep, loft;** two-sided and tapered extrudes; Extrude "to object".
+3. **B-spline surfaces in booleans.** Swept spline sides need marching on parametric surfaces.
+   Tangent intersections between curved faces need care as well.
+4. **Partial revolves,** sweep and loft; tapered extrudes; Extrude "to object".
 5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
 6. **Persistent naming.** Each operation would record which faces and edges it made from which.
    Downstream edge references would then survive upstream edits; today they are B-rep numbers. See
