@@ -5,6 +5,7 @@ from luce_geocore.geocore import Vector3
 from brep_types import Curve, BrepFace
 from curve_spacing import ArcMetric
 from patch_sides import edge_index
+from layout_cell_error import turn_sag
 
 ## A four-coedge band's opposite repeated seam does not transport its interval
 ## family into a neighboring chart. Irregular trims and externally shared edges
@@ -50,10 +51,23 @@ pub func curve_intervals(edge: Curve, divisions: i64, tolerance: f64, metric: Ar
         previous = p
     let chord = math.max(tolerance, length / ((f64)divisions * (f64)divisions * 16.0))
     let cosine = math.cos(0.75 * 2.0 * math.pi / (4.0 * (f64)divisions))
+    # An interval may also sag as an arc turning a quarter turn's
+    # 1/divisions does (as arcs are sampled), so a short curve is no finer
+    # than an arc of its curvature.
+    let sag = turn_sag(divisions)
     var count: usize = 1
     var lower: usize = 0
+    # A B-spline: at least an interval per knot span, so five probes never
+    # alias across many polynomial pieces (the sag allowance trusts the
+    # turn the probes see).
+    if edge.kind == 2:
+        let least = math.min((f64)knot_spans(edge.knots, edge.degree), (f64)(divisions * 4))
+        while (f64)count < least: count *= 2
+        if count > (usize)(divisions * 4): count = (usize)(divisions * 4)
+        lower = (usize)math.max(0.0, least - 1.0)
+        if lower >= count: lower = count - 1
     while true:
-        if try acceptable(edge, metric, count, chord, cosine, tolerance):
+        if try acceptable(edge, metric, count, chord, cosine, tolerance, sag):
             if not compact: return count
             # Doubling brackets a passing density; it does not mean the upper
             # power of two is required. Keep a passing upper bound while
@@ -61,7 +75,7 @@ pub func curve_intervals(edge: Curve, divisions: i64, tolerance: f64, metric: Ar
             # sample phase; no monotonicity or certified global minimum is claimed.
             while count > lower + 1:
                 let middle = (lower + count) // 2
-                if try acceptable(edge, metric, middle, chord, cosine, tolerance): count = middle
+                if try acceptable(edge, metric, middle, chord, cosine, tolerance, sag): count = middle
                 else: lower = middle
             return count
         # Sharp knots cannot meet an angular target under uniform refinement.
@@ -84,7 +98,15 @@ pub func curve_intervals(edge: Curve, divisions: i64, tolerance: f64, metric: Ar
         lower = count
         count = (usize)math.min((f64)(count * 2), (f64)(divisions * 4))
 
-func acceptable(edge: Curve, metric: ArcMetric*, count: usize, chord: f64, cosine: f64, tolerance: f64) -> bool!:
+## How many knot spans of nonzero length a B-spline's domain has.
+func knot_spans(knots: const f64[], degree: i64) -> usize:
+    var spans: usize = 0
+    let last = knots.length - (usize)degree - 1
+    for at in (usize)degree..<last:
+        if knots[at + 1] > knots[at]: spans += 1
+    return spans
+
+func acceptable(edge: Curve, metric: ArcMetric*, count: usize, chord: f64, cosine: f64, tolerance: f64, sag: f64) -> bool!:
     for interval in 0..<count:
         var p = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
         let ta = metric.station((f64)interval / (f64)count)
@@ -93,7 +115,7 @@ func acceptable(edge: Curve, metric: ArcMetric*, count: usize, chord: f64, cosin
         let span = p[4].subtract(p[0])
         for at in 1..<(usize)4:
             let t = math.clamp(p[at].subtract(p[0]).dot(span) / span.dot(span), 0.0, 1.0) if span.dot(span) > 1e-30 else 0.0
-            if p[at].subtract(p[0].add(span.multiply_scalar(t))).length() > chord: return false
+            if p[at].subtract(p[0].add(span.multiply_scalar(t))).length() > math.max(chord, span.length() * sag): return false
         for a in 0..<(usize)4:
             for b in a + 1..<(usize)4:
                 let da = p[a + 1].subtract(p[a])
