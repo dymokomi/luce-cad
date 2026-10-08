@@ -303,7 +303,7 @@ func joint(a: const Carrier*, b: const Carrier*) -> (f64, f64):
 pub func move_entities(sketch: Sketch*, entities: const i64[], dx: f64, dy: f64, copy: bool, out: Growing[i64]*) -> !:
     var points = Growing[i64]()
     defer points.close()
-    for e in entities: try points_of(sketch, e, &points)
+    for e in entities: try gather_points(sketch, e, &points)
     if not copy:
         for p in points.view():
             sketch.place(p, sketch.x(p) + dx, sketch.y(p) + dy)
@@ -326,7 +326,7 @@ pub func mirror_entities(sketch: Sketch*, entities: const i64[], axis: i64, out:
     var points = Growing[i64]()
     defer points.close()
     for e in entities:
-        if e != axis: try points_of(sketch, e, &points)
+        if e != axis: try gather_points(sketch, e, &points)
     var copies = Growing[i64]()
     defer copies.close()
     for p in points.view():
@@ -369,7 +369,7 @@ pub func pattern_along(sketch: Sketch*, entities: const i64[], dx: f64, dy: f64,
 func copy_placed(sketch: Sketch*, entities: const i64[], cx: f64, cy: f64, c: f64, s: f64, tx: f64, ty: f64, out: Growing[i64]*) -> !:
     var points = Growing[i64]()
     defer points.close()
-    for e in entities: try points_of(sketch, e, &points)
+    for e in entities: try gather_points(sketch, e, &points)
     var copies = Growing[i64]()
     defer copies.close()
     for p in points.view():
@@ -385,12 +385,13 @@ pub func scale_entities(sketch: Sketch*, entities: const i64[], cx: f64, cy: f64
     if not (factor > 0.0): error(invalid, "a scale needs a positive factor")
     var points = Growing[i64]()
     defer points.close()
-    for e in entities: try points_of(sketch, e, &points)
+    for e in entities: try gather_points(sketch, e, &points)
     for p in points.view():
         sketch.place(p, cx + (sketch.x(p) - cx) * factor, cy + (sketch.y(p) - cy) * factor)
     for e in entities:
         let k = sketch.entity(e).kind
-        if k == EntityKind.circle or k == EntityKind.arc:
+        # Radii scale; a conic's rho is a ratio and stays.
+        if k == EntityKind.circle or k == EntityKind.arc or k == EntityKind.ellipse:
             sketch.params.items[(usize)sketch.entity(e).second] *= factor
     # Dimensions of what scaled scale with it.
     for at in 0..<sketch.constraints.count:
@@ -404,7 +405,8 @@ pub func scale_entities(sketch: Sketch*, entities: const i64[], cx: f64, cy: f64
 ## Every place other curves cross or touch curve `curve`, sorted.
 func crossings(sketch: const Sketch*, curve: i64, out: Growing[Crossing]*) -> !:
     for other in 0..<(i64)sketch.entities.count:
-        if other == curve or sketch.entity(other).kind == EntityKind.point: continue
+        # Only lines, circles and arcs cross here.
+        if other == curve or (u8)sketch.entity(other).kind < 1 or (u8)sketch.entity(other).kind > 3: continue
         try meet(sketch, curve, other, false, out)
     # Places sorted, near repeats once.
     for i in 1..<out.count:
@@ -427,6 +429,7 @@ func crossings(sketch: const Sketch*, curve: i64, out: Growing[Crossing]*) -> !:
 func meet(sketch: const Sketch*, curve: i64, other: i64, beyond: bool, out: Growing[Crossing]*) -> !:
     let a = sketch.entity(curve)
     let b = sketch.entity(other)
+    if (u8)a.kind > 3 or (u8)b.kind > 3 or a.kind == EntityKind.point or b.kind == EntityKind.point: return
     let size = size_of(sketch)
     let tolerance = 1e-9 * size
     var hits = Growing[f64]()
@@ -649,26 +652,33 @@ func chain_closed(sketch: const Sketch*, curves: const i64[]) -> bool!:
     let end = last.second if last.kind == EntityKind.line else last.fourth
     return start == end or math.hypot(sketch.x(start) - sketch.x(end), sketch.y(start) - sketch.y(end)) <= 1e-9 * size_of(sketch)
 
-## The points of entity `e` onto `out` (each once).
-func points_of(sketch: const Sketch*, e: i64, out: Growing[i64]*) -> !:
+## The points of entity `e` added to `out` (each once).
+func gather_points(sketch: const Sketch*, e: i64, out: Growing[i64]*) -> !:
     let x = sketch.entity(e)
     if x.kind == EntityKind.point:
         try add_once(out, e)
         return
-    try add_once(out, x.first)
-    if x.kind == EntityKind.line: try add_once(out, x.second)
-    if x.kind == EntityKind.arc:
-        try add_once(out, x.third)
-        try add_once(out, x.fourth)
+    var own = Growing[i64]()
+    defer own.close()
+    try sketch.points_of(x, &own)
+    for p in own.view(): try add_once(out, p)
 
 ## A copy of entity `e` on the copied points (`points`' copies in
 ## `copies`), or -1 for a point (copied already).
 func copied(sketch: Sketch*, e: i64, points: const Growing[i64]*, copies: const Growing[i64]*) -> i64!:
     let x = sketch.entity(e)
     if x.kind == EntityKind.point: return copies.items[index_in(points, e)]
+    if x.kind == EntityKind.spline:
+        var own = Growing[i64]()
+        defer own.close()
+        try sketch.points_of(x, &own)
+        for at in 0..<own.count: own.items[at] = copies.items[index_in(points, own.items[at])]
+        return try sketch.add_spline(own.view(), x.fourth != 0, x.third, x.construction)
     let first = copies.items[index_in(points, x.first)]
     if x.kind == EntityKind.line: return try sketch.add_line(first, copies.items[index_in(points, x.second)], x.construction)
     if x.kind == EntityKind.circle: return try sketch.add_circle(first, sketch.radius_of(e), x.construction)
+    if x.kind == EntityKind.ellipse: return try sketch.add_ellipse(first, copies.items[index_in(points, x.third)], sketch.radius_of(e), x.construction)
+    if x.kind == EntityKind.conic: return try sketch.add_conic(first, copies.items[index_in(points, x.third)], copies.items[index_in(points, x.fourth)], sketch.radius_of(e), x.construction)
     return try sketch.add_arc(first, copies.items[index_in(points, x.third)], copies.items[index_in(points, x.fourth)], x.construction)
 
 func index_in(values: const Growing[i64]*, value: i64) -> usize:
@@ -692,7 +702,7 @@ func touches(sketch: const Sketch*, entities: const i64[], at: i64) -> bool:
     var points = Growing[i64]()
     defer points.close()
     for e in entities:
-        points_of(sketch, e, &points) catch failure:
+        gather_points(sketch, e, &points) catch failure:
             return false
     for p in points.view():
         if p == at: return true
@@ -701,6 +711,8 @@ func touches(sketch: const Sketch*, entities: const i64[], at: i64) -> bool:
 func require_curve(sketch: const Sketch*, curve: i64) -> !:
     if curve < 0 or curve >= (i64)sketch.entities.count or sketch.entity(curve).kind == EntityKind.point:
         error(invalid, "this works on a sketch's curves")
+    if (u8)sketch.entity(curve).kind > 3:
+        error(invalid, "this works on lines, circles and arcs (a spline, ellipse or conic goes whole with Delete)")
 
 ## A line's start and direction.
 func line_of(sketch: const Sketch*, e: SketchEntity) -> (f64, f64, f64, f64):

@@ -6,6 +6,10 @@
 ##   l <start> <end> [c]              a line between two points
 ##   o <center> <radius> [c]          a circle
 ##   a <center> <start> <end> <radius> [c]   an arc
+##   s <fit> <degree> <point>… [c]    a spline on its points (`fit` 1: through
+##                                    them, 0: its control net)
+##   e <center> <major> <minor> [c]   an ellipse
+##   n <start> <end> <apex> <rho> [c] a conic
 ##   k <kind> <first> <second> <third> <value> <side> [d]
 ##                                    a constraint; `d`: driven
 ##
@@ -27,6 +31,22 @@ pub func write_sketch(sketch: const Sketch*, out: Growing[u8]*) -> !:
         elif e.kind == EntityKind.circle:
             try put_text(out, "o")
             try put_index(out, e.first)
+            try put_number(out, sketch.params.items[(usize)e.second])
+        elif e.kind == EntityKind.spline:
+            try put_text(out, "s")
+            try put_index(out, e.fourth)
+            try put_index(out, e.third)
+            for at in 0..<e.second: try put_index(out, sketch.spline_point(e, at))
+        elif e.kind == EntityKind.ellipse:
+            try put_text(out, "e")
+            try put_index(out, e.first)
+            try put_index(out, e.third)
+            try put_number(out, sketch.params.items[(usize)e.second])
+        elif e.kind == EntityKind.conic:
+            try put_text(out, "n")
+            try put_index(out, e.first)
+            try put_index(out, e.third)
+            try put_index(out, e.fourth)
             try put_number(out, sketch.params.items[(usize)e.second])
         else:
             try put_text(out, "a")
@@ -51,7 +71,9 @@ pub func write_sketch(sketch: const Sketch*, out: Growing[u8]*) -> !:
 pub func read_sketch(text: str) -> Sketch!:
     var s = new_sketch()
     errdefer s.close()
-    var fields: str[8] = ["", "", "", "", "", "", "", ""]
+    # A spline's line: its tag, two numbers, up to 256 points and a mark.
+    var fields: str[260] = ---
+    for at in 0..<(usize)260: fields[at] = ""
     var start: usize = 0
     var checked = false
     let bytes = text.bytes
@@ -76,6 +98,18 @@ pub func read_sketch(text: str) -> Sketch!:
             let r = (i64)s.params.count
             try s.params.push(try strings.parse_f64(fields[4]))
             _ = try s.add(SketchEntity(EntityKind.arc, try whole(fields[1]), r, try whole(fields[2]), try whole(fields[3]), marked))
+        elif tag == "s" and given >= 5:
+            let listed = (i64)s.lists.count
+            for at in 3..<given: try s.lists.push(try whole(fields[at]))
+            _ = try s.add(SketchEntity(EntityKind.spline, listed, (i64)(given - 3), try whole(fields[2]), try whole(fields[1]), marked))
+        elif tag == "e" and given == 4:
+            let r = (i64)s.params.count
+            try s.params.push(try strings.parse_f64(fields[3]))
+            _ = try s.add(SketchEntity(EntityKind.ellipse, try whole(fields[1]), r, try whole(fields[2]), -1, marked))
+        elif tag == "n" and given == 5:
+            let r = (i64)s.params.count
+            try s.params.push(try strings.parse_f64(fields[4]))
+            _ = try s.add(SketchEntity(EntityKind.conic, try whole(fields[1]), r, try whole(fields[2]), try whole(fields[3]), marked))
         elif tag == "k" and given == 7:
             if not checked:
                 try check_entities(&s)
@@ -89,32 +123,29 @@ pub func read_sketch(text: str) -> Sketch!:
 
 ## Every curve read draws on points of the sketch (a curve may name points
 ## after it: a trimmed or filleted line's new end), a line's two apart, an
-## arc's center and ends apart.
+## arc's center and ends apart, a spline's degree 1..5.
 func check_entities(s: const Sketch*) -> !:
     let count = (i64)s.entities.count
+    var points = Growing[i64]()
+    defer points.close()
     for e in s.entities.view():
         if e.kind == EntityKind.point: continue
-        # A line's two points; a circle's center (twice); an arc's center
-        # and ends.
-        var named: i64[3] = [e.first, e.first, e.first]
-        if e.kind == EntityKind.line: named[1] = e.second
-        if e.kind == EntityKind.arc:
-            named[1] = e.third
-            named[2] = e.fourth
-        for p in named:
+        if e.kind == EntityKind.spline and (e.second < 2 or e.third < 1 or e.third > 5): error(invalid, "a sketch spline needs 2 points or more and a degree of 1 to 5")
+        try s.points_of(e, &points)
+        for p in points.view():
             if p < 0 or p >= count or s.entities.items[(usize)p].kind != EntityKind.point:
                 error(invalid, "a sketch curve names a point the sketch does not have")
         if e.kind == EntityKind.line and e.first == e.second: error(invalid, "a sketch line needs two different points")
         if e.kind == EntityKind.arc and (e.first == e.third or e.first == e.fourth or e.third == e.fourth): error(invalid, "a sketch arc needs a center and two different ends")
 
 ## The names of ConstraintKind's values, in order.
-func kind_names() -> str[20]:
+func kind_names() -> str[21]:
     return ["coincident", "on_curve", "horizontal", "vertical", "parallel", "perpendicular", "tangent", "equal", "fix", "midpoint",
-            "concentric", "collinear", "symmetric", "distance", "line_distance", "horizontal_distance", "vertical_distance", "angle", "radius", "diameter"]
+            "concentric", "collinear", "symmetric", "distance", "line_distance", "horizontal_distance", "vertical_distance", "angle", "radius", "diameter", "curvature"]
 
 func kind_named(name: str) -> ConstraintKind!:
     let names = kind_names()
-    for at in 0..<(usize)20:
+    for at in 0..<(usize)21:
         if names[at] == name: return ConstraintKind((u8)at)
     error(invalid, "a sketch constraint has a kind it does not know")
 

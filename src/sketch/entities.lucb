@@ -6,10 +6,16 @@
 ## is a center point and a radius parameter; an arc is a center point, a
 ## radius parameter and real start and end points, which two of the
 ## solver's rows keep on its circle (it sweeps counterclockwise from start
-## to end). Endpoints are points of their own, so a coincidence between two
-## curves' ends is between two points, and the solver merges their
-## parameters (substitution.lucb). Construction entities are solved like
-## any other but make no profile curves.
+## to end). A spline is drawn on a list of points (`lists`): its control
+## points, or the points it passes through (fit points), degree 5 (fewer
+## points, lower). An ellipse is a center point, a point at the end of its
+## major axis and a minor radius parameter. A conic is a start, an end and
+## an apex point (where its end tangents meet) and its rho parameter (0.5 a
+## parabola, less an ellipse's arc, more a hyperbola's). Endpoints are
+## points of their own, so a coincidence between two curves' ends is
+## between two points, and the solver merges their parameters
+## (substitution.lucb). Construction entities are solved like any other but
+## make no profile curves. shapes.lucb gives the new curves as NURBS.
 ## (docs/research/SKETCH-SOLVER-STUDY.md §7 has the design.)
 import interop
 import strings
@@ -25,6 +31,9 @@ pub enum EntityKind as u8:
     line = 1
     circle = 2
     arc = 3
+    spline = 4
+    ellipse = 5
+    conic = 6
 
 ## What a constraint holds `first`, `second` and `third` to, and what its
 ## `value` and `side` mean. The relations of equal or fixed parameters
@@ -43,6 +52,8 @@ pub enum ConstraintKind as u8:
     ## Line or arc `first` touching circle or arc `second` (or two circles),
     ## on side `side` (+1 or -1: for a line, the side of it the center is
     ## on; for two circles, outside or inside), kept from when it was made.
+    ## A control point spline's or a conic's end (`first`; `side` +1 its
+    ## start, -1 its end) along line, circle or arc `second`.
     tangent = 6
     ## Lines of equal length, or circles and arcs of equal radius.
     equal = 7
@@ -68,15 +79,25 @@ pub enum ConstraintKind as u8:
     angle = 17
     radius = 18
     diameter = 19
+    ## Control point spline `first`'s end (`side` +1 its start, -1 its end)
+    ## as curved as line, circle or arc `second` where they meet: curvature
+    ## continuity (G2), tangent too. `value` is the sign the curvature
+    ## turns with, kept from when it was made.
+    curvature = 20
 
 pub struct SketchEntity:
     pub var kind: EntityKind
     ## A point: its x parameter (y is the next). A line: its start point.
-    ## A circle or an arc: its center point.
+    ## A circle, arc or ellipse: its center point. A spline: where its
+    ## points start in `lists`. A conic: its start point.
     pub var first: i64
-    ## A line: its end point. A circle or an arc: its radius parameter.
+    ## A line: its end point. A circle or an arc: its radius parameter; an
+    ## ellipse its minor radius, a conic its rho. A spline: how many
+    ## points it has.
     pub var second: i64
-    ## An arc: its start and end points.
+    ## An arc: its start and end points. An ellipse: its major axis point.
+    ## A conic: its end and apex points. A spline: its degree (most), and 1
+    ## when it passes through its points, 0 when they are its control net.
     pub var third: i64
     pub var fourth: i64
     pub var construction: bool
@@ -98,11 +119,14 @@ pub struct Sketch:
     pub var params: Growing[f64]
     pub var entities: Growing[SketchEntity]
     pub var constraints: Growing[SketchConstraint]
+    ## The splines' points, each spline's a run of point entities.
+    pub var lists: Growing[i64]
 
     pub func close():
         self.params.close()
         self.entities.close()
         self.constraints.close()
+        self.lists.close()
 
     ## A new point at (`x`, `y`).
     pub func add_point(x: f64, y: f64, construction: bool = false) -> i64!:
@@ -138,6 +162,64 @@ pub struct Sketch:
         let r = (i64)self.params.count
         try self.params.push(radius)
         return try self.add(SketchEntity(EntityKind.arc, center, r, start, end, construction))
+
+    ## A spline drawn on `points` (2 to 256 point entities): through them
+    ## (`fit`), or on them as its control net; of degree `degree` (1..5),
+    ## less when there are fewer points.
+    pub func add_spline(points: const i64[], fit: bool, degree: i64 = 5, construction: bool = false) -> i64!:
+        if points.length < 2 or points.length > 256: error(invalid, "a spline needs 2 to 256 points")
+        if degree < 1 or degree > 5: error(invalid, "a spline's degree is 1 to 5")
+        for p in points: try self.require(p, EntityKind.point)
+        let start = (i64)self.lists.count
+        for p in points: try self.lists.push(p)
+        return try self.add(SketchEntity(EntityKind.spline, start, (i64)points.length, degree, 1 if fit else 0, construction))
+
+    ## An ellipse about point `center`, its major axis out to point `major`,
+    ## its minor radius `minor` (at most the major's).
+    pub func add_ellipse(center: i64, major: i64, minor: f64, construction: bool = false) -> i64!:
+        try self.require(center, EntityKind.point)
+        try self.require(major, EntityKind.point)
+        if center == major or not (minor > 0.0): error(invalid, "an ellipse needs a major axis and a positive minor radius")
+        let r = (i64)self.params.count
+        try self.params.push(minor)
+        return try self.add(SketchEntity(EntityKind.ellipse, center, r, major, -1, construction))
+
+    ## A conic from point `start` to point `end`, its end tangents meeting
+    ## at point `apex`, of `rho` (between 0 and 1).
+    pub func add_conic(start: i64, end: i64, apex: i64, rho: f64, construction: bool = false) -> i64!:
+        for p in [start, end, apex]: try self.require(p, EntityKind.point)
+        if start == end or start == apex or end == apex: error(invalid, "a conic needs three different points")
+        if not (rho > 0.0 and rho < 1.0): error(invalid, "a conic's rho is between 0 and 1")
+        let r = (i64)self.params.count
+        try self.params.push(rho)
+        return try self.add(SketchEntity(EntityKind.conic, start, r, end, apex, construction))
+
+    ## The point entities curve `e` is drawn on, in order (a spline's
+    ## list; an arc's center, start and end; a conic's start, end, apex).
+    pub func points_of(e: SketchEntity, out: Growing[i64]*) -> !:
+        out.clear()
+        if e.kind == EntityKind.point: return
+        if e.kind == EntityKind.spline:
+            for at in 0..<(usize)e.second: try out.push(self.lists.items[(usize)e.first + at])
+            return
+        if e.kind == EntityKind.conic:
+            try out.push(e.first)
+            try out.push(e.third)
+            try out.push(e.fourth)
+            return
+        try out.push(e.first)
+        if e.kind == EntityKind.line: try out.push(e.second)
+        if e.kind == EntityKind.arc or e.kind == EntityKind.ellipse: try out.push(e.third)
+        if e.kind == EntityKind.arc: try out.push(e.fourth)
+
+    ## Curve `e`'s own parameter (a radius, a minor radius, a rho), or -1.
+    pub func scalar_of(e: SketchEntity) -> i64:
+        if e.kind == EntityKind.circle or e.kind == EntityKind.arc or e.kind == EntityKind.ellipse or e.kind == EntityKind.conic: return e.second
+        return -1
+
+    ## Point `at` of spline `spline` (its list's).
+    pub func spline_point(spline: SketchEntity, at: i64) -> i64:
+        return self.lists.items[(usize)(spline.first + at)]
 
     ## A constraint; its index.
     pub func constrain(kind: ConstraintKind, first: i64, second: i64 = -1, third: i64 = -1, value: f64 = 0.0, side: f64 = 1.0, driven: bool = false) -> i64!:
@@ -176,18 +258,22 @@ pub struct Sketch:
         defer gone.close()
         try gone.fill(self.entities.count, false)
         gone.items[(usize)at] = true
+        var points = Growing[i64]()
+        defer points.close()
         # A removed point takes the curves on it.
         for index in 0..<self.entities.count:
             let e = self.entities.items[index]
             if e.kind == EntityKind.point: continue
-            if self.marked(gone.view(), e): gone.items[index] = true
+            try self.points_of(e, &points)
+            for p in points.view():
+                if gone.items[(usize)p]: gone.items[index] = true
         # A removed curve's points go unless a kept curve uses them.
         for index in 0..<self.entities.count:
             let e = self.entities.items[index]
             if not gone.items[index] or e.kind == EntityKind.point: continue
-            for point in [e.first, e.second, e.third, e.fourth]:
-                if point < 0 or self.entities.items[(usize)point].kind != EntityKind.point: continue
-                if not self.used_by_kept(point, gone.view()): gone.items[(usize)point] = true
+            try self.points_of(e, &points)
+            for p in points.view():
+                if not (try self.used_by_kept(p, gone.view())): gone.items[(usize)p] = true
         try self.compact(gone.view())
 
     ## Remove constraint `at`.
@@ -197,28 +283,27 @@ pub struct Sketch:
             self.constraints.items[index] = self.constraints.items[index + 1]
         self.constraints.count -= 1
 
-    ## Whether curve `e` is drawn on a point in `gone`.
-    func marked(gone: const bool[], e: SketchEntity) -> bool:
-        for point in [e.first, e.third, e.fourth]:
-            if point >= 0 and gone[(usize)point]: return true
-        return e.kind == EntityKind.line and gone[(usize)e.second]
-
     ## Whether a curve not in `gone` uses point `point`.
-    func used_by_kept(point: i64, gone: const bool[]) -> bool:
+    func used_by_kept(point: i64, gone: const bool[]) -> bool!:
+        var points = Growing[i64]()
+        defer points.close()
         for index in 0..<self.entities.count:
             let e = self.entities.items[index]
             if gone[index] or e.kind == EntityKind.point: continue
-            if e.first == point or e.third == point or e.fourth == point: return true
-            if e.kind == EntityKind.line and e.second == point: return true
+            try self.points_of(e, &points)
+            for p in points.view():
+                if p == point: return true
         return false
 
-    ## Keep the entities not in `gone` (with their parameters) and the
-    ## constraints on them, renumbered.
+    ## Keep the entities not in `gone` (with their parameters and point
+    ## lists) and the constraints on them, renumbered.
     func compact(gone: const bool[]) -> !:
         var renumbered = Growing[i64]()
         defer renumbered.close()
         var params = Growing[f64]()
         errdefer params.close()
+        var lists = Growing[i64]()
+        errdefer lists.close()
         var kept = Growing[SketchEntity]()
         errdefer kept.close()
         for index in 0..<self.entities.count:
@@ -232,6 +317,10 @@ pub struct Sketch:
                 try params.push(self.params.items[(usize)e.first])
                 try params.push(self.params.items[(usize)e.first + 1])
                 e.first = x
+            elif e.kind == EntityKind.spline:
+                let start = (i64)lists.count
+                for at in 0..<e.second: try lists.push(renumbered.items[(usize)self.spline_point(e, at)])
+                e.first = start
             else:
                 e.first = renumbered.items[(usize)e.first]
                 if e.kind == EntityKind.line:
@@ -240,9 +329,8 @@ pub struct Sketch:
                     let r = (i64)params.count
                     try params.push(self.params.items[(usize)e.second])
                     e.second = r
-                    if e.kind == EntityKind.arc:
-                        e.third = renumbered.items[(usize)e.third]
-                        e.fourth = renumbered.items[(usize)e.fourth]
+                    if e.third >= 0: e.third = renumbered.items[(usize)e.third]
+                    if e.fourth >= 0: e.fourth = renumbered.items[(usize)e.fourth]
             try kept.push(e)
         var constraints = Growing[SketchConstraint]()
         errdefer constraints.close()
@@ -260,6 +348,7 @@ pub struct Sketch:
         self.params = params
         self.entities = kept
         self.constraints = constraints
+        self.lists = lists
 
     ## Whether constraint `kind` joins entities `first`, `second` and
     ## `third` of their kinds.
@@ -273,12 +362,19 @@ pub struct Sketch:
         let rb = b == 2 or b == 3
         if kind == ConstraintKind.coincident or kind == ConstraintKind.distance or kind == ConstraintKind.horizontal_distance or kind == ConstraintKind.vertical_distance:
             return a == point and b == point and third < 0
-        if kind == ConstraintKind.on_curve: return a == point and b != point and second >= 0 and third < 0
+        # A point on a line, circle, arc or ellipse.
+        if kind == ConstraintKind.on_curve: return a == point and (b == line or rb or b == 5) and third < 0
         if kind == ConstraintKind.horizontal or kind == ConstraintKind.vertical:
             return (a == line and second < 0) or (a == point and b == point and third < 0)
         if kind == ConstraintKind.parallel or kind == ConstraintKind.perpendicular or kind == ConstraintKind.angle or kind == ConstraintKind.collinear:
             return a == line and b == line and third < 0
-        if kind == ConstraintKind.tangent: return ((a == line and rb) or (ra and (b == line or rb))) and third < 0
+        # A control point spline or a conic touching (a spline: curving
+        # like) another curve at its end.
+        let ended = (a == 4 and self.entities.items[(usize)first].fourth == 0) or a == 6
+        if kind == ConstraintKind.tangent:
+            if ended: return (b == line or (rb and a == 4)) and third < 0
+            return ((a == line and rb) or (ra and (b == line or rb))) and third < 0
+        if kind == ConstraintKind.curvature: return a == 4 and ended and (b == line or rb) and third < 0
         if kind == ConstraintKind.equal: return ((a == line and b == line) or (ra and rb)) and third < 0
         if kind == ConstraintKind.fix: return first >= 0 and second < 0
         if kind == ConstraintKind.midpoint or kind == ConstraintKind.line_distance: return a == point and b == line and third < 0
@@ -305,4 +401,4 @@ pub struct Sketch:
 
 ## An empty sketch.
 pub func new_sketch() -> Sketch:
-    return Sketch(Growing[f64](), Growing[SketchEntity](), Growing[SketchConstraint]())
+    return Sketch(Growing[f64](), Growing[SketchEntity](), Growing[SketchConstraint](), Growing[i64]())

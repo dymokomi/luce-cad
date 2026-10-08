@@ -1,0 +1,248 @@
+## The sketch's free-form curves as NURBS on its plane's coordinates
+## (sketch x and y): a control point spline its own net with clamped
+## uniform knots; a fit point spline the net that passes through its points
+## (global interpolation, chord-length parameters and averaged knots: The
+## NURBS Book, §9.2.1); an ellipse three rational quadratic arcs of a
+## circle mapped onto it (NURBS keep an affine map); a conic one rational
+## quadratic span, the apex weighted rho / (1 - rho). curves.lucb puts the
+## nets on the plane; the editor's drawing and picking sample them.
+
+## A NURBS curve: control points (`xs`, `ys`), weights, knots and degree.
+pub struct Net:
+    pub var xs: Growing[f64]
+    pub var ys: Growing[f64]
+    pub var ws: Growing[f64]
+    pub var knots: Growing[f64]
+    pub var degree: i64
+
+    pub func close():
+        self.xs.close()
+        self.ys.close()
+        self.ws.close()
+        self.knots.close()
+
+    pub func count() -> usize:
+        return self.xs.count
+
+    func clear():
+        self.xs.clear()
+        self.ys.clear()
+        self.ws.clear()
+        self.knots.clear()
+
+    func push(x: f64, y: f64, w: f64 = 1.0) -> !:
+        try self.xs.push(x)
+        try self.ys.push(y)
+        try self.ws.push(w)
+
+    ## The parameter range: from the first to the last of its spans.
+    pub func range() -> (f64, f64):
+        return (self.knots.items[(usize)self.degree], self.knots.items[self.xs.count])
+
+    ## The point at parameter `t` (clamped to the range).
+    pub func at(t: f64) -> (f64, f64):
+        let (low, high) = self.range()
+        let u = math.max(low, math.min(high, t))
+        let p = (usize)self.degree
+        let span = find_span(self.knots.view(), self.xs.count, p, u)
+        var basis: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        basis_at(self.knots.view(), span, u, p, basis[0..])
+        var x = 0.0
+        var y = 0.0
+        var w = 0.0
+        for j in 0..<p + 1:
+            let i = span - p + j
+            let weighted = basis[j] * self.ws.items[i]
+            x += weighted * self.xs.items[i]
+            y += weighted * self.ys.items[i]
+            w += weighted
+        return (x / w, y / w)
+
+    ## `count` + 1 points along it, evenly in its parameter, onto `out` as
+    ## x, y pairs.
+    pub func sample(count: usize, out: Growing[f64]*) -> !:
+        out.clear()
+        let (low, high) = self.range()
+        for at in 0..<count + 1:
+            let (x, y) = self.at(low + (high - low) * (f64)at / (f64)count)
+            try out.push(x)
+            try out.push(y)
+
+## Spline `e`'s degree: its own, or one less than its points when fewer.
+pub func spline_degree(e: SketchEntity) -> i64:
+    return e.third if e.third < e.second - 1 else e.second - 1
+
+pub func new_net() -> Net:
+    return Net(Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64](), 0)
+
+## Spline, ellipse or conic `e` of `sketch` as a NURBS onto `out`.
+pub func net_of(sketch: const Sketch*, e: SketchEntity, out: Net*) -> !:
+    out.clear()
+    if e.kind == EntityKind.spline:
+        if e.fourth != 0:
+            try fit_net(sketch, e, out)
+            return
+        let n = e.second
+        out.degree = spline_degree(e)
+        for at in 0..<n:
+            let point = sketch.spline_point(e, at)
+            try out.push(sketch.x(point), sketch.y(point))
+        try clamped_knots(n, out.degree, &out.knots)
+    elif e.kind == EntityKind.ellipse:
+        try ellipse_net(sketch, e, out)
+    elif e.kind == EntityKind.conic:
+        let rho = sketch.params.items[(usize)e.second]
+        out.degree = 2
+        try out.push(sketch.x(e.first), sketch.y(e.first))
+        try out.push(sketch.x(e.fourth), sketch.y(e.fourth), rho / (1.0 - rho))
+        try out.push(sketch.x(e.third), sketch.y(e.third))
+        for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]: try out.knots.push(k)
+    else:
+        error(invalid, "only splines, ellipses and conics are nets")
+
+## The curvature factor of a clamped uniform control point spline of `n`
+## points and degree `p` at its ends: there its curvature is the factor
+## times cross(P1 - P0, P2 - P1) / |P1 - P0|³ (its first span is 1 long,
+## its second 2, or 1 when there is only one).
+pub func end_curvature_factor(n: i64, p: i64) -> f64:
+    if p < 2: return 0.0
+    let second = 1.0 if n - p <= 1 else 2.0
+    return ((f64)(p - 1) / (f64)p) / second
+
+## Knots for `n` control points of degree `p`, clamped at both ends, the
+## spans between them 1 apart.
+func clamped_knots(n: i64, p: i64, out: Growing[f64]*) -> !:
+    out.clear()
+    for at in 0..<p + 1: try out.push(0.0)
+    for at in 1..<n - p: try out.push((f64)at)
+    for at in 0..<p + 1: try out.push((f64)(n - p))
+
+## A fit point spline's net: degree p = min(degree, n - 1) through its n
+## points, at their chord-length parameters, the knots averaged from them.
+func fit_net(sketch: const Sketch*, e: SketchEntity, out: Net*) -> !:
+    let n = (usize)e.second
+    let p = (usize)spline_degree(e)
+    out.degree = (i64)p
+    var params = Growing[f64]()
+    defer params.close()
+    var total = 0.0
+    try params.push(0.0)
+    for at in 1..<n:
+        let a = sketch.spline_point(e, (i64)at - 1)
+        let b = sketch.spline_point(e, (i64)at)
+        total += math.hypot(sketch.x(b) - sketch.x(a), sketch.y(b) - sketch.y(a))
+        try params.push(total)
+    for at in 0..<n: params.items[at] = params.items[at] / total if total > 0.0 else (f64)at / (f64)(n - 1)
+    for at in 0..<p + 1: try out.knots.push(0.0)
+    for j in 1..<n - p:
+        var sum = 0.0
+        for i in j..<j + p: sum += params.items[i]
+        try out.knots.push(sum / (f64)p)
+    for at in 0..<p + 1: try out.knots.push(1.0)
+    # N(params) P = Q, solved for x and y together.
+    let a = try new f64[n * n] --- in memory.heap
+    defer free(a) in memory.heap
+    let bx = try new f64[n] --- in memory.heap
+    defer free(bx) in memory.heap
+    let by = try new f64[n] --- in memory.heap
+    defer free(by) in memory.heap
+    for at in 0..<n * n: a[at] = 0.0
+    var basis: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    for k in 0..<n:
+        let u = params.items[k]
+        let span = find_span(out.knots.view(), n, p, u)
+        basis_at(out.knots.view(), span, u, p, basis[0..])
+        for j in 0..<p + 1: a[k * n + span - p + j] = basis[j]
+        let point = sketch.spline_point(e, (i64)k)
+        bx[k] = sketch.x(point)
+        by[k] = sketch.y(point)
+    if not solve_two(a, n, bx, by): error(invalid, "a fit point spline's points cannot be passed through (two at one place?)")
+    for at in 0..<n: try out.push(bx[at], by[at])
+
+## An ellipse as three rational quadratic arcs of 120 degrees, a circle's
+## (as curves.lucb's arcs) mapped onto it.
+func ellipse_net(sketch: const Sketch*, e: SketchEntity, out: Net*) -> !:
+    let cx = sketch.x(e.first)
+    let cy = sketch.y(e.first)
+    let dx = sketch.x(e.third) - cx
+    let dy = sketch.y(e.third) - cy
+    let a = math.max(math.hypot(dx, dy), 1e-300)
+    let b = sketch.params.items[(usize)e.second]
+    let ux = dx / a
+    let uy = dy / a
+    out.degree = 2
+    let step = 2.0 * math.pi / 3.0
+    let middle = 1.0 / math.cos(step * 0.5)
+    for arc in 0..<(usize)3:
+        let angle = step * (f64)arc
+        for (reach, turn, weight) in [(1.0, 0.0, 1.0), (middle, step * 0.5, math.cos(step * 0.5))]:
+            let ex = reach * math.cos(angle + turn) * a
+            let ey = reach * math.sin(angle + turn) * b
+            try out.push(cx + ex * ux - ey * uy, cy + ex * uy + ey * ux, weight)
+    try out.push(cx + a * ux, cy + a * uy)
+    for k in [0.0, 0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 3.0]: try out.knots.push(k)
+
+## The knot span holding `u` for `n` control points of degree `p`.
+func find_span(knots: const f64[], n: usize, p: usize, u: f64) -> usize:
+    if u >= knots[n]: return n - 1
+    var low = p
+    var high = n
+    while high - low > 1:
+        let middle = (low + high) // 2
+        if u < knots[middle]: high = middle
+        else: low = middle
+    return low
+
+## The p + 1 basis functions not zero at `u` in span `span`, onto `out`
+## (The NURBS Book, A2.2).
+func basis_at(knots: const f64[], span: usize, u: f64, p: usize, out: f64[]):
+    var left: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    var right: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    out[0] = 1.0
+    for j in 1..<p + 1:
+        left[j] = u - knots[span + 1 - j]
+        right[j] = knots[span + j] - u
+        var saved = 0.0
+        for r in 0..<j:
+            let denominator = right[r + 1] + left[j - r]
+            let temporary = out[r] / denominator if denominator != 0.0 else 0.0
+            out[r] = saved + right[r + 1] * temporary
+            saved = left[j - r] * temporary
+        out[j] = saved
+
+## Solve the `n` by `n` system `a` for right-hand sides `x` and `y` in
+## place (Gaussian elimination with partial pivoting); false when singular.
+func solve_two(a: f64[], n: usize, x: f64[], y: f64[]) -> bool:
+    for column in 0..<n:
+        var best = column
+        for line in column + 1..<n:
+            if math.abs(a[line * n + column]) > math.abs(a[best * n + column]): best = line
+        if math.abs(a[best * n + column]) < 1e-14: return false
+        if best != column:
+            for k in 0..<n:
+                let swap = a[column * n + k]
+                a[column * n + k] = a[best * n + k]
+                a[best * n + k] = swap
+            let sx = x[column]
+            x[column] = x[best]
+            x[best] = sx
+            let sy = y[column]
+            y[column] = y[best]
+            y[best] = sy
+        for line in column + 1..<n:
+            let factor = a[line * n + column] / a[column * n + column]
+            if factor == 0.0: continue
+            for k in column..<n: a[line * n + k] -= factor * a[column * n + k]
+            x[line] -= factor * x[column]
+            y[line] -= factor * y[column]
+    var line = n
+    while line > 0:
+        line -= 1
+        var sx = x[line]
+        var sy = y[line]
+        for k in line + 1..<n:
+            sx -= a[line * n + k] * x[k]
+            sy -= a[line * n + k] * y[k]
+        x[line] = sx / a[line * n + line]
+        y[line] = sy / a[line * n + line]
+    return true

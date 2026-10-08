@@ -1,0 +1,145 @@
+## The sketch's free-form curves (sketch/shapes.lucb): a control point
+## spline from its first point to its last, a fit point spline through its
+## points, an ellipse's samples on it, a rho 0.5 conic a parabola; their
+## text read back; Curvature holding a spline's end as curved as an arc,
+## Tangent along a line, a point solved onto an ellipse; removing a
+## spline's point takes the spline and its points.
+from luce_std import math
+from luce_geocore.geocore import invalid
+from luce_geocore.core.growing import Growing
+from sketch import Sketch, Net, new_sketch, solve_sketch, ConstraintKind, EntityKind, write_sketch, read_sketch, new_net, net_of, end_curvature_factor, spline_degree
+
+pub func sketch_shapes_contracts() -> !:
+    try nets()
+    try constraints()
+    try removal()
+
+func nets() -> !:
+    var s = new_sketch()
+    defer s.close()
+    var points = Growing[i64]()
+    defer points.close()
+    for (x, y) in [(0.0, 0.0), (10.0, 5.0), (20.0, -5.0), (30.0, 5.0), (40.0, 0.0), (50.0, 3.0)]:
+        try points.push(try s.add_point(x, y))
+    let control = try s.add_spline(points.view(), false)
+    var net = new_net()
+    defer net.close()
+    try net_of(&s, s.entity(control), &net)
+    if net.degree != 5 or net.count() != 6: error(invalid, "six control points do not make a quintic")
+    let (low, high) = net.range()
+    try at_point(&net, low, 0.0, 0.0)
+    try at_point(&net, high, 50.0, 3.0)
+    # Through four points: at each point's chord-length parameter.
+    let fit = try s.add_spline(points.view()[..<4], true)
+    try net_of(&s, s.entity(fit), &net)
+    if net.degree != 3: error(invalid, "four fit points do not make a cubic")
+    var total = 0.0
+    var lengths: f64[4] = [0.0, 0.0, 0.0, 0.0]
+    for at in 1..<(usize)4:
+        total += math.hypot(s.x(points.items[at]) - s.x(points.items[at - 1]), s.y(points.items[at]) - s.y(points.items[at - 1]))
+        lengths[at] = total
+    for at in 0..<(usize)4:
+        try at_point(&net, lengths[at] / total, s.x(points.items[at]), s.y(points.items[at]))
+    # An ellipse about (5, 5), its major axis 4 along x, minor 2.
+    let ellipse = try s.add_ellipse(try s.add_point(5.0, 5.0), try s.add_point(9.0, 5.0), 2.0)
+    try net_of(&s, s.entity(ellipse), &net)
+    var samples = Growing[f64]()
+    defer samples.close()
+    try net.sample(60, &samples)
+    for k in 0..<samples.count // 2:
+        let x = (samples.items[2 * k] - 5.0) / 4.0
+        let y = (samples.items[2 * k + 1] - 5.0) / 2.0
+        try near(x * x + y * y, 1.0)
+    # A parabola (rho 0.5): its middle a quarter of the way to the apex.
+    let conic = try s.add_conic(try s.add_point(0.0, 0.0), try s.add_point(10.0, 0.0), try s.add_point(5.0, 10.0), 0.5)
+    try net_of(&s, s.entity(conic), &net)
+    try at_point(&net, 0.5, 5.0, 5.0)
+    # Their text reads back the same.
+    var text = Growing[u8]()
+    defer text.close()
+    try write_sketch(&s, &text)
+    var back = try read_sketch((str)text.view())
+    defer back.close()
+    var again = Growing[u8]()
+    defer again.close()
+    try write_sketch(&back, &again)
+    if (str)text.view() != (str)again.view(): error(invalid, "free-form curves do not read back from their text")
+
+## A spline starting at an arc's end, held as curved as it; a spline's end
+## along a line; a point onto an ellipse.
+func constraints() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let center = try s.add_point(0.0, 0.0)
+    let start = try s.add_point(10.0, 0.0)
+    let end = try s.add_point(0.0, 10.0)
+    let arc = try s.add_arc(center, start, end)
+    _ = try s.constrain(ConstraintKind.fix, arc)
+    var points = Growing[i64]()
+    defer points.close()
+    try points.push(end)
+    for (x, y) in [(-3.0, 11.0), (-6.0, 11.0), (-10.0, 9.0), (-14.0, 9.0)]:
+        try points.push(try s.add_point(x, y))
+    let spline = try s.add_spline(points.view(), false)
+    # The arc turns counterclockwise (positive curvature) leaving its end
+    # toward -x: the spline carries on the same way.
+    _ = try s.constrain(ConstraintKind.curvature, spline, arc, value = 1.0, side = 1.0)
+    let solved = try solve_sketch(&s)
+    if not solved.converged: error(invalid, "a spline curving with an arc does not solve")
+    let e = s.entity(spline)
+    let p0 = s.spline_point(e, 0)
+    let p1 = s.spline_point(e, 1)
+    let p2 = s.spline_point(e, 2)
+    let d1x = s.x(p1) - s.x(p0)
+    let d1y = s.y(p1) - s.y(p0)
+    try near((d1x * s.x(p0) + d1y * s.y(p0)) / math.hypot(d1x, d1y), 0.0)
+    let cross = d1x * (s.y(p2) - s.y(p1)) - d1y * (s.x(p2) - s.x(p1))
+    let length = math.hypot(d1x, d1y)
+    try near(end_curvature_factor(e.second, spline_degree(e)) * cross / (length * length * length), 0.1)
+    # Along a line: its last control point's direction.
+    let line = try s.add_line(try s.add_point(-20.0, -5.0), try s.add_point(-10.0, -5.0))
+    _ = try s.constrain(ConstraintKind.tangent, spline, line, side = -1.0)
+    if not (try solve_sketch(&s)).converged: error(invalid, "a spline's end along a line does not solve")
+    let n = e.second
+    try near(s.y(s.spline_point(e, n - 1)) - s.y(s.spline_point(e, n - 2)), 0.0)
+    # A point onto an ellipse.
+    let ellipse = try s.add_ellipse(try s.add_point(40.0, 0.0), try s.add_point(46.0, 0.0), 3.0)
+    let loose = try s.add_point(45.0, 4.0)
+    _ = try s.constrain(ConstraintKind.on_curve, loose, ellipse)
+    if not (try solve_sketch(&s)).converged: error(invalid, "a point onto an ellipse does not solve")
+    # (The ellipse moves too: least motion.)
+    let o = s.entity(ellipse)
+    let ux = s.x(o.third) - s.x(o.first)
+    let uy = s.y(o.third) - s.y(o.first)
+    let a = math.hypot(ux, uy)
+    let wx = s.x(loose) - s.x(o.first)
+    let wy = s.y(loose) - s.y(o.first)
+    let x = (wx * ux + wy * uy) / (a * a)
+    let y = (ux * wy - uy * wx) / (a * s.radius_of(ellipse))
+    try near(x * x + y * y, 1.0)
+
+## Removing a spline's point takes the spline; what is left reads back.
+func removal() -> !:
+    var s = new_sketch()
+    defer s.close()
+    var points = Growing[i64]()
+    defer points.close()
+    for at in 0..<(usize)4: try points.push(try s.add_point((f64)at, (f64)(at % 2)))
+    let line = try s.add_line(try s.add_point(0.0, 5.0), try s.add_point(5.0, 5.0))
+    _ = try s.add_spline(points.view(), true)
+    try s.remove(points.items[2])
+    for e in s.entities.view():
+        if e.kind == EntityKind.spline: error(invalid, "a spline without one of its points stays")
+    # Its other points went with it (nothing else used them): the line's
+    # two points and the line are left.
+    _ = line
+    if s.entities.count != 3 or s.entity(2).kind != EntityKind.line or s.lists.count != 0: error(invalid, "removing a spline's point renumbers badly")
+
+func at_point(net: const Net*, t: f64, x: f64, y: f64) -> !:
+    let (px, py) = net.at(t)
+    if math.hypot(px - x, py - y) > 1e-7 * math.max(1.0, math.hypot(x, y)):
+        error(invalid, "a net is not where it should be")
+
+func near(value: f64, expected: f64) -> !:
+    if math.abs(value - expected) > 1e-6 * math.max(1.0, math.abs(expected)):
+        error(invalid, "a solved free-form curve is not where it should be")

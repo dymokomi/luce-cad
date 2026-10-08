@@ -38,10 +38,12 @@ pub struct CadSketch:
     pub func constraint_count() -> i64:
         return (i64)self.sketch.constraints.count
 
-    ## Entity `at`: its kind (0 point, 1 line, 2 circle, 3 arc), whether it
-    ## is construction, and its parts: a line's start and end points; a
-    ## circle's or arc's center point (`part` 0), an arc's start (1) and end
-    ## (2) points.
+    ## Entity `at`: its kind (0 point, 1 line, 2 circle, 3 arc, 4 spline,
+    ## 5 ellipse, 6 conic), whether it is construction, and its parts: a
+    ## line's start and end points; a circle's or arc's center point (`part`
+    ## 0), an arc's start (1) and end (2) points; an ellipse's center and
+    ## major axis point; a conic's start, end and apex; a spline's points in
+    ## order (`part_count` of them).
     pub func kind(at: i64) -> i64:
         return (i64)(u8)self.sketch.entity(at).kind
 
@@ -50,11 +52,52 @@ pub struct CadSketch:
 
     pub func part(at: i64, which: i64) -> i64:
         let e = self.sketch.entity(at)
+        if e.kind == EntityKind.spline: return self.sketch.spline_point(e, which)
         if which == 0: return e.first
         if e.kind == EntityKind.line: return e.second
         return e.third if which == 1 else e.fourth
 
-    ## Point `point`'s coordinates; circle or arc `curve`'s radius.
+    ## How many parts entity `at` has (a spline's points).
+    pub func part_count(at: i64) -> i64:
+        let e = self.sketch.entity(at)
+        if e.kind == EntityKind.spline: return e.second
+        if e.kind == EntityKind.point: return 0
+        if e.kind == EntityKind.circle: return 1
+        return 3 if e.kind == EntityKind.arc or e.kind == EntityKind.conic else 2
+
+    ## Whether spline `at` passes through its points (else they are its
+    ## control net).
+    pub func fit(at: i64) -> bool:
+        return self.sketch.entity(at).fourth != 0
+
+    ## Which end of spline or conic `curve` is nearer curve `other`: +1
+    ## its start, -1 its end (what Tangent and Curvature hold).
+    pub func end_nearest(curve: i64, other: i64) -> f64:
+        let e = self.sketch.entity(curve)
+        let (start, _, _) = curve_end_points(&self.sketch, e, 1.0)
+        let (end, _, _) = curve_end_points(&self.sketch, e, -1.0)
+        let o = self.sketch.entity(other)
+        let from_start = distance_to(&self.sketch, o, other, self.sketch.x(start), self.sketch.y(start))
+        let from_end = distance_to(&self.sketch, o, other, self.sketch.x(end), self.sketch.y(end))
+        return 1.0 if from_start <= from_end else -1.0
+
+    ## The way control point spline `curve`'s end `side` turns to curve as
+    ## circle or arc `other` does (Curvature's sign): +1 counterclockwise,
+    ## -1 clockwise. Leaving an arc from its end it turns the arc's way
+    ## (+1), from its start the other (-1); otherwise as it turns now.
+    pub func curvature_turn(curve: i64, side: f64, other: i64) -> f64:
+        let e = self.sketch.entity(curve)
+        let (p0, p1, p2) = curve_end_points(&self.sketch, e, side)
+        let o = self.sketch.entity(other)
+        if o.kind == EntityKind.arc:
+            if p0 == o.fourth: return 1.0
+            if p0 == o.third: return -1.0
+        if p2 < 0: return 1.0
+        let cross = (self.sketch.x(p1) - self.sketch.x(p0)) * (self.sketch.y(p2) - self.sketch.y(p1)) - (self.sketch.y(p1) - self.sketch.y(p0)) * (self.sketch.x(p2) - self.sketch.x(p1))
+        return 1.0 if cross >= 0.0 else -1.0
+
+    ## Point `point`'s coordinates; circle or arc `curve`'s radius (an
+    ## ellipse's minor radius, a conic's rho).
     pub func x(point: i64) -> f64:
         return self.sketch.x(point)
 
@@ -62,7 +105,8 @@ pub struct CadSketch:
         return self.sketch.y(point)
 
     pub func radius(curve: i64) -> f64:
-        return self.sketch.radius_of(curve)
+        let scalar = self.sketch.scalar_of(self.sketch.entity(curve))
+        return self.sketch.params.items[(usize)scalar] if scalar >= 0 else 0.0
 
     ## Constraint `at`: its kind (ConstraintKind's order), entities, value
     ## and whether it is driven.
@@ -95,12 +139,33 @@ pub struct CadSketch:
         self.forget()
         return try self.sketch.add_arc(center, start, end, construction)
 
+    ## A spline on `points`: through them (`fit`) or on them as its control
+    ## net, of degree 5 (less with fewer points).
+    pub func add_spline(points: const i64[], fit: bool, degree: i64 = 5, construction: bool = false) -> i64!:
+        self.forget()
+        return try self.sketch.add_spline(points, fit, degree, construction)
+
+    pub func add_ellipse(center: i64, major: i64, minor: f64, construction: bool = false) -> i64!:
+        self.forget()
+        return try self.sketch.add_ellipse(center, major, minor, construction)
+
+    pub func add_conic(start: i64, end: i64, apex: i64, rho: f64, construction: bool = false) -> i64!:
+        self.forget()
+        return try self.sketch.add_conic(start, end, apex, rho, construction)
+
+    ## Set circle `curve`'s radius, an ellipse's minor radius or a conic's
+    ## rho (unsolved).
+    pub func set_radius(curve: i64, value: f64):
+        self.forget()
+        let scalar = self.sketch.scalar_of(self.sketch.entity(curve))
+        if scalar >= 0: self.sketch.params.items[(usize)scalar] = value
+
     pub func set_construction(at: i64, construction: bool):
         self.sketch.entities.items[(usize)at].construction = construction
 
     ## A constraint of kind `kind` (ConstraintKind's order); its index.
     pub func constrain(kind: i64, first: i64, second: i64 = -1, third: i64 = -1, value: f64 = 0.0, side: f64 = 1.0, driven: bool = false) -> i64!:
-        if kind < 0 or kind > 19: error(invalid, "a sketch constraint kind is 0..19")
+        if kind < 0 or kind > 20: error(invalid, "a sketch constraint kind is 0..20")
         self.forget()
         return try self.sketch.constrain(ConstraintKind((u8)kind), first, second, third, value, side, driven)
 
@@ -275,9 +340,31 @@ func nearest(sketch: const Sketch*, x: f64, y: f64, reach: f64, only: i64) -> i6
         if best >= 0: return best
     return -1
 
+## `count` + 1 points along spline, ellipse or conic `at` of `sketch`, as
+## x, y pairs onto `out` (the editor draws them).
+pub func sketch_samples(sketch: const CadSketch*, at: i64, count: usize, out: Growing[f64]*) -> !:
+    var net = new_net()
+    defer net.close()
+    try net_of(&sketch.sketch, sketch.sketch.entity(at), &net)
+    try net.sample(count, out)
+
 ## How far (`x`, `y`) is from entity `e` (index `at`).
 func distance_to(sketch: const Sketch*, e: SketchEntity, at: i64, x: f64, y: f64) -> f64:
     if e.kind == EntityKind.point: return math.hypot(sketch.x(at) - x, sketch.y(at) - y)
+    if (u8)e.kind > 3:
+        # A spline, ellipse or conic: its samples as a polyline.
+        var net = new_net()
+        defer net.close()
+        var points = Growing[f64]()
+        defer points.close()
+        net_of(sketch, e, &net) catch failure:
+            return 1e300
+        net.sample(96, &points) catch failure:
+            return 1e300
+        var best = 1e300
+        for k in 0..<points.count // 2 - 1:
+            best = math.min(best, segment_distance(x, y, points.items[2 * k], points.items[2 * k + 1], points.items[2 * k + 2], points.items[2 * k + 3]))
+        return best
     if e.kind == EntityKind.line:
         let ax = sketch.x(e.first)
         let ay = sketch.y(e.first)
@@ -299,3 +386,11 @@ func distance_to(sketch: const Sketch*, e: SketchEntity, at: i64, x: f64, y: f64
     while along < 0.0: along += 2.0 * math.pi
     if along <= sweep: return off
     return math.min(math.hypot(sketch.x(e.third) - x, sketch.y(e.third) - y), math.hypot(sketch.x(e.fourth) - x, sketch.y(e.fourth) - y))
+
+## How far (`x`, `y`) is from the segment (`ax`, `ay`)-(`bx`, `by`).
+func segment_distance(x: f64, y: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64:
+    let dx = bx - ax
+    let dy = by - ay
+    let l2 = dx * dx + dy * dy
+    let t = math.max(0.0, math.min(1.0, ((x - ax) * dx + (y - ay) * dy) / l2)) if l2 > 0.0 else 0.0
+    return math.hypot(ax + t * dx - x, ay + t * dy - y)

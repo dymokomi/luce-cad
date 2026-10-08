@@ -25,6 +25,15 @@ pub enum RowKind as u8:
     ## (6, 7): halfway along it, then on either side alike.
     mirror_along = 7
     mirror_across = 8
+    ## Point (0, 1) on the ellipse about (2, 3) whose major axis ends at
+    ## (4, 5), of minor radius parameter 6: its distance from the ellipse,
+    ## near enough on it (the major radius times how far its scaled radius
+    ## is from 1).
+    on_ellipse = 9
+    ## A control point spline's end P0 (0, 1), P1 (2, 3), P2 (4, 5) as
+    ## curved as radius parameter 6: `value` (the end's curvature factor)
+    ## times cross(P1 - P0, P2 - P1) r / |P1 - P0|³ equals `side`.
+    curvature = 10
 
 pub struct Row:
     pub var kind: RowKind
@@ -55,9 +64,14 @@ pub func rows_of(sketch: const Sketch*, out: Growing[Row]*) -> !:
         try rows_for(sketch, k, (i64)index, out)
 
 func rows_for(sketch: const Sketch*, k: SketchConstraint, index: i64, out: Growing[Row]*) -> !:
+    if (k.kind == ConstraintKind.tangent or k.kind == ConstraintKind.curvature) and (sketch.entity(k.first).kind == EntityKind.spline or sketch.entity(k.first).kind == EntityKind.conic):
+        try end_rows(sketch, k, index, out)
+        return
     if k.kind == ConstraintKind.on_curve:
         let curve = sketch.entity(k.second)
-        if curve.kind == EntityKind.line:
+        if curve.kind == EntityKind.ellipse:
+            try out.push(row(RowKind.on_ellipse, index, [px(sketch, k.first), px(sketch, k.first) + 1, px(sketch, curve.first), px(sketch, curve.first) + 1, px(sketch, curve.third), px(sketch, curve.third) + 1, curve.second, -1]))
+        elif curve.kind == EntityKind.line:
             try out.push(row(RowKind.on_line, index, point_line(sketch, k.first, k.second, -1)))
         else:
             try out.push(row(RowKind.on_circle, index, [px(sketch, k.first), px(sketch, k.first) + 1, px(sketch, curve.first), px(sketch, curve.first) + 1, curve.second, -1, -1, -1]))
@@ -98,6 +112,38 @@ func rows_for(sketch: const Sketch*, k: SketchConstraint, index: i64, out: Growi
         r.weights = [1.0, -1.0, 0.0, 0.0]
         r.value = -k.side * k.value
         try out.push(r)
+
+## Tangent or curvature at a control point spline's or a conic's end
+## (`side` +1 its start, -1 its end) against a line, circle or arc: its end
+## direction P1 - P0 along the line, or square to the circle's radius at P0;
+## for curvature also P2 - P1 along the line, or the curvature row.
+func end_rows(sketch: const Sketch*, k: SketchConstraint, index: i64, out: Growing[Row]*) -> !:
+    let curve = sketch.entity(k.first)
+    let other = sketch.entity(k.second)
+    let (p0, p1, p2) = curve_end_points(sketch, curve, k.side)
+    if other.kind == EntityKind.line:
+        try out.push(row(RowKind.parallel, index, [px(sketch, p0), px(sketch, p0) + 1, px(sketch, p1), px(sketch, p1) + 1, px(sketch, other.first), px(sketch, other.first) + 1, px(sketch, other.second), px(sketch, other.second) + 1]))
+        if k.kind == ConstraintKind.curvature and p2 >= 0:
+            try out.push(row(RowKind.parallel, index, [px(sketch, p1), px(sketch, p1) + 1, px(sketch, p2), px(sketch, p2) + 1, px(sketch, other.first), px(sketch, other.first) + 1, px(sketch, other.second), px(sketch, other.second) + 1]))
+        return
+    let c = other.first
+    try out.push(row(RowKind.perpendicular, index, [px(sketch, p0), px(sketch, p0) + 1, px(sketch, p1), px(sketch, p1) + 1, px(sketch, c), px(sketch, c) + 1, px(sketch, p0), px(sketch, p0) + 1]))
+    if k.kind == ConstraintKind.curvature and p2 >= 0:
+        var r = row(RowKind.curvature, index, [px(sketch, p0), px(sketch, p0) + 1, px(sketch, p1), px(sketch, p1) + 1, px(sketch, p2), px(sketch, p2) + 1, other.second, -1])
+        r.value = end_curvature_factor(curve.second, spline_degree(curve))
+        r.side = k.value
+        try out.push(r)
+
+## The first three points from a spline's or conic's end (`side` +1 its
+## start, -1 its end): the end, the next (a conic's apex) and the one after
+## (-1 for a conic or a two-point spline).
+pub func curve_end_points(sketch: const Sketch*, curve: SketchEntity, side: f64) -> (i64, i64, i64):
+    if curve.kind == EntityKind.conic:
+        return (curve.first if side >= 0.0 else curve.third, curve.fourth, -1)
+    let n = curve.second
+    if side >= 0.0:
+        return (sketch.spline_point(curve, 0), sketch.spline_point(curve, 1), sketch.spline_point(curve, 2) if n > 2 else -1)
+    return (sketch.spline_point(curve, n - 1), sketch.spline_point(curve, n - 2), sketch.spline_point(curve, n - 3) if n > 2 else -1)
 
 ## A line, arc or circle touching a circle or arc: a line's distance from
 ## the center is the radius; two circles' centers are the sum (`side` +1)
@@ -184,6 +230,18 @@ pub func evaluate(r: const Row*, read: func(i64, void*) -> f64, context: void*, 
             e.partial[i] = r.weights[i]
     elif r.kind == RowKind.mirror_along or r.kind == RowKind.mirror_across:
         mirror_row(v[..<8], r.kind == RowKind.mirror_along, scale, &e)
+    elif r.kind == RowKind.on_ellipse or r.kind == RowKind.curvature:
+        # Central differences: these rows are smooth and cheap, and their
+        # closed-form partials long.
+        e.residual = curved_residual(v[..<8], r, scale)
+        let h = 1e-7 * scale
+        for i in 0..<(usize)8:
+            if r.at[i] < 0: continue
+            var up = v
+            var down = v
+            up[i] += h
+            down[i] -= h
+            e.partial[i] = (curved_residual(up[..<8], r, scale) - curved_residual(down[..<8], r, scale)) / (2.0 * h)
     else:
         two_directions(v[..<8], r, scale, &e)
     return e
@@ -290,3 +348,23 @@ func mirror_row(v: const f64[], along: bool, scale: f64, e: Evaluated*):
     e.partial[7] = gy
     e.partial[4] = -gx + 2.0 * dy / length
     e.partial[5] = -gy - 2.0 * dx / length
+
+## The on_ellipse and curvature rows' residuals (see RowKind).
+func curved_residual(v: const f64[], r: const Row*, scale: f64) -> f64:
+    if r.kind == RowKind.on_ellipse:
+        let dx = v[4] - v[2]
+        let dy = v[5] - v[3]
+        let a = math.max(math.hypot(dx, dy), 1e-12 * scale)
+        let b = math.max(v[6], 1e-12 * scale)
+        let wx = v[0] - v[2]
+        let wy = v[1] - v[3]
+        let along = (wx * dx + wy * dy) / a
+        let across = (dx * wy - dy * wx) / a
+        return a * (math.hypot(along / a, across / b) - 1.0)
+    let d1x = v[2] - v[0]
+    let d1y = v[3] - v[1]
+    let d2x = v[4] - v[2]
+    let d2y = v[5] - v[3]
+    let length = math.max(math.hypot(d1x, d1y), 1e-12 * scale)
+    let cross = d1x * d2y - d1y * d2x
+    return scale * (r.value * cross * v[6] / (length * length * length) - r.side)
