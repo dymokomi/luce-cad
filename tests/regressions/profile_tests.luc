@@ -1,0 +1,79 @@
+## Profiles from crossing curves (modeling/arrangement.lucb), as Fusion's:
+## two overlapping circles make three faces, joined by default into one
+## solid, or the lens alone when chosen; a line between a rectangle's
+## sides splits it in two (either side chosen by a click in it); a line
+## loose inside it splits nothing; a line right across splits it too, its
+## ends outside dropped. Each checked by its extruded solid's faces and
+## volume.
+from luce_cad.modeling import CadModeling
+from luce_cad.sketch import CadSketch
+from luce_cad.model import CadModel
+from luce_geocore.geocore import Vector3, Mesh, GeometrySet
+from checks import manifold
+from luce_std import math
+
+func volume(mesh: Mesh) -> float!:
+    var total = 0.0
+    for triangle in 0..<mesh.index_count() // 3:
+        let a = mesh.vertex(mesh.index(triangle * 3)).position
+        let b = mesh.vertex(mesh.index(triangle * 3 + 1)).position
+        let c = mesh.vertex(mesh.index(triangle * 3 + 2)).position
+        total += a.dot(b.cross(c)) / 6.0
+    return total
+
+## `model` closed, of `faces` faces and `expected` volume (within 0.3%).
+func solid(model: CadModel, faces: int, expected: float) -> unit!:
+    if model.face_count() != faces: print(f"faces {model.face_count()}, expected {faces}")
+    assert(model.face_count() == faces)
+    let mesh = model.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > expected * 0.003: print(f"volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= expected * 0.003)
+
+## A sketch's curves on the XY plane.
+func curves(s: CadSketch) -> GeometrySet!:
+    return s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0))
+
+## A 40 x 20 rectangle from the origin, with a line from `a` to `b`.
+func crossed(a: list[float], b: list[float]) -> GeometrySet!:
+    let s = CadSketch.parse("")
+    let corners = [s.add_point(0.0, 0.0), s.add_point(40.0, 0.0), s.add_point(40.0, 20.0), s.add_point(0.0, 20.0)]
+    for at in 0..<4:
+        _ = s.add_line(corners[at], corners[(at + 1) % 4])
+    _ = s.add_line(s.add_point(a[0], a[1]), s.add_point(b[0], b[1]))
+    return curves(s)
+
+pub func profile_tests() -> unit!:
+    let h = 5.0
+    # Two circles of 10 overlapping by 8: a lens and two crescents.
+    let s = CadSketch.parse("")
+    _ = s.add_circle(s.add_point(0.0, 0.0), 10.0)
+    _ = s.add_circle(s.add_point(12.0, 0.0), 10.0)
+    let pair = curves(s)
+    assert(CadModeling.profile_keys(pair).split(";").length == 3)
+    let lens = 2.0 * 100.0 * math.acos(0.6) - 6.0 * math.sqrt(400.0 - 144.0)
+    # By default all three, joined: one solid, the union.
+    solid(CadModeling.extruded(pair, h, 0.0, "e"), 4, (2.0 * math.pi * 100.0 - lens) * h)
+    # The lens alone, picked where it is.
+    let picked = CadModeling.profile_at(pair, Vector3(6.0, 0.0, 0.0))
+    assert(picked != "" and CadModeling.profile_at(pair, Vector3(40.0, 0.0, 0.0)) == "")
+    solid(CadModeling.extruded(pair, h, 0.0, "e", picked), 4, lens * h)
+    # A crescent: its key differs from the lens's (a circle run the other way).
+    let crescent = CadModeling.profile_at(pair, Vector3(-5.0, 0.0, 0.0))
+    assert(crescent != picked)
+    # A line from the bottom to the top at x 15: two faces; by default the
+    # rectangle whole, chosen the left part.
+    let split = crossed([15.0, 0.0], [15.0, 20.0])
+    assert(CadModeling.profile_keys(split).split(";").length == 2)
+    solid(CadModeling.extruded(split, h, 0.0, "e"), 6, 40.0 * 20.0 * h)
+    solid(CadModeling.extruded(split, h, 0.0, "e", CadModeling.profile_at(split, Vector3(5.0, 10.0, 0.0))), 6, 15.0 * 20.0 * h)
+    # A line loose inside splits nothing.
+    let loose = crossed([10.0, 10.0], [20.0, 10.0])
+    assert(CadModeling.profile_keys(loose).split(";").length == 1)
+    solid(CadModeling.extruded(loose, h, 0.0, "e"), 6, 40.0 * 20.0 * h)
+    # A line right across, its ends outside: two faces, the ends dropped.
+    let across = crossed([-5.0, 8.0], [45.0, 8.0])
+    assert(CadModeling.profile_keys(across).split(";").length == 2)
+    solid(CadModeling.extruded(across, h, 0.0, "e", CadModeling.profile_at(across, Vector3(20.0, 4.0, 0.0))), 6, 40.0 * 8.0 * h)
+    print("PASS profiles: crossing circles (joined, the lens, a crescent's own key), a rectangle split by a line between its sides, a loose line, a line right across")

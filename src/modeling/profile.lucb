@@ -1,11 +1,10 @@
 ## Sketch profiles: a sketch's curves (luce-geocore's curves family, on the
 ## set's sketch plane) read exactly as lines, circular arcs and B-splines,
-## chained into closed loops and nested into regions: each loop at an even
-## depth bounds a region, the loops directly inside it are its holes, as
-## Fusion's sketch profiles are. A polyline's segments are lines; a NURBS
-## whose spans are rational quadratic circular arcs (Edit Sketch's arcs and
-## circles) is those arcs, merged; any other NURBS is a B-spline edge.
-## Curves crossing each other are not split here: each closed loop counts.
+## split where they meet and traced into the faces of their arrangement
+## (arrangement.lucb), as Fusion's sketch profiles are. A polyline's
+## segments are lines; a NURBS whose spans are rational quadratic circular
+## arcs (a Sketch's arcs and circles) is those arcs, merged; any other NURBS
+## is a B-spline edge.
 import interop
 import memory
 import strings
@@ -119,6 +118,63 @@ pub struct Profiles:
         for at in 0..<self.spline_points.count:
             self.spline_points.items[at] = self.spline_points.items[at].add(by)
 
+    ## The part of spline `index` from fraction `low` to `high` of its
+    ## domain, as a new spline: knots inserted there to full multiplicity
+    ## (Boehm), the control points between kept.
+    func spline_part(index: i64, low: f64, high: f64) -> i64!:
+        let (points, weights, knots, degree) = self.spline_net(index)
+        let p = (usize)degree
+        var rows = Growing[f64]()
+        defer rows.close()
+        for at in 0..<points.length:
+            let w = weights[at]
+            try rows.push(points[at].x * w)
+            try rows.push(points[at].y * w)
+            try rows.push(points[at].z * w)
+            try rows.push(w)
+        var u = Growing[f64]()
+        defer u.close()
+        try u.assign(knots)
+        var scratch = Growing[f64]()
+        defer scratch.close()
+        let a = knots[p]
+        let b = knots[points.length]
+        let u0 = a + (b - a) * low
+        let u1 = a + (b - a) * high
+        for value in [u0, u1]:
+            if value <= a or value >= b: continue
+            var times: usize = 0
+            for k in u.view():
+                if k == value: times += 1
+            while times < p:
+                try insert_knot(&rows, &u, &scratch, p, 4, value)
+                times += 1
+        let count = rows.count // 4
+        # The point at u0 is control point (its last knot) - p; at u1, (its
+        # first knot) - 1.
+        var last_low: usize = p
+        for k in 0..<u.count:
+            if u.items[k] <= u0: last_low = k
+        var first_high: usize = count
+        var k = u.count
+        while k > 0:
+            k -= 1
+            if u.items[k] >= u1: first_high = k
+        let s = last_low - p
+        let e = first_high - 1
+        let first = self.spline_points.count
+        let knot_first = self.spline_knots.count
+        for at in s..<e + 1:
+            let w = rows.items[at * 4 + 3]
+            try self.spline_points.push(Vector3(rows.items[at * 4] / w, rows.items[at * 4 + 1] / w, rows.items[at * 4 + 2] / w))
+            try self.spline_weights.push(w)
+        for _ in 0..<p + 1: try self.spline_knots.push(u0)
+        for knot in u.view():
+            if knot > u0 and knot < u1: try self.spline_knots.push(knot)
+        for _ in 0..<p + 1: try self.spline_knots.push(u1)
+        try self.splines.push(ProfileSpline(first, e - s + 1, knot_first, degree))
+        return (i64)self.splines.count - 1
+
     ## Plane coordinates of a point.
     func planar(p: Vector3) -> (f64, f64):
         let d = p.subtract(self.origin)
@@ -180,6 +236,17 @@ pub struct Profiles:
         try self.splines.push(ProfileSpline(first, s.count, knot_first, s.degree))
         return (i64)self.splines.count - 1
 
+## A profile of one loop (a blend's tool section) as its one region, the
+## loop turned counterclockwise about the normal.
+func single_region(result: Profiles*) -> !:
+    var scratch = Growing[Vector3]()
+    defer scratch.close()
+    try result.outline(0, &scratch)
+    if signed_area(scratch.view()) < 0.0: try result.reverse_loop(0)
+    try result.region_offsets.push(0)
+    try result.region_loops.push(0)
+    try result.region_offsets.push(1)
+
 ## Twice the signed area of a closed outline (positive counterclockwise).
 func signed_area(points: const Vector3[]) -> f64:
     var total = 0.0
@@ -202,137 +269,37 @@ func inside(points: const Vector3[], point: Vector3) -> bool:
             turns -= 1
     return turns != 0
 
-## The profiles of the curves in `set`, on its sketch plane. `tolerance`
-## joins curve ends and recognises arcs.
-pub func profiles_of(set: const GeometrySet*, tolerance: f64) -> Profiles!:
-    let plane = try sketch_plane_of(set)
-    var result = Profiles(plane.origin, plane.normal, plane.u, plane.v, Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
-                          Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+## The profiles of the curves in `set`, on its sketch plane: the faces of
+## their arrangement (arrangement.lucb) that `chosen` names (face keys
+## apart by `;`), or by default islands alternating from the outside in.
+## `tolerance` joins curve ends and recognises arcs.
+pub func profiles_of(set: const GeometrySet*, tolerance: f64, chosen: str = "") -> Profiles!:
+    var result = try empty_profiles(set)
     errdefer result.close()
-    let curves = set_curves(set) else error(invalid, "Extrude needs a sketch: connect an Edit Sketch with closed curves")
-    # Each curve's pieces, then chains of them: closed ones are loops.
-    var chains = Growing[usize]()
-    defer chains.close()
-    var closed = Growing[bool]()
-    defer closed.close()
     var pieces = Growing[ProfileEdge]()
     defer pieces.close()
-    try chains.push(0)
-    for curve in 0..<curves.curve_count():
-        let before = pieces.count
-        let cyclic = try read_curve(curves, curve, &result, &pieces, tolerance)
-        if pieces.count == before: continue
-        for at in before..<pieces.count:
-            pieces.items[at].curve = (i64)curve
-            pieces.items[at].piece = (i64)(at - before)
-        try chains.push(pieces.count)
-        try closed.push(cyclic or pieces.items[before].start.subtract(pieces.items[pieces.count - 1].end).length() <= tolerance)
-    try join_chains(&result, &pieces, &chains, &closed, tolerance)
-    if result.loop_count() == 0:
-        error(invalid, "the sketch has no closed curves to make profiles of")
-    try nest(&result)
+    try read_pieces(set, &result, &pieces, tolerance)
+    try arrange(&result, &pieces, chosen, tolerance)
+    if result.region_count() == 0:
+        error(invalid, "the sketch has no closed profile: close its open curves, or choose a profile")
     return result
 
-## Close the chains into loops: closed ones as they are, open ones joined
-## end to end (either way round) until they close.
-func join_chains(result: Profiles*, pieces: const Growing[ProfileEdge]*, chains: const Growing[usize]*, closed: const Growing[bool]*, tolerance: f64) -> !:
-    try result.loop_offsets.push(0)
-    var used = Growing[bool]()
-    defer used.close()
-    for _ in 0..<closed.count: try used.push(false)
-    for chain in 0..<closed.count:
-        if used.items[chain]: continue
-        used.items[chain] = true
-        let first_edge = result.edges.count
-        try append_chain(result, pieces, chains, chain, false)
-        if not closed.items[chain]:
-            # Follow open chains from this one's end until back at its start.
-            var growing = true
-            while growing and result.edges.items[first_edge].start.subtract(result.edges.items[result.edges.count - 1].end).length() > tolerance:
-                growing = false
-                let tail = result.edges.items[result.edges.count - 1].end
-                for other in 0..<closed.count:
-                    if used.items[other] or closed.items[other]: continue
-                    let head = pieces.items[chains.items[other]].start
-                    let foot = pieces.items[chains.items[other + 1] - 1].end
-                    if head.subtract(tail).length() <= tolerance or foot.subtract(tail).length() <= tolerance:
-                        used.items[other] = true
-                        try append_chain(result, pieces, chains, other, foot.subtract(tail).length() <= tolerance and head.subtract(tail).length() > tolerance)
-                        growing = true
-                        break
-            if result.edges.items[first_edge].start.subtract(result.edges.items[result.edges.count - 1].end).length() > tolerance:
-                error(invalid, "a sketch curve is open: profiles need closed loops (close it, or snap its ends together)")
-        # Ends that met within tolerance meet exactly.
-        let last = result.edges.count - 1
-        for at in first_edge..<last:
-            result.edges.items[at + 1].start = result.edges.items[at].end
-        result.edges.items[first_edge].start = result.edges.items[last].end
-        try result.loop_offsets.push(result.edges.count)
+## No profiles yet, on the sketch plane of `set`.
+func empty_profiles(set: const GeometrySet*) -> Profiles!:
+    let plane = try sketch_plane_of(set)
+    return Profiles(plane.origin, plane.normal, plane.u, plane.v, Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+                    Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
 
-func append_chain(result: Profiles*, pieces: const Growing[ProfileEdge]*, chains: const Growing[usize]*, chain: usize, reversed: bool) -> !:
-    let first = chains.items[chain]
-    let last = chains.items[chain + 1]
-    let at = result.edges.count
-    for index in first..<last:
-        try result.edges.push(pieces.items[index])
-    if reversed:
-        # Reverse just the appended run.
-        var low = at
-        var high = result.edges.count - 1
-        while low < high:
-            let swap = result.edges.items[low]
-            result.edges.items[low] = result.edges.items[high]
-            result.edges.items[high] = swap
-            low += 1
-            high -= 1
-        for index in at..<result.edges.count:
-            try result.reverse_edge(index)
-
-## Orient and nest the loops into regions.
-func nest(result: Profiles*) -> !:
-    let count = result.loop_count()
-    var outlines = Growing[Vector3]()
-    defer outlines.close()
-    var offsets = Growing[usize]()
-    defer offsets.close()
-    var scratch = Growing[Vector3]()
-    defer scratch.close()
-    try offsets.push(0)
-    for loop in 0..<count:
-        try result.outline(loop, &scratch)
-        if signed_area(scratch.view()) < 0.0:
-            try result.reverse_loop(loop)
-            try result.outline(loop, &scratch)
-        for point in scratch.view(): try outlines.push(point)
-        try offsets.push(outlines.count)
-    # Depth: how many other loops hold a point of this one; parent: the
-    # deepest of them.
-    var depth = Growing[i64]()
-    defer depth.close()
-    var parent = Growing[i64]()
-    defer parent.close()
-    for loop in 0..<count:
-        let probe = outlines.items[offsets.items[loop]]
-        var d: i64 = 0
-        for other in 0..<count:
-            if other != loop and inside(outlines.view()[offsets.items[other]..<offsets.items[other + 1]], probe): d += 1
-        try depth.push(d)
-    for loop in 0..<count:
-        let probe = outlines.items[offsets.items[loop]]
-        var best: i64 = -1
-        for other in 0..<count:
-            if other != loop and depth.items[other] == depth.items[loop] - 1 and inside(outlines.view()[offsets.items[other]..<offsets.items[other + 1]], probe): best = (i64)other
-        try parent.push(best)
-    try result.region_offsets.push(0)
-    for loop in 0..<count:
-        if depth.items[loop] % 2 != 0: continue
-        try result.region_loops.push(loop)
-        for hole in 0..<count:
-            if parent.items[hole] == (i64)loop:
-                # Holes run clockwise about the normal.
-                try result.reverse_loop(hole)
-                try result.region_loops.push(hole)
-        try result.region_offsets.push(result.region_loops.count)
+## Every curve of `set` as pieces onto `out`, each tagged with its curve
+## and its place along it.
+func read_pieces(set: const GeometrySet*, result: Profiles*, out: Growing[ProfileEdge]*, tolerance: f64) -> !:
+    let curves = set_curves(set) else error(invalid, "Extrude needs a sketch: connect a Sketch with closed curves")
+    for curve in 0..<curves.curve_count():
+        let before = out.count
+        _ = try read_curve(curves, curve, result, out, tolerance)
+        for at in before..<out.count:
+            out.items[at].curve = (i64)curve
+            out.items[at].piece = (i64)(at - before)
 
 ## Curve `curve`'s pieces onto `out`; whether it is cyclic.
 func read_curve(curves: const Curves*, curve: usize, result: Profiles*, out: Growing[ProfileEdge]*, tolerance: f64) -> bool!:

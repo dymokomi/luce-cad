@@ -16,6 +16,7 @@ does today.
 | `extruded(set, distance, start, tag)` | The sketch's closed curves in `set`, as profile regions, each swept `distance` along the plane's normal from `start` along it. |
 | `revolved(set, axis, tag, angle)` | Each region turned about the plane's u (`0`) or v (`1`) axis: a full turn, or `angle` radians closed by the profile at each end. |
 | `profile_count(set)` | How many regions the sketch has. |
+| `profile_keys(set)`, `profile_at(set, point)` | The keys of the sketch's faces; the key of the face under a point (a click). `extruded` and `revolved` take keys to choose faces. |
 | `combined(a, b, operation)` | `0` union, `1` `a` without `b`, `2` intersection. |
 | `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
 | `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |
@@ -74,21 +75,28 @@ names.
 
 ## How each works
 
-### Profiles (`profile.lucb`)
+### Profiles (`profile.lucb`, `arrangement.lucb`)
 
 Sketch curves are read exactly:
 
 - **Lines.** A polyline's segments.
-- **Arcs.** A NURBS whose every span is a rational quadratic circular arc becomes arcs. Edit
-  Sketch's arcs and circles are built this way. Consecutive arcs of one circle are merged.
+- **Arcs.** A NURBS whose every span is a rational quadratic circular arc becomes arcs. A Sketch's
+  arcs and circles are built this way. Consecutive arcs of one circle are merged.
 - **Other NURBS.** A B-spline edge.
 
-Curves are chained end to end into closed loops. Loops nest by containment: a loop at an even depth
-bounds a region, and the loops directly inside it are its holes. Fusion's profiles work the same
-way.
+Then, as Fusion's profiles: every piece is split where it meets another (crossing, touching, or a
+curve's end on it; lines and arcs in closed form, B-splines by their samples refined by Newton and
+split by knot insertion). The pieces join at shared points into a planar graph, dangling pieces are
+dropped (a loose line inside a region splits nothing), and the graph's faces are traced: each
+bounded face is a profile. A face's **key** names it by the sketch curves round it and the way each
+runs (`0+,1-`), so it stays the same face as dimensions change; two crescents of overlapping
+circles differ by which circle each runs along.
 
-Not yet: curves crossing each other are not split into an arrangement. Each closed loop counts as
-it is. A closed spline is also not a profile yet.
+A feature takes the faces its keys name, or by default islands alternating from the outside in (a
+face's depth: how many faces of other connected pieces hold it): a plate's hole stays empty,
+overlapping shapes join. The taken faces are outlined together, so faces next to each other become
+one region, and parts of one curve going on the same way join back into one edge (one side face).
+Not yet: a closed spline as a profile.
 
 ### Extrude (`extrude.lucb`)
 
@@ -449,8 +457,7 @@ point, and gives the curves Extrude and Revolve read. Lengths are millimeters, a
   quadratic arcs, on the plane given by an origin and the sketch's x and y axes. Construction
   entities make none.
 
-Not yet: ellipses, splines, slots and text; curvature (G2) and polygon constraints; crossing
-curves split into profiles.
+Not yet: ellipses, splines, slots and text; curvature (G2) and polygon constraints.
 
 ## Limits, and what comes next
 
@@ -462,5 +469,5 @@ Roughly in order of usefulness:
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
    surfaces. Rays through them are exact (`spline_rays.lucb`).
 4. **Sweep and loft;** tapered extrudes; Extrude "to object".
-5. **Sketch arrangement.** Crossing curves split into regions (the solver is in; see Sketches).
+5. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
 6. **Shell,** offset, draft and press/pull.

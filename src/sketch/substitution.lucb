@@ -3,9 +3,10 @@
 ## radius and diameter) are not solved for. Their parameters merge into
 ## classes (union-find), each class one unknown of the solver or a
 ## constant; two different constants meeting in one class is a conflict,
-## named at once by the constraints that met. A merge keeps the second
-## entity's values (what the first is constrained to), and a pinned
-## (dragged) parameter's class keeps the pinned value.
+## named at once by the constraints that met. A merge keeps the larger
+## class's value (a level line's ends stay put when a free end joins them),
+## the second entity's (what the first is constrained to) between equals,
+## and a pinned (dragged) parameter's class keeps the pinned value.
 
 pub struct Classes:
     ## Per parameter: its class's root while merging.
@@ -16,6 +17,8 @@ pub struct Classes:
     var fixed_value: Growing[f64]
     var fixer: Growing[i64]
     var pinned: Growing[bool]
+    ## Per root: how many parameters its class holds.
+    var size: Growing[i64]
     ## Per parameter: its solver unknown, or -1 for a constant.
     pub var variable: Growing[i64]
     ## Per unknown: a parameter of its class (its value is the start).
@@ -29,6 +32,7 @@ pub struct Classes:
         self.fixed_value.close()
         self.fixer.close()
         self.pinned.close()
+        self.size.close()
         self.variable.close()
         self.source.close()
         self.conflicts.close()
@@ -56,13 +60,18 @@ pub struct Classes:
             try self.conflict(constraint, self.fixer.items[(usize)a])
             try self.conflict(constraint, self.fixer.items[(usize)b])
             return
-        # The root keeps what wins: a constant, else a pin, else `kept`.
-        if fa or (self.pinned.items[(usize)a] and not fb and not self.pinned.items[(usize)b]):
+        # The root keeps what wins: a constant, else a pin, else the larger
+        # class, else `kept`.
+        let pa = self.pinned.items[(usize)a]
+        let pb = self.pinned.items[(usize)b]
+        let larger = self.size.items[(usize)a] > self.size.items[(usize)b]
+        if fa or (not fb and ((pa and not pb) or (pa == pb and larger))):
             let swap = a
             a = b
             b = swap
         self.parent.items[(usize)a] = b
         self.pinned.items[(usize)b] = self.pinned.items[(usize)b] or self.pinned.items[(usize)a]
+        self.size.items[(usize)b] += self.size.items[(usize)a]
 
     ## Make `param`'s class the constant `value` for constraint `constraint`.
     func fix(param: i64, value: f64, constraint: i64) -> !:
@@ -82,7 +91,7 @@ pub struct Classes:
 ## The classes of `sketch`'s parameters under its substitutions; `pins`
 ## (parameters) keep their values, as a drag's do.
 pub func classes_of(sketch: const Sketch*, pins: const i64[]) -> Classes!:
-    var c = Classes(Growing[i64](), Growing[bool](), Growing[f64](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64]())
+    var c = Classes(Growing[i64](), Growing[bool](), Growing[f64](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64]())
     errdefer c.close()
     let count = sketch.params.count
     for at in 0..<count:
@@ -91,6 +100,7 @@ pub func classes_of(sketch: const Sketch*, pins: const i64[]) -> Classes!:
         try c.fixed_value.push(sketch.params.items[at])
         try c.fixer.push(-1)
         try c.pinned.push(false)
+        try c.size.push(1)
     for pin in pins: c.pinned.items[(usize)pin] = true
     for index in 0..<sketch.constraints.count:
         let k = sketch.constraints.items[index]

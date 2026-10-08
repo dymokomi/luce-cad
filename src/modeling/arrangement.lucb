@@ -1,0 +1,831 @@
+## A sketch's curves as Fusion 360 reads them for profiles: every piece
+## split where it meets another (crossing, touching, or a curve's end on
+## it), the pieces joined at shared points into a planar graph, dangling
+## pieces dropped, and the graph's faces traced: each bounded face is a
+## profile. Which faces a feature takes (`chosen`, by key) or, given none,
+## islands alternating from the outside in (a plate's hole stays empty,
+## overlapping shapes join), and their outline traced together, so faces
+## next to each other become one region. Loops leave as profile.lucb's:
+## outer loops counterclockwise about the plane's normal, holes clockwise.
+##
+## A face's key names it by what bounds it: the sorted sketch curves of its
+## loops, each with the side it runs (+ along the curve, - against), so it
+## stays the same face when dimensions move things (two crescents of
+## overlapping circles differ by which circle each runs along).
+
+## A piece cut: piece `piece` at `fraction` of the way along it.
+struct PieceCut:
+    var piece: usize
+    var fraction: f64
+
+## A half-edge: sub-edge `edge` run forward or backward, from vertex `tail`
+## to `head`, leaving at angle `angle` turning by `curving` (signed
+## curvature, for touching curves), on face `face`.
+struct SketchHalf:
+    var edge: usize
+    var backward: bool
+    var tail: usize
+    var head: usize
+    var angle: f64
+    var curving: f64
+    var face: i64
+    var alive: bool
+
+## Arrange `pieces` (on `result`'s plane) and write the regions of the faces
+## `chosen` names (keys apart by `;`; empty: alternating islands) into
+## `result`'s loops and regions.
+func arrange(result: Profiles*, pieces: const Growing[ProfileEdge]*, chosen: str, tolerance: f64) -> !:
+    var a = try arranged(result, pieces, tolerance)
+    defer a.close()
+    let count = a.areas.count
+    var take = Growing[bool]()
+    defer take.close()
+    try take.fill(count, false)
+    if trimmed(chosen) == "":
+        try alternate_islands(&a, &take)
+    else:
+        for f in 0..<count:
+            if a.areas.items[f] <= 0.0: continue
+            var key = Growing[u8]()
+            defer key.close()
+            try face_key(&a.subs, &a.halves, a.loop(f), &key)
+            take.items[f] = key_listed(chosen, (str)key.view())
+    # A piece's outside (a clockwise face) belongs to the face around it:
+    # the smallest bounded face holding a point just outside it.
+    for f in 0..<count:
+        if a.areas.items[f] > 0.0: continue
+        let owner = a.holding(a.left_point(f), (i64)f)
+        take.items[f] = owner >= 0 and take.items[(usize)owner]
+    try chosen_regions(result, &a.subs, &a.halves, a.vertex_count, &take, tolerance)
+
+## A sketch's arrangement: its sub-edges, half-edges and faces, each face's
+## signed area (positive: bounded) and outline in plane coordinates.
+struct Arranged:
+    var subs: Growing[ProfileEdge]
+    var halves: Growing[SketchHalf]
+    var vertex_count: usize
+    var faces: Growing[usize]
+    var face_offsets: Growing[usize]
+    var areas: Growing[f64]
+    var outlines: Growing[Vector3]
+    var outline_offsets: Growing[usize]
+    ## Per face: the connected piece of the graph it belongs to (faces of
+    ## one piece never hold each other).
+    var pieces_of: Growing[usize]
+
+    func close():
+        self.subs.close()
+        self.halves.close()
+        self.faces.close()
+        self.face_offsets.close()
+        self.areas.close()
+        self.outlines.close()
+        self.outline_offsets.close()
+        self.pieces_of.close()
+
+    ## Face `f`'s half-edges, in order round it.
+    func loop(f: usize) -> const usize[]:
+        return self.faces.view()[self.face_offsets.items[f]..<self.face_offsets.items[f + 1]]
+
+    func outline_of(f: usize) -> const Vector3[]:
+        return self.outlines.view()[self.outline_offsets.items[f]..<self.outline_offsets.items[f + 1]]
+
+    ## A point just left of face `f`'s first edge (inside a bounded face,
+    ## outside a piece's outer face).
+    func left_point(f: usize) -> Vector3:
+        return left_of_start(self.outline_of(f))
+
+    ## The smallest bounded face holding plane point `p`, or -1; with
+    ## `apart`, only faces of other pieces than face `apart`'s.
+    func holding(p: Vector3, apart: i64 = -1) -> i64:
+        var owner: i64 = -1
+        for other in 0..<self.areas.count:
+            if apart >= 0 and self.pieces_of.items[other] == self.pieces_of.items[(usize)apart]: continue
+            if self.areas.items[other] <= 0.0 or not inside(self.outline_of(other), p): continue
+            if owner < 0 or self.areas.items[other] < self.areas.items[(usize)owner]: owner = (i64)other
+        return owner
+
+## The arrangement of `pieces` on `result`'s plane.
+func arranged(result: Profiles*, pieces: const Growing[ProfileEdge]*, tolerance: f64) -> Arranged!:
+    var a = Arranged(Growing[ProfileEdge](), Growing[SketchHalf](), 0, Growing[usize](), Growing[usize](), Growing[f64](), Growing[Vector3](), Growing[usize](), Growing[usize]())
+    errdefer a.close()
+    try split_pieces(result, pieces, tolerance, &a.subs)
+    var vertices = Growing[Vector3]()
+    defer vertices.close()
+    try build_graph(result, &a.subs, tolerance, &vertices, &a.halves)
+    a.vertex_count = vertices.count
+    try trace_faces(&a.halves, vertices.count, &a.faces, &a.face_offsets)
+    var outline = Growing[Vector3]()
+    defer outline.close()
+    try a.outline_offsets.push(0)
+    for f in 0..<a.face_offsets.count - 1:
+        try face_outline(result, &a.subs, &a.halves, a.loop(f), &outline)
+        try a.areas.push(signed_area(outline.view()))
+        for p in outline.view(): try a.outlines.push(p)
+        try a.outline_offsets.push(a.outlines.count)
+    # Pieces: vertices joined by live edges.
+    var parent = Growing[usize]()
+    defer parent.close()
+    for v in 0..<vertices.count: try parent.push(v)
+    for h in a.halves.view():
+        if not h.alive: continue
+        let x = root_of(&parent, h.tail)
+        let y = root_of(&parent, h.head)
+        if x != y: parent.items[x] = y
+    for f in 0..<a.face_offsets.count - 1:
+        try a.pieces_of.push(root_of(&parent, a.halves.items[a.loop(f)[0]].tail))
+    return a
+
+## The keys of `set`'s profiles (its arrangement's bounded faces) apart by
+## `;` onto `out`; with `probe`, only the face holding plane point `at`.
+func face_keys(set: const GeometrySet*, tolerance: f64, probe: bool, at: Vector3, out: Growing[u8]*) -> !:
+    var result = try empty_profiles(set)
+    defer result.close()
+    var pieces = Growing[ProfileEdge]()
+    defer pieces.close()
+    try read_pieces(set, &result, &pieces, tolerance)
+    var a = try arranged(&result, &pieces, tolerance)
+    defer a.close()
+    let (x, y) = result.planar(at)
+    let target = a.holding(Vector3(x, y, 0.0)) if probe else -1
+    for f in 0..<a.areas.count:
+        if a.areas.items[f] <= 0.0 or (probe and (i64)f != target): continue
+        if out.count > 0: try out.push(59)
+        try face_key(&a.subs, &a.halves, a.loop(f), out)
+
+## Every piece cut where it meets another, as sub-edges onto `out`
+## (sketch curve and piece numbers kept: a piece's parts number on from it
+## along its curve).
+func split_pieces(result: Profiles*, pieces: const Growing[ProfileEdge]*, tolerance: f64, out: Growing[ProfileEdge]*) -> !:
+    var cuts = Growing[PieceCut]()
+    defer cuts.close()
+    for i in 0..<pieces.count:
+        for j in (i + 1)..<pieces.count:
+            try pieces_meet(result, pieces, i, j, tolerance, &cuts)
+    # Pieces of one curve number on along it, parts included.
+    var curve: i64 = -2
+    var number: i64 = 0
+    var fractions = Growing[f64]()
+    defer fractions.close()
+    for i in 0..<pieces.count:
+        let piece = pieces.items[i]
+        if piece.curve != curve:
+            curve = piece.curve
+            number = 0
+        fractions.clear()
+        try fractions.push(0.0)
+        for c in cuts.view():
+            if c.piece == i: try fractions.push(c.fraction)
+        try fractions.push(1.0)
+        sort_fractions(&fractions)
+        let length = try piece_length(result, &piece)
+        # A whole circle cut somewhere splits only there: its last part runs
+        # on round its seam to the first cut.
+        if piece.kind == 1 and math.abs(math.abs(piece.sweep) - 2.0 * math.pi) <= 1e-9 and fractions.count > 2:
+            try split_circle(result, &piece, fractions.view()[1..<fractions.count - 1], length, tolerance, number, out)
+            number += (i64)fractions.count - 2
+            continue
+        var last = 0.0
+        for at in 1..<fractions.count:
+            let next = fractions.items[at]
+            # Parts shorter than the tolerance are not parts.
+            if (next - last) * length <= tolerance and at + 1 < fractions.count: continue
+            if (next - last) * length <= tolerance: break
+            var part = try piece_part(result, &piece, last, next)
+            part.curve = piece.curve
+            part.piece = number
+            number += 1
+            try out.push(part)
+            last = next
+
+## Whole circle `piece` cut at `fractions` (sorted, inside 0..1): an arc
+## from each cut to the next, the last one round through the circle's seam.
+func split_circle(result: Profiles*, piece: const ProfileEdge*, fractions: const f64[], length: f64, tolerance: f64, first_number: i64, out: Growing[ProfileEdge]*) -> !:
+    var cuts = Growing[f64]()
+    defer cuts.close()
+    for f in fractions:
+        if cuts.count == 0 or (f - cuts.items[cuts.count - 1]) * length > tolerance: try cuts.push(f)
+    if cuts.count > 1 and (cuts.items[0] + 1.0 - cuts.items[cuts.count - 1]) * length <= tolerance: cuts.count -= 1
+    var number = first_number
+    for at in 0..<cuts.count:
+        let low = cuts.items[at]
+        let high = cuts.items[at + 1] if at + 1 < cuts.count else cuts.items[0] + 1.0
+        let start = try result.edge_at(piece, low)
+        let end = try result.edge_at(piece, high - 1.0 if high > 1.0 else high)
+        try out.push(ProfileEdge(1, start, end, piece.center, piece.radius, piece.sweep * (high - low), -1, piece.curve, number))
+        number += 1
+
+## Where pieces `i` and `j` meet, as cuts of both (a curve's end on the
+## other piece cuts it there too).
+func pieces_meet(result: Profiles*, pieces: const Growing[ProfileEdge]*, i: usize, j: usize, tolerance: f64, cuts: Growing[PieceCut]*) -> !:
+    let a = pieces.items[i]
+    let b = pieces.items[j]
+    var found = Growing[f64]()
+    defer found.close()
+    if a.kind != 2 and b.kind != 2:
+        try exact_meets(result, &a, &b, tolerance, &found)
+    else:
+        try sampled_meets(result, &a, &b, tolerance, &found)
+    # Ends on the other piece: touching, T-junctions, overlaps.
+    try ends_on(result, &a, &b, false, tolerance, &found)
+    try ends_on(result, &b, &a, true, tolerance, &found)
+    var at: usize = 0
+    while at + 1 < found.count:
+        try cuts.push(PieceCut(i, clamp_fraction(found.items[at])))
+        try cuts.push(PieceCut(j, clamp_fraction(found.items[at + 1])))
+        at += 2
+
+## The ends of `piece` lying on `other`: fraction pairs onto `found` (the
+## pair's order swapped when `swapped`).
+func ends_on(result: Profiles*, piece: const ProfileEdge*, other: const ProfileEdge*, swapped: bool, tolerance: f64, found: Growing[f64]*) -> !:
+    for own in [0.0, 1.0]:
+        let end = piece.start if own == 0.0 else piece.end
+        let (on, fraction) = try arranged_nearest_on(result, other, end)
+        if on > tolerance: continue
+        try found.push(fraction if swapped else own)
+        try found.push(own if swapped else fraction)
+
+## Lines and arcs meeting, in closed form: fraction pairs onto `found`.
+func exact_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdge*, tolerance: f64, found: Growing[f64]*) -> !:
+    let (ax, ay) = result.planar(a.start)
+    let (bx, by) = result.planar(b.start)
+    if a.kind == 0 and b.kind == 0:
+        let (ex, ey) = result.planar(a.end)
+        let (fx, fy) = result.planar(b.end)
+        let dax = ex - ax
+        let day = ey - ay
+        let dbx = fx - bx
+        let dby = fy - by
+        let d = dax * dby - day * dbx
+        let la = math.hypot(dax, day)
+        let lb = math.hypot(dbx, dby)
+        # Parallel lines meet only end on line (handled by the caller).
+        if math.abs(d) <= 1e-12 * la * lb: return
+        let s = ((bx - ax) * dby - (by - ay) * dbx) / d
+        let t = ((bx - ax) * day - (by - ay) * dax) / d
+        if within_slack(s, tolerance / la) and within_slack(t, tolerance / lb):
+            try found.push(s)
+            try found.push(t)
+        return
+    if a.kind == 0 or b.kind == 0:
+        let flip = b.kind == 0
+        let line = b if flip else a
+        let arc = a if flip else b
+        let (sx, sy) = result.planar(line.start)
+        let (ex, ey) = result.planar(line.end)
+        let (cx, cy) = result.planar(arc.center)
+        let dx = ex - sx
+        let dy = ey - sy
+        let l2 = dx * dx + dy * dy
+        let fx = sx - cx
+        let fy = sy - cy
+        # |s + t d - c|² = r²: t² l2 + 2 t (f·d) + |f|² - r² = 0.
+        let half_b = fx * dx + fy * dy
+        let c = fx * fx + fy * fy - arc.radius * arc.radius
+        var disc = half_b * half_b - l2 * c
+        # A line within tolerance of touching touches.
+        let reach = 2.0 * arc.radius * tolerance * l2
+        if disc < -reach: return
+        disc = math.max(disc, 0.0)
+        let spread = math.sqrt(disc)
+        for t in [(-half_b - spread) / l2, (-half_b + spread) / l2]:
+            if not within_slack(t, tolerance / math.sqrt(l2)): continue
+            let p = Vector3(sx + t * dx, sy + t * dy, 0.0)
+            let (onto, fraction) = arc_fraction(result, arc, p)
+            if not onto: continue
+            try found.push(fraction if flip else t)
+            try found.push(t if flip else fraction)
+            if spread <= 1e-12 * l2: break
+        return
+    # Two circles.
+    let (c1x, c1y) = result.planar(a.center)
+    let (c2x, c2y) = result.planar(b.center)
+    let d = math.hypot(c2x - c1x, c2y - c1y)
+    if d <= tolerance: return
+    if d > a.radius + b.radius + tolerance or d < math.abs(a.radius - b.radius) - tolerance: return
+    let along = (a.radius * a.radius - b.radius * b.radius + d * d) / (2.0 * d)
+    let h = math.sqrt(math.max(0.0, a.radius * a.radius - along * along))
+    let ux = (c2x - c1x) / d
+    let uy = (c2y - c1y) / d
+    let mx = c1x + along * ux
+    let my = c1y + along * uy
+    for side in [-1.0, 1.0]:
+        let p = Vector3(mx - side * h * uy, my + side * h * ux, 0.0)
+        let (on_a, fa) = arc_fraction(result, a, p)
+        let (on_b, fb) = arc_fraction(result, b, p)
+        if on_a and on_b:
+            try found.push(fa)
+            try found.push(fb)
+        if h <= tolerance: break
+
+## Where a point (plane coordinates) lies along arc `arc`, as a fraction;
+## whether it is on the arc's sweep.
+func arc_fraction(result: Profiles*, arc: const ProfileEdge*, p: Vector3) -> (bool, f64):
+    let (cx, cy) = result.planar(arc.center)
+    let (sx, sy) = result.planar(arc.start)
+    var turn = math.atan2(p.y - cy, p.x - cx) - math.atan2(sy - cy, sx - cx)
+    if arc.sweep < 0.0: turn = -turn
+    while turn < -1e-9: turn += 2.0 * math.pi
+    while turn >= 2.0 * math.pi - 1e-9: turn -= 2.0 * math.pi
+    let sweep = math.abs(arc.sweep)
+    let slack = 1e-7
+    if turn <= sweep + slack: return (true, turn / sweep)
+    # Just before the start wraps to near a whole turn.
+    if 2.0 * math.pi - turn <= slack: return (true, 0.0)
+    return (false, 0.0)
+
+## Pieces with a B-spline: their samples' crossings, refined by Newton on
+## the exact curves.
+func sampled_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdge*, tolerance: f64, found: Growing[f64]*) -> !:
+    let n: usize = 64
+    var pa = Growing[Vector3]()
+    defer pa.close()
+    var pb = Growing[Vector3]()
+    defer pb.close()
+    for at in 0..<n + 1:
+        let (x, y) = result.planar(try result.edge_at(a, (f64)at / (f64)n))
+        try pa.push(Vector3(x, y, 0.0))
+        let (u, v) = result.planar(try result.edge_at(b, (f64)at / (f64)n))
+        try pb.push(Vector3(u, v, 0.0))
+    for i in 0..<n:
+        for j in 0..<n:
+            let p0 = pa.items[i]
+            let p1 = pa.items[i + 1]
+            let q0 = pb.items[j]
+            let q1 = pb.items[j + 1]
+            let dx = p1.x - p0.x
+            let dy = p1.y - p0.y
+            let ex = q1.x - q0.x
+            let ey = q1.y - q0.y
+            let d = dx * ey - dy * ex
+            if math.abs(d) <= 1e-18: continue
+            let s = ((q0.x - p0.x) * ey - (q0.y - p0.y) * ex) / d
+            let t = ((q0.x - p0.x) * dy - (q0.y - p0.y) * dx) / d
+            if s < -0.01 or s > 1.01 or t < -0.01 or t > 1.01: continue
+            var fa = ((f64)i + s) / (f64)n
+            var fb = ((f64)j + t) / (f64)n
+            # Newton on P(fa) - Q(fb) = 0, slopes by central differences.
+            for _ in 0..<(usize)20:
+                let (px, py) = result.planar(try result.edge_at(a, fa))
+                let (qx, qy) = result.planar(try result.edge_at(b, fb))
+                let rx = px - qx
+                let ry = py - qy
+                if math.hypot(rx, ry) <= tolerance * 1e-3: break
+                let h = 1e-6
+                let (pxa, pya) = result.planar(try result.edge_at(a, clamp_fraction(fa + h)))
+                let (pxb, pyb) = result.planar(try result.edge_at(a, clamp_fraction(fa - h)))
+                let (qxa, qya) = result.planar(try result.edge_at(b, clamp_fraction(fb + h)))
+                let (qxb, qyb) = result.planar(try result.edge_at(b, clamp_fraction(fb - h)))
+                let ja = Vector3((pxa - pxb) / (2.0 * h), (pya - pyb) / (2.0 * h), 0.0)
+                let jb = Vector3((qxa - qxb) / (2.0 * h), (qya - qyb) / (2.0 * h), 0.0)
+                let det = -ja.x * jb.y + ja.y * jb.x
+                if math.abs(det) <= 1e-18: break
+                fa -= (-rx * jb.y + ry * jb.x) / det
+                fb -= (ja.x * ry - ja.y * rx) / det
+                fa = clamp_fraction(fa)
+                fb = clamp_fraction(fb)
+            let (px, py) = result.planar(try result.edge_at(a, fa))
+            let (qx, qy) = result.planar(try result.edge_at(b, fb))
+            if math.hypot(px - qx, py - qy) <= tolerance:
+                try found.push(fa)
+                try found.push(fb)
+
+## The point of `piece` nearest `p`: its distance and fraction.
+func arranged_nearest_on(result: Profiles*, piece: const ProfileEdge*, p: Vector3) -> (f64, f64)!:
+    let (x, y) = result.planar(p)
+    if piece.kind == 0:
+        let (sx, sy) = result.planar(piece.start)
+        let (ex, ey) = result.planar(piece.end)
+        let dx = ex - sx
+        let dy = ey - sy
+        let l2 = dx * dx + dy * dy
+        let t = math.max(0.0, math.min(1.0, ((x - sx) * dx + (y - sy) * dy) / l2)) if l2 > 0.0 else 0.0
+        return (math.hypot(sx + t * dx - x, sy + t * dy - y), t)
+    if piece.kind == 1:
+        let (cx, cy) = result.planar(piece.center)
+        let (on, fraction) = arc_fraction(result, piece, Vector3(x, y, 0.0))
+        if on: return (math.abs(math.hypot(x - cx, y - cy) - piece.radius), fraction)
+        let (sx, sy) = result.planar(piece.start)
+        let (ex, ey) = result.planar(piece.end)
+        let ds = math.hypot(sx - x, sy - y)
+        let de = math.hypot(ex - x, ey - y)
+        return (ds, 0.0) if ds <= de else (de, 1.0)
+    # A spline: the nearest of its samples, refined by bisection-free
+    # Newton on the distance's slope.
+    let n: usize = 64
+    var best = 0.0
+    var best_distance = 1.0e300
+    for at in 0..<n + 1:
+        let f = (f64)at / (f64)n
+        let (sx, sy) = result.planar(try result.edge_at(piece, f))
+        let d = math.hypot(sx - x, sy - y)
+        if d < best_distance:
+            best_distance = d
+            best = f
+    let h = 1e-6
+    for _ in 0..<(usize)20:
+        let (sx, sy) = result.planar(try result.edge_at(piece, best))
+        let (ax, ay) = result.planar(try result.edge_at(piece, clamp_fraction(best + h)))
+        let (bx, by) = result.planar(try result.edge_at(piece, clamp_fraction(best - h)))
+        let tx = (ax - bx) / (2.0 * h)
+        let ty = (ay - by) / (2.0 * h)
+        let t2 = tx * tx + ty * ty
+        if t2 <= 0.0: break
+        let step = ((sx - x) * tx + (sy - y) * ty) / t2
+        best = clamp_fraction(best - step)
+        if math.abs(step) <= 1e-12: break
+    let (sx, sy) = result.planar(try result.edge_at(piece, best))
+    return (math.hypot(sx - x, sy - y), best)
+
+## A piece's length (arcs by their sweep, splines by their samples).
+func piece_length(result: Profiles*, piece: const ProfileEdge*) -> f64!:
+    if piece.kind == 0: return piece.end.subtract(piece.start).length()
+    if piece.kind == 1: return math.abs(piece.sweep) * piece.radius
+    var total = 0.0
+    var previous = piece.start
+    for at in 1..<(usize)65:
+        let p = try result.edge_at(piece, (f64)at / 64.0)
+        total += p.subtract(previous).length()
+        previous = p
+    return total
+
+## The part of `piece` from fraction `low` to `high`.
+func piece_part(result: Profiles*, piece: const ProfileEdge*, low: f64, high: f64) -> ProfileEdge!:
+    let start = try result.edge_at(piece, low)
+    let end = try result.edge_at(piece, high)
+    if piece.kind == 0: return ProfileEdge(0, start, end, Vector3(), 0.0, 0.0, -1)
+    if piece.kind == 1:
+        let whole = low == 0.0 and high == 1.0
+        return ProfileEdge(1, piece.start if whole else start, piece.end if whole else end, piece.center, piece.radius, piece.sweep * (high - low), -1)
+    if low == 0.0 and high == 1.0: return ProfileEdge(2, piece.start, piece.end, Vector3(), 0.0, 0.0, piece.spline)
+    let spline = try result.spline_part(piece.spline, low, high)
+    return ProfileEdge(2, start, end, Vector3(), 0.0, 0.0, spline)
+
+## The sub-edges as a graph: their ends merged into vertices within
+## `tolerance`, each a pair of half-edges (repeats of one sub-edge, as
+## overlapping curves make, kept once), and pieces left dangling dropped.
+func build_graph(result: Profiles*, subs: Growing[ProfileEdge]*, tolerance: f64, vertices: Growing[Vector3]*, halves: Growing[SketchHalf]*) -> !:
+    var ends = Growing[usize]()
+    defer ends.close()
+    for e in subs.view():
+        try ends.push(try vertex_of(vertices, e.start, tolerance))
+        try ends.push(try vertex_of(vertices, e.end, tolerance))
+    for index in 0..<subs.count:
+        let tail = ends.items[2 * index]
+        let head = ends.items[2 * index + 1]
+        let e = subs.items[index]
+        if tail == head and e.kind == 0: continue
+        if try repeats_earlier(result, subs, &ends, index, tolerance): continue
+        let (forward_angle, forward_curving) = try leaving_way(result, &e, false)
+        let (backward_angle, backward_curving) = try leaving_way(result, &e, true)
+        try halves.push(SketchHalf(index, false, tail, head, forward_angle, forward_curving, -1, true))
+        try halves.push(SketchHalf(index, true, head, tail, backward_angle, backward_curving, -1, true))
+    # Dangling pieces go, one end at a time.
+    var degree = Growing[i64]()
+    defer degree.close()
+    try degree.fill(vertices.count, 0)
+    for h in halves.view(): degree.items[h.tail] += 1
+    var pruned = true
+    while pruned:
+        pruned = false
+        var at: usize = 0
+        while at < halves.count:
+            let h = halves.items[at]
+            if h.alive and (degree.items[h.tail] == 1 or degree.items[h.head] == 1):
+                halves.items[at].alive = false
+                halves.items[at + 1].alive = false
+                degree.items[h.tail] -= 1
+                degree.items[h.head] -= 1
+                pruned = true
+            at += 2
+
+## Whether sub-edge `index` repeats an earlier one: the same ends and the
+## same middle.
+func repeats_earlier(result: Profiles*, subs: Growing[ProfileEdge]*, ends: const Growing[usize]*, index: usize, tolerance: f64) -> bool!:
+    let a = ends.items[2 * index]
+    let b = ends.items[2 * index + 1]
+    let middle = try result.edge_at(&subs.items[index], 0.5)
+    for other in 0..<index:
+        let c = ends.items[2 * other]
+        let d = ends.items[2 * other + 1]
+        if not ((a == c and b == d) or (a == d and b == c)): continue
+        if middle.subtract(try result.edge_at(&subs.items[other], 0.5)).length() <= tolerance: return true
+    return false
+
+## The vertex at `p` (an existing one within `tolerance`, else a new one).
+func vertex_of(vertices: Growing[Vector3]*, p: Vector3, tolerance: f64) -> usize!:
+    for at in 0..<vertices.count:
+        if vertices.items[at].subtract(p).length() <= tolerance: return at
+    try vertices.push(p)
+    return vertices.count - 1
+
+## The direction (angle in plane coordinates) a sub-edge leaves its tail
+## (`backward`: leaves its end going back), and how it turns from there
+## (signed curvature: positive to the left).
+func leaving_way(result: Profiles*, e: const ProfileEdge*, backward: bool) -> (f64, f64)!:
+    if e.kind == 0:
+        let (sx, sy) = result.planar(e.start)
+        let (ex, ey) = result.planar(e.end)
+        return (math.atan2(sy - ey, sx - ex), 0.0) if backward else (math.atan2(ey - sy, ex - sx), 0.0)
+    if e.kind == 1:
+        let (cx, cy) = result.planar(e.center)
+        let (px, py) = result.planar(e.end if backward else e.start)
+        # Counterclockwise arcs leave square to the radius, to the left.
+        let left = (e.sweep > 0.0) != backward
+        let rx = px - cx
+        let ry = py - cy
+        let direction = math.atan2(rx, -ry) if left else math.atan2(-rx, ry)
+        return (direction, (1.0 if left else -1.0) / e.radius)
+    # A spline: its first and second differences at the end it leaves.
+    let h = 1e-5
+    let f0 = 1.0 if backward else 0.0
+    let s = -1.0 if backward else 1.0
+    let (x0, y0) = result.planar(try result.edge_at(e, f0))
+    let (x1, y1) = result.planar(try result.edge_at(e, f0 + s * h))
+    let (x2, y2) = result.planar(try result.edge_at(e, f0 + s * 2.0 * h))
+    let dx = (x1 - x0) / h
+    let dy = (y1 - y0) / h
+    let ddx = (x2 - 2.0 * x1 + x0) / (h * h)
+    let ddy = (y2 - 2.0 * y1 + y0) / (h * h)
+    let speed = math.hypot(dx, dy)
+    let curving = (dx * ddy - dy * ddx) / math.max(speed * speed * speed, 1e-300)
+    return (math.atan2(dy, dx), curving)
+
+## The faces: from each half-edge not yet on one, at its head the next
+## edge clockwise from the way back (the face kept on the left), until
+## back where it began.
+func trace_faces(halves: Growing[SketchHalf]*, vertex_count: usize, faces: Growing[usize]*, offsets: Growing[usize]*) -> !:
+    try offsets.push(0)
+    for start in 0..<halves.count:
+        if not halves.items[start].alive or halves.items[start].face >= 0: continue
+        let face = (i64)offsets.count - 1
+        var at = start
+        var guard: usize = 0
+        while halves.items[at].face < 0:
+            halves.items[at].face = face
+            try faces.push(at)
+            at = next_of(halves, at)
+            guard += 1
+            if guard > halves.count: error(invalid, "a sketch's curves could not be traced into faces")
+        try offsets.push(faces.count)
+    _ = vertex_count
+
+## The half-edge after `at` round its face: at its head, the outgoing edge
+## just clockwise of the twin (the way back).
+func next_of(halves: Growing[SketchHalf]*, at: usize) -> usize:
+    let h = halves.items[at]
+    let twin = twin_of(at)
+    let back = halves.items[twin]
+    var best: usize = twin
+    var best_turn = 10.0
+    for index in 0..<halves.count:
+        let o = halves.items[index]
+        if not o.alive or o.tail != h.head or index == twin: continue
+        let turn = clockwise_turn(&back, &o)
+        if turn < best_turn:
+            best_turn = turn
+            best = index
+    return best
+
+## The outline of a face's half-edges (plane coordinates), for its area.
+func face_outline(result: Profiles*, subs: Growing[ProfileEdge]*, halves: Growing[SketchHalf]*, loop: const usize[], out: Growing[Vector3]*) -> !:
+    out.clear()
+    for at in loop:
+        let h = halves.items[at]
+        let e = subs.items[h.edge]
+        var steps: usize = 1
+        if e.kind == 1: steps = (usize)math.max(2.0, math.ceil(math.abs(e.sweep) / 0.1745))
+        if e.kind == 2: steps = 32
+        for step in 0..<steps:
+            let f = (f64)step / (f64)steps
+            let (x, y) = result.planar(try result.edge_at(&e, 1.0 - f if h.backward else f))
+            try out.push(Vector3(x, y, 0.0))
+
+## The faces taken by default: bounded faces of islands alternating from
+## the outside in (a face's depth: how many bounded faces of other pieces
+## hold it).
+func alternate_islands(a: const Arranged*, take: Growing[bool]*) -> !:
+    let count = a.areas.count
+    for f in 0..<count:
+        if a.areas.items[f] <= 0.0: continue
+        let probe = a.left_point(f)
+        var depth = 0
+        for other in 0..<count:
+            if a.areas.items[other] <= 0.0 or a.pieces_of.items[other] == a.pieces_of.items[f]: continue
+            if inside(a.outline_of(other), probe): depth += 1
+        take.items[f] = depth % 2 == 0
+
+## Union-find's root of `at`.
+func root_of(parent: Growing[usize]*, at: usize) -> usize:
+    var x = at
+    while parent.items[x] != x:
+        parent.items[x] = parent.items[parent.items[x]]
+        x = parent.items[x]
+    return x
+
+## A point just left of an outline's first segment's middle: inside a
+## counterclockwise outline, outside a clockwise one.
+func left_of_start(points: const Vector3[]) -> Vector3:
+    let a = points[0]
+    let b = points[1 % points.length]
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let l = math.max(math.hypot(dx, dy), 1e-300)
+    let reach = l * 1e-3
+    return Vector3((a.x + b.x) * 0.5 - dy / l * reach, (a.y + b.y) * 0.5 + dx / l * reach, 0.0)
+
+## Face key: its half-edges' sketch curves and the way each is run.
+func face_key(subs: Growing[ProfileEdge]*, halves: Growing[SketchHalf]*, loop: const usize[], out: Growing[u8]*) -> !:
+    var parts = Growing[i64]()
+    defer parts.close()
+    for at in loop:
+        let h = halves.items[at]
+        let e = subs.items[h.edge]
+        let code = e.curve * 2 + (1 if h.backward else 0)
+        var seen = false
+        for p in parts.view():
+            if p == code: seen = true
+        if not seen: try parts.push(code)
+    sort_codes(&parts)
+    for index in 0..<parts.count:
+        if index > 0: try out.push(44)
+        try push_number(out, parts.items[index] // 2)
+        try out.push(45 if parts.items[index] % 2 == 1 else 43)
+
+## Whether `key` is one of `keys` (apart by `;`).
+func key_listed(keys: str, key: str) -> bool:
+    var start: usize = 0
+    let bytes = keys.bytes
+    while start <= bytes.length:
+        var end = start
+        while end < bytes.length and bytes[end] != 59: end += 1
+        if trimmed((str)bytes[start..<end]) == key: return true
+        start = end + 1
+    return false
+
+## The outline of the taken faces together: the half-edges with a taken
+## face on their left and none on their right, traced into loops (around
+## each vertex, the next such edge clockwise), then nested into regions
+## (counterclockwise loops outer, clockwise ones holes of the smallest
+## outer loop holding them).
+func chosen_regions(result: Profiles*, subs: Growing[ProfileEdge]*, halves: Growing[SketchHalf]*, vertex_count: usize, take: const Growing[bool]*, tolerance: f64) -> !:
+    # Boundary half-edges stay alive; the rest leave the tracing (decided
+    # for all before any face is cleared).
+    var boundary = Growing[bool]()
+    defer boundary.close()
+    for at in 0..<halves.count:
+        let h = halves.items[at]
+        let twin = halves.items[twin_of(at)]
+        let left = h.alive and h.face >= 0 and take.items[(usize)h.face]
+        let right = twin.alive and twin.face >= 0 and take.items[(usize)twin.face]
+        try boundary.push(left and not right)
+    for at in 0..<halves.count:
+        halves.items[at].alive = boundary.items[at]
+        halves.items[at].face = -1
+    try result.loop_offsets.push(0)
+    for start in 0..<halves.count:
+        if not halves.items[start].alive or halves.items[start].face >= 0: continue
+        var at = start
+        var guard: usize = 0
+        while halves.items[at].face < 0:
+            halves.items[at].face = 0
+            let h = halves.items[at]
+            var e = subs.items[h.edge]
+            try result.edges.push(e)
+            if h.backward: try result.reverse_edge(result.edges.count - 1)
+            at = next_boundary(halves, at)
+            guard += 1
+            if guard > halves.count: error(invalid, "a sketch's profile could not be traced")
+        let first = result.loop_offsets.items[result.loop_offsets.count - 1]
+        try join_parts(result, first, tolerance)
+        # Ends that met within tolerance meet exactly.
+        let last = result.edges.count - 1
+        for index in first..<last:
+            result.edges.items[index + 1].start = result.edges.items[index].end
+        result.edges.items[first].start = result.edges.items[last].end
+        try result.loop_offsets.push(result.edges.count)
+    _ = vertex_count
+    _ = tolerance
+    try nest_oriented(result)
+
+## Loop edges from `first` on: neighbors that are parts of one sketch curve
+## going on the same way (a line straight on, an arc round the same circle)
+## joined into one, the loop's last and first included.
+func join_parts(result: Profiles*, first: usize, tolerance: f64) -> !:
+    var at = first
+    while at + 1 < result.edges.count:
+        if continues(&result.edges.items[at], &result.edges.items[at + 1], tolerance):
+            result.edges.items[at].end = result.edges.items[at + 1].end
+            result.edges.items[at].sweep += result.edges.items[at + 1].sweep
+            for move in at + 1..<result.edges.count - 1:
+                result.edges.items[move] = result.edges.items[move + 1]
+            result.edges.count -= 1
+        else:
+            at += 1
+    # Round the loop's seam: the last edge going on into the first.
+    let last = result.edges.count - 1
+    if last > first and continues(&result.edges.items[last], &result.edges.items[first], tolerance):
+        var joined = result.edges.items[last]
+        joined.end = result.edges.items[first].end
+        joined.sweep += result.edges.items[first].sweep
+        result.edges.items[first] = joined
+        result.edges.count -= 1
+
+## Whether `b` goes on from `a` as one curve: the same sketch curve, both
+## lines in line, or both arcs of one circle turning one way.
+func continues(a: const ProfileEdge*, b: const ProfileEdge*, tolerance: f64) -> bool:
+    if a.curve < 0 or a.curve != b.curve or a.kind != b.kind or a.kind == 2: return false
+    if a.kind == 0:
+        let d1 = a.end.subtract(a.start)
+        let d2 = b.end.subtract(b.start)
+        return d1.cross(d2).length() <= tolerance * math.max(d1.length(), d2.length()) and d1.dot(d2) > 0.0
+    return a.center.subtract(b.center).length() <= tolerance and math.abs(a.radius - b.radius) <= tolerance and (a.sweep > 0.0) == (b.sweep > 0.0)
+
+## The next boundary half-edge after `at`: at its head, the alive one
+## leaving most clockwise from the way back.
+func next_boundary(halves: Growing[SketchHalf]*, at: usize) -> usize:
+    let h = halves.items[at]
+    let back = halves.items[twin_of(at)]
+    var best: usize = at
+    var best_turn = 10.0
+    for index in 0..<halves.count:
+        let o = halves.items[index]
+        if not o.alive or o.tail != h.head or o.face >= 0: continue
+        let turn = clockwise_turn(&back, &o)
+        if turn < best_turn:
+            best_turn = turn
+            best = index
+    return best
+
+## Loops already oriented (outer counterclockwise, holes clockwise) into
+## regions: each hole in the smallest outer loop holding it.
+func nest_oriented(result: Profiles*) -> !:
+    let count = result.loop_count()
+    var outlines = Growing[Vector3]()
+    defer outlines.close()
+    var offsets = Growing[usize]()
+    defer offsets.close()
+    var scratch = Growing[Vector3]()
+    defer scratch.close()
+    var areas = Growing[f64]()
+    defer areas.close()
+    try offsets.push(0)
+    for loop in 0..<count:
+        try result.outline(loop, &scratch)
+        try areas.push(signed_area(scratch.view()))
+        for p in scratch.view(): try outlines.push(p)
+        try offsets.push(outlines.count)
+    try result.region_offsets.push(0)
+    for loop in 0..<count:
+        if areas.items[loop] <= 0.0: continue
+        try result.region_loops.push(loop)
+        for hole in 0..<count:
+            if areas.items[hole] >= 0.0: continue
+            let probe = outlines.items[offsets.items[hole]]
+            if not inside(outlines.view()[offsets.items[loop]..<offsets.items[loop + 1]], probe): continue
+            # The smallest outer loop holding it.
+            var smallest = true
+            for other in 0..<count:
+                if other == loop or areas.items[other] <= 0.0 or areas.items[other] >= areas.items[loop]: continue
+                if inside(outlines.view()[offsets.items[other]..<offsets.items[other + 1]], probe): smallest = false
+            if smallest: try result.region_loops.push(hole)
+        try result.region_offsets.push(result.region_loops.count)
+
+## How far clockwise from the way back (`back`'s direction) `o` leaves,
+## in (0, 2π]: among edges leaving the same way, one curving more to the
+## right of it comes first.
+func clockwise_turn(back: const SketchHalf*, o: const SketchHalf*) -> f64:
+    var turn = back.angle - o.angle
+    while turn <= 0.0: turn += 2.0 * math.pi
+    while turn > 2.0 * math.pi: turn -= 2.0 * math.pi
+    if turn <= 1e-9 or turn >= 2.0 * math.pi - 1e-9:
+        turn = 2.0 * math.pi if o.curving > back.curving else 1e-10
+    return turn
+
+## The other half of half-edge `at`'s pair.
+func twin_of(at: usize) -> usize:
+    return at + 1 if at % 2 == 0 else at - 1
+
+func within_slack(t: f64, slack: f64) -> bool:
+    return t >= -slack and t <= 1.0 + slack
+
+func clamp_fraction(t: f64) -> f64:
+    return math.max(0.0, math.min(1.0, t))
+
+func sort_fractions(values: Growing[f64]*):
+    for i in 1..<values.count:
+        let v = values.items[i]
+        var j = i
+        while j > 0 and values.items[j - 1] > v:
+            values.items[j] = values.items[j - 1]
+            j -= 1
+        values.items[j] = v
+
+func sort_codes(values: Growing[i64]*):
+    for i in 1..<values.count:
+        let v = values.items[i]
+        var j = i
+        while j > 0 and values.items[j - 1] > v:
+            values.items[j] = values.items[j - 1]
+            j -= 1
+        values.items[j] = v
