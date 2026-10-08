@@ -98,6 +98,30 @@ func contacts_cross(p: Vector3, way_a: Vector3, into_a: Vector3, reach_a: f64, w
 ## 3): the region between the sharp corner and the patch, within the
 ## setback planes. The patch's quads are named `name`.
 func setback_tool(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, name: str) -> interop.Reference[CadModel]!:
+    var quads = Growing[Vector3]()
+    defer quads.close()
+    var quad_knots = Growing[f64]()
+    defer quad_knots.close()
+    try setback_patch(w, corner, radius, continuity, &quads, &quad_knots)
+    let p = w.points.items[(usize)corner.vertex]
+    let cone = try corner_cone(w, corner, radius)
+    return try corner_solid(p, corner, quads.view(), cone[..<3], quad_knots.view(), quad_knots.count - 6, name)
+
+## Each face's outward normal at a setback corner, turned to face away
+## from the corner's inside (along the edge not on the face).
+func corner_cone(w: const Shape*, corner: const Setback*, radius: f64) -> Vector3[3]!:
+    let frame = try setback_frame(w, corner, radius)
+    var cone: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+    for i in 0..<(usize)3:
+        let n = face_outward(w, frame.faces[i])
+        cone[i] = n if n.dot(corner.ways[(i + 2) % 3]) > 0.0 else n.multiply_scalar(-1.0)
+    return cone
+
+## A setback corner's patch for fillets of `radius` and `continuity`: six
+## quads onto `quads` (patch_fit.lucb's order), their knots onto
+## `quad_knots`. Its control points must stay between the faces and the
+## setback planes (so it meets the body only along curves both carry).
+func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, quads: Growing[Vector3]*, quad_knots: Growing[f64]*) -> !:
     let frame = try setback_frame(w, corner, radius)
     let reaches = frame.reaches
     let intos = frame.intos
@@ -105,14 +129,12 @@ func setback_tool(w: const Shape*, corner: const Setback*, radius: f64, continui
     let p = w.points.items[(usize)corner.vertex]
     # The hole's six curves: each fillet's end section (as its tool's
     # profile makes it) from face i - 1 to face i, then the curve on face i
-    # to the next fillet's contact, legs along the contact lines.
-    let g2: f64[3] = [0.0, 0.3, 0.6]
-    let g3: f64[4] = [0.0, 0.2, 0.4, 0.6]
-    let half: usize = 3 if continuity == 2 else 4
-    let degree = (i64)half * 2 - 1
-    let m = half * 2
+    # to the next fillet's contact, legs along the contact lines. All are
+    # the fillet's section (fillet_section), so they share knots.
     var curves = Growing[Vector3]()
     defer curves.close()
+    var knots = Growing[f64]()
+    defer knots.close()
     var sides = Growing[HoleSide]()
     defer sides.close()
     for i in 0..<(usize)3:
@@ -120,35 +142,26 @@ func setback_tool(w: const Shape*, corner: const Setback*, radius: f64, continui
         let foot = p.add(corner.ways[i].multiply_scalar(corner.distances[i]))
         let ta = foot.add(intos[i * 2].multiply_scalar(reaches[i]))
         let tb = foot.add(intos[i * 2 + 1].multiply_scalar(reaches[i]))
-        for k in 0..<half: try curves.push(ta.add(foot.subtract(ta).multiply_scalar(g2[k] if half == 3 else g3[k])))
-        for k in 0..<half: try curves.push(tb.add(foot.subtract(tb).multiply_scalar(g2[half - 1 - k] if half == 3 else g3[half - 1 - k])))
+        knots.clear()
+        try fillet_section(ta, tb, foot, continuity, &curves, &knots)
         try sides.push(HoleSide(true, corner.ways[i]))
         let cross = try contacts_cross(p, corner.ways[i], intos[i * 2 + 1], reaches[i], corner.ways[next], intos[next * 2], reaches[next])
         let foot_next = p.add(corner.ways[next].multiply_scalar(corner.distances[next]))
         let tc = foot_next.add(intos[next * 2].multiply_scalar(reaches[next]))
-        for k in 0..<half: try curves.push(tb.add(cross.subtract(tb).multiply_scalar(g2[k] if half == 3 else g3[k])))
-        for k in 0..<half: try curves.push(tc.add(cross.subtract(tc).multiply_scalar(g2[half - 1 - k] if half == 3 else g3[half - 1 - k])))
+        knots.clear()
+        try fillet_section(tb, tc, cross, continuity, &curves, &knots)
         try sides.push(HoleSide(false, face_outward(w, faces[i])))
-    var quads = Growing[Vector3]()
-    defer quads.close()
-    try corner_patch(curves.view(), sides.view(), degree, &quads)
-    # The patch must stay within the corner: on the solid's side of each
-    # face, and short of each setback plane. Its control points' hull
-    # holds it, so the booleans can take it as touching there.
+    try corner_patch(curves.view(), knots.view(), sides.view(), continuity, quads, quad_knots)
     let slack = radius * 1e-9
-    var cone: Vector3[3] = [Vector3(), Vector3(), Vector3()]
-    for i in 0..<(usize)3:
-        let n = face_outward(w, faces[i])
-        cone[i] = n if n.dot(corner.ways[(i + 2) % 3]) > 0.0 else n.multiply_scalar(-1.0)
+    let cone = try corner_cone(w, corner, radius)
     for q in quads.view():
         for i in 0..<(usize)3:
             if q.subtract(p).dot(cone[i]) < -slack or q.subtract(p).dot(corner.ways[i]) > corner.distances[i] + slack:
                 error(invalid, "the G2 corner patch would leave its corner: use G1 there")
-    return try corner_solid(p, corner, quads.view(), cone[..<3], degree, m, name)
 
 ## The corner tool's B-rep: the six quads, a cap on each setback plane and
 ## a piece of each face, between corner `p` and the patch.
-func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], cone: const Vector3[], degree: i64, m: usize, name: str) -> interop.Reference[CadModel]!:
+func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], cone: const Vector3[], knots: const f64[], m: usize, name: str) -> interop.Reference[CadModel]!:
     let size = (quads[0].subtract(p)).length() * 4.0
     let solid = try new_solid(size)
     defer solid.release()
@@ -172,10 +185,14 @@ func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], co
         lines[i] = try b.add_line(apex, feet[i])
         toward_before[i] = try b.add_line(feet[i], corners[i * 2])
         toward_after[i] = try b.add_line(feet[i], corners[i * 2 + 1])
-    # Each curve's halves and each seam, from the quads' own rows.
-    var knots = Growing[f64]()
-    defer knots.close()
-    for k in 0..<m * 2: try knots.push(0.0 if k < m else 1.0)
+    # Each curve's halves and each seam, from the quads' own rows (a half
+    # run from the middle back takes the knots reversed).
+    var reversed = Growing[f64]()
+    defer reversed.close()
+    var k_ = knots.length
+    while k_ > 0:
+        k_ -= 1
+        try reversed.push(1.0 - knots[k_])
     var weights = Growing[f64]()
     defer weights.close()
     try weights.fill(mm, 1.0)
@@ -188,18 +205,18 @@ func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], co
         let next = (k + 1) % 6
         net.clear()
         for a in 0..<m: try net.push(quads[k * mm + a * m])
-        firsts[k] = try b.add_spline_edge(corners[k], middles[k], net.view(), weights.view()[..<m], degree, knots.view(), true)
+        firsts[k] = try b.add_spline_edge(corners[k], middles[k], net.view(), weights.view()[..<m], 5, knots, true)
         net.clear()
         for b_ in 0..<m: try net.push(quads[next * mm + m - 1 - b_])
-        seconds[k] = try b.add_spline_edge(middles[k], corners[next], net.view(), weights.view()[..<m], degree, knots.view(), true)
+        seconds[k] = try b.add_spline_edge(middles[k], corners[next], net.view(), weights.view()[..<m], 5, reversed.view(), true)
         net.clear()
         for b_ in 0..<m: try net.push(quads[k * mm + (m - 1) * m + b_])
-        seams[k] = try b.add_spline_edge(middles[k], center, net.view(), weights.view()[..<m], degree, knots.view(), true)
+        seams[k] = try b.add_spline_edge(middles[k], center, net.view(), weights.view()[..<m], 5, knots, true)
     # The quads: outward (away from the corner) is du x dv or against it.
     var bu: f64[36]
     var bv: f64[36]
-    bernstein(degree, 0.75, bu[..<36])
-    bernstein(degree, 0.75, bv[..<36])
+    spline_basis(knots, 0.75, bu[..<36])
+    spline_basis(knots, 0.75, bv[..<36])
     let sizes: i64[1] = [4]
     for k in 0..<(usize)6:
         let before = (k + 5) % 6
@@ -212,7 +229,7 @@ func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], co
                 du = du.add(q.multiply_scalar(bu[9 + a] * bv[b_]))
                 dv = dv.add(q.multiply_scalar(bu[a] * bv[9 + b_]))
                 at = at.add(q.multiply_scalar(bu[a] * bv[b_]))
-        let surface = try b.add_spline_surface(quads[k * mm..<(k + 1) * mm], weights.view(), (i64)m, (i64)m, degree, degree, knots.view(), knots.view())
+        let surface = try b.add_spline_surface(quads[k * mm..<(k + 1) * mm], weights.view(), (i64)m, (i64)m, 5, 5, knots, knots)
         let outward = du.cross(dv).dot(at.subtract(p)) > 0.0
         let forward: i64[4] = [firsts[k] + 1, seams[k] + 1, -(seams[before] + 1), seconds[before] + 1]
         let backward: i64[4] = [-(seconds[before] + 1), seams[before] + 1, -(seams[k] + 1), -(firsts[k] + 1)]

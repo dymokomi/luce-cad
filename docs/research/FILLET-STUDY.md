@@ -221,7 +221,9 @@ This is the case that matters for G2 fillets.
 > and 1e-6 only at m = 24 for G0 alone. luce-cad instead fills the hole with six Bezier quads, one
 > per hole corner, with exact outer sides (rows on the sweep or in the face's plane). The seams are
 > G1 by fixed coefficients (μ = 1, ν = t, the six-valent vertex's 2 cos 60°), and G2 is held by
-> least squares. See MODELING.md, "Setback corners".
+> least squares. See MODELING.md, "Setback corners". Degree 5 became the element for everything
+> freeform, so G3 is not degree 7 as below. Its section is a degree 5 B-spline of three spans,
+> eight control points, and its quads are degree 5 nets of two spans.
 
 
 A ball corner is only G1 against G2 fillets: the fillets' end sections are not circular arcs, so no

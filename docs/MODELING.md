@@ -239,14 +239,18 @@ Outside tools are subtracted first, then inside ones added. "Every edge" (no ref
 outside edges only.
 
 **G2 and G3 fillets** are smoother than circular ones: curvature flows into the faces instead of
-jumping at the contact lines. Their cross-section is a Bezier curve between the circular fillet's
-contact points. For G2, it is degree 5, and the first three control points on each side lie along
-that face. For G3, it is degree 7, with four on each side. The curvature is then zero where the
-curve meets each face, and for G3 so is its rate of change.
+jumping at the contact lines. Their cross-section is a degree 5 B-spline between the circular
+fillet's contact points. Degree 5 is the element every freeform curve and patch here uses.
+- **G2:** one span, six control points. The first three on each side lie along that face, at 0, 0.3
+  and 0.6 of the way toward the corner.
+- **G3:** three spans (knots at the thirds), eight control points. The first four on each side lie
+  along that face, at 0, 0.1, 0.2 and 0.6.
 
-The points sit at 0, 0.3 and 0.6 of the way toward the corner (G3: 0, 0.2, 0.4 and 0.6). This keeps
-the curve's middle near the circle's: 0.27 of the way in for a square corner, against the circle's
-0.29.
+The curvature is then zero where the curve meets each face, and for G3 so is its rate of change.
+For a square corner with contacts a unit from it, both curves' curvature peaks at 1.17 times the
+circle's. Their middles are 0.376 (G2) and 0.360 (G3) from the corner, against the circle's 0.414.
+A single degree 5 curve can't make a good G3: it would need its two middle control points on the
+corner itself, and its curvature would peak at 3 to 6.5 times the circle's.
 
 The blend face is that curve swept along the edge, a B-spline surface. `splines.lucb` lets booleans
 meet a plane with such a swept profile in closed form:
@@ -278,15 +282,16 @@ contact distance (1.5 r at a square corner).
 
 The hole left is six-sided. Its sides alternate between the fillets' end sections (A curves) and
 curves on the faces (B curves). A B curve runs between two fillets' contacts, its legs along their
-contact lines, built like the profile. Six Bezier quads fill the hole, one at each of its corners,
-meeting at a center (patch_fit.lucb):
+contact lines, built like the profile. Six quads fill the hole, one at each of its corners, meeting
+at a center (patch_fit.lucb). Each is a degree 5 B-spline net: one span for G2; for G3, two (a
+curve's half, cut at its middle by knot insertion, keeps two of its three spans).
 - **Outer sides:** exact. Next to an A curve, a quad's first rows are the curve's control points
   moved along the sweep. Next to a B curve, they lie in its plane. So the corner meets the fillets
   and faces with their own continuity: two rows beyond the side for G2, three for G3.
 - **Seams:** G1 exactly, with the fixed coefficients of a vertex where six meet (one quad's cross
   derivative is the next one's turned back, plus t times the seam's). G2 holds by least squares, and
-  thin-plate energy picks among what's left. It is one linear solve, measured at 1e-4 degrees and
-  0.01% in curvature across the seams.
+  thin-plate energy picks among what's left. It is one linear solve. Across the seams the surface
+  normals agree within 0.00025 degrees (G3; G2's within 0.000003).
 
 The study's single trimmed surface was tried first. Its sides only came within 1e-5 of the corner's
 size, which the booleans can't use. The corner tool is the region between the sharp corner and the

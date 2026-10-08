@@ -225,26 +225,12 @@ func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: 
     try profile.loop_offsets.push(0)
     try profile.edges.push(line_edge(p, ta))
     if round and continuity > 1:
-        # Control points along each face toward the corner, at these
-        # fractions of the way from the contact point: the curve's middle
-        # stays near the circle's (0.27 of the way in for a square corner,
-        # against the circle's 0.29).
-        let g2: f64[3] = [0.0, 0.3, 0.6]
-        let g3: f64[4] = [0.0, 0.2, 0.4, 0.6]
-        let half: usize = 3 if continuity == 2 else 4
         let first = profile.spline_points.count
-        for k in 0..<half:
-            let f = g2[k] if continuity == 2 else g3[k]
-            try profile.spline_points.push(ta.add(p.subtract(ta).multiply_scalar(f)))
-        for k in 0..<half:
-            let f = g2[half - 1 - k] if continuity == 2 else g3[half - 1 - k]
-            try profile.spline_points.push(tb.add(p.subtract(tb).multiply_scalar(f)))
-        let count = half * 2
         let knot_first = profile.spline_knots.count
-        for k in 0..<count * 2:
-            try profile.spline_knots.push(0.0 if k < count else 1.0)
+        try fillet_section(ta, tb, p, continuity, &profile.spline_points, &profile.spline_knots)
+        let count = profile.spline_points.count - first
         for _ in 0..<count: try profile.spline_weights.push(1.0)
-        try profile.splines.push(ProfileSpline(first, count, knot_first, (i64)count - 1))
+        try profile.splines.push(ProfileSpline(first, count, knot_first, 5))
         try profile.edges.push(ProfileEdge(2, ta, tb, Vector3(), 0.0, 0.0, (i64)profile.splines.count - 1))
     elif round:
         let bisector = try ua.add(ub).normalized()
@@ -259,6 +245,30 @@ func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: 
     try profile.loop_offsets.push(profile.edges.count)
     try nest(&profile)
     return profile
+
+## A G2 or G3 fillet's section from contact `ta` to contact `tb`, whose
+## legs run along the faces to the corner `p`: a degree 5 B-spline (the
+## degree of every freeform element), its control points onto `points`
+## and its knots onto `knots`. The first three (G2) or four (G3) control
+## points lie along each leg, so the curvature (and for G3 its change) is
+## zero where it meets each face. G2 is one span (six points); G3 three
+## spans (eight points, knots at the thirds). At a square corner with
+## contacts a unit from it, both curves' curvature peaks at 1.17 times the
+## circle's, and their middles are 0.376 (G2) and 0.360 (G3) from the
+## corner, the circle's 0.414.
+func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, points: Growing[Vector3]*, knots: Growing[f64]*) -> !:
+    let g2: f64[3] = [0.0, 0.3, 0.6]
+    let g3: f64[4] = [0.0, 0.1, 0.2, 0.6]
+    let half: usize = 3 if continuity == 2 else 4
+    for k in 0..<half: try points.push(ta.add(p.subtract(ta).multiply_scalar(g2[k] if half == 3 else g3[k])))
+    for k in 0..<half:
+        let f = g2[half - 1 - k] if half == 3 else g3[half - 1 - k]
+        try points.push(tb.add(p.subtract(tb).multiply_scalar(f)))
+    for _ in 0..<(usize)6: try knots.push(0.0)
+    if half == 4:
+        try knots.push(1.0 / 3.0)
+        try knots.push(2.0 / 3.0)
+    for _ in 0..<(usize)6: try knots.push(1.0)
 
 ## A concave edge's tool, added to the solid: the corner profile (in the
 ## air between its faces) swept from `start` to `end`, ending flush with
