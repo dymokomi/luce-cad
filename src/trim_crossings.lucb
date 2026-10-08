@@ -6,7 +6,7 @@ from luce_geocore.geocore import Vector3, invalid
 from brep_types import Surface, Curve, BrepFace
 from layout_types import Stations, GridLayout
 from patch_sides import edge_index
-from mapped_patch import parameter
+from mapped_patch import parameter, point
 from trim_chains import refreshed
 from trim_memo import TrimMemo, memo_parameter, bits
 from face_errors import FaceErrors
@@ -96,6 +96,7 @@ pub func crossings_of(plan: const GridLayout*, face: BrepFace, s: Surface, verti
                     let value = lines.values[line]
                     line += 1
                     if value >= high: break
+                    if try grazes(s, edge, uv, times, segment, axis, value, tolerance): continue
                     _ = intersection(s, edge, times[segment], times[segment + 1], uv[segment], uv[segment + 1], axis, value, tolerance, plan.epsilon, memo, index) catch failure:
                         if failure.code != invalid: error(failure.code, failure.message)
                         recover 0.0
@@ -140,6 +141,34 @@ pub func speculate(vertices: const Vector3[], edges: const Curve[], surfaces: co
     var job = Speculation(vertices = vertices, edges = edges, surfaces = surfaces, faces = faces, cuts = cuts, plans = plans, memos = memos, wanted = wanted[..<count], tolerance = tolerance, errors = &errors)
     parallel.run(count, speculate_item, (void*)&job)
     try errors.raise()
+
+## Whether `segment` reaches `value` only through a sampled extremum that
+## overshoots the line by less than the snap budget. A curve tangent to a grid
+## line, evaluated within its fitting tolerance, can poke through the line by
+## a few ULPs of the part size. Its two exact roots then sit a square root of
+## that depth away from the extremum, leaving near-duplicate vertices and a
+## sub-tolerance cap that no display triangulation can represent. Such a line
+## is not crossed: alignment snaps the extremum onto it instead (same budget).
+pub func grazes(s: Surface, edge: Curve, uv: const Vector3[], times: const f64[], segment: usize, axis: usize, value: f64, tolerance: f64) -> bool!:
+    for at in [segment, segment + 1]:
+        if at == 0 or at + 1 >= uv.length: continue
+        let p = coordinate(uv[at], axis) - value
+        if p * (coordinate(uv[at - 1], axis) - value) >= 0.0 or p * (coordinate(uv[at + 1], axis) - value) >= 0.0: continue
+        let q = try edge.at(times[at])
+        let spacing = math.min(q.subtract(try edge.at(times[at - 1])).length(), q.subtract(try edge.at(times[at + 1])).length())
+        let snapped = Vector3(value, uv[at].y, 0.0) if axis == 0 else Vector3(uv[at].x, value, 0.0)
+        let depth = (try point(s, snapped)).subtract(try point(s, uv[at])).length()
+        if depth <= graze_budget(spacing, tolerance): return true
+    return false
+
+## Largest physical extremum snap that replaces a pair of crossings. It is a
+## fraction of the model tolerance and of the local sample spacing, so it
+## scales with the part and never reorders the extremum's neighbors.
+pub func graze_budget(spacing: f64, tolerance: f64) -> f64:
+    return math.min(tolerance * 0.01, spacing * 0.2)
+
+func coordinate(p: Vector3, axis: usize) -> f64:
+    return p.x if axis == 0 else p.y
 
 ## First index in 1..<last whose line lies strictly above `low` (else `last`).
 pub func first_above(lines: Stations, low: f64, last: usize) -> usize:

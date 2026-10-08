@@ -5,6 +5,7 @@ from luce_geocore.geocore import Vector3
 from brep_types import Surface
 from layout_types import GridLayout, Stations
 from mapped_patch import point
+from trim_crossings import graze_budget
 
 pub func align(uv: Vector3[], sizes: const i64[], ids: const i64[], canonical: const Vector3[], surface: Surface, plan: GridLayout, tolerance: f64) -> !:
     let original_uv = try new Vector3[uv.length] --- in memory.heap
@@ -20,7 +21,8 @@ pub func align(uv: Vector3[], sizes: const i64[], ids: const i64[], canonical: c
             let p = canonical[(usize)ids[index]]
             let before = canonical[(usize)ids[previous]]
             let after = canonical[(usize)ids[next]]
-            let budget = math.min(tolerance * 0.05, math.min(p.subtract(before).length(), p.subtract(after).length()) * 0.2)
+            let spacing = math.min(p.subtract(before).length(), p.subtract(after).length())
+            let budget = math.min(tolerance * 0.05, spacing * 0.2)
             let original = try point(surface, uv[index])
             for axis in 0..<(usize)2:
                 let stations = plan.u if axis == 0 else plan.v
@@ -30,9 +32,15 @@ pub func align(uv: Vector3[], sizes: const i64[], ids: const i64[], canonical: c
                 let b = coordinate(original_uv[next], axis)
                 let candidate = Vector3(aligned, uv[index].y, 0.0) if axis == 0 else Vector3(uv[index].x, aligned, 0.0)
                 let incidence = plan.epsilon * 1e-5
-                if math.abs(aligned - value) > incidence and (aligned <= math.min(a, b) or aligned >= math.max(a, b)): continue
+                # A sampled extremum within the graze budget of a line, on
+                # either side, touches it: reconcile left an overshooting one
+                # uncut (trim_crossings.grazes), and one stopping short would
+                # leave a sub-tolerance gap. Either way it lands on the line.
+                let grazing = aligned != value and (a - aligned) * (b - aligned) > 0.0
+                if math.abs(aligned - value) > incidence and not grazing and (aligned <= math.min(a, b) or aligned >= math.max(a, b)): continue
                 let support = try point(surface, candidate)
-                if support.subtract(original).length() <= budget and support.subtract(p).length() <= tolerance: uv[index] = candidate
+                let limit = graze_budget(spacing, tolerance) if grazing else budget
+                if support.subtract(original).length() <= limit and support.subtract(p).length() <= tolerance: uv[index] = candidate
         begin += count
     # Crossings above can land beside a numerical endpoint that was visited
     # earlier. Resolve that incidence only after all crossings are aligned.

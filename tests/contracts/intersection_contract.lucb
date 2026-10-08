@@ -8,6 +8,8 @@ from layout_types import GridLayout, Stations, UVChain
 from trim_chains import cached
 from trim_layout import reconcile
 from trim_alignment import align
+from trim_crossings import graze_budget
+from mapped_patch import point
 
 pub func intersection_contract() -> !:
     for delta in [1e-8, 4e-8, 1e-7]:
@@ -121,9 +123,14 @@ func shallow_crossing(delta: f64, swap: bool, reverse: bool, tolerance: f64) -> 
     for value in ys:
         if swap: _ = try plan.u.insert(value, 1e-12)
         else: _ = try plan.v.insert(value, 1e-12)
-    # Both roots are compulsory even if the modelling tolerance's sample
-    # separation is larger than their distance to the intervening extremum.
-    # A root and the extremum are not two estimates of the same incidence.
+    # A cap deeper than the graze budget keeps both roots, even if the
+    # modelling tolerance's sample separation is larger than their distance
+    # to the intervening extremum: a root and the extremum are not two
+    # estimates of the same incidence. A shallower cap is a tangency within
+    # fitting precision: no roots, and alignment lands the extremum on the
+    # line instead (trim_crossings.grazes).
+    let spacing = (try arc.at(0.5)).subtract(try arc.at(0.25)).length()
+    let grazing = delta <= graze_budget(spacing, tolerance)
     _ = try reconcile(&plan, face, s, vertices, edges, cuts, tolerance, false)
     let frozen = cuts[1].count
     _ = try reconcile(&plan, face, s, vertices, edges, cuts, tolerance, false)
@@ -135,27 +142,36 @@ func shallow_crossing(delta: f64, swap: bool, reverse: bool, tolerance: f64) -> 
         if math.abs(p.x - 0.5) < 1e-11:
             if t < 0.5: before += 1
             else: after += 1
-    if before != 1 or after != 1: error(invalid, "shallow trim crossings must register on both sides of the tangent")
+    let roots: usize = 0 if grazing else 1
+    if before != roots or after != roots: error(invalid, "shallow trim crossings must register on both sides of a cut tangent, and not at all on a grazed one")
     # Use the frozen shared chain unchanged. Clipping must produce a valid cell
     # arrangement, not force the entire patch through the constrained fallback.
     let points = try new Vector3[512] --- in memory.heap
     defer free(points) in memory.heap
+    let canonical = try new Vector3[512] --- in memory.heap
+    defer free(canonical) in memory.heap
+    let ids = try new i64[512] --- in memory.heap
+    defer free(ids) in memory.heap
     var length: usize = 0
+    var extremum: usize = 0
     for use in 0..<(usize)4:
         let signed = uses[use]
         let index = (usize)(-signed - 1 if signed < 0 else signed - 1)
         let uv = try cached(&plan.chains[use], s, vertices, edges[index], cuts[index], tolerance)
         for at in 0..<uv.length - 1:
-            var p = uv[at if signed > 0 else uv.length - 1 - at]
-            # Same incidence-only endpoint alignment as clipped_patch. Do not
-            # flatten the tangent extremum onto the nearby grid side.
-            for axis in 0..<(usize)2:
-                let lines = plan.u if axis == 0 else plan.v
-                for value in lines.values[..<lines.count]:
-                    if axis == 0 and math.abs(p.x - value) < 1e-11: p = Vector3(value, p.y, 0.0)
-                    if axis == 1 and math.abs(p.y - value) < 1e-11: p = Vector3(p.x, value, 0.0)
+            let sample = at if signed > 0 else uv.length - 1 - at
+            let p = uv[sample]
+            if index == 1 and cuts[1].values[sample] == 0.5: extremum = length
             points[length] = p
+            canonical[length] = try point(s, p)
+            ids[length] = (i64)length
             length += 1
+    # The same alignment as clipped_patch. It moves the chart only: the cut
+    # tangent keeps its extremum beyond the line, the grazed one lands on it.
+    let original = points[extremum]
+    try align(points[..<length], [(i64)length], ids[..<length], canonical[..<length], s, plan, tolerance)
+    if (points[extremum].subtract(original).length() != 0.0) != grazing:
+        error(invalid, "only a grazed extremum aligns onto its tangent line")
     let mesh = try TrimGrid.clip(points[..<length], [(i64)length], plan.u.values[..<plan.u.count], plan.v.values[..<plan.v.count])
     defer mesh.release()
     for at in 0..<length:

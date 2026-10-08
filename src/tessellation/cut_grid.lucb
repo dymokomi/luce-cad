@@ -91,7 +91,17 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
     defer free(grid) in memory.heap
     let boundary = try new Segment[points.length] --- in memory.heap
     defer free(boundary) in memory.heap
-    for at in 0..<heads.length: heads[at] = -1
+    # Trim vertices lying on one cell side, per cell. A tangent extremum
+    # touches a cell that none of its segments enter; that cell must still
+    # split its side there, or the arrangement gets a T-junction.
+    let touch_heads = try new i64[nx * ny] --- in memory.heap
+    defer free(touch_heads) in memory.heap
+    let touches = try new Segment[points.length * 2] --- in memory.heap
+    defer free(touches) in memory.heap
+    var touch_count: usize = 0
+    for at in 0..<heads.length:
+        heads[at] = -1
+        touch_heads[at] = -1
     for at in 0..<grid.length: grid[at] = -1
     var mesh = try MeshBuilder(precise = true)
     defer mesh.close()
@@ -123,6 +133,8 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
                 if previous >= 0 and previous != aliases[ai]:
                     error(invalid, "distinct trim vertices coincide on grid")
                 grid[gy * us.length + gx] = aliases[ai]
+            else:
+                touch_count = touch(us, vs, points[ai], aliases[ai], incidence, touch_heads, touches, touch_count)
         offset += count
     if offset != points.length: error(invalid, "trim grid loops do not cover vertices")
     var scratch = Cell()
@@ -143,6 +155,10 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
             while current >= 0:
                 trim += 1
                 current = boundary[(usize)current].next
+            current = touch_heads[row * nx + col]
+            while current >= 0:
+                trim += 1
+                current = touches[(usize)current].next
             try scratch.reserve(trim)
             let edges = scratch.edges
             let side_ids = scratch.side_ids
@@ -152,7 +168,7 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
                 let segment = boundary[(usize)current]
                 try add(edges, &length, segment.a, segment.b)
                 current = segment.next
-            if length == 0:
+            if length == 0 and touch_heads[row * nx + col] < 0:
                 if not row_inside(crossings[..<crossing_count], center.x): continue
                 try mesh.face(4)
                 for at in 0..<(usize)4: try mesh.corner(try grid_point(&mesh, grid, corner_grid[at], corners[at]))
@@ -168,27 +184,11 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
                 side_values[0] = 0.0
                 side_values[1] = 1.0
                 for index in 0..<trim_count:
-                    for id in [edges[index].a, edges[index].b]:
-                        let p = points[(usize)id]
-                        let t = p.subtract(a).dot(delta) / delta.dot(delta)
-                        if t < -incidence or t > 1.0 + incidence or math.abs(delta.cross(p.subtract(a)).z) > incidence * delta.length(): continue
-                        var duplicate = false
-                        for at in 0..<count:
-                            if math.abs(side_values[at] - t) * delta.length() < incidence:
-                                if side_ids[at] >= 0 and side_ids[at] != id: error(invalid, "distinct trim vertices coincide on a grid side")
-                                side_ids[at] = id
-                                duplicate = true
-                                break
-                        if duplicate: continue
-                        if count == side_ids.length: error(invalid, "trim cell side exceeds budget")
-                        var at = count
-                        while at > 0 and side_values[at - 1] > t:
-                            side_values[at] = side_values[at - 1]
-                            side_ids[at] = side_ids[at - 1]
-                            at -= 1
-                        side_values[at] = t
-                        side_ids[at] = id
-                        count += 1
+                    for id in [edges[index].a, edges[index].b]: try place(points, id, a, delta, incidence, side_ids, side_values, &count)
+                var touching = touch_heads[row * nx + col]
+                while touching >= 0:
+                    try place(points, touches[(usize)touching].a, a, delta, incidence, side_ids, side_values, &count)
+                    touching = touches[(usize)touching].next
                 for at in 0..<count - 1:
                     let p = a.add(delta.multiply_scalar((side_values[at] + side_values[at + 1]) * 0.5))
                     if not inside(points, sizes, Vector3(inward(p.x, center.x), inward(p.y, center.y), 0.0)): continue
@@ -199,6 +199,50 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
     let result = try mesh.finish()
     errdefer result.release()
     try topology.audit(result.value(), sizes, aliases)
+    return result
+
+## Insert trim vertex `id` into the sorted pieces of the grid side from `a`
+## along `delta` if it lies on that side; one vertex per side position.
+func place(points: const Vector3[], id: i64, a: Vector3, delta: Vector3, incidence: f64, side_ids: i64[], side_values: f64[], count: usize*) -> !:
+    let p = points[(usize)id]
+    let t = p.subtract(a).dot(delta) / delta.dot(delta)
+    if t < -incidence or t > 1.0 + incidence or math.abs(delta.cross(p.subtract(a)).z) > incidence * delta.length(): return
+    for at in 0..<*count:
+        if math.abs(side_values[at] - t) * delta.length() < incidence:
+            if side_ids[at] >= 0 and side_ids[at] != id: error(invalid, "distinct trim vertices coincide on a grid side")
+            side_ids[at] = id
+            return
+    if *count == side_ids.length: error(invalid, "trim cell side exceeds budget")
+    var at = *count
+    while at > 0 and side_values[at - 1] > t:
+        side_values[at] = side_values[at - 1]
+        side_ids[at] = side_ids[at - 1]
+        at -= 1
+    side_values[at] = t
+    side_ids[at] = id
+    *count += 1
+
+## Register a trim vertex lying on exactly one grid line with the two cells
+## sharing that side (grid corners are identified through `grid` instead).
+func touch(us: const f64[], vs: const f64[], p: Vector3, id: i64, incidence: f64, heads: i64[], touches: Segment[], count: usize) -> usize:
+    let nx = us.length - 1
+    let gx = nearest(us, p.x)
+    let gy = nearest(vs, p.y)
+    var result = count
+    if math.abs(us[gx] - p.x) < incidence:
+        let row = cell(vs, p.y)
+        for col in [gx - 1 if gx > 0 else nx, gx]:
+            if col >= nx: continue
+            touches[result] = Segment(id, -1, heads[row * nx + col])
+            heads[row * nx + col] = (i64)result
+            result += 1
+    elif math.abs(vs[gy] - p.y) < incidence:
+        let col = cell(us, p.x)
+        for row in [gy - 1 if gy > 0 else vs.length - 1, gy]:
+            if row >= vs.length - 1: continue
+            touches[result] = Segment(id, -1, heads[row * nx + col])
+            heads[row * nx + col] = (i64)result
+            result += 1
     return result
 
 func add(edges: Segment[], length: usize*, a: i64, b: i64) -> !:
