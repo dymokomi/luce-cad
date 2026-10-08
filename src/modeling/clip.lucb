@@ -54,16 +54,10 @@ pub func nearest_on(w: const Shape*, c: i64, p: Vector3, low: f64, high: f64) ->
 pub func crossings(w: const Shape*, c: i64, low: f64, high: f64, e: usize, size: f64, tol: f64, out: Growing[Hit]*) -> !:
     let edge = w.edges.items[e]
     let ec = edge.carrier
-    # Along the curve: the edge's ends and middle all on it.
-    let start = try w.at(ec, edge.t0)
-    let end = try w.at(ec, edge.t1)
-    let middle = try w.at(ec, (edge.t0 + edge.t1) * 0.5)
-    let ts = try nearest_on(w, c, start, low, high)
-    let te = try nearest_on(w, c, end, low, high)
-    let tm = try nearest_on(w, c, middle, low, high)
-    if (try w.at(c, ts)).subtract(start).length() <= tol * 10.0 and (try w.at(c, te)).subtract(end).length() <= tol * 10.0 and (try w.at(c, tm)).subtract(middle).length() <= tol * 10.0:
-        try out.push(Hit(ts, edge.t0))
-        try out.push(Hit(te, edge.t1))
+    # One curve under both (an edge lying along the curve): the ends of the
+    # stretch they share.
+    if try same_curve(w, c, e, tol):
+        try overlap_ends(w, c, low, high, e, tol, out)
         return
     let n = sample_count(w, c, low, high, size)
     let m = sample_count(w, ec, edge.t0, edge.t1, size)
@@ -90,6 +84,45 @@ pub func crossings(w: const Shape*, c: i64, low: f64, high: f64, e: usize, size:
             for hit in out.view():
                 if (try w.at(c, hit.t)).subtract(try w.at(c, t)).length() <= tol * 10.0 and math.abs(hit.s - s) <= math.abs(edge.t1 - edge.t0) * 1e-6 + 1e-12: known = true
             if not known: try out.push(Hit(t, s))
+
+## The parameter range of carrier `c` to search all of it (a line: far).
+func full_range(w: const Shape*, c: i64) -> (f64, f64):
+    let carrier = w.carriers.items[(usize)c]
+    if carrier.kind == 0: return (-1.0e12, 1.0e12)
+    if carrier.kind == 1 or carrier.kind == 3: return (-math.pi, 3.0 * math.pi)
+    let (points, weights, knots, degree) = w.spline_net(carrier.spline)
+    _ = weights
+    return (knots[(usize)degree], knots[points.length])
+
+## Whether edge `e` lies on carrier `c`'s whole curve: its ends and middle
+## on it.
+func same_curve(w: const Shape*, c: i64, e: usize, tol: f64) -> bool!:
+    let edge = w.edges.items[e]
+    let (low, high) = full_range(w, c)
+    for k in 0..<3:
+        let p = try w.at(edge.carrier, edge.t0 + (edge.t1 - edge.t0) * (f64)k * 0.5)
+        let t = try nearest_on(w, c, p, low, high)
+        if (try w.at(c, t)).subtract(p).length() > tol * 10.0: return false
+    return true
+
+## The ends of the stretch where edge `e` and carrier `c` on [low, high]
+## (one curve) overlap: each end of either that lies within the other.
+func overlap_ends(w: const Shape*, c: i64, low: f64, high: f64, e: usize, tol: f64, out: Growing[Hit]*) -> !:
+    let edge = w.edges.items[e]
+    let candidates: f64[2] = [edge.t0, edge.t1]
+    for s in candidates:
+        let p = try w.at(edge.carrier, s)
+        let t = try nearest_on(w, c, p, low, high)
+        if (try w.at(c, t)).subtract(p).length() <= tol * 10.0: try out.push(Hit(t, s))
+    let ends: f64[2] = [low, high]
+    for t in ends:
+        let p = try w.at(c, t)
+        let s = try nearest_on(w, edge.carrier, p, edge.t0, edge.t1)
+        if (try w.at(edge.carrier, s)).subtract(p).length() > tol * 10.0: continue
+        var known = false
+        for hit in out.view():
+            if (try w.at(c, hit.t)).subtract(p).length() <= tol * 10.0: known = true
+        if not known: try out.push(Hit(t, s))
 
 ## Gauss-Newton on |C(t) - E(s)|: the nearest pair of parameters from a
 ## guess, kept in their intervals, and their distance.

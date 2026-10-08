@@ -183,7 +183,10 @@ pub func combine(a: const CadModel*, b: const CadModel*, op: i64) -> interop.Ref
         low = Vector3(math.min(low.x, l.x), math.min(low.y, l.y), math.min(low.z, l.z))
         high = Vector3(math.max(high.x, h.x), math.max(high.y, h.y), math.max(high.z, h.z))
     work.size = math.max(1e-6, high.subtract(low).length())
-    work.tol = math.max(work.w.tolerance, second.tolerance)
+    # Relative to the model's size, not the inputs' tolerances: results
+    # are inputs again, and their tolerance must not grow from one to the
+    # next.
+    work.tol = math.max(work.size * 1e-7, 1e-10)
     for p in work.w.points.view(): try work.point_vertex.push(try work.vertex(p))
     try intersect_faces(&work)
     try cut_edges(&work)
@@ -279,6 +282,9 @@ func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: co
         if ia == outside or ib == outside or (ia == on_boundary and ib == on_boundary): continue
         let start = try work.vertex(try w.at(c, t0))
         let end = try work.vertex(try w.at(c, t1))
+        # Ends merged into one vertex: nothing between them (a closed curve
+        # once around is its own loop).
+        if start == end and not (closed and count == 2): continue
         try work.sections.push(Section(ShapeEdge(c, t0, t1, start, end), (i64)fa, (i64)fb))
     _ = low
     _ = high
@@ -318,10 +324,12 @@ func cut_edges(work: Work*) -> !:
         try sort(&ts)
         var previous_fraction = 0.0
         var previous_vertex = work.point_vertex.items[(usize)edge.start]
+        let last_vertex = work.point_vertex.items[(usize)edge.end]
         for at in 0..<ts.count + 1:
             let fraction = ts.items[at] if at < ts.count else 1.0
-            let vertex = (try work.vertex(try w.edge_at(e, fraction))) if at < ts.count else work.point_vertex.items[(usize)edge.end]
-            if vertex == previous_vertex and at < ts.count: continue
+            let vertex = (try work.vertex(try w.edge_at(e, fraction))) if at < ts.count else last_vertex
+            # Cuts that merge into a vertex already there cut nothing.
+            if at < ts.count and (vertex == previous_vertex or vertex == last_vertex): continue
             if vertex == previous_vertex and fraction - previous_fraction < 1e-9: continue
             let piece = ShapeEdge(edge.carrier, edge.t0 + span * previous_fraction, edge.t0 + span * fraction, previous_vertex, vertex)
             let (id, forward) = try work.final_edge(piece)
@@ -691,6 +699,7 @@ func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[],
             let fe = work.finals.items[e]
     if open_edges > 0:
         error(invalid, "the result is not a closed solid (some edges are not shared by two faces); this operation is not supported for these shapes yet")
+    # Merged vertices sit within ten tolerances of their curves.
     let output = try interop.Reference[BrepModel].adopt(new BrepModel(math.max(work.tol * 20.0, 1e-9)) in memory.heap, brep_model_type, memory.heap)
     defer output.release()
     let b = output.value()

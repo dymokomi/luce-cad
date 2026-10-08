@@ -1,0 +1,127 @@
+## Chamfers and fillets of straight edges between two planar faces (the
+## first rows of OpenCASCADE's ChFiKPart table: plane/plane gives a plane or
+## a cylinder), made with booleans: for each edge a tool solid, the corner
+## the blend takes away, swept along the edge a little past its ends, is
+## subtracted. A chamfer's tool is the triangle between the edge and the
+## points `distance` along each face; a fillet's is the region between the
+## edge and the circle of `radius` touching both faces (its center where a
+## ball of that radius rolls). Chamfered corners where edges meet follow
+## from the booleans; fillets meeting at a corner need cylinders crossing at
+## an angle, which booleans do not support yet. Convex edges only.
+
+## The two faces using edge `e`, or an error.
+func edge_faces(w: const Shape*, e: usize) -> (usize, usize)!:
+    var first: i64 = -1
+    var second: i64 = -1
+    for f in 0..<w.faces.count:
+        for use in w.face_uses(f):
+            if (usize)((use if use > 0 else -use) - 1) != e: continue
+            if first < 0: first = (i64)f
+            elif second < 0 and (i64)f != first: second = (i64)f
+    if first < 0 or second < 0: error(invalid, "a blended edge must lie between two faces")
+    return ((usize)first, (usize)second)
+
+## The unit direction across face `f` from the middle of edge `e`, into the
+## face, perpendicular to the edge.
+func into_face(w: const Shape*, f: usize, e: usize, along: Vector3) -> Vector3!:
+    let n = w.surfaces.items[(usize)w.faces.items[f].surface].z
+    let side = try n.cross(along).normalized()
+    let middle = try w.edge_at(e, 0.5)
+    let reach = (try w.edge_at(e, 0.0)).subtract(try w.edge_at(e, 1.0)).length() * 0.01
+    if try face_contains(w, f, middle.add(side.multiply_scalar(reach)), w.tolerance) == inside_face: return side
+    return side.multiply_scalar(-1.0)
+
+## Whether edge `e` can be blended: a line between two planar faces,
+## convex (the faces turn away from each other).
+func blendable(w: const Shape*, e: usize) -> bool!:
+    let edge = w.edges.items[e]
+    if w.carriers.items[(usize)edge.carrier].kind != 0: return false
+    let (fa, fb) = try edge_faces(w, e)
+    if w.surfaces.items[(usize)w.faces.items[fa].surface].kind != 0 or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != 0: return false
+    let along = try (try w.edge_at(e, 1.0)).subtract(try w.edge_at(e, 0.0)).normalized()
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    # Convex: the other face runs below this one's outward normal.
+    return ub.dot(try w.face_normal(fa, try w.edge_at(e, 0.5))) < -1e-9 and ua.cross(ub).length() > 1e-9
+
+## The tool that blends edge `e` (a fillet of `size` radius when `round`,
+## else a chamfer `size` along each face), as a closed solid.
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool) -> interop.Reference[CadModel]!:
+    let start = try w.edge_at(e, 0.0)
+    let end = try w.edge_at(e, 1.0)
+    let length = end.subtract(start).length()
+    let along = try end.subtract(start).normalized()
+    let (fa, fb) = try edge_faces(w, e)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    # The tool reaches past both ends by a margin, starting on its plane.
+    let margin = size * 2.0 + length * 0.01
+    let p = start.subtract(along.multiply_scalar(margin))
+    var reach = size
+    if round: reach = size / math.tan(angle * 0.5)
+    let ta = p.add(ua.multiply_scalar(reach))
+    let tb = p.add(ub.multiply_scalar(reach))
+    let u = ua
+    let v = along.cross(ua)
+    var profile = Profiles(p, along, u, v, Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+                           Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+    defer profile.close()
+    try profile.loop_offsets.push(0)
+    try profile.edges.push(line_edge(p, ta))
+    if round:
+        let bisector = try ua.add(ub).normalized()
+        let center = p.add(bisector.multiply_scalar(size / math.sin(angle * 0.5)))
+        let leaving = ta.subtract(center)
+        let arriving = tb.subtract(center)
+        let sweep = math.atan2(along.dot(leaving.cross(arriving)), leaving.dot(arriving))
+        try profile.edges.push(ProfileEdge(1, ta, tb, center, size, sweep, -1))
+    else:
+        try profile.edges.push(line_edge(ta, tb))
+    try profile.edges.push(line_edge(tb, p))
+    try profile.loop_offsets.push(profile.edges.count)
+    try nest(&profile)
+    let solid = try new_solid(length + margin * 2.0)
+    defer solid.release()
+    try extrude_into(solid.value(), &profile, length + margin * 2.0)
+    return try model_of(solid)
+
+## `model` with `edges` (B-rep edge numbers; empty: every straight convex
+## edge between two planes) blended: filleted to `size` when `round`, else
+## chamfered `size` along each face.
+pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: bool) -> interop.Reference[CadModel]!:
+    if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
+    var w = try shape_of(model)
+    defer w.close()
+    var chosen = Growing[usize]()
+    defer chosen.close()
+    if edges.length == 0:
+        for e in 0..<w.edges.count:
+            if try blendable(&w, e): try chosen.push(e)
+    else:
+        for e in edges:
+            if e < 0 or e >= (i64)w.edges.count: error(invalid, "a blended edge number is not an edge of the body")
+            if not try blendable(&w, (usize)e): error(invalid, "only straight convex edges between flat faces can be blended yet")
+            try chosen.push((usize)e)
+    if chosen.count == 0: error(invalid, "the body has no edges to blend")
+    var tools = Growing[interop.Reference[CadModel]]()
+    defer:
+        for tool in tools.view(): tool.release()
+        tools.close()
+    for e in chosen.view(): try tools.push(try edge_tool(&w, e, size, round))
+    var result = try copy_model(model)
+    for tool in tools.view():
+        let next = combine(result.value(), tool.value(), op_subtract) catch failure:
+            result.release()
+            error(failure.code, failure.message)
+        result.release()
+        result = next
+    return result
+
+## A new reference to `model`'s B-rep, placed as it is.
+func copy_model(model: const CadModel*) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model)
+    defer w.close()
+    let b = try brep_of(&w)
+    defer b.release()
+    return try model_of(b)
