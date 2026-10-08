@@ -32,6 +32,11 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
 - `cad_solids` (`luce_cad.solids`): `CadSolids`, analytic solids as closed
   B-reps (box, cylinder, cone or frustum, sphere, torus), centered on the
   origin along +Y with outward faces.
+- `modeling` (`luce_cad.modeling`): `CadModeling`, features that make and
+  change closed solids: sketch profiles extruded, booleans (union,
+  subtract, intersect), chamfers and fillets of straight edges between
+  flat faces. How each works and what is not supported yet:
+  [docs/MODELING.md](docs/MODELING.md).
 - `tessellation` (`luce_cad.tessellation.surface`): rational B-spline
   evaluation and trim/grid/recombine meshing (the separate `luce-tesselator`
   package until luce-cad 0.2.0).
