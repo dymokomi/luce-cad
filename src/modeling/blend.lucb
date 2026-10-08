@@ -36,7 +36,10 @@ func into_face(w: const Shape*, f: usize, e: usize, along: Vector3) -> Vector3!:
 func blendable(w: const Shape*, e: usize) -> bool!:
     let edge = w.edges.items[e]
     if w.carriers.items[(usize)edge.carrier].kind != 0: return false
-    let (fa, fb) = try edge_faces(w, e)
+    # A seam (one face's both ways) is no edge between two faces.
+    let (fa, fb) = edge_faces(w, e) catch failure:
+        _ = failure
+        return false
     if w.surfaces.items[(usize)w.faces.items[fa].surface].kind != 0 or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != 0: return false
     let along = try (try w.edge_at(e, 1.0)).subtract(try w.edge_at(e, 0.0)).normalized()
     let ua = try into_face(w, fa, e, along)
@@ -44,11 +47,10 @@ func blendable(w: const Shape*, e: usize) -> bool!:
     # Convex: the other face runs below this one's outward normal.
     return ub.dot(try w.face_normal(fa, try w.edge_at(e, 0.5))) < -1e-9 and ua.cross(ub).length() > 1e-9
 
-## The tool that blends edge `e` (a fillet of `size` radius when `round`,
-## else a chamfer `size` along each face), as a closed solid.
-func edge_tool(w: const Shape*, e: usize, size: f64, round: bool) -> interop.Reference[CadModel]!:
-    let start = try w.edge_at(e, 0.0)
-    let end = try w.edge_at(e, 1.0)
+## The tool that blends edge `e` from `start` to `end` (its chain's ends),
+## a fillet of `size` radius when `round`, else a chamfer `size` along each
+## face, as a closed solid.
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3, end: Vector3) -> interop.Reference[CadModel]!:
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -108,7 +110,31 @@ pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: b
     defer:
         for tool in tools.view(): tool.release()
         tools.close()
-    for e in chosen.view(): try tools.push(try edge_tool(&w, e, size, round))
+    # Collinear chosen edges between the same two faces (one edge cut into
+    # pieces by earlier operations) are one chain: one tool spans them.
+    var done = Growing[bool]()
+    defer done.close()
+    for _ in chosen.view(): try done.push(false)
+    for i in 0..<chosen.count:
+        if done.items[i]: continue
+        done.items[i] = true
+        let e = chosen.items[i]
+        let (fa, fb) = try edge_faces(&w, e)
+        var low = try w.edge_at(e, 0.0)
+        var high = try w.edge_at(e, 1.0)
+        let along = try high.subtract(low).normalized()
+        for j in i + 1..<chosen.count:
+            if done.items[j]: continue
+            let other = chosen.items[j]
+            if not try same_curve(&w, w.edges.items[e].carrier, other, w.tolerance): continue
+            let (ga, gb) = try edge_faces(&w, other)
+            if not ((ga == fa and gb == fb) or (ga == fb and gb == fa)): continue
+            done.items[j] = true
+            for k in 0..<2:
+                let p = try w.edge_at(other, (f64)k)
+                if p.subtract(low).dot(along) < 0.0: low = p
+                if p.subtract(high).dot(along) > 0.0: high = p
+        try tools.push(try edge_tool(&w, e, size, round, low, high))
     var result = try copy_model(model)
     for tool in tools.view():
         let next = combine(result.value(), tool.value(), op_subtract) catch failure:
