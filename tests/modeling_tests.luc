@@ -1,0 +1,49 @@
+## CAD modeling: sketch profiles extruded into closed solids, checked by
+## their tessellations: closed and outward, with the volume the profile
+## area times the distance gives.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_geocore.geocore import Mesh, GeometrySet, Sketches
+from checks import manifold
+from luce_std import math
+
+func volume(mesh: Mesh) -> float!:
+    var total = 0.0
+    for triangle in 0..<mesh.index_count() // 3:
+        let a = mesh.vertex(mesh.index(triangle * 3)).position
+        let b = mesh.vertex(mesh.index(triangle * 3 + 1)).position
+        let c = mesh.vertex(mesh.index(triangle * 3 + 2)).position
+        total += a.dot(b.cross(c)) / 6.0
+    return total
+
+func solid(model: CadModel, faces: int, expected: float, tolerance: float) -> Mesh!:
+    if model.face_count() != faces: print(f"faces {model.face_count()}, expected {faces}")
+    assert(model.face_count() == faces)
+    let mesh = model.tessellate(16)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > tolerance: print(f"volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= tolerance)
+    return mesh
+
+pub func modeling_tests() -> unit!:
+    let empty = GeometrySet.of_mesh(Mesh.empty())
+    # A 4 x 2 rectangle with a hole of radius 0.5 (shape 4 is a rectangle,
+    # 3 a circle), on the ground plane.
+    let plate = Sketches.with_shape(Sketches.with_shape(empty, 4, [4.0, 2.0], 0.0, 0.0), 3, [0.5], 1.0, 0.0)
+    assert(CadModeling.profile_count(plate) == 1)
+    _ = solid(CadModeling.extruded(plate, 1.0), 7, 8.0 - math.pi * 0.25, 0.02)
+    # Downward, and a lone circle: a cylinder.
+    _ = solid(CadModeling.extruded(plate, -0.5), 7, (8.0 - math.pi * 0.25) * 0.5, 0.02)
+    let disc = Sketches.with_shape(empty, 3, [1.0], 0.0, 0.0)
+    _ = solid(CadModeling.extruded(disc, 2.0), 3, math.pi * 2.0, 0.05)
+    # An arc closed by a line: a D shape (half disc).
+    let arc = Sketches.with_shape(empty, 2, [1.0, 0.0, 180.0], 0.0, 0.0)
+    let d_shape = Sketches.with_shape(arc, 0, [2.0], 0.0, 0.0)
+    _ = solid(CadModeling.extruded(d_shape, 1.0), 4, math.pi * 0.5, 0.02)
+    # An open curve is no profile.
+    var rejected = false
+    _ = CadModeling.extruded(arc, 1.0) catch failure:
+        rejected = failure.message.contains("open")
+    assert(rejected)
+    print("PASS modeling: sketch profiles (holes, arcs, circles, chained curves) extruded into closed solids of the right volume")

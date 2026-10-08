@@ -1,0 +1,46 @@
+## Luce's CAD modeling operations: features that make and change closed
+## B-reps (see docs/MODELING.md for the plan and what each supports).
+pub struct CadModeling:
+    let reserved: u8 = 0
+
+    ## The closed curves of the sketch in `set` (its curves on its sketch
+    ## plane) as profiles, every region extruded `distance` along the
+    ## plane's normal (negative: the other way): one closed solid each.
+    pub static func extruded(set: interop.Reference[GeometrySet], distance: f64) -> interop.Reference[CadModel]!:
+        let source = try set.get()
+        let size = try sketch_size(source)
+        var p = try profiles_of(source, size * 0.0001)
+        defer p.close()
+        let solid = try new_solid(size)
+        defer solid.release()
+        try extrude_into(solid.value(), &p, distance)
+        return try model_of(solid)
+
+    ## How many profile regions the sketch in `set` has.
+    pub static func profile_count(set: interop.Reference[GeometrySet]) -> i64!:
+        let source = try set.get()
+        var p = try profiles_of(source, try sketch_size(source) * 0.0001)
+        defer p.close()
+        return (i64)p.region_count()
+
+## The extent of the sketch's curves (at least 1), which scales tolerances.
+func sketch_size(set: const GeometrySet*) -> f64!:
+    let curves = set_curves(set) else return 1.0
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for at in 0..<curves.point_count():
+        let p = curves.point(at)
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    if curves.point_count() == 0: return 1.0
+    return math.max(1.0, high.subtract(low).length())
+
+## An empty B-rep with a tolerance for `size`.
+func new_solid(size: f64) -> interop.Reference[BrepModel]!:
+    return try interop.Reference[BrepModel].adopt(new BrepModel(math.max(0.000000001, size * 0.000001)) in memory.heap, brep_model_type, memory.heap)
+
+func model_of(solid: interop.Reference[BrepModel]) -> interop.Reference[CadModel]!:
+    let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
+    errdefer result.release()
+    try result.value().attach_brep(solid)
+    return result

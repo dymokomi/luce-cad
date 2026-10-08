@@ -1,0 +1,110 @@
+## Extrusion: each profile region swept along `offset` into a closed B-rep:
+## a cap at each end and a side face per profile edge (a plane for a line,
+## a cylinder band for an arc, the curve swept straight, as a B-spline
+## surface, for a spline), joined by straight edges at the loops' vertices
+## (a full circle's one vertex is its side's seam). Faces face outward and
+## each loop runs counterclockwise about its face's normal, so every edge is
+## used twice, in opposite directions, as CadSolids' solids are.
+
+## The surface `edge` sweeps along `axis` (unit) from where it lies, as a face
+## whose normal points to the edge's right (outward of a counterclockwise
+## loop): the surface and whether its normal agrees.
+func side_surface(b: BrepModel*, p: const Profiles*, edge: const ProfileEdge*, axis: Vector3, length: f64) -> (i64, bool)!:
+    if edge.kind == 0:
+        let along = try edge.end.subtract(edge.start).normalized()
+        let outward = try along.cross(axis).normalized()
+        return (try b.add_surface(0, edge.start, outward, along), true)
+    if edge.kind == 1:
+        let radial = edge.start.subtract(edge.center)
+        # The tangent at the start, the way the arc runs about the axis
+        # (sweeps are signed about the plane's normal).
+        let turn = 1.0 if (edge.sweep > 0.0) == (axis.dot(p.normal) > 0.0) else -1.0
+        let tangent = axis.cross(radial).multiply_scalar(turn)
+        let outward = tangent.cross(axis)
+        return (try b.add_surface(1, edge.center, axis, radial, edge.radius), outward.dot(radial) > 0.0)
+    # The curve's net and its copy `length` along: v runs along the axis.
+    let (points, weights, knots, degree) = p.spline_net(edge.spline)
+    var net = Growing[Vector3]()
+    defer net.close()
+    var w = Growing[f64]()
+    defer w.close()
+    for at in 0..<points.length:
+        try net.push(points[at])
+        try net.push(points[at].add(axis.multiply_scalar(length)))
+        try w.push(weights[at])
+        try w.push(weights[at])
+    let kv: f64[4] = [0.0, 0.0, 1.0, 1.0]
+    # u along the curve and v along the axis: du x dv = tangent x axis, its right.
+    return (try b.add_spline_surface(net.view(), w.view(), (i64)points.length, 2, degree, 1, knots, kv[..<4]), true)
+
+## `edge` moved `shift` along, between vertices `start` and `end` of `b`.
+func edge_curve(b: BrepModel*, p: const Profiles*, edge: const ProfileEdge*, shift: Vector3, axis: Vector3, start: i64, end: i64) -> i64!:
+    if edge.kind == 0: return try b.add_line(start, end)
+    if edge.kind == 1:
+        return try b.add_circle(start, end, edge.center.add(shift), axis, edge.start.subtract(edge.center), edge.radius, (edge.sweep > 0.0) == (axis.dot(p.normal) > 0.0))
+    let (points, weights, knots, degree) = p.spline_net(edge.spline)
+    var moved = Growing[Vector3]()
+    defer moved.close()
+    for point in points: try moved.push(point.add(shift))
+    return try b.add_spline_edge(start, end, moved.view(), weights, degree, knots, true)
+
+## Every region of `p` extruded `distance` along the plane's normal (negative:
+## the other way) into `b`.
+pub func extrude_into(b: BrepModel*, p: Profiles*, distance: f64) -> !:
+    if not math.is_finite(distance) or math.abs(distance) < 1e-9:
+        error(invalid, "an extrusion needs a nonzero distance")
+    # Loops run counterclockwise about the way the solid grows.
+    var axis = p.normal
+    if distance < 0.0:
+        axis = p.normal.multiply_scalar(-1.0)
+        for loop in 0..<p.loop_count(): try p.reverse_loop(loop)
+    let length = math.abs(distance)
+    let lift = axis.multiply_scalar(length)
+    var bottom_caps = Growing[i64]()
+    defer bottom_caps.close()
+    var top_caps = Growing[i64]()
+    defer top_caps.close()
+    var bottom_sizes = Growing[i64]()
+    defer bottom_sizes.close()
+    var top_sizes = Growing[i64]()
+    defer top_sizes.close()
+    for region in 0..<p.region_count():
+        bottom_caps.clear()
+        top_caps.clear()
+        bottom_sizes.clear()
+        top_sizes.clear()
+        for loop in p.region(region):
+            let edges = p.loop_edges(loop)
+            let count = edges.length
+            let first_vertex = b.vertex_count()
+            for edge in edges:
+                _ = try b.add_vertex(edge.start)
+                _ = try b.add_vertex(edge.start.add(lift))
+            # Vertex i's bottom is first + 2i, its top first + 2i + 1.
+            let first_edge = b.edge_count()
+            for at in 0..<count:
+                let next = (at + 1) % count
+                _ = try edge_curve(b, p, &edges[at], Vector3(), axis, first_vertex + 2 * (i64)at, first_vertex + 2 * (i64)next)
+                _ = try edge_curve(b, p, &edges[at], lift, axis, first_vertex + 2 * (i64)at + 1, first_vertex + 2 * (i64)next + 1)
+                _ = try b.add_line(first_vertex + 2 * (i64)at, first_vertex + 2 * (i64)at + 1)
+            # Edge i's bottom is first + 3i, its top first + 3i + 1, the
+            # upright at its start first + 3i + 2.
+            for at in 0..<count:
+                let next = (at + 1) % count
+                let low = first_edge + 3 * (i64)at
+                let (surface, sense) = try side_surface(b, p, &edges[at], axis, length)
+                let uses: i64[4] = [low + 1, first_edge + 3 * (i64)next + 2 + 1, -(low + 1 + 1), -(low + 2 + 1)]
+                let sizes: i64[1] = [4]
+                _ = try b.add_face(surface, uses[..<4], sizes[..<1], sense)
+            # The caps: the top runs with the loop, the bottom against it.
+            for at in 0..<count:
+                try top_caps.push(first_edge + 3 * (i64)at + 1 + 1)
+                try bottom_caps.push(-(first_edge + 3 * (i64)(count - 1 - at) + 1))
+            try top_sizes.push((i64)count)
+            try bottom_sizes.push((i64)count)
+        let outer = p.loop_edges(p.region(region)[0])
+        let reference = outer[0].end.subtract(outer[0].start) if outer[0].kind == 0 else outer[0].start.subtract(outer[0].center)
+        let floor = try b.add_surface(0, outer[0].start, axis.multiply_scalar(-1.0), reference)
+        _ = try b.add_face(floor, bottom_caps.view(), bottom_sizes.view())
+        let roof = try b.add_surface(0, outer[0].start.add(lift), axis, reference)
+        _ = try b.add_face(roof, top_caps.view(), top_sizes.view())
