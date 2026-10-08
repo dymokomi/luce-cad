@@ -319,6 +319,48 @@ turned part way along them, a part torus or cone. Where chained edges meet, each
 at the joint, so neighbouring tools share their end planes. A free end of an arc reaches past, as a
 line's does, when the corner beyond is empty.
 
+### Direct fillets (`local_blend.lucb`, `local_corners.lucb`)
+
+Fillets of straight edges between flat faces are built directly, without booleans (FILLET-STUDY.md
+§3.2). The booleans above are what's left for anything else. The result's B-rep is made from the
+body's:
+- **Each chosen edge** becomes a strip between its contact lines on its two faces: a cylinder for
+  G1, its degree 5 section swept straight for G2 and G3.
+- **Each face touched** keeps its plane. Its loops are rebuilt: a chosen edge becomes its contact
+  line, a sharp edge at a rounded corner is shortened, and at a corner the face gains the curves the
+  corner leaves on it.
+- **Each corner** (a vertex where a chosen edge ends, with three edges and three flat faces) ends
+  its strips there and adds its own faces:
+  - one chosen edge: its strip runs to the third face's plane and is cut by it, and that face gains
+    the cut;
+  - two: a miter, both strips cut by the plane bisecting their edges;
+  - three, G1: a ball, the strips stopping square to their edges through its center;
+  - three, G2 or G3: a setback corner, its six quads.
+
+Every point and curve is made once and shared by the faces that meet there, so the result is
+closed by construction. It is still checked: each edge used twice, once each way, with the new
+faces turned to agree with the body's.
+
+What it declines falls to the booleans:
+- curved faces at a corner, more than three edges at a vertex, chamfers and rims;
+- an inside fillet meeting an outside one;
+- a miter that isn't symmetric about its plane. The two strips' sections are one curve only when
+  the sharp edge lies in the plane.
+
+A contract (`src/tests/direct_fillet_contract.lucb`) requires nine cases to be built directly at
+G1, G2 and G3:
+- an edge alone, a ring of miters, a corner of three, every edge;
+- an L's inside edge, a pocket's floor alone and with its walls;
+- a slanted box's oblique ends and corner.
+
+It also builds them by booleans and requires the same faces and volume. That runs at G1 for every
+case, at G2 for all but the two heaviest, and at G3 for four of them. `fillet_tests` checks the
+heaviest ones' volumes against exact values instead.
+
+The cost is the touched faces', with no intersection, splitting or classification. Every edge of a
+box at G2 takes 44 ms, against 1 s by booleans. A corner patch's thin-plate energy is one quadratic
+form, the same for every quad, so it is made once per fit.
+
 ### Fillets meeting at corners (`corners.lucb`)
 
 - **Two fillets** of one radius meeting where the third edge stays sharp meet in a miter. Both
@@ -371,8 +413,7 @@ Roughly in order of usefulness:
    unequal radii, Fusion's other corner type).
 2. **Blends on other curved edges:** ellipses, and edges between two curved faces.
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
-   surfaces, and rays through them (classifying a body with B-spline faces meshes it now, most of a
-   G2 corner's time).
+   surfaces. Rays through them are exact (`spline_rays.lucb`).
 4. **Sweep and loft;** tapered extrudes; Extrude "to object".
 5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
 6. **Shell,** offset, draft and press/pull.

@@ -1,0 +1,127 @@
+## Direct fillets (modeling/local_blend.lucb) against the booleans: the
+## same edges filleted both ways give the same faces and volume. Each case
+## is G1, G2 and G3, and must be built directly (not declined). The
+## booleans' build is the slow side: it is compared at G1 everywhere, at
+## G2 but for every edge and the pocket's corners, at G3 for the miter,
+## the corner and the slanted box (fillet_tests check those volumes
+## against their exact values, both continuities):
+## - a box's edge alone (its ends cut by the faces there),
+## - a box's top ring (miters at four corners),
+## - three edges at a box's corner (a ball or a setback),
+## - every edge of a box,
+## - an L's inside edge (ends cut, inside),
+## - a pocket's floor (inside miters), and its floor and walls (inside
+##   corners of three; the walls' edges ending at the top),
+## - a box cut by a slanted plane: its top front and back edges (ending at
+##   the slanted face), and three edges at a slanted corner.
+import interop
+from luce_std import math
+from luce_geocore.geocore import Vector3, Mesh, invalid
+from luce_geocore.core.growing import Growing
+from model import CadModel
+from solids import CadSolids
+from modeling import CadModeling, blended, shape_of, local_blend, resolve_edges
+
+pub func main(arguments: str[]) -> i32!:
+    let box = try CadModeling.tagged(try CadSolids.box(2.0, 2.0, 2.0), "#b")
+    defer box.release()
+    for continuity in 1..<(i64)4:
+        try compare(box, 0, 0.4, continuity)
+        try compare(box, 1, 0.3, continuity)
+        try compare(box, 2, 0.4, continuity)
+        try compare(box, 3, 0.3, continuity)
+    let slab = try (try CadModeling.tagged(try CadSolids.box(2.0, 1.0, 2.0), "#s")).value().transformed(Vector3(0.0, -0.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer slab.release()
+    let wall = try (try CadModeling.tagged(try CadSolids.box(1.0, 2.0, 2.0), "#w")).value().transformed(Vector3(-0.5, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer wall.release()
+    let l = try CadModeling.combined(slab, wall, 0)
+    defer l.release()
+    let block = try CadModeling.tagged(try CadSolids.box(4.0, 2.0, 4.0), "#k")
+    defer block.release()
+    let cut = try (try CadModeling.tagged(try CadSolids.box(2.0, 2.0, 2.0), "#c")).value().transformed(Vector3(0.0, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer cut.release()
+    let pocket = try CadModeling.combined(block, cut, 1)
+    defer pocket.release()
+    let cutter = try (try (try CadModeling.tagged(try CadSolids.box(4.0, 4.0, 4.0), "#c")).value().transformed(Vector3(2.6, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))).value().transformed(Vector3(), Vector3(0.0, 0.25, 0.0), Vector3(1.0, 1.0, 1.0))
+    defer cutter.release()
+    let slanted = try CadModeling.combined(box, cutter, 1)
+    defer slanted.release()
+    for continuity in 1..<(i64)4:
+        try compare(l, 4, 0.3, continuity)
+        try compare(pocket, 5, 0.3, continuity)
+        try compare(pocket, 6, 0.3, continuity)
+        try compare(slanted, 7, 0.2, continuity)
+        try compare(slanted, 8, 0.2, continuity)
+    return 0
+
+## Case `case`'s edges of `model` filleted to `radius` both ways.
+func compare(model: interop.Reference[CadModel], case: i64, radius: f64, continuity: i64) -> !:
+    var w = try shape_of(model.value())
+    defer w.close()
+    # The corner of cases 2 and 8: the box's, or the slanted top front one
+    # (its largest x there).
+    var corner = Vector3(1.0, 1.0, 1.0)
+    if case == 8:
+        corner = Vector3(-10.0, 0.0, 0.0)
+        for p in w.points.view():
+            if p.y > 0.99 and p.z > 0.99 and p.x > corner.x: corner = p
+    var edges = Growing[i64]()
+    defer edges.close()
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        if w.carriers.items[(usize)edge.carrier].kind != 0: continue
+        if picked(case, w.points.items[(usize)edge.start], w.points.items[(usize)edge.end], corner): try edges.push((i64)e)
+    if edges.count == 0: error(invalid, "a direct fillet case picked no edges")
+    let references = try CadModeling.edge_references(model, edges.view())
+    defer references.release()
+    let text = references.value
+    # Built directly, not declined.
+    var chosen = Growing[usize]()
+    defer chosen.close()
+    try resolve_edges(&w, text, &chosen)
+    if let direct = try local_blend(&w, chosen.view(), radius, continuity, "#f"): direct.release()
+    else: error(invalid, "a direct fillet case was declined")
+    if not compared(case, continuity): return
+    let made = try blended(model.value(), text, radius, true, "#f", continuity)
+    defer made.release()
+    let reference = try blended(model.value(), text, radius, true, "#f", continuity, true, false)
+    defer reference.release()
+    if made.value().face_count() != reference.value().face_count(): error(invalid, "a direct fillet has other faces than the booleans'")
+    let a = try volume(made.value())
+    let b = try volume(reference.value())
+    if math.abs(a - b) > 2e-4 * radius: error(invalid, "a direct fillet's volume is not the booleans'")
+
+## Whether case `case` at `continuity` is also built by booleans.
+func compared(case: i64, continuity: i64) -> bool:
+    if continuity == 1: return true
+    if continuity == 2: return case != 3 and case != 5
+    return case == 1 or case == 2 or case == 7 or case == 8
+
+## Whether case `case` takes the edge from `a` to `b` (`corner`: its
+## corner, cases 2 and 8).
+func picked(case: i64, a: Vector3, b: Vector3, corner: Vector3) -> bool:
+    let at_corner = a.subtract(corner).length() < 1e-6 or b.subtract(corner).length() < 1e-6
+    let floor = math.abs(a.y) < 1e-6 and math.abs(b.y) < 1e-6 and math.abs(a.x) < 1.0001 and math.abs(a.z) < 1.0001 and math.abs(b.x) < 1.0001 and math.abs(b.z) < 1.0001
+    let upright = math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9 and math.abs(math.abs(a.x) - 1.0) < 1e-4 and math.abs(math.abs(a.z) - 1.0) < 1e-4 and a.y > -1e-6 and b.y > -1e-6
+    if case == 0: return a.y > 0.99 and b.y > 0.99 and a.z > 0.99 and b.z > 0.99
+    if case == 1: return a.y > 0.99 and b.y > 0.99
+    if case == 2 or case == 8: return at_corner
+    if case == 3: return true
+    if case == 4: return math.abs(a.x) < 1e-6 and math.abs(a.y) < 1e-6 and math.abs(b.x) < 1e-6 and math.abs(b.y) < 1e-6
+    if case == 5: return floor or upright
+    if case == 6: return floor
+    return a.y > 0.99 and b.y > 0.99 and math.abs(a.z) > 0.99 and math.abs(b.z) > 0.99
+
+func volume(model: const CadModel*) -> f64!:
+    let mesh = try model.tessellate(32)
+    defer mesh.release()
+    let m = mesh.value()
+    var total = 0.0
+    for triangle in 0..<m.index_count() // 3:
+        var p = [Vector3(), Vector3(), Vector3()]
+        for at in 0..<(usize)3:
+            let index = m.index(triangle * 3 + (i64)at)
+            defer index.release()
+            p[at] = try m.point(try m.corner_point(try index.get()))
+        total += p[0].dot(p[1].cross(p[2])) / 6.0
+    return total

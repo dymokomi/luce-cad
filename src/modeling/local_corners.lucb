@@ -1,0 +1,363 @@
+## The corners of a direct fillet (local_blend.lucb), one per vertex where
+## a chosen edge ends; each vertex has three edges and three flat faces.
+## - One chosen edge (an end): its strip runs to the third face's plane
+##   and stops there, cut by it. The face gains that cut; the two sharp
+##   edges there end where the contact lines reach the plane.
+## - Two (a miter): the strips meet in the plane bisecting their edges,
+##   through where their contact lines cross on the face they share. Both
+##   strips' sections there are one curve only when the corner is
+##   symmetric about that plane (the sharp edge in it); else declined.
+## - Three, G1 (a ball): each strip stops square to its edge through the
+##   ball's center, in an arc of the ball, and a sphere patch closes the
+##   corner, touching each face at one point.
+## - Three, G2 or G3 (a setback): each strip stops at its setback, and the
+##   six quads of the patch (setback.lucb) close the corner; each face
+##   gains the curve between its two fillets' contacts.
+## All three outside, or all inside.
+
+## A corner's plan: its vertex and kind (1 an end, 2 a miter, 3 a ball, 4
+## a setback), the chosen edges there, a ball's center, a setback's frame,
+## a miter's or end's plane (normal, offset).
+struct CornerPlan:
+    var vertex: i64
+    var kind: i64
+    var chosen: usize[3]
+    var count: usize
+    var center: Vector3
+    var setback: Setback
+    var plane: Vector3
+    var offset: f64
+
+    func close():
+        self.count = 0
+
+## Strip `s`'s end at vertex `v` (0 its edge's start, 1 its end).
+func end_at(b: const Local*, s: usize, v: i64) -> usize:
+    return 0 if b.w.edges.items[b.strips.items[s].edge].start == v else 1
+
+## Vertex `v`'s plan; each strip's end there given its plane.
+func plan_corner(b: Local*, v: i64) -> CornerPlan!:
+    let w = b.w
+    var plan = CornerPlan(v, 0, [0, 0, 0], 0, Vector3(), Setback(v, [0, 0, 0], [Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0], false), Vector3(), 0.0)
+    var all: usize[3] = [0, 0, 0]
+    var count: usize = 0
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        if edge.start != v and edge.end != v: continue
+        if count == 3: error(invalid, "a corner has more than three edges")
+        all[count] = e
+        count += 1
+        if b.strip_of.items[e] >= 0:
+            plan.chosen[plan.count] = e
+            plan.count += 1
+    if count != 3: error(invalid, "a corner needs three edges")
+    var convex_count: usize = 0
+    for k in 0..<plan.count:
+        if b.strips.items[(usize)b.strip_of.items[plan.chosen[k]]].convex: convex_count += 1
+    if convex_count != 0 and convex_count != plan.count: error(invalid, "an inside and an outside fillet meet")
+    let p = w.points.items[(usize)v]
+    if plan.count == 1:
+        # The third face: the one the edge does not lie on.
+        let s = (usize)b.strip_of.items[plan.chosen[0]]
+        let strip = b.strips.items[s]
+        for f in try vertex_faces(b, v):
+            if f == strip.faces[0] or f == strip.faces[1]: continue
+            let n = face_outward(w, f)
+            plan.kind = 1
+            plan.plane = n
+            plan.offset = n.dot(p)
+        try set_end(b, s, v, plan.plane, plan.offset)
+        return plan
+    if plan.count == 2:
+        let sa = (usize)b.strip_of.items[plan.chosen[0]]
+        let sb = (usize)b.strip_of.items[plan.chosen[1]]
+        let a = b.strips.items[sa]
+        let c = b.strips.items[sb]
+        let shared = shared_strip_face(&a, &c)
+        if shared < 0: error(invalid, "a miter's fillets share no face")
+        let da = a.along.multiply_scalar(1.0 if end_at(b, sa, v) == 0 else -1.0)
+        let dc = c.along.multiply_scalar(1.0 if end_at(b, sb, v) == 0 else -1.0)
+        let ia = a.intos[0 if a.faces[0] == (usize)shared else 1]
+        let ic = c.intos[0 if c.faces[0] == (usize)shared else 1]
+        let x = try contacts_cross(p, da, ia, a.reach, dc, ic, c.reach)
+        plan.kind = 2
+        plan.plane = try da.subtract(dc).normalized()
+        plan.offset = plan.plane.dot(x)
+        try set_end(b, sa, v, plan.plane, plan.offset)
+        try set_end(b, sb, v, plan.plane, plan.offset)
+        return plan
+    if b.continuity == 1:
+        plan.kind = 3
+        plan.center = try ball_center(w, v, b.radius if convex_count > 0 else -b.radius)
+        for k in 0..<(usize)3:
+            let s = (usize)b.strip_of.items[plan.chosen[k]]
+            let along = b.strips.items[s].along
+            try set_end(b, s, v, along, along.dot(plan.center))
+        return plan
+    plan.kind = 4
+    plan.setback = try setback_at(w, v, plan.chosen[..<3], b.radius, convex_count == 0)
+    for i in 0..<(usize)3:
+        let s = (usize)b.strip_of.items[plan.setback.edges[i]]
+        let way = plan.setback.ways[i]
+        try set_end(b, s, v, way, way.dot(p.add(way.multiply_scalar(plan.setback.distances[i]))))
+    return plan
+
+func set_end(b: Local*, s: usize, v: i64, n: Vector3, h: f64) -> !:
+    let end = end_at(b, s, v)
+    b.strips.items[s].planes[end] = n
+    b.strips.items[s].offsets[end] = h
+
+## The face two strips share, or -1.
+func shared_strip_face(a: const Strip*, c: const Strip*) -> i64:
+    for f in a.faces:
+        if f == c.faces[0] or f == c.faces[1]: return (i64)f
+    return -1
+
+## Plan `plan`'s corner: its strips' contacts and sections there, the
+## sharp edges' new ends, the curves it leaves on faces and its faces.
+func make_corner(b: Local*, plan: const CornerPlan*, tag: str) -> !:
+    if plan.kind == 1: try make_end(b, plan)
+    elif plan.kind == 2: try make_miter(b, plan)
+    elif plan.kind == 3: try make_ball(b, plan, tag)
+    else: try make_setback(b, plan, tag)
+
+## A strip's contacts at its end at `v`, where its plane cuts the contact
+## lines, as new points.
+func cut_contacts(b: Local*, s: usize, v: i64) -> (i64, i64)!:
+    let strip = b.strips.items[s]
+    let end = end_at(b, s, v)
+    let a = try b.new_point(contact_at(&strip, 0, try contact_stop(&strip, 0, strip.planes[end], strip.offsets[end])))
+    let z = try b.new_point(contact_at(&strip, 1, try contact_stop(&strip, 1, strip.planes[end], strip.offsets[end])))
+    b.strips.items[s].contacts[end * 2] = a
+    b.strips.items[s].contacts[end * 2 + 1] = z
+    return (a, z)
+
+## The sharp edge at `v` between faces `f` and `g`, ending at point `p`
+## there now.
+func end_sharp(b: Local*, v: i64, f: usize, g: usize, p: i64) -> !:
+    let w = b.w
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        if edge.start != v and edge.end != v: continue
+        if b.strip_of.items[e] >= 0: continue
+        let fa = b.edge_faces.items[e * 2]
+        let fb = b.edge_faces.items[e * 2 + 1]
+        if not ((fa == f and fb == g) or (fa == g and fb == f)): continue
+        b.ends.items[e * 2 + (0 if edge.start == v else 1)] = p
+        return
+    error(invalid, "a corner's sharp edge is missing")
+
+func make_end(b: Local*, plan: const CornerPlan*) -> !:
+    let v = plan.vertex
+    let s = (usize)b.strip_of.items[plan.chosen[0]]
+    let (a, z) = try cut_contacts(b, s, v)
+    let strip = b.strips.items[s]
+    let section = try plane_section(b, &strip, plan.plane, plan.offset, a, z)
+    b.strips.items[s].sections[end_at(b, s, v)] = (i64)section
+    # The end face: the face at the corner the strip does not lie on.
+    var g: usize = 0
+    for f in try vertex_faces(b, v):
+        if f != strip.faces[0] and f != strip.faces[1]: g = f
+    try end_sharp(b, v, strip.faces[0], g, a)
+    try end_sharp(b, v, strip.faces[1], g, z)
+    try b.links.push(Link(v, g, section))
+
+func make_miter(b: Local*, plan: const CornerPlan*) -> !:
+    let v = plan.vertex
+    let w = b.w
+    let sa = (usize)b.strip_of.items[plan.chosen[0]]
+    let sc = (usize)b.strip_of.items[plan.chosen[1]]
+    let a = b.strips.items[sa]
+    let c = b.strips.items[sc]
+    let shared = (usize)shared_strip_face(&a, &c)
+    let side_a = (usize)(0 if a.faces[0] == shared else 1)
+    let side_c = (usize)(0 if c.faces[0] == shared else 1)
+    # Where each strip's contact lines reach the plane.
+    let xa = contact_at(&a, side_a, try contact_stop(&a, side_a, plan.plane, plan.offset))
+    let xc = contact_at(&c, side_c, try contact_stop(&c, side_c, plan.plane, plan.offset))
+    let ya = contact_at(&a, 1 - side_a, try contact_stop(&a, 1 - side_a, plan.plane, plan.offset))
+    let yc = contact_at(&c, 1 - side_c, try contact_stop(&c, 1 - side_c, plan.plane, plan.offset))
+    let close = w.tolerance * 10.0
+    if xa.subtract(xc).length() > close or ya.subtract(yc).length() > close: error(invalid, "an unsymmetric miter")
+    let x = try b.new_point(xa)
+    let y = try b.new_point(ya)
+    let end_a = end_at(b, sa, v)
+    let end_c = end_at(b, sc, v)
+    b.strips.items[sa].contacts[end_a * 2 + side_a] = x
+    b.strips.items[sa].contacts[end_a * 2 + 1 - side_a] = y
+    b.strips.items[sc].contacts[end_c * 2 + side_c] = x
+    b.strips.items[sc].contacts[end_c * 2 + 1 - side_c] = y
+    let cut = b.strips.items[sa]
+    let section = try plane_section(b, &cut, plan.plane, plan.offset, cut.contacts[end_a * 2], cut.contacts[end_a * 2 + 1])
+    # The other strip's section must be the same curve: its middle on it.
+    try same_section(b, sa, sc, plan.plane, plan.offset)
+    b.strips.items[sa].sections[end_a] = (i64)section
+    b.strips.items[sc].sections[end_c] = (i64)section
+    try end_sharp(b, v, a.faces[1 - side_a], c.faces[1 - side_c], y)
+
+## Whether strips `sa` and `sc` cut by one plane give one curve: the
+## middle of each one's section (sampled as plane_section makes it) the
+## same point.
+func same_section(b: const Local*, sa: usize, sc: usize, n: Vector3, h: f64) -> !:
+    let a = b.strips.items[sa]
+    let c = b.strips.items[sc]
+    let ma = try section_middle(b, &a, n, h)
+    let mc = try section_middle(b, &c, n, h)
+    if ma.subtract(mc).length() > b.w.tolerance * 10.0: error(invalid, "an unsymmetric miter")
+
+## The middle of strip `strip`'s section in plane (`n`, `h`): the profile's
+## middle (the circle's, or the curve's at half its parameter) moved along
+## the edge onto the plane.
+func section_middle(b: const Local*, strip: const Strip*, n: Vector3, h: f64) -> Vector3!:
+    let ua = strip.intos[0]
+    let ub = strip.intos[1]
+    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    let bisector = try ua.add(ub).normalized()
+    var middle = strip.origin.add(bisector.multiply_scalar(b.radius / math.sin(angle * 0.5) - b.radius))
+    if b.continuity > 1:
+        var section = Growing[Vector3]()
+        defer section.close()
+        var knots = Growing[f64]()
+        defer knots.close()
+        try fillet_section(strip.origin.add(ua.multiply_scalar(strip.reach)), strip.origin.add(ub.multiply_scalar(strip.reach)), strip.origin, b.continuity, &section, &knots)
+        var weights = Growing[f64]()
+        defer weights.close()
+        try weights.fill(section.count, 1.0)
+        middle = try NurbsCurve.at(section.view(), weights.view(), 5, knots.view(), 0.5)
+    return middle.add(strip.along.multiply_scalar((h - n.dot(middle)) / n.dot(strip.along)))
+
+func make_ball(b: Local*, plan: const CornerPlan*, tag: str) -> !:
+    let v = plan.vertex
+    let w = b.w
+    let c = plan.center
+    let first = (usize)b.strip_of.items[plan.chosen[0]]
+    let sign = 1.0 if b.strips.items[first].convex else -1.0
+    # The ball touches each face at one point.
+    let faces = try vertex_faces(b, v)
+    var touches: i64[3] = [0, 0, 0]
+    for k in 0..<(usize)3: touches[k] = try b.new_point(c.add(face_outward(w, faces[k]).multiply_scalar(sign * b.radius)))
+    var sections: usize[3] = [0, 0, 0]
+    for k in 0..<(usize)3:
+        let s = (usize)b.strip_of.items[plan.chosen[k]]
+        let end = end_at(b, s, v)
+        for side in 0..<(usize)2:
+            for j in 0..<(usize)3:
+                if faces[j] == b.strips.items[s].faces[side]: b.strips.items[s].contacts[end * 2 + side] = touches[j]
+        let a = b.strips.items[s].contacts[end * 2]
+        let z = b.strips.items[s].contacts[end * 2 + 1]
+        let arc = try b.arc(a, z, c, b.radius)
+        let uses: i64[1] = [arc + 1]
+        sections[k] = try b.chain(a, z, uses[..<1])
+        b.strips.items[s].sections[end] = (i64)sections[k]
+    # The sphere patch: the three arcs head to tail.
+    var loop = Growing[i64]()
+    defer loop.close()
+    var at = b.chains.items[sections[0]].head
+    var used: bool[3] = [false, false, false]
+    for _ in 0..<(usize)3:
+        var found = false
+        for k in 0..<(usize)3:
+            if used[k]: continue
+            let chain = b.chains.items[sections[k]]
+            if chain.head != at and chain.tail != at: continue
+            try b.walk(sections[k], at, &loop)
+            at = b.other_end(sections[k], at)
+            used[k] = true
+            found = true
+            break
+        if not found: error(invalid, "a ball corner's arcs do not close")
+    var middle = Vector3()
+    for k in 0..<(usize)3: middle = middle.add(try b.at(touches[k]).subtract(c).normalized())
+    let pole = try middle.normalized()
+    var empty_points: Vector3[]
+    var empty_numbers: f64[]
+    try b.out.surfaces.push(try Surface(4, c, try across(pole), pole, b.radius, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+    b.name.clear()
+    try corner_name(w, (usize)v, tag, &b.name)
+    try b.extras.push(Extra((i64)b.out.surfaces.count - 1, sign > 0.0, try b.out.add_name((str)b.name.view()), b.store.count, loop.count))
+    for use in loop.view(): try b.store.push(use)
+
+func make_setback(b: Local*, plan: const CornerPlan*, tag: str) -> !:
+    let v = plan.vertex
+    let w = b.w
+    let corner = &plan.setback
+    var quads = Growing[Vector3]()
+    defer quads.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    try setback_patch(w, corner, b.radius, b.continuity, &quads, &knots)
+    let frame = try setback_frame(w, corner, b.radius)
+    let m = knots.count - 6
+    let mm = m * m
+    let p = w.points.items[(usize)v]
+    var reversed = Growing[f64]()
+    defer reversed.close()
+    var k_ = knots.count
+    while k_ > 0:
+        k_ -= 1
+        try reversed.push(1.0 - knots.items[k_])
+    # The hole's corners, its curves' middles and the center; each curve's
+    # halves and each seam, from the quads' rows (as corner_solid).
+    var corners: i64[6] = [0, 0, 0, 0, 0, 0]
+    var middles: i64[6] = [0, 0, 0, 0, 0, 0]
+    for k in 0..<(usize)6:
+        corners[k] = try b.new_point(quads.items[k * mm])
+        middles[k] = try b.new_point(quads.items[k * mm + (m - 1) * m])
+    let center = try b.new_point(quads.items[mm - 1])
+    var firsts: i64[6] = [0, 0, 0, 0, 0, 0]
+    var seconds: i64[6] = [0, 0, 0, 0, 0, 0]
+    var seams: i64[6] = [0, 0, 0, 0, 0, 0]
+    var net = Growing[Vector3]()
+    defer net.close()
+    for k in 0..<(usize)6:
+        let next = (k + 1) % 6
+        net.clear()
+        for a in 0..<m: try net.push(quads.items[k * mm + a * m])
+        firsts[k] = try b.spline(corners[k], middles[k], net.view(), knots.view())
+        net.clear()
+        for b_ in 0..<m: try net.push(quads.items[next * mm + m - 1 - b_])
+        seconds[k] = try b.spline(middles[k], corners[next], net.view(), reversed.view())
+        net.clear()
+        for b_ in 0..<m: try net.push(quads.items[k * mm + (m - 1) * m + b_])
+        seams[k] = try b.spline(middles[k], center, net.view(), knots.view())
+    # Each strip ends in its curve's halves; each face gains the B curve.
+    for i in 0..<(usize)3:
+        let s = (usize)b.strip_of.items[corner.edges[i]]
+        let end = end_at(b, s, v)
+        for side in 0..<(usize)2:
+            let f = b.strips.items[s].faces[side]
+            if f == frame.faces[(i + 2) % 3]: b.strips.items[s].contacts[end * 2 + side] = corners[i * 2]
+            elif f == frame.faces[i]: b.strips.items[s].contacts[end * 2 + side] = corners[i * 2 + 1]
+            else: error(invalid, "a setback's fillet is not on its faces")
+        let halves: i64[2] = [firsts[i * 2] + 1, seconds[i * 2] + 1]
+        b.strips.items[s].sections[end] = (i64)(try b.chain(corners[i * 2], corners[i * 2 + 1], halves[..<2]))
+        let along_face: i64[2] = [firsts[i * 2 + 1] + 1, seconds[i * 2 + 1] + 1]
+        try b.links.push(Link(v, frame.faces[i], try b.chain(corners[i * 2 + 1], corners[(i * 2 + 2) % 6], along_face[..<2])))
+    # The quads, outward toward the corner's apex at an outside corner
+    # (the material is beyond the patch), away from it inside.
+    var bu: f64[36]
+    var bv: f64[36]
+    spline_basis(knots.view(), 0.75, bu[..<36])
+    spline_basis(knots.view(), 0.75, bv[..<36])
+    var weights = Growing[f64]()
+    defer weights.close()
+    try weights.fill(mm, 1.0)
+    b.name.clear()
+    try corner_name(w, (usize)v, tag, &b.name)
+    let name = try b.out.add_name((str)b.name.view())
+    for k in 0..<(usize)6:
+        let before = (k + 5) % 6
+        var du = Vector3()
+        var dv = Vector3()
+        var at = Vector3()
+        for a in 0..<m:
+            for b_ in 0..<m:
+                let q = quads.items[k * mm + a * m + b_]
+                du = du.add(q.multiply_scalar(bu[9 + a] * bv[b_]))
+                dv = dv.add(q.multiply_scalar(bu[a] * bv[9 + b_]))
+                at = at.add(q.multiply_scalar(bu[a] * bv[b_]))
+        try b.out.surfaces.push(try Surface(3, Vector3(), Vector3(), Vector3(), 0.0, 0.0, quads.view()[k * mm..<(k + 1) * mm], weights.view(), knots.view(), knots.view(), (i64)m, (i64)m, 5, 5))
+        let away = du.cross(dv).dot(at.subtract(p)) > 0.0
+        let loop: i64[4] = [firsts[k] + 1, seams[k] + 1, -(seams[before] + 1), seconds[before] + 1]
+        try b.extras.push(Extra((i64)b.out.surfaces.count - 1, away == corner.inside, name, b.store.count, 4))
+        for use in loop: try b.store.push(use)

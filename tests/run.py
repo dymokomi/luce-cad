@@ -10,7 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 EXE = ".exe" if os.name == "nt" else ""
 # Base contract entry points; each one runs the contract modules it imports.
-CONTRACTS = ["layout_contract", "trim_predicates_contract", "exact_contract"]
+CONTRACTS = ["layout_contract", "trim_predicates_contract", "exact_contract", "direct_fillet_contract"]
 
 
 def main():

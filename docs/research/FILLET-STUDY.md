@@ -454,6 +454,11 @@ re-trim neighbours. CAD-MODELING-STUDY §5 phase 6 already lists them.
 
 ### 3.2 Local face replacement for planar-faced bodies with cylinder and sphere blends
 
+> **As built (2026-10-08):** `local_blend.lucb` and `local_corners.lucb`. Corners are an end (cut by
+> the third face), a miter (symmetric only), a ball, or a setback patch, all outside or all inside.
+> Faces are turned by propagation from the body's, and the result is checked closed. Anything else
+> falls back to the booleans. Every edge of a box at G2 went from 1 s to 44 ms.
+
 This generalizes `rounded.lucb` (every edge of a convex polyhedron) to any chosen set of edges between
 planes. It is about OCCT's `ChFi3d` + `TopOpeBRepBuild` for the KPart cases, in a few hundred lines.
 

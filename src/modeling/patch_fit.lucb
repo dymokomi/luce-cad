@@ -295,15 +295,15 @@ func set_rule(kinds: Growing[i64]*, bases: Growing[Vector3]*, ways: Growing[Vect
     ways.items[key] = side.direction
 
 ## The thin-plate energy of every quad (S_uu^2 + 2 S_uv^2 + S_vv^2 over
-## its square), as rows at Gauss points, weighted lightly: it only
-## chooses among the surfaces the seams allow.
+## its square), weighted lightly: it only chooses among the surfaces the
+## seams allow. Over a quad it is p^T M p (p its control points, each
+## axis alike), M the same for every quad: made once by Gauss points in
+## each span, then added for each quad's unknowns.
 func fairness_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[]) -> !:
     let nodes: f64[8] = [0.019855071751231856, 0.10166676129318664, 0.2372337950418355, 0.4082826787521751, 0.5917173212478249, 0.7627662049581645, 0.8983332387068134, 0.9801449282487681]
     let weights: f64[8] = [0.05061426814518813, 0.11119051722668724, 0.15685332293894364, 0.18134189168918100, 0.18134189168918100, 0.15685332293894364, 0.11119051722668724, 0.05061426814518813]
-    let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
     let orders: usize[6] = [2, 0, 1, 1, 0, 2]
     let factors: f64[3] = [1.0, 2.0, 1.0]
-    # Gauss points in each span (the energy is a polynomial in each).
     var points = Growing[f64]()
     defer points.close()
     var spans = Growing[f64]()
@@ -315,6 +315,14 @@ func fairness_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[
         for q in 0..<(usize)8:
             try points.push(a + (b - a) * nodes[q])
             try spans.push((b - a) * weights[q])
+    # M over the m^2 control points (u-major).
+    let mm = m * m
+    var energy = Growing[f64]()
+    defer energy.close()
+    try energy.fill(mm * mm, 0.0)
+    var term = Growing[f64]()
+    defer term.close()
+    try term.fill(mm, 0.0)
     var bu: f64[36]
     var bv: f64[36]
     for qu in 0..<points.count:
@@ -322,15 +330,29 @@ func fairness_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[
         for qv in 0..<points.count:
             spline_basis(knots, points.items[qv], bv[..<36])
             let weight = 1e-5 * spans.items[qu] * spans.items[qv]
-            for k in 0..<(usize)6:
-                for term in 0..<(usize)3:
-                    let du = orders[term * 2]
-                    let dv = orders[term * 2 + 1]
-                    for axis in axes:
-                        for a in 0..<m:
-                            for b in 0..<m:
-                                try rows.add(&slots[patch_key(k, a, b, m)], bu[du * 9 + a] * bv[dv * 9 + b], axis)
-                        rows.commit(0.0, weight * factors[term])
+            for t in 0..<(usize)3:
+                let du = orders[t * 2]
+                let dv = orders[t * 2 + 1]
+                for a in 0..<m:
+                    for b in 0..<m: term.items[a * m + b] = bu[du * 9 + a] * bv[dv * 9 + b]
+                let w = weight * factors[t]
+                for i in 0..<mm:
+                    let wi = w * term.items[i]
+                    if wi == 0.0: continue
+                    for j in 0..<mm: energy.items[i * mm + j] += wi * term.items[j]
+    # Each quad's share: p_i . p_j times M_ij, through its slots.
+    let n = rows.size
+    for k in 0..<(usize)6:
+        for i in 0..<mm:
+            let si = slots[patch_key(k, i // m, i % m, m)]
+            for j in 0..<mm:
+                let coefficient = energy.items[i * mm + j]
+                if coefficient == 0.0: continue
+                let sj = slots[patch_key(k, j // m, j % m, m)]
+                for x in 0..<si.count:
+                    let axis = si.axes[x]
+                    rows.rhs.items[si.first + x] -= coefficient * axis.dot(sj.base)
+                    for y in 0..<sj.count: rows.matrix.items[(si.first + x) * n + sj.first + y] += coefficient * axis.dot(sj.axes[y])
 
 ## The seams' rows. Seam k is quad k's side u = 1 and quad k + 1's side
 ## v = 1, both from a curve's middle (t = 0) to the center. G1, weighted
