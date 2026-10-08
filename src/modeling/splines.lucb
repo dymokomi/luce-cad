@@ -1,0 +1,107 @@
+## B-spline surfaces in modeling: their chart (the surface's own parameters,
+## found by inversion), normals, and where a plane cuts a profile swept
+## straight (a surface of linear extrusion: two rows of control points, the
+## second the first moved by one vector), in closed form. Blends of G2 and
+## G3 continuity are such surfaces (blend.lucb), as are extruded splines.
+## Other pairs with B-spline surfaces are not supported yet.
+
+## Surface `s`'s parameters at `p` (on it), by inversion; NaN when it fails.
+func spline_uv(s: const Surface*, p: Vector3) -> (f64, f64):
+    let uv = project(*s, p, Vector3(0.5, 0.5, 0.0), 1e-7) catch failure:
+        _ = failure
+        recover Vector3(0.0 / 0.0, 0.0 / 0.0, 0.0)
+    return (uv.x, uv.y)
+
+## Surface `s`'s unit normal at `p` (du x dv, by differences).
+func spline_normal(s: const Surface*, p: Vector3) -> Vector3!:
+    let (u, v) = spline_uv(s, p)
+    if not math.is_finite(u): error(invalid, "a point is not on its B-spline surface")
+    let h = 1e-6
+    let u0 = math.max(0.0, u - h)
+    let u1 = math.min(1.0, u + h)
+    let v0 = math.max(0.0, v - h)
+    let v1 = math.min(1.0, v + h)
+    let du = (try evaluate(*s, Vector3(u1, v, 0.0))).subtract(try evaluate(*s, Vector3(u0, v, 0.0)))
+    let dv = (try evaluate(*s, Vector3(u, v1, 0.0))).subtract(try evaluate(*s, Vector3(u, v0, 0.0)))
+    # Each difference is tiny: their units, crossed.
+    return try (try du.normalized()).cross(try dv.normalized()).normalized()
+
+## Whether `s` is a profile swept straight, and the sweep (the second row's
+## offset from the first).
+func extrusion_of(s: const Surface*) -> (bool, Vector3):
+    if s.kind != 3 or s.nv != 2 or s.dv != 1: return (false, Vector3())
+    let sweep = s.points[1].subtract(s.points[0])
+    let reach = sweep.length()
+    if reach <= 0.0: return (false, Vector3())
+    for u in 0..<(usize)s.nu:
+        if s.points[u * 2 + 1].subtract(s.points[u * 2]).subtract(sweep).length() > reach * 1e-9: return (false, Vector3())
+        if s.weights.length > 0 and s.weights[u * 2] != s.weights[u * 2 + 1]: return (false, Vector3())
+    return (true, sweep)
+
+## Where plane `p` cuts profile surface `s` (extrusion_of), onto `out`: the
+## profile moved along the sweep onto the plane (an affine copy, exact) when
+## the plane crosses the sweep; else lines along it through the profile's
+## points on the plane (its ends where it touches, found exactly). Spline
+## curves are stored in `w`.
+func plane_extrusion(w: Shape*, p: const Surface*, s: const Surface*, sweep: Vector3, tol: f64, out: Growing[Carrier]*) -> !:
+    let n = p.z
+    let h = n.dot(p.origin)
+    let along = try sweep.normalized()
+    let nu = (usize)s.nu
+    let crossing = n.dot(along)
+    if math.abs(crossing) > 1e-9:
+        var moved = Growing[Vector3]()
+        defer moved.close()
+        var weights = Growing[f64]()
+        defer weights.close()
+        for u in 0..<nu:
+            let q = s.points[u * 2]
+            try moved.push(q.add(along.multiply_scalar((h - n.dot(q)) / crossing)))
+            try weights.push(s.weights[u * 2] if s.weights.length > 0 else 1.0)
+        # Knots from 0 to 1, as carriers of traced curves run.
+        var knots = Growing[f64]()
+        defer knots.close()
+        let low = s.ku[0]
+        let span = s.ku[s.ku.length - 1] - low
+        for k in s.ku: try knots.push((k - low) / span)
+        let spline = try w.store_spline(moved.view(), weights.view(), knots.view(), s.du, Matrix4())
+        try out.push(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline))
+        return
+    # Along the sweep: where the profile (v = 0) meets the plane.
+    let samples = 64 * nu
+    var previous = 0.0
+    for k in 0..<samples + 1:
+        let u = (f64)k / (f64)samples
+        let point = try evaluate(*s, Vector3(u, 0.0, 0.0))
+        let value = n.dot(point) - h
+        var hit = false
+        var at = u
+        if math.abs(value) <= tol:
+            # On the plane at an end (a blend's contact). Inside, a curve
+            # hugging the plane (touching it, G2) stays within reach over a
+            # stretch: only crossings count there.
+            hit = k == 0 or k == samples
+        elif k > 0 and math.abs(previous) > tol and (previous < 0.0) != (value < 0.0):
+            var low = u - 1.0 / (f64)samples
+            var high = u
+            for _ in 0..<60:
+                let middle = (low + high) * 0.5
+                let m = n.dot(try evaluate(*s, Vector3(middle, 0.0, 0.0))) - h
+                if (m < 0.0) == (previous < 0.0): low = middle
+                else: high = middle
+            at = (low + high) * 0.5
+            hit = true
+        if hit: try out.push(Carrier(0, try evaluate(*s, Vector3(at, 0.0, 0.0)), along, Vector3(), 0.0, 0.0, -1))
+        previous = value
+
+## Where faces `fa` and `fb` of `w` meet when one lies on a B-spline
+## surface, onto `out`: a plane and a profile swept straight, in closed
+## form (plane_extrusion); anything else is not supported yet.
+func spline_meet(w: Shape*, fa: usize, fb: usize, tol: f64, out: Growing[Carrier]*) -> !:
+    let sa = &w.surfaces.items[(usize)w.faces.items[fa].surface]
+    let sb = &w.surfaces.items[(usize)w.faces.items[fb].surface]
+    let plane = sa if sa.kind == 0 else sb
+    let other = sb if sa.kind == 0 else sa
+    let (swept, sweep) = extrusion_of(other)
+    if plane.kind != 0 or not swept: error(invalid, "booleans of B-spline surfaces with anything but planes are not supported yet")
+    try plane_extrusion(w, plane, other, sweep, tol, out)

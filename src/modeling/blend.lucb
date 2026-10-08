@@ -76,8 +76,8 @@ func convex(w: const Shape*, e: usize) -> bool!:
 ## goes on (a wall the edge runs into).
 ## An end marked exact (where a corner ball takes over) stops right there.
 ## Its blend face is named `name`.
-func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: const Mesh*, name: str) -> interop.Reference[CadModel]!:
-    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 1: return try rim_tool(w, e, size, round, name)
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: const Mesh*, name: str) -> interop.Reference[CadModel]!:
+    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 1: return try rim_tool(w, e, size, round, continuity, name)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -89,7 +89,7 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3
     let extent = math.max(length, size) * 4.0
     let before = 0.0 if exact_start or try inside_mesh(body, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
     let after = 0.0 if exact_end or try inside_mesh(body, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
-    var profile = try corner_profile(start.subtract(along.multiply_scalar(before)), along, ua, ub, size, round)
+    var profile = try corner_profile(start.subtract(along.multiply_scalar(before)), along, ua, ub, size, round, continuity)
     defer profile.close()
     let solid = try new_solid(length + margin * 2.0)
     defer solid.release()
@@ -99,9 +99,13 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3
 
 ## The corner profile at `p` on an edge running `along`, between its faces'
 ## directions `ua` and `ub` (into each face): a chamfer's triangle `size`
-## along each, or a fillet's region between them and the circle of radius
-## `size` touching both. Its middle edge is the blend's.
-func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool) -> Profiles!:
+## along each, or a fillet's region between them and its curve. A fillet of
+## continuity 1 (G1) is the circle of radius `size` touching both faces; of
+## 2 or 3 (G2, G3) a Bezier curve between the same contact points whose
+## first three or four control points lie along each face, so its
+## curvature (and for G3 its change) is zero where it meets them. Its
+## middle edge is the blend's.
+func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool, continuity: i64) -> Profiles!:
     let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
     let reach = size / math.tan(angle * 0.5) if round else size
     let ta = p.add(ua.multiply_scalar(reach))
@@ -111,7 +115,29 @@ func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: 
     errdefer profile.close()
     try profile.loop_offsets.push(0)
     try profile.edges.push(line_edge(p, ta))
-    if round:
+    if round and continuity > 1:
+        # Control points along each face toward the corner, at these
+        # fractions of the way from the contact point: the curve's middle
+        # stays near the circle's (0.27 of the way in for a square corner,
+        # against the circle's 0.29).
+        let g2: f64[3] = [0.0, 0.3, 0.6]
+        let g3: f64[4] = [0.0, 0.2, 0.4, 0.6]
+        let half: usize = 3 if continuity == 2 else 4
+        let first = profile.spline_points.count
+        for k in 0..<half:
+            let f = g2[k] if continuity == 2 else g3[k]
+            try profile.spline_points.push(ta.add(p.subtract(ta).multiply_scalar(f)))
+        for k in 0..<half:
+            let f = g2[half - 1 - k] if continuity == 2 else g3[half - 1 - k]
+            try profile.spline_points.push(tb.add(p.subtract(tb).multiply_scalar(f)))
+        let count = half * 2
+        let knot_first = profile.spline_knots.count
+        for k in 0..<count * 2:
+            try profile.spline_knots.push(0.0 if k < count else 1.0)
+        for _ in 0..<count: try profile.spline_weights.push(1.0)
+        try profile.splines.push(ProfileSpline(first, count, knot_first, (i64)count - 1))
+        try profile.edges.push(ProfileEdge(2, ta, tb, Vector3(), 0.0, 0.0, (i64)profile.splines.count - 1))
+    elif round:
         let bisector = try ua.add(ub).normalized()
         let center = p.add(bisector.multiply_scalar(size / math.sin(angle * 0.5)))
         let leaving = ta.subtract(center)
@@ -129,7 +155,7 @@ func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: 
 ## air between its faces) swept from `start` to `end`, ending flush with
 ## the face at each end: exactly there when that face is square to the
 ## edge, else swept past and cut by the face's plane.
-func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3, end: Vector3, name: str) -> interop.Reference[CadModel]!:
+func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, name: str) -> interop.Reference[CadModel]!:
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -139,7 +165,7 @@ func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vect
     let (n1, h1) = try end_plane(w, end, fa, fb)
     let square = math.abs(n0.dot(along)) > 1.0 - 1e-9 and math.abs(n1.dot(along)) > 1.0 - 1e-9
     let margin = 0.0 if square else size * 4.0 + length * 0.1
-    var profile = try corner_profile(start.subtract(along.multiply_scalar(margin)), along, ua, ub, size, round)
+    var profile = try corner_profile(start.subtract(along.multiply_scalar(margin)), along, ua, ub, size, round, continuity)
     defer profile.close()
     let solid = try new_solid(length + margin * 2.0)
     defer solid.release()
@@ -188,14 +214,15 @@ func name_tool(b: BrepModel*, name: str) -> !:
 ## A rim's tool: the corner profile at its middle (a triangle `size` along
 ## each face, or the region between them and the circle of radius `size`
 ## touching both) turned about the rim's axis: a cone, or a torus.
-func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, name: str) -> interop.Reference[CadModel]!:
+func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, name: str) -> interop.Reference[CadModel]!:
     let carrier = w.carriers.items[(usize)w.edges.items[e].carrier]
     let (fa, fb) = try edge_faces(w, e)
     let along = try along_edge(w, e)
     let p = try w.edge_at(e, 0.5)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
-    var profile = try corner_profile(p, along, ua, ub, size, round)
+    if round and continuity > 1: error(invalid, "G2 and G3 fillets of rims are not supported yet")
+    var profile = try corner_profile(p, along, ua, ub, size, round, continuity)
     defer profile.close()
     let solid = try new_solid(carrier.a + size * 4.0)
     defer solid.release()
@@ -206,9 +233,11 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, name: str) -> i
 ## `model` with the edges `references` refers to (references.lucb; empty:
 ## every straight convex edge between two planes) blended: filleted to
 ## `size` when `round`, else chamfered `size` along each face. The blend
-## faces are named for feature `tag`.
-pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str) -> interop.Reference[CadModel]!:
+## faces are named for feature `tag`. A fillet's `continuity` is 1 (G1,
+## circular), 2 (G2) or 3 (G3): see corner_profile.
+pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1) -> interop.Reference[CadModel]!:
     if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
+    if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
@@ -225,12 +254,12 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             if not try blendable(&w, e): error(invalid, "only straight edges between flat faces, and rims (a circle between a flat face and a cylinder about it), can be blended yet")
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
     # Every edge of a convex polyhedron rounded: built whole.
-    if round and every:
+    if round and every and continuity == 1:
         if let whole = try rounded_polyhedron(&w, size, tag): return whole
     # Where three fillets meet, a ball rounds the corner.
     var balls = Growing[Ball]()
     defer balls.close()
-    if round: try fillet_corners(&w, chosen.view(), size, &balls)
+    if round: try fillet_corners(&w, chosen.view(), size, continuity, &balls)
     let body = try model.tessellate(16)
     defer body.release()
     var tools = Growing[interop.Reference[CadModel]]()
@@ -257,7 +286,7 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
         let adding = not try convex(&w, e)
         # A rim is its own tool.
         if w.carriers.items[(usize)w.edges.items[e].carrier].kind != 0:
-            try tools.push(try edge_tool(&w, e, size, round, low, high, false, false, body.value(), (str)name.view()))
+            try tools.push(try edge_tool(&w, e, size, round, continuity, low, high, false, false, body.value(), (str)name.view()))
             try adds.push(adding)
             continue
         let (fa, fb) = try edge_faces(&w, e)
@@ -285,8 +314,8 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             elif corner.subtract(high).length() <= w.tolerance * 10.0:
                 high = foot
                 exact_high = true
-        if adding: try tools.push(try concave_tool(&w, e, size, round, low, high, (str)name.view()))
-        else: try tools.push(try edge_tool(&w, e, size, round, low, high, exact_low, exact_high, body.value(), (str)name.view()))
+        if adding: try tools.push(try concave_tool(&w, e, size, round, continuity, low, high, (str)name.view()))
+        else: try tools.push(try edge_tool(&w, e, size, round, continuity, low, high, exact_low, exact_high, body.value(), (str)name.view()))
         try adds.push(adding)
     for ball in balls.view():
         try corner_name(&w, (usize)ball.vertex, tag, &name)

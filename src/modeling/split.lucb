@@ -52,17 +52,26 @@ func end_of(w: const Shape*, h: HalfEdge) -> i64:
 ## The direction `h` leaves (`leaving`) or arrives back from (not leaving)
 ## the vertex at its start or end: a short chord, so curves leaving along
 ## one tangent still order by how they bend.
-func half_direction(w: const Shape*, h: HalfEdge, at_start: bool) -> Vector3!:
+func half_direction(w: const Shape*, h: HalfEdge, at_start: bool, fraction: f64 = 0.001) -> Vector3!:
     let e = (usize)h.edge
-    let edge = w.edges.items[e]
     # The edge's own end the half-edge is at.
     let own_start = at_start == h.forward
-    let fraction = 0.001
     let here = try w.edge_at(e, 0.0 if own_start else 1.0)
     let near = try w.edge_at(e, fraction if own_start else 1.0 - fraction)
     let chord = near.subtract(here)
     if chord.length() > 1e-300: return chord
     return try w.leaving(e, 0 if own_start else 1)
+
+## Whether half-edge `a` turns clockwise from `back` before `b` does, both
+## leaving along one tangent: compared on chords further along each until
+## they part.
+func first_clockwise(w: const Shape*, back: Vector3, a: HalfEdge, b: HalfEdge, n: Vector3) -> bool!:
+    let fractions: f64[4] = [0.01, 0.05, 0.2, 0.5]
+    for f in fractions:
+        let ta = clockwise(back, try half_direction(w, a, true, f), n)
+        let tb = clockwise(back, try half_direction(w, b, true, f), n)
+        if math.abs(ta - tb) > 1e-9: return ta < tb
+    return false
 
 ## The clockwise turn from `back` to `to` about `n`, in (0, 2 pi].
 func clockwise(back: Vector3, to: Vector3, n: Vector3) -> f64:
@@ -103,6 +112,12 @@ pub func split_face(w: const Shape*, f: usize, halves: const HalfEdge[], pole: f
                 # Its own reverse comes last.
                 var turn = clockwise(back, try half_direction(w, halves[k], true), n)
                 if halves[k].edge == h.edge and halves[k].forward != h.forward: turn = 2.0 * math.pi + 1.0
+                if best >= 0 and math.abs(turn - best_turn) < 1e-6:
+                    # Leaving along one tangent (a curve touching a line, as
+                    # a G2 blend's edge does its face's): the one that bends
+                    # first clockwise, seen further along both.
+                    if try first_clockwise(w, back, halves[k], halves[(usize)best], n): best = (i64)k
+                    continue
                 if turn < best_turn:
                     best_turn = turn
                     best = (i64)k

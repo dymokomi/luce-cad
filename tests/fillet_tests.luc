@@ -110,7 +110,8 @@ pub func fillet_tests() -> unit!:
                 slant_corner = p
     _ = filleted(slanted, edges_where(slanted, at(slant_corner)), 0.2, 10, 0.0, -1.0, false)
     inside_corners()
-    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim)")
+    smooth()
+    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim); G2 and G3 fillets outside and inside, alone and apart")
 
 func blend(model: CadModel, edges: list[int], r: float, round: bool, faces: int, expected: float, tolerance: float) -> unit!:
     let refs = CadModeling.edge_references(model, edges)
@@ -179,3 +180,45 @@ func inside_corners() -> unit!:
     let bossed = CadModeling.combined(plate, boss, 0)
     let reach = r * (10.0 - 3.0 * math.pi) / (3.0 * (4.0 - math.pi))
     blend(bossed, round_edges_where(bossed, boss_rim), r, true, 9, volume(bossed.tessellate(32)) + 2.0 * math.pi * (0.5 + reach) * a, 0.001)
+
+## G2 and G3 fillets: Bezier cross-sections between the G1 fillet's contact
+## points. For a square corner of setback r they take r^2 times these areas
+## (the curves' control points at fractions 0, 0.3, 0.6 and 0, 0.2, 0.4,
+## 0.6 of the way to the corner, from each contact point).
+func smooth() -> unit!:
+    let g2 = 0.17678573604910766
+    let g3 = 0.16566435913024405
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#b")
+    let r = 0.4
+    let upright = edges_where(box, func(a: Vector3, b: Vector3) -> bool:
+        return a.x > 0.99 and b.x > 0.99 and a.z > 0.99 and b.z > 0.99)
+    smoothed(box, upright, r, 2, 7, 8.0 - 2.0 * r * r * g2)
+    smoothed(box, upright, r, 3, 7, 8.0 - 2.0 * r * r * g3)
+    let apart = edges_where(box, func(a: Vector3, b: Vector3) -> bool:
+        return a.y > 0.99 and b.y > 0.99 and ((a.z > 0.99 and b.z > 0.99) or (a.z < -0.99 and b.z < -0.99)))
+    smoothed(box, apart, r, 2, 8, 8.0 - 4.0 * r * r * g2)
+    # Inside an L.
+    let slab = CadModeling.tagged(CadSolids.box(2.0, 1.0, 2.0), "#s").transformed(Vector3(0.0, -0.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let wall = CadModeling.tagged(CadSolids.box(1.0, 2.0, 2.0), "#w").transformed(Vector3(-0.5, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let l = CadModeling.combined(slab, wall, 0)
+    smoothed(l, edges_where(l, inner), 0.3, 2, 9, 6.0 + 2.0 * 0.09 * g2)
+    smoothed(l, edges_where(l, inner), 0.3, 3, 9, 6.0 + 2.0 * 0.09 * g3)
+    # Meeting at a corner: refused, clearly.
+    var refused = false
+    _ = CadModeling.filleted(box, CadModeling.edge_references(box, edges_where(box, at(Vector3(1.0, 1.0, 1.0)))), r, "#f", 2) catch failure:
+        refused = failure.message.contains("G2 and G3")
+    assert(refused)
+
+func smoothed(model: CadModel, edges: list[int], r: float, continuity: int, faces: int, expected: float) -> unit!:
+    let made = CadModeling.filleted(model, CadModeling.edge_references(model, edges), r, "#f", continuity)
+    assert(made.face_count() == faces)
+    let mesh = made.tessellate(32)
+    # A G3 blend meets its faces so flatly that a display sliver there may
+    # face either way: closed, then.
+    if continuity == 2:
+        manifold(mesh)
+    else:
+        closed(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > 0.0002: print(f"volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= 0.0002)

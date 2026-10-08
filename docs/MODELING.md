@@ -18,7 +18,7 @@ does today.
 | `profile_count(set)` | How many regions the sketch has. |
 | `combined(a, b, operation)` | `0` union, `1` `a` without `b`, `2` intersection. |
 | `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
-| `filleted(model, references, radius, tag)` | The referenced edges filleted to `radius`. |
+| `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |
 | `edge_references(model, edges)` | References to edges, given by their B-rep numbers (what a viewport pick gives). |
 | `resolved_count(model, references)` | How many edges the references find, or an error when one is gone. |
 | `tagged(model, tag)` | Unnamed faces named `tag/f<i>`, for bodies made without names, such as primitives. |
@@ -190,6 +190,30 @@ faces, and its tool is added with a union:
 Outside tools are subtracted first, then inside ones added. "Every edge" (no references) takes
 outside edges only.
 
+**G2 and G3 fillets** are smoother than circular ones: curvature flows into the faces instead of
+jumping at the contact lines. Their cross-section is a Bezier curve between the circular fillet's
+contact points. For G2, it is degree 5, and the first three control points on each side lie along
+that face. For G3, it is degree 7, with four on each side. The curvature is then zero where the
+curve meets each face, and for G3 so is its rate of change.
+
+The points sit at 0, 0.3 and 0.6 of the way toward the corner (G3: 0, 0.2, 0.4 and 0.6). This keeps
+the curve's middle near the circle's: 0.27 of the way in for a square corner, against the circle's
+0.29.
+
+The blend face is that curve swept along the edge, a B-spline surface. `splines.lucb` lets booleans
+meet a plane with such a swept profile in closed form:
+- **A plane crossing the sweep** cuts it in an affine copy of the profile.
+- **A plane along the sweep** cuts it in lines through the profile's points on the plane.
+
+At a G2 contact, curves stay within tolerance of the face they touch over a stretch, so two rules
+keep that stretch from producing false crossings:
+- **Crossings snap:** where a curve runs along an edge up to either one's end, the crossing is that
+  end.
+- **Splitting looks further:** where two edges leave a vertex along one tangent, the split compares
+  them further along to see which turns first.
+
+G2 and G3 fillets meeting at a corner, and those of rims, are refused for now.
+
 ### Fillets meeting at corners (`corners.lucb`)
 
 - **Two fillets** of one radius meeting where the third edge stays sharp meet in a miter. Both
@@ -223,8 +247,8 @@ Roughly in order of usefulness:
 1. **Fillet corners beyond three edges,** and setback corners (an n-sided patch, Fusion's other
    corner type).
 2. **Blends on other curved edges:** a cone's rims, ellipses, and edges between two curved faces.
-3. **B-spline surfaces in booleans.** Swept spline sides need marching on parametric surfaces.
-   Tangent intersections between curved faces need care as well.
+3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
+   surfaces. That would also bring G2 and G3 corners and rims.
 4. **Partial revolves,** sweep and loft; tapered extrudes; Extrude "to object".
 5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
 6. **Inside-corner fillets meeting other fillets;** shell, offset, draft and press/pull.
