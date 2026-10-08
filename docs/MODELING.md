@@ -232,8 +232,11 @@ G2 and G3 fillets meeting at a corner, and those of rims, are refused for now.
   edge's tool stops at the plane through that center square to the edge, where its cylinder touches
   the ball in a great circle. A corner tool then takes what is left: the region beyond those three
   planes, reaching past the faces, minus the ball. That leaves the sphere patch.
+- **Inside corners** work the same way, mirrored: the ball rolls in the air, on the faces' planes
+  moved out by the radius, and the corner tool adds material around it. A pocket's floor edges meet
+  in miters; with its walls' edges too, its corners are balls.
 - **Anything else** is refused: more than three edges at a corner, fillets meeting where the faces
-  aren't flat, or an inside-corner fillet meeting another.
+  aren't flat, or inside and outside fillets meeting at one corner.
 
 Tangent faces meet along these circles, so booleans also cut an edge wherever a vertex lies inside
 it, or wherever an edge lying along it is cut (OpenCASCADE's vertex/edge interference). Without
@@ -259,4 +262,4 @@ Roughly in order of usefulness:
    surfaces. That would also bring G2 and G3 corners and rims.
 4. **Partial revolves,** sweep and loft; tapered extrudes; Extrude "to object".
 5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
-6. **Inside-corner fillets meeting other fillets;** shell, offset, draft and press/pull.
+6. **Inside and outside fillets meeting at one corner;** shell, offset, draft and press/pull.

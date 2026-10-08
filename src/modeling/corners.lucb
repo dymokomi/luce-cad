@@ -2,16 +2,19 @@
 ## third edge stays sharp meet in a miter: their tools, each reaching past
 ## the corner, cross in the ellipses of crossing_cylinders (intersect.lucb),
 ## and the booleans make the rest. Three meeting at a corner of three flat
-## faces are rounded by a ball (OpenCASCADE's Rotule): each edge's tool
+## faces (all outside, or all inside) are rounded by a ball (OpenCASCADE's
+## Rotule): each edge's tool
 ## stops at the plane through the ball's center square to it, where its
 ## cylinder touches the ball, and a corner tool (the corner beyond those
 ## planes, without the ball) leaves the sphere patch.
 
-## A corner where three fillets meet: its vertex, and the center of the
-## ball rolling into it.
+## A corner where three fillets meet: its vertex, the center of the ball
+## rolling into it, and whether it is an inside corner (the ball rolls in
+## the air outside the faces and material is added around it).
 struct Ball:
     var vertex: i64
     var center: Vector3
+    var inside: bool
 
 ## The corners where chosen edges' fillets (of `radius`, `continuity`) meet. Two meeting
 ## where a third edge stays sharp meet in a miter, which their tools give
@@ -42,19 +45,24 @@ func fillet_corners(w: const Shape*, chosen: const usize[], radius: f64, continu
                 if not same: try directions.push(other)
             if directions.count < 2: continue
             if continuity > 1: error(invalid, "G2 and G3 fillets meeting at a corner are not supported yet: use G1 there")
+            # All outside or all inside; mixed corners are not supported yet.
+            var concave_count = 0
             for d in directions.view():
-                if not try convex(w, d): error(invalid, "a fillet of an inside corner meeting another fillet is not supported yet: fillet them one at a time")
+                if not try convex(w, d): concave_count += 1
+            if concave_count > 0 and concave_count < (i64)directions.count:
+                error(invalid, "an inside-corner fillet meeting an outside one at a corner is not supported yet: fillet them one at a time")
             let degree = edge_degree(w, vertex)
             if directions.count == 2 and degree == 3: continue
             if directions.count == 3 and degree == 3:
-                try balls.push(Ball(vertex, try ball_center(w, vertex, radius)))
+                # Inside, the ball's planes move out into the air.
+                try balls.push(Ball(vertex, try ball_center(w, vertex, -radius if concave_count > 0 else radius), concave_count > 0))
                 continue
             error(invalid, "fillets meeting at a corner are supported where two or three edges meet; fillet edges that do not meet, or chamfer them")
 
 ## A ball's corner tool: the corner beyond the planes through the ball's
 ## center square to each edge (where the edges' tools stop), reaching past
-## the faces, without the ball. Subtracted, it leaves the sphere patch
-## (named `name`) that rounds the corner.
+## the faces, without the ball. Subtracted (added, at an inside corner), it
+## leaves the sphere patch (named `name`) that rounds the corner.
 func corner_tool(w: const Shape*, ball: const Ball*, radius: f64, name: str) -> interop.Reference[CadModel]!:
     let c = ball.center
     let corner = w.points.items[(usize)ball.vertex]
@@ -85,9 +93,12 @@ func corner_tool(w: const Shape*, ball: const Ball*, radius: f64, name: str) -> 
                 if other.start == ball.vertex or other.end == ball.vertex: at_corner = true
             if at_corner and not on_edge: far = (i64)f
         if far < 0: error(invalid, "a rounded corner lost one of its faces")
+        # Past the face: into the air outside, or (an inside corner, whose
+        # tool is added) into the material.
         let n = face_outward(w, (usize)far)
-        normals[at + 3] = n
-        offsets[at + 3] = n.dot(w.surfaces.items[(usize)w.faces.items[(usize)far].surface].origin) + radius
+        let h = n.dot(w.surfaces.items[(usize)w.faces.items[(usize)far].surface].origin)
+        normals[at + 3] = n.multiply_scalar(-1.0) if ball.inside else n
+        offsets[at + 3] = (-h if ball.inside else h) + radius
         at += 1
     if at != 3: error(invalid, "a rounded corner needs three edges")
     let cell = try hexahedron(normals[..<6], offsets[..<6], radius)
