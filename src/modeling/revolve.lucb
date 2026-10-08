@@ -11,8 +11,12 @@
 ## axis) need none. The profile must not cross the axis.
 
 ## The profile's faces turned about the line through `origin` along `axis`
-## (unit, in the plane), into `b`, named for feature `tag` (naming.lucb).
-pub func revolve_into(b: BrepModel*, p: Profiles*, origin: Vector3, axis: Vector3, tol: f64, tag: str) -> !:
+## (unit, in the plane), into `b`, named for feature `tag` (naming.lucb):
+## a full turn, or `angle` radians (from the profile's plane toward its
+## normal), closed by the profile at each end.
+pub func revolve_into(b: BrepModel*, p: Profiles*, origin: Vector3, axis: Vector3, tol: f64, tag: str, angle: f64 = 2.0 * math.pi) -> !:
+    if not math.is_finite(angle) or angle <= 1e-9: error(invalid, "a revolve needs a positive angle")
+    let partial = angle < 2.0 * math.pi - 1e-9
     # Turn the way that sweeps the profile's plane toward its normal at
     # angle 0, so loops counterclockwise about the normal give outward faces.
     var a = axis
@@ -35,7 +39,10 @@ pub func revolve_into(b: BrepModel*, p: Profiles*, origin: Vector3, axis: Vector
     defer edges.close()
     var halves = Growing[bool]()
     defer halves.close()
+    var caps = Caps(Growing[i64](), Growing[i64](), Growing[i64]())
+    defer caps.close()
     for region in 0..<p.region_count():
+        caps.clear()
         for loop in p.region(region):
             # An arc from the axis back to it (a sphere's) is two halves,
             # each a cap.
@@ -52,7 +59,11 @@ pub func revolve_into(b: BrepModel*, p: Profiles*, origin: Vector3, axis: Vector
                 else:
                     try edges.push(e)
                     try halves.push(false)
-            try revolve_loop(b, p, edges.view(), halves.view(), origin, a, tol, tag)
+            if partial:
+                try revolve_part(b, p, edges.view(), origin, a, tol, tag, angle, &caps)
+            else:
+                try revolve_loop(b, p, edges.view(), halves.view(), origin, a, tol, tag)
+        if partial: try close_part(b, p, &caps, origin, a, angle, tag, p.loop_edges(p.region(region)[0]))
 
 ## How far `point` is from the axis, and where it projects onto it.
 func axis_distance(point: Vector3, origin: Vector3, a: Vector3) -> (f64, Vector3):
@@ -127,7 +138,8 @@ func revolve_loop(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[],
 
 ## The surface edge `e` sweeps about the axis, and whether its face is a cap
 ## (a plane, or a sphere reaching the axis: bounded by circles alone).
-func swept_surface(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, origin: Vector3, a: Vector3, tol: f64) -> (i64, bool)!:
+## A part revolve passes `pole`: a sphere's pole off the swept region.
+func swept_surface(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, origin: Vector3, a: Vector3, tol: f64, pole: Vector3 = Vector3()) -> (i64, bool)!:
     let (r0, f0) = axis_distance(e.start, origin, a)
     let (r1, f1) = axis_distance(e.end, origin, a)
     if e.kind == 0:
@@ -144,6 +156,8 @@ func swept_surface(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, ori
     if e.kind == 1:
         let (rc, fc) = axis_distance(e.center, origin, a)
         if rc <= tol * 10.0:
+            if pole.length() > 0.0:
+                return (try b.add_surface(4, e.center, pole, try across(pole), e.radius), false)
             let reference = e.start.subtract(f0) if r0 > tol else e.end.subtract(f1)
             return (try b.add_surface(4, e.center, a, reference, e.radius), r0 <= tol * 10.0 or r1 <= tol * 10.0)
         if e.radius >= rc: error(invalid, "an arc revolved about an axis it reaches past would make a torus through itself")
@@ -155,3 +169,135 @@ func surface_normal_at(b: const BrepModel*, s: i64, p: Vector3) -> Vector3!:
     var record = try b.surface_record(s)
     defer record.close()
     return try surface_normal(&record, p)
+
+## A part revolve's end caps: each loop's edges at the start and at the end
+## (in profile order) and the loops' sizes.
+struct Caps:
+    var start: Growing[i64]
+    var end: Growing[i64]
+    var sizes: Growing[i64]
+
+    func close():
+        self.start.close()
+        self.end.close()
+        self.sizes.close()
+
+    func clear():
+        self.start.clear()
+        self.end.clear()
+        self.sizes.clear()
+
+## `v` turned `angle` about the line through `origin` along unit `a`.
+func turned_point(v: Vector3, origin: Vector3, a: Vector3, angle: f64) -> Vector3:
+    return origin.add(turned_direction(v.subtract(origin), a, angle))
+
+## Direction `d` turned `angle` about unit `a` (Rodrigues).
+func turned_direction(d: Vector3, a: Vector3, angle: f64) -> Vector3:
+    let c = math.cos(angle)
+    let s = math.sin(angle)
+    return d.multiply_scalar(c).add(a.cross(d).multiply_scalar(s)).add(a.multiply_scalar(a.dot(d) * (1.0 - c)))
+
+## One loop turned part way: each vertex's arc (none on the axis), each
+## edge at the start and turned to the end, and the face each sweeps;
+## the start and end edges onto `caps` for close_part.
+func revolve_part(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[], origin: Vector3, a: Vector3, tol: f64, tag: str, angle: f64, caps: Caps*) -> !:
+    let count = edges.length
+    var first = Growing[i64]()
+    defer first.close()
+    var last = Growing[i64]()
+    defer last.close()
+    var arcs = Growing[i64]()
+    defer arcs.close()
+    for at in 0..<count:
+        let point = edges[at].start
+        let v0 = try b.add_vertex(point)
+        try first.push(v0)
+        let (r, foot) = axis_distance(point, origin, a)
+        if r <= tol * 10.0:
+            try last.push(v0)
+            try arcs.push(-1)
+            continue
+        let v1 = try b.add_vertex(turned_point(point, origin, a, angle))
+        try last.push(v1)
+        try arcs.push(try b.add_circle(v0, v1, foot, a, point.subtract(foot), r, true))
+    var name = Growing[u8]()
+    defer name.close()
+    let normal_end = turned_direction(p.normal, a, angle)
+    for at in 0..<count:
+        let next = (at + 1) % count
+        let e = &edges[at]
+        let a0 = arcs.items[at]
+        let a1 = arcs.items[next]
+        let at_start = try edge_curve(b, p, e, Vector3(), p.normal, first.items[at], first.items[next])
+        # A line on the axis stays where it is: both caps share it.
+        let on_axis = a0 < 0 and a1 < 0 and e.kind == 0
+        let at_end = at_start if on_axis else try turned_edge(b, p, e, origin, a, angle, normal_end, last.items[at], last.items[next])
+        try caps.start.push(at_start)
+        try caps.end.push(at_end)
+        if on_axis: continue
+        let middle = try p.edge_at(e, 0.5)
+        let tangent = try (try p.edge_at(e, 0.501)).subtract(try p.edge_at(e, 0.499)).normalized()
+        let outward = tangent.cross(p.normal)
+        # A sphere's poles both off its face: the face (half a profile arc
+        # turned) lies on one side of the axis's middle plane and toward
+        # the turn's middle, so its pole leans along the axis that side
+        # and away from the turn's middle.
+        let radial = middle.subtract(axis_distance(middle, origin, a).1)
+        var pole = Vector3()
+        if e.kind == 1 and radial.length() > tol:
+            let side = 1.0 if middle.subtract(e.center).dot(a) >= 0.0 else -1.0
+            pole = try a.multiply_scalar(side).subtract(turned_direction(try radial.normalized(), a, angle * 0.5)).normalized()
+        let (surface, cap) = try swept_surface(b, p, e, origin, a, tol, pole)
+        _ = cap
+        let sense = (try surface_normal_at(b, surface, middle)).dot(outward) > 0.0
+        var uses = Growing[i64]()
+        defer uses.close()
+        try uses.push(at_start + 1)
+        if a1 >= 0: try uses.push(a1 + 1)
+        try uses.push(-(at_end + 1))
+        if a0 >= 0: try uses.push(-(a0 + 1))
+        let sizes: i64[1] = [(i64)uses.count]
+        let face = try b.add_face(surface, uses.view(), sizes[..<1], sense)
+        try side_name(&name, tag, e, "")
+        try b.set_face_name(face, (str)name.view())
+    try caps.sizes.push((i64)count)
+
+## Profile edge `e` turned `angle` about the axis, between vertices
+## `start` and `end` of `b` (its plane's normal turned: `normal`).
+func turned_edge(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, origin: Vector3, a: Vector3, angle: f64, normal: Vector3, start: i64, end: i64) -> i64!:
+    if e.kind == 0: return try b.add_line(start, end)
+    if e.kind == 1:
+        return try b.add_circle(start, end, turned_point(e.center, origin, a, angle), normal, turned_direction(e.start.subtract(e.center), a, angle), e.radius, e.sweep > 0.0)
+    let (points, weights, knots, degree) = p.spline_net(e.spline)
+    var moved = Growing[Vector3]()
+    defer moved.close()
+    for point in points: try moved.push(turned_point(point, origin, a, angle))
+    return try b.add_spline_edge(start, end, moved.view(), weights, degree, knots, true)
+
+## A part revolve's caps: the profile region at the start (facing back
+## against the turn) and turned to the end (facing on).
+func close_part(b: BrepModel*, p: const Profiles*, caps: const Caps*, origin: Vector3, a: Vector3, angle: f64, tag: str, outer: const ProfileEdge[]) -> !:
+    var start = Growing[i64]()
+    defer start.close()
+    var at: usize = 0
+    for size in caps.sizes.view():
+        # Each loop backwards.
+        var k = (usize)size
+        while k > 0:
+            k -= 1
+            try start.push(-(caps.start.items[at + k] + 1))
+        at += (usize)size
+    var end = Growing[i64]()
+    defer end.close()
+    for e in caps.end.view(): try end.push(e + 1)
+    let reference = outer[0].end.subtract(outer[0].start) if outer[0].kind == 0 else outer[0].start.subtract(outer[0].center)
+    var name = Growing[u8]()
+    defer name.close()
+    let back = try b.add_surface(0, outer[0].start, p.normal.multiply_scalar(-1.0), reference)
+    let first = try b.add_face(back, start.view(), caps.sizes.view())
+    try cap_name(&name, tag, "start", outer)
+    try b.set_face_name(first, (str)name.view())
+    let on = try b.add_surface(0, turned_point(outer[0].start, origin, a, angle), turned_direction(p.normal, a, angle), turned_direction(reference, a, angle))
+    let last = try b.add_face(on, end.view(), caps.sizes.view())
+    try cap_name(&name, tag, "end", outer)
+    try b.set_face_name(last, (str)name.view())

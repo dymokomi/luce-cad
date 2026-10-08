@@ -14,7 +14,7 @@ does today.
 | `CadModeling.` | What it does |
 |---|---|
 | `extruded(set, distance, start, tag)` | The sketch's closed curves in `set`, as profile regions, each swept `distance` along the plane's normal from `start` along it. |
-| `revolved(set, axis, tag)` | Each region turned a full turn about the plane's u (`0`) or v (`1`) axis. |
+| `revolved(set, axis, tag, angle)` | Each region turned about the plane's u (`0`) or v (`1`) axis: a full turn, or `angle` radians closed by the profile at each end. |
 | `profile_count(set)` | How many regions the sketch has. |
 | `combined(a, b, operation)` | `0` union, `1` `a` without `b`, `2` intersection. |
 | `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
@@ -100,6 +100,26 @@ Each region becomes a closed solid:
 
 Every loop runs counterclockwise about its face's outward normal, so every edge is used twice, in
 opposite directions.
+
+### Revolve (`revolve.lucb`)
+
+Each profile edge turned about the axis sweeps a face:
+
+| Edge | Face |
+|---|---|
+| A line along the axis | A cylinder |
+| A line at an angle | A cone |
+| A line across the axis | A plane |
+| An arc centered on the axis | A sphere |
+| An arc off it | A torus |
+
+Each vertex off the axis sweeps a circle. A full turn needs no caps: each face's seam is the profile
+edge itself, used both ways. A part turn has an arc for each vertex, the profile edge at the start
+and its turned copy at the end, and the profile region as a planar cap at each end. A line on the
+axis stays put, so both caps share it.
+
+A sphere's pole is kept off its faces: along the axis on the face's side, leaning away from the turn's
+middle. A pole on a face makes the tessellator flip triangles.
 
 ### Booleans (`shape`, `intersect`, `clip`, `split`, `boolean`, `classify`, `merging.lucb`)
 
@@ -265,6 +285,6 @@ Roughly in order of usefulness:
 2. **Blends on other curved edges:** a cone's rims, ellipses, and edges between two curved faces.
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
    surfaces. That would also bring G2 and G3 corners and rims.
-4. **Partial revolves,** sweep and loft; tapered extrudes; Extrude "to object".
+4. **Sweep and loft;** tapered extrudes; Extrude "to object".
 5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
 6. **Inside and outside fillets meeting at one corner;** shell, offset, draft and press/pull.
