@@ -284,6 +284,27 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             if not try blendable(&w, e): error(invalid, "only straight edges between flat faces, and rims (a circle or arc between a flat face and a cylinder about it), can be blended yet")
         if chain: try tangent_chains(&w, &chosen)
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
+    # Inside and outside fillets meeting at a corner: one side first, the
+    # other then runs around it (a torus), by name on the result.
+    if round and not every:
+        var later = Growing[usize]()
+        defer later.close()
+        try mixed_order(&w, chosen.view(), &later)
+        if later.count > 0:
+            var first = Growing[i64]()
+            defer first.close()
+            var second = Growing[i64]()
+            defer second.close()
+            for e in chosen.view():
+                if edge_in(later.view(), e): try second.push((i64)e)
+                else: try first.push((i64)e)
+            var text = Growing[u8]()
+            defer text.close()
+            try references_of(&w, first.view(), &text)
+            let earlier = try blended(model, (str)text.view(), size, round, tag, continuity, false)
+            defer earlier.release()
+            try references_of(&w, second.view(), &text)
+            return try blended(earlier.value(), (str)text.view(), size, round, tag, continuity, true)
     # Every edge of a convex polyhedron rounded: built whole.
     if round and every and continuity == 1:
         if let whole = try rounded_polyhedron(&w, size, tag): return whole
@@ -373,6 +394,57 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             result.release()
             result = next
     return result
+
+func edge_in(edges: const usize[], e: usize) -> bool:
+    for known in edges:
+        if known == e: return true
+    return false
+
+## The edges of `chosen` to fillet after the rest, where inside and
+## outside fillets meet at a corner: the lone outside edge first where it
+## meets two inside ones (a boss's upright on a plate: the base then runs
+## around its fillet), the lone inside edge first where two outside ones
+## meet it (an L's inside upright under its top edges). Others: refused.
+func mixed_order(w: const Shape*, chosen: const usize[], later: Growing[usize]*) -> !:
+    var seen = Growing[i64]()
+    defer seen.close()
+    var here = Growing[usize]()
+    defer here.close()
+    for e in chosen:
+        let ends: i64[2] = [w.edges.items[e].start, w.edges.items[e].end]
+        for v in ends:
+            if vertex_in(seen.view(), v): continue
+            try seen.push(v)
+            here.clear()
+            var concaves = 0
+            for other in chosen:
+                let o = w.edges.items[other]
+                if o.start != v and o.end != v: continue
+                try here.push(other)
+                if not try convex(w, other): concaves += 1
+            if concaves == 0 or concaves == (i64)here.count: continue
+            if here.count != 3:
+                error(invalid, "an inside-corner fillet meeting an outside one at a corner is supported where three edges meet: fillet them one at a time")
+            # The lone kind goes first; the pair after.
+            let lone_inside = concaves == 1
+            for other in here.view():
+                let goes_later = (not try convex(w, other)) != lone_inside
+                if goes_later and not edge_in(later.view(), other): try later.push(other)
+                if not goes_later and edge_in(later.view(), other): error(invalid, "these fillets meet at corners in orders that conflict: fillet them in two features")
+    # An edge sent later at one corner but first at another conflicts.
+    seen.clear()
+    for e in later.view():
+        let ends: i64[2] = [w.edges.items[e].start, w.edges.items[e].end]
+        for v in ends:
+            var concaves = 0
+            var count = 0
+            for other in chosen:
+                let o = w.edges.items[other]
+                if o.start != v and o.end != v: continue
+                count += 1
+                if not try convex(w, other): concaves += 1
+            if concaves == 0 or concaves == count: continue
+            if (not try convex(w, e)) == (concaves == 1): error(invalid, "these fillets meet at corners in orders that conflict: fillet them in two features")
 
 func vertex_in(vertices: const i64[], v: i64) -> bool:
     for known in vertices:

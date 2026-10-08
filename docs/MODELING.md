@@ -273,8 +273,17 @@ line's does, when the corner beyond is empty.
 - **Inside corners** work the same way, mirrored: the ball rolls in the air, on the faces' planes
   moved out by the radius, and the corner tool adds material around it. A pocket's floor edges meet
   in miters; with its walls' edges too, its corners are balls.
+- **Inside and outside fillets meeting** where three edges meet are made in two passes, ordered by
+  OpenCASCADE's pivot rule:
+  - One outside edge with two inside ones (a boss's upright on a plate): the outside edge first.
+    The inside edges then run around its fillet as a tangent chain, a part torus at the corner.
+  - Two outside edges with one inside one (an L's inside upright under its top edges): the inside
+    edge first. The outside edges then run around it.
+
+  The second pass finds its edges by reference on the first pass's result.
 - **Anything else** is refused: more than three edges at a corner, fillets meeting where the faces
-  aren't flat, or inside and outside fillets meeting at one corner.
+  aren't flat, inside and outside fillets meeting where only two edges are picked, or orders that
+  conflict along one edge.
 
 Tangent faces meet along these circles, so booleans also cut an edge wherever a vertex lies inside
 it, or wherever an edge lying along it is cut (OpenCASCADE's vertex/edge interference). Without
@@ -300,4 +309,4 @@ Roughly in order of usefulness:
    surfaces. That would also bring G2 and G3 corners and rims.
 4. **Sweep and loft;** tapered extrudes; Extrude "to object".
 5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
-6. **Inside and outside fillets meeting at one corner;** shell, offset, draft and press/pull.
+6. **Shell,** offset, draft and press/pull.

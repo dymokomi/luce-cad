@@ -112,8 +112,9 @@ pub func fillet_tests() -> unit!:
     inside_corners()
     pocket_corners()
     chains()
+    mixed()
     smooth()
-    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim); G2 and G3 fillets outside and inside, alone and apart; a pocket's inside corners, mitered and balled; tangent chains around a slot's rim and an earlier fillet")
+    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim); G2 and G3 fillets outside and inside, alone and apart; a pocket's inside corners, mitered and balled; tangent chains around a slot's rim and an earlier fillet; inside and outside fillets meeting (a boss on a plate, an L's inside corner)")
 
 func blend(model: CadModel, edges: list[int], r: float, round: bool, faces: int, expected: float, tolerance: float) -> unit!:
     let refs = CadModeling.edge_references(model, edges)
@@ -297,3 +298,45 @@ func chains() -> unit!:
     closed(mesh)
     let expected = volume(rounded.tessellate(64)) - 2.0 * 1.5 * a - 0.5 * math.pi * (0.5 - reach) * a
     assert(math.abs(volume(mesh) - expected) < 0.001)
+
+## A unit boss's uprights and its base edges on the plate.
+func boss_edges(a: Vector3, b: Vector3) -> bool:
+    let upright = math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9 and math.abs(math.abs(a.x) - 0.5) < 1e-6 and math.abs(math.abs(a.z) - 0.5) < 1e-6 and a.y > 0.49 and b.y > 0.49
+    let base = math.abs(a.y - 0.5) < 1e-6 and math.abs(b.y - 0.5) < 1e-6 and math.abs(a.x) < 0.5001 and math.abs(b.x) < 0.5001 and math.abs(a.z) < 0.5001 and math.abs(b.z) < 0.5001
+    return upright or base
+
+## An L's inside upright (x = z = 0), and the top edges reaching it.
+func l_corner(a: Vector3, b: Vector3) -> bool:
+    let upright = math.abs(a.x) < 1e-6 and math.abs(a.z) < 1e-6 and math.abs(b.x) < 1e-6 and math.abs(b.z) < 1e-6
+    let corner = Vector3(0.0, 1.0, 0.0)
+    let on_top = a.y > 0.999 and b.y > 0.999 and (a.subtract(corner).length() < 1e-6 or b.subtract(corner).length() < 1e-6)
+    return upright or on_top
+
+## Inside and outside fillets meeting at corners, by order. A boss on a
+## plate (an outside upright, two inside base edges at each corner): the
+## uprights first, then the base runs around them (a quarter torus each,
+## its region's centroid r + reach from the upright's axis). An L's inside
+## corner (two outside top edges, the inside upright): the upright first,
+## then the top edges run around it.
+func mixed() -> unit!:
+    let r = 0.2
+    let a = r * r * (1.0 - math.pi * 0.25)
+    let reach = r * (10.0 - 3.0 * math.pi) / (3.0 * (4.0 - math.pi))
+    let plate = CadModeling.tagged(CadSolids.box(4.0, 1.0, 4.0), "#p")
+    let boss = CadModeling.tagged(CadSolids.box(1.0, 1.0, 1.0), "#s").transformed(Vector3(0.0, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let bossed = CadModeling.combined(plate, boss, 0)
+    let edges = edges_where(bossed, boss_edges)
+    assert(edges.length == 8)
+    let made = CadModeling.filleted(bossed, CadModeling.edge_references(bossed, edges), r, "#f")
+    let mesh = made.tessellate(32)
+    closed(mesh)
+    assert(math.abs(volume(mesh) - (17.0 - 4.0 * a + 4.0 * (1.0 - 2.0 * r) * a + 2.0 * math.pi * (r + reach) * a)) < 0.0005)
+    let a1 = CadModeling.tagged(CadSolids.box(2.0, 1.0, 1.0), "#a").transformed(Vector3(0.0, 0.5, -0.5), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let a2 = CadModeling.tagged(CadSolids.box(1.0, 1.0, 1.0), "#c").transformed(Vector3(-0.5, 0.5, 0.5), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let l = CadModeling.combined(a1, a2, 0)
+    let corner_edges = edges_where(l, l_corner)
+    assert(corner_edges.length == 3)
+    let rounded = CadModeling.filleted(l, CadModeling.edge_references(l, corner_edges), r, "#f")
+    let lm = rounded.tessellate(32)
+    closed(lm)
+    assert(math.abs(volume(lm) - (3.0 + a - 2.0 * (1.0 - r) * a - 0.5 * math.pi * (r + reach) * a)) < 0.0005)
