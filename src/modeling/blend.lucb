@@ -9,18 +9,6 @@
 ## from the booleans; fillets meeting at a corner need cylinders crossing at
 ## an angle, which booleans do not support yet. Convex edges only.
 
-## The two faces using edge `e`, or an error.
-func edge_faces(w: const Shape*, e: usize) -> (usize, usize)!:
-    var first: i64 = -1
-    var second: i64 = -1
-    for f in 0..<w.faces.count:
-        for use in w.face_uses(f):
-            if (usize)((use if use > 0 else -use) - 1) != e: continue
-            if first < 0: first = (i64)f
-            elif second < 0 and (i64)f != first: second = (i64)f
-    if first < 0 or second < 0: error(invalid, "a blended edge must lie between two faces")
-    return ((usize)first, (usize)second)
-
 ## The unit direction across face `f` from the middle of edge `e`, into the
 ## face, perpendicular to the edge.
 func into_face(w: const Shape*, f: usize, e: usize, along: Vector3) -> Vector3!:
@@ -78,8 +66,9 @@ func blendable(w: const Shape*, e: usize) -> bool!:
 ## `body` is the solid's mesh: the tool reaches past an end only where
 ## nothing is there (an outside corner), and stops flush where the solid
 ## goes on (a wall the edge runs into).
-func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3, end: Vector3, body: const Mesh*) -> interop.Reference[CadModel]!:
-    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 1: return try rim_tool(w, e, size, round)
+## Its blend face is named `name`.
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3, end: Vector3, body: const Mesh*, name: str) -> interop.Reference[CadModel]!:
+    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 1: return try rim_tool(w, e, size, round, name)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -118,13 +107,22 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3
     try nest(&profile)
     let solid = try new_solid(length + margin * 2.0)
     defer solid.release()
-    try extrude_into(solid.value(), &profile, length + before + after)
+    try extrude_into(solid.value(), &profile, length + before + after, "")
+    try name_tool(solid.value(), name)
     return try model_of(solid)
+
+## A tool's faces: the one its corner profile's middle edge made (the
+## profile's order survives nesting: three edges reversed keep their
+## middle) is the blend, named `name`; the rest go with the corner and
+## stay unnamed.
+func name_tool(b: BrepModel*, name: str) -> !:
+    for face in 0..<b.face_count():
+        try b.set_face_name(face, name if face == 1 else "")
 
 ## A rim's tool: the corner profile at its middle (a triangle `size` along
 ## each face, or the region between them and the circle of radius `size`
 ## touching both) turned about the rim's axis: a cone, or a torus.
-func rim_tool(w: const Shape*, e: usize, size: f64, round: bool) -> interop.Reference[CadModel]!:
+func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, name: str) -> interop.Reference[CadModel]!:
     let carrier = w.carriers.items[(usize)w.edges.items[e].carrier]
     let (fa, fb) = try edge_faces(w, e)
     let along = try along_edge(w, e)
@@ -155,31 +153,33 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool) -> interop.Refe
     try nest(&profile)
     let solid = try new_solid(carrier.a + size * 4.0)
     defer solid.release()
-    try revolve_into(solid.value(), &profile, carrier.origin, carrier.x.cross(carrier.y), (carrier.a + size) * 1e-7)
+    try revolve_into(solid.value(), &profile, carrier.origin, carrier.x.cross(carrier.y), (carrier.a + size) * 1e-7, "")
+    try name_tool(solid.value(), name)
     return try model_of(solid)
 
-## `model` with `edges` (B-rep edge numbers; empty: every straight convex
-## edge between two planes) blended: filleted to `size` when `round`, else
-## chamfered `size` along each face.
-pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: bool) -> interop.Reference[CadModel]!:
+## `model` with the edges `references` refers to (references.lucb; empty:
+## every straight convex edge between two planes) blended: filleted to
+## `size` when `round`, else chamfered `size` along each face. The blend
+## faces are named for feature `tag`.
+pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str) -> interop.Reference[CadModel]!:
     if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
     defer chosen.close()
-    if edges.length == 0:
+    let every = trimmed(references) == ""
+    if every:
         # Every straight edge between flat faces; rims only when named.
         for e in 0..<w.edges.count:
             if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 0 and try blendable(&w, e): try chosen.push(e)
     else:
-        for e in edges:
-            if e < 0 or e >= (i64)w.edges.count: error(invalid, "a blended edge number is not an edge of the body")
-            if not try blendable(&w, (usize)e): error(invalid, "only convex straight edges between flat faces, and rims (a circle between a flat face and a cylinder about it), can be blended yet")
-            try chosen.push((usize)e)
+        try resolve_edges(&w, references, &chosen)
+        for e in chosen.view():
+            if not try blendable(&w, e): error(invalid, "only convex straight edges between flat faces, and rims (a circle between a flat face and a cylinder about it), can be blended yet")
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
     # Every edge of a convex polyhedron rounded: built whole.
-    if round and edges.length == 0:
-        if let whole = try rounded_polyhedron(&w, size): return whole
+    if round and every:
+        if let whole = try rounded_polyhedron(&w, size, tag): return whole
     if round:
         # Fillets meeting at a corner at an angle need a corner patch (a
         # sphere where three meet), which is not made yet.
@@ -201,15 +201,18 @@ pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: b
     var done = Growing[bool]()
     defer done.close()
     for _ in chosen.view(): try done.push(false)
+    var name = Growing[u8]()
+    defer name.close()
     for i in 0..<chosen.count:
         if done.items[i]: continue
         done.items[i] = true
         let e = chosen.items[i]
         var low = try w.edge_at(e, 0.0)
         var high = try w.edge_at(e, 1.0)
+        try blend_name(&w, e, tag, &name)
         # A rim is its own tool.
         if w.carriers.items[(usize)w.edges.items[e].carrier].kind != 0:
-            try tools.push(try edge_tool(&w, e, size, round, low, high, body.value()))
+            try tools.push(try edge_tool(&w, e, size, round, low, high, body.value(), (str)name.view()))
             continue
         let (fa, fb) = try edge_faces(&w, e)
         let along = try high.subtract(low).normalized()
@@ -224,7 +227,7 @@ pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: b
                 let p = try w.edge_at(other, (f64)k)
                 if p.subtract(low).dot(along) < 0.0: low = p
                 if p.subtract(high).dot(along) > 0.0: high = p
-        try tools.push(try edge_tool(&w, e, size, round, low, high, body.value()))
+        try tools.push(try edge_tool(&w, e, size, round, low, high, body.value(), (str)name.view()))
     var result = try copy_model(model)
     for tool in tools.view():
         let next = combine(result.value(), tool.value(), op_subtract) catch failure:
@@ -233,6 +236,16 @@ pub func blended(model: const CadModel*, edges: const i64[], size: f64, round: b
         result.release()
         result = next
     return result
+
+## The name of edge `e`'s blend, `tag/blend[A&B]`, into `out` (empty
+## when its faces have no names).
+func blend_name(w: const Shape*, e: usize, tag: str, out: Growing[u8]*) -> !:
+    out.clear()
+    let (fa, fb) = try edge_faces(w, e)
+    if w.face_name(fa) == "" or w.face_name(fb) == "": return
+    try role_name(out, tag, "blend[")
+    try edge_name(w, e, out)
+    try out.push(93)
 
 ## A new reference to `model`'s B-rep, placed as it is.
 func copy_model(model: const CadModel*) -> interop.Reference[CadModel]!:
@@ -249,7 +262,7 @@ func copy_model(model: const CadModel*) -> interop.Reference[CadModel]!:
 ## a cylinder about the shrunk edge; each corner a sphere about the shrunk
 ## vertex, bounded by its edges' arcs. None when the solid is not such a
 ## polyhedron (or the radius consumes a face).
-func rounded_polyhedron(w: const Shape*, radius: f64) -> interop.Reference[CadModel]?!:
+func rounded_polyhedron(w: const Shape*, radius: f64, tag: str) -> interop.Reference[CadModel]?!:
     for f in 0..<w.faces.count:
         if w.surfaces.items[(usize)w.faces.items[f].surface].kind != 0 or w.face_sizes(f).length != 1: return none
     for e in 0..<w.edges.count:
@@ -293,6 +306,8 @@ func rounded_polyhedron(w: const Shape*, radius: f64) -> interop.Reference[CadMo
     defer curve_ids.close()
     let faces = (i64)w.faces.count
     let edges = (i64)w.edges.count
+    var name = Growing[u8]()
+    defer name.close()
     for f in 0..<w.faces.count:
         let s = w.surfaces.items[(usize)w.faces.items[f].surface]
         let n = s.z if w.faces.items[f].sense else s.z.multiply_scalar(-1.0)
@@ -313,7 +328,8 @@ func rounded_polyhedron(w: const Shape*, radius: f64) -> interop.Reference[CadMo
         let (corner, unused) = try edge_ends(b, uses.items[0] - 1)
         _ = unused
         let plane = try b.add_surface(0, try b.vertex_at(corner), n, s.x)
-        _ = try b.add_face(plane, uses.view(), sizes[..<1], true)
+        let face = try b.add_face(plane, uses.view(), sizes[..<1], true)
+        try b.set_face_name(face, w.face_name(f))
     # Each edge: a cylinder band between its two faces' lines and its arcs.
     for e in 0..<w.edges.count:
         let edge = w.edges.items[e]
@@ -351,7 +367,9 @@ func rounded_polyhedron(w: const Shape*, radius: f64) -> interop.Reference[CadMo
         let cylinder = try b.add_surface(1, cv, axis, (try b.vertex_at(pa_v)).subtract(cv), radius)
         let uses: i64[4] = [-(line_a + 1), arc_v + 1, -(line_b + 1), -(arc_u + 1)]
         let sizes: i64[1] = [4]
-        _ = try b.add_face(cylinder, uses[..<4], sizes[..<1], true)
+        let band = try b.add_face(cylinder, uses[..<4], sizes[..<1], true)
+        try blend_name(w, e, tag, &name)
+        try b.set_face_name(band, (str)name.view())
     # Each vertex: a sphere patch bounded by its edges' arcs, each run the
     # other way than its band runs it, chained into a loop.
     for v in 0..<count:
@@ -371,9 +389,37 @@ func rounded_polyhedron(w: const Shape*, radius: f64) -> interop.Reference[CadMo
         let pole = try facing.cross(Vector3(0.0, 0.0, 1.0) if math.abs(facing.z) < 0.9 else Vector3(1.0, 0.0, 0.0)).normalized()
         let sphere = try b.add_surface(4, center, pole, facing, radius)
         let sizes: i64[1] = [(i64)chained.count]
-        _ = try b.add_face(sphere, chained.view(), sizes[..<1], true)
+        let patch = try b.add_face(sphere, chained.view(), sizes[..<1], true)
+        try corner_name(w, v, tag, &name)
+        try b.set_face_name(patch, (str)name.view())
     _ = edges
     return try model_of(solid)
+
+## The name of the corner at vertex `v`, `tag/corner[A&B&C]` (its faces'
+## names, sorted), into `out`.
+func corner_name(w: const Shape*, v: usize, tag: str, out: Growing[u8]*) -> !:
+    var names = Growing[str]()
+    defer names.close()
+    for f in 0..<w.faces.count:
+        for use in w.face_uses(f):
+            let edge = w.edges.items[(usize)((use if use > 0 else -use) - 1)]
+            if edge.start != (i64)v and edge.end != (i64)v: continue
+            var known = false
+            for other in names.view():
+                if other == w.face_name(f): known = true
+            if not known: try names.push(w.face_name(f))
+    for i in 1..<names.count:
+        let value = names.items[i]
+        var j = i
+        while j > 0 and text_before(value, names.items[j - 1]):
+            names.items[j] = names.items[j - 1]
+            j -= 1
+        names.items[j] = value
+    try role_name(out, tag, "corner[")
+    for at in 0..<names.count:
+        if at > 0: try out.push(face_separator)
+        try push_text(out, names.items[at])
+    try out.push(93)
 
 ## A vertex's outward-facing face normal of face `f`.
 func face_outward(w: const Shape*, f: usize) -> Vector3:

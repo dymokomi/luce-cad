@@ -1,6 +1,7 @@
 ## A B-rep in a geometry file (geocore's prism codec): element `brep` with the
 ## tolerance and every column as it is stored, so a load gives back the same
-## model bit for bit; face paths are one byte column split by offsets.
+## model bit for bit; face paths and names are each one byte column split by
+## offsets.
 ## Derived data (records, caches, tessellations) is never written. The
 ## writer borrows the stores' bytes until the file is written.
 
@@ -39,20 +40,20 @@ pub func encode_brep(model: const BrepModel*, writer: GeometryWriter*, path: str
     try put[Matrix4](writer, "face_placement", dtype_float64, 12, &model.face_placement)
     try put[Vector3](writer, "face_color", dtype_float64, 3, &model.face_color)
     try put[u8](writer, "face_colored", dtype_uint8, 1, &model.face_colored)
-    # Face paths: their bytes, split by offsets.
+    # Face paths and names: their bytes, split by offsets. The writer
+    # borrows array bytes until the file is written; these are temporary,
+    # so they are copied.
+    try put_texts(writer, "path_bytes", "path_offsets", &model.face_paths)
+    try put_texts(writer, "name_bytes", "name_offsets", &model.face_names)
+
+func put_texts(writer: GeometryWriter*, bytes_name: str, offsets_name: str, texts: const FaceTexts*) -> !:
     var bytes = Growing[u8]()
     defer bytes.close()
     var offsets = Growing[i32]()
     defer offsets.close()
-    try offsets.push(0)
-    for path_text in model.face_paths.view():
-        if let text = path_text:
-            for byte in text.value.bytes: try bytes.push(byte)
-        try offsets.push((i32)bytes.count)
-    # The writer borrows array bytes until the file is written; these are
-    # temporary, so they are copied.
-    try writer.crate.copied_array("path_bytes", dtype_uint8, bytes.count, bytes.view())
-    try writer.crate.copied_array("path_offsets", dtype_int32, offsets.count, u8[]((u8*)offsets.items.data, offsets.count * 4))
+    try texts.pack(&bytes, &offsets)
+    try writer.crate.copied_array(bytes_name, dtype_uint8, bytes.count, bytes.view())
+    try writer.crate.copied_array(offsets_name, dtype_int32, offsets.count, u8[]((u8*)offsets.items.data, offsets.count * 4))
 
 func put[T](writer: GeometryWriter*, name: str, dtype: u8, columns: usize, store: const Store[T]*) -> !:
     let values = store.view()
@@ -71,6 +72,10 @@ pub func decode_brep(reader: GeometryReader*, path: str) -> interop.Reference[Br
     defer path_bytes.release()
     var path_offsets: Column[i32]
     defer path_offsets.release()
+    var name_bytes: Column[u8]
+    defer name_bytes.release()
+    var name_offsets: Column[i32]
+    defer name_offsets.release()
     # The tolerance comes first; the model is made when it is known.
     while let header = try reader.next_property():
         let name = header.name
@@ -85,26 +90,17 @@ pub func decode_brep(reader: GeometryReader*, path: str) -> interop.Reference[Br
         let label = base_name(name)
         if label == "path_bytes": path_bytes = try reader.column[u8](header)
         elif label == "path_offsets": path_offsets = try reader.column[i32](header)
+        elif label == "name_bytes": name_bytes = try reader.column[u8](header)
+        elif label == "name_offsets": name_offsets = try reader.column[i32](header)
         else: try read_store(reader, header, label, model)
     let owner = model_owner else error(invalid, "a saved B-rep has no columns")
     let model = owner.value()
     model.changed()
     if model.surface_edited.count != model.surface_kind.count: error(invalid, "a saved B-rep's surface columns do not match")
-    # Paths, one per face.
-    let offsets = path_offsets.view()
+    # Paths and names, one per face.
     let faces = (usize)model.face_count()
-    if offsets.length != faces + 1: error(invalid, "a saved B-rep's paths do not match its faces")
-    let bytes = path_bytes.view()
-    model.face_paths.clear()
-    for face in 0..<faces:
-        let first = (usize)offsets[face]
-        let end = (usize)offsets[face + 1]
-        if end < first or end > bytes.length: error(invalid, "a saved B-rep's path offsets are out of range")
-        var copy: interop.Packet[str]? = none
-        if end > first: copy = try interop.text_transfer.copy((str)bytes[first..<end])
-        model.face_paths.push(copy) catch failure:
-            if let made = copy: made.release()
-            error(failure.code, failure.message)
+    try model.face_paths.unpack(path_bytes.view(), path_offsets.view(), faces)
+    try model.face_names.unpack(name_bytes.view(), name_offsets.view(), faces)
     model_owner = none
     return owner
 

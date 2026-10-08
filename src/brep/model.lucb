@@ -113,7 +113,8 @@ pub struct BrepModel:
     var face_placement: Store[Matrix4]
     var face_color: Store[Vector3]
     var face_colored: Store[u8]
-    var face_paths: Growing[interop.Packet[str]?]
+    var face_paths: FaceTexts
+    var face_names: FaceTexts
     var derived: Derived*
 
     pub func init(tolerance: f64 = 0.000001) -> !:
@@ -151,7 +152,8 @@ pub struct BrepModel:
         self.face_placement = Store[Matrix4]()
         self.face_color = Store[Vector3]()
         self.face_colored = Store[u8]()
-        self.face_paths = Growing[interop.Packet[str]?]()
+        self.face_paths = face_texts()
+        self.face_names = face_texts()
         self.derived = try new Derived(sync.Mutex(), none, none, Growing[KeptMesh]()) in memory.heap
         # A failure below lets go of what is made so far.
         errdefer self.close()
@@ -187,13 +189,21 @@ pub struct BrepModel:
     ## A format-independent object path attached to an analytic face.
     pub func face_path(face: i64) -> str!:
         try self.check_face(face)
-        return (self.face_paths.items[(usize)face] else interop.Packet[str]("")).value
+        return self.face_paths.get((usize)face)
 
     pub func set_face_path(face: i64, path: str) -> !:
         try self.check_face(face)
-        let copy = try interop.text_transfer.copy(path)
-        if let previous = self.face_paths.items[(usize)face]: previous.release()
-        self.face_paths.items[(usize)face] = copy
+        try self.face_paths.set((usize)face, path)
+
+    ## The name modeling gave the face ("" when none): which feature made
+    ## it and from what, kept through later features (docs/MODELING.md).
+    pub func face_name(face: i64) -> str!:
+        try self.check_face(face)
+        return self.face_names.get((usize)face)
+
+    pub func set_face_name(face: i64, name: str) -> !:
+        try self.check_face(face)
+        try self.face_names.set((usize)face, name)
 
     ## The edge uses of face `face` (signed) and its loop sizes.
     func uses_of(face: usize) -> const i32[]:
@@ -243,6 +253,7 @@ pub struct BrepModel:
             try target.face_color.set((usize)copied, self.face_color.get((usize)id))
             try target.face_colored.set((usize)copied, self.face_colored.get((usize)id))
             try target.set_face_path(copied, try self.face_path(id))
+            try target.set_face_name(copied, try self.face_name(id))
         return output
 
     ## Curve `index` of `source`, its end vertices mapped through `vertices`.
@@ -481,7 +492,8 @@ pub struct BrepModel:
         try self.face_placement.push(Matrix4())
         try self.face_color.push(Vector3(1.0, 1.0, 1.0))
         try self.face_colored.push(0)
-        try self.face_paths.push(none)
+        try self.face_paths.push_empty()
+        try self.face_names.push_empty()
         self.changed()
         return self.face_count() - 1
 
@@ -625,21 +637,18 @@ pub struct BrepModel:
     ## Takes `mesh`: with each face's B-rep path (by its `cad_face`) in the
     ## `path` text attribute, when any face has one.
     func with_paths(mesh: interop.Reference[Mesh]) -> interop.Reference[Mesh]!:
-        var any = false
-        for path in self.face_paths.view():
-            if let text = path: any = any or text.value != ""
+        let any = self.face_paths.any()
         let source = mesh.value().find_attribute("cad_face", 2)
         if not any or source < 0: return mesh
         defer mesh.release()
         var strings = TableBuilder()
         defer strings.close()
-        let count = self.face_paths.count
+        let count = self.face_paths.count()
         let face_paths = try new i32[count] --- in memory.heap
         defer free(face_paths) in memory.heap
         for face in 0..<count:
-            face_paths[face] = -1
-            if let text = self.face_paths.items[face]:
-                if text.value != "": face_paths[face] = try strings.intern(text.value)
+            let text = self.face_paths.get(face)
+            face_paths[face] = (try strings.intern(text)) if text != "" else -1
         let faces = (usize)mesh.value().face_count()
         let values = try new i32[faces] --- in memory.heap
         defer free(values) in memory.heap
@@ -694,9 +703,8 @@ pub struct BrepModel:
         self.face_placement.close()
         self.face_color.close()
         self.face_colored.close()
-        for path in self.face_paths.view():
-            if let text = path: text.release()
         self.face_paths.close()
+        self.face_names.close()
 
 pub let brep_model_type: interop.Type[BrepModel] = interop.Type[BrepModel]("BrepModel", BrepModel.close, closeable = true)
 

@@ -24,9 +24,10 @@ pub struct ShapeEdge:
     pub var start: i64
     pub var end: i64
 
-## A face: its surface, whether its normal is the surface's, and its loops:
+## A face: its surface, whether its normal is the surface's, its loops:
 ## uses[first..<first + count] (signed: +(edge + 1) forward), loop sizes
-## sizes[loop_first..<loop_first + loops], the outer loop first.
+## sizes[loop_first..<loop_first + loops], the outer loop first; and its
+## name (the shape's name `name`, -1 for none).
 pub struct ShapeFace:
     pub var surface: i64
     pub var sense: bool
@@ -34,6 +35,7 @@ pub struct ShapeFace:
     pub var count: usize
     pub var loop_first: usize
     pub var loops: usize
+    pub var name: i64 = -1
 
 pub struct ShapeSpline:
     pub var first: usize
@@ -54,6 +56,9 @@ pub struct Shape:
     pub var spline_points: Growing[Vector3]
     pub var spline_weights: Growing[f64]
     pub var spline_knots: Growing[f64]
+    ## Face names: name n is name_bytes[name_offsets[n]..<name_offsets[n + 1]].
+    pub var name_bytes: Growing[u8]
+    pub var name_offsets: Growing[usize]
 
     pub func close():
         self.points.close()
@@ -70,6 +75,25 @@ pub struct Shape:
         self.spline_points.close()
         self.spline_weights.close()
         self.spline_knots.close()
+        self.name_bytes.close()
+        self.name_offsets.close()
+
+    ## Name `n` ("" for -1).
+    pub func name(n: i64) -> str:
+        if n < 0: return ""
+        return (str)self.name_bytes.view()[self.name_offsets.items[(usize)n]..<self.name_offsets.items[(usize)n + 1]]
+
+    ## Face `f`'s name.
+    pub func face_name(f: usize) -> str:
+        return self.name(self.faces.items[f].name)
+
+    ## A new name (-1 for "").
+    pub func add_name(text: str) -> i64!:
+        if text == "": return -1
+        if self.name_offsets.count == 0: try self.name_offsets.push(0)
+        for byte in text.bytes: try self.name_bytes.push(byte)
+        try self.name_offsets.push(self.name_bytes.count)
+        return (i64)self.name_offsets.count - 2
 
     pub func spline_net(index: i64) -> (const Vector3[], const f64[], const f64[], i64):
         let s = self.splines.items[(usize)index]
@@ -127,8 +151,8 @@ pub struct Shape:
         return (i64)self.edges.count - 1
 
     ## A face of surface `surface` with `uses` in loops of `sizes`.
-    pub func add_face(surface: i64, sense: bool, uses: const i64[], sizes: const i64[]) -> !:
-        try self.faces.push(ShapeFace(surface, sense, self.uses.count, uses.length, self.sizes.count, sizes.length))
+    pub func add_face(surface: i64, sense: bool, uses: const i64[], sizes: const i64[], name: i64 = -1) -> !:
+        try self.faces.push(ShapeFace(surface, sense, self.uses.count, uses.length, self.sizes.count, sizes.length, name))
         for use in uses: try self.uses.push(use)
         for size in sizes: try self.sizes.push(size)
 
@@ -159,7 +183,7 @@ pub struct Shape:
 
 pub func empty_shape(tolerance: f64) -> Shape:
     return Shape(tolerance, Growing[Vector3](), Growing[Carrier](), Growing[ShapeEdge](), Growing[Surface](), Growing[ShapeFace](),
-                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize]())
 
 ## Surface `s`'s unit normal at `p`.
 pub func surface_normal(s: const Surface*, p: Vector3) -> Vector3!:
@@ -252,8 +276,9 @@ pub func shape_of(model: const CadModel*) -> Shape!:
     for f in 0..<b.face_count():
         var face = try b.face_record(f)
         defer face.close()
+        let name = try shape.add_name(try b.face_name(f))
         if not mirrored:
-            try shape.add_face(face.surface, face.sense, face.uses, face.sizes)
+            try shape.add_face(face.surface, face.sense, face.uses, face.sizes, name)
             continue
         turned.clear()
         var at: usize = 0
@@ -263,7 +288,7 @@ pub func shape_of(model: const CadModel*) -> Shape!:
                 k -= 1
                 try turned.push(-face.uses[at + k])
             at += (usize)size
-        try shape.add_face(face.surface, face.sense, turned.view(), face.sizes)
+        try shape.add_face(face.surface, face.sense, turned.view(), face.sizes, name)
     return shape
 
 ## `shape` as a new B-rep: its points, edges, surfaces and faces as they are.
@@ -290,5 +315,6 @@ pub func brep_of(shape: const Shape*) -> interop.Reference[BrepModel]!:
         else:
             _ = try b.add_surface(s.kind, s.origin, s.z, s.x, s.radius, s.angle)
     for f in 0..<shape.faces.count:
-        _ = try b.add_face(shape.faces.items[f].surface, shape.face_uses(f), shape.face_sizes(f), shape.faces.items[f].sense)
+        let face = try b.add_face(shape.faces.items[f].surface, shape.face_uses(f), shape.face_sizes(f), shape.faces.items[f].sense)
+        try b.set_face_name(face, shape.face_name(f))
     return output

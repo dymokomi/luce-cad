@@ -13,16 +13,63 @@ does today.
 
 | `CadModeling.` | What it does |
 |---|---|
-| `extruded(set, distance, start)` | The sketch's closed curves in `set`, as profile regions, each swept `distance` along the plane's normal from `start` along it. |
-| `revolved(set, axis)` | Each region turned a full turn about the plane's u (`0`) or v (`1`) axis. |
+| `extruded(set, distance, start, tag)` | The sketch's closed curves in `set`, as profile regions, each swept `distance` along the plane's normal from `start` along it. |
+| `revolved(set, axis, tag)` | Each region turned a full turn about the plane's u (`0`) or v (`1`) axis. |
 | `profile_count(set)` | How many regions the sketch has. |
 | `combined(a, b, operation)` | `0` union, `1` `a` without `b`, `2` intersection. |
-| `chamfered(model, edges, distance)` | Edges chamfered `distance` along each face. |
-| `filleted(model, edges, radius)` | Edges filleted to `radius`. |
+| `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
+| `filleted(model, references, radius, tag)` | The referenced edges filleted to `radius`. |
+| `edge_references(model, edges)` | References to edges, given by their B-rep numbers (what a viewport pick gives). |
+| `resolved_count(model, references)` | How many edges the references find, or an error when one is gone. |
+| `tagged(model, tag)` | Unnamed faces named `tag/f<i>`, for bodies made without names, such as primitives. |
+| `prefixed(model, prefix)` | Every name with `prefix` in front, so a pattern's or mirror's copy is distinct. |
 
-`edges` are the body's B-rep edge numbers. An empty list means every straight convex edge between
-two flat faces. Rims are blended only when named: a rim is a full circle between a flat face and a
-cylinder about it, such as a hole's rim or a boss's edge.
+`tag` names the feature (luced-3d passes the node). Empty `references` mean every straight convex
+edge between two flat faces. Rims are blended only when referenced: a rim is a full circle between a
+flat face and a cylinder about it, such as a hole's rim or a boss's edge.
+
+## Names
+
+Edge numbers change whenever anything upstream changes, so a fillet can't remember its edges by
+number. This is the topological naming problem; the study's §4 compares how OpenCASCADE, FreeCAD and
+Onshape handle it. Here, every face carries a name saying what made it (`naming.lucb`), and edges are
+referred to by the faces they lie between (`references.lucb`).
+
+**Face names** are `tag/role`:
+
+| Made by | Role | Which face |
+|---|---|---|
+| Extrude | `start<c>`, `end<c>` | The caps of the region whose outer loop has sketch curve `c` (its lowest). |
+| | `side<c>.<k>` | The side swept by piece `k` of sketch curve `c` (a polyline's segment, say). |
+| Revolve | `side<c>.<k>` | As Extrude's; a sphere's two halves get `a` and `b` after it. |
+| Fillet, Chamfer | `blend[<edge>]` | The blend of an edge, `<edge>` its two faces' names. |
+| | `corner[<faces>]` | A rounded corner, by the names of the faces that met there. |
+| A primitive | `f<i>` | By the face's number, which a primitive keeps. |
+
+Sketch curves are numbered in the order the sketch holds them. Editing a dimension keeps every name.
+Deleting a curve renumbers the curves after it.
+
+**Through booleans,** each kept piece keeps its face's name. When a face is split into several pieces,
+they all share the name. Flush faces merged into one carry all their names, apart by `|`. Pattern and
+mirror copies get a prefix, so they don't take the original's names.
+
+**An edge reference** is its two faces' names, sorted, and where its ends were when it was picked:
+
+    #3/side0.1&#3/side0.2@1,0,3,1,1,3
+
+References are apart by `;`. Separators count only outside brackets, so names can nest.
+
+**Resolving** a reference finds the edges between faces of those names (any alias), then:
+
+- **One edge:** that is the edge.
+- **Several** (faces split by later features): the nearest to the recorded ends, together with
+  others on the same curve whose middles lie between those ends. An edge cut into pieces upstream is
+  all of its pieces.
+- **None:** the faces no longer meet, and the feature fails with "an edge this feature refers to is
+  gone". It never quietly picks another edge.
+
+Edges move with dimension edits, so where an edge was only breaks ties between edges with the same
+names.
 
 ## How each works
 
@@ -148,7 +195,4 @@ Roughly in order of usefulness:
    Tangent intersections between curved faces need care as well.
 4. **Partial revolves,** sweep and loft; tapered extrudes; Extrude "to object".
 5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
-6. **Persistent naming.** Each operation would record which faces and edges it made from which.
-   Downstream edge references would then survive upstream edits; today they are B-rep numbers. See
-   the study's §4.
-7. **Concave edge blends** (adding material), shell, offset, draft and press/pull.
+6. **Concave edge blends** (adding material), shell, offset, draft and press/pull.

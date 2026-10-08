@@ -164,7 +164,7 @@ func append_shape(into: Shape*, source: const Shape*) -> !:
     for f in 0..<source.faces.count:
         uses.clear()
         for use in source.face_uses(f): try uses.push(use + edges if use > 0 else use - edges)
-        try into.add_face(source.faces.items[f].surface + surfaces, source.faces.items[f].sense, uses.view(), source.face_sizes(f))
+        try into.add_face(source.faces.items[f].surface + surfaces, source.faces.items[f].sense, uses.view(), source.face_sizes(f), try into.add_name(source.face_name(f)))
 
 ## `a` combined with `b` by `op` (op_union, op_subtract, op_intersect).
 pub func combine(a: const CadModel*, b: const CadModel*, op: i64) -> interop.Reference[CadModel]!:
@@ -402,6 +402,9 @@ func assemble(work: Work*, op: i64, mesh_a: const Mesh*, mesh_b: const Mesh*) ->
     defer pieces.close()
     var piece_face = Growing[usize]()
     defer piece_face.close()
+    # Each piece's name: its face's, or merged faces' names together.
+    var piece_name = Growing[i64]()
+    defer piece_name.close()
     for f in 0..<w.faces.count:
         halves.clear()
         # The boundary, piece by piece, the way the face uses each edge.
@@ -430,7 +433,9 @@ func assemble(work: Work*, op: i64, mesh_a: const Mesh*, mesh_b: const Mesh*) ->
                 if try face_contains(w, f, middle, work.tol) == inside_face: try add_both(&halves, boundary, id)
         let before = pieces.piece_count()
         try split_face(&traced, f, halves.view(), try face_pole(w, f), &pieces)
-        for _ in before..<pieces.piece_count(): try piece_face.push(f)
+        for _ in before..<pieces.piece_count():
+            try piece_face.push(f)
+            try piece_name.push(w.faces.items[f].name)
     # Classify and select.
     var keep = Growing[bool]()
     defer keep.close()
@@ -453,16 +458,16 @@ func assemble(work: Work*, op: i64, mesh_a: const Mesh*, mesh_b: const Mesh*) ->
             take = class == class_in or (class == class_same and first)
         try keep.push(take)
         try turn.push(flip)
-    try merge_pieces(work, &traced, &pieces, &piece_face, &keep, &turn)
+    try merge_pieces(work, &traced, &pieces, &piece_face, &piece_name, &keep, &turn)
     try seam_zones(work, &traced, &pieces, piece_face.view(), keep.view())
-    return try write_result(work, &pieces, piece_face.view(), keep.view(), turn.view())
+    return try write_result(work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view())
 
 ## Kept pieces of one face, or of faces on one surface facing one way
 ## (coincident pairs), that share edges no other face uses are one region:
 ## each such group is traced again without those edges (a seam, one
 ## piece's both ways, stays), so a face cut and kept whole is one face and
-## two flush faces joined are one.
-func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face: Growing[usize]*, keep: Growing[bool]*, turn: Growing[bool]*) -> !:
+## two flush faces joined are one, named by all of the faces' names.
+func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face: Growing[usize]*, piece_name: Growing[i64]*, keep: Growing[bool]*, turn: Growing[bool]*) -> !:
     let original = pieces.piece_count()
     # Faces on one surface facing one way share a group (its first face).
     var group = Growing[usize]()
@@ -482,6 +487,10 @@ func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face
     defer dropped.close()
     var remaining = Growing[HalfEdge]()
     defer remaining.close()
+    var names = Growing[str]()
+    defer names.close()
+    var joined = Growing[u8]()
+    defer joined.close()
     for f in 0..<work.w.faces.count:
         if root(&group, f) != f: continue
         for side in 0..<2:
@@ -513,10 +522,16 @@ func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face
                 if not dropped.items[i]: try remaining.push(halves.items[i])
             let before = pieces.piece_count()
             try split_face(traced, f, remaining.view(), try face_pole(&work.w, f), pieces)
+            names.clear()
             for p in 0..<original:
-                if keep.items[p] and turn.items[p] == flip and root(&group, piece_face.items[p]) == f: keep.items[p] = false
+                if keep.items[p] and turn.items[p] == flip and root(&group, piece_face.items[p]) == f:
+                    keep.items[p] = false
+                    try names.push(work.w.name(piece_name.items[p]))
+            try joined_names(names.view(), &joined)
+            let name = try work.w.add_name((str)joined.view())
             for _ in before..<pieces.piece_count():
                 try piece_face.push(f)
+                try piece_name.push(name)
                 try keep.push(true)
                 try turn.push(flip)
 
@@ -728,7 +743,7 @@ pub func inside_mesh(mesh: const Mesh*, point: Vector3, size: f64) -> bool!:
     return inside_votes >= 2
 
 ## Step 7: the kept pieces as a new B-rep.
-func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[], keep: const bool[], turn: const bool[]) -> interop.Reference[CadModel]!:
+func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[], piece_name: const i64[], keep: const bool[], turn: const bool[]) -> interop.Reference[CadModel]!:
     let w = &work.w
     var uses_count = Growing[i64]()
     defer uses_count.close()
@@ -804,7 +819,8 @@ func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[],
                 let e = (usize)((use if use > 0 else -use) - 1)
                 try uses.push((edge_ids.items[e] + 1) * (1 if use > 0 else -1))
             try sizes.push((i64)cycle.length)
-        _ = try b.add_face(surface_ids.items[si], uses.view(), sizes.view(), face.sense != turn[p])
+        let made = try b.add_face(surface_ids.items[si], uses.view(), sizes.view(), face.sense != turn[p])
+        try b.set_face_name(made, w.name(piece_name[p]))
     let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
     errdefer result.release()
     try result.value().attach_brep(output)

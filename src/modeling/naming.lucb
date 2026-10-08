@@ -1,0 +1,153 @@
+## Names: each face of a modeled solid carries the name of what made it, so
+## a later feature can refer to faces and edges by what they are rather than
+## by their numbers, which change whenever an earlier feature does (the
+## topological naming problem: docs/research/CAD-MODELING-STUDY.md §4).
+##
+## A face's name is `tag/role`: `tag` the feature that made it (the editor
+## passes its node), `role` which of its faces it is:
+##
+##   Extrude    start<c>, end<c>     the caps of the region whose outer loop
+##                                   has sketch curve c (its lowest)
+##              side<c>.<k>          the side swept by piece k of curve c
+##   Revolve    side<c>.<k>          (a sphere's two halves: side<c>.<k>a, b)
+##   Fillet,    blend[<edge>]        the blend of edge <edge> (a reference)
+##   Chamfer    corner[<faces>]      a rounded corner where those faces met
+##   unnamed    f<i>                 a face named by its number (primitives)
+##
+## Booleans keep each piece's name; faces merged from several (flush faces
+## joined) carry all of their names, apart by `|`. An edge is named by the
+## two faces it lies between (references.lucb). Names nest: a blend's name
+## holds its edge's, inside brackets, and separators count only outside
+## brackets.
+
+## Whether byte string `a` sorts before `b`.
+func text_before(a: str, b: str) -> bool:
+    let x = a.bytes
+    let y = b.bytes
+    let common = x.length if x.length < y.length else y.length
+    for at in 0..<common:
+        if x[at] != y[at]: return x[at] < y[at]
+    return x.length < y.length
+
+## The parts of `text` apart by `separator` outside brackets, as (start,
+## end) byte ranges onto `out`.
+func top_parts(text: str, separator: u8, out: Growing[(usize, usize)]*) -> !:
+    out.clear()
+    let bytes = text.bytes
+    var depth = 0
+    var start: usize = 0
+    for at in 0..<bytes.length:
+        let byte = bytes[at]
+        if byte == 91: depth += 1
+        elif byte == 93: depth -= 1
+        elif byte == separator and depth == 0:
+            try out.push((start, at))
+            start = at + 1
+    try out.push((start, bytes.length))
+
+## Text `text`'s byte range `part`.
+func part_of(text: str, part: (usize, usize)) -> str:
+    let (start, end) = part
+    return (str)text.bytes[start..<end]
+
+let alias_separator: u8 = 124
+
+## Whether face names `a` and `b` share an alias.
+pub func names_meet(a: str, b: str) -> bool!:
+    if a == "" or b == "": return false
+    var pa = Growing[(usize, usize)]()
+    defer pa.close()
+    var pb = Growing[(usize, usize)]()
+    defer pb.close()
+    try top_parts(a, alias_separator, &pa)
+    try top_parts(b, alias_separator, &pb)
+    for x in pa.view():
+        for y in pb.view():
+            if part_of(a, x) == part_of(b, y): return true
+    return false
+
+## The aliases of every name in `names`, sorted, each once, apart by `|`,
+## into `out`.
+func joined_names(names: const str[], out: Growing[u8]*) -> !:
+    out.clear()
+    var parts = Growing[(usize, usize)]()
+    defer parts.close()
+    var all = Growing[str]()
+    defer all.close()
+    for name in names:
+        if name == "": continue
+        try top_parts(name, alias_separator, &parts)
+        for part in parts.view():
+            let alias = part_of(name, part)
+            var known = false
+            for other in all.view():
+                if other == alias: known = true
+            if not known: try all.push(alias)
+    # Insertion sort, by bytes.
+    for i in 1..<all.count:
+        let value = all.items[i]
+        var j = i
+        while j > 0 and text_before(value, all.items[j - 1]):
+            all.items[j] = all.items[j - 1]
+            j -= 1
+        all.items[j] = value
+    for at in 0..<all.count:
+        if at > 0: try out.push(alias_separator)
+        for byte in all.items[at].bytes: try out.push(byte)
+
+## `tag` "/" `role` into `out`.
+func role_name(out: Growing[u8]*, tag: str, role: str) -> !:
+    out.clear()
+    for byte in tag.bytes: try out.push(byte)
+    try out.push(47)
+    for byte in role.bytes: try out.push(byte)
+
+## `number` in decimal onto `out`.
+func push_number(out: Growing[u8]*, number: i64) -> !:
+    if number < 0:
+        try out.push(45)
+        try push_number(out, -number)
+        return
+    var digits: u8[24]
+    var count: usize = 0
+    var rest = number
+    while true:
+        digits[count] = (u8)(48 + rest % 10)
+        count += 1
+        rest = rest // 10
+        if rest == 0: break
+    while count > 0:
+        count -= 1
+        try out.push(digits[count])
+
+func push_text(out: Growing[u8]*, text: str) -> !:
+    for byte in text.bytes: try out.push(byte)
+
+## A profile edge's side name, `tag/side<c>.<k>` and `suffix`, into `out`.
+func side_name(out: Growing[u8]*, tag: str, edge: const ProfileEdge*, suffix: str) -> !:
+    try role_name(out, tag, "side")
+    try push_number(out, edge.curve)
+    try out.push(46)
+    try push_number(out, edge.piece)
+    try push_text(out, suffix)
+
+## A cap's name, `tag/<role><c>`, `c` the lowest curve of `outer` (the
+## region's outer loop).
+func cap_name(out: Growing[u8]*, tag: str, role: str, outer: const ProfileEdge[]) -> !:
+    try role_name(out, tag, role)
+    var lowest = outer[0].curve
+    for edge in outer:
+        if edge.curve < lowest: lowest = edge.curve
+    try push_number(out, lowest)
+
+## Name `name` with `prefix` before each alias, into `out`.
+func prefixed_name(name: str, prefix: str, out: Growing[u8]*) -> !:
+    out.clear()
+    if name == "": return
+    var parts = Growing[(usize, usize)]()
+    defer parts.close()
+    try top_parts(name, alias_separator, &parts)
+    for at in 0..<parts.count:
+        if at > 0: try out.push(alias_separator)
+        try push_text(out, prefix)
+        try push_text(out, part_of(name, parts.items[at]))

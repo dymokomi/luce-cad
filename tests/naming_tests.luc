@@ -1,0 +1,115 @@
+## Names: modeled faces carry what made them, and edge references (two face
+## names and where the edge was) find the same edges after changes upstream
+## renumber the body.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_cad.cad_geometry import CadGeometry
+from luce_geocore.geocore import Vector3, GeometryFile
+from luce_geocore.geocore import Mesh, GeometrySet, Sketches
+from checks import manifold
+
+## The straight edges of `model` whose ends `pick` likes best: each edge
+## scored by `score` at its middle, the highest returned.
+func best_edge(model: CadModel, direction: Vector3, toward: Vector3) -> int!:
+    var best = -1
+    var best_score = -1.0e300
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            if not model.face_edge_linear(face, use):
+                continue
+            let a = model.face_edge_point(face, use, 0.0)
+            let b = model.face_edge_point(face, use, 1.0)
+            let along = b.subtract(a)
+            if along.cross(direction).length() > 1e-9 * along.length():
+                continue
+            let score = a.add(b).multiply_scalar(0.5).dot(toward)
+            if score > best_score + 1e-9:
+                best_score = score
+                best = model.face_edge_id(face, use)
+    assert(best >= 0)
+    return best
+
+## Whether a vertex of `mesh` lies within 1e-6 of `p` on the axes `axes`
+## marks (1 checked, 0 ignored).
+func has_corner(mesh: Mesh, p: Vector3, axes: Vector3) -> bool!:
+    for at in 0..<mesh.vertex_count():
+        let q = mesh.vertex(at).position
+        let d = Vector3((q.x - p.x) * axes.x, (q.y - p.y) * axes.y, (q.z - p.z) * axes.z)
+        if d.length() < 1e-6:
+            return true
+    return false
+
+pub func naming_tests() -> unit!:
+    let empty = GeometrySet.of_mesh(Mesh.empty())
+    # Faces are named for the feature and the sketch curve they came from.
+    let plate = Sketches.with_shape(empty, 4, [4.0, 2.0], 0.0, 0.0)
+    let body = CadModeling.extruded(plate, 1.0, 0.0, "#1")
+    for face in 0..<body.face_count():
+        assert(body.face_name(face).starts_with("#1/"))
+    assert(body.face_name(body.face_count() - 1) == "#1/end0")
+    # A geometry file keeps them.
+    _ = CadGeometry.register_codec()
+    _ = GeometryFile.save(CadGeometry.of_model(body), "naming_codec.prism")
+    let back = CadGeometry.model(GeometryFile.load("naming_codec.prism"), 0)
+    for face in 0..<body.face_count():
+        assert(back.face_name(face) == body.face_name(face))
+
+    # A corner picked on the first sketch survives the sketch growing longer
+    # and gaining a hole (more faces, every number changed): it is still
+    # the far corner that is rounded.
+    let corner = best_edge(body, Vector3(0.0, 1.0, 0.0), Vector3(1.0, 0.0, 1.0))
+    let references = CadModeling.edge_references(body, [corner])
+    let wider = Sketches.with_shape(Sketches.with_shape(empty, 4, [6.0, 2.0], 0.0, 0.0), 3, [0.4], -1.0, 0.0)
+    let grown = CadModeling.extruded(wider, 1.0, 0.0, "#1")
+    assert(CadModeling.resolved_count(grown, references) == 1)
+    let r = 0.25
+    let rounded = CadModeling.filleted(grown, references, r, "#2")
+    let mesh = rounded.tessellate(16)
+    manifold(mesh)
+    assert(not has_corner(mesh, Vector3(1.0, 0.0, 3.0), Vector3(1.0, 0.0, 1.0)))
+    assert(has_corner(mesh, Vector3(-1.0, 0.0, 3.0), Vector3(1.0, 0.0, 1.0)))
+    var blends = 0
+    for face in 0..<rounded.face_count():
+        if rounded.face_name(face).starts_with("#2/blend["):
+            blends += 1
+    assert(blends == 1)
+
+    # A box's top front edge, then a hole drilled upstream (renumbering
+    # every edge): the same edge is filleted.
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#b")
+    let top_front = best_edge(box, Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 1.0))
+    let edge = CadModeling.edge_references(box, [top_front])
+    let hole = CadModeling.tagged(CadSolids.cylinder(0.3, 4.0), "#h")
+    let drilled = CadModeling.combined(box, hole, 1)
+    assert(CadModeling.resolved_count(drilled, edge) == 1)
+    let filleted = CadModeling.filleted(drilled, edge, r, "#f")
+    let filleted_mesh = filleted.tessellate(16)
+    manifold(filleted_mesh)
+    assert(not has_corner(filleted_mesh, Vector3(0.0, 1.0, 1.0), Vector3(0.0, 1.0, 1.0)))
+    assert(has_corner(filleted_mesh, Vector3(0.0, 1.0, -1.0), Vector3(0.0, 1.0, 1.0)))
+
+    # A slot cut across that edge upstream: the edge is two pieces now, and
+    # the reference is both.
+    let slot = CadModeling.tagged(CadSolids.box(0.5, 1.0, 4.0), "#s").transformed(Vector3(0.0, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let slotted = CadModeling.combined(box, slot, 1)
+    assert(CadModeling.resolved_count(slotted, edge) == 2)
+
+    # A body without those faces: the reference is gone.
+    let other = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#o")
+    var gone = false
+    _ = CadModeling.resolved_count(other, edge) catch failure:
+        gone = failure.message.contains("gone")
+    assert(gone)
+
+    # Flush faces joined carry both names; a copy prefixed is distinct.
+    let beside = CadModeling.prefixed(box, "#p.1:").transformed(Vector3(2.0, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let joined = CadModeling.combined(box, beside, 0)
+    var merged = 0
+    for face in 0..<joined.face_count():
+        if joined.face_name(face).contains("|"):
+            merged += 1
+    assert(merged == 4)
+    let copy_edge = CadModeling.edge_references(beside, [top_front])
+    assert(copy_edge.contains("#p.1:#b/"))
+    print("PASS naming: faces named for their features, kept by geometry files; edge references survive a longer sketch, a hole and a slot upstream, and fail when their faces are gone; flush faces joined carry both names")

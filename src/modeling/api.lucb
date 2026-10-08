@@ -7,8 +7,8 @@ pub struct CadModeling:
     ## plane) as profiles, every region extruded `distance` along the
     ## plane's normal (negative: the other way) from `start` along it (a
     ## symmetric extrusion starts at minus half its distance): one closed
-    ## solid each.
-    pub static func extruded(set: interop.Reference[GeometrySet], distance: f64, start: f64 = 0.0) -> interop.Reference[CadModel]!:
+    ## solid each. Its faces are named for feature `tag` (naming.lucb).
+    pub static func extruded(set: interop.Reference[GeometrySet], distance: f64, start: f64, tag: str) -> interop.Reference[CadModel]!:
         let source = try set.get()
         let size = try sketch_size(source)
         var p = try profiles_of(source, size * 0.0001)
@@ -16,7 +16,7 @@ pub struct CadModeling:
         if start != 0.0: p.moved(p.normal.multiply_scalar(start))
         let solid = try new_solid(size)
         defer solid.release()
-        try extrude_into(solid.value(), &p, distance)
+        try extrude_into(solid.value(), &p, distance, tag)
         return try model_of(solid)
 
     ## `a` and `b` combined: `operation` 0 their union, 1 `a` without
@@ -25,28 +25,78 @@ pub struct CadModeling:
         if operation < 0 or operation > 2: error(invalid, "a boolean operation is 0 union, 1 subtract or 2 intersect")
         return try combine(a.value(), b.value(), operation)
 
-    ## `model` with `edges` (its B-rep edge numbers; empty: every straight
-    ## convex edge between two flat faces) chamfered `distance` along each
-    ## face.
-    pub static func chamfered(model: interop.Reference[CadModel], edges: const i64[], distance: f64) -> interop.Reference[CadModel]!:
-        return try blended(model.value(), edges, distance, false)
+    ## `model` with the edges `references` names (edge_references'; empty:
+    ## every straight convex edge between two flat faces) chamfered
+    ## `distance` along each face, the chamfers named for feature `tag`.
+    pub static func chamfered(model: interop.Reference[CadModel], references: str, distance: f64, tag: str) -> interop.Reference[CadModel]!:
+        return try blended(model.value(), references, distance, false, tag)
 
-    ## `model` with `edges` (as chamfered) filleted to `radius`.
-    pub static func filleted(model: interop.Reference[CadModel], edges: const i64[], radius: f64) -> interop.Reference[CadModel]!:
-        return try blended(model.value(), edges, radius, true)
+    ## `model` with the edges `references` names (as chamfered) filleted to
+    ## `radius`.
+    pub static func filleted(model: interop.Reference[CadModel], references: str, radius: f64, tag: str) -> interop.Reference[CadModel]!:
+        return try blended(model.value(), references, radius, true, tag)
+
+    ## References to `model`'s edges `edges` (B-rep edge numbers), apart by
+    ## `;`: each the names of its two faces and where it is, so a feature
+    ## finds the same edges after changes upstream renumber them.
+    pub static func edge_references(model: interop.Reference[CadModel], edges: const i64[]) -> interop.Owned[str]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var text = Growing[u8]()
+        defer text.close()
+        try references_of(&w, edges, &text)
+        return try interop.copy_text((str)text.view())
+
+    ## How many of `model`'s edges `references` resolves to (an error when
+    ## one is gone).
+    pub static func resolved_count(model: interop.Reference[CadModel], references: str) -> i64!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var edges = Growing[usize]()
+        defer edges.close()
+        try resolve_edges(&w, references, &edges)
+        return (i64)edges.count
+
+    ## `model` with its unnamed faces named `tag/f<i>` (i the face's
+    ## number), as a feature that makes a body without naming its faces
+    ## (a primitive) gives them.
+    pub static func tagged(model: interop.Reference[CadModel], tag: str) -> interop.Reference[CadModel]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var name = Growing[u8]()
+        defer name.close()
+        for f in 0..<w.faces.count:
+            if w.faces.items[f].name >= 0: continue
+            try role_name(&name, tag, "f")
+            try push_number(&name, (i64)f)
+            w.faces.items[f].name = try w.add_name((str)name.view())
+        return try shape_model(&w)
+
+    ## `model` with `prefix` before each of its faces' names (every alias):
+    ## a copy (a pattern's, a mirror's) distinct from its original.
+    pub static func prefixed(model: interop.Reference[CadModel], prefix: str) -> interop.Reference[CadModel]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var name = Growing[u8]()
+        defer name.close()
+        for f in 0..<w.faces.count:
+            try prefixed_name(w.face_name(f), prefix, &name)
+            w.faces.items[f].name = try w.add_name((str)name.view())
+        return try shape_model(&w)
 
     ## The closed curves of the sketch in `set` as profiles, every region
     ## turned a full turn about its plane's `axis` (0 the plane's u
     ## direction, 1 its v direction) through the plane's origin, into
-    ## closed solids. The profile must lie on one side of the axis.
-    pub static func revolved(set: interop.Reference[GeometrySet], axis: i64) -> interop.Reference[CadModel]!:
+    ## closed solids. The profile must lie on one side of the axis. Its
+    ## faces are named for feature `tag`.
+    pub static func revolved(set: interop.Reference[GeometrySet], axis: i64, tag: str) -> interop.Reference[CadModel]!:
         let source = try set.get()
         let size = try sketch_size(source)
         var p = try profiles_of(source, size * 0.0001)
         defer p.close()
         let solid = try new_solid(size)
         defer solid.release()
-        try revolve_into(solid.value(), &p, p.origin, p.u if axis == 0 else p.v, size * 0.000001)
+        try revolve_into(solid.value(), &p, p.origin, p.u if axis == 0 else p.v, size * 0.000001, tag)
         return try model_of(solid)
 
     ## How many profile regions the sketch in `set` has.
@@ -71,6 +121,12 @@ func sketch_size(set: const GeometrySet*) -> f64!:
 ## An empty B-rep with a tolerance for `size`.
 func new_solid(size: f64) -> interop.Reference[BrepModel]!:
     return try interop.Reference[BrepModel].adopt(new BrepModel(math.max(0.000000001, size * 0.000001)) in memory.heap, brep_model_type, memory.heap)
+
+## A model of shape `w`.
+func shape_model(w: const Shape*) -> interop.Reference[CadModel]!:
+    let b = try brep_of(w)
+    defer b.release()
+    return try model_of(b)
 
 func model_of(solid: interop.Reference[BrepModel]) -> interop.Reference[CadModel]!:
     let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)

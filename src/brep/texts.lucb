@@ -1,0 +1,68 @@
+## A text per face (empty when unset): face paths (a format's object path)
+## and face names (the modeling feature that made the face, for references
+## that outlive renumbering: see docs/MODELING.md, "Names").
+
+pub struct FaceTexts:
+    var items: Growing[interop.Packet[str]?]
+
+    pub func close():
+        for text in self.items.view():
+            if let owned = text: owned.release()
+        self.items.close()
+
+    pub func count() -> usize:
+        return self.items.count
+
+    ## Text `at` ("" when unset).
+    pub func get(at: usize) -> str:
+        return (self.items.items[at] else interop.Packet[str]("")).value
+
+    pub func set(at: usize, text: str) -> !:
+        var copy: interop.Packet[str]? = none
+        if text != "": copy = try interop.text_transfer.copy(text)
+        if let previous = self.items.items[at]: previous.release()
+        self.items.items[at] = copy
+
+    ## Room for one more face, unset.
+    pub func push_empty() -> !:
+        try self.items.push(none)
+
+    pub func push(text: str) -> !:
+        try self.items.push(none)
+        try self.set(self.items.count - 1, text)
+
+    ## Whether any face has a text.
+    pub func any() -> bool:
+        for text in self.items.view():
+            if text != none: return true
+        return false
+
+    pub func clear():
+        for text in self.items.view():
+            if let owned = text: owned.release()
+        self.items.clear()
+
+    ## Every text, its bytes in `bytes` split by `offsets` (one more than
+    ## the faces, from 0).
+    pub func pack(bytes: Growing[u8]*, offsets: Growing[i32]*) -> !:
+        try offsets.push(0)
+        for at in 0..<self.items.count:
+            for byte in self.get(at).bytes: try bytes.push(byte)
+            try offsets.push((i32)bytes.count)
+
+    ## The texts of `faces` faces read back from pack's columns (none when
+    ## both are empty: no face has a text).
+    pub func unpack(bytes: const u8[], offsets: const i32[], faces: usize) -> !:
+        self.clear()
+        if offsets.length == 0 and bytes.length == 0:
+            for _ in 0..<faces: try self.push_empty()
+            return
+        if offsets.length != faces + 1: error(invalid, "a saved B-rep's face texts do not match its faces")
+        for face in 0..<faces:
+            let first = (usize)offsets[face]
+            let end = (usize)offsets[face + 1]
+            if end < first or end > bytes.length: error(invalid, "a saved B-rep's face text offsets are out of range")
+            try self.push((str)bytes[first..<end])
+
+pub func face_texts() -> FaceTexts:
+    return FaceTexts(Growing[interop.Packet[str]?]())

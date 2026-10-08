@@ -1,0 +1,160 @@
+## Edge references: an edge named by the two faces it lies between, and
+## where it was when picked, so a feature's chosen edges survive changes
+## upstream that renumber the body (naming.lucb).
+##
+##   <face>&<face>@x0,y0,z0,x1,y1,z1
+##
+## The face names sort by bytes; the six numbers are the edge's ends (one
+## point twice for a closed edge). References are apart by `;`.
+##
+## Resolving one: the edges between faces of those names (any of their
+## aliases). Of several (faces split by later features), the one nearest
+## the recorded edge, and with it the others on its curve whose middles lie
+## within the recorded ends: an edge later cut in pieces is all of them.
+## No edge between those faces is an error: the reference is gone.
+
+let reference_separator: u8 = 59
+let face_separator: u8 = 38
+let place_separator: u8 = 64
+
+## The two faces using edge `e` (each once: a seam, one face's both ways,
+## is no edge between two faces), or an error.
+func edge_faces(w: const Shape*, e: usize) -> (usize, usize)!:
+    var first: i64 = -1
+    var second: i64 = -1
+    for f in 0..<w.faces.count:
+        for use in w.face_uses(f):
+            if (usize)((use if use > 0 else -use) - 1) != e: continue
+            if first < 0: first = (i64)f
+            elif second < 0 and (i64)f != first: second = (i64)f
+    if first < 0 or second < 0: error(invalid, "an edge must lie between two faces")
+    return ((usize)first, (usize)second)
+
+## The faces' names of edge `e`, sorted, `A&B`, onto `out` (which is not
+## cleared).
+func edge_name(w: const Shape*, e: usize, out: Growing[u8]*) -> !:
+    let (fa, fb) = try edge_faces(w, e)
+    var a = w.face_name(fa)
+    var b = w.face_name(fb)
+    if a == "" or b == "": error(invalid, "an edge between unnamed faces cannot be referred to")
+    if text_before(b, a):
+        let swap = a
+        a = b
+        b = swap
+    try push_text(out, a)
+    try out.push(face_separator)
+    try push_text(out, b)
+
+## A coordinate to a millionth, onto `out`.
+func push_coordinate(out: Growing[u8]*, value: f64) -> !:
+    var buffer: u8[32]
+    try push_text(out, try strings.format_f64(math.round(value * 1.0e6) / 1.0e6, buffer[..<32]))
+
+## Edge `e`'s reference onto `out` (which is not cleared).
+func edge_reference(w: const Shape*, e: usize, out: Growing[u8]*) -> !:
+    try edge_name(w, e, out)
+    try out.push(place_separator)
+    for k in 0..<2:
+        let p = try w.edge_at(e, (f64)k)
+        if k > 0: try out.push(44)
+        try push_coordinate(out, p.x)
+        try out.push(44)
+        try push_coordinate(out, p.y)
+        try out.push(44)
+        try push_coordinate(out, p.z)
+
+## The references of edges `edges`, apart by `;`, into `out`.
+func references_of(w: const Shape*, edges: const i64[], out: Growing[u8]*) -> !:
+    out.clear()
+    for at in 0..<edges.length:
+        let e = edges[at]
+        if e < 0 or e >= (i64)w.edges.count: error(invalid, "an edge number is not an edge of the body")
+        if at > 0: try out.push(reference_separator)
+        try edge_reference(w, (usize)e, out)
+
+## Whether edge `e` lies between faces named `a` and `b` (either way round).
+func between(w: const Shape*, e: usize, a: str, b: str) -> bool!:
+    let (fa, fb) = edge_faces(w, e) catch failure:
+        _ = failure
+        return false
+    let na = w.face_name(fa)
+    let nb = w.face_name(fb)
+    return (try names_meet(na, a) and try names_meet(nb, b)) or (try names_meet(na, b) and try names_meet(nb, a))
+
+## How far `p` is from the segment from `a` to `z`, and where along it it
+## falls (0 at a, 1 at z).
+func segment_place(p: Vector3, a: Vector3, z: Vector3) -> (f64, f64):
+    let d = z.subtract(a)
+    let length = d.dot(d)
+    if length <= 0.0: return (p.subtract(a).length(), 0.0)
+    let t = p.subtract(a).dot(d) / length
+    let clamped = math.clamp(t, 0.0, 1.0)
+    return (p.subtract(a.add(d.multiply_scalar(clamped))).length(), t)
+
+## The edges `text` (references apart by `;`) refers to, each once, onto
+## `out`.
+pub func resolve_edges(w: const Shape*, text: str, out: Growing[usize]*) -> !:
+    out.clear()
+    var references = Growing[(usize, usize)]()
+    defer references.close()
+    var parts = Growing[(usize, usize)]()
+    defer parts.close()
+    var faces = Growing[(usize, usize)]()
+    defer faces.close()
+    var numbers = Growing[(usize, usize)]()
+    defer numbers.close()
+    var candidates = Growing[usize]()
+    defer candidates.close()
+    try top_parts(text, reference_separator, &references)
+    for range in references.view():
+        let reference = trimmed(part_of(text, range))
+        if reference == "": continue
+        try top_parts(reference, place_separator, &parts)
+        let names = part_of(reference, parts.items[0])
+        try top_parts(names, face_separator, &faces)
+        if faces.count != 2 or parts.count > 2: error(invalid, "an edge reference is two face names apart by & (and where the edge was, after @)")
+        let a = part_of(names, faces.items[0])
+        let b = part_of(names, faces.items[1])
+        candidates.clear()
+        for e in 0..<w.edges.count:
+            if try between(w, e, a, b): try candidates.push(e)
+        if candidates.count == 0: error(invalid, "an edge this feature refers to is gone (its faces no longer meet): pick its edges again")
+        if parts.count == 1:
+            for e in candidates.view(): try add_once(out, e)
+            continue
+        # Where it was: its two ends.
+        let place = part_of(reference, parts.items[1])
+        try top_parts(place, 44, &numbers)
+        if numbers.count != 6: error(invalid, "an edge reference's place is its two ends, six numbers")
+        var values: f64[6]
+        for k in 0..<(usize)6: values[k] = try strings.parse_f64(part_of(place, numbers.items[k]))
+        let a_end = Vector3(values[0], values[1], values[2])
+        let z_end = Vector3(values[3], values[4], values[5])
+        var best = candidates.items[0]
+        var best_distance = 1.0e300
+        for e in candidates.view():
+            let (distance, _) = segment_place(try w.edge_at(e, 0.5), a_end, z_end)
+            if distance < best_distance:
+                best_distance = distance
+                best = e
+        try add_once(out, best)
+        if a_end.subtract(z_end).length() <= w.tolerance: continue
+        let carrier = w.edges.items[best].carrier
+        for e in candidates.view():
+            if e == best or not try same_curve(w, carrier, e, w.tolerance * 10.0): continue
+            let (_, along) = segment_place(try w.edge_at(e, 0.5), a_end, z_end)
+            if along > 0.0 and along < 1.0: try add_once(out, e)
+
+func add_once(out: Growing[usize]*, e: usize) -> !:
+    for known in out.view():
+        if known == e: return
+    try out.push(e)
+
+## `text` without spaces at either end.
+func trimmed(text: str) -> str:
+    let bytes = text.bytes
+    var start: usize = 0
+    var end = bytes.length
+    while start < end and (bytes[start] == 32 or bytes[start] == 10 or bytes[start] == 9): start += 1
+    while end > start and (bytes[end - 1] == 32 or bytes[end - 1] == 10 or bytes[end - 1] == 9): end -= 1
+    return (str)bytes[start..<end]
