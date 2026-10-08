@@ -300,6 +300,12 @@ Tangent faces meet along these circles, so booleans also cut an edge wherever a 
 it, or wherever an edge lying along it is cut (OpenCASCADE's vertex/edge interference). Without
 that, two copies of one circle could be split at different points.
 
+A sphere patch bounded by three great-circle arcs, as at these corners, is meshed on a barycentric
+grid (`spherical_triangle.lucb`, mesher 7). Its border is the arcs' own samples. The interior points
+are the corner directions weighted and normalized. This gives near-equilateral triangles with no pole.
+It is used when the arcs are sampled alike and finely enough for the meshers' deviation; otherwise the
+general meshers take the patch.
+
 ### Every edge rounded whole (`rounded.lucb`)
 
 When no edges are picked, filleting every edge of a convex polyhedron is built whole, as a
