@@ -9,7 +9,7 @@
 ##   k <kind> <first> <second> <third> <value> <side> [d]
 ##                                    a constraint; `d`: driven
 ##
-## Entities are numbered in order from 0 and refer to earlier ones; a
+## Entities are numbered in order from 0 and may name any of the points; a
 ## constraint's kind is its ConstraintKind name. Points hold where the last
 ## solve left them.
 
@@ -53,6 +53,7 @@ pub func read_sketch(text: str) -> Sketch!:
     errdefer s.close()
     var fields: str[8] = ["", "", "", "", "", "", "", ""]
     var start: usize = 0
+    var checked = false
     let bytes = text.bytes
     while start < bytes.length:
         var end = start
@@ -66,18 +67,45 @@ pub func read_sketch(text: str) -> Sketch!:
         if tag == "p" and given == 3:
             _ = try s.add_point(try strings.parse_f64(fields[1]), try strings.parse_f64(fields[2]), marked)
         elif tag == "l" and given == 3:
-            _ = try s.add_line(try whole(fields[1]), try whole(fields[2]), marked)
+            _ = try s.add(SketchEntity(EntityKind.line, try whole(fields[1]), try whole(fields[2]), -1, -1, marked))
         elif tag == "o" and given == 3:
-            _ = try s.add_circle(try whole(fields[1]), try strings.parse_f64(fields[2]), marked)
+            let r = (i64)s.params.count
+            try s.params.push(try strings.parse_f64(fields[2]))
+            _ = try s.add(SketchEntity(EntityKind.circle, try whole(fields[1]), r, -1, -1, marked))
         elif tag == "a" and given == 5:
-            let arc = try s.add_arc(try whole(fields[1]), try whole(fields[2]), try whole(fields[3]), marked)
-            s.params.items[(usize)s.entity(arc).second] = try strings.parse_f64(fields[4])
+            let r = (i64)s.params.count
+            try s.params.push(try strings.parse_f64(fields[4]))
+            _ = try s.add(SketchEntity(EntityKind.arc, try whole(fields[1]), r, try whole(fields[2]), try whole(fields[3]), marked))
         elif tag == "k" and given == 7:
+            if not checked:
+                try check_entities(&s)
+                checked = true
             let kind = try kind_named(fields[1])
             _ = try s.constrain(kind, try whole(fields[2]), try whole(fields[3]), try whole(fields[4]), try strings.parse_f64(fields[5]), try strings.parse_f64(fields[6]), marked)
         else:
             error(invalid, "a sketch's text has a line it does not know")
+    if not checked: try check_entities(&s)
     return s
+
+## Every curve read draws on points of the sketch (a curve may name points
+## after it: a trimmed or filleted line's new end), a line's two apart, an
+## arc's center and ends apart.
+func check_entities(s: const Sketch*) -> !:
+    let count = (i64)s.entities.count
+    for e in s.entities.view():
+        if e.kind == EntityKind.point: continue
+        # A line's two points; a circle's center (twice); an arc's center
+        # and ends.
+        var named: i64[3] = [e.first, e.first, e.first]
+        if e.kind == EntityKind.line: named[1] = e.second
+        if e.kind == EntityKind.arc:
+            named[1] = e.third
+            named[2] = e.fourth
+        for p in named:
+            if p < 0 or p >= count or s.entities.items[(usize)p].kind != EntityKind.point:
+                error(invalid, "a sketch curve names a point the sketch does not have")
+        if e.kind == EntityKind.line and e.first == e.second: error(invalid, "a sketch line needs two different points")
+        if e.kind == EntityKind.arc and (e.first == e.third or e.first == e.fourth or e.third == e.fourth): error(invalid, "a sketch arc needs a center and two different ends")
 
 ## The names of ConstraintKind's values, in order.
 func kind_names() -> str[20]:
