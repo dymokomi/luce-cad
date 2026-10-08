@@ -59,11 +59,115 @@ func blendable(w: const Shape*, e: usize) -> bool!:
         return false
     if kind == 1:
         if not is_rim(w, e, fa, fb): return false
-    elif w.surfaces.items[(usize)w.faces.items[fa].surface].kind != 0 or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != 0: return false
+    elif not flat_pair(w, fa, fb) and ruled_pair(w, e, fa, fb) < 0: return false
     let along = try along_edge(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     return ua.cross(ub).length() > 1e-9
+
+func flat_pair(w: const Shape*, fa: usize, fb: usize) -> bool:
+    return w.surfaces.items[(usize)w.faces.items[fa].surface].kind == 0 and w.surfaces.items[(usize)w.faces.items[fb].surface].kind == 0
+
+## Of a straight edge `e` between a plane and a cylinder along it (a
+## D-shaft's flat, a slot's side meeting its round end), the cylinder's
+## face (fa or fb); -1 when it is not one.
+func ruled_pair(w: const Shape*, e: usize, fa: usize, fb: usize) -> i64:
+    let sa = w.surfaces.items[(usize)w.faces.items[fa].surface]
+    let sb = w.surfaces.items[(usize)w.faces.items[fb].surface]
+    var cylinder: i64 = -1
+    if sa.kind == 0 and sb.kind == 1: cylinder = (i64)fb
+    elif sa.kind == 1 and sb.kind == 0: cylinder = (i64)fa
+    else: return -1
+    let c = w.surfaces.items[(usize)w.faces.items[(usize)cylinder].surface]
+    let edge = w.edges.items[e]
+    let direction = w.carriers.items[(usize)edge.carrier].x
+    if c.z.cross(direction).length() > 1e-9: return -1
+    return cylinder
+
+## The section of edge `e`'s blend at `p` (its start), swept along `along`:
+## the corner profile between two planes, or between a plane and a
+## cylinder along the edge (ruled_profile).
+func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, round: bool, continuity: i64) -> Profiles!:
+    let (fa, fb) = try edge_faces(w, e)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let cylinder = ruled_pair(w, e, fa, fb)
+    if cylinder < 0: return try corner_profile(p, along, ua, ub, size, round, continuity)
+    if round and continuity > 1: error(invalid, "G2 and G3 fillets between a plane and a cylinder are not supported yet")
+    let plane = fb if (usize)cylinder == fa else fa
+    return try ruled_profile(w, plane, (usize)cylinder, p, along, ua if plane == fa else ub, ub if plane == fa else ua, size, round, try convex(w, e))
+
+## The section of a blend between plane face `plane` and cylinder face
+## `cylinder` (its axis along the edge), at edge point `p`: the region
+## between the edge, the contacts and the blend (a fillet's circle touching
+## the plane and the cylinder, its center where the plane and the cylinder
+## moved by the radius meet; a chamfer's line `size` along each), closed
+## back along the cylinder's own circle. `into_plane` and `into_round` are
+## the directions into each face from the edge.
+func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool) -> Profiles!:
+    let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
+    let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+    let radius = s.radius
+    let (ta, tb, center) = try ruled_contacts(w, plane, cylinder, p, into_plane, into_round, size, round, outward)
+    var profile = Profiles(p, along, into_plane, along.cross(into_plane), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+                           Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+    errdefer profile.close()
+    try profile.loop_offsets.push(0)
+    try profile.edges.push(line_edge(p, ta))
+    if round:
+        let leaving = ta.subtract(center)
+        let arriving = tb.subtract(center)
+        try profile.edges.push(ProfileEdge(1, ta, tb, center, size, math.atan2(along.dot(leaving.cross(arriving)), leaving.dot(arriving)), -1))
+    else:
+        try profile.edges.push(line_edge(ta, tb))
+    let back = tb.subtract(axis_point)
+    let home = p.subtract(axis_point)
+    try profile.edges.push(ProfileEdge(1, tb, p, axis_point, radius, math.atan2(along.dot(back.cross(home)), back.dot(home)), -1))
+    try profile.loop_offsets.push(profile.edges.count)
+    try nest(&profile)
+    return profile
+
+## A plane/cylinder blend's contacts at edge point `p`: on the plane, on
+## the cylinder, and a fillet's center (see ruled_profile).
+func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool) -> (Vector3, Vector3, Vector3)!:
+    let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
+    let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+    let radius = s.radius
+    let n_plane = face_outward_at(w, plane, p)
+    # Away from the axis, the cylinder's outward normal at p, or toward it.
+    let away = (try w.face_normal(cylinder, p)).dot(p.subtract(axis_point)) > 0.0
+    var ta = Vector3()
+    var tb = Vector3()
+    var center = Vector3()
+    if round:
+        # The center: `size` from the plane (inside an outside corner, in
+        # the air at an inside one), the cylinder's radius moved likewise.
+        let toward = n_plane.multiply_scalar(-size if outward else size)
+        let moved = radius - size if outward == away else radius + size
+        if moved <= 0.0: error(invalid, "a fillet radius is larger than the cylinder it meets allows")
+        let q = p.add(toward).subtract(axis_point)
+        let b = q.dot(into_plane)
+        let disc = b * b - (q.dot(q) - moved * moved)
+        if disc < 0.0: error(invalid, "a fillet this large finds no circle touching both faces")
+        let spread = math.sqrt(disc)
+        # The nearer place along the plane into its face.
+        var t = -b - spread
+        if t <= 0.0: t = -b + spread
+        center = p.add(toward).add(into_plane.multiply_scalar(t))
+        ta = center.subtract(toward)
+        tb = axis_point.add(try center.subtract(axis_point).normalized().multiply_scalar(radius))
+    else:
+        ta = p.add(into_plane.multiply_scalar(size))
+        # `size` along the cylinder's circle, the way into its face.
+        let r0 = p.subtract(axis_point)
+        let turn = 1.0 if s.z.cross(r0).dot(into_round) > 0.0 else -1.0
+        tb = axis_point.add(turned_direction(r0, s.z, turn * size / radius))
+    return (ta, tb, center)
+
+func face_outward_at(w: const Shape*, f: usize, p: Vector3) -> Vector3:
+    return w.face_normal(f, p) catch failure:
+        _ = failure
+        recover Vector3()
 
 ## Whether edge `e`'s faces turn away from each other (the other face runs
 ## below this one's outward normal): a blend takes material away there.
@@ -94,7 +198,7 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i6
     let extent = math.max(length, size) * 4.0
     let before = 0.0 if exact_start or try inside_mesh(body, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
     let after = 0.0 if exact_end or try inside_mesh(body, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
-    var profile = try corner_profile(start.subtract(along.multiply_scalar(before)), along, ua, ub, size, round, continuity)
+    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity)
     defer profile.close()
     let solid = try new_solid(length + margin * 2.0)
     defer solid.release()
@@ -171,7 +275,7 @@ func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity:
     let (n1, h1) = (along, along.dot(end)) if exact_end else try end_plane(w, end, fa, fb)
     let square = math.abs(n0.dot(along)) > 1.0 - 1e-9 and math.abs(n1.dot(along)) > 1.0 - 1e-9
     let margin = 0.0 if square else size * 4.0 + length * 0.1
-    var profile = try corner_profile(start.subtract(along.multiply_scalar(margin)), along, ua, ub, size, round, continuity)
+    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(margin)), along, size, round, continuity)
     defer profile.close()
     let solid = try new_solid(length + margin * 2.0)
     defer solid.release()
@@ -425,7 +529,9 @@ func reach_of(w: const Shape*, e: usize, size: f64, round: bool) -> f64!:
 ## How far into face `f` from edge `e` the blend's contact can reach before
 ## leaving it: over samples along the edge, the least distance to the
 ## face's boundary going straight in.
-func room(w: const Shape*, e: usize, f: usize, limit: f64) -> f64!:
+## On a cylinder along the edge (`around`), the step goes around its
+## circle.
+func room(w: const Shape*, e: usize, f: usize, limit: f64, around: bool = false) -> f64!:
     let edge = w.edges.items[e]
     var least = limit
     for k in 1..<8:
@@ -435,20 +541,31 @@ func room(w: const Shape*, e: usize, f: usize, limit: f64) -> f64!:
         let along = (try w.tangent(edge.carrier, t)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
         let n = try w.face_normal(f, p)
         var side = try n.cross(try along.normalized()).normalized()
-        let probe = p.add(side.multiply_scalar(least * 1e-3 + w.tolerance * 100.0))
+        let probe = try stepped(w, f, p, side, least * 1e-3 + w.tolerance * 100.0, around)
         if try face_contains(w, f, probe, w.tolerance) != inside_face: side = side.multiply_scalar(-1.0)
-        # On a curved face (a rim's cylinder) the straight step leaves the
-        # surface: the step is taken on the face's plane or along the axis.
-        if try face_contains(w, f, p.add(side.multiply_scalar(least)), w.tolerance) != outside and try on_face_surface(w, f, p.add(side.multiply_scalar(least))): continue
+        # On a rim's cylinder the straight step runs along the axis, on the
+        # face; one leaving the surface has left the face.
+        let far = try stepped(w, f, p, side, least, around)
+        if try face_contains(w, f, far, w.tolerance) != outside and try on_face_surface(w, f, far): continue
         var inside_at = 0.0
         var outside_at = least
         for _ in 0..<40:
             let middle = (inside_at + outside_at) * 0.5
-            let q = p.add(side.multiply_scalar(middle))
+            let q = try stepped(w, f, p, side, middle, around)
             if try on_face_surface(w, f, q) and try face_contains(w, f, q, w.tolerance) != outside: inside_at = middle
             else: outside_at = middle
         least = inside_at
     return least
+
+## `p` moved `distance` along `side` on face `f`: straight, or (around)
+## that far around its cylinder's circle.
+func stepped(w: const Shape*, f: usize, p: Vector3, side: Vector3, distance: f64, around: bool) -> Vector3!:
+    if not around: return p.add(side.multiply_scalar(distance))
+    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+    let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+    let r0 = p.subtract(axis_point)
+    let turn = 1.0 if s.z.cross(r0).dot(side) > 0.0 else -1.0
+    return axis_point.add(turned_direction(r0, s.z, turn * distance / s.radius))
 
 func on_face_surface(w: const Shape*, f: usize, p: Vector3) -> bool!:
     let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
@@ -459,17 +576,33 @@ func on_face_surface(w: const Shape*, f: usize, p: Vector3) -> bool!:
 ## (all the way, a face would vanish): else an error saying so, and the
 ## size it must stay under.
 func check_fits(w: const Shape*, e: usize, size: f64, round: bool) -> !:
-    let edge = w.edges.items[e]
-    # A rim's contact runs around a circle: the planar face's room is
-    # measured straight in, the cylinder's along its axis; both are lines
-    # from the rim, which the straight probe follows.
-    let reach = try reach_of(w, e, size, round)
     let (fa, fb) = try edge_faces(w, e)
-    let probe = reach * 1.01 + w.tolerance * 100.0
-    let least = math.min(try room(w, e, fa, probe), try room(w, e, fb, probe))
-    if least > reach + w.tolerance * 10.0: return
-    _ = edge
-    let most = size * least / reach
+    # How far the blend reaches along each face: alike between planes (and
+    # at rims), each its own between a plane and a cylinder (the
+    # cylinder's along its circle).
+    var reach_a = try reach_of(w, e, size, round)
+    var reach_b = reach_a
+    var around: i64 = -1
+    let edge = w.edges.items[e]
+    if w.carriers.items[(usize)edge.carrier].kind == 0:
+        let cylinder = ruled_pair(w, e, fa, fb)
+        if cylinder >= 0:
+            around = cylinder
+            let along = try along_edge(w, e)
+            let p = try w.edge_at(e, 0.5)
+            let plane = fb if (usize)cylinder == fa else fa
+            let into_plane = try into_face(w, plane, e, along)
+            let into_round = try into_face(w, (usize)cylinder, e, along)
+            let (ta, tb, _) = try ruled_contacts(w, plane, (usize)cylinder, p, into_plane, into_round, size, round, try convex(w, e))
+            let s = w.surfaces.items[(usize)w.faces.items[(usize)cylinder].surface]
+            let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+            let arc = s.radius * math.acos(math.clamp(tb.subtract(axis_point).dot(p.subtract(axis_point)) / (s.radius * s.radius), -1.0, 1.0))
+            reach_a = ta.subtract(p).length() if fa == plane else arc
+            reach_b = arc if fa == plane else ta.subtract(p).length()
+    let room_a = try room(w, e, fa, reach_a * 1.01 + w.tolerance * 100.0, around == (i64)fa)
+    let room_b = try room(w, e, fb, reach_b * 1.01 + w.tolerance * 100.0, around == (i64)fb)
+    if room_a > reach_a + w.tolerance * 10.0 and room_b > reach_b + w.tolerance * 10.0: return
+    let most = size * math.min(room_a / reach_a, room_b / reach_b)
     var buffer: u8[256]
     let text = try strings.format(buffer, f"a fillet radius of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}") if round else try strings.format(buffer, f"a chamfer of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}")
     let owned = try interop.copy_text(text)

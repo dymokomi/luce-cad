@@ -218,6 +218,12 @@ stops flush.
 Corners where chamfers meet come out of the booleans as three chamfer planes meeting at a point.
 Fusion's setback triangle is not made.
 
+**A plane meeting a cylinder along its length** (a D-shaft's flat, a slot's side) is blended by a
+cylinder parallel to the axis. A fillet's center is where the plane moved by the radius meets the
+cylinder moved by it: a radius of R − r or R + r, by which sides the material and the corner are on.
+Its section closes back along the cylinder's own circle, not a chord, so it takes no material the
+fillet keeps. A chamfer runs `size` along the plane and `size` around the circle.
+
 **Inside corners** (concave edges, where faces meet at more than 180° through the solid) take
 material rather than losing it. The corner profile is the same shape, lying in the air between the
 faces, and its tool is added with a union:
@@ -322,8 +328,7 @@ Roughly in order of usefulness:
 
 1. **Fillet corners beyond three edges,** and setback corners (an n-sided patch, Fusion's other
    corner type).
-2. **Blends on other curved edges:** a plane meeting a cylinder along its length, ellipses, and
-   edges between two curved faces.
+2. **Blends on other curved edges:** ellipses, and edges between two curved faces.
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
    surfaces. That would also bring G2 and G3 corners and rims.
 4. **Sweep and loft;** tapered extrudes; Extrude "to object".
