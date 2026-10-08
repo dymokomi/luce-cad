@@ -1,7 +1,8 @@
 ## Editing a set's CAD models through what the viewport picks on. The pick
 ## mesh is the models' display tessellations joined, each polygon tagged
 ## with its model (`cad_model`) and B-rep face (`cad_face`), each edge with
-## the B-rep edge it lies on (`cad_edge`, -1 inside a face); group
+## the B-rep edge it lies on (`cad_edge`, -1 inside a face) and, for named
+## models, that edge's reference (`cad_edge_reference`); group
 ## expressions on it name what a step edits. Whole models move and go;
 ## faces go (a model losing every face goes with them); models are added.
 import interop
@@ -9,9 +10,10 @@ import memory
 from luce_std import math
 from luce_geocore.geocore import Mesh, Vector3, Matrix4, invalid, GeometrySet
 from luce_geocore.core.growing import Growing
-from luce_geocore.kernel import ComponentTransform, MeshPart, concatenated, group_bits_of, Domain
+from luce_geocore.kernel import ComponentTransform, MeshPart, concatenated, group_bits_of, Domain, TableBuilder, text_attribute
 from model import CadModel
 from cad_geometry import set_models, with_models
+from modeling import reference_lines
 
 ## Luce's CAD editing operations (Edit CAD).
 pub struct CadEdits:
@@ -44,8 +46,11 @@ pub struct CadEdits:
         defer tagged.release()
         var edges = Growing[f64]()
         defer edges.close()
-        try edge_owners(tagged.value(), owning.view(), models, &edges)
-        return try tagged.value().with_attribute("cad_edge", 4, 1, edges.view(), true)
+        var edge_models = Growing[i64]()
+        defer edge_models.close()
+        try edge_owners(tagged.value(), owning.view(), models, &edges, &edge_models)
+        let numbered = try tagged.value().with_attribute("cad_edge", 4, 1, edges.view(), true)
+        return try with_references(numbered, models, edges.view(), edge_models.view())
 
     ## `set` with the models `group` names on `pick` (whole models only)
     ## moved by Transform Components' numbers: translate, rotate (degrees),
@@ -165,10 +170,11 @@ struct Chosen:
 ## seam): an edge between polygons of two B-rep faces lies on the B-rep edge
 ## those faces share, the nearest one when they share several. `owning` is
 ## each polygon's model.
-func edge_owners(mesh: const Mesh*, owning: const f64[], models: const interop.Reference[CadModel][], out: Growing[f64]*) -> !:
+func edge_owners(mesh: const Mesh*, owning: const f64[], models: const interop.Reference[CadModel][], out: Growing[f64]*, out_models: Growing[i64]*) -> !:
     let ends = try mesh.edge_span()
     let edges = ends.length // 2
     try out.fill(edges, -1.0)
+    try out_models.fill(edges, -1)
     let source = mesh.find_attribute("cad_face", 2)
     if source < 0: return
     let faces = try mesh.attribute_entry(source)
@@ -204,6 +210,7 @@ func edge_owners(mesh: const Mesh*, owning: const f64[], models: const interop.R
         if a == b: continue
         let key = (i64)model * 1099511627776 + (a if a < b else b) * 1048576 + (b if a < b else a)
         let index = &pairs.items[model]
+        out_models.items[edge] = (i64)model
         if key == last_key and index.single(a, b):
             out.items[edge] = (f64)last_edge
             continue
@@ -211,6 +218,46 @@ func edge_owners(mesh: const Mesh*, owning: const f64[], models: const interop.R
         last_key = key
         last_edge = try index.nearest(models[model].value(), a, b, middle)
         out.items[edge] = (f64)last_edge
+
+## Takes `mesh`: with each edge's B-rep edge reference (modeling's names:
+## the edge's faces and where it is) in text attribute
+## `cad_edge_reference`, when a model has names. That is what a feature
+## keeps of picked edges, since their numbers change with anything upstream.
+func with_references(mesh: interop.Reference[Mesh], models: const interop.Reference[CadModel][], edges: const f64[], edge_models: const i64[]) -> interop.Reference[Mesh]!:
+    var strings = TableBuilder()
+    defer strings.close()
+    # Each model's B-rep edge's string (-1 none), after the earlier models'.
+    var ids = Growing[i32]()
+    defer ids.close()
+    var firsts = Growing[usize]()
+    defer firsts.close()
+    var lines = Growing[u8]()
+    defer lines.close()
+    var any = false
+    for model in models:
+        try firsts.push(ids.count)
+        try reference_lines(model.value(), &lines)
+        let bytes = lines.view()
+        var start: usize = 0
+        var line: i64 = 0
+        let count = model.value().edge_count()
+        for at in 0..<bytes.length + 1:
+            if at < bytes.length and bytes[at] != 10: continue
+            if line < count:
+                let text = (str)bytes[start..<at]
+                try ids.push((try strings.intern(text)) if text != "" else -1)
+                any = any or text != ""
+            line += 1
+            start = at + 1
+        while (i64)(ids.count - firsts.items[firsts.count - 1]) < count: try ids.push(-1)
+    if not any: return mesh
+    defer mesh.release()
+    let values = try new i32[edges.length] --- in memory.heap
+    defer free(values) in memory.heap
+    for at in 0..<edges.length:
+        let model = edge_models[at]
+        values[at] = ids.items[firsts.items[(usize)model] + (usize)edges[at]] if model >= 0 and edges[at] >= 0.0 else -1
+    return try mesh.value().with_attribute_entry(try text_attribute("cad_edge_reference", Domain.edge, edges.length, &strings, values))
 
 ## A model's B-rep edges by the pair of faces using them: sorted keys
 ## (low face * 2^20 + high face) and their edges.
