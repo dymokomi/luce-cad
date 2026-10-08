@@ -43,7 +43,7 @@ func is_rim(w: const Shape*, e: usize, fa: usize, fb: usize) -> bool:
     return offset.subtract(cylinder.z.multiply_scalar(offset.dot(cylinder.z))).length() < c.a * 1e-6 and math.abs(cylinder.radius - c.a) < c.a * 1e-6
 
 ## Whether edge `e` can be blended: a line between two planar faces, or a
-## rim (is_rim), convex (the faces turn away from each other).
+## rim (is_rim), convex or concave but not flat.
 func blendable(w: const Shape*, e: usize) -> bool!:
     let edge = w.edges.items[e]
     let kind = w.carriers.items[(usize)edge.carrier].kind
@@ -58,8 +58,15 @@ func blendable(w: const Shape*, e: usize) -> bool!:
     let along = try along_edge(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
-    # Convex: the other face runs below this one's outward normal.
-    return ub.dot(try w.face_normal(fa, try w.edge_at(e, 0.5))) < -1e-9 and ua.cross(ub).length() > 1e-9
+    return ua.cross(ub).length() > 1e-9
+
+## Whether edge `e`'s faces turn away from each other (the other face runs
+## below this one's outward normal): a blend takes material away there.
+## Concave edges (an inside corner) are blended by adding it.
+func convex(w: const Shape*, e: usize) -> bool!:
+    let (fa, fb) = try edge_faces(w, e)
+    let ub = try into_face(w, fb, e, try along_edge(w, e))
+    return ub.dot(try w.face_normal(fa, try w.edge_at(e, 0.5))) < 0.0
 
 ## The tool that blends edge `e` from `start` to `end` (its chain's ends),
 ## a fillet of `size` radius when `round`, else a chamfer `size` along each
@@ -76,23 +83,32 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3
     let (fa, fb) = try edge_faces(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
-    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
     # Past each end by a margin, where the corner beyond is empty.
     let margin = size * 2.0 + length * 0.01
     let corner = try ua.add(ub).normalized().multiply_scalar(size * 0.25)
     let extent = math.max(length, size) * 4.0
     let before = 0.0 if exact_start or try inside_mesh(body, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
     let after = 0.0 if exact_end or try inside_mesh(body, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
-    let p = start.subtract(along.multiply_scalar(before))
-    var reach = size
-    if round: reach = size / math.tan(angle * 0.5)
+    var profile = try corner_profile(start.subtract(along.multiply_scalar(before)), along, ua, ub, size, round)
+    defer profile.close()
+    let solid = try new_solid(length + margin * 2.0)
+    defer solid.release()
+    try extrude_into(solid.value(), &profile, length + before + after, "")
+    try name_tool(solid.value(), name)
+    return try model_of(solid)
+
+## The corner profile at `p` on an edge running `along`, between its faces'
+## directions `ua` and `ub` (into each face): a chamfer's triangle `size`
+## along each, or a fillet's region between them and the circle of radius
+## `size` touching both. Its middle edge is the blend's.
+func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool) -> Profiles!:
+    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    let reach = size / math.tan(angle * 0.5) if round else size
     let ta = p.add(ua.multiply_scalar(reach))
     let tb = p.add(ub.multiply_scalar(reach))
-    let u = ua
-    let v = along.cross(ua)
-    var profile = Profiles(p, along, u, v, Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+    var profile = Profiles(p, along, ua, along.cross(ua), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
                            Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
-    defer profile.close()
+    errdefer profile.close()
     try profile.loop_offsets.push(0)
     try profile.edges.push(line_edge(p, ta))
     if round:
@@ -107,11 +123,59 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3
     try profile.edges.push(line_edge(tb, p))
     try profile.loop_offsets.push(profile.edges.count)
     try nest(&profile)
+    return profile
+
+## A concave edge's tool, added to the solid: the corner profile (in the
+## air between its faces) swept from `start` to `end`, ending flush with
+## the face at each end: exactly there when that face is square to the
+## edge, else swept past and cut by the face's plane.
+func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, start: Vector3, end: Vector3, name: str) -> interop.Reference[CadModel]!:
+    let length = end.subtract(start).length()
+    let along = try end.subtract(start).normalized()
+    let (fa, fb) = try edge_faces(w, e)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let (n0, h0) = try end_plane(w, start, fa, fb)
+    let (n1, h1) = try end_plane(w, end, fa, fb)
+    let square = math.abs(n0.dot(along)) > 1.0 - 1e-9 and math.abs(n1.dot(along)) > 1.0 - 1e-9
+    let margin = 0.0 if square else size * 4.0 + length * 0.1
+    var profile = try corner_profile(start.subtract(along.multiply_scalar(margin)), along, ua, ub, size, round)
+    defer profile.close()
     let solid = try new_solid(length + margin * 2.0)
     defer solid.release()
-    try extrude_into(solid.value(), &profile, length + before + after, "")
+    try extrude_into(solid.value(), &profile, length + margin * 2.0, "")
     try name_tool(solid.value(), name)
-    return try model_of(solid)
+    let swept = try model_of(solid)
+    if square: return swept
+    defer swept.release()
+    # Cut by the end faces' planes; the sides far off.
+    let s1 = try ua.add(ub).normalized()
+    let s2 = along.cross(s1)
+    let far = (size * 8.0 + length) * 2.0
+    let normals: Vector3[6] = [n0, s1, s2, n1, s1.multiply_scalar(-1.0), s2.multiply_scalar(-1.0)]
+    let offsets: f64[6] = [h0, s1.dot(start) + far, s2.dot(start) + far, h1, -s1.dot(start) + far, -s2.dot(start) + far]
+    let cell = try hexahedron(normals[..<6], offsets[..<6], far)
+    defer cell.release()
+    return try combine(swept.value(), cell.value(), op_intersect)
+
+## The plane of the face at the end of an edge between faces `fa` and `fb`
+## (at its vertex at `point`): its outward normal and offset.
+func end_plane(w: const Shape*, point: Vector3, fa: usize, fb: usize) -> (Vector3, f64)!:
+    var vertex: i64 = -1
+    for v in 0..<w.points.count:
+        if w.points.items[v].subtract(point).length() <= w.tolerance * 10.0: vertex = (i64)v
+    if vertex < 0: error(invalid, "a concave blend's end is not a corner of the body")
+    var found: i64 = -1
+    for f in 0..<w.faces.count:
+        if f == fa or f == fb: continue
+        for use in w.face_uses(f):
+            let edge = w.edges.items[(usize)((use if use > 0 else -use) - 1)]
+            if edge.start == vertex or edge.end == vertex:
+                if found >= 0 and found != (i64)f: error(invalid, "a concave blend must end at one flat face")
+                found = (i64)f
+    if found < 0 or w.surfaces.items[(usize)w.faces.items[(usize)found].surface].kind != 0: error(invalid, "a concave blend must end at one flat face")
+    let n = face_outward(w, (usize)found)
+    return (n, n.dot(w.surfaces.items[(usize)w.faces.items[(usize)found].surface].origin))
 
 ## A tool's faces: the one its corner profile's middle edge made (the
 ## profile's order survives nesting: three edges reversed keep their
@@ -131,28 +195,8 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, name: str) -> i
     let p = try w.edge_at(e, 0.5)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
-    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
-    var reach = size
-    if round: reach = size / math.tan(angle * 0.5)
-    let ta = p.add(ua.multiply_scalar(reach))
-    let tb = p.add(ub.multiply_scalar(reach))
-    var profile = Profiles(p, along, ua, along.cross(ua), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
-                           Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+    var profile = try corner_profile(p, along, ua, ub, size, round)
     defer profile.close()
-    try profile.loop_offsets.push(0)
-    try profile.edges.push(line_edge(p, ta))
-    if round:
-        let bisector = try ua.add(ub).normalized()
-        let center = p.add(bisector.multiply_scalar(size / math.sin(angle * 0.5)))
-        let leaving = ta.subtract(center)
-        let arriving = tb.subtract(center)
-        let sweep = math.atan2(along.dot(leaving.cross(arriving)), leaving.dot(arriving))
-        try profile.edges.push(ProfileEdge(1, ta, tb, center, size, sweep, -1))
-    else:
-        try profile.edges.push(line_edge(ta, tb))
-    try profile.edges.push(line_edge(tb, p))
-    try profile.loop_offsets.push(profile.edges.count)
-    try nest(&profile)
     let solid = try new_solid(carrier.a + size * 4.0)
     defer solid.release()
     try revolve_into(solid.value(), &profile, carrier.origin, carrier.x.cross(carrier.y), (carrier.a + size) * 1e-7, "")
@@ -171,13 +215,14 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
     defer chosen.close()
     let every = trimmed(references) == ""
     if every:
-        # Every straight edge between flat faces; rims only when named.
+        # Every straight convex edge between flat faces; rims and inside
+        # corners only when named.
         for e in 0..<w.edges.count:
-            if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 0 and try blendable(&w, e): try chosen.push(e)
+            if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 0 and try blendable(&w, e) and try convex(&w, e): try chosen.push(e)
     else:
         try resolve_edges(&w, references, &chosen)
         for e in chosen.view():
-            if not try blendable(&w, e): error(invalid, "only convex straight edges between flat faces, and rims (a circle between a flat face and a cylinder about it), can be blended yet")
+            if not try blendable(&w, e): error(invalid, "only straight edges between flat faces, and rims (a circle between a flat face and a cylinder about it), can be blended yet")
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
     # Every edge of a convex polyhedron rounded: built whole.
     if round and every:
@@ -192,6 +237,9 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
     defer:
         for tool in tools.view(): tool.release()
         tools.close()
+    # Whether each tool is added (a concave edge's) rather than taken away.
+    var adds = Growing[bool]()
+    defer adds.close()
     # Collinear chosen edges between the same two faces (one edge cut into
     # pieces by earlier operations) are one chain: one tool spans them.
     var done = Growing[bool]()
@@ -206,9 +254,11 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
         var low = try w.edge_at(e, 0.0)
         var high = try w.edge_at(e, 1.0)
         try blend_name(&w, e, tag, &name)
+        let adding = not try convex(&w, e)
         # A rim is its own tool.
         if w.carriers.items[(usize)w.edges.items[e].carrier].kind != 0:
             try tools.push(try edge_tool(&w, e, size, round, low, high, false, false, body.value(), (str)name.view()))
+            try adds.push(adding)
             continue
         let (fa, fb) = try edge_faces(&w, e)
         let along = try high.subtract(low).normalized()
@@ -235,17 +285,23 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             elif corner.subtract(high).length() <= w.tolerance * 10.0:
                 high = foot
                 exact_high = true
-        try tools.push(try edge_tool(&w, e, size, round, low, high, exact_low, exact_high, body.value(), (str)name.view()))
+        if adding: try tools.push(try concave_tool(&w, e, size, round, low, high, (str)name.view()))
+        else: try tools.push(try edge_tool(&w, e, size, round, low, high, exact_low, exact_high, body.value(), (str)name.view()))
+        try adds.push(adding)
     for ball in balls.view():
         try corner_name(&w, (usize)ball.vertex, tag, &name)
         try tools.push(try corner_tool(&w, &ball, size, (str)name.view()))
+        try adds.push(false)
+    # Material taken away first, then added.
     var result = try copy_model(model)
-    for tool in tools.view():
-        let next = combine(result.value(), tool.value(), op_subtract) catch failure:
+    for pass in 0..<2:
+        for at in 0..<tools.count:
+            if adds.items[at] != (pass == 1): continue
+            let next = combine(result.value(), tools.items[at].value(), op_union if pass == 1 else op_subtract) catch failure:
+                result.release()
+                error(failure.code, failure.message)
             result.release()
-            error(failure.code, failure.message)
-        result.release()
-        result = next
+            result = next
     return result
 
 ## The name of edge `e`'s blend, `tag/blend[A&B]`, into `out` (empty

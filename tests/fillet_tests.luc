@@ -88,8 +88,8 @@ pub func fillet_tests() -> unit!:
     # running out past the bottom.
     _ = filleted(box, edges_where(box, top_or_upright), r, 18, 8.0 - 4.0 * (2.0 - 2.0 * r) * a - 4.0 * (2.0 - r) * a - 4.0 * r * r * r * (1.0 - math.pi / 6.0), 0.001, true)
     # Every edge by reference: the rounded box, as the box rounded whole.
-    let inner = 2.0 - 2.0 * r
-    let rounded = inner * inner * inner + 6.0 * inner * inner * r + 3.0 * math.pi * r * r * inner + 4.0 / 3.0 * math.pi * r * r * r
+    let shrunk = 2.0 - 2.0 * r
+    let rounded = shrunk * shrunk * shrunk + 6.0 * shrunk * shrunk * r + 3.0 * math.pi * r * r * shrunk + 4.0 / 3.0 * math.pi * r * r * r
     _ = filleted(box, edges_where(box, any), r, 26, rounded, 0.001, true)
     # A box cut by a slanted plane (corners of 104 and 76 degrees): every
     # edge by reference and the body rounded whole agree; a slanted corner's
@@ -109,4 +109,73 @@ pub func fillet_tests() -> unit!:
             if p.y > 0.99 and p.z > 0.99 and p.x > slant_corner.x:
                 slant_corner = p
     _ = filleted(slanted, edges_where(slanted, at(slant_corner)), 0.2, 10, 0.0, -1.0, false)
-    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners")
+    inside_corners()
+    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim)")
+
+func blend(model: CadModel, edges: list[int], r: float, round: bool, faces: int, expected: float, tolerance: float) -> unit!:
+    let refs = CadModeling.edge_references(model, edges)
+    let made = CadModeling.filleted(model, refs, r, "#f") if round else CadModeling.chamfered(model, refs, r, "#f")
+    assert(made.face_count() == faces)
+    let mesh = made.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    if tolerance >= 0.0 and math.abs(v - expected) > tolerance: print(f"volume {v}, expected {expected}")
+    assert(tolerance < 0.0 or math.abs(v - expected) <= tolerance)
+
+## The L's inside edge: along z at x = 0, y = 0.
+func inner(a: Vector3, b: Vector3) -> bool:
+    return math.abs(a.x) < 1e-6 and math.abs(a.y) < 1e-6 and math.abs(b.x) < 1e-6 and math.abs(b.y) < 1e-6
+
+func inner_or_wall_top(a: Vector3, b: Vector3) -> bool:
+    return inner(a, b) or (math.abs(a.x + 1.0) < 1e-6 and math.abs(b.x + 1.0) < 1e-6 and a.y > 0.99 and b.y > 0.99)
+
+func inner_or_slab_front(a: Vector3, b: Vector3) -> bool:
+    return inner(a, b) or (math.abs(a.z - 1.0) < 1e-6 and math.abs(b.z - 1.0) < 1e-6 and math.abs(a.y) < 1e-6 and math.abs(b.y) < 1e-6 and a.x > -1e-6 and b.x > -1e-6)
+
+func boss_rim(a: Vector3, b: Vector3) -> bool:
+    return math.abs(a.y - 0.5) < 1e-6
+
+## Edges whose carriers are not lines that `keep` takes.
+func round_edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            if model.face_edge_linear(face, use):
+                continue
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return found
+
+## Inside corners take material: an L (a slab and a wall joined) filleted
+## and chamfered along its inside edge, the corner region added; the same
+## edge ending on a slanted face; beside an outside fillet (one adds what
+## the other takes); a boss's rim on a plate, by Pappus. One meeting an
+## outside fillet at a corner is refused, clearly.
+func inside_corners() -> unit!:
+    let slab = CadModeling.tagged(CadSolids.box(2.0, 1.0, 2.0), "#s").transformed(Vector3(0.0, -0.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let wall = CadModeling.tagged(CadSolids.box(1.0, 2.0, 2.0), "#w").transformed(Vector3(-0.5, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let l = CadModeling.combined(slab, wall, 0)
+    let r = 0.3
+    let a = r * r * (1.0 - math.pi * 0.25)
+    let edge = edges_where(l, inner)
+    assert(edge.length == 1)
+    blend(l, edge, r, true, 9, 6.0 + 2.0 * a, 0.001)
+    blend(l, edge, r, false, 9, 6.0 + r * r, 0.001)
+    blend(l, edges_where(l, inner_or_wall_top), r, true, 10, 6.0, 0.001)
+    var refused = false
+    _ = CadModeling.filleted(l, CadModeling.edge_references(l, edges_where(l, inner_or_slab_front)), r, "#f") catch failure:
+        refused = failure.message.contains("inside corner")
+    assert(refused)
+    # Its +z end cut at a slant: the fillet ends on the slanted face.
+    let cutter = CadModeling.tagged(CadSolids.box(6.0, 6.0, 4.0), "#k").transformed(Vector3(0.0, 0.0, 2.8), Vector3(), Vector3(1.0, 1.0, 1.0)).transformed(Vector3(), Vector3(0.0, 0.3, 0.0), Vector3(1.0, 1.0, 1.0))
+    let cut = CadModeling.combined(l, cutter, 1)
+    let before = volume(cut.tessellate(16))
+    blend(cut, edges_where(cut, inner), r, true, 10, before + a * 1.8, 0.01)
+    # A boss of radius 0.5 on a plate: the corner region's centroid is
+    # `reach` out from the boss.
+    let plate = CadModeling.tagged(CadSolids.box(3.0, 1.0, 3.0), "#p")
+    let boss = CadModeling.tagged(CadSolids.cylinder(0.5, 1.0), "#c").transformed(Vector3(0.0, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let bossed = CadModeling.combined(plate, boss, 0)
+    let reach = r * (10.0 - 3.0 * math.pi) / (3.0 * (4.0 - math.pi))
+    blend(bossed, round_edges_where(bossed, boss_rim), r, true, 9, volume(bossed.tessellate(32)) + 2.0 * math.pi * (0.5 + reach) * a, 0.001)

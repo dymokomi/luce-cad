@@ -24,7 +24,8 @@ does today.
 | `tagged(model, tag)` | Unnamed faces named `tag/f<i>`, for bodies made without names, such as primitives. |
 | `prefixed(model, prefix)` | Every name with `prefix` in front, so a pattern's or mirror's copy is distinct. |
 
-`tag` names the feature (luced-3d passes the node). Empty `references` mean every straight convex
+`tag` names the feature (luced-3d passes the node). Edges may be outside (convex) or inside (concave)
+corners. Empty `references` mean every straight convex
 edge between two flat faces. Rims are blended only when referenced: a rim is a full circle between a
 flat face and a cylinder about it, such as a hole's rim or a boss's edge.
 
@@ -178,6 +179,17 @@ stops flush.
 Corners where chamfers meet come out of the booleans as three chamfer planes meeting at a point.
 Fusion's setback triangle is not made.
 
+**Inside corners** (concave edges, where faces meet at more than 180° through the solid) take
+material rather than losing it. The corner profile is the same shape, lying in the air between the
+faces, and its tool is added with a union:
+- a straight edge's tool ends exactly at the face at each end when that face is square to the edge;
+  otherwise it is swept past and cut by the face's plane;
+- a rim's tool (where a boss meets a plate, or a blind hole's floor) is revolved, as for outside
+  rims.
+
+Outside tools are subtracted first, then inside ones added. "Every edge" (no references) takes
+outside edges only.
+
 ### Fillets meeting at corners (`corners.lucb`)
 
 - **Two fillets** of one radius meeting where the third edge stays sharp meet in a miter. Both
@@ -188,8 +200,8 @@ Fusion's setback triangle is not made.
   edge's tool stops at the plane through that center square to the edge, where its cylinder touches
   the ball in a great circle. A corner tool then takes what is left: the region beyond those three
   planes, reaching past the faces, minus the ball. That leaves the sphere patch.
-- **Anything else** is refused: more than three edges at a corner, or fillets meeting where the
-  faces aren't flat.
+- **Anything else** is refused: more than three edges at a corner, fillets meeting where the faces
+  aren't flat, or an inside-corner fillet meeting another.
 
 Tangent faces meet along these circles, so booleans also cut an edge wherever a vertex lies inside
 it, or wherever an edge lying along it is cut (OpenCASCADE's vertex/edge interference). Without
@@ -215,4 +227,4 @@ Roughly in order of usefulness:
    Tangent intersections between curved faces need care as well.
 4. **Partial revolves,** sweep and loft; tapered extrudes; Extrude "to object".
 5. **Sketch arrangement.** Crossing curves split into regions, then a constraint solver.
-6. **Concave edge blends** (adding material), shell, offset, draft and press/pull.
+6. **Inside-corner fillets meeting other fillets;** shell, offset, draft and press/pull.
