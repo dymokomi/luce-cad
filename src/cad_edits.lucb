@@ -1,16 +1,17 @@
 ## Editing a set's CAD models through what the viewport picks on. The pick
 ## mesh is the models' display tessellations joined, each polygon tagged
 ## with its model (`cad_model`) and B-rep face (`cad_face`), each edge with
-## the B-rep edge it lies on (`cad_edge`, -1 inside a face) and, for named
-## models, that edge's reference (`cad_edge_reference`); group
-## expressions on it name what a step edits. Whole models move and go;
-## faces go (a model losing every face goes with them); models are added.
+## the B-rep edge it lies on (`cad_edge`, -1 inside a face), that edge's
+## model (`cad_edge_model`) and, for named models, its reference
+## (`cad_edge_reference`); group expressions on it name what a step edits.
+## Whole models move and go; faces go (a model losing every face goes with
+## them); models are added or replaced (a feature on picked edges).
 import interop
 import memory
 from luce_std import math
 from luce_geocore.geocore import Mesh, Vector3, Matrix4, invalid, GeometrySet
 from luce_geocore.core.growing import Growing
-from luce_geocore.kernel import ComponentTransform, MeshPart, concatenated, group_bits_of, Domain, TableBuilder, text_attribute
+from luce_geocore.kernel import ComponentTransform, MeshPart, concatenated, group_bits_of, Domain, TableBuilder, text_attribute, append_text
 from model import CadModel
 from cad_geometry import set_models, with_models
 from modeling import reference_lines
@@ -50,7 +51,12 @@ pub struct CadEdits:
         defer edge_models.close()
         try edge_owners(tagged.value(), owning.view(), models, &edges, &edge_models)
         let numbered = try tagged.value().with_attribute("cad_edge", 4, 1, edges.view(), true)
-        let referenced = try with_references(numbered, models, edges.view(), edge_models.view())
+        defer numbered.release()
+        var owners_of_edges = Growing[f64]()
+        defer owners_of_edges.close()
+        for model in edge_models.view(): try owners_of_edges.push((f64)model)
+        let owned = try numbered.value().with_attribute("cad_edge_model", 4, 1, owners_of_edges.view(), true)
+        let referenced = try with_references(owned, models, edges.view(), edge_models.view())
         return try with_face_names(referenced, models, owning.view())
 
     ## `set` with the models `group` names on `pick` (whole models only)
@@ -105,6 +111,45 @@ pub struct CadEdits:
                 rest.release()
                 error(failure.code, failure.message)
         return try with_models(source, result.view())
+
+    ## The references of the B-rep edges of model `model` that edge group
+    ## `group` of `pick` names, apart by `;` ("" when it names none of that
+    ## model's): what a feature on picked edges (Fillet) takes.
+    pub static func model_edges(pick: interop.Reference[Mesh], group: str, model: i64) -> interop.Owned[str]!:
+        let mesh = try pick.get()
+        let owner = mesh.find_attribute("cad_edge_model", 4)
+        let texts = mesh.find_attribute("cad_edge_reference", 4)
+        if owner < 0: error(invalid, "the pick mesh lost its CAD tags")
+        if texts < 0: error(invalid, "these edges have no names to keep: they are on a model made without them")
+        var bits = try group_bits_of(mesh, group, Domain.edge)
+        defer bits.bits.release()
+        let words = bits.bits.view()
+        var joined = Growing[u8]()
+        defer joined.close()
+        var seen = Growing[str]()
+        defer seen.close()
+        for edge in 0..<(try mesh.edge_count()):
+            if (words[(usize)edge >> 6] >> (u64)((usize)edge & 63)) & 1 == 0: continue
+            if (i64)(try mesh.attribute_value(owner, edge)) != model: continue
+            let reference = try mesh.attribute_text(texts, edge)
+            if reference == "": continue
+            var known = false
+            for other in seen.view(): known = known or other == reference
+            if known: continue
+            try seen.push(reference)
+            if joined.count > 0: try append_text(&joined, ";")
+            try append_text(&joined, reference)
+        return try interop.copy_text((str)joined.view())
+
+    ## `set` with model `index` replaced by `model`.
+    pub static func replaced(set: interop.Reference[GeometrySet], index: i64, model: interop.Reference[CadModel]) -> interop.Reference[GeometrySet]!:
+        let source = try set.get()
+        let models = set_models(source)
+        if index < 0 or index >= (i64)models.length: error(invalid, "no such CAD model")
+        var all = Growing[interop.Reference[CadModel]]()
+        defer all.close()
+        for at in 0..<models.length: try all.push(model if (i64)at == index else models[at])
+        return try with_models(source, all.view())
 
     ## `set` with `model` added after its models.
     pub static func with_model(set: interop.Reference[GeometrySet], model: interop.Reference[CadModel]) -> interop.Reference[GeometrySet]!:
