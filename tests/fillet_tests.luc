@@ -1,0 +1,112 @@
+## Fillets meeting at corners, checked by volume: two meeting where a third
+## edge stays sharp (a miter), three rounded by a ball (a sphere corner), and
+## every edge of a box by reference against the box rounded whole; a box
+## cut by a slanted plane, whose corners are not square, both ways.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3, Mesh
+from checks import manifold, closed
+from luce_std import math
+
+func volume(mesh: Mesh) -> float!:
+    var total = 0.0
+    for triangle in 0..<mesh.index_count() // 3:
+        let a = mesh.vertex(mesh.index(triangle * 3)).position
+        let b = mesh.vertex(mesh.index(triangle * 3 + 1)).position
+        let c = mesh.vertex(mesh.index(triangle * 3 + 2)).position
+        total += a.dot(b.cross(c)) / 6.0
+    return total
+
+## The straight edges of `model` that `keep` takes (by their ends).
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            if not model.face_edge_linear(face, use):
+                continue
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return found
+
+## `model` with `edges` filleted to `r`: `faces` faces, closed, of volume
+## `expected` within `tolerance` (unchecked when negative). Square corners
+## also face their display triangles out (manifold); the sphere patches of
+## slanted corners leave slivers too thin to say.
+func filleted(model: CadModel, edges: list[int], r: float, faces: int, expected: float, tolerance: float, square: bool) -> float!:
+    let made = CadModeling.filleted(model, CadModeling.edge_references(model, edges), r, "#f")
+    if made.face_count() != faces: print(f"faces {made.face_count()}, expected {faces}")
+    assert(made.face_count() == faces)
+    let mesh = made.tessellate(32)
+    if square:
+        manifold(mesh)
+    else:
+        closed(mesh)
+    let v = volume(mesh)
+    if tolerance >= 0.0 and math.abs(v - expected) > tolerance: print(f"volume {v}, expected {expected}")
+    assert(tolerance < 0.0 or math.abs(v - expected) <= tolerance)
+    return v
+
+func top(a: Vector3, b: Vector3) -> bool:
+    return a.y > 0.99 and b.y > 0.99
+
+func top_or_upright(a: Vector3, b: Vector3) -> bool:
+    return (a.y > 0.99 and b.y > 0.99) or math.abs(a.y - b.y) > 0.5
+
+func any(a: Vector3, b: Vector3) -> bool:
+    return true
+
+## Edges with an end at `corner`.
+func at(corner: Vector3) -> func(Vector3, Vector3) -> bool:
+    return func(a: Vector3, b: Vector3) -> bool:
+        return a.subtract(corner).length() < 1e-6 or b.subtract(corner).length() < 1e-6
+
+pub func fillet_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#b")
+    let r = 0.3
+    # The corner region a fillet takes from a square edge, per length.
+    let a = r * r * (1.0 - math.pi * 0.25)
+    # Two top edges meeting at a corner whose upright edge stays sharp: a
+    # miter, where the regions both take overlap by r^3 (5/3 - pi/2).
+    let two = edges_where(box, at(Vector3(1.0, 1.0, 1.0)))
+    let pair = edges_where(box, func(p: Vector3, q: Vector3) -> bool:
+        return top(p, q) and (p.subtract(Vector3(1.0, 1.0, 1.0)).length() < 1e-6 or q.subtract(Vector3(1.0, 1.0, 1.0)).length() < 1e-6))
+    assert(two.length == 3 and pair.length == 2)
+    _ = filleted(box, pair, r, 8, 8.0 - 4.0 * a + r * r * r * (5.0 / 3.0 - math.pi * 0.5), 0.001, true)
+    # The three at that corner: a ball rounds it. Each edge reaches the
+    # ball's plane (2 - r long), and the corner cube loses all but an eighth
+    # of the ball.
+    let corner = CadModeling.filleted(box, CadModeling.edge_references(box, two), r, "#f")
+    var corners = 0
+    for face in 0..<corner.face_count():
+        if corner.face_name(face).starts_with("#f/corner["):
+            corners += 1
+    assert(corners == 1)
+    _ = filleted(box, two, r, 10, 8.0 - 3.0 * (2.0 - r) * a - r * r * r * (1.0 - math.pi / 6.0), 0.001, true)
+    # The top ring and the uprights: four balls at the top, the uprights
+    # running out past the bottom.
+    _ = filleted(box, edges_where(box, top_or_upright), r, 18, 8.0 - 4.0 * (2.0 - 2.0 * r) * a - 4.0 * (2.0 - r) * a - 4.0 * r * r * r * (1.0 - math.pi / 6.0), 0.001, true)
+    # Every edge by reference: the rounded box, as the box rounded whole.
+    let inner = 2.0 - 2.0 * r
+    let rounded = inner * inner * inner + 6.0 * inner * inner * r + 3.0 * math.pi * r * r * inner + 4.0 / 3.0 * math.pi * r * r * r
+    _ = filleted(box, edges_where(box, any), r, 26, rounded, 0.001, true)
+    # A box cut by a slanted plane (corners of 104 and 76 degrees): every
+    # edge by reference and the body rounded whole agree; a slanted corner's
+    # three edges.
+    let cutter = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0), "#c").transformed(Vector3(2.6, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)).transformed(Vector3(), Vector3(0.0, 0.25, 0.0), Vector3(1.0, 1.0, 1.0))
+    let slanted = CadModeling.combined(box, cutter, 1)
+    assert(slanted.face_count() == 6)
+    let whole = CadModeling.filleted(slanted, "", 0.2, "#w")
+    let whole_mesh = whole.tessellate(32)
+    manifold(whole_mesh)
+    let by_reference = filleted(slanted, edges_where(slanted, any), 0.2, 26, volume(whole_mesh), 0.0005, false)
+    assert(by_reference < volume(slanted.tessellate(16)))
+    var slant_corner = Vector3(-10.0, 0.0, 0.0)
+    for face in 0..<slanted.face_count():
+        for use in 0..<slanted.face_edge_count(face):
+            let p = slanted.face_edge_point(face, use, 0.0)
+            if p.y > 0.99 and p.z > 0.99 and p.x > slant_corner.x:
+                slant_corner = p
+    _ = filleted(slanted, edges_where(slanted, at(slant_corner)), 0.2, 10, 0.0, -1.0, false)
+    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners")

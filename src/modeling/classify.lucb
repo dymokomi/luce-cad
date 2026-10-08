@@ -1,0 +1,88 @@
+## The booleans' classification (step 5): a point well inside each piece,
+## and whether it lies inside the other solid, on its coincident face, or
+## outside.
+
+## A point well inside piece `p` of face `f`: across the middle of its
+## chart, the middle of the widest stretch inside it, on the surface.
+func piece_point(work: Work*, traced: const Shape*, f: usize, pieces: const Pieces*, p: usize) -> Vector3!:
+    let face = work.w.faces.items[f]
+    var chart = Growing[Vector3]()
+    defer chart.close()
+    var starts = Growing[usize]()
+    defer starts.close()
+    for c in pieces.piece_cycles(p):
+        try starts.push(chart.count)
+        try loop_chart(traced, face.surface, try face_pole(&work.w, f), pieces.cycle(c), &chart)
+    try starts.push(chart.count)
+    var low = Vector3(1.0e300, 1.0e300, 0.0)
+    var high = Vector3(-1.0e300, -1.0e300, 0.0)
+    for q in chart.view():
+        low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), 0.0)
+        high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), 0.0)
+    # Angles count by the radius, so clearances compare like lengths.
+    let s = &work.w.surfaces.items[(usize)face.surface]
+    let wraps = periodic(s)
+    let scale = 1.0 if s.kind == 0 else math.max(s.radius, 1e-300)
+    var best_u = 0.0
+    var best_v = 0.0
+    var best_width = -1.0
+    var best_clearance = -1.0
+    # A grid of candidates off the vertices (an irrational step); of those
+    # inside, the one farthest from every boundary segment.
+    for row in 0..<24:
+        let v = low.y + (high.y - low.y) * (((f64)row + 0.5) / 24.0 + 0.0123456789)
+        for column in 0..<48:
+            let u = low.x + (high.x - low.x) * (((f64)column + 0.5) / 48.0 + 0.0098765432)
+            if chart_winding(chart.view(), starts.view(), u, v, wraps, s.kind == 5) == 0: continue
+            var clearance = 1.0e300
+            for loop in 0..<starts.count - 1:
+                let first = starts.items[loop]
+                let last = starts.items[loop + 1]
+                for k in first..<last:
+                    let a = chart.items[k]
+                    let b = chart.items[first if k + 1 == last else k + 1]
+                    let d = segment_distance(Vector3(a.x * scale, a.y, 0.0), Vector3(b.x * scale, b.y, 0.0), Vector3(u * scale, v, 0.0), Vector3(u * scale, v, 0.0))
+                    clearance = math.min(clearance, d)
+            if clearance > best_clearance:
+                best_clearance = clearance
+                best_width = clearance
+                best_u = u
+                best_v = v
+    if best_width < 0.0: error(invalid, "a face piece has no inside to classify")
+    return surface_point(&work.w.surfaces.items[(usize)face.surface], best_u, best_v)
+
+## The point of `s` at chart coordinates (u, v) (surface_uv's inverse).
+func surface_point(s: const Surface*, u: f64, v: f64) -> Vector3:
+    if s.kind == 0: return s.origin.add(s.x.multiply_scalar(u)).add(s.y.multiply_scalar(v))
+    let around = s.x.multiply_scalar(math.cos(u)).add(s.y.multiply_scalar(math.sin(u)))
+    if s.kind == 1: return s.origin.add(around.multiply_scalar(s.radius)).add(s.z.multiply_scalar(v))
+    if s.kind == 2: return s.origin.add(around.multiply_scalar(s.radius + v * math.tan(s.angle))).add(s.z.multiply_scalar(v))
+    if s.kind == 4: return s.origin.add(around.multiply_scalar(s.radius * math.cos(v))).add(s.z.multiply_scalar(s.radius * math.sin(v)))
+    return s.origin.add(around.multiply_scalar(s.radius + s.angle * math.cos(v))).add(s.z.multiply_scalar(s.angle * math.sin(v)))
+
+## Piece `p` of face `f` against the other solid (`other` its mesh).
+func classify(work: Work*, traced: const Shape*, f: usize, pieces: const Pieces*, p: usize, other: const Mesh*) -> i64!:
+    let point = try piece_point(work, traced, f, pieces, p)
+    for pair in work.coincident.view():
+        let partner = pair.fb if pair.fa == f else (pair.fa if pair.fb == f else f)
+        if partner == f: continue
+        if try face_contains(&work.w, partner, point, work.tol) != outside:
+            return class_same if pair.same else class_opposite
+    return class_in if try inside_mesh(other, point, work.size) else class_out
+
+## Whether `point` is inside the closed `mesh` (of extent `size`): crossings
+## of three rays through it, the majority deciding.
+pub func inside_mesh(mesh: const Mesh*, point: Vector3, size: f64) -> bool!:
+    let rays: Vector3[3] = [Vector3(0.5377, 0.8319, 0.1373), Vector3(-0.3271, 0.2491, 0.9116), Vector3(0.7713, -0.5129, -0.3772)]
+    var inside_votes = 0
+    for ray in rays:
+        let direction = try ray.normalized()
+        var origin = point
+        var crossings_count = 0
+        for _ in 0..<10000:
+            let distance = try mesh.ray_distance(origin, direction)
+            if distance < 0.0: break
+            crossings_count += 1
+            origin = origin.add(direction.multiply_scalar(distance + size * 1e-7))
+        if crossings_count % 2 == 1: inside_votes += 1
+    return inside_votes >= 2

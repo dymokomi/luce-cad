@@ -1,0 +1,224 @@
+## Every edge of a convex polyhedron (flat faces of one loop, straight
+## convex edges) filleted to `radius`, built whole rather than by booleans:
+## the solid shrunk by the radius and grown back by a ball (a Minkowski
+## sum). Each face keeps its plane, its corners moved in; each edge becomes
+## a cylinder about the shrunk edge; each corner a sphere about the shrunk
+## vertex, bounded by its edges' arcs. None when the solid is not such a
+## polyhedron (or the radius consumes a face).
+func rounded_polyhedron(w: const Shape*, radius: f64, tag: str) -> interop.Reference[CadModel]?!:
+    for f in 0..<w.faces.count:
+        if w.surfaces.items[(usize)w.faces.items[f].surface].kind != 0 or w.face_sizes(f).length != 1: return none
+    for e in 0..<w.edges.count:
+        if not try blendable(w, e): return none
+    # Each vertex's faces, and its shrunk position: the faces' planes moved
+    # in by the radius meet there.
+    let count = w.points.count
+    var centers = Growing[Vector3]()
+    defer centers.close()
+    for v in 0..<count:
+        var normals = Growing[Vector3]()
+        defer normals.close()
+        var offsets = Growing[f64]()
+        defer offsets.close()
+        for f in 0..<w.faces.count:
+            var touches = false
+            for use in w.face_uses(f):
+                let edge = w.edges.items[(usize)((use if use > 0 else -use) - 1)]
+                if edge.start == (i64)v or edge.end == (i64)v: touches = true
+            if not touches: continue
+            let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+            let n = s.z if w.faces.items[f].sense else s.z.multiply_scalar(-1.0)
+            try normals.push(n)
+            try offsets.push(n.dot(s.origin) - radius)
+        if normals.count < 3: return none
+        try centers.push(try least_squares_point(normals.view(), offsets.view()))
+    let solid = try new_solid(radius * 100.0)
+    defer solid.release()
+    let b = solid.value()
+    # Contact points: vertex v on face f at center + normal * radius, made
+    # once per (vertex, face).
+    var contact_keys = Growing[i64]()
+    defer contact_keys.close()
+    var contact_ids = Growing[i64]()
+    defer contact_ids.close()
+    # Lines along each face's side of each edge, and arcs at each end of
+    # each edge, made once, by key.
+    var curve_keys = Growing[i64]()
+    defer curve_keys.close()
+    var curve_ids = Growing[i64]()
+    defer curve_ids.close()
+    let faces = (i64)w.faces.count
+    let edges = (i64)w.edges.count
+    var name = Growing[u8]()
+    defer name.close()
+    for f in 0..<w.faces.count:
+        let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+        let n = s.z if w.faces.items[f].sense else s.z.multiply_scalar(-1.0)
+        var uses = Growing[i64]()
+        defer uses.close()
+        for use in w.face_uses(f):
+            let e = (use if use > 0 else -use) - 1
+            let edge = w.edges.items[(usize)e]
+            let from_vertex = edge.start if use > 0 else edge.end
+            let to_vertex = edge.end if use > 0 else edge.start
+            let a = try contact(b, &contact_keys, &contact_ids, centers.view(), from_vertex * faces + (i64)f, from_vertex, n, radius)
+            let z = try contact(b, &contact_keys, &contact_ids, centers.view(), to_vertex * faces + (i64)f, to_vertex, n, radius)
+            let line = try b.add_line(a, z)
+            try curve_keys.push(e * faces + (i64)f)
+            try curve_ids.push(line)
+            try uses.push(line + 1)
+        let sizes: i64[1] = [(i64)uses.count]
+        let (corner, unused) = try edge_ends(b, uses.items[0] - 1)
+        _ = unused
+        let plane = try b.add_surface(0, try b.vertex_at(corner), n, s.x)
+        let face = try b.add_face(plane, uses.view(), sizes[..<1], true)
+        try b.set_face_name(face, w.face_name(f))
+    # Each edge: a cylinder band between its two faces' lines and its arcs.
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        let (fa, fb) = try edge_faces(w, e)
+        # fa uses the edge forward (start to end), fb backward.
+        var forward_face = fa
+        var backward_face = fb
+        for use in w.face_uses(fb):
+            if use == (i64)e + 1:
+                forward_face = fb
+                backward_face = fa
+        let na = face_outward(w, forward_face)
+        let nb = face_outward(w, backward_face)
+        let v = edge.start
+        let u = edge.end
+        let cv = centers.items[(usize)v]
+        let cu = centers.items[(usize)u]
+        let pa_v = try contact(b, &contact_keys, &contact_ids, centers.view(), v * faces + (i64)forward_face, v, na, radius)
+        let pa_u = try contact(b, &contact_keys, &contact_ids, centers.view(), u * faces + (i64)forward_face, u, na, radius)
+        let pb_v = try contact(b, &contact_keys, &contact_ids, centers.view(), v * faces + (i64)backward_face, v, nb, radius)
+        let pb_u = try contact(b, &contact_keys, &contact_ids, centers.view(), u * faces + (i64)backward_face, u, nb, radius)
+        let line_a = try find_curve(&curve_keys, &curve_ids, (i64)e * faces + (i64)forward_face)
+        let line_b = try find_curve(&curve_keys, &curve_ids, (i64)e * faces + (i64)backward_face)
+        # Arcs at each end, from the forward face's contact to the backward's.
+        let arc_v = try short_arc(b, pa_v, pb_v, cv, radius)
+        let arc_u = try short_arc(b, pa_u, pb_u, cu, radius)
+        try curve_keys.push(-(((i64)e * 2) + 1))
+        try curve_ids.push(arc_v)
+        try curve_keys.push(-(((i64)e * 2) + 2))
+        try curve_ids.push(arc_u)
+        # The band: the forward face's line backward (u to v), the arc at v,
+        # the backward face's line (v to u, as that face runs it backward),
+        # the arc at u back.
+        let axis = try cu.subtract(cv).normalized()
+        let cylinder = try b.add_surface(1, cv, axis, (try b.vertex_at(pa_v)).subtract(cv), radius)
+        let uses: i64[4] = [-(line_a + 1), arc_v + 1, -(line_b + 1), -(arc_u + 1)]
+        let sizes: i64[1] = [4]
+        let band = try b.add_face(cylinder, uses[..<4], sizes[..<1], true)
+        try blend_name(w, e, tag, &name)
+        try b.set_face_name(band, (str)name.view())
+    # Each vertex: a sphere patch bounded by its edges' arcs, each run the
+    # other way than its band runs it, chained into a loop.
+    for v in 0..<count:
+        var pieces = Growing[i64]()
+        defer pieces.close()
+        for e in 0..<w.edges.count:
+            let edge = w.edges.items[e]
+            if edge.start == (i64)v: try pieces.push(-(try find_curve(&curve_keys, &curve_ids, -(((i64)e * 2) + 1)) + 1))
+            if edge.end == (i64)v: try pieces.push(try find_curve(&curve_keys, &curve_ids, -(((i64)e * 2) + 2)) + 1)
+        var chained = Growing[i64]()
+        defer chained.close()
+        try chain_uses(b, pieces.view(), &chained)
+        let center = centers.items[(usize)v]
+        # The pole in the middle of the patch (its corners' mean way), so
+        # its chart is even around it, as the corner tools' balls have it.
+        var middle = Vector3()
+        for use in chained.view():
+            let (start, end) = try edge_ends(b, (use if use > 0 else -use) - 1)
+            middle = middle.add(try (try b.vertex_at(start if use > 0 else end)).subtract(center).normalized())
+        let pole = try middle.normalized()
+        let sphere = try b.add_surface(4, center, pole, try across(pole), radius)
+        let sizes: i64[1] = [(i64)chained.count]
+        let patch = try b.add_face(sphere, chained.view(), sizes[..<1], true)
+        try corner_name(w, v, tag, &name)
+        try b.set_face_name(patch, (str)name.view())
+    _ = edges
+    return try model_of(solid)
+
+## A vertex's outward-facing face normal of face `f`.
+func face_outward(w: const Shape*, f: usize) -> Vector3:
+    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+    return s.z if w.faces.items[f].sense else s.z.multiply_scalar(-1.0)
+
+## The point where `normals` . x = `offsets` best (exact for three planes).
+func least_squares_point(normals: const Vector3[], offsets: const f64[]) -> Vector3!:
+    # The normal equations, a 3x3 solved by Cramer's rule.
+    var m: f64[9]
+    for k in 0..<(usize)9: m[k] = 0.0
+    var r = Vector3()
+    for i in 0..<normals.length:
+        let n = normals[i]
+        m[0] += n.x * n.x
+        m[1] += n.x * n.y
+        m[2] += n.x * n.z
+        m[4] += n.y * n.y
+        m[5] += n.y * n.z
+        m[8] += n.z * n.z
+        r = r.add(n.multiply_scalar(offsets[i]))
+    m[3] = m[1]
+    m[6] = m[2]
+    m[7] = m[5]
+    let a = Vector3(m[0], m[3], m[6])
+    let b = Vector3(m[1], m[4], m[7])
+    let c = Vector3(m[2], m[5], m[8])
+    let det = a.dot(b.cross(c))
+    if math.abs(det) < 1e-300: error(invalid, "a corner's faces do not meet in a point")
+    return Vector3(r.dot(b.cross(c)) / det, a.dot(r.cross(c)) / det, a.dot(b.cross(r)) / det)
+
+## The vertex of vertex `v`'s contact with the face of normal `n` (key
+## `key`), made once.
+func contact(b: BrepModel*, keys: Growing[i64]*, ids: Growing[i64]*, centers: const Vector3[], key: i64, v: i64, n: Vector3, radius: f64) -> i64!:
+    for at in 0..<keys.count:
+        if keys.items[at] == key: return ids.items[at]
+    let id = try b.add_vertex(centers[(usize)v].add(n.multiply_scalar(radius)))
+    try keys.push(key)
+    try ids.push(id)
+    return id
+
+func find_curve(keys: const Growing[i64]*, ids: const Growing[i64]*, key: i64) -> i64!:
+    for at in 0..<keys.count:
+        if keys.items[at] == key: return ids.items[at]
+    error(invalid, "a rounded corner lost one of its curves")
+
+## The shorter arc of the circle about `center` from vertex `a` to `z`.
+func short_arc(b: BrepModel*, a: i64, z: i64, center: Vector3, radius: f64) -> i64!:
+    let pa = (try b.vertex_at(a)).subtract(center)
+    let pz = (try b.vertex_at(z)).subtract(center)
+    let axis = try pa.cross(pz).normalized()
+    return try b.add_circle(a, z, center, axis, pa, radius, true)
+
+## Edge `e` of `b`'s start and end vertices.
+func edge_ends(b: const BrepModel*, e: i64) -> (i64, i64)!:
+    var record = try b.edge_record(e)
+    defer record.close()
+    return (record.start, record.end)
+
+## Signed edge uses chained end to start into one loop onto `out`.
+func chain_uses(b: const BrepModel*, uses: const i64[], out: Growing[i64]*) -> !:
+    out.clear()
+    if uses.length == 0: error(invalid, "a rounded corner has no arcs")
+    var taken = Growing[bool]()
+    defer taken.close()
+    for _ in uses: try taken.push(false)
+    taken.items[0] = true
+    try out.push(uses[0])
+    for _ in 1..<uses.length:
+        let last = out.items[out.count - 1]
+        let (ls, le) = try edge_ends(b, (last if last > 0 else -last) - 1)
+        let at_vertex = le if last > 0 else ls
+        var found = false
+        for k in 0..<uses.length:
+            if taken.items[k]: continue
+            let (s0, e0) = try edge_ends(b, (uses[k] if uses[k] > 0 else -uses[k]) - 1)
+            if (s0 if uses[k] > 0 else e0) == at_vertex:
+                taken.items[k] = true
+                try out.push(uses[k])
+                found = true
+                break
+        if not found: error(invalid, "a rounded corner's arcs do not close")

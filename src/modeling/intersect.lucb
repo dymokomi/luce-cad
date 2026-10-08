@@ -9,7 +9,10 @@
 ##   plane / cone         a circle (axis across the plane)
 ##   plane / sphere       a circle
 ##   cylinder / cylinder  lines (parallel axes), coincident (one axis, one
-##                        radius)
+##                        radius), two ellipses (one radius, axes crossing:
+##                        two fillets meeting at a corner)
+##   cylinder / sphere    circles (the center on the axis), one where they
+##                        touch (a fillet ending in a rounded corner)
 ##   sphere / sphere      a circle
 ## Anything else is not supported yet: the operation says which surfaces.
 
@@ -36,6 +39,7 @@ pub func meet(s1: const Surface*, s2: const Surface*, tol: f64, out: Growing[Car
     if k1 == 0 and k2 == 2: return try plane_cone(s1, s2, tol, out)
     if k1 == 0 and k2 == 4: return try plane_sphere(s1, s2, tol, out)
     if k1 == 1 and k2 == 1: return try cylinder_cylinder(s1, s2, tol, out)
+    if k1 == 1 and k2 == 4: return try cylinder_sphere(s1, s2, tol, out)
     if k1 == 4 and k2 == 4: return try sphere_sphere(s1, s2, tol, out)
     if k1 == 0 and k2 == 5: return try plane_torus(s1, s2, tol, out)
     # Surfaces of revolution about one axis meet in circles.
@@ -107,7 +111,7 @@ func plane_sphere(p: const Surface*, s: const Surface*, tol: f64, out: Growing[C
     return meet_curves
 
 func cylinder_cylinder(a: const Surface*, b: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
-    if a.z.cross(b.z).length() > 1e-9: return meet_march
+    if a.z.cross(b.z).length() > 1e-9: return try crossing_cylinders(a, b, tol, out)
     # Parallel: circles meeting in the cross-section through a's origin.
     let offset = b.origin.subtract(a.origin)
     let planar = offset.subtract(a.z.multiply_scalar(offset.dot(a.z)))
@@ -125,6 +129,45 @@ func cylinder_cylinder(a: const Surface*, b: const Surface*, tol: f64, out: Grow
     try out.push(Carrier(0, foot.add(side.multiply_scalar(half)), a.z, Vector3(), 0.0, 0.0, -1))
     if half > tol:
         try out.push(Carrier(0, foot.subtract(side.multiply_scalar(half)), a.z, Vector3(), 0.0, 0.0, -1))
+    return meet_curves
+
+## Cylinders of one radius whose axes cross at a point meet in two ellipses,
+## one in each plane bisecting the axes (Steinmetz's curves): each cuts
+## either cylinder at the same angle. Two fillets of one radius meeting at
+## a corner meet so. Anything else is traced.
+func crossing_cylinders(a: const Surface*, b: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    if math.abs(a.radius - b.radius) > tol: return meet_march
+    # The axes' common perpendicular must be (nearly) nothing.
+    let normal = try a.z.cross(b.z).normalized()
+    if math.abs(b.origin.subtract(a.origin).dot(normal)) > tol: return meet_march
+    # Where they cross: a's axis at the parameter nearest b's.
+    let w = a.origin.subtract(b.origin)
+    let c = a.z.dot(b.z)
+    let t = (c * w.dot(b.z) - w.dot(a.z)) / (1.0 - c * c)
+    let center = a.origin.add(a.z.multiply_scalar(t))
+    for k in 0..<2:
+        let plane = try (a.z.subtract(b.z) if k == 0 else a.z.add(b.z)).normalized()
+        let tilt = math.abs(a.z.dot(plane))
+        let major_axis = try a.z.subtract(plane.multiply_scalar(a.z.dot(plane))).normalized()
+        try out.push(Carrier(3, center, major_axis, plane.cross(major_axis), a.radius / tilt, a.radius, -1))
+    return meet_curves
+
+## A cylinder and a sphere centered on its axis meet in circles where the
+## sphere's radius across the axis is the cylinder's: two, or one where they
+## touch (the sphere's radius is the cylinder's). Off the axis: traced.
+func cylinder_sphere(c: const Surface*, s: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:
+    let offset = s.origin.subtract(c.origin)
+    let along = offset.dot(c.z)
+    if offset.subtract(c.z.multiply_scalar(along)).length() > tol: return meet_march
+    let center = c.origin.add(c.z.multiply_scalar(along))
+    if s.radius < c.radius - tol: return meet_curves
+    let y = c.z.cross(c.x)
+    if math.abs(s.radius - c.radius) <= tol:
+        try out.push(Carrier(1, center, c.x, y, c.radius, c.radius, -1))
+        return meet_curves
+    let half = math.sqrt(s.radius * s.radius - c.radius * c.radius)
+    try out.push(Carrier(1, center.add(c.z.multiply_scalar(half)), c.x, y, c.radius, c.radius, -1))
+    try out.push(Carrier(1, center.subtract(c.z.multiply_scalar(half)), c.x, y, c.radius, c.radius, -1))
     return meet_curves
 
 func sphere_sphere(a: const Surface*, b: const Surface*, tol: f64, out: Growing[Carrier]*) -> i64!:

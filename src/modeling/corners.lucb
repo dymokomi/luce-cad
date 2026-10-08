@@ -1,0 +1,230 @@
+## Fillets meeting at corners. Two fillets of one radius meeting where a
+## third edge stays sharp meet in a miter: their tools, each reaching past
+## the corner, cross in the ellipses of crossing_cylinders (intersect.lucb),
+## and the booleans make the rest. Three meeting at a corner of three flat
+## faces are rounded by a ball (OpenCASCADE's Rotule): each edge's tool
+## stops at the plane through the ball's center square to it, where its
+## cylinder touches the ball, and a corner tool (the corner beyond those
+## planes, without the ball) leaves the sphere patch.
+
+## A corner where three fillets meet: its vertex, and the center of the
+## ball rolling into it.
+struct Ball:
+    var vertex: i64
+    var center: Vector3
+
+## The corners where chosen edges' fillets (of `radius`) meet. Two meeting
+## where a third edge stays sharp meet in a miter, which their tools give
+## (crossing_cylinders): nothing to add. Three meeting at a corner of three
+## faces get a ball there (`balls`). Anything else is refused.
+func fillet_corners(w: const Shape*, chosen: const usize[], radius: f64, balls: Growing[Ball]*) -> !:
+    var seen = Growing[i64]()
+    defer seen.close()
+    var directions = Growing[usize]()
+    defer directions.close()
+    for e in chosen:
+        let edge = w.edges.items[e]
+        let ends: i64[2] = [edge.start, edge.end]
+        for vertex in ends:
+            var known = false
+            for v in seen.view():
+                if v == vertex: known = true
+            if known: continue
+            try seen.push(vertex)
+            # The chosen edges here, one per line (pieces of one edge are one).
+            directions.clear()
+            for other in chosen:
+                let o = w.edges.items[other]
+                if o.start != vertex and o.end != vertex: continue
+                var same = false
+                for d in directions.view():
+                    if try same_curve(w, w.edges.items[d].carrier, other, w.tolerance): same = true
+                if not same: try directions.push(other)
+            if directions.count < 2: continue
+            let degree = edge_degree(w, vertex)
+            if directions.count == 2 and degree == 3: continue
+            if directions.count == 3 and degree == 3:
+                try balls.push(Ball(vertex, try ball_center(w, vertex, radius)))
+                continue
+            error(invalid, "fillets meeting at a corner are supported where two or three edges meet; fillet edges that do not meet, or chamfer them")
+
+## A ball's corner tool: the corner beyond the planes through the ball's
+## center square to each edge (where the edges' tools stop), reaching past
+## the faces, without the ball. Subtracted, it leaves the sphere patch
+## (named `name`) that rounds the corner.
+func corner_tool(w: const Shape*, ball: const Ball*, radius: f64, name: str) -> interop.Reference[CadModel]!:
+    let c = ball.center
+    let corner = w.points.items[(usize)ball.vertex]
+    # Each edge here: its way from the center toward the corner, and the
+    # face at the corner it does not lie on.
+    var normals: Vector3[6] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    var offsets: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    var diagonal = Vector3()
+    var at: usize = 0
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        if edge.start != ball.vertex and edge.end != ball.vertex: continue
+        if at == 3: error(invalid, "a rounded corner has more than three edges")
+        var d = try along_edge(w, e)
+        if corner.subtract(c).dot(d) < 0.0: d = d.multiply_scalar(-1.0)
+        diagonal = diagonal.add(d)
+        # Beyond the plane through the center: outward is back along it.
+        normals[at] = d.multiply_scalar(-1.0)
+        offsets[at] = -d.dot(c)
+        var far: i64 = -1
+        for f in 0..<w.faces.count:
+            var at_corner = false
+            var on_edge = false
+            for use in w.face_uses(f):
+                let k = (usize)((use if use > 0 else -use) - 1)
+                if k == e: on_edge = true
+                let other = w.edges.items[k]
+                if other.start == ball.vertex or other.end == ball.vertex: at_corner = true
+            if at_corner and not on_edge: far = (i64)f
+        if far < 0: error(invalid, "a rounded corner lost one of its faces")
+        let n = face_outward(w, (usize)far)
+        normals[at + 3] = n
+        offsets[at + 3] = n.dot(w.surfaces.items[(usize)w.faces.items[(usize)far].surface].origin) + radius
+        at += 1
+    if at != 3: error(invalid, "a rounded corner needs three edges")
+    let cell = try hexahedron(normals[..<6], offsets[..<6], radius)
+    defer cell.release()
+    let ball_solid = try ball_at(c, try diagonal.normalized(), radius)
+    defer ball_solid.release()
+    let tool = try combine(cell.value(), ball_solid.value(), op_subtract)
+    defer tool.release()
+    # The ball's face inside the cell is the corner's.
+    var shape = try shape_of(tool.value())
+    defer shape.close()
+    let named = try shape.add_name(name)
+    for f in 0..<shape.faces.count:
+        let kind = shape.surfaces.items[(usize)shape.faces.items[f].surface].kind
+        shape.faces.items[f].name = named if kind == 4 else -1
+    return try shape_model(&shape)
+
+## A solid ball about `center`, its poles along `pole`.
+func ball_at(center: Vector3, pole: Vector3, radius: f64) -> interop.Reference[CadModel]!:
+    let solid = try new_solid(radius * 4.0)
+    defer solid.release()
+    let b = solid.value()
+    let x = try across(pole)
+    let east = try b.add_vertex(center.add(x.multiply_scalar(radius)))
+    let equator = try b.add_circle(east, east, center, pole, x, radius)
+    let sphere = try b.add_surface(4, center, pole, x, radius)
+    let sizes: i64[1] = [1]
+    let north: i64[1] = [equator + 1]
+    _ = try b.add_face(sphere, north[..<1], sizes[..<1])
+    let south: i64[1] = [-(equator + 1)]
+    _ = try b.add_face(sphere, south[..<1], sizes[..<1])
+    return try model_of(solid)
+
+## The hexahedron of six half-spaces n . p <= offset (outward `normals`),
+## plane i opposite plane i + 3: corner bits (b0, b1, b2) where planes
+## i + 3 b_i meet. `size` scales its tolerance.
+func hexahedron(normals: const Vector3[], offsets: const f64[], size: f64) -> interop.Reference[CadModel]!:
+    let solid = try new_solid(size * 8.0)
+    defer solid.release()
+    let b = solid.value()
+    var three_normals: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+    var three_offsets: f64[3] = [0.0, 0.0, 0.0]
+    var corners: Vector3[8] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    for bits in 0..<(usize)8:
+        for i in 0..<(usize)3:
+            let plane = i + 3 * ((bits >> i) & 1)
+            three_normals[i] = normals[plane]
+            three_offsets[i] = offsets[plane]
+        corners[bits] = try least_squares_point(three_normals[..<3], three_offsets[..<3])
+        _ = try b.add_vertex(corners[bits])
+    # Edges between corners one bit apart, made once.
+    var keys = Growing[i64]()
+    defer keys.close()
+    var ids = Growing[i64]()
+    defer ids.close()
+    for side in 0..<(usize)6:
+        let i = side % 3
+        let bit = side // 3
+        let j = (i + 1) % 3
+        let k = (i + 2) % 3
+        var ring: usize[4] = [0, 0, 0, 0]
+        let steps: usize[8] = [0, 0, 1, 0, 1, 1, 0, 1]
+        for q in 0..<(usize)4:
+            ring[q] = (bit << i) | (steps[2 * q] << j) | (steps[2 * q + 1] << k)
+        # Counterclockwise about the outward normal.
+        let normal = corners[ring[1]].subtract(corners[ring[0]]).cross(corners[ring[2]].subtract(corners[ring[0]]))
+        if normal.dot(normals[side]) < 0.0:
+            let swap = ring[1]
+            ring[1] = ring[3]
+            ring[3] = swap
+        var uses: i64[4] = [0, 0, 0, 0]
+        for q in 0..<(usize)4:
+            let head = (i64)ring[q]
+            let tail = (i64)ring[(q + 1) % 4]
+            let low = head if head < tail else tail
+            let high = tail if head < tail else head
+            var id: i64 = -1
+            for at in 0..<keys.count:
+                if keys.items[at] == low * 8 + high: id = ids.items[at]
+            if id < 0:
+                id = try b.add_line(low, high)
+                try keys.push(low * 8 + high)
+                try ids.push(id)
+            uses[q] = (id + 1) if head == low else -(id + 1)
+        let plane = try b.add_surface(0, corners[ring[0]], normals[side], corners[ring[1]].subtract(corners[ring[0]]))
+        let sizes: i64[1] = [4]
+        _ = try b.add_face(plane, uses[..<4], sizes[..<1])
+    return try model_of(solid)
+
+## How many edges meet at vertex `v`.
+func edge_degree(w: const Shape*, v: i64) -> i64:
+    var count: i64 = 0
+    for edge in w.edges.view():
+        if edge.start == v: count += 1
+        if edge.end == v: count += 1
+    return count
+
+## Where a ball of `radius` touches the three faces at vertex `v`: their
+## planes moved in by the radius meet there.
+func ball_center(w: const Shape*, v: i64, radius: f64) -> Vector3!:
+    var normals = Growing[Vector3]()
+    defer normals.close()
+    var offsets = Growing[f64]()
+    defer offsets.close()
+    for f in 0..<w.faces.count:
+        var touches = false
+        for use in w.face_uses(f):
+            let edge = w.edges.items[(usize)((use if use > 0 else -use) - 1)]
+            if edge.start == v or edge.end == v: touches = true
+        if not touches: continue
+        let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind != 0: error(invalid, "fillets meeting at a corner need flat faces there")
+        let n = face_outward(w, f)
+        try normals.push(n)
+        try offsets.push(n.dot(s.origin) - radius)
+    if normals.count != 3: error(invalid, "fillets meeting at a corner need three faces there")
+    return try least_squares_point(normals.view(), offsets.view())
+
+## The name of the corner at vertex `v`, `tag/corner[A&B&C]` (its faces'
+## names, sorted), into `out`.
+func corner_name(w: const Shape*, v: usize, tag: str, out: Growing[u8]*) -> !:
+    var names = Growing[str]()
+    defer names.close()
+    for f in 0..<w.faces.count:
+        for use in w.face_uses(f):
+            let edge = w.edges.items[(usize)((use if use > 0 else -use) - 1)]
+            if edge.start != (i64)v and edge.end != (i64)v: continue
+            var known = false
+            for other in names.view():
+                if other == w.face_name(f): known = true
+            if not known: try names.push(w.face_name(f))
+    for i in 1..<names.count:
+        let value = names.items[i]
+        var j = i
+        while j > 0 and text_before(value, names.items[j - 1]):
+            names.items[j] = names.items[j - 1]
+            j -= 1
+        names.items[j] = value
+    try role_name(out, tag, "corner[")
+    for at in 0..<names.count:
+        if at > 0: try out.push(face_separator)
+        try push_text(out, names.items[at])
+    try out.push(93)

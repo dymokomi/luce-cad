@@ -100,7 +100,7 @@ Each region becomes a closed solid:
 Every loop runs counterclockwise about its face's outward normal, so every edge is used twice, in
 opposite directions.
 
-### Booleans (`shape`, `intersect`, `clip`, `split`, `boolean.lucb`)
+### Booleans (`shape`, `intersect`, `clip`, `split`, `boolean`, `classify`, `merging.lucb`)
 
 This is OpenCASCADE's General Fuse structure, in a lean form:
 
@@ -113,6 +113,8 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    - plane/cone with the axis across the plane: a circle;
    - plane/sphere: a circle;
    - parallel cylinders: lines;
+   - cylinders of one radius whose axes cross: two ellipses, one in each plane bisecting the axes;
+   - cylinder/sphere with the center on the axis: circles, or one where they touch;
    - sphere/sphere: a circle;
    - plane/torus with the axis across the plane: circles;
    - surfaces of revolution about one axis (cylinder, cone, sphere, torus): circles, where their
@@ -176,20 +178,38 @@ stops flush.
 Corners where chamfers meet come out of the booleans as three chamfer planes meeting at a point.
 Fusion's setback triangle is not made.
 
-Filleting every edge of a convex polyhedron is built whole, as a Minkowski sum: the solid shrunk
+### Fillets meeting at corners (`corners.lucb`)
+
+- **Two fillets** of one radius meeting where the third edge stays sharp meet in a miter. Both
+  tools reach past the corner, and their cylinders cross in two ellipses, one in each plane bisecting
+  the axes. `intersect.lucb` gives those in closed form.
+- **Three fillets** meeting at a corner of three flat faces are rounded by a ball, as OpenCASCADE's
+  `Rotule` does. The ball's center is where the faces' planes, moved in by the radius, meet. Each
+  edge's tool stops at the plane through that center square to the edge, where its cylinder touches
+  the ball in a great circle. A corner tool then takes what is left: the region beyond those three
+  planes, reaching past the faces, minus the ball. That leaves the sphere patch.
+- **Anything else** is refused: more than three edges at a corner, or fillets meeting where the
+  faces aren't flat.
+
+Tangent faces meet along these circles, so booleans also cut an edge wherever a vertex lies inside
+it, or wherever an edge lying along it is cut (OpenCASCADE's vertex/edge interference). Without
+that, two copies of one circle could be split at different points.
+
+### Every edge rounded whole (`rounded.lucb`)
+
+When no edges are picked, filleting every edge of a convex polyhedron is built whole, as a
+Minkowski sum: the solid shrunk
 by the radius, then grown back by a ball. Each face keeps its plane with its corners moved in, each
 edge becomes a cylinder band about the shrunk edge, and each corner becomes a sphere patch bounded
-by its edges' arcs. A box comes out with 26 faces.
+by its edges' arcs. A box comes out with 26 faces. Each sphere patch's pole sits in its middle, which keeps its
+tessellation even.
 
 ## Limits, and what comes next
 
 Roughly in order of usefulness:
 
-1. **Fillets meeting at a corner,** other than all edges of a convex polyhedron. These are refused
-   today. Two fillet cylinders of one radius
-   whose axes meet intersect in a doubly singular way (the curves cross where the gradients are
-   parallel), which tracing can't follow. Fusion avoids this with a corner patch: a sphere where
-   three fillets meet (KPart's `Rotule`), with each edge's tool stopping at the corner.
+1. **Fillet corners beyond three edges,** and setback corners (an n-sided patch, Fusion's other
+   corner type).
 2. **Blends on other curved edges:** a cone's rims, ellipses, and edges between two curved faces.
 3. **B-spline surfaces in booleans.** Swept spline sides need marching on parametric surfaces.
    Tangent intersections between curved faces need care as well.
