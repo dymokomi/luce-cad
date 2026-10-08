@@ -385,55 +385,64 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
 ## `direct` false skips the direct build (local_blend.lucb), for tests
 ## that compare it with the booleans.
 pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true, direct: bool = true) -> interop.Reference[CadModel]!:
-    if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
-    if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
     defer chosen.close()
-    let every = trimmed(references) == ""
-    if every:
-        # Every straight convex edge between flat faces; rims and inside
-        # corners only when named.
+    try choose_edges(&w, references, chain, &chosen)
+    return try blend_chosen(model, &w, chosen.view(), trimmed(references) == "", size, round, tag, continuity, direct, none)
+
+## The edges of `w` that `references` names onto `chosen` (empty: every
+## straight convex edge between flat faces; rims and inside corners only
+## when named), with the edges continuing them tangentially when `chain`.
+func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize]*) -> !:
+    if trimmed(references) == "":
         for e in 0..<w.edges.count:
-            if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 0 and try blendable(&w, e) and try convex(&w, e): try chosen.push(e)
+            if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 0 and try blendable(w, e) and try convex(w, e): try chosen.push(e)
     else:
-        try resolve_edges(&w, references, &chosen)
+        try resolve_edges(w, references, chosen)
         for e in chosen.view():
-            if not try blendable(&w, e): error(invalid, "only straight edges between flat faces, and rims (a circle or arc between a flat face and a cylinder about it), can be blended yet")
-        if chain: try tangent_chains(&w, &chosen)
+            if not try blendable(w, e): error(invalid, "only straight edges between flat faces, and rims (a circle or arc between a flat face and a cylinder about it), can be blended yet")
+        if chain: try tangent_chains(w, chosen)
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
+
+## `model` (its shape `w`) with edges `chosen` blended to `size` (`every`:
+## they are every edge, as blended's empty references). `patches` keeps
+## setback corners' patches between sizes (FilletPlan), when given.
+func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct: bool, patches: PatchCache*?) -> interop.Reference[CadModel]!:
+    if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
+    if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     # Each edge's blend must fit its faces: said precisely, before any tool.
-    for e in chosen.view(): try check_fits(&w, e, size, round)
+    for e in chosen: try check_fits(w, e, size, round)
     # Straight edges between flat faces are built directly; what that
     # declines (curved faces at a corner, mixed corners, chamfers...) the
     # booleans below make.
     if round and direct:
-        if let made = try local_blend(&w, chosen.view(), size, continuity, tag): return made
+        if let made = try local_blend(w, chosen, size, continuity, tag, patches): return made
     # Inside and outside fillets meeting at a corner: one side first, the
     # other then runs around it (a torus), by name on the result.
     if round and not every:
         var later = Growing[usize]()
         defer later.close()
-        try mixed_order(&w, chosen.view(), &later)
+        try mixed_order(w, chosen, &later)
         if later.count > 0:
             var first = Growing[i64]()
             defer first.close()
             var second = Growing[i64]()
             defer second.close()
-            for e in chosen.view():
+            for e in chosen:
                 if edge_in(later.view(), e): try second.push((i64)e)
                 else: try first.push((i64)e)
             var text = Growing[u8]()
             defer text.close()
-            try references_of(&w, first.view(), &text)
+            try references_of(w, first.view(), &text)
             let earlier = try blended(model, (str)text.view(), size, round, tag, continuity, false, direct)
             defer earlier.release()
-            try references_of(&w, second.view(), &text)
+            try references_of(w, second.view(), &text)
             return try blended(earlier.value(), (str)text.view(), size, round, tag, continuity, true, direct)
     # Every edge of a convex polyhedron rounded: built whole.
     if round and every and continuity == 1:
-        if let whole = try rounded_polyhedron(&w, size, tag): return whole
+        if let whole = try rounded_polyhedron(w, size, tag): return whole
     # Where three fillets meet, a ball rounds the corner.
     var balls = Growing[Ball]()
     defer balls.close()
@@ -443,7 +452,7 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
     # Where chained edges meet tangentially, their tools end square.
     var joints = Growing[i64]()
     defer joints.close()
-    try fillet_corners(&w, chosen.view(), size, continuity, round, &balls, &setbacks, &joints)
+    try fillet_corners(w, chosen, size, continuity, round, &balls, &setbacks, &joints)
     let body = try model.tessellate(16)
     defer body.release()
     var tools = Growing[interop.Reference[CadModel]]()
@@ -457,32 +466,32 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
     # pieces by earlier operations) are one chain: one tool spans them.
     var done = Growing[bool]()
     defer done.close()
-    for _ in chosen.view(): try done.push(false)
+    for _ in chosen: try done.push(false)
     var name = Growing[u8]()
     defer name.close()
-    for i in 0..<chosen.count:
+    for i in 0..<chosen.length:
         if done.items[i]: continue
         done.items[i] = true
-        let e = chosen.items[i]
+        let e = chosen[i]
         var low = try w.edge_at(e, 0.0)
         var high = try w.edge_at(e, 1.0)
-        try blend_name(&w, e, tag, &name)
-        let adding = not try convex(&w, e)
+        try blend_name(w, e, tag, &name)
+        let adding = not try convex(w, e)
         # A rim is its own tool.
         if w.carriers.items[(usize)w.edges.items[e].carrier].kind != 0:
             let edge = w.edges.items[e]
             let at_start = vertex_in(joints.view(), edge.start)
             let at_end = vertex_in(joints.view(), edge.end)
-            try tools.push(try edge_tool(&w, e, size, round, continuity, low, high, at_start, at_end, body.value(), (str)name.view()))
+            try tools.push(try edge_tool(w, e, size, round, continuity, low, high, at_start, at_end, body.value(), (str)name.view()))
             try adds.push(adding)
             continue
-        let (fa, fb) = try edge_faces(&w, e)
+        let (fa, fb) = try edge_faces(w, e)
         let along = try high.subtract(low).normalized()
-        for j in i + 1..<chosen.count:
+        for j in i + 1..<chosen.length:
             if done.items[j]: continue
-            let other = chosen.items[j]
-            if not try same_curve(&w, w.edges.items[e].carrier, other, w.tolerance): continue
-            let (ga, gb) = try edge_faces(&w, other)
+            let other = chosen[j]
+            if not try same_curve(w, w.edges.items[e].carrier, other, w.tolerance): continue
+            let (ga, gb) = try edge_faces(w, other)
             if not ((ga == fa and gb == fb) or (ga == fb and gb == fa)): continue
             done.items[j] = true
             for k in 0..<2:
@@ -527,16 +536,16 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
             let corner = w.points.items[(usize)v]
             if corner.subtract(low).length() <= w.tolerance * 10.0: exact_low = true
             elif corner.subtract(high).length() <= w.tolerance * 10.0: exact_high = true
-        if adding: try tools.push(try concave_tool(&w, e, size, round, continuity, low, high, exact_low, exact_high, (str)name.view()))
-        else: try tools.push(try edge_tool(&w, e, size, round, continuity, low, high, exact_low, exact_high, body.value(), (str)name.view()))
+        if adding: try tools.push(try concave_tool(w, e, size, round, continuity, low, high, exact_low, exact_high, (str)name.view()))
+        else: try tools.push(try edge_tool(w, e, size, round, continuity, low, high, exact_low, exact_high, body.value(), (str)name.view()))
         try adds.push(adding)
     for ball in balls.view():
-        try corner_name(&w, (usize)ball.vertex, tag, &name)
-        try tools.push(try corner_tool(&w, &ball, size, (str)name.view()))
+        try corner_name(w, (usize)ball.vertex, tag, &name)
+        try tools.push(try corner_tool(w, &ball, size, (str)name.view()))
         try adds.push(ball.inside)
     for corner in setbacks.view():
-        try corner_name(&w, (usize)corner.vertex, tag, &name)
-        try tools.push(try setback_tool(&w, &corner, size, continuity, (str)name.view()))
+        try corner_name(w, (usize)corner.vertex, tag, &name)
+        try tools.push(try setback_tool(w, &corner, size, continuity, (str)name.view()))
         try adds.push(corner.inside)
     # Material taken away first, then added.
     var result = try copy_model(model)

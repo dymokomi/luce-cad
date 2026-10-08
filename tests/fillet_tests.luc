@@ -126,7 +126,7 @@ pub func fillet_tests() -> unit!:
     cone_rims()
     flats()
     smooth()
-    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim); G2 and G3 fillets outside and inside, alone, apart, mitered, on a hole's rim, and three at a corner (setback corners: a box's, every edge, a pocket's, slanted); a pocket's inside corners, mitered and balled; tangent chains around a slot's rim and an earlier fillet; inside and outside fillets meeting (a boss on a plate, an L's inside corner); sizes too large, said with the size that fits; a cone's rims; a D-shaft's flat meeting its cylinder")
+    print("PASS fillets: two meeting in a miter, three rounded by a ball, the top ring with uprights, every edge by reference as the box rounded whole; a slanted box's corners; inside corners (an L's edge filleted and chamfered, ending square or slanted, beside an outside fillet; a boss's rim); G2 and G3 fillets outside and inside, alone, apart, mitered, on a hole's rim, and three at a corner (setback corners: a box's, every edge, a pocket's, slanted); a pocket's inside corners, mitered and balled; tangent chains around a slot's rim and an earlier fillet; inside and outside fillets meeting (a boss on a plate, an L's inside corner); sizes too large, said with the size that fits; a cone's rims; a D-shaft's flat meeting its cylinder; a fillet kept between radii (its corners fitted once)")
 
 func blend(model: CadModel, edges: list[int], r: float, round: bool, faces: int, expected: float, tolerance: float) -> unit!:
     let refs = CadModeling.edge_references(model, edges)
@@ -232,6 +232,7 @@ func smooth() -> unit!:
     assert(mitered.face_count() == 10)
     closed(mitered.tessellate(32))
     setback_corners()
+    fillet_plans()
     # A hole's rim (radius 0.5, r 0.2): the profile turned in two halves
     # (two faces of revolution), by Pappus, the regions' centroids 0.20313 r
     # (G2) and 0.19592 r (G3) out from the hole.
@@ -488,3 +489,30 @@ pub func setback_corners() -> unit!:
         closed(mesh)
         let v = volume(mesh)
         assert(v < volume(slanted.tessellate(32)) - 0.001 and v > volume(CadModeling.filleted(slanted, three, 0.2, "#f").tessellate(32)) - 0.05)
+
+## A fillet kept between radii (CadModeling.fillet_plan): each radius it
+## gives is the fillet made afresh (its corner patches fitted once, at
+## radius 1, then scaled), growing and shrinking; it is for its own body,
+## references and continuity only.
+func fillet_plans() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#b")
+    let every = CadModeling.edge_references(box, edges_where(box, any))
+    for continuity in [1, 2, 3]:
+        let plan = CadModeling.fillet_plan(box, every, continuity, "#f")
+        for r in [0.3, 0.1, 0.45, 0.3]:
+            let kept = plan.filleted(r)
+            let fresh = CadModeling.filleted(box, every, r, "#f", continuity)
+            assert(kept.face_count() == fresh.face_count())
+            # Scaled rather than fitted at this radius: the same within
+            # rounding (2e-8 at most here; a mesh's own error is 1e-4).
+            assert(math.abs(volume(kept.tessellate(16)) - volume(fresh.tessellate(16))) < 1e-6)
+        assert(plan.made_for(box, every, continuity, "#f", true))
+        assert(not plan.made_for(box, every, continuity % 3 + 1, "#f", true))
+        assert(not plan.made_for(CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#b"), every, continuity, "#f", true))
+    # Too large, said as a fresh fillet says it.
+    let plan = CadModeling.fillet_plan(box, every, 2, "#f")
+    var refused = false
+    _ = plan.filleted(1.5) catch failure:
+        refused = failure.message.contains("must be less than")
+        recover box
+    assert(refused)

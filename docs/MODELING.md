@@ -361,6 +361,19 @@ The cost is the touched faces', with no intersection, splitting or classificatio
 box at G2 takes 44 ms, against 1 s by booleans. A corner patch's thin-plate energy is one quadratic
 form, the same for every quad, so it is made once per fit.
 
+**Kept between radii** (`fillet_plan.lucb`). `CadModeling.fillet_plan` works out once what does
+not depend on the radius:
+- the body's modeling shape;
+- the edges its references name, with their chains;
+- each setback corner's patch, fitted at radius 1.
+
+A corner scales with the radius about its vertex: its setbacks, contacts and curves all do, and the
+fit is made at unit size. So `FilletPlan.filleted(radius)` scales the patches instead of fitting
+them. `made_for` says when the body (the same object), references, continuity, tag or chaining
+changed. luced-3d's Fillet node keeps its plan on the compute worker, so dragging its radius only
+rebuilds. On every edge of a box, a radius costs 1 ms at G2 and 1.5 ms at G3, against 33 ms and 55
+ms afresh.
+
 ### Fillets meeting at corners (`corners.lucb`)
 
 - **Two fillets** of one radius meeting where the third edge stays sharp meet in a miter. Both

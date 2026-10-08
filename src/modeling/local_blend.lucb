@@ -61,6 +61,42 @@ struct Link:
     var face: usize
     var chain: usize
 
+## Setback corners' patches kept between radii (a FilletPlan's): a
+## corner's patch scales with the radius about its vertex (its setbacks,
+## contacts and curves all do, and the fit is made at unit size), so each
+## is fitted once, at radius 1. Vertex `vertices[k]`'s quads (about the
+## vertex) are quads[firsts[k]..], all of knots `knots`.
+struct PatchCache:
+    var vertices: Growing[i64]
+    var firsts: Growing[usize]
+    var quads: Growing[Vector3]
+    var knots: Growing[f64]
+
+    func close():
+        self.vertices.close()
+        self.firsts.close()
+        self.quads.close()
+        self.knots.close()
+
+    ## Vertex `v`'s patch for `radius` (at corner point `p`) onto `quads`
+    ## and `knots`; false when it is not kept yet.
+    func scaled(v: i64, p: Vector3, radius: f64, quads: Growing[Vector3]*, knots: Growing[f64]*) -> bool!:
+        for k in 0..<self.vertices.count:
+            if self.vertices.items[k] != v: continue
+            let first = self.firsts.items[k]
+            let last = self.firsts.items[k + 1] if k + 1 < self.firsts.count else self.quads.count
+            for q in self.quads.view()[first..<last]: try quads.push(p.add(q.multiply_scalar(radius)))
+            try knots.assign(self.knots.view())
+            return true
+        return false
+
+    ## Keep vertex `v`'s patch `quads` (made for `radius`, at corner `p`).
+    func keep(v: i64, p: Vector3, radius: f64, quads: const Vector3[], knots: const f64[]) -> !:
+        try self.vertices.push(v)
+        try self.firsts.push(self.quads.count)
+        for q in quads: try self.quads.push(q.subtract(p).multiply_scalar(1.0 / radius))
+        try self.knots.assign(knots)
+
 ## The builder: the body `w`, the result `out` (its geometry stores begun
 ## as copies of the body's, so surfaces, carriers and splines keep their
 ## indices), and what each part of the body became.
@@ -69,6 +105,7 @@ struct Local:
     var out: Shape
     var radius: f64
     var continuity: i64
+    var patches: PatchCache*?
     ## Each edge's two faces.
     var edge_faces: Growing[usize]
     ## Each edge's strip, or -1.
@@ -179,11 +216,12 @@ struct Local:
         let chain = self.chains.items[c]
         return chain.tail if chain.head == start else chain.head
 
-## Edge `e` of `w` (a fillet of `radius`, `continuity`, round) and its
-## chosen companions `chosen`, built directly; none when the body or the
-## edges are beyond what this builds (the booleans then do it).
-pub func local_blend(w: const Shape*, chosen: const usize[], radius: f64, continuity: i64, tag: str) -> interop.Reference[CadModel]?!:
-    var made = try new_local(w, radius, continuity)
+## Edges `chosen` of `w` filleted to `radius` (`continuity`), built
+## directly; none when the body or the edges are beyond what this builds
+## (the booleans then do it). `patches` keeps setback patches between
+## radii, when given.
+pub func local_blend(w: const Shape*, chosen: const usize[], radius: f64, continuity: i64, tag: str, patches: PatchCache*? = none) -> interop.Reference[CadModel]?!:
+    var made = try new_local(w, radius, continuity, patches)
     defer made.close()
     let b = &made
     if not try eligible(b, chosen): return none
@@ -224,7 +262,7 @@ pub func local_blend(w: const Shape*, chosen: const usize[], radius: f64, contin
         return none
     return result
 
-func new_local(w: const Shape*, radius: f64, continuity: i64) -> Local!:
+func new_local(w: const Shape*, radius: f64, continuity: i64, patches: PatchCache*?) -> Local!:
     var out = empty_shape(w.tolerance)
     errdefer out.close()
     for c in w.carriers.view(): try out.carriers.push(c)
@@ -234,7 +272,7 @@ func new_local(w: const Shape*, radius: f64, continuity: i64) -> Local!:
     for k in w.spline_knots.view(): try out.spline_knots.push(k)
     for s in w.surfaces.view():
         try out.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
-    var made = Local(w, out, radius, continuity, Growing[usize](), Growing[i64](), Growing[Strip](), Growing[i64](), Growing[i64](), Growing[i64](),
+    var made = Local(w, out, radius, continuity, patches, Growing[usize](), Growing[i64](), Growing[Strip](), Growing[i64](), Growing[i64](), Growing[i64](),
                      Growing[Chain](), Growing[i64](), Growing[Link](), Growing[Extra](), Growing[u8]())
     errdefer made.close()
     try made.edge_faces.fill(w.edges.count * 2, 0)

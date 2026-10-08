@@ -1,0 +1,60 @@
+## A fillet kept between radii, for a feature whose radius is being
+## dragged: what does not depend on the radius is worked out once. That is
+## the body's modeling shape, the edges its references name (with their
+## tangent chains), and each setback corner's patch, fitted at radius 1
+## (PatchCache: a corner scales with the radius about its vertex). Each
+## radius then costs only the build: about a tenth of a G2 box's, whose
+## eight corner fits were the rest. A plan is for one body (the same
+## object), references, continuity, tag and chaining (made_for).
+pub struct FilletPlan:
+    var model: interop.Reference[CadModel]
+    var shape: Shape
+    var chosen: Growing[usize]
+    var every: bool
+    var references: Growing[u8]
+    var tag: Growing[u8]
+    var continuity: i64
+    var chain: bool
+    var patches: PatchCache
+
+    pub func close():
+        self.model.release()
+        self.shape.close()
+        self.chosen.close()
+        self.references.close()
+        self.tag.close()
+        self.patches.close()
+
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        self.model.trace(visit, context)
+
+    ## Whether this plan is for `model` (the same object), `references`,
+    ## `continuity`, `tag` and `chain`.
+    pub func made_for(model: interop.Reference[CadModel], references: str, continuity: i64, tag: str, chain: bool) -> bool:
+        return model.value() == self.model.value() and references == (str)self.references.view() and continuity == self.continuity and tag == (str)self.tag.view() and chain == self.chain
+
+    ## The body with the plan's edges filleted to `radius`.
+    pub func filleted(radius: f64) -> interop.Reference[CadModel]!:
+        return try blend_chosen(self.model.value(), &self.shape, self.chosen.view(), self.every, radius, true, (str)self.tag.view(), self.continuity, true, &self.patches)
+
+pub let fillet_plan_type: interop.Type[FilletPlan] = interop.Type[FilletPlan]("FilletPlan", FilletPlan.close, FilletPlan.trace, closeable = true)
+
+## The plan of filleting `model`'s edges `references` (as blended's) at
+## `continuity`, faces named for `tag`.
+func fillet_plan_of(model: interop.Reference[CadModel], references: str, continuity: i64, tag: str, chain: bool) -> interop.Reference[FilletPlan]!:
+    if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
+    var shape = try shape_of(model.value())
+    errdefer shape.close()
+    var chosen = Growing[usize]()
+    errdefer chosen.close()
+    try choose_edges(&shape, references, chain, &chosen)
+    var text = Growing[u8]()
+    errdefer text.close()
+    for byte in references.bytes: try text.push(byte)
+    var name = Growing[u8]()
+    errdefer name.close()
+    for byte in tag.bytes: try name.push(byte)
+    let owner = model.clone()
+    errdefer owner.release()
+    let patches = PatchCache(Growing[i64](), Growing[usize](), Growing[Vector3](), Growing[f64]())
+    return try interop.Reference[FilletPlan].adopt(new FilletPlan(owner, shape, chosen, trimmed(references) == "", text, name, continuity, chain, patches) in memory.heap, fillet_plan_type, memory.heap)
