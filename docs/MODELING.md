@@ -122,11 +122,17 @@ stops flush.
 Corners where chamfers meet come out of the booleans as three chamfer planes meeting at a point.
 Fusion's setback triangle is not made.
 
+Filleting every edge of a convex polyhedron is built whole, as a Minkowski sum: the solid shrunk
+by the radius, then grown back by a ball. Each face keeps its plane with its corners moved in, each
+edge becomes a cylinder band about the shrunk edge, and each corner becomes a sphere patch bounded
+by its edges' arcs. A box comes out with 26 faces.
+
 ## Limits, and what comes next
 
 Roughly in order of usefulness:
 
-1. **Fillets meeting at a corner.** These are refused today. Two fillet cylinders of one radius
+1. **Fillets meeting at a corner,** other than all edges of a convex polyhedron. These are refused
+   today. Two fillet cylinders of one radius
    whose axes meet intersect in a doubly singular way (the curves cross where the gradients are
    parallel), which tracing can't follow. Fusion avoids this with a corner patch: a sphere where
    three fillets meet (KPart's `Rotule`), with each edge's tool stopping at the corner.
