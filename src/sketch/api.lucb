@@ -39,7 +39,8 @@ pub struct CadSketch:
         return (i64)self.sketch.constraints.count
 
     ## Entity `at`: its kind (0 point, 1 line, 2 circle, 3 arc, 4 spline,
-    ## 5 ellipse, 6 conic), whether it is construction, and its parts: a
+    ## 5 ellipse, 6 conic, 7 text), whether it is construction, and its
+    ## parts: a text's anchor point; a
     ## line's start and end points; a circle's or arc's center point (`part`
     ## 0), an arc's start (1) and end (2) points; an ellipse's center and
     ## major axis point; a conic's start, end and apex; a spline's points in
@@ -144,6 +145,19 @@ pub struct CadSketch:
     pub func add_spline(points: const i64[], fit: bool, degree: i64 = 5, construction: bool = false) -> i64!:
         self.forget()
         return try self.sketch.add_spline(points, fit, degree, construction)
+
+    ## A text at point `anchor` saying `content` in font file `font`
+    ## (empty: the system's sans), its capitals `height` tall.
+    pub func add_text(anchor: i64, height: f64, content: str, font: str = "", construction: bool = false) -> i64!:
+        self.forget()
+        return try self.sketch.add_text(anchor, height, content, font, construction)
+
+    ## What text `at` says, and its font file.
+    pub func text_content(at: i64) -> interop.Owned[str]!:
+        return try interop.copy_text(self.sketch.text_content(self.sketch.entity(at)))
+
+    pub func text_font(at: i64) -> interop.Owned[str]!:
+        return try interop.copy_text(self.sketch.text_font(self.sketch.entity(at)))
 
     pub func add_ellipse(center: i64, major: i64, minor: f64, construction: bool = false) -> i64!:
         self.forget()
@@ -340,29 +354,44 @@ func nearest(sketch: const Sketch*, x: f64, y: f64, reach: f64, only: i64) -> i6
         if best >= 0: return best
     return -1
 
-## `count` + 1 points along spline, ellipse or conic `at` of `sketch`, as
-## x, y pairs onto `out` (the editor draws them).
+## Points along spline, ellipse, conic or text `at` of `sketch`, as x, y
+## pairs onto `out` (the editor draws them): `count` + 1 along the curve,
+## or a text's pieces, 8 steps each, a NaN pair after each piece.
 pub func sketch_samples(sketch: const CadSketch*, at: i64, count: usize, out: Growing[f64]*) -> !:
+    try samples_of(&sketch.sketch, sketch.sketch.entity(at), count, out)
+
+func samples_of(sketch: const Sketch*, e: SketchEntity, count: usize, out: Growing[f64]*) -> !:
+    if e.kind == EntityKind.text:
+        out.clear()
+        var letters = new_lettering()
+        defer letters.close()
+        try letter(sketch, e, &letters)
+        for piece in 0..<letters.count():
+            let steps: usize = 1 if letters.degrees.items[piece] == 1 else 8
+            for k in 0..<steps + 1:
+                let (x, y) = letters.at(piece, (f64)k / (f64)steps)
+                try out.push(x)
+                try out.push(y)
+            try out.push(math.nan)
+            try out.push(math.nan)
+        return
     var net = new_net()
     defer net.close()
-    try net_of(&sketch.sketch, sketch.sketch.entity(at), &net)
+    try net_of(sketch, e, &net)
     try net.sample(count, out)
 
 ## How far (`x`, `y`) is from entity `e` (index `at`).
 func distance_to(sketch: const Sketch*, e: SketchEntity, at: i64, x: f64, y: f64) -> f64:
     if e.kind == EntityKind.point: return math.hypot(sketch.x(at) - x, sketch.y(at) - y)
     if (u8)e.kind > 3:
-        # A spline, ellipse or conic: its samples as a polyline.
-        var net = new_net()
-        defer net.close()
+        # A spline, ellipse, conic or text: its samples as polylines.
         var points = Growing[f64]()
         defer points.close()
-        net_of(sketch, e, &net) catch failure:
-            return 1e300
-        net.sample(96, &points) catch failure:
+        samples_of(sketch, e, 96, &points) catch failure:
             return 1e300
         var best = 1e300
         for k in 0..<points.count // 2 - 1:
+            if math.is_nan(points.items[2 * k]) or math.is_nan(points.items[2 * k + 2]): continue
             best = math.min(best, segment_distance(x, y, points.items[2 * k], points.items[2 * k + 1], points.items[2 * k + 2], points.items[2 * k + 3]))
         return best
     if e.kind == EntityKind.line:

@@ -15,16 +15,22 @@
 ## points of their own, so a coincidence between two curves' ends is
 ## between two points, and the solver merges their parameters
 ## (substitution.lucb). Construction entities are solved like any other but
-## make no profile curves. shapes.lucb gives the new curves as NURBS.
+## make no profile curves. shapes.lucb gives the new curves as NURBS. A
+## text is an anchor point (where its first line's baseline starts), a
+## height parameter (its capitals') and its label: what it says and the
+## font file it is set in (lettering.lucb makes its outlines).
 ## (docs/research/SKETCH-SOLVER-STUDY.md §7 has the design.)
 import interop
 import strings
+import c as native_c
 import memory
 import ownership
 from luce_std import math
 from luce_geocore.geocore import invalid, Vector3, GeometrySet
 from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import CurvesBuilder, CurveType, SketchPlane, empty_set, dispose_set, adopt_set, with_curves
+from luce_std import files, utf8
+from luce_fonts import opentype
 
 pub enum EntityKind as u8:
     point = 0
@@ -34,6 +40,7 @@ pub enum EntityKind as u8:
     spline = 4
     ellipse = 5
     conic = 6
+    text = 7
 
 ## What a constraint holds `first`, `second` and `third` to, and what its
 ## `value` and `side` mean. The relations of equal or fixed parameters
@@ -92,15 +99,24 @@ pub struct SketchEntity:
     ## points start in `lists`. A conic: its start point.
     pub var first: i64
     ## A line: its end point. A circle or an arc: its radius parameter; an
-    ## ellipse its minor radius, a conic its rho. A spline: how many
-    ## points it has.
+    ## ellipse its minor radius, a conic its rho, a text its height. A
+    ## spline: how many points it has.
     pub var second: i64
     ## An arc: its start and end points. An ellipse: its major axis point.
     ## A conic: its end and apex points. A spline: its degree (most), and 1
     ## when it passes through its points, 0 when they are its control net.
+    ## A text: its label (in `labels`).
     pub var third: i64
     pub var fourth: i64
     pub var construction: bool
+
+## A text's label: what it says and its font file (empty: the system's
+## sans), as runs of a sketch's `chars`.
+pub struct Label:
+    pub var content: usize
+    pub var content_length: usize
+    pub var font: usize
+    pub var font_length: usize
 
 pub struct SketchConstraint:
     pub var kind: ConstraintKind
@@ -121,12 +137,17 @@ pub struct Sketch:
     pub var constraints: Growing[SketchConstraint]
     ## The splines' points, each spline's a run of point entities.
     pub var lists: Growing[i64]
+    ## The texts' labels, their bytes in `chars`.
+    pub var labels: Growing[Label]
+    pub var chars: Growing[u8]
 
     pub func close():
         self.params.close()
         self.entities.close()
         self.constraints.close()
         self.lists.close()
+        self.labels.close()
+        self.chars.close()
 
     ## A new point at (`x`, `y`).
     pub func add_point(x: f64, y: f64, construction: bool = false) -> i64!:
@@ -194,6 +215,30 @@ pub struct Sketch:
         try self.params.push(rho)
         return try self.add(SketchEntity(EntityKind.conic, start, r, end, apex, construction))
 
+    ## A text at point `anchor` saying `content` (lines apart by newlines)
+    ## in font file `font` (empty: the system's sans), its capitals
+    ## `height` tall.
+    pub func add_text(anchor: i64, height: f64, content: str, font: str, construction: bool = false) -> i64!:
+        try self.require(anchor, EntityKind.point)
+        if not (height > 0.0): error(invalid, "a text needs a positive height")
+        if content.length == 0: error(invalid, "a text needs something to say")
+        let label = Label(self.chars.count, content.length, self.chars.count + content.length, font.length)
+        for byte in content.bytes: try self.chars.push(byte)
+        for byte in font.bytes: try self.chars.push(byte)
+        try self.labels.push(label)
+        let r = (i64)self.params.count
+        try self.params.push(height)
+        return try self.add(SketchEntity(EntityKind.text, anchor, r, (i64)self.labels.count - 1, -1, construction))
+
+    ## What text `e` says, and its font file.
+    pub func text_content(e: SketchEntity) -> str:
+        let label = self.labels.items[(usize)e.third]
+        return (str)self.chars.view()[label.content..<label.content + label.content_length]
+
+    pub func text_font(e: SketchEntity) -> str:
+        let label = self.labels.items[(usize)e.third]
+        return (str)self.chars.view()[label.font..<label.font + label.font_length]
+
     ## The point entities curve `e` is drawn on, in order (a spline's
     ## list; an arc's center, start and end; a conic's start, end, apex).
     pub func points_of(e: SketchEntity, out: Growing[i64]*) -> !:
@@ -208,13 +253,14 @@ pub struct Sketch:
             try out.push(e.fourth)
             return
         try out.push(e.first)
+        if e.kind == EntityKind.text: return
         if e.kind == EntityKind.line: try out.push(e.second)
         if e.kind == EntityKind.arc or e.kind == EntityKind.ellipse: try out.push(e.third)
         if e.kind == EntityKind.arc: try out.push(e.fourth)
 
     ## Curve `e`'s own parameter (a radius, a minor radius, a rho), or -1.
     pub func scalar_of(e: SketchEntity) -> i64:
-        if e.kind == EntityKind.circle or e.kind == EntityKind.arc or e.kind == EntityKind.ellipse or e.kind == EntityKind.conic: return e.second
+        if e.kind == EntityKind.circle or e.kind == EntityKind.arc or e.kind == EntityKind.ellipse or e.kind == EntityKind.conic or e.kind == EntityKind.text: return e.second
         return -1
 
     ## Point `at` of spline `spline` (its list's).
@@ -329,7 +375,8 @@ pub struct Sketch:
                     let r = (i64)params.count
                     try params.push(self.params.items[(usize)e.second])
                     e.second = r
-                    if e.third >= 0: e.third = renumbered.items[(usize)e.third]
+                    # A text's third is its label, which stays.
+                    if e.third >= 0 and e.kind != EntityKind.text: e.third = renumbered.items[(usize)e.third]
                     if e.fourth >= 0: e.fourth = renumbered.items[(usize)e.fourth]
             try kept.push(e)
         var constraints = Growing[SketchConstraint]()
@@ -401,4 +448,4 @@ pub struct Sketch:
 
 ## An empty sketch.
 pub func new_sketch() -> Sketch:
-    return Sketch(Growing[f64](), Growing[SketchEntity](), Growing[SketchConstraint](), Growing[i64]())
+    return Sketch(Growing[f64](), Growing[SketchEntity](), Growing[SketchConstraint](), Growing[i64](), Growing[Label](), Growing[u8]())

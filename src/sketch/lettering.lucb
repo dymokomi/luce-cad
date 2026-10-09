@@ -1,0 +1,169 @@
+## A sketch text's outlines: each line of what it says set along its
+## baseline from its anchor (later lines below, a line height apart), the
+## glyphs' outlines from the font file (luce-fonts' opentype engine; no
+## shaping: one glyph per character, advanced by its own width), scaled
+## so a capital is the text's height. The outlines are pieces of lines and
+## quadratic and cubic Béziers in sketch coordinates; curves.lucb makes
+## them curves, the editor samples them. The font last used is kept, so
+## drawing and picking do not read its file again.
+
+## A text's outline pieces: each a Bézier of `degrees` (1 to 3), its
+## degree + 1 points from `starts` in `xs` and `ys`.
+pub struct Lettering:
+    pub var degrees: Growing[i64]
+    pub var starts: Growing[usize]
+    pub var xs: Growing[f64]
+    pub var ys: Growing[f64]
+
+    pub func close():
+        self.degrees.close()
+        self.starts.close()
+        self.xs.close()
+        self.ys.close()
+
+    pub func count() -> usize:
+        return self.degrees.count
+
+    ## Piece `piece` at `t` (0..1), by de Casteljau's steps.
+    pub func at(piece: usize, t: f64) -> (f64, f64):
+        let degree = (usize)self.degrees.items[piece]
+        let first = self.starts.items[piece]
+        var x: f64[4] = [0.0, 0.0, 0.0, 0.0]
+        var y: f64[4] = [0.0, 0.0, 0.0, 0.0]
+        for k in 0..<degree + 1:
+            x[k] = self.xs.items[first + k]
+            y[k] = self.ys.items[first + k]
+        for level in 1..<degree + 1:
+            for k in 0..<degree + 1 - level:
+                x[k] = x[k] + (x[k + 1] - x[k]) * t
+                y[k] = y[k] + (y[k + 1] - y[k]) * t
+        return (x[0], y[0])
+
+    func clear():
+        self.degrees.clear()
+        self.starts.clear()
+        self.xs.clear()
+        self.ys.clear()
+
+    func piece(degree: i64, points: const f64[]) -> !:
+        try self.degrees.push(degree)
+        try self.starts.push(self.xs.count)
+        for k in 0..<(usize)degree + 1:
+            try self.xs.push(points[2 * k])
+            try self.ys.push(points[2 * k + 1])
+
+pub func new_lettering() -> Lettering:
+    return Lettering(Growing[i64](), Growing[usize](), Growing[f64](), Growing[f64]())
+
+## The font last set in: its file, bytes (a plain heap copy: kept for the
+## program's life, no object) and face.
+struct LoadedFont:
+    var path: Growing[u8]
+    var data: u8[]
+    var face: opentype.SfntFace*
+
+local var loaded_font: LoadedFont? = none
+
+## The system's sans: the first of these that is there.
+func default_fonts() -> str[7]:
+    return ["/System/Library/Fonts/Helvetica.ttc", "/System/Library/Fonts/Supplemental/Arial.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf", "C:\\Windows\\Fonts\\arial.ttf", "C:\\Windows\\Fonts\\segoeui.ttf"]
+
+## The face of font file `path` (empty: the system's sans), loaded once.
+func font_face(path: str) -> opentype.SfntFace*!:
+    var chosen = path
+    if chosen.length == 0:
+        for candidate in default_fonts():
+            let native = try strings.copy(candidate)
+            defer strings.release(native)
+            if files.exists((native_c.str)native):
+                chosen = candidate
+                break
+        if chosen.length == 0: error(invalid, "no font for sketch text: name a font file")
+    if let held = loaded_font:
+        if (str)held.path.view() == chosen: return held.face
+    let native = try strings.copy(chosen)
+    defer strings.release(native)
+    let read = try files.read((native_c.str)native, 67108864)
+    let data = new u8[read.value.length] --- in memory.heap catch failure:
+        read.release()
+        error(failure.code, failure.message)
+    memory.copy(data, read.value, read.value.length)
+    read.release()
+    let face = opentype.sfnt_face_create(data, 0) catch failure:
+        free(data) in memory.heap
+        error(invalid, "the sketch text's font file is not a font luce-fonts reads")
+    if let held = loaded_font:
+        var old = held
+        opentype.sfnt_face_destroy(old.face)
+        free(old.data) in memory.heap
+        old.path.close()
+    var kept = Growing[u8]()
+    for byte in chosen.bytes: try kept.push(byte)
+    loaded_font = LoadedFont(kept, data, face)
+    return face
+
+## Text `e`'s outline pieces onto `out`.
+pub func letter(sketch: const Sketch*, e: SketchEntity, out: Lettering*) -> !:
+    out.clear()
+    let face = try font_face(sketch.text_font(e))
+    let height = sketch.params.items[(usize)e.second]
+    let upem = (f64)face.units_per_em
+    var cap = upem * 0.7
+    if let os2 = face.os2:
+        if os2.s_cap_height > 0: cap = (f64)os2.s_cap_height
+    let em = height * upem / cap
+    let per_unit = em / upem
+    let line_height = ((f64)face.ascender - (f64)face.descender + (f64)face.hhea_line_gap) * per_unit
+    let ax = sketch.x(e.first)
+    let ay = sketch.y(e.first)
+    let content = sketch.text_content(e)
+    var pen = 0.0
+    var baseline = 0.0
+    var offset: usize = 0
+    while offset < content.length:
+        let decoded = utf8.decode(content.bytes, offset) else error(invalid, "a sketch text is not UTF-8")
+        offset += decoded.width
+        let scalar = (u32)decoded.scalar
+        if scalar == 10:
+            pen = 0.0
+            baseline -= line_height
+            continue
+        let glyph = opentype.sfnt_face_glyph_for_code_point(face, scalar)
+        var path = opentype.sfnt_face_glyph_path(face, glyph, (f32)em)
+        defer path.release()
+        try glyph_pieces(&path, ax + pen, ay + baseline, out)
+        pen += (f64)opentype.sfnt_face_advance(face, glyph) * per_unit
+
+## A glyph path's pieces, its origin at (`x`, `y`) (its y grows down).
+func glyph_pieces(path: const opentype.GlyphPath*, x: f64, y: f64, out: Lettering*) -> !:
+    var points: f64[8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    var cx = 0.0
+    var cy = 0.0
+    var sx = 0.0
+    var sy = 0.0
+    var next: usize = 0
+    for at in 0..<path.verbs.length():
+        let verb = *path.verbs.at(at)
+        if verb == opentype.GlyphPathVerb.close:
+            if cx != sx or cy != sy:
+                points = [cx, cy, sx, sy, 0.0, 0.0, 0.0, 0.0]
+                try out.piece(1, points[0..])
+            cx = sx
+            cy = sy
+            continue
+        let taken: usize = 1 if verb == opentype.GlyphPathVerb.move or verb == opentype.GlyphPathVerb.line else (2 if verb == opentype.GlyphPathVerb.quad else 3)
+        points[0] = cx
+        points[1] = cy
+        for k in 0..<taken:
+            let p = *path.points.at(next + k)
+            points[2 * k + 2] = x + (f64)p.x
+            points[2 * k + 3] = y - (f64)p.y
+        next += taken
+        if verb == opentype.GlyphPathVerb.move:
+            sx = points[2]
+            sy = points[3]
+        else:
+            try out.piece((i64)taken, points[0..])
+        cx = points[2 * taken]
+        cy = points[2 * taken + 1]

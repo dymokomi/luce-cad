@@ -10,6 +10,10 @@
 ##                                    them, 0: its control net)
 ##   e <center> <major> <minor> [c]   an ellipse
 ##   n <start> <end> <apex> <rho> [c] a conic
+##   t <anchor> <height> <font> <content> [c]   a text; its font file
+##                                    and what it says with %, space and
+##                                    newline as %25, %20 and %0A (an
+##                                    empty font: -)
 ##   k <kind> <first> <second> <third> <value> <side> [d]
 ##                                    a constraint; `d`: driven
 ##
@@ -42,6 +46,16 @@ pub func write_sketch(sketch: const Sketch*, out: Growing[u8]*) -> !:
             try put_index(out, e.first)
             try put_index(out, e.third)
             try put_number(out, sketch.params.items[(usize)e.second])
+        elif e.kind == EntityKind.text:
+            try put_text(out, "t")
+            try put_index(out, e.first)
+            try put_number(out, sketch.params.items[(usize)e.second])
+            try put_text(out, " ")
+            let font = sketch.text_font(e)
+            if font.length == 0: try put_text(out, "-")
+            else: try put_escaped(out, font)
+            try put_text(out, " ")
+            try put_escaped(out, sketch.text_content(e))
         elif e.kind == EntityKind.conic:
             try put_text(out, "n")
             try put_index(out, e.first)
@@ -102,6 +116,21 @@ pub func read_sketch(text: str) -> Sketch!:
             let listed = (i64)s.lists.count
             for at in 3..<given: try s.lists.push(try whole(fields[at]))
             _ = try s.add(SketchEntity(EntityKind.spline, listed, (i64)(given - 3), try whole(fields[2]), try whole(fields[1]), marked))
+        elif tag == "t" and given == 5:
+            var content = Growing[u8]()
+            defer content.close()
+            var font = Growing[u8]()
+            defer font.close()
+            if fields[3] != "-": try unescape(fields[3], &font)
+            try unescape(fields[4], &content)
+            let anchor = try whole(fields[1])
+            let label = Label(s.chars.count, content.count, s.chars.count + content.count, font.count)
+            for byte in content.view(): try s.chars.push(byte)
+            for byte in font.view(): try s.chars.push(byte)
+            try s.labels.push(label)
+            let r = (i64)s.params.count
+            try s.params.push(try strings.parse_f64(fields[2]))
+            _ = try s.add(SketchEntity(EntityKind.text, anchor, r, (i64)s.labels.count - 1, -1, marked))
         elif tag == "e" and given == 4:
             let r = (i64)s.params.count
             try s.params.push(try strings.parse_f64(fields[3]))
@@ -180,3 +209,27 @@ func put_number(out: Growing[u8]*, value: f64) -> !:
     var buffer: u8[32] = ---
     try put_text(out, " ")
     try put_text(out, try strings.format_f64(value, buffer[0..]))
+
+## `text` with %, space and newline written %25, %20, %0A.
+func put_escaped(out: Growing[u8]*, text: str) -> !:
+    for byte in text.bytes:
+        if byte == 37: try put_text(out, "%25")
+        elif byte == 32: try put_text(out, "%20")
+        elif byte == 10: try put_text(out, "%0A")
+        else: try out.push(byte)
+
+## `text` with put_escaped's escapes read back onto `out`.
+func unescape(text: str, out: Growing[u8]*) -> !:
+    let bytes = text.bytes
+    var at: usize = 0
+    while at < bytes.length:
+        if bytes[at] == 37 and at + 2 < bytes.length:
+            let code = (str)bytes[at + 1..<at + 3]
+            if code == "25": try out.push(37)
+            elif code == "20": try out.push(32)
+            elif code == "0A": try out.push(10)
+            else: error(invalid, "a sketch text has an escape it does not know")
+            at += 3
+            continue
+        try out.push(bytes[at])
+        at += 1
