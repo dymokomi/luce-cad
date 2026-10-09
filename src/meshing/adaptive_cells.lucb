@@ -1,0 +1,83 @@
+## Face meshers (internal): one face's mesh from its planned layout. A
+## four-sided patch's mapped grid (mapped_*), a face clipped by its layout's
+## cells (clipped_*), analytic and B-spline faces trimmed in their chart
+## (analytic_trim, surface_trim, sphere_chart), cone and sphere corners
+## (conical_fan, spherical_triangle), curvature refinement (adaptive_*),
+## shading normals (surface_normals), and the checks a face's mesh passes
+## (display_error, patch_validation, conformed_display, seam_conform).
+## patch_dispatch picks the mesher per face.
+##
+## This file: splitting a cell of the UV mesh where it bends.
+import interop
+import memory
+from luce_std import math
+from luce_geocore.geocore import MeshBuilder, Vector3, Mesh, invalid, squared_triangle_distance, PolygonTopology, dissolve_edge, DissolveWorkspace, Matrix4
+from geometry import Surface, analytic_point, support_normal, surface_spline, wrap, surface_cylinder, surface_cone, surface_sphere, surface_torus, evaluate, project, BrepFace, Samples, Curve, edge_index, chart_parameter, surface_point, surface_plane, nurbs_normal, curve_line, curve_circle, NurbsSurface
+from polygons import TrimConstraints, TrimPolygon, TrimGrid
+from layout import patch_sides, GridLayout, chart_identities, align
+from luce_geocore.core.growing import Growing
+
+## Detect a centre fan that would violate the polygon engine's triangle
+## conditioning contract. Edge-only subdivision is a bounded alternative.
+pub func center_conditioned(mesh: const MeshBuilder*, vertices: const i64[], cuts: const i64[], center: Vector3) -> bool:
+    for at in 0..<(usize)3:
+        let a = mesh.points[(usize)vertices[at]]
+        let b = mesh.points[(usize)vertices[(at+1)%3]]
+        if cuts[at] < 0:
+            if not conditioned(a,b,center): return false
+        else:
+            let cut = mesh.points[(usize)cuts[at]]
+            if not conditioned(a,cut,center) or not conditioned(cut,b,center): return false
+    return true
+
+func conditioned(a: Vector3, b: Vector3, c: Vector3) -> bool:
+    let ab = b.subtract(a)
+    let ac = c.subtract(a)
+    return ab.cross(ac).z > math.max(1e-30,math.max(ab.dot(ab),ac.dot(ac))*1e-14)
+
+pub func split_triangle(mesh: MeshBuilder*, vertices: const i64[], cuts: const i64[]) -> bool!:
+    var count: usize = 0
+    for cut in cuts:
+        if cut >= 0: count += 1
+    if count == 0: return false
+    if count == 3:
+        for at in 0..<(usize)3: try add_triangle(mesh,vertices[at],cuts[at],cuts[(at+2)%3])
+        try add_triangle(mesh,cuts[0],cuts[1],cuts[2])
+        return true
+    var start: usize = 0
+    for at in 0..<(usize)3:
+        if cuts[at] >= 0 and (count == 1 or cuts[(at+1)%3] >= 0):
+            start = at
+            break
+    let a = vertices[start]
+    let b = vertices[(start+1)%3]
+    let c = vertices[(start+2)%3]
+    let ab = cuts[start]
+    if count == 1:
+        try add_triangle(mesh,a,ab,c)
+        try add_triangle(mesh,ab,b,c)
+        return true
+    let bc = cuts[(start+1)%3]
+    try add_triangle(mesh,b,bc,ab)
+    # The remaining convex quad admits two diagonals. Maximize the weaker
+    # child's area/longest-side², rather than selecting an arbitrary fan.
+    let first = math.min(triangle_quality(mesh,a,ab,c),triangle_quality(mesh,ab,bc,c))
+    let second = math.min(triangle_quality(mesh,a,ab,bc),triangle_quality(mesh,a,bc,c))
+    if first >= second:
+        try add_triangle(mesh,a,ab,c)
+        try add_triangle(mesh,ab,bc,c)
+    else:
+        try add_triangle(mesh,a,ab,bc)
+        try add_triangle(mesh,a,bc,c)
+    return true
+
+func triangle_quality(mesh: MeshBuilder*, a: i64, b: i64, c: i64) -> f64:
+    let ab = mesh.points[(usize)b].subtract(mesh.points[(usize)a])
+    let ac = mesh.points[(usize)c].subtract(mesh.points[(usize)a])
+    let bc = mesh.points[(usize)c].subtract(mesh.points[(usize)b])
+    let longest = math.max(ab.dot(ab),math.max(ac.dot(ac),bc.dot(bc)))
+    return ab.cross(ac).length()/longest if longest > 0.0 else 0.0
+
+func add_triangle(mesh: MeshBuilder*, a: i64, b: i64, c: i64) -> !:
+    try mesh.face(3)
+    for id in [a,b,c]: try mesh.corner(id)

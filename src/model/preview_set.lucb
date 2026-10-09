@@ -1,0 +1,378 @@
+## A CAD model's disposable display preview, built on the worker pool. Each
+## face's preview mesh is copied into raw arrays on its worker (a mesh and its
+## owner stay on the thread that made them) and merged here, in face order,
+## into display batches, as luced-3d once merged its per-patch meshes one by
+## one: same meshes, same batch limits, far less copying.
+
+## Batch limits: small retained meshes keep partial redraws cheap.
+let batch_points: usize = 4096
+let batch_vertices: usize = 16000
+
+## One point, corner or face attribute of a part.
+struct PartColumn:
+    var name: u8[64]
+    var length: usize = 0
+    var domain: i64 = 0
+    var width: i64 = 1
+    var integer: bool = false
+    var values: f64[]
+
+    func label() -> str:
+        return (str)self.name[..<self.length]
+
+## One face's preview and boundary polylines, filled on a worker.
+pub struct PreviewPart:
+    var points: Vector3[]
+    var sizes: i64[]
+    var corners: i64[]
+    ## Display triangles as corners local to their face, grouped by face.
+    var display: i64[]
+    var columns: PartColumn[]
+    var column_count: usize = 0
+    var colored: bool = false
+    var guide: bool = false
+    var guide_start: Vector3 = Vector3()
+    var guide_end: Vector3 = Vector3()
+    ## Edge IDs of the face's uses, and each use's polyline in `polyline`.
+    var ids: i64[]
+    var starts: usize[]
+    var polyline: Vector3[]
+    var uses: usize = 0
+    var used: usize = 0
+    var failure: interop.Packet[str]? = none
+    var fatal_failure: bool = false
+
+    pub func open_boundaries(uses: usize) -> !:
+        self.ids = try new i64[uses] --- in memory.heap
+        self.starts = try new usize[uses + 1] --- in memory.heap
+        self.polyline = try new Vector3[uses * 65 + 1] --- in memory.heap
+        self.starts[0] = 0
+
+    pub func begin_use(id: i64) -> !:
+        if self.uses == self.ids.length: error(invalid, "preview boundary use overflow")
+        self.ids[self.uses] = id
+        self.uses += 1
+        self.starts[self.uses] = self.used
+
+    pub func boundary_point(point: Vector3) -> !:
+        if self.used == self.polyline.length: error(invalid, "preview boundary overflow")
+        self.polyline[self.used] = point
+        self.used += 1
+        self.starts[self.uses] = self.used
+
+    pub func failed() -> bool:
+        if let failure = self.failure:
+            _ = failure
+            return true
+        return false
+
+    ## The preview failed; the face is counted and keeps its boundaries.
+    pub func fail(message: str):
+        self.failure = interop.text_transfer.copy(message) catch exhausted: trap(exhausted.message)
+
+    ## The whole preview fails, as the serial boundary sampling did.
+    pub func fatal(message: str):
+        self.fail(message)
+        self.fatal_failure = true
+
+    ## Copy `mesh` into raw arrays and its normal guide (as luced-3d drew it).
+    pub func adopt(mesh: interop.Reference[Mesh]) -> !:
+        let m = mesh.value()
+        let point_count = (usize)m.point_count()
+        let face_count = (usize)m.face_count()
+        self.points = try new Vector3[point_count] --- in memory.heap
+        for at in 0..<point_count: self.points[at] = try m.point((i64)at)
+        self.sizes = try new i64[face_count] --- in memory.heap
+        self.corners = try new i64[(usize)m.vertex_count()] --- in memory.heap
+        self.display = try new i64[(usize)m.index_count()] --- in memory.heap
+        var corner: usize = 0
+        var triangle: usize = 0
+        for face in 0..<face_count:
+            let size = try m.face_size((i64)face)
+            let offset = try m.face_offset((i64)face)
+            self.sizes[face] = size
+            for at in 0..<size:
+                self.corners[corner] = try m.face_point((i64)face, at)
+                corner += 1
+            let first = (offset - (i64)face * 2) * 3
+            for at in 0..<(size - 2) * 3:
+                let index = m.index(first + at)
+                defer index.release()
+                self.display[triangle] = (try index.get()) - offset
+                triangle += 1
+        var kept: usize = 0
+        let count = (usize)m.attribute_count()
+        self.columns = try new PartColumn[count] --- in memory.heap
+        for index in 0..<count:
+            let domain = try m.attribute_domain((i64)index)
+            if domain > 2: continue
+            let name = try m.attribute_name((i64)index)
+            let width = try m.attribute_width((i64)index)
+            let elements = try m.domain_count(domain)
+            var column = PartColumn()
+            memory.copy(column.name[..<name.length], name.bytes, name.length)
+            column.length = name.length
+            column.domain = domain
+            column.width = width
+            column.integer = try m.attribute_integer((i64)index)
+            column.values = try new f64[(usize)(elements * width)] --- in memory.heap
+            for element in 0..<elements:
+                for component in 0..<width:
+                    column.values[(usize)(element * width + component)] = try m.attribute_value((i64)index, element, component)
+            self.columns[kept] = column
+            kept += 1
+            self.column_count = kept
+            if domain == 2 and name == "Cd": self.colored = true
+        if face_count > 0:
+            let middle = (i64)face_count // 2
+            let center = try m.face_center(middle)
+            let box = m.bounds()
+            let length = box.maximum.subtract(box.minimum).length() * 0.03
+            self.guide = true
+            self.guide_start = center
+            self.guide_end = center.add((try m.face_normal(middle)).multiply_scalar(length))
+
+    func close():
+        if self.points.length > 0: free(self.points) in memory.heap
+        if self.sizes.length > 0: free(self.sizes) in memory.heap
+        if self.corners.length > 0: free(self.corners) in memory.heap
+        if self.display.length > 0: free(self.display) in memory.heap
+        for column in self.columns[..<self.column_count]:
+            if column.values.length > 0: free(column.values) in memory.heap
+        if self.columns.length > 0: free(self.columns) in memory.heap
+        if self.ids.length > 0: free(self.ids) in memory.heap
+        if self.starts.length > 0: free(self.starts) in memory.heap
+        if self.polyline.length > 0: free(self.polyline) in memory.heap
+        if let failure = self.failure: failure.release()
+
+## Fills face `index`'s part on a worker; must not touch caller-owned objects.
+pub type PartMaker = func(void*?, usize, PreviewPart*) -> unit
+
+struct PartJob:
+    let make: PartMaker
+    let context: void*?
+    let parts: PreviewPart[]
+    var stop: @bool
+
+func part_item(raw: void*?, index: usize):
+    let job = (PartJob*)(raw else return)
+    if job.stop.load(.acquire): return
+    let make = job.make
+    make(job.context, index, &job.parts[index])
+
+## Make every face's part on the pool and assemble the preview. `edges` bounds
+## the shared edge IDs; other IDs belong to one face use and always show.
+pub func collect_preview(faces: usize, edges: usize, make: PartMaker, context: void*?, progress: interop.Callback[f64, unit]?) -> interop.Reference[CadPreviewSet]!:
+    let parts = try new PreviewPart[faces] --- in memory.heap
+    defer free(parts) in memory.heap
+    for at in 0..<faces: parts[at] = PreviewPart()
+    defer close_parts(parts)
+    var job = PartJob(make = make, context = context, parts = parts)
+    var pooled = parallel.Job()
+    parallel.start(&pooled, faces, part_item, (void*)&job)
+    var waiting = true
+    defer:
+        if waiting:
+            job.stop.store(true, .release)
+            parallel.wait(&pooled)
+    var reported: usize = 0
+    while true:
+        let completed = parallel.completed(&pooled)
+        if completed != reported:
+            if let report = progress:
+                let outcome = report.invoke((f64)completed / (f64)faces)
+                defer outcome.release()
+                try outcome.get()
+            reported = completed
+        if completed >= faces: break
+        thread.sleep(2)
+    parallel.wait(&pooled)
+    waiting = false
+    for part in parts:
+        if part.fatal_failure:
+            if let failure = part.failure:
+                let owned = try interop.copy_text(failure.value)
+                if let owner = owned.owner: _ = ownership.pool_object(owner)
+                error(invalid, owned.value)
+    let set = try new CadPreviewSet(faces) in memory.heap
+    let result = try interop.Reference[CadPreviewSet].adopt(set, cad_preview_set_type, memory.heap)
+    errdefer result.release()
+    try result.value().assemble(parts, edges)
+    return result
+
+func close_parts(parts: const PreviewPart[]):
+    for part in parts: part.close()
+
+pub struct CadPreviewSet:
+    var meshes: interop.Reference[Mesh][]
+    var mesh_total: usize = 0
+    var boundaries: Vector3[]
+    var boundary_total: usize = 0
+    var guides: Vector3[]
+    var guide_total: usize = 0
+    var failures: i64 = 0
+    var error_text: interop.Packet[str]? = none
+
+    func init(faces: usize) -> !:
+        self.meshes = try new interop.Reference[Mesh][faces + 1] --- in memory.heap
+        errdefer free(self.meshes) in memory.heap
+        self.guides = try new Vector3[faces * 2 + 1] --- in memory.heap
+        var empty: Vector3[]
+        self.boundaries = empty
+        self.mesh_total = 0
+        self.boundary_total = 0
+        self.guide_total = 0
+        self.failures = 0
+        self.error_text = none
+
+    pub func mesh_count() -> i64:
+        return (i64)self.mesh_total
+
+    pub func mesh(index: i64) -> interop.Reference[Mesh]!:
+        if index < 0 or (usize)index >= self.mesh_total: error(invalid, "preview mesh index out of range")
+        return self.meshes[(usize)index].clone()
+
+    ## Boundary segments as point pairs.
+    pub func boundary_count() -> i64:
+        return (i64)self.boundary_total
+
+    pub func boundary(index: i64) -> Vector3!:
+        if index < 0 or (usize)index >= self.boundary_total: error(invalid, "preview boundary index out of range")
+        return self.boundaries[(usize)index]
+
+    ## Normal guides as (start, end) pairs, one per meshed face.
+    pub func guide_count() -> i64:
+        return (i64)self.guide_total
+
+    pub func guide(index: i64) -> Vector3!:
+        if index < 0 or (usize)index >= self.guide_total: error(invalid, "preview guide index out of range")
+        return self.guides[(usize)index]
+
+    pub func failed_faces() -> i64:
+        return self.failures
+
+    ## "Patch N: message" for the first failed face in order, or empty.
+    pub func first_error() -> str:
+        return (self.error_text else interop.Packet[str]("")).value
+
+    func assemble(parts: const PreviewPart[], edges: usize) -> !:
+        var total: usize = 0
+        for part in parts:
+            for use in 0..<part.uses:
+                total += (part.starts[use + 1] - part.starts[use] - 1) * 2
+        self.boundaries = try new Vector3[total + 1] --- in memory.heap
+        let shown = try new bool[edges + 1] --- in memory.heap
+        defer free(shown) in memory.heap
+        for at in 0..<shown.length: shown[at] = false
+        var batch_start: usize = 0
+        var batch_end: usize = 0
+        var points: usize = 0
+        var vertices: usize = 0
+        for face in 0..<parts.length:
+            let part = parts[face]
+            for use in 0..<part.uses:
+                let id = part.ids[use]
+                if id >= 0 and (usize)id < edges:
+                    if shown[(usize)id]: continue
+                    shown[(usize)id] = true
+                for at in part.starts[use] + 1..<part.starts[use + 1]:
+                    self.boundaries[self.boundary_total] = part.polyline[at - 1]
+                    self.boundaries[self.boundary_total + 1] = part.polyline[at]
+                    self.boundary_total += 2
+            if let failure = part.failure:
+                self.failures += 1
+                if self.failures == 1:
+                    var buffer: u8[1024]
+                    let text = strings.format(buffer, f"Patch {face + 1}: {failure.value}") catch exhausted: recover failure.value
+                    self.error_text = try interop.text_transfer.copy(text)
+                continue
+            if part.guide:
+                self.guides[self.guide_total] = part.guide_start
+                self.guides[self.guide_total + 1] = part.guide_end
+                self.guide_total += 2
+            if batch_end > batch_start:
+                let same = parts[batch_start].colored == part.colored
+                if same and points + part.points.length < batch_points and vertices + part.corners.length < batch_vertices:
+                    batch_end = face + 1
+                    points += part.points.length
+                    vertices += part.corners.length
+                    continue
+                try self.flush(parts[batch_start..<batch_end])
+            batch_start = face
+            batch_end = face + 1
+            points = part.points.length
+            vertices = part.corners.length
+        if batch_end > batch_start: try self.flush(parts[batch_start..<batch_end])
+
+    ## One display mesh from consecutive parts; failed parts in the range are
+    ## skipped. Attributes join by (name, domain) in first-seen order, zeros
+    ## where a part lacks one, as Mesh.merged does.
+    func flush(parts: const PreviewPart[]) -> !:
+        var builder = try MeshBuilder()
+        defer builder.close()
+        for part in parts:
+            if part.failed(): continue
+            let base = (i64)builder.np
+            for point in part.points: _ = try builder.point(point)
+            var corner: usize = 0
+            var triangle: usize = 0
+            for size in part.sizes:
+                try builder.face(size)
+                for at in 0..<(usize)size:
+                    try builder.corner(base + part.corners[corner + at])
+                corner += (usize)size
+                let count = ((usize)size - 2) * 3
+                try builder.set_last_display(part.display[triangle..<triangle + count])
+                triangle += count
+        var mesh = try builder.finish()
+        errdefer mesh.release()
+        for part in parts:
+            if part.failed(): continue
+            for column in part.columns[..<part.column_count]:
+                if mesh.value().find_attribute(column.label(), column.domain) >= 0: continue
+                let values = try joined(parts, column)
+                defer free(values) in memory.heap
+                let next = try mesh.value().with_attribute(column.label(), column.domain, column.width, values, column.integer)
+                mesh.release()
+                mesh = next
+        self.meshes[self.mesh_total] = mesh
+        self.mesh_total += 1
+
+    pub func close():
+        for mesh in self.meshes[..<self.mesh_total]: mesh.release()
+        free(self.meshes) in memory.heap
+        if self.boundaries.length > 0: free(self.boundaries) in memory.heap
+        free(self.guides) in memory.heap
+        if let text = self.error_text: text.release()
+
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        for mesh in self.meshes[..<self.mesh_total]: mesh.trace(visit, context)
+
+pub let cad_preview_set_type: interop.Type[CadPreviewSet] = interop.Type[CadPreviewSet]("CadPreviewSet", CadPreviewSet.close, CadPreviewSet.trace, closeable = true)
+
+## One attribute across a batch's parts, zero where a part lacks it.
+func joined(parts: const PreviewPart[], like: PartColumn) -> f64[]!:
+    var total: usize = 0
+    for part in parts:
+        if part.failed(): continue
+        total += domain_size(part, like.domain) * (usize)like.width
+    let values = try new f64[total] --- in memory.heap
+    var at: usize = 0
+    for part in parts:
+        if part.failed(): continue
+        let count = domain_size(part, like.domain) * (usize)like.width
+        var found = false
+        for column in part.columns[..<part.column_count]:
+            if column.domain == like.domain and column.width == like.width and column.label() == like.label():
+                memory.copy(values[at..<at + count], column.values, count)
+                found = true
+                break
+        if not found:
+            for index in at..<at + count: values[index] = 0.0
+        at += count
+    return values
+
+func domain_size(part: PreviewPart, domain: i64) -> usize:
+    if domain == 0: return part.points.length
+    if domain == 1: return part.corners.length
+    return part.sizes.length

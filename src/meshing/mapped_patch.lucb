@@ -1,0 +1,107 @@
+## Four-sided trimmed patches: matched shared boundaries and a Coons UV grid.
+## Interior points lie on the exact support, not a ruled approximation in 3D.
+
+## Mesh a four-sided disk without inserting independent boundary vertices.
+## Reject folded/degenerate parameter grids so the constrained mesher can retry.
+pub func mapped_patch(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, divisions: i64 = 16) -> !:
+    let sides = try patch_sides(face, s, edges, tolerance)
+    if not sides.valid:
+        error(invalid, "mapped patch requires four boundary sides")
+    var offsets: usize[5]
+    offsets[0] = 0
+    for side in 0..<(usize)4:
+        offsets[side + 1] = offsets[side] + 1
+        for segment in 0..<sides.lengths[side]:
+            offsets[side + 1] += samples[edge_index(face.uses[(sides.starts[side] + segment) % face.uses.length])].ids.length - 1
+    let nx = offsets[1] - offsets[0] - 1
+    let ny = offsets[2] - offsets[1] - 1
+    if nx != offsets[3] - offsets[2] - 1 or ny != offsets[4] - offsets[3] - 1 or nx == 0 or ny == 0 or (nx + 1) * (ny + 1) > 131072:
+        error(invalid, "mapped patch boundary counts are incompatible")
+    let boundary = try new Vector3[offsets[4]] --- in memory.heap
+    defer free(boundary) in memory.heap
+    let ids = try new i64[offsets[4]] --- in memory.heap
+    defer free(ids) in memory.heap
+    var previous = Vector3(0.5, 0.5, 0.0)
+    for side in 0..<(usize)4:
+        var index = offsets[side]
+        for segment in 0..<sides.lengths[side]:
+            let use = face.uses[(sides.starts[side] + segment) % face.uses.length]
+            let points = samples[edge_index(use)].ids
+            let length = points.length if segment + 1 == sides.lengths[side] else points.length - 1
+            for at in 0..<length:
+                ids[index] = points[at if use > 0 else points.length - 1 - at]
+                let p = mesh.points[(usize)ids[index]]
+                previous = try chart_parameter(s, p, previous, tolerance, index > 0)
+                boundary[index] = previous
+                index += 1
+        if side > 0 and ids[offsets[side] - 1] != ids[offsets[side]]:
+            error(invalid, "mapped patch sides do not meet")
+    if ids[0] != ids[ids.length - 1] or boundary[0].subtract(boundary[boundary.length - 1]).length() > 0.00001:
+        error(invalid, "mapped patch has an open or singular parameter boundary")
+    let grid = try new Vector3[(nx + 1) * (ny + 1)] --- in memory.heap
+    defer free(grid) in memory.heap
+    let mapped = try new i64[grid.length] --- in memory.heap
+    defer free(mapped) in memory.heap
+    let a = boundary[0]
+    let b = boundary[nx]
+    let c = boundary[offsets[2]]
+    let d = boundary[offsets[3]]
+    for row in 0..<ny + 1:
+        let v = (f64)row / (f64)ny
+        for column in 0..<nx + 1:
+            let u = (f64)column / (f64)nx
+            let bottom = boundary[column]
+            let right = boundary[offsets[1] + row]
+            let top = boundary[offsets[2] + nx - column]
+            let left = boundary[offsets[3] + ny - row]
+            let bilinear = a.multiply_scalar((1.0 - u) * (1.0 - v)).add(b.multiply_scalar(u * (1.0 - v))).add(c.multiply_scalar(u * v)).add(d.multiply_scalar((1.0 - u) * v))
+            let uv = bottom.multiply_scalar(1.0 - v).add(top.multiply_scalar(v)).add(left.multiply_scalar(1.0 - u)).add(right.multiply_scalar(u)).subtract(bilinear)
+            grid[row * (nx + 1) + column] = uv
+            if s.kind == surface_spline and (uv.x < -0.0000001 or uv.x > 1.0000001 or uv.y < -0.0000001 or uv.y > 1.0000001):
+                error(invalid, "mapped patch leaves the NURBS domain")
+    let initial_turn = grid[1].subtract(grid[0]).cross(grid[nx + 2].subtract(grid[1])).z
+    try redistribute_grid(grid, nx, ny, s, tolerance, (initial_turn > 0.0) == face.sense, divisions)
+    # Every corner must have the same nonzero Jacobian sign. This also excludes
+    # concave quads that would otherwise hide an inverted display triangle.
+    var direction: f64 = 0.0
+    for row in 0..<ny:
+        for column in 0..<nx:
+            let at = row * (nx + 1) + column
+            let corners = [grid[at], grid[at + 1], grid[at + nx + 2], grid[at + nx + 1]]
+            for corner in 0..<(usize)4:
+                let turn = corners[(corner + 1) % 4].subtract(corners[corner]).cross(corners[(corner + 2) % 4].subtract(corners[(corner + 1) % 4])).z
+                if direction == 0.0: direction = turn
+                if math.abs(turn) < 1e-16 or turn * direction <= 0.0:
+                    error(invalid, "mapped patch grid folds or degenerates")
+    for row in 0..<ny + 1:
+        for column in 0..<nx + 1:
+            let at = row * (nx + 1) + column
+            if row == 0: mapped[at] = ids[column]
+            elif row == ny: mapped[at] = ids[offsets[2] + nx - column]
+            elif column == 0: mapped[at] = ids[offsets[3] + ny - row]
+            elif column == nx: mapped[at] = ids[offsets[1] + row]
+            else: mapped[at] = try mesh.point(try surface_point(s, grid[at]))
+    let forward = (direction > 0.0) == face.sense
+    let refine = s.kind != surface_plane and s.kind != surface_spline and face.uses.length > 4
+    for row in 0..<ny:
+        for column in 0..<nx:
+            let at = row * (nx + 1) + column
+            let corners = [mapped[at], mapped[at + 1], mapped[at + nx + 2], mapped[at + nx + 1]]
+            let pa = mesh.points[(usize)corners[0]]
+            let pb = mesh.points[(usize)corners[1]]
+            let pc = mesh.points[(usize)corners[2]]
+            let pd = mesh.points[(usize)corners[3]]
+            let first = pb.subtract(pa).cross(pc.subtract(pa))
+            let second = pc.subtract(pa).cross(pd.subtract(pa))
+            if first.length() <= 1e-12 or second.length() <= 1e-12 or first.dot(second) <= 0.0:
+                error(invalid, "mapped patch folds or collapses on its support")
+            let normal = try first.add(second).normalized()
+            let positions = [pa, pb, pc, pd]
+            for corner in 0..<(usize)4:
+                let p = positions[corner]
+                if positions[(corner + 1) % 4].subtract(p).cross(positions[(corner + 2) % 4].subtract(p)).dot(normal) <= 1e-12:
+                    error(invalid, "mapped patch has a degenerate display diagonal")
+            if not refine:
+                try mesh.face(4)
+                for corner in 0..<(usize)4: try mesh.corner(corners[corner if forward else 3 - corner])
+    if refine: try mapped_refine(mesh, grid, mapped, nx, ny, s, forward, tolerance, divisions)

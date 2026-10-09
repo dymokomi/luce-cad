@@ -1,0 +1,89 @@
+## Lift a frozen UV cell arrangement onto its exact CAD support. Shared boundary
+## IDs survive clipping; n-gons describe cut cells, not hidden coarse geometry.
+
+## Emit planned cells or fail atomically at the caller's rollback boundary.
+pub func clipped_patch(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: i64) -> !:
+    if not plan.valid: error(invalid, "no compatible trimmed-grid layout")
+    var length: usize = 0
+    for use in face.uses: length += samples[edge_index(use)].ids.length - 1
+    let uv = try new Vector3[length] --- in memory.heap
+    defer free(uv) in memory.heap
+    let ids = try new i64[length] --- in memory.heap
+    defer free(ids) in memory.heap
+    let sizes = try new i64[face.sizes.length] --- in memory.heap
+    defer free(sizes) in memory.heap
+    var written: usize = 0
+    var offset: usize = 0
+    var seed = Vector3(0.5, 0.5, 0.0)
+    for loop in 0..<face.sizes.length:
+        let start = written
+        for at in 0..<(usize)face.sizes[loop]:
+            let use = face.uses[offset + at]
+            let chain = samples[edge_index(use)].ids
+            for i in 0..<chain.length - 1:
+                let id = chain[i if use > 0 else chain.length - 1 - i]
+                let chain_uv = plan.chains[offset + at].points
+                if chain_uv.length != chain.length: error(invalid, "trim layout boundary is not frozen")
+                seed = chain_uv[i if use > 0 else chain.length - 1 - i]
+                uv[written] = seed
+                ids[written] = id
+                written += 1
+        offset += (usize)face.sizes[loop]
+        sizes[loop] = (i64)(written - start)
+    try align(uv, sizes, ids, mesh.points[..<mesh.np], surface, plan, tolerance)
+    let chart_ids = try chart_identities(surface, uv, ids, tolerance)
+    defer free(chart_ids) in memory.heap
+    let raw_cells = try TrimGrid.clip_identified(uv, sizes, plan.u.values[..<plan.u.count], plan.v.values[..<plan.v.count], chart_ids)
+    defer raw_cells.release()
+    let initial = (try coalesce(raw_cells, ids.length, tolerance)) if surface.kind == surface_plane else raw_cells.clone()
+    defer initial.release()
+    let part = initial.value()
+    var lifted = try MeshBuilder(precise = true)
+    defer lifted.close()
+    let mapping = try new i64[(usize)part.point_count()] --- in memory.heap
+    defer free(mapping) in memory.heap
+    for at in 0..<part.point_count():
+        let p = mesh.points[(usize)ids[(usize)at]] if (usize)at < ids.length else (try surface_point(surface, try part.point(at)))
+        _ = try lifted.point(p)
+    # Only physically sub-tolerance boundary slivers qualify. The union keeps
+    # every original point and display triangle; support checks still follow.
+    let cells = initial.clone() if surface.kind == surface_plane else (try coalesce(initial, ids.length, tolerance, lifted.points[..<lifted.np]))
+    defer cells.release()
+    let normals = try new Vector3[mapping.length] --- in memory.heap
+    defer free(normals) in memory.heap
+    for at in 0..<normals.length:
+        let n = try support_normal(surface, try part.point((i64)at))
+        if n.length() < 1e-15: error(invalid, "trimmed grid touches a singular support")
+        normals[at] = n.multiply_scalar(1.0 if face.sense else -1.0)
+    var repaired = try append_repaired(&lifted, cells, face.sense, normals)
+    defer repaired.release()
+    # Redistribution is optional and transactional; it may not rescue an
+    # invalid baseline by hiding a failed normal or surface-deviation check.
+    let baseline = try lifted.finish()
+    defer baseline.release()
+    try validate_display_error(baseline.value(), repaired.value(), surface, tolerance, divisions)
+    let spaced = try redistribute_cells(&lifted, repaired, ids.length, surface, face.sense, normals, tolerance, divisions)
+    let unchanged = repaired.value() == spaced.value()
+    repaired.release()
+    repaired = spaced
+    # Validate the real display triangulation, including concave cut cells.
+    let validation = baseline.clone() if unchanged else (try lifted.finish())
+    defer validation.release()
+    for at in 0..<normals.length:
+        normals[at] = try face.placement.transform_normal(normals[at])
+    plan.normals[0].values = try new f64[lifted.nc * 3] --- in memory.heap
+    var normal_corner: usize = 0
+    for at in 0..<mapping.length:
+        mapping[at] = ids[at] if at < ids.length else (try mesh.point(lifted.points[at]))
+    for f in 0..<lifted.nf:
+        let count = lifted.sizes[f]
+        try mesh.face(count)
+        for at in 0..<count:
+            let id = (usize)lifted.corners[normal_corner]
+            try mesh.corner(mapping[id])
+            let n = normals[id]
+            plan.normals[0].values[normal_corner * 3] = n.x
+            plan.normals[0].values[normal_corner * 3 + 1] = n.y
+            plan.normals[0].values[normal_corner * 3 + 2] = n.z
+            normal_corner += 1
+        try mesh.copy_last_display(validation.value(), (i64)f)

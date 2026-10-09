@@ -1,0 +1,135 @@
+## A grazing grid line can isolate a thin trim sliver with no valid lifted
+## triangulation. Agglomerate only that small cell across a manifold grid edge.
+## All vertices, canonical boundary segments and holes remain unchanged.
+
+pub func append_repaired(lifted: MeshBuilder*, source: interop.Reference[Mesh], forward: bool, normals: const Vector3[]) -> interop.Reference[Mesh]!:
+    var current = source.clone()
+    errdefer current.release()
+    for pass in 0..<(usize)33:
+        lifted.nf = 0
+        lifted.nc = 0
+        var failed: i64 = -1
+        var accepted = true
+        append_cells(lifted, current.value(), forward, normals, &failed) catch failure:
+            if failure.code != invalid or failed < 0: error(failure.code, failure.message)
+            accepted = false
+            recover ()
+        if accepted: return current
+        if pass == 32: error(invalid, "trim sliver agglomeration exceeds budget")
+        let edge = try merge_edge(current.value(), failed, lifted.points[..<lifted.np])
+        if edge < 0: error(invalid, "trimmed cell cannot safely agglomerate")
+        let next = try dissolve_edge(current.value(), edge)
+        current.release()
+        current = next
+    error(invalid, "trim sliver agglomeration exceeds budget")
+
+func face_area[M: PolygonTopology](mesh: const M*, face: i64) -> f64!:
+    let count = try mesh.face_size(face)
+    let origin = try mesh.point(try mesh.face_point(face, 0))
+    var result: f64 = 0.0
+    for at in 1..<count - 1:
+        let a = (try mesh.point(try mesh.face_point(face, at))).subtract(origin)
+        let b = (try mesh.point(try mesh.face_point(face, at + 1))).subtract(origin)
+        result += a.cross(b).z
+    return math.abs(result) * 0.5
+
+## Ordinary candidates are at most one eighth of their neighbor's chart area.
+## Physically collapsed ribbons instead require the spanning internal chord,
+## including through another collapsed cell. Final support checks still apply.
+pub func merge_edge(mesh: const Mesh*, face: i64, positions: const Vector3[]? = none) -> i64!:
+    let count = try mesh.face_size(face)
+    let neighbors = try new i64[(usize)(try mesh.edge_count())] --- in memory.heap
+    defer free(neighbors) in memory.heap
+    for at in 0..<neighbors.length: neighbors[at] = -2
+    for at in 0..<count: neighbors[(usize)(try mesh.face_edge(face, at))] = -1
+    for corner in 0..<mesh.vertex_count():
+        let candidate = try mesh.corner_face(corner)
+        if candidate == face: continue
+        let edge = (usize)(try mesh.corner_edge(corner))
+        if neighbors[edge] == -2: continue
+        neighbors[edge] = candidate if neighbors[edge] == -1 else -3
+    let candidates = try new i64[(usize)count] --- in memory.heap
+    defer free(candidates) in memory.heap
+    for side in 0..<count: candidates[(usize)side] = neighbors[(usize)(try mesh.face_edge(face, side))]
+    return try choose_edge(mesh, face, candidates, positions)
+
+## Identical merge policy over immutable meshes or native dissolve workspaces.
+## The caller supplies one opposite face per side, -1 for unavailable neighbors.
+pub func choose_edge[M: PolygonTopology](mesh: const M*, face: i64, neighbors: const i64[], positions: const Vector3[]? = none) -> i64!:
+    let count = try mesh.face_size(face)
+    if neighbors.length != (usize)count: error(invalid, "sliver adjacency must cover every side")
+    let measure = try face_area(mesh, face)
+    let span = try collapsed_span(mesh, face, positions)
+    var best: i64 = -1
+    var longest: f64 = 0.0
+    # Only failed cells or physically tiny boundary slivers enter this search,
+    # bounded to a small patch arrangement. Ordinary cells stay unchanged.
+    for side in 0..<count:
+        let candidate = neighbors[(usize)side]
+        if candidate < 0: continue
+        let size = try mesh.face_size(candidate)
+        if count + size - 2 > 256: continue
+        if span >= 0:
+            if (try mesh.face_edge(face, side)) != span: continue
+        elif measure > (try face_area(mesh, candidate)) * 0.125: continue
+        var shared: i64 = -1
+        var connections: usize = 0
+        var shared_vertices: usize = 0
+        for at in 0..<count:
+            let a = try mesh.face_point(face, at)
+            let b = try mesh.face_point(face, (at + 1) % count)
+            for other in 0..<size:
+                let c = try mesh.face_point(candidate, other)
+                if a == c: shared_vertices += 1
+                if b == c and a == (try mesh.face_point(candidate, (other + 1) % size)):
+                    shared = try mesh.face_edge(face, at)
+                    connections += 1
+        # Exactly one shared side and no other touching vertices guarantees a
+        # simple union, not a hole, bridge or pinched polygon.
+        if connections != 1 or shared_vertices != 2: continue
+        let a = try mesh.point(try mesh.edge_point(shared, 0))
+        let b = try mesh.point(try mesh.edge_point(shared, 1))
+        let length = b.subtract(a).length()
+        if length > longest:
+            best = shared
+            longest = length
+    return best
+
+## Roundoff in a support projection can enclose a UV ribbon whose lifted
+## vertices are collinear. Only its spanning chord can be removed safely:
+## dissolving a shorter side leaves a physically retracing polygon boundary.
+## The neighbor may itself be collapsed; allow the ribbon to reach a real
+## cell before applying the ordinary small-to-large area test again.
+func collapsed_span[M: PolygonTopology](mesh: const M*, face: i64, positions: const Vector3[]?) -> i64!:
+    if let points = positions:
+        if points.length != (usize)mesh.point_count(): error(invalid, "cut-cell metric must cover every chart point")
+        let count = try mesh.face_size(face)
+        var side: i64 = -1
+        var length: f64 = 0.0
+        for at in 0..<count:
+            let a = points[(usize)(try mesh.face_point(face, at))]
+            let b = points[(usize)(try mesh.face_point(face, (at + 1) % count))]
+            let distance = b.subtract(a).length()
+            if distance > length:
+                length = distance
+                side = at
+        if side < 0: return -1
+        let origin = points[(usize)(try mesh.face_point(face, side))]
+        let direction = points[(usize)(try mesh.face_point(face, (side + 1) % count))].subtract(origin).multiply_scalar(1.0 / length)
+        var magnitude = length
+        for at in 0..<count:
+            let p = points[(usize)(try mesh.face_point(face, at))]
+            magnitude = math.max(magnitude, math.max(math.abs(p.x), math.max(math.abs(p.y), math.abs(p.z))))
+        # Subtraction inherits the precision of absolute support coordinates,
+        # especially on a tiny sliver far from the origin. This is a numerical
+        # classification only: no point is snapped, welded or removed.
+        let epsilon = length * 1e-14 + magnitude * 8e-16
+        # If the entire cell approaches coordinate resolution, this test no
+        # longer establishes a thin ribbon. Leave it to ordinary validation.
+        if epsilon > length * 1e-8: return -1
+        for at in 0..<count:
+            let offset = points[(usize)(try mesh.face_point(face, at))].subtract(origin)
+            let along = offset.dot(direction)
+            if along < -epsilon or along > length + epsilon or offset.cross(direction).length() > epsilon: return -1
+        return try mesh.face_edge(face, side)
+    return -1

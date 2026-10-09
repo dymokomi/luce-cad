@@ -1,0 +1,48 @@
+## A hard seam adds boundary corners, not interior rows. Triangulate those
+## nonplanar boundary cells in the support chart and retain the result through
+## assembly. Generic dominant-axis projection can otherwise select sliver ears
+## along a curved boundary and force an unnecessary shared-row fallback.
+
+pub func conform_display(mesh: MeshBuilder*, first_face: usize, first_corner: usize, face: BrepFace, surface: Surface, tolerance: f64, divisions: i64) -> !:
+    var unplaced = face
+    unplaced.placement = Matrix4()
+    let values = try face_normals(mesh, first_corner, mesh.nc - first_corner, unplaced, surface, tolerance)
+    defer free(values) in memory.heap
+    let normals = try new Vector3[values.length // 3] --- in memory.heap
+    defer free(normals) in memory.heap
+    for at in 0..<normals.length: normals[at] = Vector3(values[at * 3], values[at * 3 + 1], values[at * 3 + 2])
+    var chart = try MeshBuilder(precise = true)
+    defer chart.close()
+    var lifted = try MeshBuilder(precise = true)
+    defer lifted.close()
+    var corner = first_corner
+    for size in mesh.sizes[first_face..<mesh.nf]:
+        try chart.face(size)
+        var seed = Vector3(0.5, 0.5, 0.0)
+        for at in 0..<size:
+            let p = mesh.points[(usize)mesh.corners[corner]]
+            seed = try chart_parameter(surface, p, seed, tolerance)
+            let id = try chart.point(seed)
+            try chart.corner(id)
+            _ = try lifted.point(p)
+            corner += 1
+    let uv = try chart.finish()
+    defer uv.release()
+    try append_cells(&lifted, uv.value(), true, normals)
+    let result = try lifted.finish()
+    defer result.release()
+    try validate_display_error(result.value(), uv.value(), surface, tolerance, divisions)
+    # MeshBuilder's last-face API uses a prefix. Restore the complete scratch
+    # even on allocation failure; the caller owns the transactional rollback.
+    let end_face = mesh.nf
+    let end_corner = mesh.nc
+    defer restore(mesh, end_face, end_corner)
+    mesh.nc = first_corner
+    for at in first_face..<end_face:
+        mesh.nf = at + 1
+        mesh.nc += (usize)mesh.sizes[at]
+        try mesh.copy_last_display(result.value(), (i64)(at - first_face))
+
+func restore(mesh: MeshBuilder*, faces: usize, corners: usize):
+    mesh.nf = faces
+    mesh.nc = corners

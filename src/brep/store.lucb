@@ -1,0 +1,66 @@
+## Growable columns for the B-rep's structure of arrays. Each is a geocore
+## Column (a shared block with a change id) and the number of elements in
+## use. Copies of a model share every column by count; the first write to a
+## shared one copies it (so moving control vertices copies only their
+## positions).
+
+pub struct Store[T]:
+    pub var column: Column[T]
+    pub var count: usize = 0
+
+    pub func view() -> const T[]:
+        return self.column.view()[..<self.count]
+
+    pub func range(first: usize, end: usize) -> const T[]:
+        return self.column.view()[first..<end]
+
+    pub func get(index: usize) -> T:
+        return self.column.view()[index]
+
+    ## The contents' change id (equal ids, equal elements).
+    pub func id() -> u64:
+        return self.column.id()
+
+    ## Private room for `extra` more elements, doubling.
+    func room(extra: usize) -> !:
+        let needed = self.count + extra
+        if self.column.unique() and needed <= self.column.count(): return
+        var capacity = self.column.count() * 2
+        if capacity < 16: capacity = 16
+        if capacity < needed: capacity = needed
+        var grown = try Column[T].allocate(capacity)
+        if self.count > 0: memory.copy(grown.span(), self.view(), self.count)
+        self.column.release()
+        self.column = grown
+
+    pub func push(value: T) -> !:
+        try self.room(1)
+        self.column.span()[self.count] = value
+        self.count += 1
+
+    pub func append(values: const T[]) -> !:
+        try self.room(values.length)
+        if values.length > 0: memory.copy(self.column.span()[self.count..<self.count + values.length], values, values.length)
+        self.count += values.length
+
+    ## Change element `index`, copying a shared column first.
+    pub func set(index: usize, value: T) -> !:
+        try self.room(0)
+        self.column.span()[index] = value
+
+    ## Writable elements (a shared column is copied first); a new change id.
+    pub func writable() -> T[]!:
+        try self.room(0)
+        return (try self.column.writable())[..<self.count]
+
+    ## Another store over the same column: O(1). Either copies before it
+    ## writes while the other holds it.
+    pub func share() -> Store[T]:
+        return Store[T](self.column.share(), self.count)
+
+    pub func bytes() -> usize:
+        return self.column.bytes()
+
+    pub func close():
+        self.column.release()
+        self.count = 0

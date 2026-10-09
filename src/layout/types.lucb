@@ -1,0 +1,122 @@
+## Face layout (internal): where a face's mesh rows and columns go before
+## any face is meshed. Each edge's stations (curve_spacing, edge_sampling),
+## a face's four logical sides (patch_sides), its coedges chained in one
+## chart (trim_chains, trim_memo), row counts agreed across shared edges
+## (counts, balance, phase, density, rows, seam_flow, circular_lattice),
+## and the checks a plan must pass (feasibility, policy, envelope, pitch,
+## cell_error, flow_admission, trim_crossings, trim_alignment).
+##
+## This file: the layout's shared types.
+import memory
+import interop
+import ownership
+from luce_std import math
+from luce_geocore.geocore import invalid, Vector3, squared_triangle_distance
+from geometry import Surface, Curve, BrepFace, edge_index, project, chart_uv, surface_spline, curve_line, evaluate, curve_circle, curve_spline, chart_parameter, surface_point, chart_gap, chart_near, surface_plane, surface_cylinder, surface_cone, surface_torus, curve_ellipse, surface_sphere, union_root, Samples
+from luce_geocore.core import parallel
+
+## Bound the two-dimensional layout rather than assuming square patches.
+## The total matches TrimGrid's 131,072 grid-point budget; a narrow strip may
+## use more than 256 intervals along its long direction without a larger grid.
+pub func check_grid_size(u: usize, v: usize) -> !:
+    if u > 1025 or v > 1025 or u * v > 131072:
+        error(invalid, "trim support grid exceeds total station budget")
+
+## Cached parameter chain for one oriented face use; points remain in the
+## canonical edge direction. Its length is the edge's monotonic revision.
+pub struct UVChain:
+    pub var points: Vector3[]
+    pub var times: f64[]
+
+## Corner normals evaluated directly from the clipped grid's known UVs.
+pub struct NormalCache:
+    pub var values: f64[]
+
+## Frozen global point IDs selected by one face for its own interior rows.
+pub struct RowIds:
+    pub var values: i64[]
+
+## Bounded, sorted parameters with separate numerical and optional row spacing.
+pub struct Stations:
+    pub var values: f64[]
+    pub var count: usize = 0
+    pub var epsilon: f64 = 1e-7
+    pub var separation: f64 = 0.0
+    pub var baseline: usize = 0
+    pub var limit: usize = 0
+
+    pub func open(capacity: usize) -> !:
+        self.values = try new f64[capacity if capacity < 16 else 16] --- in memory.heap
+        self.count = 0
+        self.limit = capacity
+
+    ## Sorted bounded union, not an interval count: phase survives propagation.
+    pub func insert(value: f64, epsilon: f64) -> bool!:
+        var low: usize = 0
+        var high = self.count
+        while low < high:
+            let mid = (low + high) // 2
+            if self.values[mid] < value: low = mid + 1
+            else: high = mid
+        let distance = math.max(epsilon, self.separation)
+        if low < self.count and math.abs(self.values[low] - value) <= distance: return false
+        if low > 0 and math.abs(self.values[low - 1] - value) <= distance: return false
+        if self.count == self.values.length:
+            if self.count == self.limit: error(invalid, "cross-patch layout station budget exceeded")
+            let capacity = self.limit if self.values.length * 2 > self.limit else self.values.length * 2
+            let grown = try new f64[capacity] --- in memory.heap
+            memory.copy(grown, self.values, self.count)
+            free(self.values) in memory.heap
+            self.values = grown
+        var at = self.count
+        while at > low:
+            self.values[at] = self.values[at - 1]
+            at -= 1
+        self.values[low] = value
+        self.count += 1
+        return true
+
+    pub func close():
+        if self.values.length > 0: free(self.values) in memory.heap
+
+## Per-face layout and owned coedge/normal caches, frozen before face meshing.
+pub struct GridLayout:
+    pub var island: i64 = -1
+    pub var rows: Stations[]
+    pub var row_ids: RowIds[]
+    pub var flow: bool[]
+    pub var u: Stations = Stations()
+    pub var v: Stations = Stations()
+    pub var valid: bool = false
+    pub var cut_first: bool = false
+    pub var epsilon: f64 = 1e-8
+    pub var trim_low: Vector3 = Vector3()
+    pub var trim_high: Vector3 = Vector3()
+    pub var independent_phase: bool = false
+    pub var pitch_axes: bool[2] = [false, false]
+    pub var applied: bool[]
+    # One face job owns this slot: 1 local rows, 2 clipped grid, 3 canonical
+    # rows, 4 constrained fallback, 5 baseline fallback plus seam conformity.
+    pub var method: i64[]
+    pub var seen: usize = 0
+    pub var chains: UVChain[]
+    pub var normals: NormalCache[]
+
+    pub func close():
+        for row in self.rows: row.close()
+        if self.rows.length > 0: free(self.rows) in memory.heap
+        for ids in self.row_ids:
+            if ids.values.length > 0: free(ids.values) in memory.heap
+        if self.row_ids.length > 0: free(self.row_ids) in memory.heap
+        if self.flow.length > 0: free(self.flow) in memory.heap
+        self.u.close()
+        self.v.close()
+        if self.applied.length > 0: free(self.applied) in memory.heap
+        if self.method.length > 0: free(self.method) in memory.heap
+        for chain in self.chains:
+            if chain.points.length > 0: free(chain.points) in memory.heap
+            if chain.times.length > 0: free(chain.times) in memory.heap
+        if self.chains.length > 0: free(self.chains) in memory.heap
+        if self.normals.length > 0:
+            if self.normals[0].values.length > 0: free(self.normals[0].values) in memory.heap
+            free(self.normals) in memory.heap

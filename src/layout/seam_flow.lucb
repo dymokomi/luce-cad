@@ -1,0 +1,119 @@
+## CAD seam classification: topology stays shared even when quad flow stops.
+## These are sampled layout decisions, not certified geometric continuity orders.
+
+## A two-face seam may be tangent-continuous yet have incompatible UV directions.
+pub struct SeamFlow:
+    pub var first: i64 = -1
+    pub var second: i64 = -1
+    pub var uses: usize = 0
+    pub var smooth: bool = false
+    pub var aligned: bool = false
+
+struct Frame:
+    var u: Vector3
+    var v: Vector3
+    var n: Vector3
+
+## Build adjacency and deterministic flow-island IDs. Uncertain, nonmanifold or
+## singular seams conservatively terminate rows; they never split point IDs.
+pub func classify(edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], plans: GridLayout[], tolerance: f64) -> SeamFlow[]!:
+    let result = try new SeamFlow[edges.length] --- in memory.heap
+    errdefer free(result) in memory.heap
+    for at in 0..<result.length: result[at] = SeamFlow()
+    for face in 0..<faces.length:
+        plans[face].island = (i64)face
+        for use in faces[face].uses:
+            let seam = &result[edge_index(use)]
+            if seam.uses == 0: seam.first = (i64)face
+            elif seam.uses == 1: seam.second = (i64)face
+            seam.uses += 1
+    # Each seam is compared on its own (in parallel); a seam whose comparison
+    # failed for another reason than invalid geometry is compared again here,
+    # so the error is the serial one.
+    var comparing = Comparing(edges, surfaces, faces, result, tolerance, 0)
+    parallel.parallel_for(edges.length, 32, compare_seams, (void*)&comparing)
+    if comparing.failed.load(.acquire) != 0:
+        for edge in 0..<edges.length: try judge(&result[edge], edges[edge], surfaces, faces, tolerance)
+    for edge in 0..<edges.length:
+        let seam = &result[edge]
+        if seam.uses != 2 or seam.first == seam.second: continue
+        if seam.aligned:
+            let a = root(plans, seam.first)
+            let b = root(plans, seam.second)
+            plans[(usize)(a if a > b else b)].island = a if a < b else b
+    for at in 0..<plans.length: plans[at].island = root(plans, (i64)at)
+    return result
+
+struct Comparing:
+    let edges: const Curve[]
+    let surfaces: const Surface[]
+    let faces: const BrepFace[]
+    let seams: SeamFlow[]
+    let tolerance: f64
+    var failed: @u32
+
+func compare_seams(context: void*?, first: usize, end: usize):
+    let work = (Comparing*)(context else return)
+    for edge in first..<end:
+        judge(&work.seams[edge], work.edges[edge], work.surfaces, work.faces, work.tolerance) catch failure:
+            _ = failure
+            work.failed.store(1, .relaxed)
+            return
+
+## Whether a two-face seam is smooth and its faces' grids aligned across it
+## (a face meeting itself always is); invalid geometry is neither.
+func judge(seam: SeamFlow*, edge: Curve, surfaces: const Surface[], faces: const BrepFace[], tolerance: f64) -> !:
+    if seam.uses != 2: return
+    if seam.first == seam.second:
+        seam.smooth = true
+        seam.aligned = true
+        return
+    compare(seam, edge, surfaces, faces, tolerance) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        seam.smooth = false
+        seam.aligned = false
+        recover ()
+
+func root(plans: const GridLayout[], start: i64) -> i64:
+    var at = start
+    while plans[(usize)at].island != at: at = plans[(usize)at].island
+    return at
+
+func compare(seam: SeamFlow*, edge: Curve, surfaces: const Surface[], faces: const BrepFace[], tolerance: f64) -> !:
+    let a = faces[(usize)seam.first]
+    let b = faces[(usize)seam.second]
+    var ua = Vector3(0.5, 0.5, 0.0)
+    var ub = ua
+    var straight = true
+    var swapped = true
+    seam.smooth = true
+    # 0.5 degree tangent-plane tolerance, 5 degree director tolerance. Requiring
+    # one consistent permutation along the seam prevents circular trim/plane
+    # joins from being mistaken for an aligned Cartesian grid at a few points.
+    for step in 0..<(usize)7:
+        let p = try edge.at(0.02 + 0.96 * (f64)step / 6.0)
+        ua = try chart_parameter(surfaces[(usize)a.surface], p, ua, tolerance)
+        ub = try chart_parameter(surfaces[(usize)b.surface], p, ub, tolerance)
+        let fa = try frame(surfaces[(usize)a.surface], a, ua)
+        let fb = try frame(surfaces[(usize)b.surface], b, ub)
+        if math.abs(fa.n.dot(fb.n)) < 0.999961923:
+            seam.smooth = false
+            seam.aligned = false
+            return
+        straight = straight and math.abs(fa.u.dot(fb.u)) >= 0.996194698 and math.abs(fa.v.dot(fb.v)) >= 0.996194698
+        swapped = swapped and math.abs(fa.u.dot(fb.v)) >= 0.996194698 and math.abs(fa.v.dot(fb.u)) >= 0.996194698
+    seam.aligned = straight or swapped
+
+func frame(s: Surface, face: BrepFace, uv: Vector3) -> Frame!:
+    var u = s.x
+    var v = s.y
+    if s.kind != surface_plane:
+        let ua = math.max(0.0, uv.x - 1e-5) if s.kind == surface_spline else uv.x - 1e-5
+        let ub = math.min(1.0, uv.x + 1e-5) if s.kind == surface_spline else uv.x + 1e-5
+        let va = math.max(0.0, uv.y - 1e-5) if s.kind == surface_spline else uv.y - 1e-5
+        let vb = math.min(1.0, uv.y + 1e-5) if s.kind == surface_spline else uv.y + 1e-5
+        u = (try surface_point(s, Vector3(ub, uv.y, 0.0))).subtract(try surface_point(s, Vector3(ua, uv.y, 0.0)))
+        v = (try surface_point(s, Vector3(uv.x, vb, 0.0))).subtract(try surface_point(s, Vector3(uv.x, va, 0.0)))
+    u = try face.placement.transform_direction(u).normalized()
+    v = try face.placement.transform_direction(v).normalized()
+    return Frame(u, v, try u.cross(v).normalized())

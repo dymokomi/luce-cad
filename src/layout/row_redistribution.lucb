@@ -1,0 +1,44 @@
+## Evenly redistribute a resolved row family on geometrically straight rails.
+## Canonical trim/intersection vertices stay in place as polygon boundary corners.
+
+## Clipping may add unevenly phased rows after count planning. Straight rails
+## have no curvature reason to preserve that bunching. Resample their interior
+## row contract, but retain every old shared boundary sample for conformity.
+pub func redistribute(faces: const BrepFace[], edges: const Curve[], metrics: const ArcMetric[], cuts: Stations[], plans: GridLayout[]) -> !:
+    let straight = try new bool[edges.length] --- in memory.heap
+    defer free(straight) in memory.heap
+    for at in 0..<edges.length:
+        straight[at] = try is_straight(edges[at])
+    for face in 0..<faces.length:
+        for use in 0..<faces[face].uses.length:
+            let index = edge_index(faces[face].uses[use])
+            let row = &plans[face].rows[use]
+            if plans[face].flow[use] or not straight[index] or row.count < 4: continue
+            var minimum: f64 = 1e30
+            var maximum: f64 = 0.0
+            for at in 0..<row.count - 1:
+                let gap = metrics[index].at(row.values[at + 1]) - metrics[index].at(row.values[at])
+                minimum = math.min(minimum, gap)
+                maximum = math.max(maximum, gap)
+            if maximum <= minimum * 1.25: continue
+            let count = row.count - 1
+            row.count = 0
+            for at in 0..<count + 1:
+                let t = metrics[index].parameter(metrics[index].at(1.0) * (f64)at / (f64)count)
+                _ = try row.insert(t, 1e-12)
+                _ = try cuts[index].insert(t, 1e-9)
+
+func is_straight(edge: Curve) -> bool!:
+    if edge.kind == curve_line: return true
+    if edge.kind != curve_spline: return false
+    let a = try edge.at(0.0)
+    let delta = (try edge.at(1.0)).subtract(a)
+    let length = delta.length()
+    if length < 1e-12: return false
+    var previous: f64 = 0.0
+    for at in 1..<(usize)17:
+        let p = (try edge.at((f64)at / 16.0)).subtract(a)
+        let t = p.dot(delta) / (length * length)
+        if t < previous - 1e-12 or t > 1.0 + 1e-12 or p.subtract(delta.multiply_scalar(t)).length() > length * 1e-8: return false
+        previous = t
+    return true

@@ -1,0 +1,81 @@
+## A sphere patch bounded by three great-circle arcs (a rounded corner,
+## where three fillets meet) meshed on a barycentric grid: point (a, b) is
+## the sphere point toward the corners' directions weighted n - a - b, a
+## and b, its border the arcs' own shared samples. Every triangle is near
+## equilateral; there is no pole and no seam (a latitude-longitude chart
+## crowds or folds triangles about its pole). Arcs sampled unequally are
+## left to the general meshers.
+
+## Whether `face` is a sphere triangle: one loop of three great-circle arcs.
+pub func sphere_triangle(face: BrepFace, surface: Surface, edges: const Curve[], tolerance: f64) -> bool:
+    if surface.kind != surface_sphere or face.sizes.length != 1 or face.uses.length != 3: return false
+    for use in face.uses:
+        let edge = edges[edge_index(use)]
+        if edge.kind != curve_circle or edge.origin.subtract(surface.origin).length() > tolerance * 10.0: return false
+        if math.abs(edge.radius - surface.radius) > tolerance * 10.0: return false
+    return true
+
+pub func barycentric_sphere(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], tolerance: f64, divisions: i64) -> !:
+    # Each side's samples the way the loop runs, one after another.
+    var ids = Growing[i64]()
+    defer ids.close()
+    var starts: usize[4] = [0, 0, 0, 0]
+    for at in 0..<(usize)3:
+        let use = face.uses[at]
+        let own = samples[edge_index(use)].ids
+        starts[at] = ids.count
+        for k in 0..<own.length: try ids.push(own[k] if use > 0 else own[own.length - 1 - k])
+    starts[3] = ids.count
+    let n = starts[1] - starts[0] - 1
+    if n < 1 or starts[2] - starts[1] - 1 != n or starts[3] - starts[2] - 1 != n:
+        error(invalid, "a sphere triangle's sides are sampled unequally")
+    for at in 0..<(usize)3:
+        if ids.items[starts[at] + n] != ids.items[starts[(at + 1) % 3]]: error(invalid, "a sphere triangle's sides do not chain")
+    let sides = ids.view()
+    # Its triangles are as fine as the arcs' samples: those must keep the
+    # deviation the general meshers keep (analytic_trim's, for a whole
+    # sphere), or they mesh it.
+    let c = surface.origin
+    let deviation = math.max(tolerance, surface.radius * 3.4641016151377544 / ((f64)divisions * (f64)divisions * 16.0))
+    for at in 0..<(usize)3:
+        for k in 0..<n:
+            let p = mesh.points[(usize)ids.items[starts[at] + k]].subtract(c)
+            let q = mesh.points[(usize)ids.items[starts[at] + k + 1]].subtract(c)
+            let half = 0.5 * math.acos(math.clamp(p.dot(q) / (p.length() * q.length()), -1.0, 1.0))
+            if surface.radius * (1.0 - math.cos(half)) > deviation: error(invalid, "a sphere triangle's arcs are sampled too coarsely for a grid")
+    let da = try mesh.points[(usize)sides[starts[0]]].subtract(c).normalized()
+    let db = try mesh.points[(usize)sides[starts[1]]].subtract(c).normalized()
+    let dc = try mesh.points[(usize)sides[starts[2]]].subtract(c).normalized()
+    # Point (a, b): toward corner B by a, corner C by b; side 0 is b = 0
+    # (A to B), side 1 is a + b = n (B to C), side 2 is a = 0 (C to A).
+    let width = n + 1
+    let grid = try new i64[width * width] --- in memory.heap
+    defer free(grid) in memory.heap
+    for a in 0..<width:
+        for b in 0..<width - a:
+            var id: i64 = -1
+            if b == 0: id = sides[starts[0] + a]
+            elif a + b == n: id = sides[starts[1] + b]
+            elif a == 0: id = sides[starts[2] + n - b]
+            else:
+                let w = da.multiply_scalar((f64)(n - a - b)).add(db.multiply_scalar((f64)a)).add(dc.multiply_scalar((f64)b))
+                id = try mesh.point(c.add((try w.normalized()).multiply_scalar(surface.radius)))
+            grid[a * width + b] = id
+    # Wind the triangles so their normals leave the sphere as the face's do.
+    let p0 = mesh.points[(usize)grid[0]]
+    let p1 = mesh.points[(usize)grid[width]]
+    let p2 = mesh.points[(usize)grid[1]]
+    let outward = p0.add(p1).add(p2).multiply_scalar(1.0 / 3.0).subtract(c)
+    let forward = (p1.subtract(p0).cross(p2.subtract(p0)).dot(outward) > 0.0) == face.sense
+    for a in 0..<n:
+        for b in 0..<n - a:
+            let first: i64[3] = [grid[a * width + b], grid[(a + 1) * width + b], grid[a * width + b + 1]]
+            try push_triangle(mesh, first, forward)
+            if a + b + 1 < n:
+                let second: i64[3] = [grid[(a + 1) * width + b], grid[(a + 1) * width + b + 1], grid[a * width + b + 1]]
+                try push_triangle(mesh, second, forward)
+
+func push_triangle(mesh: MeshBuilder*, corners: i64[3], forward: bool) -> !:
+    try mesh.face(3)
+    for at in 0..<(usize)3:
+        try mesh.corner(corners[at if forward else 2 - at])

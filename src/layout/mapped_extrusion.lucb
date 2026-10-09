@@ -1,0 +1,87 @@
+## One physical row phase for a mapped affine extrusion. Late clipped neighbors
+## may contribute incompatible phases on its two straight rails. Preserve those
+## canonical vertices as trim corners instead of bending the entire strip.
+
+## Runs after global row reconciliation, before shared vertices are allocated.
+## Only line rails, matching extrusion coverage and proven affine supports
+## qualify. Curved row families and all original shared cuts remain untouched.
+pub func regularize_extrusions(faces: const BrepFace[], surfaces: const Surface[], edges: const Curve[], sides: const PatchSides[], metrics: const ArcMetric[], cuts: Stations[], plans: GridLayout[], tolerance: f64) -> !:
+    for at in 0..<faces.length:
+        let face = faces[at]
+        let side = sides[at]
+        let plan = &plans[at]
+        if plan.valid or not side.valid or face.uses.length != 4: continue
+        let s = surfaces[(usize)face.surface]
+        for axis in 0..<(usize)2:
+            if not affine_axis(s, (i64)axis): continue
+            let stride = (usize)s.nv if axis == 0 else 1
+            let along = (usize)(s.nu if axis == 0 else s.nv)
+            let translation = s.points[(along - 1) * stride].subtract(s.points[0])
+            for pair in 0..<(usize)2:
+                if side.lengths[pair] != 1 or side.lengths[pair + 2] != 1: continue
+                let a = side.starts[pair]
+                let b = side.starts[pair + 2]
+                let ai = edge_index(face.uses[a])
+                let bi = edge_index(face.uses[b])
+                if edges[ai].kind != curve_line or edges[bi].kind != curve_line: continue
+                if not rails(edges[ai], edges[bi], translation, tolerance): continue
+                let cross_a = side.starts[(pair + 1) % 4]
+                let cross_b = side.starts[(pair + 3) % 4]
+                let cross_count = plan.rows[cross_a].count - 1
+                # A single transverse span is valid on flat/low-curvature
+                # profiles too. Its two boundary rails still define physical
+                # pitch; it must not disable correction of a crowded phase.
+                if cross_count < 1 or cross_count != plan.rows[cross_b].count - 1: continue
+                let cross_length = math.min(metrics[edge_index(face.uses[cross_a])].at(1.0), metrics[edge_index(face.uses[cross_b])].at(1.0))
+                let length = metrics[ai].at(1.0)
+                let pitch = cross_length / (f64)cross_count
+                if pitch <= 1e-20: continue
+                let existing = math.max((f64)(plan.rows[a].count - 1), (f64)(plan.rows[b].count - 1))
+                let needed = math.max(existing, math.ceil(length / (pitch * 16.0)))
+                if not math.is_finite(needed) or needed > 1024.0: continue
+                let count = (usize)needed
+                if (count + 1) * (cross_count + 1) > 131072: continue
+                # A good existing phase retains its continuation contract.
+                if not crowded(plan.rows[a]) and not crowded(plan.rows[b]) and needed <= existing: continue
+                # Conservative atomic budget preflight includes every old cut.
+                if cuts[ai].count + count - 1 > cuts[ai].limit or cuts[bi].count + count - 1 > cuts[bi].limit: continue
+                for use in [a, b]:
+                    let index = edge_index(face.uses[use])
+                    let row = &plan.rows[use]
+                    row.count = 0
+                    for step in 0..<count + 1:
+                        let t = (f64)step / (f64)count
+                        _ = try row.insert(t, 1e-12)
+                        _ = try cuts[index].insert(t, 1e-9)
+
+func crowded(row: Stations) -> bool:
+    if row.count < 3: return false
+    var small: f64 = 1.0
+    var large: f64 = 0.0
+    for at in 0..<row.count - 1:
+        let gap = row.values[at + 1] - row.values[at]
+        small = math.min(small, gap)
+        large = math.max(large, gap)
+    return large > small * 1.5
+
+func rails(a: Curve, b: Curve, translation: Vector3, tolerance: f64) -> bool:
+    let delta = a.points[1].subtract(a.points[0])
+    let other = b.points[1].subtract(b.points[0])
+    let length = delta.length()
+    let span = translation.length()
+    if length <= 1e-20 or span <= 1e-20: return false
+    # Independently fitted STEP edges can disagree within import uncertainty.
+    # Use that model's tolerance for classification only, capped relative to
+    # rail length so a loose File setting cannot turn oblique rails into flow.
+    # Never move an endpoint, change the curve, or enlarge projection tolerance.
+    # One part per million is only a layout-direction cap, not a new geometric
+    # tolerance. Independently fitted rails still have to agree within the
+    # File setting; clearly oblique rails remain ineligible even with a loose
+    # import. Coverage below is measured on the exact support translation.
+    let epsilon = math.max(length * 1e-10, math.min(tolerance, length * 1e-6))
+    if delta.cross(translation).length() > span * epsilon: return false
+    let same = delta.dot(other) > 0.0
+    if (other if same else other.multiply_scalar(-1.0)).subtract(delta).length() > epsilon: return false
+    # No slanted or shifted ends: both rails cover the same extrusion interval.
+    let offset = b.points[0 if same else 1].subtract(a.points[0])
+    return math.abs(offset.dot(translation)) <= span * epsilon

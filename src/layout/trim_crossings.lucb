@@ -1,0 +1,170 @@
+## Exact CAD-edge/grid-line crossings for layout reconciliation, and the
+## parallel speculative pass that computes them ahead of the serial pass.
+
+## Parameter on `edge` in [ta, tb] whose support chart coordinate `axis`
+## equals `value`, by safeguarded bisection on inverse projections. Pure in
+## its inputs, so `memo` may return an earlier identical call's result.
+pub func intersection(s: Surface, edge: Curve, ta: f64, tb: f64, pa: Vector3, pb: Vector3, axis: usize, value: f64, tolerance: f64, epsilon: f64, memo: TrimMemo*? = none, edge_id: usize = 0) -> f64!:
+    let table = memo else return try bisect(s, edge, ta, tb, pa, pb, axis, value, tolerance, epsilon)
+    var key: u64[11]
+    key[0] = 2
+    key[1] = (u64)edge_id
+    key[2] = bits(ta)
+    key[3] = bits(tb)
+    key[4] = bits(pa.x)
+    key[5] = bits(pa.y)
+    key[6] = bits(pb.x)
+    key[7] = bits(pb.y)
+    key[8] = (u64)axis
+    key[9] = bits(value)
+    key[10] = bits(pa.z) ^ (bits(pb.z) << 1)
+    var failed = false
+    if let found = table.find(key[..<11], &failed):
+        if failed: error(invalid, "CAD edge/grid intersection did not converge")
+        return found.x
+    let t = bisect(s, edge, ta, tb, pa, pb, axis, value, tolerance, epsilon) catch failure:
+        if failure.code == invalid: try table.put(key[..<11], Vector3(), true)
+        error(failure.code, failure.message)
+    try table.put(key[..<11], Vector3(t, 0.0, 0.0), false)
+    return t
+
+func bisect(s: Surface, edge: Curve, ta: f64, tb: f64, pa: Vector3, pb: Vector3, axis: usize, value: f64, tolerance: f64, epsilon: f64) -> f64!:
+    var low = ta
+    var high = tb
+    var a = pa.x if axis == 0 else pa.y
+    var b = pb.x if axis == 0 else pb.y
+    let chord = (try edge.at(tb)).subtract(try edge.at(ta)).length()
+    # Parameter error must also fit the physical snap budget. A short curved
+    # trim with a tight CAD tolerance cannot use the same UV residual as a
+    # metre-scale support with a loose modelling tolerance.
+    let target = epsilon * 1e-5 if s.kind == surface_plane else math.min(epsilon * 0.1, tolerance * 0.01 * math.abs(b - a) / math.max(tolerance, chord))
+    var seed = pa.add(pb).multiply_scalar(0.5)
+    for step in 0..<32:
+        let fraction = 0.5 if step % 4 == 3 else math.clamp((value - a) / (b - a), 0.05, 0.95)
+        let t = low + (high - low) * fraction
+        seed = try chart_parameter(s, try edge.at(t), seed, tolerance)
+        let p = seed.x if axis == 0 else seed.y
+        if math.abs(p - value) < target: return t
+        if (p < value) == (a < value):
+            low = t
+            a = p
+        else:
+            high = t
+            b = p
+    error(invalid, "CAD edge/grid intersection did not converge")
+
+## Crossings of every trim segment with every interior grid line of `plan`,
+## as reconcile enumerates them. With `speculative`, chains are previewed
+## without being stored and results only fill `memo`.
+pub func crossings_of(plan: const GridLayout*, face: BrepFace, s: Surface, vertices: const Vector3[], edges: const Curve[], cuts: const Stations[], tolerance: f64, memo: TrimMemo*) -> !:
+    for use in 0..<face.uses.length:
+        let index = edge_index(face.uses[use])
+        let edge = edges[index]
+        let chain = plan.chains[use]
+        var owned = false
+        var uv = chain.points
+        if chain.points.length != cuts[index].count:
+            let fresh = try refreshed(chain, s, vertices, edge, cuts[index], tolerance, memo = memo)
+            free(fresh.times) in memory.heap
+            uv = fresh.points
+            owned = true
+        defer:
+            if owned: free(uv) in memory.heap
+        let times = cuts[index].values
+        let incidence = math.max(1e-13, plan.epsilon * 1e-5)
+        for axis in 0..<(usize)2:
+            let lines = plan.u if axis == 0 else plan.v
+            let last = lines.count - 1
+            for segment in 0..<uv.length - 1:
+                let a = uv[segment].x if axis == 0 else uv[segment].y
+                let b = uv[segment + 1].x if axis == 0 else uv[segment + 1].y
+                let low = math.min(a, b) + incidence
+                let high = math.max(a, b) - incidence
+                var line = first_above(lines, low, last)
+                while line < last:
+                    let value = lines.values[line]
+                    line += 1
+                    if value >= high: break
+                    if try grazes(s, edge, uv, times, segment, axis, value, tolerance): continue
+                    _ = intersection(s, edge, times[segment], times[segment + 1], uv[segment], uv[segment + 1], axis, value, tolerance, plan.epsilon, memo, index) catch failure:
+                        if failure.code != invalid: error(failure.code, failure.message)
+                        recover 0.0
+
+struct Speculation:
+    let vertices: const Vector3[]
+    let edges: const Curve[]
+    let surfaces: const Surface[]
+    let faces: const BrepFace[]
+    let cuts: const Stations[]
+    let plans: const GridLayout[]
+    let memos: TrimMemo[]
+    let wanted: const usize[]
+    let tolerance: f64
+    let errors: FaceErrors*
+
+func speculate_item(raw: void*?, item: usize):
+    let job = (Speculation*)(raw else return)
+    let at = job.wanted[item]
+    let face = job.faces[at]
+    crossings_of(&job.plans[at], face, job.surfaces[(usize)face.surface], job.vertices, job.edges, job.cuts, job.tolerance, &job.memos[at]) catch failure:
+        # A speculative failure is only a missing memo entry, except that an
+        # exhausted allocator must not be ignored.
+        if failure.code != invalid: job.errors.record(at, failure.code, failure.message)
+
+## Fill each pending face's memo in parallel from the current shared cuts,
+## before the serial reconcile pass that consumes it.
+pub func speculate(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], cuts: const Stations[], plans: const GridLayout[], memos: TrimMemo[], tolerance: f64) -> !:
+    let wanted = try new usize[faces.length] --- in memory.heap
+    defer free(wanted) in memory.heap
+    var count: usize = 0
+    for at in 0..<faces.length:
+        if not plans[at].valid: continue
+        var revision: usize = 0
+        for use in faces[at].uses: revision += cuts[edge_index(use)].count
+        if revision == plans[at].seen: continue
+        wanted[count] = at
+        count += 1
+    if count < 2: return
+    var errors = try FaceErrors(faces.length)
+    defer errors.close()
+    var job = Speculation(vertices = vertices, edges = edges, surfaces = surfaces, faces = faces, cuts = cuts, plans = plans, memos = memos, wanted = wanted[..<count], tolerance = tolerance, errors = &errors)
+    parallel.run(count, speculate_item, (void*)&job)
+    try errors.raise()
+
+## Whether `segment` reaches `value` only through a sampled extremum that
+## overshoots the line by less than the snap budget. A curve tangent to a grid
+## line, evaluated within its fitting tolerance, can poke through the line by
+## a few ULPs of the part size. Its two exact roots then sit a square root of
+## that depth away from the extremum, leaving near-duplicate vertices and a
+## sub-tolerance cap that no display triangulation can represent. Such a line
+## is not crossed: alignment snaps the extremum onto it instead (same budget).
+pub func grazes(s: Surface, edge: Curve, uv: const Vector3[], times: const f64[], segment: usize, axis: usize, value: f64, tolerance: f64) -> bool!:
+    for at in [segment, segment + 1]:
+        if at == 0 or at + 1 >= uv.length: continue
+        let p = coordinate(uv[at], axis) - value
+        if p * (coordinate(uv[at - 1], axis) - value) >= 0.0 or p * (coordinate(uv[at + 1], axis) - value) >= 0.0: continue
+        let q = try edge.at(times[at])
+        let spacing = math.min(q.subtract(try edge.at(times[at - 1])).length(), q.subtract(try edge.at(times[at + 1])).length())
+        let snapped = Vector3(value, uv[at].y, 0.0) if axis == 0 else Vector3(uv[at].x, value, 0.0)
+        let depth = (try surface_point(s, snapped)).subtract(try surface_point(s, uv[at])).length()
+        if depth <= graze_budget(spacing, tolerance): return true
+    return false
+
+## Largest physical extremum snap that replaces a pair of crossings. It is a
+## fraction of the model tolerance and of the local sample spacing, so it
+## scales with the part and never reorders the extremum's neighbors.
+pub func graze_budget(spacing: f64, tolerance: f64) -> f64:
+    return math.min(tolerance * 0.01, spacing * 0.2)
+
+func coordinate(p: Vector3, axis: usize) -> f64:
+    return p.x if axis == 0 else p.y
+
+## First index in 1..<last whose line lies strictly above `low` (else `last`).
+pub func first_above(lines: Stations, low: f64, last: usize) -> usize:
+    var lower: usize = 1
+    var upper = last if last > 1 else 1
+    while lower < upper:
+        let middle = (lower + upper) // 2
+        if lines.values[middle] > low: upper = middle
+        else: lower = middle + 1
+    return lower

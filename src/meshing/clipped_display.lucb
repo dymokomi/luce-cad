@@ -1,0 +1,70 @@
+## Repair display diagonals inside one cut cell without changing its boundary.
+## Every flip stays inside a convex UV quadrilateral and strictly reduces the
+## number of degenerate or support-normal-opposing triangles. Work is bounded.
+
+pub func folds(mesh: const MeshBuilder*, indices: const i64[], normals: const Vector3[]) -> i64:
+    var result: i64 = 0
+    for at in 0..<indices.length // 3:
+        if folded(mesh, indices[at * 3], indices[at * 3 + 1], indices[at * 3 + 2], normals): result += 1
+    return result
+
+pub func folded(mesh: const MeshBuilder*, ai: i64, bi: i64, ci: i64, normals: const Vector3[]) -> bool:
+    let start = mesh.nc - (usize)mesh.sizes[mesh.nf - 1]
+    let a = (usize)mesh.corners[start + (usize)ai]
+    let b = (usize)mesh.corners[start + (usize)bi]
+    let c = (usize)mesh.corners[start + (usize)ci]
+    let p = mesh.points[a]
+    let ab = mesh.points[b].subtract(p)
+    let ac = mesh.points[c].subtract(p)
+    let cross = ab.cross(ac)
+    let area = cross.length()
+    # Match Mesh's display admission: a tiny positive dot product is
+    # not sufficient for a usable triangle after lifting a roundoff ribbon.
+    if area <= math.max(1e-30, math.max(ab.dot(ab), ac.dot(ac)) * 1e-14): return true
+    let epsilon = area * 1e-10
+    return cross.dot(normals[a]) <= epsilon or cross.dot(normals[b]) <= epsilon or cross.dot(normals[c]) <= epsilon
+
+func orient(a: Vector3, b: Vector3, c: Vector3) -> f64:
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+
+pub func repair(mesh: const MeshBuilder*, part: const Mesh*, face: i64, forward: bool, indices: i64[], normals: const Vector3[]) -> !:
+    let count = (usize)(try part.face_size(face))
+    let uv = try new Vector3[count] --- in memory.heap
+    defer free(uv) in memory.heap
+    var extent2: f64 = 0.0
+    for at in 0..<count:
+        uv[at] = try part.point(try part.face_point(face, (i64)(at if forward else count - 1 - at)))
+        let delta = uv[at].subtract(uv[0])
+        extent2 = math.max(extent2, delta.dot(delta))
+    let epsilon = math.max(1e-30, extent2 * 1e-14)
+    let sign = (try part.face_normal(face)).z * (1.0 if forward else -1.0)
+    let triangles = indices.length // 3
+    for pass in 0..<triangles:
+        var changed = false
+        for first in 0..<triangles:
+            if changed: break
+            if not folded(mesh, indices[first * 3], indices[first * 3 + 1], indices[first * 3 + 2], normals): continue
+            for second in 0..<triangles:
+                if changed: break
+                if first == second: continue
+                let old_bad = 2 if folded(mesh, indices[second * 3], indices[second * 3 + 1], indices[second * 3 + 2], normals) else 1
+                for edge in 0..<(usize)3:
+                    if changed: break
+                    let a = indices[first * 3 + edge]
+                    let b = indices[first * 3 + (edge + 1) % 3]
+                    let c = indices[first * 3 + (edge + 2) % 3]
+                    for opposite in 0..<(usize)3:
+                        if indices[second * 3 + opposite] != b or indices[second * 3 + (opposite + 1) % 3] != a: continue
+                        let d = indices[second * 3 + (opposite + 2) % 3]
+                        if sign * orient(uv[(usize)c], uv[(usize)a], uv[(usize)d]) <= epsilon or sign * orient(uv[(usize)c], uv[(usize)d], uv[(usize)b]) <= epsilon: continue
+                        let new_bad = (1 if folded(mesh, c, a, d, normals) else 0) + (1 if folded(mesh, c, d, b, normals) else 0)
+                        if new_bad >= old_bad: continue
+                        indices[first * 3] = c
+                        indices[first * 3 + 1] = a
+                        indices[first * 3 + 2] = d
+                        indices[second * 3] = c
+                        indices[second * 3 + 1] = d
+                        indices[second * 3 + 2] = b
+                        changed = true
+                        break
+        if not changed: return

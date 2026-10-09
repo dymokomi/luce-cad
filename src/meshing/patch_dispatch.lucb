@@ -1,0 +1,491 @@
+## Transactional face meshing: mapped quads, clipped cells, constrained fallback.
+
+## Each failed strategy rewinds scratch before the next strategy runs.
+pub func mesh_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    # Hard oblique trims use an independent support grid. Compatible mapped
+    # seams retain their shared row contract and continuous quad strips.
+    let mapped_np = mesh.np
+    let mapped_nf = mesh.nf
+    let mapped_nc = mesh.nc
+    # A sphere triangle (a rounded corner): a barycentric grid.
+    if sphere_triangle(face, surface, edges, tolerance):
+        var meshed = true
+        barycentric_sphere(mesh, face, surface, full_samples, tolerance, divisions) catch failure:
+            mesh.np = mapped_np
+            mesh.nf = mapped_nf
+            mesh.nc = mapped_nc
+            if failure.code != invalid: error(failure.code, failure.message)
+            meshed = false
+            recover ()
+        if meshed:
+            if plan.method.length > 0: plan.method[0] = 7
+            return
+    # A cone's side closing at its apex: rings and an apex fan.
+    if apex_cone(face, surface, edges):
+        try conical_fan(mesh, face, surface, edges, full_samples, tolerance)
+        if plan.method.length > 0: plan.method[0] = 6
+        return
+    if plan.valid and plan.cut_first and (try attempt_clip(mesh, face, surface, full_samples, plan, tolerance, divisions)): return
+    var mapped = true
+    mapped_rows(mesh, face, surface, edges, full_samples, plan, tolerance, divisions) catch failure:
+        mesh.np = mapped_np
+        mesh.nf = mapped_nf
+        mesh.nc = mapped_nc
+        if failure.code != invalid: error(failure.code, failure.message)
+        mapped = false
+        recover ()
+    if mapped:
+        plan.method[0] = 1
+        return
+    # Never bypass an available boundary-terminating layout merely because the
+    # first mapped candidate's warped n-gons could not be displayed safely.
+    if plan.valid and not plan.cut_first and (try attempt_clip(mesh, face, surface, full_samples, plan, tolerance, divisions)): return
+    # Warped boundary n-gons may not have a support-consistent triangulation.
+    # Retry the shared-row map transactionally before constrained fallbacks.
+    mapped = true
+    mapped_full(mesh, face, surface, edges, full_samples, tolerance, divisions) catch failure:
+        mesh.np = mapped_np
+        mesh.nf = mapped_nf
+        mesh.nc = mapped_nc
+        if failure.code != invalid: error(failure.code, failure.message)
+        mapped = false
+        recover ()
+    if mapped:
+        plan.method[0] = 3
+        return
+    let first_point = mesh.np
+    let first_face = mesh.nf
+    let first_corner = mesh.nc
+    var accepted = true
+    constrained_checked(mesh, face, surface, edges, full_samples, divisions, tolerance, edge_size) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        accepted = false
+        mesh.np = first_point
+        mesh.nf = first_face
+        mesh.nc = first_corner
+        recover ()
+    if accepted:
+        plan.method[0] = 4
+        return
+    let samples = try new Samples[full_samples.length] --- in memory.heap
+    defer free(samples) in memory.heap
+    for use in face.uses:
+        let index = edge_index(use)
+        samples[index] = Samples(full_samples[index].baseline)
+    try constrained_face(mesh, face, surface, edges, samples, divisions, tolerance, edge_size)
+    try conform_seams(mesh, face, full_samples, first_face, first_corner)
+    try validate(mesh, first_face, first_corner)
+    plan.method[0] = 5
+
+func attempt_clip(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: i64) -> bool!:
+    let np = mesh.np
+    let nf = mesh.nf
+    let nc = mesh.nc
+    clipped_patch(mesh, face, surface, samples, plan, tolerance, divisions) catch failure:
+        mesh.np = np
+        mesh.nf = nf
+        mesh.nc = nc
+        if failure.code != invalid: error(failure.code, failure.message)
+        return false
+    plan.applied[0] = true
+    plan.method[0] = 2
+    return true
+
+func mapped_rows(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: i64) -> !:
+    let nf = mesh.nf
+    let nc = mesh.nc
+    let samples = try new Samples[full_samples.length] --- in memory.heap
+    defer free(samples) in memory.heap
+    var conform = false
+    for use in 0..<face.uses.length:
+        let index = edge_index(face.uses[use])
+        let ids = plan.row_ids[use].values
+        samples[index] = Samples(ids)
+        conform = conform or ids.length != full_samples[index].ids.length
+    try mapped_patch(mesh, face, s, edges, samples, tolerance, divisions)
+    if conform:
+        for use in 0..<face.uses.length:
+            let index = edge_index(face.uses[use])
+            samples[index] = Samples(full_samples[index].ids, plan.row_ids[use].values)
+        try conform_seams(mesh, face, samples, nf, nc)
+        validate_conformed(mesh, nf, nc, face, s, tolerance) catch failure:
+            if failure.code != invalid: error(failure.code, failure.message)
+            try conform_display(mesh, nf, nc, face, s, tolerance, divisions)
+            recover ()
+    else: try validate(mesh, nf, nc)
+
+func mapped_full(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, divisions: i64) -> !:
+    let nf = mesh.nf
+    let nc = mesh.nc
+    try mapped_patch(mesh, face, s, edges, samples, tolerance, divisions)
+    try validate(mesh, nf, nc)
+
+func constrained_checked(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], samples: const Samples[], divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    let nf = mesh.nf
+    let nc = mesh.nc
+    try constrained_face(mesh, face, s, edges, samples, divisions, tolerance, edge_size, true)
+    try validate(mesh, nf, nc)
+
+func constrained_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], divisions: i64, tolerance: f64, edge_size: f64, mapped_tried: bool = false) -> !:
+    if surface.kind == surface_plane:
+        if mapped_tried:
+            try planar(mesh, face, surface, samples, tolerance, edge_size, divisions)
+            return
+        let np = mesh.np
+        let nf = mesh.nf
+        let nc = mesh.nc
+        mapped_patch(mesh, face, surface, edges, samples, tolerance, divisions) catch failure:
+            mesh.np = np
+            mesh.nf = nf
+            mesh.nc = nc
+            if failure.code != invalid: error(failure.code, failure.message)
+            try planar(mesh, face, surface, samples, tolerance, edge_size, divisions)
+            recover ()
+        return
+    let np = mesh.np
+    let nf = mesh.nf
+    let nc = mesh.nc
+    structured(mesh, face, surface, edges, samples, tolerance, mapped_tried, divisions) catch failure:
+        mesh.np = np
+        mesh.nf = nf
+        mesh.nc = nc
+        if failure.code != invalid: error(failure.code, failure.message)
+        try nurbs_trim(mesh, face, surface, samples, divisions, edge_size, tolerance)
+        recover ()
+
+func structured(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, mapped_tried: bool, divisions: i64) -> !:
+    if mapped_tried:
+        if surface.kind == surface_spline: try ruled(mesh, face, surface, edges, samples, tolerance)
+        else: try periodic_band(mesh, face, surface, edges, samples, tolerance)
+        return
+    let np = mesh.np
+    let nf = mesh.nf
+    let nc = mesh.nc
+    mapped_patch(mesh, face, surface, edges, samples, tolerance, divisions) catch failure:
+        mesh.np = np
+        mesh.nf = nf
+        mesh.nc = nc
+        if failure.code != invalid: error(failure.code, failure.message)
+        if surface.kind == surface_spline:
+            try ruled(mesh, face, surface, edges, samples, tolerance)
+        else:
+            try periodic_band(mesh, face, surface, edges, samples, tolerance)
+        recover ()
+
+## The number of boundary samples around `face` (each use's samples but its
+## last, which the next use starts with).
+func boundary_samples(face: BrepFace, samples: const Samples[]) -> usize:
+    var count: usize = 0
+    for use in face.uses: count += samples[edge_index(use)].ids.length - 1
+    return count
+
+func nurbs_trim(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], divisions: i64, edge_size: f64, tolerance: f64) -> !:
+    let ids = try new i64[boundary_samples(face, samples)] --- in memory.heap
+    defer free(ids) in memory.heap
+    let sizes = try new i64[face.sizes.length] --- in memory.heap
+    defer free(sizes) in memory.heap
+    var count: usize = 0
+    var offset: usize = 0
+    for loop in 0..<face.sizes.length:
+        let first = count
+        for at in 0..<(usize)face.sizes[loop]:
+            let use = face.uses[offset + at]
+            let sample = samples[edge_index(use)].ids
+            for item in 0..<sample.length - 1:
+                ids[count] = sample[item if use > 0 else sample.length - 1 - item]
+                count += 1
+        sizes[loop] = (i64)(count - first)
+        offset += (usize)face.sizes[loop]
+    if surface.kind == surface_spline:
+        try mesh_trim(mesh, ids[..<count], sizes, surface, face.sense, divisions, edge_size, tolerance)
+    else:
+        try analytic_trim(mesh, ids[..<count], sizes, surface, face.sense, divisions, tolerance, edge_size)
+
+func planar(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], tolerance: f64, edge_size: f64, divisions: i64) -> !:
+    let boundary = boundary_samples(face, samples)
+    let points = try new Vector3[boundary] --- in memory.heap
+    defer free(points) in memory.heap
+    # Boundary ids, then (after triangulation) the ids of the part's own points.
+    var ids = try new i64[boundary] --- in memory.heap
+    defer free(ids) in memory.heap
+    let sizes = try new i64[face.sizes.length] --- in memory.heap
+    defer free(sizes) in memory.heap
+    var count: usize = 0
+    var offset: usize = 0
+    for loop in 0..<face.sizes.length:
+        let first = count
+        for at in 0..<(usize)face.sizes[loop]:
+            let use = face.uses[offset + at]
+            let sample = samples[edge_index(use)].ids
+            for item in 0..<sample.length - 1:
+                let id = sample[item if use > 0 else sample.length - 1 - item]
+                let position = mesh.points[(usize)id]
+                if math.abs(position.subtract(surface.origin).dot(surface.z)) > tolerance:
+                    error(invalid, "B-rep boundary is not on its plane")
+                ids[count] = id
+                points[count] = position.subtract(surface.z.multiply_scalar(position.subtract(surface.origin).dot(surface.z)))
+                count += 1
+        sizes[loop] = (i64)(count - first)
+        offset += (usize)face.sizes[loop]
+    let normal = surface.z.multiply_scalar(1.0 if face.sense else -1.0)
+    if sizes.length == 1 and count == 4 and edge_size == 0.0:
+        var convex = true
+        var sign: f64 = 0.0
+        for at in 0..<4:
+            let a = points[at]
+            let b = points[(at + 1) % 4]
+            let c = points[(at + 2) % 4]
+            let turn = b.subtract(a).cross(c.subtract(b)).dot(normal)
+            if math.abs(turn) < 0.0000000001 or (at > 0 and turn * sign < 0.0):
+                convex = false
+            sign = turn
+        if convex:
+            try mesh.face(4)
+            for at in 0..<4:
+                try mesh.corner(ids[at if sign > 0.0 else 3 - at])
+            return
+    var spacing = edge_size
+    var vertical = edge_size
+    if edge_size == 0.0 and count > 8:
+        # Complex planar trims need interior support too: do not connect every
+        # fine hole/border sample to a far-away corner of the outer boundary.
+        let reference = Vector3(1.0, 0.0, 0.0) if math.abs(normal.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+        let u = try reference.subtract(normal.multiply_scalar(reference.dot(normal))).normalized()
+        let v = normal.cross(u)
+        var low = Vector3()
+        var high = Vector3()
+        for p in points[..<count]:
+            let relative = p.subtract(points[0])
+            low = Vector3(math.min(low.x, relative.dot(u)), math.min(low.y, relative.dot(v)), 0.0)
+            high = Vector3(math.max(high.x, relative.dot(u)), math.max(high.y, relative.dot(v)), 0.0)
+        let resolution = math.min(math.max(32.0, (f64)divisions), math.max((f64)divisions, (f64)count / 4.0))
+        spacing = (high.x - low.x) / resolution
+        vertical = (high.y - low.y) / resolution
+    let part = try TrimPolygon.quadrangulate_seams(points[..<count], sizes, normal, ids[..<count], spacing, vertical)
+    defer part.release()
+    let all = try new i64[(usize)part.value().point_count()] --- in memory.heap
+    memory.copy(all, ids, count)
+    free(ids) in memory.heap
+    ids = all
+    for index in count..<(usize)part.value().point_count():
+        ids[index] = try mesh.point(try part.value().point((i64)index))
+    for index in 0..<part.value().face_count():
+        let corners = try part.value().face_size(index)
+        try mesh.face(corners)
+        for corner in 0..<corners:
+            try mesh.corner(ids[(usize)(try part.value().face_point(index, corner))])
+
+func close(a: Vector3, b: Vector3, tolerance: f64) -> bool:
+    return a.subtract(b).length() <= tolerance
+
+## Prove linearity in V from the control net, then verify all boundary samples.
+## Unsupported nonrectangular/general trimmed patches fail rather than leak.
+func ruled(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, transposed: bool = false) -> !:
+    if face.sizes.length != 1 or face.uses.length != 4:
+        error(invalid, "NURBS face needs a four-edge ruled boundary in this tessellator")
+    let u0 = surface.ku[(usize)surface.du]
+    let u1 = surface.ku[(usize)surface.nu]
+    var v0 = surface.kv[(usize)surface.dv]
+    var v1 = surface.kv[(usize)surface.nv]
+    var linear = true
+    for u in 0..<(usize)surface.nu:
+        let first = u * (usize)surface.nv
+        let a = surface.points[first]
+        let b = surface.points[first + (usize)surface.nv - 1]
+        for v in 0..<(usize)surface.nv:
+            var greville: f64 = 0.0
+            for index in 1..<(usize)surface.dv + 1:
+                greville += surface.kv[v + index] / (f64)surface.dv
+            let expected = a.add(b.subtract(a).multiply_scalar((greville - v0) / (v1 - v0)))
+            if not close(expected, surface.points[first + v], tolerance) or math.abs(surface.weights[first + v] - surface.weights[first]) > 0.000000000001:
+                linear = false
+    if not linear:
+        if transposed:
+            error(invalid, "general trimmed non-ruled NURBS tessellation is not supported yet")
+        let points = try new Vector3[surface.points.length] --- in memory.heap
+        defer free(points) in memory.heap
+        let weights = try new f64[surface.weights.length] --- in memory.heap
+        defer free(weights) in memory.heap
+        for u in 0..<(usize)surface.nu:
+            for v in 0..<(usize)surface.nv:
+                points[v * (usize)surface.nu + u] = surface.points[u * (usize)surface.nv + v]
+                weights[v * (usize)surface.nu + u] = surface.weights[u * (usize)surface.nv + v]
+        var swapped = try Surface(3, surface.origin, surface.x, surface.z, 0.0, 0.0, points, weights, surface.kv, surface.ku, surface.nv, surface.nu, surface.dv, surface.du)
+        swapped.edited = surface.edited
+        defer swapped.close()
+        let reversed = try BrepFace(face.surface, face.uses, face.sizes, not face.sense)
+        defer reversed.close()
+        try ruled(mesh, reversed, swapped, edges, samples, tolerance, true)
+        return
+    let original_low = v0
+    let original_high = v1
+    let base = try surface.at(u0, v0)
+    let span = (try surface.at(u0, v1)).subtract(base)
+    var minimum: f64 = 1e100
+    var maximum: f64 = -1e100
+    for use in face.uses:
+        let edge = edges[edge_index(use)]
+        for id in [edge.start, edge.end]:
+            let p = mesh.points[(usize)id]
+            let t = p.subtract(base).dot(span) / span.dot(span)
+            if close(p, base.add(span.multiply_scalar(t)), tolerance):
+                minimum = math.min(minimum, t)
+                maximum = math.max(maximum, t)
+    if minimum < maximum and minimum >= -0.000001 and maximum <= 1.000001:
+        v0 = original_low + (original_high - original_low) * math.clamp(minimum, 0.0, 1.0)
+        v1 = original_low + (original_high - original_low) * math.clamp(maximum, 0.0, 1.0)
+    let a = try surface.at(u0, v0)
+    let b = try surface.at(u1, v0)
+    let c = try surface.at(u0, v1)
+    let d = try surface.at(u1, v1)
+    var lower: i64 = -1
+    var upper: i64 = -1
+    var low_forward = true
+    var high_forward = true
+    var sides: usize = 0
+    for use in face.uses:
+        let index = edge_index(use)
+        let edge = edges[index]
+        let start = mesh.points[(usize)edge.start]
+        let end = mesh.points[(usize)edge.end]
+        if (close(start, a, tolerance) and close(end, b, tolerance)) or (close(start, b, tolerance) and close(end, a, tolerance)):
+            lower = (i64)index
+            low_forward = close(start, a, tolerance)
+        elif (close(start, c, tolerance) and close(end, d, tolerance)) or (close(start, d, tolerance) and close(end, c, tolerance)):
+            upper = (i64)index
+            high_forward = close(start, c, tolerance)
+        elif edge.kind == curve_line and ((close(start, a, tolerance) and close(end, c, tolerance)) or (close(start, c, tolerance) and close(end, a, tolerance)) or (close(start, b, tolerance) and close(end, d, tolerance)) or (close(start, d, tolerance) and close(end, b, tolerance))):
+            sides += 1
+        else:
+            error(invalid, "NURBS face boundary is not the complete ruled parameter rectangle")
+    if lower < 0 or upper < 0 or sides != 2:
+        error(invalid, "NURBS ruled face is missing its boundary edges")
+    let low = samples[(usize)lower].ids
+    let high = samples[(usize)upper].ids
+    if low.length != high.length:
+        error(invalid, "opposing NURBS edges have incompatible discretizations")
+    for at in 0..<low.length:
+        let u = u0 + (u1 - u0) * (f64)at / (f64)(low.length - 1)
+        let li = low[at if low_forward else low.length - 1 - at]
+        let hi = high[at if high_forward else high.length - 1 - at]
+        if not close(mesh.points[(usize)li], try surface.at(u, v0), tolerance) or not close(mesh.points[(usize)hi], try surface.at(u, v1), tolerance):
+            error(invalid, "B-rep spline edge and surface parameterizations disagree")
+    let lower_ids = try new i64[low.length] --- in memory.heap
+    defer free(lower_ids) in memory.heap
+    let upper_ids = try new i64[high.length] --- in memory.heap
+    defer free(upper_ids) in memory.heap
+    for at in 0..<low.length:
+        lower_ids[at] = low[at if low_forward else low.length - 1 - at]
+        upper_ids[at] = high[at if high_forward else high.length - 1 - at]
+    try stitch_strip(mesh, face, edges, samples, lower_ids, upper_ids, not face.sense)
+
+func quad(mesh: MeshBuilder*, a: i64, b: i64, c: i64, d: i64, reversed: bool) -> !:
+    try mesh.face(4)
+    for index in [a, d if reversed else b, c, b if reversed else d]:
+        try mesh.corner(index)
+
+func stitch_strip(mesh: MeshBuilder*, face: BrepFace, edges: const Curve[], samples: const Samples[], low: const i64[], high: const i64[], reversed: bool) -> !:
+    var left: i64 = -1
+    var right: i64 = -1
+    for use in face.uses:
+        let index = edge_index(use)
+        let edge = edges[index]
+        if (edge.start == low[0] and edge.end == high[0]) or (edge.end == low[0] and edge.start == high[0]):
+            left = (i64)index
+        if (edge.start == low[low.length - 1] and edge.end == high[high.length - 1]) or (edge.end == low[low.length - 1] and edge.start == high[high.length - 1]):
+            right = (i64)index
+    if left < 0 or right < 0:
+        error(invalid, "structured patch has no matching side edges")
+    let l = samples[(usize)left].ids
+    let r = samples[(usize)right].ids
+    if l.length != r.length or low.length != high.length or l.length * low.length > 16384:
+        error(invalid, "structured patch grid is incompatible or exceeds point budget")
+    let grid = try new i64[l.length * low.length] --- in memory.heap
+    defer free(grid) in memory.heap
+    let closed = low[0] == low[low.length - 1]
+    for row in 0..<l.length:
+        let fraction = (f64)row / (f64)(l.length - 1)
+        for column in 0..<low.length:
+            var id: i64 = -1
+            if row == 0:
+                id = low[column]
+            elif row + 1 == l.length:
+                id = high[column]
+            elif column == 0:
+                id = l[row if l[0] == low[0] else l.length - 1 - row]
+            elif column + 1 == low.length:
+                id = grid[row * low.length] if closed else r[row if r[0] == low[column] else r.length - 1 - row]
+            else:
+                let a = mesh.points[(usize)low[column]]
+                let b = mesh.points[(usize)high[column]]
+                id = try mesh.point(a.add(b.subtract(a).multiply_scalar(fraction)))
+            grid[row * low.length + column] = id
+    for row in 0..<l.length - 1:
+        for column in 0..<low.length - 1:
+            let at = row * low.length + column
+            try quad(mesh, grid[at], grid[at + 1], grid[at + low.length + 1], grid[at + low.length], reversed)
+
+## Circular closed bands, including a topological seam used twice by the face.
+func periodic_band(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64) -> !:
+    if face.sizes.length != 1 or face.uses.length != 4:
+        error(invalid, "cylinder/cone requires a closed circular band with a seam")
+    var rings: i64[2]
+    var count: usize = 0
+    var seam: i64 = -1
+    var seam_count: usize = 0
+    for use in face.uses:
+        let index = edge_index(use)
+        let edge = edges[index]
+        if edge.kind == curve_circle and count < 2:
+            rings[count] = (i64)index
+            count += 1
+        elif edge.kind == curve_line:
+            seam = (i64)index
+            seam_count += 1
+        else:
+            error(invalid, "unsupported periodic surface trim")
+    if count != 2 or seam < 0 or seam_count != 2:
+        error(invalid, "periodic face is missing rings or seam")
+    let first = samples[(usize)rings[0]].ids
+    let second = samples[(usize)rings[1]].ids
+    if first.length != second.length or first.length < 4:
+        error(invalid, "periodic rings have incompatible discretization")
+    let tangent = math.sin(surface.angle) / math.cos(surface.angle) if surface.kind == surface_cone else 0.0
+    for ring in rings:
+        for id in samples[(usize)ring].ids:
+            let relative = mesh.points[(usize)id].subtract(surface.origin)
+            let axial = relative.dot(surface.z)
+            let radius = relative.subtract(surface.z.multiply_scalar(axial)).length()
+            if math.abs(radius - surface.radius - axial * tangent) > tolerance:
+                error(invalid, "circular boundary is not on its analytic support surface")
+    let a0 = mesh.points[(usize)first[0]]
+    let b0 = mesh.points[(usize)second[0]]
+    let radial_a = try radial_offset(a0, surface).normalized()
+    let closed = first[0] == first[first.length - 1]
+    let forward = close(try radial_offset(mesh.points[(usize)first[1]], surface).normalized(), try radial_offset(mesh.points[(usize)second[1]], surface).normalized(), tolerance) if closed else close(radial_a, try radial_offset(b0, surface).normalized(), tolerance)
+    if not close(radial_a, try radial_offset(mesh.points[(usize)second[0 if forward else second.length - 1]], surface).normalized(), tolerance):
+        error(invalid, "circular band endpoints have different angles")
+    let steps = first.length - 1
+    let paired = try new i64[second.length] --- in memory.heap
+    defer free(paired) in memory.heap
+    for at in 0..<paired.length:
+        paired[at] = second[at if forward else steps - at]
+    var reversed = false
+    for at in 0..<steps:
+        let a = first[at]
+        let b = first[at + 1]
+        let c = second[at + 1 if forward else steps - at - 1]
+        let d = second[at if forward else steps - at]
+        if not close(try radial_offset(mesh.points[(usize)a], surface).normalized(), try radial_offset(mesh.points[(usize)d], surface).normalized(), tolerance):
+            error(invalid, "periodic ring samples cannot be paired")
+        let pa = mesh.points[(usize)a]
+        let pb = mesh.points[(usize)b]
+        let pd = mesh.points[(usize)d]
+        let outward = (try radial_offset(pa.add(pb).multiply_scalar(0.5), surface).normalized()).subtract(surface.z.multiply_scalar(tangent))
+        let normal = pb.subtract(pa).cross(pd.subtract(pa))
+        reversed = (normal.dot(outward) < 0.0) == face.sense
+    try stitch_strip(mesh, face, edges, samples, first, paired, reversed)
+
+func radial_offset(point: Vector3, surface: Surface) -> Vector3:
+    let relative = point.subtract(surface.origin)
+    return relative.subtract(surface.z.multiply_scalar(relative.dot(surface.z)))

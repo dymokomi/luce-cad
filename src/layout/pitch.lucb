@@ -1,0 +1,71 @@
+## Physical pitch on affine-extruded support grids. Curvature owns the curved
+## stations; the straight direction can subdivide long cells without adding
+## any new geometric approximation. Existing rows are never relocated.
+
+## Target at most sixteen times the mean transverse pitch before cutting.
+## This is not a bound on individual Boolean cut cells. Skip an over-budget
+## proposal atomically; optional shape refinement must not invalidate a chart.
+pub func refine_pitch(u: Stations*, v: Stations*, s: Surface, epsilon: f64) -> bool[2]!:
+    var refined = [false,false]
+    for axis in 0..<(usize)2:
+        if not extrusion_axis(s,(i64)axis): continue
+        let along = u if axis == 0 else v
+        let across = v if axis == 0 else u
+        if across.count < 3 or along.count < 2: continue
+        let middle = (along.values[0]+along.values[along.count-1])*0.5
+        var length: f64 = 0.0
+        var first = try surface_point(s,Vector3(middle,across.values[0],0.0) if axis == 0 else Vector3(across.values[0],middle,0.0))
+        for at in 1..<across.count:
+            let next = try surface_point(s,Vector3(middle,across.values[at],0.0) if axis == 0 else Vector3(across.values[at],middle,0.0))
+            length += next.subtract(first).length()
+            first = next
+        let pitch = length/(f64)(across.count-1)*16.0
+        if pitch <= 1e-20 or not math.is_finite(pitch): continue
+        let cross = (across.values[0]+across.values[across.count-1])*0.5
+        let a = try surface_point(s,Vector3(along.values[0],cross,0.0) if axis == 0 else Vector3(cross,along.values[0],0.0))
+        let b = try surface_point(s,Vector3(along.values[along.count-1],cross,0.0) if axis == 0 else Vector3(cross,along.values[along.count-1],0.0))
+        let span = along.values[along.count-1]-along.values[0]
+        if span <= epsilon: continue
+        let physical = b.subtract(a).length()
+        if physical <= 1e-20 or not math.is_finite(physical): continue
+        let limit = (usize)math.min((f64)along.limit,math.min(1025.0,(f64)(131072//across.count)))
+        var required: usize = 1
+        var fits = true
+        for at in 0..<along.count-1:
+            let extra = math.max(1.0,math.ceil((along.values[at+1]-along.values[at])/span*physical/pitch))
+            if not math.is_finite(extra) or extra > (f64)(limit-required):
+                fits = false
+                break
+            required += (usize)extra
+        if not fits: continue
+        let original_count = along.count
+        let separation = along.separation
+        along.separation = 0.0
+        defer along.separation = separation
+        var at: usize = 0
+        while at+1 < along.count:
+            let low = along.values[at]
+            let high = along.values[at+1]
+            let count = (usize)math.max(1.0,math.ceil((high-low)/span*physical/pitch))
+            var inserted: usize = 0
+            for step in 1..<count:
+                if try along.insert(low+(high-low)*(f64)step/(f64)count,epsilon): inserted += 1
+            at += inserted+1
+        refined[axis] = along.count > original_count
+    return refined
+
+## A curvature-free direction with an adequate physical pitch owns its phase.
+## Additional smooth-seam samples can bisect cells, but must not create a close
+## parallel row. The shared sample remains a boundary corner either way.
+pub func accept_pitch_row(stations: Stations, value: f64, epsilon: f64) -> bool:
+    var low: usize = 0
+    var high = stations.count
+    while low < high:
+        let mid = (low+high)//2
+        if stations.values[mid] < value: low = mid+1
+        else: high = mid
+    if high == 0 or high == stations.count: return true
+    let a = stations.values[high-1]
+    let b = stations.values[high]
+    if value-a <= epsilon or b-value <= epsilon: return false
+    return math.min(value-a,b-value)+epsilon >= (b-a)*0.4

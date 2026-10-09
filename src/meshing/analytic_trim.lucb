@@ -1,0 +1,134 @@
+## Periodic analytic support inversion and trim meshing in unwrapped UV space.
+
+pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    if s.kind == surface_sphere and touches_pole(s, mesh.points[..<mesh.np], ids):
+        let chart = try local_sphere(s, mesh.points[..<mesh.np], ids)
+        defer chart.close()
+        try mesh_in_chart(mesh, ids, sizes, chart, sense, divisions, tolerance, edge_size)
+        return
+    let np = mesh.np
+    let nf = mesh.nf
+    let nc = mesh.nc
+    mesh_in_chart(mesh, ids, sizes, s, sense, divisions, tolerance, edge_size) catch failure:
+        if failure.code != invalid or s.kind != surface_sphere: error(failure.code, failure.message)
+        mesh.np = np
+        mesh.nf = nf
+        mesh.nc = nc
+        # Retry a failed angular chart away from an authored pole too.
+        # Canonical trim positions/IDs never move.
+        let chart = try local_sphere(s, mesh.points[..<mesh.np], ids)
+        defer chart.close()
+        try mesh_in_chart(mesh, ids, sizes, chart, sense, divisions, tolerance, edge_size)
+        recover ()
+
+func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    let uv = try new Vector3[ids.length] --- in memory.heap
+    defer free(uv) in memory.heap
+    let uscale = math.max(s.radius, tolerance)
+    let vscale = s.radius if s.kind == surface_sphere else (s.angle if s.kind == surface_torus else 1.0)
+    var offset: usize = 0
+    var anchor = Vector3()
+    for loop in 0..<sizes.length:
+        var previous = anchor
+        for at in 0..<(usize)sizes[loop]:
+            let p = mesh.points[(usize)ids[offset + at]].subtract(s.origin)
+            let x = p.dot(s.x)
+            let y = p.dot(s.y)
+            let z = p.dot(s.z)
+            let radius = math.sqrt(x * x + y * y)
+            var u = math.atan2(y, x)
+            var v = math.atan2(z, radius) if s.kind == surface_sphere else (math.atan2(z, radius - s.radius) if s.kind == surface_torus else z)
+            if at > 0 or loop > 0:
+                u = wrap(u, previous.x)
+                if s.kind == surface_torus:
+                    v = wrap(v, previous.y)
+            if analytic_point(s, u, v).subtract(mesh.points[(usize)ids[offset + at]]).length() > tolerance:
+                error(invalid, "analytic trim is outside its support tolerance")
+            previous = Vector3(u, v, 0.0)
+            uv[offset + at] = Vector3(u * uscale, v * vscale, 0.0)
+            if loop == 0 and at == 0:
+                anchor = previous
+        offset += (usize)sizes[loop]
+    # A single latitude loop bounds a spherical cap; UV has a singular pole.
+    if s.kind == surface_sphere and sizes.length == 1:
+        var latitude = true
+        for p in uv:
+            latitude = latitude and math.abs(p.y - uv[0].y) <= tolerance
+        if latitude:
+            try spherical_cap(mesh, ids, uv, s, sense, divisions)
+            return
+    var spacing = uscale * math.pi / (2.0 * (f64)divisions)
+    var vertical = vscale * math.pi / (2.0 * (f64)divisions) if s.kind == surface_sphere or s.kind == surface_torus else spacing
+    if edge_size == 0.0:
+        var minimum = uv[0]
+        var maximum = uv[0]
+        for p in uv:
+            minimum = Vector3(math.min(minimum.x, p.x), math.min(minimum.y, p.y), 0.0)
+            maximum = Vector3(math.max(maximum.x, p.x), math.max(maximum.y, p.y), 0.0)
+        # A tiny-radius, long axial strip must not request millions of square
+        # cells when target edge length is off. Shared boundary samples retain
+        # angular resolution; interior refinement stays bounded by divisions.
+        spacing = math.max(math.min(spacing, (maximum.x - minimum.x) / (f64)divisions), (maximum.x - minimum.x) / ((f64)divisions * 4.0))
+        vertical = math.max(math.min(vertical, (maximum.y - minimum.y) / (f64)divisions), (maximum.y - minimum.y) / ((f64)divisions * 4.0))
+    if edge_size > 0.0:
+        spacing = math.min(spacing, edge_size)
+        vertical = math.min(vertical, edge_size)
+    let initial = try TrimPolygon.quadrangulate_seams(uv, sizes, Vector3(0.0, 0.0, 1.0), ids, spacing, vertical)
+    defer initial.release()
+    var low = mesh.points[(usize)ids[0]]
+    var high = low
+    for id in ids:
+        let p = mesh.points[(usize)id]
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    # Relative to the face's extent, or its whole surface's when that is
+    # larger (a sphere's, a torus's, a cylinder's section), so a small
+    # patch is meshed as densely as its surface would be, not more.
+    var extent = high.subtract(low).length()
+    if s.kind == surface_sphere: extent = math.max(extent, s.radius * 3.4641016151377544)
+    elif s.kind == surface_torus: extent = math.max(extent, (s.radius + s.angle) * 2.0)
+    elif s.kind == surface_cylinder or s.kind == surface_cone: extent = math.max(extent, s.radius * 2.0)
+    let deviation = math.max(tolerance, extent / ((f64)divisions * (f64)divisions * 16.0))
+    let constraints = try TrimConstraints.build(uv, ids, sizes)
+    defer constraints.close()
+    let part = try refine_uv(initial, s, uscale, vscale, deviation, constraints)
+    defer part.release()
+    let mapped = try new i64[(usize)part.value().point_count()] --- in memory.heap
+    defer free(mapped) in memory.heap
+    for at in 0..<mapped.length:
+        let p = try part.value().point((i64)at)
+        mapped[at] = ids[at] if at < ids.length else (try mesh.point(analytic_point(s, p.x / uscale, p.y / vscale)))
+    for face in 0..<part.value().face_count():
+        let count = try part.value().face_size(face)
+        try mesh.face(count)
+        for at in 0..<count:
+            try mesh.corner(mapped[(usize)(try part.value().face_point(face, at if sense else count - 1 - at))])
+
+func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s: Surface, sense: bool, divisions: i64) -> !:
+    let north = uv[uv.length - 1].x > uv[0].x
+    let pole_v = math.pi * (0.5 if north else -0.5)
+    let start_v = uv[0].y / s.radius
+    let previous = try new i64[ids.length] --- in memory.heap
+    defer free(previous) in memory.heap
+    let next = try new i64[ids.length] --- in memory.heap
+    defer free(next) in memory.heap
+    for at in 0..<ids.length:
+        previous[at] = ids[at]
+    for row in 1..<divisions:
+        let v = start_v + (pole_v - start_v) * (f64)row / (f64)divisions
+        for at in 0..<ids.length:
+            next[at] = try mesh.point(analytic_point(s, uv[at].x / s.radius, v))
+        for at in 0..<ids.length:
+            let following = (at + 1) % ids.length
+            let corners = [previous[at], previous[following], next[following], next[at]]
+            try mesh.face(4)
+            for index in 0..<(usize)4:
+                try mesh.corner(corners[index if sense else 3 - index])
+        for at in 0..<ids.length:
+            previous[at] = next[at]
+    let pole = try mesh.point(analytic_point(s, 0.0, pole_v))
+    for at in 0..<ids.length:
+        let corners = [previous[at], previous[(at + 1) % ids.length], pole]
+        try mesh.face(3)
+        for index in 0..<(usize)3:
+            try mesh.corner(corners[index if sense else 2 - index])

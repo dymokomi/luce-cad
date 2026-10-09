@@ -1,0 +1,73 @@
+## CAD control vertices as a point cloud, so geocore's point verbs edit them.
+## The cloud holds every cv of a set's models, placed (model placement, then
+## the surface's face placement), in model then cv order, with no faces;
+## a hidden detail attribute marks it. A point verb (Transform Components,
+## Mountain, Flatten, Snap) runs on the cloud, and the cvs whose points it
+## moved go back into copies of the models: only those, so every other cv
+## keeps its exact f64 position and the per-face tessellation cache reuses
+## every face they do not reach. A moved cv takes its exact old position
+## plus the cloud point's change.
+
+## The detail attribute that marks a cv cloud.
+let cloud_marker = ".cad_cvs"
+
+## The cloud of `models`' cvs.
+pub func cloud_mesh(models: const interop.Reference[CadModel][]) -> interop.Reference[Mesh]!:
+    var points = Growing[Vector3]()
+    defer points.close()
+    for model in models: try placed_cvs(model.value(), &points)
+    var builder = try MeshBuilder()
+    defer builder.close()
+    for point in points.view(): _ = try builder.point(point)
+    let bare = try builder.finish()
+    defer bare.release()
+    var marker = try Attribute.create(cloud_marker, Domain.detail, DataType.int32, 1, 1)
+    return bare.value().with_attribute_entry(marker) catch failure:
+        marker.release()
+        error(failure.code, failure.message)
+
+## Whether `mesh` is a cv cloud.
+pub func is_cloud(mesh: const Mesh*) -> bool:
+    return mesh.face_count() == 0 and mesh.find_attribute(cloud_marker, (i64)(u8)Domain.detail) >= 0
+
+## `models` with the cvs `after` moved relative to `before` (both clouds of
+## `models`), into `out`; a model none of whose cvs moved is shared.
+pub func moved_models(models: const interop.Reference[CadModel][], before: const Mesh*, after: const Mesh*, out: Growing[interop.Reference[CadModel]]*) -> !:
+    let old_points = before.point_span()
+    let new_points = after.point_span()
+    if old_points.length != new_points.length: error(invalid, "the control vertex cloud changed its point count")
+    let old_origin = before.position_origin()
+    let new_origin = after.position_origin()
+    let same_origin = old_origin.subtract(new_origin).length() == 0.0
+    # Without a shared origin, points moved by less than float rounding stay.
+    let bounds = before.bounds()
+    let slack = 0.0 if same_origin else bounds.maximum.subtract(bounds.minimum).length() * 0.000001
+    var ids = Growing[i64]()
+    defer ids.close()
+    var placed = Growing[Vector3]()
+    defer placed.close()
+    var exact = Growing[Vector3]()
+    defer exact.close()
+    var first: usize = 0
+    for model in models:
+        let count = (usize)model.value().cv_count()
+        if first + count > old_points.length: error(invalid, "the control vertex cloud does not match its models")
+        ids.clear()
+        placed.clear()
+        exact.clear()
+        try placed_cvs(model.value(), &exact)
+        for at in first..<first + count:
+            let was = old_points[at]
+            let now = new_points[at]
+            if same_origin and was.x == now.x and was.y == now.y and was.z == now.z: continue
+            let change = now.vector().add(new_origin).subtract(was.vector().add(old_origin))
+            if change.length() <= slack: continue
+            let cv = (i64)(at - first)
+            try ids.push(cv)
+            try placed.push(exact.items[at - first].add(change))
+        first += count
+        let result = (try model.value().with_cvs_placed(ids.view(), placed.view())) if ids.count > 0 else model.clone()
+        out.push(result) catch failure:
+            result.release()
+            error(failure.code, failure.message)
+    if first != old_points.length: error(invalid, "the control vertex cloud does not match its models")
