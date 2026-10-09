@@ -21,6 +21,8 @@ pub func sketch_contracts() -> !:
     try freedom()
     try growing_components()
     try round_trip()
+    try read_checks()
+    try fits_checks()
 
 ## Values read straight from the sketch's parameters.
 func read_param(param: i64, context: void*) -> f64:
@@ -277,3 +279,55 @@ func growing_components() -> !:
         _ = try s.constrain(ConstraintKind.distance, s.entity(lines.items[at]).first, s.entity(lines.items[at]).second, value = 10.0)
     let solved = try solve_sketch(&s)
     if not solved.converged: error(invalid, "a sketch whose second component is larger does not solve")
+
+## A text that says `c` stays a text that says `c` (not a construction
+## mark); a cut escape, a negative radius, a rho past 1, a projection of a
+## point and a mark past a line's fields are refused.
+func read_checks() -> !:
+    var s = try read_sketch("p 0 0\nt 0 5 - c\n")
+    defer s.close()
+    let e = s.entities.items[1]
+    if e.construction or s.text_content(e) != "c": error(invalid, "a text that says c reads as a construction mark")
+    try rejects("p 0 0\nt 0 5 - abc%\n", "a sketch text ending in % reads")
+    try rejects("p 0 0\no 0 -1\n", "a circle with a negative radius reads")
+    try rejects("p 0 0\np 1 0\np 0 1\nn 0 1 2 1.5\n", "a conic with rho past 1 reads")
+    try rejects("p 0 0\nj 0 edge\n", "a projection of a point reads")
+    try rejects("p 0 0 c c\n", "a point with two marks reads")
+
+func rejects(text: str, why: str) -> !:
+    var s = read_sketch(text) catch failure:
+        _ = failure
+        return
+    s.close()
+    error(invalid, why)
+
+## Curvature takes a control net of degree 2 and 3 points or more, smooth
+## one of degree 3 and 4 points; a line's, an arc's and a text's points
+## are listed in order.
+func fits_checks() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let line = try s.add_line(try s.add_point(-5.0, 0.0), try s.add_point(0.0, 0.0))
+    let p0 = try s.add_point(0.0, 0.0)
+    let p1 = try s.add_point(2.0, 0.0)
+    let p2 = try s.add_point(4.0, 1.0)
+    let p3 = try s.add_point(6.0, 3.0)
+    let straight = try s.add_spline([p0, p1, p2], false, degree = 1)
+    let three = try s.add_spline([p0, p1, p2], false, degree = 3)
+    let four = try s.add_spline([p0, p1, p2, p3], false, degree = 3)
+    try refuses(&s, ConstraintKind.curvature, straight, line, "curvature on a degree 1 net is taken")
+    _ = try s.constrain(ConstraintKind.curvature, three, line, side = 1.0)
+    try refuses(&s, ConstraintKind.smooth, three, line, "smooth on a net of 3 points is taken")
+    _ = try s.constrain(ConstraintKind.smooth, four, line, side = 1.0)
+    var points = Growing[i64]()
+    defer points.close()
+    let arc = try s.add_arc(p0, p1, try s.add_point(0.0, 2.0))
+    try s.points_of(s.entity(arc), &points)
+    if points.count != 3 or points.items[0] != p0 or points.items[1] != p1: error(invalid, "an arc's points are not its center, start and end")
+    if s.point_count(s.entity(p0)) != 0: error(invalid, "a point is drawn on points")
+
+func refuses(s: Sketch*, kind: ConstraintKind, first: i64, second: i64, why: str) -> !:
+    _ = s.constrain(kind, first, second, side = 1.0) catch failure:
+        _ = failure
+        return
+    error(invalid, why)

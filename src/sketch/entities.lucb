@@ -270,24 +270,41 @@ pub struct Sketch:
         for byte in reference.bytes: try self.chars.push(byte)
         try self.links.push(Link(entity, at, reference.length))
 
+    ## Curve `entity` no longer follows the edge it was projected from
+    ## (it was cut, extended or rounded: its own shape now).
+    pub func unlink(entity: i64):
+        var kept: usize = 0
+        for at in 0..<self.links.count:
+            if self.links.items[at].entity == entity: continue
+            self.links.items[kept] = self.links.items[at]
+            kept += 1
+        self.links.count = kept
+
     ## The point entities curve `e` is drawn on, in order (a spline's
     ## list; an arc's center, start and end; a conic's start, end, apex).
     pub func points_of(e: SketchEntity, out: Growing[i64]*) -> !:
         out.clear()
-        if e.kind == EntityKind.point: return
-        if e.kind == EntityKind.spline:
-            for at in 0..<(usize)e.second: try out.push(self.lists.items[(usize)e.first + at])
-            return
-        if e.kind == EntityKind.conic:
-            try out.push(e.first)
-            try out.push(e.third)
-            try out.push(e.fourth)
-            return
-        try out.push(e.first)
-        if e.kind == EntityKind.text: return
-        if e.kind == EntityKind.line: try out.push(e.second)
-        if e.kind == EntityKind.arc or e.kind == EntityKind.ellipse: try out.push(e.third)
-        if e.kind == EntityKind.arc: try out.push(e.fourth)
+        for at in 0..<self.point_count(e): try out.push(self.point_of(e, at))
+
+    ## How many point entities curve `e` is drawn on (none for a point).
+    pub func point_count(e: SketchEntity) -> i64:
+        if e.kind == EntityKind.spline: return e.second
+        if e.kind == EntityKind.point: return 0
+        if e.kind == EntityKind.circle or e.kind == EntityKind.text: return 1
+        return 3 if e.kind == EntityKind.arc or e.kind == EntityKind.conic else 2
+
+    ## Point `at` of those curve `e` is drawn on (points_of's order).
+    pub func point_of(e: SketchEntity, at: i64) -> i64:
+        if e.kind == EntityKind.spline: return self.spline_point(e, at)
+        if at == 0: return e.first
+        if e.kind == EntityKind.line: return e.second
+        return e.third if at == 1 else e.fourth
+
+    ## Whether `value` can be curve `e`'s own parameter: a rho between 0
+    ## and 1, any other positive.
+    pub func scalar_fits(e: SketchEntity, value: f64) -> bool:
+        if e.kind == EntityKind.conic: return value > 0.0 and value < 1.0
+        return value > 0.0
 
     ## Curve `e`'s own parameter (a radius, a minor radius, a rho), or -1.
     pub func scalar_of(e: SketchEntity) -> i64:
@@ -460,25 +477,33 @@ pub struct Sketch:
         let a = self.kind_at(first)
         let b = self.kind_at(second)
         let c = self.kind_at(third)
-        let point: i64 = 0
-        let line: i64 = 1
-        let ra = a == 2 or a == 3
-        let rb = b == 2 or b == 3
+        let point = (i64)(u8)EntityKind.point
+        let line = (i64)(u8)EntityKind.line
+        let spline = (i64)(u8)EntityKind.spline
+        let ra = a == (i64)(u8)EntityKind.circle or a == (i64)(u8)EntityKind.arc
+        let rb = b == (i64)(u8)EntityKind.circle or b == (i64)(u8)EntityKind.arc
         if kind == ConstraintKind.coincident or kind == ConstraintKind.distance or kind == ConstraintKind.horizontal_distance or kind == ConstraintKind.vertical_distance:
             return a == point and b == point and third < 0
         # A point on a line, circle, arc or ellipse.
-        if kind == ConstraintKind.on_curve: return a == point and (b == line or rb or b == 5) and third < 0
+        if kind == ConstraintKind.on_curve: return a == point and (b == line or rb or b == (i64)(u8)EntityKind.ellipse) and third < 0
         if kind == ConstraintKind.horizontal or kind == ConstraintKind.vertical:
             return (a == line and second < 0) or (a == point and b == point and third < 0)
         if kind == ConstraintKind.parallel or kind == ConstraintKind.perpendicular or kind == ConstraintKind.angle or kind == ConstraintKind.collinear:
             return a == line and b == line and third < 0
         # A control point spline or a conic touching (a spline: curving
         # like) another curve at its end.
-        let ended = (a == 4 and self.entities.items[(usize)first].fourth == 0) or a == 6
+        let net = a == spline and self.entities.items[(usize)first].fourth == 0
+        let ended = net or a == (i64)(u8)EntityKind.conic
         if kind == ConstraintKind.tangent:
-            if ended: return (b == line or (rb and a == 4)) and third < 0
+            if ended: return (b == line or (rb and a == spline)) and third < 0
             return ((a == line and rb) or (ra and (b == line or rb))) and third < 0
-        if kind == ConstraintKind.curvature or kind == ConstraintKind.smooth: return a == 4 and ended and (b == line or rb) and third < 0
+        if kind == ConstraintKind.curvature or kind == ConstraintKind.smooth:
+            if not net or not (b == line or rb) or third >= 0: return false
+            # Curving needs a degree 2 net of 3 points; its change, degree
+            # 3 and 4.
+            let e = self.entities.items[(usize)first]
+            let least: i64 = 2 if kind == ConstraintKind.curvature else 3
+            return e.third >= least and e.second >= least + 1
         if kind == ConstraintKind.equal: return ((a == line and b == line) or (ra and rb)) and third < 0
         if kind == ConstraintKind.fix: return first >= 0 and second < 0
         if kind == ConstraintKind.midpoint or kind == ConstraintKind.line_distance: return a == point and b == line and third < 0

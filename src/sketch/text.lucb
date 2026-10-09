@@ -107,7 +107,11 @@ pub func read_sketch(text: str) -> Sketch!:
         start = end + 1
         if count == 0: continue
         let tag = fields[0]
-        let marked = fields[count - 1] == "c" or fields[count - 1] == "d"
+        # A trailing mark only past the fields its line has (a text that
+        # says `c` is not a construction text): `d` on a constraint, `c`
+        # on an entity.
+        let expected = fields_of(tag, count)
+        let marked = expected >= 0 and count == (usize)expected + 1 and fields[count - 1] == ("d" if tag == "k" else "c") and tag != "j"
         let given = count - 1 if marked else count
         if tag == "p" and given == 3:
             _ = try s.add_point(try strings.parse_f64(fields[1]), try strings.parse_f64(fields[2]), marked)
@@ -162,11 +166,25 @@ pub func read_sketch(text: str) -> Sketch!:
         else:
             error(invalid, "a sketch's text has a line it does not know")
     if not checked: try check_entities(&s)
+    for l in s.links.view():
+        if l.entity < 0 or l.entity >= (i64)s.entities.count or s.entities.items[(usize)l.entity].kind == EntityKind.point or s.entities.items[(usize)l.entity].kind == EntityKind.text or l.reference_length == 0:
+            error(invalid, "a sketch's projection names a curve the sketch does not have")
     return s
+
+## How many fields a line of tag `tag` has before its mark (a spline's:
+## all `count` but a trailing `c`), -1 for a tag there is not.
+func fields_of(tag: str, count: usize) -> i64:
+    if tag == "s": return (i64)count - 1
+    if tag == "p" or tag == "l" or tag == "o" or tag == "j": return 3
+    if tag == "e": return 4
+    if tag == "a" or tag == "n" or tag == "t": return 5
+    if tag == "k": return 7
+    return -1
 
 ## Every curve read draws on points of the sketch (a curve may name points
 ## after it: a trimmed or filleted line's new end), a line's two apart, an
-## arc's center and ends apart, a spline's degree 1..5.
+## arc's center and ends apart, a spline's degree 1..5, its radius,
+## height or minor radius positive and its rho between 0 and 1.
 func check_entities(s: const Sketch*) -> !:
     let count = (i64)s.entities.count
     var points = Growing[i64]()
@@ -180,6 +198,8 @@ func check_entities(s: const Sketch*) -> !:
                 error(invalid, "a sketch curve names a point the sketch does not have")
         if e.kind == EntityKind.line and e.first == e.second: error(invalid, "a sketch line needs two different points")
         if e.kind == EntityKind.arc and (e.first == e.third or e.first == e.fourth or e.third == e.fourth): error(invalid, "a sketch arc needs a center and two different ends")
+        let scalar = s.scalar_of(e)
+        if scalar >= 0 and not s.scalar_fits(e, s.params.items[(usize)scalar]): error(invalid, "a sketch curve's radius, height or minor radius is not positive, or its rho not between 0 and 1")
 
 ## The names of ConstraintKind's values, in order.
 func kind_names() -> str[22]:
@@ -237,7 +257,8 @@ func unescape(text: str, out: Growing[u8]*) -> !:
     let bytes = text.bytes
     var at: usize = 0
     while at < bytes.length:
-        if bytes[at] == 37 and at + 2 < bytes.length:
+        if bytes[at] == 37:
+            if at + 2 >= bytes.length: error(invalid, "a sketch text ends in a cut escape")
             let code = (str)bytes[at + 1..<at + 3]
             if code == "25": try out.push(37)
             elif code == "20": try out.push(32)

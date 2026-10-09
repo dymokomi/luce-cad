@@ -85,33 +85,50 @@ pub func add_shadow(sketch: Sketch*, run: const f64[], reference: str) -> i64!:
     let tolerance = 1e-6 * math.max(1.0, size_of(sketch))
     if end_on(run, tolerance): error(invalid, "this edge runs straight at the sketch's plane: it casts only a point")
     let n = run.length // 2
-    let closed = math.hypot(run[0] - run[2 * n - 2], run[1] - run[2 * n - 1]) <= tolerance
     var made: i64 = -1
-    if not closed and straight(run, tolerance):
+    let kind = shadow_kind(run, tolerance)
+    if kind == EntityKind.line:
         made = try sketch.add_line(try sketch.add_point(run[0], run[1]), try sketch.add_point(run[2 * n - 2], run[2 * n - 1]))
-    elif let circle = circle_through(run, tolerance):
-        if closed:
-            made = try sketch.add_circle(try sketch.add_point(circle[0], circle[1]), circle[2])
-        else:
-            # Counterclockwise from whichever end the samples turn away from.
-            let center = try sketch.add_point(circle[0], circle[1])
-            let a = try sketch.add_point(run[0], run[1])
-            let b = try sketch.add_point(run[2 * n - 2], run[2 * n - 1])
-            let turning = (run[2] - run[0]) * (run[1] - circle[1]) - (run[3] - run[1]) * (run[0] - circle[0])
-            made = try sketch.add_arc(center, b if turning > 0.0 else a, a if turning > 0.0 else b)
+    elif kind == EntityKind.circle:
+        let circle = circle_through(run, tolerance) else error(invalid, "a circular shadow has no circle")
+        made = try sketch.add_circle(try sketch.add_point(circle[0], circle[1]), circle[2])
+    elif kind == EntityKind.arc:
+        # Counterclockwise from whichever end the samples turn away from.
+        let circle = circle_through(run, tolerance) else error(invalid, "a circular shadow has no circle")
+        let center = try sketch.add_point(circle[0], circle[1])
+        let a = try sketch.add_point(run[0], run[1])
+        let b = try sketch.add_point(run[2 * n - 2], run[2 * n - 1])
+        let turning = (run[2] - run[0]) * (run[1] - circle[1]) - (run[3] - run[1]) * (run[0] - circle[0])
+        made = try sketch.add_arc(center, b if turning > 0.0 else a, a if turning > 0.0 else b)
     else:
         # A fit point spline through every fourth sample (and its end).
         var points = Growing[i64]()
         defer points.close()
+        let loop = run_closed(run, tolerance)
         var k: usize = 0
         while k < n:
-            if not (closed and k == n - 1): try points.push(try sketch.add_point(run[2 * k], run[2 * k + 1]))
+            if not (loop and k == n - 1): try points.push(try sketch.add_point(run[2 * k], run[2 * k + 1]))
             k = k + 4 if k + 4 < n or k == n - 1 else n - 1
-        if closed: try points.push(points.items[0])
+        if loop: try points.push(points.items[0])
         made = try sketch.add_spline(points.view(), true)
     _ = try sketch.constrain(ConstraintKind.fix, made)
     try sketch.link(made, reference)
     return made
+
+## What a shadow of samples `run` is: a line when straight, a circle
+## when closed on one, an arc when open on one, else a spline.
+func shadow_kind(run: const f64[], tolerance: f64) -> EntityKind:
+    let loop = run_closed(run, tolerance)
+    if not loop and straight(run, tolerance): return EntityKind.line
+    if let circle = circle_through(run, tolerance):
+        _ = circle
+        return EntityKind.circle if loop else EntityKind.arc
+    return EntityKind.spline
+
+## Whether the samples end where they start.
+func run_closed(run: const f64[], tolerance: f64) -> bool:
+    let n = run.length // 2
+    return math.hypot(run[0] - run[2 * n - 2], run[1] - run[2 * n - 1]) <= tolerance
 
 ## Whether every sample is at the first's place (an edge seen end-on).
 func end_on(run: const f64[], tolerance: f64) -> bool:
@@ -150,8 +167,8 @@ func circle_through(run: const f64[], tolerance: f64) -> f64[3]?:
 
 ## Cast every linked edge of `sketch` again from `model` onto the plane
 ## through `origin` (axes `u`, `v`): each shadow's points and radius follow
-## its edge. How many links no longer find their edge (they stay as they
-## were).
+## its edge. How many links no longer find their edge, or find it
+## another kind of curve now (they stay as they were).
 pub func relink_sketch(sketch: Sketch*, model: const CadModel*, origin: Vector3, u: Vector3, v: Vector3) -> i64!:
     if sketch.links.count == 0: return 0
     var w = try shape_of(model)
@@ -160,6 +177,7 @@ pub func relink_sketch(sketch: Sketch*, model: const CadModel*, origin: Vector3,
     defer edges.close()
     var run = Growing[f64]()
     defer run.close()
+    let tolerance = 1e-6 * math.max(1.0, size_of(sketch))
     var lost: i64 = 0
     for l in sketch.links.view():
         resolve_edges(&w, sketch.link_reference(l), &edges) catch failure:
@@ -170,6 +188,9 @@ pub func relink_sketch(sketch: Sketch*, model: const CadModel*, origin: Vector3,
             continue
         run.clear()
         try cast_edge(&w, edges.items[0], origin, u, v, &run)
+        if end_on(run.view(), tolerance) or shadow_kind(run.view(), tolerance) != sketch.entity(l.entity).kind:
+            lost += 1
+            continue
         try follow(sketch, l.entity, run.view())
     return lost
 

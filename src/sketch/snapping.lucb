@@ -4,7 +4,10 @@
 ## curves near it, a line's or arc's middle, a place on a curve. Each kind
 ## can be left out, and an entity skipped (the point a drag moves, a
 ## line's start while its end is placed), and with a point the curves
-## drawn on it (a dragged corner does not snap to its own sides).
+## drawn on it (a dragged corner does not snap to its own sides), and the
+## points held on it by coincident constraints and theirs. Crossings take
+## lines, circles and arcs with any curve; two splines, ellipses or conics
+## have none.
 
 ## The kinds, as bits of a mask and as a result.
 pub let snap_point: i64 = 1
@@ -33,7 +36,7 @@ pub func snap_in(sketch: const Sketch*, x: f64, y: f64, reach: f64, mask: i64, s
         var closest = reach
         for at in 0..<sketch.entities.count:
             let e = sketch.entities.items[at]
-            if e.kind != EntityKind.point or (i64)at == skip: continue
+            if e.kind != EntityKind.point or (i64)at == skip or joined(sketch, (i64)at, skip): continue
             let d = math.hypot(sketch.x((i64)at) - x, sketch.y((i64)at) - y)
             if d <= closest:
                 closest = d
@@ -51,7 +54,7 @@ pub func snap_in(sketch: const Sketch*, x: f64, y: f64, reach: f64, mask: i64, s
         if skip >= 0 and sketch.entity(skip).kind == EntityKind.point:
             try sketch.points_of(e, &drawn_on)
             var on_skip = false
-            for p in drawn_on.view(): on_skip = on_skip or p == skip
+            for p in drawn_on.view(): on_skip = on_skip or p == skip or joined(sketch, p, skip)
             if on_skip: continue
         if distance_to(sketch, e, (i64)at, x, y) <= 2.0 * reach: try near.push((i64)at)
     if mask & snap_crossing != 0:
@@ -61,7 +64,9 @@ pub func snap_in(sketch: const Sketch*, x: f64, y: f64, reach: f64, mask: i64, s
         for i in 0..<near.count:
             for j in i + 1..<near.count:
                 found.clear()
-                try meet(sketch, near.items[i], near.items[j], false, &found)
+                # Along a line, circle or arc (meet's first curve).
+                let (a, b) = (near.items[j], near.items[i]) if is_sampled(sketch.entity(near.items[i]).kind) else (near.items[i], near.items[j])
+                try meet(sketch, a, b, false, &found)
                 for c in found.view():
                     let d = math.hypot(c.x - x, c.y - y)
                     if d <= closest:
@@ -89,3 +94,10 @@ pub func snap_in(sketch: const Sketch*, x: f64, y: f64, reach: f64, mask: i64, s
                 let (on_x, on_y) = nearest_on(sketch, c, x, y)
                 best = SnapHit(snap_curve, on_x, on_y, c, -1)
     return best
+
+## Whether points `a` and `b` are held together by a coincident constraint.
+func joined(sketch: const Sketch*, a: i64, b: i64) -> bool:
+    if a < 0 or b < 0: return false
+    for k in sketch.constraints.view():
+        if k.kind == ConstraintKind.coincident and ((k.first == a and k.second == b) or (k.first == b and k.second == a)): return true
+    return false
