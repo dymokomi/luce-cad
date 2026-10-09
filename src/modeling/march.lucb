@@ -79,7 +79,7 @@ func trace(s1: const Surface*, s2: const Surface*, seed: Vector3, heading: Vecto
 
 ## Cubic B-spline through `points` (chord-length parameters, clamped ends,
 ## knots by averaging; the Piegl-Tiller interpolation): its net and knots.
-func interpolate(points: const Vector3[], net: Growing[Vector3]*, knots: Growing[f64]*) -> !:
+pub func interpolate(points: const Vector3[], net: Growing[Vector3]*, knots: Growing[f64]*) -> !:
     let n = points.length
     if n < 4: error(invalid, "a traced curve needs more points")
     var u = Growing[f64]()
@@ -96,51 +96,51 @@ func interpolate(points: const Vector3[], net: Growing[Vector3]*, knots: Growing
     for j in 1..<n - 3:
         try knots.push((u.items[j] + u.items[j + 1] + u.items[j + 2]) / 3.0)
     for _ in 0..<(usize)4: try knots.push(1.0)
-    # The banded system N P = Q, solved by Gaussian elimination on rows of
-    # four basis values (each row's nonzero span).
-    var rows = Growing[f64]()
-    defer rows.close()
-    var first = Growing[usize]()
-    defer first.close()
+    # The banded system N P = Q: row k's four basis values start at column
+    # span - 3, all within three of the diagonal (Schoenberg-Whitney, with
+    # averaged knots). Only that band is stored: entry (r, c) at
+    # band[r * 7 + c + 3 - r]. Gaussian elimination without pivoting (the
+    # system is totally positive) keeps the band.
+    var band = Growing[f64]()
+    defer band.close()
+    try band.fill(n * 7, 0.0)
     for k in 0..<n:
         var values: f64[9]
         let span = basis_at(knots.view(), n, u.items[k], &values)
-        try first.push(span - 3)
-        for c in 0..<(usize)4: try rows.push(values[c])
-    # Dense solve over a band of width 4: small enough (n under a few
-    # thousand) as forward elimination with the band.
-    var a = Growing[f64]()
-    defer a.close()
-    for _ in 0..<n * n: try a.push(0.0)
-    for k in 0..<n:
         for c in 0..<(usize)4:
-            let column = first.items[k] + c
-            if column < n: a.items[k * n + column] = rows.items[k * 4 + c]
+            let column = span - 3 + c
+            if column >= n or values[c] == 0.0: continue
+            if column + 3 < k or column > k + 3: error(invalid, "a traced curve could not be fitted")
+            band.items[k * 7 + column + 3 - k] = values[c]
     net.clear()
     for p in points: try net.push(p)
     for k in 0..<n:
-        # Pivot on the diagonal (the system is totally positive and banded).
-        let pivot = a.items[k * n + k]
+        let pivot = band.items[k * 7 + 3]
         if math.abs(pivot) < 1e-300: error(invalid, "a traced curve could not be fitted")
         for r in k + 1..<lesser(n, k + 4):
-            let factor = a.items[r * n + k] / pivot
+            let factor = band.items[r * 7 + k + 3 - r] / pivot
             if factor == 0.0: continue
-            for c in k..<lesser(n, k + 4): a.items[r * n + c] -= factor * a.items[k * n + c]
+            for c in k..<lesser(n, k + 4): band.items[r * 7 + c + 3 - r] -= factor * band.items[k * 7 + c + 3 - k]
             net.items[r] = net.items[r].subtract(net.items[k].multiply_scalar(factor))
     var k = n
     while k > 0:
         k -= 1
         var value = net.items[k]
-        for c in k + 1..<lesser(n, k + 4): value = value.subtract(net.items[c].multiply_scalar(a.items[k * n + c]))
-        net.items[k] = value.multiply_scalar(1.0 / a.items[k * n + k])
+        for c in k + 1..<lesser(n, k + 4): value = value.subtract(net.items[c].multiply_scalar(band.items[k * 7 + c + 3 - k]))
+        net.items[k] = value.multiply_scalar(1.0 / band.items[k * 7 + 3])
 
 func lesser(a: usize, b: usize) -> usize:
     return a if a < b else b
 
 ## The cubic basis values at `t` (into values[0..4]) and the span index.
 func basis_at(knots: const f64[], count: usize, t: f64, values: f64[9]*) -> usize:
+    # The span: the last knot interval starting at or before t (bisected).
     var span: usize = 3
-    while span + 1 < count and knots[span + 1] <= t: span += 1
+    var above = count
+    while above - span > 1:
+        let middle = (span + above) // 2
+        if knots[middle] <= t: span = middle
+        else: above = middle
     # Cox-de Boor, degree 3.
     var left: f64[4]
     var right: f64[4]
@@ -171,7 +171,8 @@ pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, s
     try boundary_seeds(w, fb, s1, s2, tol, &seeds)
     try grid_seeds(w, fa, s2, s1, tol, &seeds)
     try grid_seeds(w, fb, s1, s2, tol, &seeds)
-    var traced = Growing[Vector3]()
+    # Every point traced so far, to skip seeds on curves already traced.
+    var traced = try new_point_cells(step * 2.0)
     defer traced.close()
     var back = Growing[Vector3]()
     defer back.close()
@@ -185,10 +186,7 @@ pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, s
     defer weights.close()
     for seed in seeds.view():
         # A seed on a curve already traced adds nothing.
-        var known = false
-        for p in traced.view():
-            if p.subtract(seed).length() < step * 2.0: known = true
-        if known: continue
+        if traced.near(seed): continue
         let heading = (try curve_direction(s1, s2, seed)) else continue
         line.clear()
         back.clear()
@@ -210,12 +208,62 @@ pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, s
             # Closed: end on the start exactly.
             try line.push(seed)
         if line.count < 4: continue
-        for p in line.view(): try traced.push(p)
+        for p in line.view(): try traced.add(p)
         try interpolate(line.view(), &net, &knots)
         weights.clear()
         for _ in net.view(): try weights.push(1.0)
         let spline = try w.store_spline(net.view(), weights.view(), knots.view(), 3, Matrix4())
         try out.push(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline))
+
+## Points binned in cubes of side `reach`, the cubes hashed into a fixed
+## number of buckets (chained through `next`): whether a point lies within
+## `reach` of any looks only at the 27 cubes around it.
+struct PointCells:
+    var reach: f64
+    var heads: Growing[i64]
+    var next: Growing[i64]
+    var points: Growing[Vector3]
+
+    func close():
+        self.heads.close()
+        self.next.close()
+        self.points.close()
+
+    ## The bucket of cube (i, j, k): Teschner et al.'s spatial hash.
+    func bucket(i: i64, j: i64, k: i64) -> usize:
+        let count = (i64)self.heads.count
+        var h = ((i *% 73856093) ^ (j *% 19349663) ^ (k *% 83492791)) % count
+        if h < 0: h += count
+        return (usize)h
+
+    func cube(value: f64) -> i64:
+        return (i64)math.floor(value / self.reach)
+
+    func add(p: Vector3) -> !:
+        let b = self.bucket(self.cube(p.x), self.cube(p.y), self.cube(p.z))
+        try self.points.push(p)
+        try self.next.push(self.heads.items[b])
+        self.heads.items[b] = (i64)self.points.count - 1
+
+    ## Whether a point added lies within `reach` of `p`.
+    func near(p: Vector3) -> bool:
+        let i = self.cube(p.x)
+        let j = self.cube(p.y)
+        let k = self.cube(p.z)
+        for di in -1..<(i64)2:
+            for dj in -1..<(i64)2:
+                for dk in -1..<(i64)2:
+                    var at = self.heads.items[self.bucket(i + di, j + dj, k + dk)]
+                    while at >= 0:
+                        if self.points.items[(usize)at].subtract(p).length() < self.reach: return true
+                        at = self.next.items[(usize)at]
+        return false
+
+func new_point_cells(reach: f64) -> PointCells!:
+    var made = PointCells(reach, Growing[i64](), Growing[i64](), Growing[Vector3]())
+    errdefer made.close()
+    try made.heads.fill(4096, -1)
+    return made
 
 ## Where `other`'s function changes sign along face `f`'s boundary (which
 ## lies on `own`), refined onto both, onto `seeds`.

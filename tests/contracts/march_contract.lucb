@@ -1,0 +1,38 @@
+## Marching (modeling/march.lucb): a traced curve's cubic B-spline passes
+## through every traced point, even for a long trace (the solve keeps only
+## its band: a dense matrix of 20,000 points was 3.2 GB).
+from luce_std import math
+from luce_geocore.geocore import Vector3, invalid
+from luce_geocore.core.growing import Growing
+from tessellation.surface import NurbsCurve
+from modeling import interpolate
+
+pub func march_contracts() -> !:
+    try long_trace()
+
+## 20,000 points along a helix, interpolated: the curve meets each at its
+## chord-length parameter.
+func long_trace() -> !:
+    let count: usize = 20000
+    var points = Growing[Vector3]()
+    defer points.close()
+    for k in 0..<count:
+        let t = (f64)k * 0.01
+        try points.push(Vector3(math.cos(t), math.sin(t), t * 0.05))
+    var net = Growing[Vector3]()
+    defer net.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    try interpolate(points.view(), &net, &knots)
+    if net.count != count or knots.count != count + 4: error(invalid, "an interpolated trace has the wrong net")
+    var weights = Growing[f64]()
+    defer weights.close()
+    try weights.fill(count, 1.0)
+    var total = 0.0
+    for k in 1..<count: total += points.items[k].subtract(points.items[k - 1]).length()
+    var run = 0.0
+    for k in 0..<count:
+        if k > 0: run += points.items[k].subtract(points.items[k - 1]).length()
+        if k % 997 != 0 and k != count - 1: continue
+        let p = try NurbsCurve.at(net.view(), weights.view(), 3, knots.view(), run / total)
+        if p.subtract(points.items[k]).length() > 1e-6: error(invalid, "an interpolated trace misses its points")

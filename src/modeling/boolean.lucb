@@ -115,23 +115,87 @@ struct Work:
     func is_a(f: usize) -> bool:
         return f < self.faces_a
 
-## The faces of `w` as boxes: points along their edges (a sphere's whole
-## ball, its rims leave its dome out).
+## A box holding face `f` of `w`, never short of it (a pair of faces whose
+## boxes miss is never met). A plane's face lies within its boundary's box;
+## a curved face can bulge past its boundary, so it takes its surface's
+## extent there: a cylinder's or cone's band between the boundary's
+## heights, a sphere's ball, a torus whole, a B-spline's control net.
 func face_box(w: const Shape*, f: usize) -> (Vector3, Vector3)!:
     var low = Vector3(1.0e300, 1.0e300, 1.0e300)
     var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
     for use in w.face_uses(f):
-        let e = (usize)(use - 1 if use > 0 else -use - 1)
-        for step in 0..<17:
-            let p = try w.edge_at(e, (f64)step / 16.0)
-            low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
-            high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
-    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+        let (l, h) = try edge_box(w, (usize)(use - 1 if use > 0 else -use - 1))
+        low = lower(low, l)
+        high = upper(high, h)
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    if s.kind == 0: return (low, high)
+    if s.kind == 3:
+        low = Vector3(1.0e300, 1.0e300, 1.0e300)
+        high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+        for p in s.points:
+            low = lower(low, p)
+            high = upper(high, p)
+        return (low, high)
     if s.kind == 4:
         let r = Vector3(s.radius, s.radius, s.radius)
-        low = s.origin.subtract(r)
-        high = s.origin.add(r)
+        return (s.origin.subtract(r), s.origin.add(r))
+    if s.kind == 5:
+        # The ring's circle, widened by the tube.
+        let (l, h) = circle_box(s.origin, s.z, s.radius)
+        let tube = Vector3(s.angle, s.angle, s.angle)
+        return (l.subtract(tube), h.add(tube))
+    # A cylinder or cone between the boundary's lowest and highest heights
+    # (from its box's corners): the circles there hold the band between
+    # (a cone's points are blends of theirs).
+    var bottom = 1.0e300
+    var top = -1.0e300
+    for corner in 0..<8:
+        let p = Vector3(high.x if corner % 2 == 1 else low.x, high.y if (corner // 2) % 2 == 1 else low.y, high.z if corner >= 4 else low.z)
+        let height = p.subtract(s.origin).dot(s.z)
+        bottom = math.min(bottom, height)
+        top = math.max(top, height)
+    let slope = math.tan(s.angle) if s.kind == 2 else 0.0
+    let r0 = math.abs(s.radius + bottom * slope)
+    let r1 = math.abs(s.radius + top * slope)
+    let (l0, h0) = circle_box(s.origin.add(s.z.multiply_scalar(bottom)), s.z, r0)
+    let (l1, h1) = circle_box(s.origin.add(s.z.multiply_scalar(top)), s.z, r1)
+    return (lower(l0, l1), upper(h0, h1))
+
+## A box holding edge `e` of `w`: a line's ends, an arc's whole circle or
+## ellipse, a B-spline's control points (it lies in their hull).
+func edge_box(w: const Shape*, e: usize) -> (Vector3, Vector3)!:
+    let edge = w.edges.items[e]
+    let c = w.carriers.items[(usize)edge.carrier]
+    if c.kind == 0:
+        let a = try w.at(edge.carrier, edge.t0)
+        let b = try w.at(edge.carrier, edge.t1)
+        return (lower(a, b), upper(a, b))
+    if c.kind == 1 or c.kind == 3:
+        # Along each axis, origin +- |(a x_i, b y_i)|.
+        let reach = Vector3(math.sqrt(c.a * c.x.x * c.a * c.x.x + c.b * c.y.x * c.b * c.y.x),
+                            math.sqrt(c.a * c.x.y * c.a * c.x.y + c.b * c.y.y * c.b * c.y.y),
+                            math.sqrt(c.a * c.x.z * c.a * c.x.z + c.b * c.y.z * c.b * c.y.z))
+        return (c.origin.subtract(reach), c.origin.add(reach))
+    let (points, _, _, _) = w.spline_net(c.spline)
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for p in points:
+        low = lower(low, p)
+        high = upper(high, p)
     return (low, high)
+
+## The box of the circle of `radius` about unit `axis` through `center`:
+## along each axis e, center +- radius sqrt(1 - (axis . e)^2).
+func circle_box(center: Vector3, axis: Vector3, radius: f64) -> (Vector3, Vector3):
+    let reach = Vector3(radius * math.sqrt(math.max(0.0, 1.0 - axis.x * axis.x)), radius * math.sqrt(math.max(0.0, 1.0 - axis.y * axis.y)),
+                        radius * math.sqrt(math.max(0.0, 1.0 - axis.z * axis.z)))
+    return (center.subtract(reach), center.add(reach))
+
+func lower(a: Vector3, b: Vector3) -> Vector3:
+    return Vector3(math.min(a.x, b.x), math.min(a.y, b.y), math.min(a.z, b.z))
+
+func upper(a: Vector3, b: Vector3) -> Vector3:
+    return Vector3(math.max(a.x, b.x), math.max(a.y, b.y), math.max(a.z, b.z))
 
 func boxes_meet(a: (Vector3, Vector3), b: (Vector3, Vector3), pad: f64) -> bool:
     let (al, ah) = a

@@ -59,6 +59,9 @@ pub struct Shape:
     ## Face names: name n is name_bytes[name_offsets[n]..<name_offsets[n + 1]].
     pub var name_bytes: Growing[u8]
     pub var name_offsets: Growing[usize]
+    ## Each edge's two faces, sides[2e] and sides[2e + 1] (-1 for none),
+    ## indexed by index_sides (shape_of does): stale once faces change.
+    pub var sides: Growing[i64]
 
     pub func close():
         self.points.close()
@@ -77,6 +80,7 @@ pub struct Shape:
         self.spline_knots.close()
         self.name_bytes.close()
         self.name_offsets.close()
+        self.sides.close()
 
     ## Name `n` ("" for -1).
     pub func name(n: i64) -> str:
@@ -162,6 +166,18 @@ pub struct Shape:
         for use in uses: try self.uses.push(use)
         for size in sizes: try self.sizes.push(size)
 
+    ## Each edge's two faces into `sides`, from one pass over the uses: the
+    ## first face using an edge, then the first other one (a seam, one
+    ## face's both ways, has no second).
+    pub func index_sides() -> !:
+        self.sides.clear()
+        try self.sides.fill(self.edges.count * 2, -1)
+        for f in 0..<self.faces.count:
+            for use in self.face_uses(f):
+                let e = (usize)((use if use > 0 else -use) - 1)
+                if self.sides.items[e * 2] < 0: self.sides.items[e * 2] = (i64)f
+                elif self.sides.items[e * 2 + 1] < 0 and self.sides.items[e * 2] != (i64)f: self.sides.items[e * 2 + 1] = (i64)f
+
     pub func face_uses(f: usize) -> const i64[]:
         let face = self.faces.items[f]
         return self.uses.view()[face.first..<face.first + face.count]
@@ -191,7 +207,7 @@ pub struct Shape:
 
 pub func empty_shape(tolerance: f64) -> Shape:
     return Shape(tolerance, Growing[Vector3](), Growing[Carrier](), Growing[ShapeEdge](), Growing[Surface](), Growing[ShapeFace](),
-                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize]())
+                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize](), Growing[i64]())
 
 ## Surface `s`'s unit normal at `p`.
 pub func surface_normal(s: const Surface*, p: Vector3) -> Vector3!:
@@ -303,6 +319,7 @@ pub func shape_of(model: const CadModel*) -> Shape!:
                 try turned.push(-face.uses[at + k])
             at += (usize)size
         try shape.add_face(face.surface, face.sense, turned.view(), face.sizes, name)
+    try shape.index_sides()
     return shape
 
 ## `shape` as a new B-rep: its points, edges, surfaces and faces as they are.

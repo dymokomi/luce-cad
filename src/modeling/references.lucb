@@ -18,15 +18,12 @@ let face_separator: u8 = 38
 let place_separator: u8 = 64
 
 ## The two faces using edge `e` (each once: a seam, one face's both ways,
-## is no edge between two faces), or an error.
+## is no edge between two faces), or an error. From the shape's sides
+## table (Shape.index_sides).
 func edge_faces(w: const Shape*, e: usize) -> (usize, usize)!:
-    var first: i64 = -1
-    var second: i64 = -1
-    for f in 0..<w.faces.count:
-        for use in w.face_uses(f):
-            if (usize)((use if use > 0 else -use) - 1) != e: continue
-            if first < 0: first = (i64)f
-            elif second < 0 and (i64)f != first: second = (i64)f
+    if w.sides.count != w.edges.count * 2: error(invalid, "the shape's edges are not indexed to their faces (Shape.index_sides)")
+    let first = w.sides.items[e * 2]
+    let second = w.sides.items[e * 2 + 1]
     if first < 0 or second < 0: error(invalid, "an edge must lie between two faces")
     return ((usize)first, (usize)second)
 
@@ -77,38 +74,32 @@ pub func references_of(w: const Shape*, edges: const i64[], out: Growing[u8]*) -
 ## into `out`. Nothing for a model that is not a solid B-rep.
 pub func reference_lines(model: const CadModel*, out: Growing[u8]*) -> !:
     out.clear()
-    var w = shape_of(model) catch failure:
-        _ = failure
-        return
+    if model.independent_faces() > 0: return
+    if model.brep() == none: return
+    var w = try shape_of(model)
     defer w.close()
-    # Each edge's two faces, from one pass over the uses.
-    let count = w.edges.count
-    let first = try new i64[count] --- in memory.heap
-    defer free(first) in memory.heap
-    let second = try new i64[count] --- in memory.heap
-    defer free(second) in memory.heap
-    for e in 0..<count:
-        first[e] = -1
-        second[e] = -1
-    for f in 0..<w.faces.count:
-        for use in w.face_uses(f):
-            let e = (usize)((use if use > 0 else -use) - 1)
-            if first[e] < 0: first[e] = (i64)f
-            elif second[e] < 0 and first[e] != (i64)f: second[e] = (i64)f
-    for e in 0..<count:
+    for e in 0..<w.edges.count:
         if e > 0: try out.push(10)
-        if first[e] < 0 or second[e] < 0: continue
-        if w.face_name((usize)first[e]) == "" or w.face_name((usize)second[e]) == "": continue
+        let first = w.sides.items[e * 2]
+        let second = w.sides.items[e * 2 + 1]
+        if first < 0 or second < 0: continue
+        if w.face_name((usize)first) == "" or w.face_name((usize)second) == "": continue
         try edge_reference(&w, e, out)
 
-## Whether edge `e` lies between faces named `a` and `b` (either way round).
-func between(w: const Shape*, e: usize, a: str, b: str) -> bool!:
-    let (fa, fb) = edge_faces(w, e) catch failure:
-        _ = failure
-        return false
-    let na = w.face_name(fa)
-    let nb = w.face_name(fb)
-    return (try names_meet(na, a) and try names_meet(nb, b)) or (try names_meet(na, b) and try names_meet(nb, a))
+## Which faces of `w` go by name `name` (any alias) into `marks`.
+func mark_faces(w: const Shape*, name: str, marks: Growing[bool]*) -> !:
+    marks.clear()
+    for f in 0..<w.faces.count: try marks.push(try names_meet(w.face_name(f), name))
+
+## Whether edge `e` lies between a face of `a` and a face of `b` (either
+## way round), the faces marked by mark_faces.
+func between(w: const Shape*, e: usize, a: const bool[], b: const bool[]) -> bool:
+    let first = w.sides.items[e * 2]
+    let second = w.sides.items[e * 2 + 1]
+    if first < 0 or second < 0: return false
+    let fa = (usize)first
+    let fb = (usize)second
+    return (a[fa] and b[fb]) or (a[fb] and b[fa])
 
 ## How far `p` is from the segment from `a` to `z`, and where along it it
 ## falls (0 at a, 1 at z).
@@ -124,6 +115,11 @@ func segment_place(p: Vector3, a: Vector3, z: Vector3) -> (f64, f64):
 ## `out`.
 pub func resolve_edges(w: const Shape*, text: str, out: Growing[usize]*) -> !:
     out.clear()
+    if w.sides.count != w.edges.count * 2: error(invalid, "the shape's edges are not indexed to their faces (Shape.index_sides)")
+    # Whether each edge is in `out` already.
+    var taken = Growing[bool]()
+    defer taken.close()
+    try taken.fill(w.edges.count, false)
     var references = Growing[(usize, usize)]()
     defer references.close()
     var parts = Growing[(usize, usize)]()
@@ -134,6 +130,10 @@ pub func resolve_edges(w: const Shape*, text: str, out: Growing[usize]*) -> !:
     defer numbers.close()
     var candidates = Growing[usize]()
     defer candidates.close()
+    var named_a = Growing[bool]()
+    defer named_a.close()
+    var named_b = Growing[bool]()
+    defer named_b.close()
     try top_parts(text, reference_separator, &references)
     for range in references.view():
         let reference = trimmed(part_of(text, range))
@@ -142,14 +142,14 @@ pub func resolve_edges(w: const Shape*, text: str, out: Growing[usize]*) -> !:
         let names = part_of(reference, parts.items[0])
         try top_parts(names, face_separator, &faces)
         if faces.count != 2 or parts.count > 2: error(invalid, "an edge reference is two face names apart by & (and where the edge was, after @)")
-        let a = part_of(names, faces.items[0])
-        let b = part_of(names, faces.items[1])
+        try mark_faces(w, part_of(names, faces.items[0]), &named_a)
+        try mark_faces(w, part_of(names, faces.items[1]), &named_b)
         candidates.clear()
         for e in 0..<w.edges.count:
-            if try between(w, e, a, b): try candidates.push(e)
+            if between(w, e, named_a.view(), named_b.view()): try candidates.push(e)
         if candidates.count == 0: error(invalid, "an edge this feature refers to is gone (its faces no longer meet): pick its edges again")
         if parts.count == 1:
-            for e in candidates.view(): try add_once(out, e)
+            for e in candidates.view(): try add_once(out, &taken, e)
             continue
         # Where it was: its two ends.
         let place = part_of(reference, parts.items[1])
@@ -166,17 +166,17 @@ pub func resolve_edges(w: const Shape*, text: str, out: Growing[usize]*) -> !:
             if distance < best_distance:
                 best_distance = distance
                 best = e
-        try add_once(out, best)
+        try add_once(out, &taken, best)
         if a_end.subtract(z_end).length() <= w.tolerance: continue
         let carrier = w.edges.items[best].carrier
         for e in candidates.view():
             if e == best or not try same_curve(w, carrier, e, w.tolerance * 10.0): continue
             let (_, along) = segment_place(try w.edge_at(e, 0.5), a_end, z_end)
-            if along > 0.0 and along < 1.0: try add_once(out, e)
+            if along > 0.0 and along < 1.0: try add_once(out, &taken, e)
 
-func add_once(out: Growing[usize]*, e: usize) -> !:
-    for known in out.view():
-        if known == e: return
+func add_once(out: Growing[usize]*, taken: Growing[bool]*, e: usize) -> !:
+    if taken.items[e]: return
+    taken.items[e] = true
     try out.push(e)
 
 ## `text` without spaces at either end.

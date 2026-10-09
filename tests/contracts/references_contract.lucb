@@ -1,0 +1,101 @@
+## Edge references (modeling/references.lucb) at scale: a prism of many
+## sides has every edge indexed to its two faces once (Shape.index_sides),
+## and every edge's reference resolves back to that edge alone. Resolving
+## used to scan every face's uses per edge per reference: at this size
+## that was billions of steps.
+from luce_std import math
+from luce_geocore.geocore import Vector3, invalid
+from luce_geocore.core.growing import Growing
+from brep_types import Surface
+from modeling import Shape, Carrier, ShapeEdge, empty_shape, references_of, resolve_edges
+
+pub func references_contracts() -> !:
+    let sides: usize = 400
+    var w = try prism(sides)
+    defer w.close()
+    try w.index_sides()
+    # Every edge between two different faces.
+    for e in 0..<w.edges.count:
+        let a = w.sides.items[e * 2]
+        let b = w.sides.items[e * 2 + 1]
+        if a < 0 or b < 0 or a == b: error(invalid, "a prism edge is not between two faces")
+    # Each edge's reference back to itself.
+    var edges = Growing[i64]()
+    defer edges.close()
+    for e in 0..<w.edges.count: try edges.push((i64)e)
+    var text = Growing[u8]()
+    defer text.close()
+    try references_of(&w, edges.view(), &text)
+    var resolved = Growing[usize]()
+    defer resolved.close()
+    try resolve_edges(&w, (str)text.view(), &resolved)
+    if resolved.count != w.edges.count: error(invalid, "a prism's edge references resolve to other edges")
+    for at in 0..<resolved.count:
+        if resolved.items[at] != at: error(invalid, "a prism's edge reference resolves out of order")
+    # Faces changed after indexing: refused, not answered from a stale table.
+    w.edges.clear()
+    resolve_edges(&w, (str)text.view(), &resolved) catch failure:
+        _ = failure
+        return
+    error(invalid, "a shape whose edges changed after indexing still resolved references")
+
+## A prism of `count` sides about z, unit tall, each face named.
+func prism(count: usize) -> Shape!:
+    var w = empty_shape(1e-6)
+    errdefer w.close()
+    for level in 0..<(usize)2:
+        for k in 0..<count:
+            let angle = 2.0 * math.pi * (f64)k / (f64)count
+            _ = try w.add_point(Vector3(math.cos(angle), math.sin(angle), (f64)level))
+    let n = (i64)count
+    # Edges: bottom k, top k (point k to k + 1), then upright k.
+    for level in 0..<(i64)2:
+        for k in 0..<n:
+            try line(&w, level * n + k, level * n + (k + 1) % n)
+    for k in 0..<n: try line(&w, k, n + k)
+    let empty_points: Vector3[1] = [Vector3()]
+    let empty_numbers: f64[1] = [0.0]
+    var uses = Growing[i64]()
+    defer uses.close()
+    var size: i64[1] = [n]
+    # Bottom (out down, so backwards), top.
+    _ = try w.add_name("bottom")
+    try w.surfaces.push(try Surface(0, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0), 0.0, 0.0, empty_points[..<0], empty_numbers[..<0], empty_numbers[..<0], empty_numbers[..<0], 0, 0, 0, 0))
+    for k in 0..<n: try uses.push(-(n - k))
+    try w.add_face(0, true, uses.view(), size[..<1], 0)
+    _ = try w.add_name("top")
+    try w.surfaces.push(try Surface(0, Vector3(0.0, 0.0, 1.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, empty_points[..<0], empty_numbers[..<0], empty_numbers[..<0], empty_numbers[..<0], 0, 0, 0, 0))
+    uses.clear()
+    for k in 0..<n: try uses.push(n + k + 1)
+    try w.add_face(1, true, uses.view(), size[..<1], 1)
+    size[0] = 4
+    var name = Growing[u8]()
+    defer name.close()
+    for k in 0..<n:
+        let a = w.points.items[(usize)k]
+        let b = w.points.items[(usize)((k + 1) % n)]
+        let out = Vector3((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, 0.0)
+        try w.surfaces.push(try Surface(0, a, try b.subtract(a).normalized(), try out.normalized(), 0.0, 0.0, empty_points[..<0], empty_numbers[..<0], empty_numbers[..<0], empty_numbers[..<0], 0, 0, 0, 0))
+        uses.clear()
+        try uses.push(k + 1)
+        try uses.push(2 * n + (k + 1) % n + 1)
+        try uses.push(-(n + k + 1))
+        try uses.push(-(2 * n + k + 1))
+        name.clear()
+        try name.push(115)
+        var digits = k
+        var place: i64 = 1
+        while place * 10 <= digits: place *= 10
+        while place > 0:
+            try name.push((u8)(48 + digits // place))
+            digits = digits % place
+            place = place // 10
+        try w.add_face((i64)w.surfaces.count - 1, true, uses.view(), size[..<1], try w.add_name((str)name.view()))
+    return w
+
+## A straight edge from point `a` to point `b`.
+func line(w: Shape*, a: i64, b: i64) -> !:
+    let p = w.points.items[(usize)a]
+    let q = w.points.items[(usize)b]
+    let c = try w.add_carrier(Carrier(0, p, try q.subtract(p).normalized(), Vector3(), 0.0, 0.0, -1))
+    _ = try w.add_edge(ShapeEdge(c, 0.0, q.subtract(p).length(), a, b))
