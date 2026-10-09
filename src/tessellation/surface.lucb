@@ -195,66 +195,70 @@ inline func local_basis(knots: const f64[], count: i64, degree: i64, parameter: 
         (*values)[level] = saved
     return span - (usize)degree
 
-## The nonzero bases at `parameter` and their first and second
-## derivatives (order k at (*out)[k * 9 + i]; zero beyond the degree), as
-## The NURBS Book's A2.3. Returns the first basis's index.
-pub func basis_derivatives(knots: const f64[], count: i64, degree: i64, parameter: f64, out: f64[27]*) -> usize:
+## Nonzero basis functions and their first two derivatives at `t` (Piegl and
+## Tiller, The NURBS Book, A2.3): `ders[k * 9 + j]` is the k-th derivative of
+## basis function first + j (zero beyond the degree). Returns `first`. A zero
+## knot difference (repeated knots) divides to 0: that basis is zero there.
+pub func basis_derivatives(knots: const f64[], count: i64, degree: i64, t: f64, ders: f64[27]*) -> usize:
     var low = (usize)degree
     var high = (usize)count
     while low + 1 < high:
         let middle = (low + high) // 2
-        if parameter < knots[middle]: high = middle
+        if t < knots[middle]: high = middle
         else: low = middle
     let span = low
     let p = (usize)degree
-    # ndu[j * 9 + r]: bases (upper triangle) and knot differences (lower).
     var ndu: f64[81]
     var left: f64[9]
     var right: f64[9]
     ndu[0] = 1.0
     for j in 1..<p + 1:
-        left[j] = parameter - knots[span + 1 - j]
-        right[j] = knots[span + j] - parameter
-        var saved = 0.0
+        left[j] = t - knots[span + 1 - j]
+        right[j] = knots[span + j] - t
+        var saved: f64 = 0.0
         for r in 0..<j:
             ndu[j * 9 + r] = right[r + 1] + left[j - r]
-            let temporary = ndu[r * 9 + j - 1] / ndu[j * 9 + r]
+            let temporary = ndu[r * 9 + j - 1] / ndu[j * 9 + r] if ndu[j * 9 + r] != 0.0 else 0.0
             ndu[r * 9 + j] = saved + right[r + 1] * temporary
             saved = left[j - r] * temporary
         ndu[j * 9 + j] = saved
-    for k in 0..<(usize)27: (*out)[k] = 0.0
-    for j in 0..<p + 1: (*out)[j] = ndu[j * 9 + p]
-    let most: i64 = 2 if degree >= 2 else degree
+    for j in 0..<27: (*ders)[j] = 0.0
+    for j in 0..<p + 1: (*ders)[j] = ndu[j * 9 + p]
     var a: f64[18]
-    for r in 0..<(i64)p + 1:
-        var s1: i64 = 0
-        var s2: i64 = 1
+    for r in 0..<p + 1:
+        var s1: usize = 0
+        var s2: usize = 1
         a[0] = 1.0
-        for k in 1..<most + 1:
-            var d = 0.0
-            let rk = r - k
-            let pk = degree - k
+        for k in 1..<(usize)3:
+            if k > p: break
+            var d: f64 = 0.0
+            let rk = (i64)r - (i64)k
+            let pk = p - k
             if r >= k:
-                a[(usize)(s2 * 9)] = a[(usize)(s1 * 9)] / ndu[(usize)((pk + 1) * 9 + rk)]
-                d = a[(usize)(s2 * 9)] * ndu[(usize)(rk * 9 + pk)]
+                let denominator = ndu[(pk + 1) * 9 + (usize)rk]
+                a[s2 * 9] = a[s1 * 9] / denominator if denominator != 0.0 else 0.0
+                d = a[s2 * 9] * ndu[(usize)rk * 9 + pk]
             let j1: i64 = 1 if rk >= -1 else -rk
-            let j2: i64 = k - 1 if r - 1 <= pk else degree - r
+            let j2: i64 = (i64)k - 1 if (i64)r - 1 <= (i64)pk else (i64)(p - r)
             var j = j1
             while j <= j2:
-                a[(usize)(s2 * 9 + j)] = (a[(usize)(s1 * 9 + j)] - a[(usize)(s1 * 9 + j - 1)]) / ndu[(usize)((pk + 1) * 9 + rk + j)]
-                d += a[(usize)(s2 * 9 + j)] * ndu[(usize)((rk + j) * 9 + pk)]
+                let denominator = ndu[(pk + 1) * 9 + (usize)(rk + j)]
+                a[s2 * 9 + (usize)j] = (a[s1 * 9 + (usize)j] - a[s1 * 9 + (usize)j - 1]) / denominator if denominator != 0.0 else 0.0
+                d += a[s2 * 9 + (usize)j] * ndu[(usize)(rk + j) * 9 + pk]
                 j += 1
             if r <= pk:
-                a[(usize)(s2 * 9 + k)] = -a[(usize)(s1 * 9 + k - 1)] / ndu[(usize)((pk + 1) * 9 + r)]
-                d += a[(usize)(s2 * 9 + k)] * ndu[(usize)(r * 9 + pk)]
-            (*out)[(usize)(k * 9 + r)] = d
+                let denominator = ndu[(pk + 1) * 9 + r]
+                a[s2 * 9 + k] = -a[s1 * 9 + k - 1] / denominator if denominator != 0.0 else 0.0
+                d += a[s2 * 9 + k] * ndu[r * 9 + pk]
+            (*ders)[k * 9 + r] = d
             let swap = s1
             s1 = s2
             s2 = swap
-    var factor = (f64)degree
-    for k in 1..<most + 1:
-        for j in 0..<(i64)p + 1: (*out)[(usize)(k * 9 + j)] *= factor
-        factor *= (f64)(degree - k)
+    var factor = (f64)p
+    for k in 1..<(usize)3:
+        if k > p: break
+        for j in 0..<p + 1: (*ders)[k * 9 + j] *= factor
+        factor *= (f64)(p - k)
     return span - p
 
 ## The hottest function of CAD import: scalar sums in the same order as the

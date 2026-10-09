@@ -19,6 +19,7 @@ pub func initialize(chains: UVChain[], face: BrepFace, s: Surface, vertices: con
         for before in 0..<use:
             seam = seam or edge_index(face.uses[use]) == edge_index(face.uses[before])
     if not seam and s.kind != 1 and s.kind != 2: return
+    let gap = chart_gap(s, tolerance)
     let closed_u = try closed_axis(s, 0, tolerance)
     let closed_v = try closed_axis(s, 1, tolerance)
     var complete = false
@@ -39,14 +40,14 @@ pub func initialize(chains: UVChain[], face: BrepFace, s: Surface, vertices: con
                 let uv = try cached(&chains[at], s, vertices, edges[index], cuts[index], tolerance, seed, use > 0)
                 let start = uv[0 if use > 0 else uv.length - 1]
                 if entry == 0: first = start
-                elif start.subtract(seed).length() > 1e-4: valid = false
+                elif not chart_near(start, seed, gap): valid = false
                 seed = uv[uv.length - 1 if use > 0 else 0]
                 # A jump across a closed support inside one sampled coedge is
                 # not an edge across the surface. Reject that chart branch.
                 if s.kind == 3:
                     for i in 1..<uv.length:
                         if (closed_u and math.abs(uv[i].x - uv[i - 1].x) > 0.5) or (closed_v and math.abs(uv[i].y - uv[i - 1].y) > 0.5): valid = false
-            if seed.subtract(first).length() > 1e-4: valid = false
+            if not chart_near(seed, first, gap): valid = false
             # A hole may begin on the other side of atan2's branch. Seed it
             # inside the outer chart, not independently around zero. This is
             # an integer-period chart choice; canonical geometry is unchanged.
@@ -63,6 +64,32 @@ pub func initialize(chains: UVChain[], face: BrepFace, s: Surface, vertices: con
             complete = true
             break
     if not complete: error(invalid, "trim loops do not close in one support chart")
+
+## How far apart two points of `s`'s chart may be and still be one point,
+## per coordinate: a hundred times `tolerance` in model units, turned into
+## an angle about the surface's radius on a cylinder, cone, sphere or torus,
+## or into a fraction of a B-spline's control net across its normalized
+## domain. (A fixed gap was a tenth of a micron on a meter-sized model and
+## a tenth of a millimeter on a micron-sized one.)
+pub func chart_gap(s: Surface, tolerance: f64) -> Vector3:
+    let reach = tolerance * 100.0
+    if s.kind == 0: return Vector3(reach, reach, 0.0)
+    if s.kind == 1 or s.kind == 2: return Vector3(reach / math.max(s.radius, reach), reach, 0.0)
+    if s.kind == 4:
+        let angle = reach / math.max(s.radius, reach)
+        return Vector3(angle, angle, 0.0)
+    if s.kind == 5: return Vector3(reach / math.max(s.radius - s.angle, reach), reach / math.max(s.angle, reach), 0.0)
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for p in s.points:
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    let fraction = reach / math.max(high.subtract(low).length(), reach)
+    return Vector3(fraction, fraction, 0.0)
+
+## Whether chart points `a` and `b` are one point (chart_gap's `gap`).
+pub func chart_near(a: Vector3, b: Vector3, gap: Vector3) -> bool:
+    return math.abs(a.x - b.x) <= gap.x and math.abs(a.y - b.y) <= gap.y
 
 func closed_axis(s: Surface, axis: usize, tolerance: f64) -> bool!:
     if s.kind != 3: return false

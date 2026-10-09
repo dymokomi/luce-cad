@@ -13,6 +13,7 @@ from face_errors import FaceErrors
 from luce_geocore.core import parallel
 from brep_types import Surface, BrepFace
 from mapped_patch import parameter
+from tessellation.surface import basis_derivatives
 
 pub struct Curvature:
     pub var k1: f64 = 0.0
@@ -158,71 +159,6 @@ func nurbs_chart(s: Surface, uv: Vector3, c: Chart*) -> bool!:
     c.svv = a[5].subtract(c.sv.multiply_scalar(2.0 * w[2])).subtract(point.multiply_scalar(w[5])).multiply_scalar(inverse)
     let scale = math.max(c.su.dot(c.su), c.sv.dot(c.sv))
     return scale > 0.0 and c.su.cross(c.sv).length() > 1e-12 * scale
-
-## Nonzero basis functions and their first two derivatives at `t` (Piegl and
-## Tiller, The NURBS Book, A2.3): `ders[k * 9 + j]` is the k-th derivative of
-## basis function first + j. Returns `first`.
-func basis_derivatives(knots: const f64[], count: i64, degree: i64, t: f64, ders: f64[27]*) -> usize:
-    var low = (usize)degree
-    var high = (usize)count
-    while low + 1 < high:
-        let middle = (low + high) // 2
-        if t < knots[middle]: high = middle
-        else: low = middle
-    let span = low
-    let p = (usize)degree
-    var ndu: f64[81]
-    var left: f64[9]
-    var right: f64[9]
-    ndu[0] = 1.0
-    for j in 1..<p + 1:
-        left[j] = t - knots[span + 1 - j]
-        right[j] = knots[span + j] - t
-        var saved: f64 = 0.0
-        for r in 0..<j:
-            ndu[j * 9 + r] = right[r + 1] + left[j - r]
-            let temporary = ndu[r * 9 + j - 1] / ndu[j * 9 + r] if ndu[j * 9 + r] != 0.0 else 0.0
-            ndu[r * 9 + j] = saved + right[r + 1] * temporary
-            saved = left[j - r] * temporary
-        ndu[j * 9 + j] = saved
-    for j in 0..<27: (*ders)[j] = 0.0
-    for j in 0..<p + 1: (*ders)[j] = ndu[j * 9 + p]
-    var a: f64[18]
-    for r in 0..<p + 1:
-        var s1: usize = 0
-        var s2: usize = 1
-        a[0] = 1.0
-        for k in 1..<(usize)3:
-            if k > p: break
-            var d: f64 = 0.0
-            let rk = (i64)r - (i64)k
-            let pk = p - k
-            if r >= k:
-                let denominator = ndu[(pk + 1) * 9 + (usize)rk]
-                a[s2 * 9] = a[s1 * 9] / denominator if denominator != 0.0 else 0.0
-                d = a[s2 * 9] * ndu[(usize)rk * 9 + pk]
-            let j1: i64 = 1 if rk >= -1 else -rk
-            let j2: i64 = (i64)k - 1 if (i64)r - 1 <= (i64)pk else (i64)(p - r)
-            var j = j1
-            while j <= j2:
-                let denominator = ndu[(pk + 1) * 9 + (usize)(rk + j)]
-                a[s2 * 9 + (usize)j] = (a[s1 * 9 + (usize)j] - a[s1 * 9 + (usize)j - 1]) / denominator if denominator != 0.0 else 0.0
-                d += a[s2 * 9 + (usize)j] * ndu[(usize)(rk + j) * 9 + pk]
-                j += 1
-            if r <= pk:
-                let denominator = ndu[(pk + 1) * 9 + r]
-                a[s2 * 9 + k] = -a[s1 * 9 + k - 1] / denominator if denominator != 0.0 else 0.0
-                d += a[s2 * 9 + k] * ndu[r * 9 + pk]
-            (*ders)[k * 9 + r] = d
-            let swap = s1
-            s1 = s2
-            s2 = swap
-    var factor = (f64)p
-    for k in 1..<(usize)3:
-        if k > p: break
-        for j in 0..<p + 1: (*ders)[k * 9 + j] *= factor
-        factor *= (f64)(p - k)
-    return span - p
 
 ## Corner curvatures for one face's contiguous corner range: k1 and k2 per
 ## corner, and with `directions` d1 and d2 (xyz each). Corners sharing a point

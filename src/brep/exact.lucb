@@ -14,7 +14,7 @@
 import curve_spacing as spacing
 from edge_sampling import compact_seams, curve_intervals
 from layout_types import Stations, UVChain
-from trim_chains import refreshed
+from trim_chains import refreshed, chart_gap, chart_near
 from patch_sides import edge_index
 
 ## A face's support, copied out of the model.
@@ -64,6 +64,7 @@ pub struct FaceSupport:
 ## line on the face's side.
 func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], edges: const Curve[], stations: const Stations[], tolerance: f64, initial: Vector3, uv: Growing[Vector3]*, sizes: Growing[i64]*) -> bool!:
     let period = 2.0 * math.pi if surface.kind == 1 or surface.kind == 2 or surface.kind == 4 or surface.kind == 5 else 0.0
+    let gap = chart_gap(surface, tolerance)
     var offset: usize = 0
     var loop_seed = initial
     var junctions = Growing[usize]()
@@ -84,10 +85,10 @@ func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], ed
             var shift = 0.0
             let at_singular = entry > 0 and singular(surface, seed, tolerance)
             if at_singular: try junctions.push(uv.count)
-            if entry > 0 and not at_singular and begin.subtract(seed).length() > 1e-4:
-                if period > 0.0 and begin.add(Vector3(period, 0.0, 0.0)).subtract(seed).length() <= 1e-4:
+            if entry > 0 and not at_singular and not chart_near(begin, seed, gap):
+                if period > 0.0 and chart_near(begin.add(Vector3(period, 0.0, 0.0)), seed, gap):
                     shift = period
-                elif period > 0.0 and begin.subtract(Vector3(period, 0.0, 0.0)).subtract(seed).length() <= 1e-4:
+                elif period > 0.0 and chart_near(begin.subtract(Vector3(period, 0.0, 0.0)), seed, gap):
                     shift = -period
                 else:
                     return false
@@ -96,7 +97,7 @@ func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], ed
                 try uv.push(points[step if forward else points.length - 1 - step].add(Vector3(shift, 0.0, 0.0)))
             seed = points[points.length - 1 if forward else 0].add(Vector3(shift, 0.0, 0.0))
         let first = uv.items[start]
-        if seed.subtract(first).length() > 1e-4 and not (try close_loop(face, surface, tolerance, period, uv, start, seed, junctions.view())):
+        if not chart_near(seed, first, gap) and not (try close_loop(face, surface, gap, period, uv, start, seed, junctions.view())):
             return false
         try sizes.push((i64)(uv.count - start))
         # A hole on a periodic support is seeded inside the outer loop's chart.
@@ -114,16 +115,16 @@ func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], ed
 ## the coedges after a singular junction to the chart's other side, or,
 ## for a loop wrapping once around the period, along the singular line on
 ## the face's side. False when neither closes it.
-func close_loop(face: BrepFace, surface: Surface, tolerance: f64, period: f64, uv: Growing[Vector3]*, start: usize, end: Vector3, junctions: const usize[]) -> bool!:
+func close_loop(face: BrepFace, surface: Surface, gap: Vector3, period: f64, uv: Growing[Vector3]*, start: usize, end: Vector3, junctions: const usize[]) -> bool!:
     if period <= 0.0: return false
     let first = uv.items[start]
     for junction in junctions:
         for side in [-period, period]:
-            if end.add(Vector3(side, 0.0, 0.0)).subtract(first).length() <= 1e-4:
+            if chart_near(end.add(Vector3(side, 0.0, 0.0)), first, gap):
                 for at in junction..<uv.count: uv.items[at] = uv.items[at].add(Vector3(side, 0.0, 0.0))
                 return true
     let wrap = end.x - first.x
-    if math.abs(math.abs(wrap) - period) > 1e-4 or math.abs(end.y - first.y) > 1e-4: return false
+    if math.abs(math.abs(wrap) - period) > gap.x or math.abs(end.y - first.y) > gap.y: return false
     # Left of the loop's direction in (u, v) is the face when it follows
     # the support's normal.
     let upward = (wrap > 0.0) == face.sense

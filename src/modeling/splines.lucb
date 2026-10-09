@@ -5,27 +5,16 @@
 ## G3 continuity are such surfaces (blend.lucb), as are extruded splines.
 ## Other pairs with B-spline surfaces are not supported yet.
 
-## Surface `s`'s parameters at `p` (on it), by inversion from `seed`;
-## NaN when it fails.
-func spline_uv(s: const Surface*, p: Vector3, seed: Vector3 = Vector3(0.5, 0.5, 0.0)) -> (f64, f64):
-    let uv = project(*s, p, seed, 1e-7) catch failure:
-        _ = failure
-        recover Vector3(0.0 / 0.0, 0.0 / 0.0, 0.0)
+## Surface `s`'s parameters at `p` (on it), by inversion from `seed`; an
+## error when `p` is not on it.
+func spline_uv(s: const Surface*, p: Vector3, seed: Vector3 = Vector3(0.5, 0.5, 0.0)) -> (f64, f64)!:
+    let uv = try project(*s, p, seed, 1e-7)
     return (uv.x, uv.y)
 
-## Surface `s`'s unit normal at `p` (du x dv, by differences).
+## Surface `s`'s unit normal at `p` (du x dv, exactly).
 func spline_normal(s: const Surface*, p: Vector3) -> Vector3!:
-    let (u, v) = spline_uv(s, p)
-    if not math.is_finite(u): error(invalid, "a point is not on its B-spline surface")
-    let h = 1e-6
-    let u0 = math.max(0.0, u - h)
-    let u1 = math.min(1.0, u + h)
-    let v0 = math.max(0.0, v - h)
-    let v1 = math.min(1.0, v + h)
-    let du = (try evaluate(*s, Vector3(u1, v, 0.0))).subtract(try evaluate(*s, Vector3(u0, v, 0.0)))
-    let dv = (try evaluate(*s, Vector3(u, v1, 0.0))).subtract(try evaluate(*s, Vector3(u, v0, 0.0)))
-    # Each difference is tiny: their units, crossed.
-    return try (try du.normalized()).cross(try dv.normalized()).normalized()
+    let (u, v) = try spline_uv(s, p)
+    return try nurbs_normal(*s, Vector3(u, v, 0.0))
 
 ## Whether `s` is a profile swept straight, and the sweep (the second row's
 ## offset from the first).
@@ -178,10 +167,9 @@ func revolution_of(s: const Surface*, tol: f64) -> (bool, Vector3, Vector3):
         let q2 = s.points[u * 5 + 2]
         let q4 = s.points[u * 5 + 4]
         let n = q2.subtract(q0).cross(q4.subtract(q0))
-        if n.length() <= tol * tol: continue
-        let axis = n.normalized() catch failure:
-            _ = failure
-            recover Vector3()
+        let length = n.length()
+        if length <= tol * tol: continue
+        let axis = n.multiply_scalar(1.0 / length)
         # The circle's center: where the chords' bisectors meet, in its plane.
         let m1 = q0.add(q2).multiply_scalar(0.5)
         let m2 = q2.add(q4).multiply_scalar(0.5)
@@ -282,8 +270,12 @@ func extrusion_pair(w: Shape*, a: const Surface*, sweep_a: Vector3, b: const Sur
                 var on = true
                 for step in 0..<9:
                     let q = try spline_point(w, curves.items[0].spline, (f64)step / 8.0)
-                    let (u, v) = spline_uv(b, q)
-                    if not math.is_finite(u) or (try evaluate(*b, Vector3(u, v, 0.0))).subtract(q).length() > tol * 100.0:
+                    # Off `b` where it cannot be inverted there.
+                    let uv = project(*b, q, Vector3(0.5, 0.5, 0.0), 1e-7) catch failure:
+                        if failure.code != invalid: error(failure.code, failure.message)
+                        on = false
+                        break
+                    if (try evaluate(*b, uv)).subtract(q).length() > tol * 100.0:
                         on = false
                         break
                 if on:

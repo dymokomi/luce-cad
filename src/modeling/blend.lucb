@@ -133,7 +133,7 @@ func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, 
     let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
     let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
     let radius = s.radius
-    let n_plane = face_outward_at(w, plane, p)
+    let n_plane = try w.face_normal(plane, p)
     # Away from the axis, the cylinder's outward normal at p, or toward it.
     let away = (try w.face_normal(cylinder, p)).dot(p.subtract(axis_point)) > 0.0
     var ta = Vector3()
@@ -164,11 +164,6 @@ func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, 
         tb = axis_point.add(turned_direction(r0, s.z, turn * size / radius))
     return (ta, tb, center)
 
-func face_outward_at(w: const Shape*, f: usize, p: Vector3) -> Vector3:
-    return w.face_normal(f, p) catch failure:
-        _ = failure
-        recover Vector3()
-
 ## Whether edge `e`'s faces turn away from each other (the other face runs
 ## below this one's outward normal): a blend takes material away there.
 ## Concave edges (an inside corner) are blended by adding it.
@@ -180,12 +175,12 @@ func convex(w: const Shape*, e: usize) -> bool!:
 ## The tool that blends edge `e` from `start` to `end` (its chain's ends),
 ## a fillet of `size` radius when `round`, else a chamfer `size` along each
 ## face, as a closed solid.
-## `body` is the solid's mesh: the tool reaches past an end only where
-## nothing is there (an outside corner), and stops flush where the solid
-## goes on (a wall the edge runs into).
+## `body` holds rays against the solid's faces: the tool reaches past an
+## end only where nothing is there (an outside corner), and stops flush
+## where the solid goes on (a wall the edge runs into).
 ## An end marked exact (where a corner ball takes over) stops right there.
 ## Its blend face is named `name`.
-func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: const Mesh*, name: str) -> interop.Reference[CadModel]!:
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str) -> interop.Reference[CadModel]!:
     if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 1: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
@@ -196,8 +191,8 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i6
     let margin = size * 2.0 + length * 0.01
     let corner = try ua.add(ub).normalized().multiply_scalar(size * 0.25)
     let extent = math.max(length, size) * 4.0
-    let before = 0.0 if exact_start or try inside_mesh(body, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
-    let after = 0.0 if exact_end or try inside_mesh(body, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
+    let before = 0.0 if exact_start or try body.inside(w, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
+    let after = 0.0 if exact_end or try body.inside(w, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
     var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity)
     defer profile.close()
     let solid = try new_solid(length + margin * 2.0)
@@ -337,7 +332,7 @@ func name_tool(b: BrepModel*, name: str) -> !:
 ## turns all the way; an arc's turns along it, reaching past an end where
 ## the corner beyond is empty and stopping at an exact one (a tangent
 ## joint with the next edge of a chain).
-func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, exact_start: bool, exact_end: bool, body: const Mesh*, name: str) -> interop.Reference[CadModel]!:
+func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str) -> interop.Reference[CadModel]!:
     let edge = w.edges.items[e]
     let carrier = w.carriers.items[(usize)edge.carrier]
     let (fa, fb) = try edge_faces(w, e)
@@ -364,8 +359,8 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     let extent = (carrier.a + size) * 4.0
     let first = try w.edge_at(e, 0.0)
     let last = try w.edge_at(e, 1.0)
-    let before = 0.0 if exact_start or try inside_mesh(body, turned_point(first, carrier.origin, a, -size * 0.5 / carrier.a).add(turned_direction(corner, a, -sweep * 0.5)), extent) else margin
-    let after = 0.0 if exact_end or try inside_mesh(body, turned_point(last, carrier.origin, a, size * 0.5 / carrier.a).add(turned_direction(corner, a, sweep * 0.5)), extent) else margin
+    let before = 0.0 if exact_start or try body.inside(w, turned_point(first, carrier.origin, a, -size * 0.5 / carrier.a).add(turned_direction(corner, a, -sweep * 0.5)), extent) else margin
+    let after = 0.0 if exact_end or try body.inside(w, turned_point(last, carrier.origin, a, size * 0.5 / carrier.a).add(turned_direction(corner, a, sweep * 0.5)), extent) else margin
     # The profile where the tool starts: the middle's turned back.
     let back = -(sweep * 0.5 + before)
     var profile = try corner_profile(turned_point(p, carrier.origin, a, back), turned_direction(along, a, back), turned_direction(ua, a, back), turned_direction(ub, a, back), size, round, continuity)
@@ -453,8 +448,8 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
     var joints = Growing[i64]()
     defer joints.close()
     try fillet_corners(w, chosen, size, continuity, round, &balls, &setbacks, &joints)
-    let body = try model.tessellate(16)
-    defer body.release()
+    var body = try shape_rays(w)
+    defer body.close()
     var tools = Growing[interop.Reference[CadModel]]()
     defer:
         for tool in tools.view(): tool.release()
@@ -482,7 +477,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             let edge = w.edges.items[e]
             let at_start = vertex_in(joints.view(), edge.start)
             let at_end = vertex_in(joints.view(), edge.end)
-            try tools.push(try edge_tool(w, e, size, round, continuity, low, high, at_start, at_end, body.value(), (str)name.view()))
+            try tools.push(try edge_tool(w, e, size, round, continuity, low, high, at_start, at_end, &body, (str)name.view()))
             try adds.push(adding)
             continue
         let (fa, fb) = try edge_faces(w, e)
@@ -537,7 +532,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             if corner.subtract(low).length() <= w.tolerance * 10.0: exact_low = true
             elif corner.subtract(high).length() <= w.tolerance * 10.0: exact_high = true
         if adding: try tools.push(try concave_tool(w, e, size, round, continuity, low, high, exact_low, exact_high, (str)name.view()))
-        else: try tools.push(try edge_tool(w, e, size, round, continuity, low, high, exact_low, exact_high, body.value(), (str)name.view()))
+        else: try tools.push(try edge_tool(w, e, size, round, continuity, low, high, exact_low, exact_high, &body, (str)name.view()))
         try adds.push(adding)
     for ball in balls.view():
         try corner_name(w, (usize)ball.vertex, tag, &name)
