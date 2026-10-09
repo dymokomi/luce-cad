@@ -33,7 +33,7 @@ func crossings(sketch: const Sketch*, curve: i64, out: Growing[Crossing]*) -> !:
     out.count = kept
 
 ## Where curve `other` meets curve `curve` (as places along `curve`); with
-## `beyond`, `curve` counts as running on past its end_xy (lines as lines,
+## `beyond`, `curve` counts as running on past its ends (lines as lines,
 ## arcs round their circle), for Extend.
 func meet(sketch: const Sketch*, curve: i64, other: i64, beyond: bool, out: Growing[Crossing]*) -> !:
     let a = sketch.entity(curve)
@@ -45,7 +45,7 @@ func meet(sketch: const Sketch*, curve: i64, other: i64, beyond: bool, out: Grow
     defer hits.close()
     # Points (x, y) common to both carriers.
     if is_free_form(b.kind):
-        try free_hits(sketch, a, b, beyond, &hits)
+        try free_hits(sketch, curve, b, &hits)
     elif a.kind == EntityKind.line and b.kind == EntityKind.line:
         let (ax, ay, dx, dy) = line_of(sketch, a)
         let (bx, by, ex, ey) = line_of(sketch, b)
@@ -99,41 +99,37 @@ func meet(sketch: const Sketch*, curve: i64, other: i64, beyond: bool, out: Grow
         if not on_curve(sketch, curve, x, y, tolerance * 1000.0, beyond): continue
         try out.push(Crossing(place_of(sketch, curve, x, y), x, y, other))
 
-## Where spline, ellipse or conic `b` crosses line, circle or arc `a`'s
-## carrier, onto `hits` as x, y: its samples' sign changes against the
+## Where spline, ellipse or conic `b` crosses line, circle or arc
+## `curve`'s carrier (the whole line or circle, so Extend's `beyond`
+## holds), onto `hits` as x, y: its samples' sign changes against the
 ## carrier, each refined by bisection along it to the sketch's precision.
-func free_hits(sketch: const Sketch*, a: SketchEntity, b: SketchEntity, beyond: bool, hits: Growing[f64]*) -> !:
-    _ = beyond
+func free_hits(sketch: const Sketch*, curve: i64, b: SketchEntity, hits: Growing[f64]*) -> !:
     var net = new_net()
     defer net.close()
     try net_of(sketch, b, &net)
     let (low, high) = net.range()
     let steps: usize = 256
-    var previous = carrier_side(sketch, a, net.at(low))
+    var previous = side_at(sketch, curve, net.at(low))
     for k in 1..<steps + 1:
         let t1 = low + (high - low) * (f64)k / (f64)steps
-        let now = carrier_side(sketch, a, net.at(t1))
+        let now = side_at(sketch, curve, net.at(t1))
         if (previous < 0.0) != (now < 0.0) or now == 0.0:
             var lo = t1 - (high - low) / (f64)steps
             var hi = t1
             let below = previous < 0.0
             for i in 0..<(usize)60:
                 let middle = (lo + hi) * 0.5
-                if (carrier_side(sketch, a, net.at(middle)) < 0.0) == below: lo = middle
+                if (side_at(sketch, curve, net.at(middle)) < 0.0) == below: lo = middle
                 else: hi = middle
             let (x, y) = net.at((lo + hi) * 0.5)
             try hits.push(x)
             try hits.push(y)
         previous = now
 
-## Which side of line, circle or arc `a`'s carrier point `at` is (its
-## signed distance: left of a line, outside a circle).
-func carrier_side(sketch: const Sketch*, a: SketchEntity, at: (f64, f64)) -> f64:
+## Which side of line, circle or arc `curve`'s carrier point `at` is.
+func side_at(sketch: const Sketch*, curve: i64, at: (f64, f64)) -> f64:
     let (x, y) = at
-    if a.kind == EntityKind.line:
-        let (ax, ay, dx, dy) = line_of(sketch, a)
-        return (dx * (y - ay) - dy * (x - ax)) / math.max(math.hypot(dx, dy), 1e-300)
-    return math.hypot(x - sketch.x(a.first), y - sketch.y(a.first)) - sketch.params.items[(usize)a.second]
+    return signed_side(sketch, curve, x, y)
 
 ## Whether (`x`, `y`) on its curve's carrier lies on curve `curve` itself
 ## (with `beyond`, anywhere on a line's line or an arc's circle).
@@ -152,7 +148,7 @@ func around(found: const Growing[Crossing]*, here: f64) -> (i64, i64):
     var high: i64 = -1
     for at in 0..<found.count:
         let p = found.items[at].place
-        # Crossings at a curve's own end_xy are its end_xy.
+        # Crossings at a curve's own ends are its ends.
         if p <= 1e-9 or p >= 1.0 - 1e-9: continue
         if p < here: low = (i64)at
         elif high < 0: high = (i64)at
