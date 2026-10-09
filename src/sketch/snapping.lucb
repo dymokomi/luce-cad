@@ -1,0 +1,112 @@
+## Snapping in a sketch: where the pointer lands among what the sketch
+## already has, for the editor's snapping layer (luced-3d snapping.luc). In
+## order: a point (an end, a center, any sketch point), the crossing of two
+## curves near it, a line's or arc's middle, a place on a curve. Each kind
+## can be left out, and an entity skipped (the point a drag moves, a
+## line's start while its end is placed).
+
+## The kinds, as bits of a mask and as a result.
+pub let snap_point: i64 = 1
+pub let snap_middle: i64 = 2
+pub let snap_crossing: i64 = 4
+pub let snap_curve: i64 = 8
+
+## Where a snap landed: its kind (0 none), place and entity (a crossing's
+## two curves: `entity` and `other`; a middle's line or arc).
+pub struct SnapHit:
+    pub var kind: i64
+    pub var x: f64
+    pub var y: f64
+    pub var entity: i64
+    pub var other: i64
+
+## The snap for (`x`, `y`) within `reach` among the kinds in `mask`, not
+## entity `skip`.
+pub func snap_in(sketch: const Sketch*, x: f64, y: f64, reach: f64, mask: i64, skip: i64) -> SnapHit!:
+    var best = SnapHit(0, x, y, -1, -1)
+    # Points first: the closest within reach.
+    if mask & snap_point != 0:
+        var closest = reach
+        for at in 0..<sketch.entities.count:
+            let e = sketch.entities.items[at]
+            if e.kind != EntityKind.point or (i64)at == skip: continue
+            let d = math.hypot(sketch.x((i64)at) - x, sketch.y((i64)at) - y)
+            if d <= closest:
+                closest = d
+                best = SnapHit(snap_point, sketch.x((i64)at), sketch.y((i64)at), (i64)at, -1)
+        if best.kind != 0: return best
+    # Curves near the pointer (within twice the reach): their crossings,
+    # middles and closest places.
+    var near = Growing[i64]()
+    defer near.close()
+    for at in 0..<sketch.entities.count:
+        let e = sketch.entities.items[at]
+        if e.kind == EntityKind.point or e.kind == EntityKind.text or (i64)at == skip: continue
+        if distance_to(sketch, e, (i64)at, x, y) <= 2.0 * reach: try near.push((i64)at)
+    if mask & snap_crossing != 0:
+        var closest = reach
+        var found = Growing[Crossing]()
+        defer found.close()
+        for i in 0..<near.count:
+            for j in i + 1..<near.count:
+                found.clear()
+                try meet(sketch, near.items[i], near.items[j], false, &found)
+                for c in found.view():
+                    let d = math.hypot(c.x - x, c.y - y)
+                    if d <= closest:
+                        closest = d
+                        best = SnapHit(snap_crossing, c.x, c.y, near.items[i], near.items[j])
+        if best.kind != 0: return best
+    if mask & snap_middle != 0:
+        var closest = reach
+        for c in near.view():
+            let e = sketch.entity(c)
+            if e.kind != EntityKind.line and e.kind != EntityKind.arc: continue
+            let (mx, my) = at_place(sketch, c, 0.5)
+            let d = math.hypot(mx - x, my - y)
+            if d <= closest:
+                closest = d
+                best = SnapHit(snap_middle, mx, my, c, -1)
+        if best.kind != 0: return best
+    if mask & snap_curve != 0:
+        var closest = reach
+        for c in near.view():
+            let e = sketch.entity(c)
+            let d = distance_to(sketch, e, c, x, y)
+            if d <= closest:
+                closest = d
+                let (on_x, on_y) = nearest_on(sketch, c, x, y)
+                best = SnapHit(snap_curve, on_x, on_y, c, -1)
+    return best
+
+## The place on curve `curve` closest (`x`, `y`).
+func nearest_on(sketch: const Sketch*, curve: i64, x: f64, y: f64) -> (f64, f64):
+    let e = sketch.entity(curve)
+    if e.kind == EntityKind.line:
+        let place = math.max(0.0, math.min(1.0, place_of(sketch, curve, x, y)))
+        return at_place(sketch, curve, place)
+    if e.kind == EntityKind.circle or e.kind == EntityKind.arc:
+        let cx = sketch.x(e.first)
+        let cy = sketch.y(e.first)
+        let d = math.hypot(x - cx, y - cy)
+        if d <= 0.0: return (x, y)
+        if e.kind == EntityKind.arc:
+            let place = place_of(sketch, curve, x, y)
+            if place < 0.0 or place > 1.0: return at_place(sketch, curve, math.max(0.0, math.min(1.0, place)))
+        let r = sketch.radius_of(curve)
+        return (cx + (x - cx) * r / d, cy + (y - cy) * r / d)
+    # A free-form curve: its closest sample.
+    var points = Growing[f64]()
+    defer points.close()
+    samples_of(sketch, e, 192, &points) catch failure:
+        return (x, y)
+    var best = 1e300
+    var bx = x
+    var by = y
+    for k in 0..<points.count // 2:
+        let d = math.hypot(points.items[2 * k] - x, points.items[2 * k + 1] - y)
+        if d < best:
+            best = d
+            bx = points.items[2 * k]
+            by = points.items[2 * k + 1]
+    return (bx, by)
