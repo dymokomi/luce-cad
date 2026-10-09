@@ -7,6 +7,34 @@
 ## A place along a curve: a line's from 0 at its start to 1 at its end; an
 ## arc's the same along its sweep; a circle's an angle (radians).
 
+## Whether entity kind `kind` is a spline, an ellipse or a conic (a NURBS:
+## shapes.lucb), and whether it is known by its samples (those, and text).
+pub func is_free_form(kind: EntityKind) -> bool:
+    return kind == EntityKind.spline or kind == EntityKind.ellipse or kind == EntityKind.conic
+
+pub func is_sampled(kind: EntityKind) -> bool:
+    return is_free_form(kind) or kind == EntityKind.text
+
+## A curve's start (`start`) or end point: a line's, an arc's, a spline's
+## first or last, a conic's; -1 for a curve without ends (a circle, an
+## ellipse, a text) or a point.
+pub func end_point(sketch: const Sketch*, e: SketchEntity, start: bool) -> i64:
+    if e.kind == EntityKind.line: return e.first if start else e.second
+    if e.kind == EntityKind.arc: return e.third if start else e.fourth
+    if e.kind == EntityKind.conic: return e.first if start else e.third
+    if e.kind == EntityKind.spline: return sketch.spline_point(e, 0 if start else e.second - 1)
+    return -1
+
+## Arc `e`'s start angle and its counterclockwise sweep (0, 2π].
+pub func arc_sweep(sketch: const Sketch*, e: SketchEntity) -> (f64, f64):
+    let cx = sketch.x(e.first)
+    let cy = sketch.y(e.first)
+    let start = math.atan2(sketch.y(e.third) - cy, sketch.x(e.third) - cx)
+    var sweep = math.atan2(sketch.y(e.fourth) - cy, sketch.x(e.fourth) - cx) - start
+    while sweep <= 0.0: sweep += 2.0 * math.pi
+    while sweep > 2.0 * math.pi: sweep -= 2.0 * math.pi
+    return (start, sweep)
+
 ## A line's start and direction.
 func line_of(sketch: const Sketch*, e: SketchEntity) -> (f64, f64, f64, f64):
     let ax = sketch.x(e.first)
@@ -39,7 +67,7 @@ func signed_side(sketch: const Sketch*, curve: i64, x: f64, y: f64) -> f64:
     if e.kind == EntityKind.line:
         let (ax, ay, dx, dy) = line_of(sketch, e)
         return (dx * (y - ay) - dy * (x - ax)) / math.max(math.hypot(dx, dy), 1e-300)
-    if (u8)e.kind > 3:
+    if is_sampled(e.kind):
         # Left (+) or right of the curve where it passes nearest.
         var net = new_net()
         defer net.close()
@@ -71,9 +99,7 @@ func at_place(sketch: const Sketch*, curve: i64, place: f64) -> (f64, f64):
     let r = sketch.radius_of(curve)
     var angle = place
     if e.kind == EntityKind.arc:
-        let start = math.atan2(sketch.y(e.third) - cy, sketch.x(e.third) - cx)
-        var sweep = math.atan2(sketch.y(e.fourth) - cy, sketch.x(e.fourth) - cx) - start
-        while sweep <= 0.0: sweep += 2.0 * math.pi
+        let (start, sweep) = arc_sweep(sketch, e)
         angle = start + sweep * place
     return (cx + r * math.cos(angle), cy + r * math.sin(angle))
 
@@ -90,9 +116,7 @@ func place_of(sketch: const Sketch*, curve: i64, x: f64, y: f64) -> f64:
     let angle = math.atan2(y - cy, x - cx)
     if e.kind == EntityKind.circle:
         return angle if angle >= 0.0 else angle + 2.0 * math.pi
-    let start = math.atan2(sketch.y(e.third) - cy, sketch.x(e.third) - cx)
-    var sweep = math.atan2(sketch.y(e.fourth) - cy, sketch.x(e.fourth) - cx) - start
-    while sweep <= 0.0: sweep += 2.0 * math.pi
+    let (start, sweep) = arc_sweep(sketch, e)
     var turn = angle - start
     while turn < 0.0: turn += 2.0 * math.pi
     # Past the end: the shorter way, before the start (negative) or after
@@ -107,7 +131,7 @@ func holds_points(kind: EntityKind) -> bool:
 func require_curve(sketch: const Sketch*, curve: i64) -> !:
     if curve < 0 or curve >= (i64)sketch.entities.count or sketch.entity(curve).kind == EntityKind.point:
         error(invalid, "this works on a sketch's curves")
-    if (u8)sketch.entity(curve).kind > 3:
+    if is_sampled(sketch.entity(curve).kind):
         error(invalid, "this works on lines, circles and arcs (a spline, ellipse or conic goes whole with Delete)")
 
 ## The entity of `sketch` nearest (`x`, `y`) within `reach`: a point if one
@@ -150,7 +174,7 @@ func samples_of(sketch: const Sketch*, e: SketchEntity, count: usize, out: Growi
 ## How far (`x`, `y`) is from entity `e` (index `at`).
 func distance_to(sketch: const Sketch*, e: SketchEntity, at: i64, x: f64, y: f64) -> f64:
     if e.kind == EntityKind.point: return math.hypot(sketch.x(at) - x, sketch.y(at) - y)
-    if (u8)e.kind > 3:
+    if is_sampled(e.kind):
         # A spline, ellipse, conic or text: its samples as polylines.
         var points = Growing[f64]()
         defer points.close()
@@ -175,9 +199,7 @@ func distance_to(sketch: const Sketch*, e: SketchEntity, at: i64, x: f64, y: f64
     let off = math.abs(math.hypot(x - cx, y - cy) - r)
     if e.kind == EntityKind.circle: return off
     # An arc: on its sweep, the distance to its circle; else to its ends.
-    let start = math.atan2(sketch.y(e.third) - cy, sketch.x(e.third) - cx)
-    var sweep = math.atan2(sketch.y(e.fourth) - cy, sketch.x(e.fourth) - cx) - start
-    while sweep <= 0.0: sweep += 2.0 * math.pi
+    let (start, sweep) = arc_sweep(sketch, e)
     var along = math.atan2(y - cy, x - cx) - start
     while along < 0.0: along += 2.0 * math.pi
     if along <= sweep: return off
