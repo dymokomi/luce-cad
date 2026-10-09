@@ -443,7 +443,7 @@ The columns are float32.
 
 ## Parallel work
 
-One persistent worker pool (luce-geocore's `geocore_parallel`, processors minus one, shared with the geometry kernels) runs
+One persistent worker pool (luce-std's `parallel`, process-wide, shared with the geometry kernels) runs
 the per-face work: layout seeding and row setup, speculative crossing
 computation, face meshing and normals, curvature and previews. Each item runs
 in its own runtime context and hands back raw arrays only. Layout

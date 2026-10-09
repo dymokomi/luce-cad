@@ -154,8 +154,8 @@ struct PartJob:
     let parts: PreviewPart[]
     var stop: @bool
 
-func part_item(raw: void*?, index: usize):
-    let job = (PartJob*)(raw else return)
+func part_item(raw: void*, index: usize, worker: usize):
+    let job = (PartJob*)raw
     if job.stop.load(.acquire): return
     let make = job.make
     make(job.context, index, &job.parts[index])
@@ -168,16 +168,15 @@ pub func collect_preview(faces: usize, edges: usize, make: PartMaker, context: v
     for at in 0..<faces: parts[at] = PreviewPart()
     defer close_parts(parts)
     var job = PartJob(make = make, context = context, parts = parts)
-    var pooled = parallel.Job()
-    parallel.start(&pooled, faces, part_item, (void*)&job)
+    var pooled = try parallel.start(faces, (void*)&job, part_item)
     var waiting = true
     defer:
         if waiting:
             job.stop.store(true, .release)
-            parallel.wait(&pooled)
+            pooled.wait() catch failure: _ = failure
     var reported: usize = 0
     while true:
-        let completed = parallel.completed(&pooled)
+        let completed = pooled.progress()
         if completed != reported:
             if let report = progress:
                 let outcome = report.invoke((f64)completed / (f64)faces)
@@ -186,8 +185,8 @@ pub func collect_preview(faces: usize, edges: usize, make: PartMaker, context: v
             reported = completed
         if completed >= faces: break
         thread.sleep(2)
-    parallel.wait(&pooled)
     waiting = false
+    try pooled.wait()
     for part in parts:
         if part.fatal_failure:
             if let failure = part.failure:

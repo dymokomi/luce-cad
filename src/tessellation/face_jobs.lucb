@@ -71,9 +71,9 @@ struct Jobs:
     let order: const usize[]
 
 ## One pool item per worker: each keeps one scratch builder for all its faces.
-func run(raw: void*?, slot: usize):
+func run(raw: void*, slot: usize, worker: usize):
     _ = slot
-    let jobs = (Jobs*)(raw else return)
+    let jobs = (Jobs*)raw
     run_jobs(jobs) catch failure:
         jobs.lock.lock()
         defer jobs.lock.unlock()
@@ -161,16 +161,15 @@ pub func mesh_faces(mesh: MeshBuilder*, edges: const Curve[], surfaces: const Su
     if let store = cache:
         try face_tables(faces, samples, plans, &tables)
         var keying = Keying(faces, surfaces, edges, samples, plans, mesh.points[..<mesh.np], &tables, divisions, tolerance, edge_size, keys)
-        parallel.parallel_for(faces.length, 16, key_faces, (void*)&keying)
+        try parallel.for_each_range(faces.length, 16, (void*)&keying, key_faces)
         for index in 0..<faces.length: found[index] = store.find(index, keys[index])
     for index in 0..<faces.length:
         if found[index] == none: try order.push(index)
     var jobs = Jobs(points = mesh.points[..<mesh.np], edges = edges, surfaces = surfaces, faces = faces, samples = samples, plans = plans, divisions = divisions, tolerance = tolerance, edge_size = edge_size, products = products, mesher = mesher, order = order.view())
     defer release_failure(&jobs)
-    var job = parallel.Job()
     let threads = job_threads()
     let wanted = order.count
-    parallel.start(&job, threads if threads < wanted else wanted, run, (void*)&jobs)
+    var job = try parallel.start(threads if threads < wanted else wanted, (void*)&jobs, run)
     var running = true
     defer:
         if running: stop_jobs(&jobs, &job)
@@ -275,8 +274,8 @@ struct Keying:
     let edge_size: f64
     let keys: u64[]
 
-func key_faces(context: void*?, first: usize, end: usize):
-    let keying = (Keying*)(context else return)
+func key_faces(context: void*, first: usize, end: usize, worker: usize):
+    let keying = (Keying*)context
     for index in first..<end:
         keying.keys[index] = face_key(index, keying.faces, keying.surfaces, keying.edges, keying.samples, keying.plans, keying.points, keying.tables, keying.divisions, keying.tolerance, keying.edge_size)
 
@@ -341,7 +340,8 @@ func stop_jobs(jobs: Jobs*, job: parallel.Job*):
     jobs.lock.lock()
     jobs.stop = true
     jobs.lock.unlock()
-    parallel.wait(job)
+    # Items catch their own failures (jobs.failure): the job itself has none to give.
+    job.wait() catch failure: _ = failure
 
 ## Fail with a copy of a face's failure `message`.
 func fail(message: str, code: ErrorCode = invalid) -> !:
@@ -355,8 +355,11 @@ func close_products(products: const Product[]):
 func release_failure(jobs: Jobs*):
     if let failure = jobs.failure: failure.release()
 
-## Faces meshed at once: one long-running item per pool worker (a batch
-## started here runs on the workers alone), or one on this thread without any.
+## Faces meshed at once: one long-running item per pool thread but one (a job
+## runs on the pool's threads; this one polls progress), at least one.
 pub func job_threads() -> usize:
-    let width = parallel.width()
+    let width = parallel.workers(most_job_threads)
     return width - 1 if width > 1 else 1
+
+## More long-running face items than this never help.
+let most_job_threads: usize = 256
