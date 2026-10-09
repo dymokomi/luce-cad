@@ -23,7 +23,7 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
   set with CAD saves and loads as `.prism` (`brep/codec.lucb`: every column as
   stored, bit for bit; derived data is never written). `cv_cloud`,
   `with_cv_cloud` and `is_cv_cloud` expose the control vertices as a point
-  cloud for geocore's point verbs (`cv_cloud.lucb`).
+  cloud for geocore's point verbs (`model/cv_cloud.lucb`).
 - `cad_edits` (`luce_cad.cad_edits`): `CadEdits`, editing a set's models
   through a pick mesh (the display tessellations joined, tagged with
   `cad_model`, `cad_face` and `cad_edge`): `pick_mesh`, `transformed_parts`
@@ -33,13 +33,11 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
   B-reps (box, cylinder, cone or frustum, sphere, torus), centered on the
   origin along +Y with outward faces.
 - `modeling` (`luce_cad.modeling`): `CadModeling`, features that make and
-  change closed solids: sketch profiles extruded, booleans (union,
-  subtract, intersect), chamfers and fillets of straight edges between
-  flat faces. How each works and what is not supported yet:
+  change closed solids: sketch profiles extruded and revolved, booleans
+  (union, subtract, intersect), chamfers and fillets (G1, G2, G3) of lines
+  between planes, lines between a plane and a cylinder, and rims, with
+  corners where they meet. How each works and what is not supported yet:
   [docs/MODELING.md](docs/MODELING.md).
-- `tessellation` (`luce_cad.tessellation.surface`): rational B-spline
-  evaluation and trim/grid/recombine meshing (the separate `luce-tesselator`
-  package until luce-cad 0.2.0).
 - `cad_exact` (`luce_cad.exact`, Base only): `FaceSupport`, the exact data
   exporters read (luce-usd writes CAD faces as USD NurbsPatch prims).
   `model.face_support(face)` copies a face's support out (kind, frame,
@@ -94,7 +92,7 @@ polygons as `face_count()` does: independent faces first, then the B-rep's.
 
 `BrepModel` is a structure of arrays: vertices, curves, surfaces, faces and
 loops are columns (geocore `Column`s with change ids, `brep/model.lucb` and
-`brep_store.lucb`), so copies of a model share them by count. The control
+`brep/store.lucb`), so copies of a model share them by count. The control
 vertices of every B-spline surface form the **cv domain** (`cv_count`,
 `cv_position`, `cv_surface`); `with_cvs_moved(ids, delta)` returns an O(1)
 copy that shares every column but the cv positions, and `with_cvs_at(ids,
@@ -105,7 +103,7 @@ an edge stay joined.
 
 Tessellation is a cache, not a conversion:
 
-- **Per face** (`face_cache.lucb`): each face job's result is kept as a piece
+- **Per face** (`tessellation/face_cache.lucb`): each face job's result is kept as a piece
   keyed by every input it reads: its support surface, the curves of its edge
   uses, its boundary points (by position, by which entries share a point and
   by id rank), its layout plan and the parameters. Corners name boundary
@@ -449,17 +447,36 @@ One persistent worker pool (luce-geocore's `geocore_parallel`, processors minus 
 the per-face work: layout seeding and row setup, speculative crossing
 computation, face meshing and normals, curvature and previews. Each item runs
 in its own runtime context and hands back raw arrays only. Layout
-reconciliation stays serial (each face sees its neighbours' newest cuts) but
+reconciliation stays serial (each face sees its neighbors' newest cuts) but
 reuses an exact per-face memo of NURBS inversions and edge/grid crossings
 that a parallel pass fills first, so output is identical to the serial order
 on any number of cores. Errors are raised in face order.
 
-## Surface evaluation and trim meshing (`tessellation`)
+## Source layout
 
-Rational tensor-product B-spline evaluation and mesh tessellation in
-`src/tessellation/`. `tessellation.NurbsSurface.tessellate(points,
-weights, nu, nv, degree_u, degree_v, knots_u, knots_v, segments=16)` samples a
-whole patch.
+Every module is Luce Base. The public ones are flat files (`cad_edits`,
+`cad_geometry`, `exact`, `solids`) or ORDER modules (`model`, `modeling`,
+`sketch`); the rest are internal, each depending only on those above it in
+this list:
+
+- `geometry/`: surface and curve kinds, the B-rep records (`Curve`,
+  `Surface`, `BrepFace`), rational B-spline evaluation and inversion,
+  surface charts and normals, edge uses, the tolerance policy.
+- `polygons/`: planar polygon meshing (`TrimPolygon`, `TrimGrid`).
+- `layout/`: where a face's mesh rows go before meshing: edge stations,
+  four logical sides, coedges chained in one chart, row counts shared
+  across edges, and the checks a plan passes.
+- `meshing/`: one face's mesh from its plan (mapped grids, clipped cells,
+  trimmed charts, bands, fans), its shading normals and checks.
+- `tessellation/`: a whole B-rep's mesh: planning every face, meshing in
+  parallel jobs, the per-face cache, curvature.
+- `brep/`: `BrepModel`, its columns, records, meshes, cv edits, codec.
+- `model/`, `modeling/`, `sketch/`: the public model, features and sketches.
+
+## Surface evaluation and trim meshing (`geometry`, `polygons`)
+
+`geometry/nurbs.lucb` evaluates rational tensor-product B-splines;
+`polygons/` meshes trim loops in a plane.
 
 Points/positive weights use u-major, v-minor order. Knot vectors are expanded,
 finite and nondecreasing. The evaluator uses Cox–de Boor basis functions and a
@@ -472,9 +489,10 @@ triangulated by luce-geocore for rendering. No UI, File node or STEP syntax live
 already validated immutable net and returns their normalized cross product.
 It returns zero at a singular parameterization; CAD owns limiting-pole policy.
 
-`tessellate_region` also accepts `u0, u1, v0, v1` before `segments` for a
-rectangular parameter subdomain; `check` and `check_region` validate input without
-allocating a mesh. The CAD model owns the face's chosen domain.
+`check` and `check_region` validate a net and a rectangular parameter
+subdomain without allocating anything; an independent patch's grid over its
+trim rectangle is `meshing.nurbs_grid`. The CAD model owns the face's chosen
+domain.
 
 `NurbsCurve.at` and `NurbsSurface.at` expose rational evaluation at actual
 knot-domain parameters. `TrimPolygon.triangulate` accepts a planar outer loop
@@ -545,22 +563,23 @@ weights, knot counts and collapsed surface polygons are checked errors.
 Planar trims are bounded to 64 loops and 16,384 vertices. Exact shared-vertex
 junctions within one loop are supported; touching distinct loops and unidentified
 overlapping segments remain invalid. Explicit retraced seams use the identity
-API above. Regression tests include
-a bilinear plane, rational quarter-cylinder/curve, multiple holes, invalid
-boundaries, conservative quad recombination, grid-crossing holes, oblique trims,
+API above. Contracts (`nurbs_contract`, `polygons_contract`) cover a bilinear
+plane, a rational quarter cylinder and curve, multiple and touching holes,
+invalid boundaries, conservative quad recombination, grid-crossing holes,
 oversized cut cells and rejection of unsplit trim crossings.
 
 ## Tests
 
 `luc test` builds and runs two test programs:
 
-- `tests/contracts`, the Base contracts (`layout_contract` and
-  `trim_predicates_contract` run every contract module they import;
-  `exact_contract` checks the exporter accessors), which reach the package's
-  internals;
+- `tests/contracts`, the Base contracts (`main.lucb` runs each topic's
+  contracts; `layout_contract` and `trim_predicates_contract` run every
+  contract module they import), which reach the package's internals:
+  geometry, polygons, layout, meshing, modeling (references, march,
+  booleans, surface inversion) and the exporter accessors;
 - `tests/regressions`, the Luce regressions (`main.luc` and one `*_tests.luc`
-  module per topic), which build CAD models in code, mesh them and check
-  topology, trims, normals and spacing through the public `cad` and
-  `tessellation` exports.
+  module per topic, sharing `checks.luc`), which build CAD models in code,
+  mesh them and check topology, trims, normals, volumes and spacing through
+  the public exports.
 
 STEP-file regressions live in luce-step; editor behavior stays in luced-3d.

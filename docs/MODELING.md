@@ -324,7 +324,7 @@ earlier fillet. Pass `chain = false` to blend only the edges named.
 
 Arcs of rims (an arc between a flat face and a cylinder about it) are blended by a corner profile
 turned part way along them, a part torus or cone. Where chained edges meet, each tool ends square
-at the joint, so neighbouring tools share their end planes. A free end of an arc reaches past, as a
+at the joint, so neighboring tools share their end planes. A free end of an arc reaches past, as a
 line's does, when the corner beyond is empty.
 
 ### Direct fillets (`local_blend.lucb`, `local_corners.lucb`)

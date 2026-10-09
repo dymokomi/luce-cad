@@ -94,10 +94,10 @@ marked as inference.
 | **Loft** | Ordered profiles (points allowed at the ends), rails or a centerline. End conditions: free, direction, tangent (G1), smooth (G2). Closed loft. | Compatible NURBS skinning, with section alignment and twist control. |
 | **Fillet** | Constant, **chord length**, **asymmetric** or **variable** radius (multiple points along an edge). Edges, faces and features as input, with tangent-chain propagation. **Corner type: Rolling Ball or Setback**. **Continuity: G1 tangent or G2 curvature**. *Rule Fillet* (all edges between feature or body sets) and *Full Round Fillet* (three faces). | Rolling-ball blend, corner (vertex) blends, edge-chain propagation, face removal when a fillet consumes a face. |
 | **Chamfer** | Equal distance, two distances, distance plus angle. Tangent chain. Corner type: chamfer, miter or blend. | Same framework as fillet, with a ruled cross-section. |
-| **Shell** | Faces to remove, inside, outside or both thickness, tangent chain. | Offset every face, re-intersect the neighbours, handle self-intersection. This is the hardest of the common features. |
+| **Shell** | Faces to remove, inside, outside or both thickness, tangent chain. | Offset every face, re-intersect the neighbors, handle self-intersection. This is the hardest of the common features. |
 | **Combine** | Target body, tool bodies, Join, Cut or Intersect, keep tools, new component. | Booleans. |
 | **Mirror / Pattern** | Mirror faces, bodies, features or components about a plane. Rectangular, circular or on-path pattern. Compute option: Optimized, Identical or Adjust (Adjust re-evaluates each instance's extents, so a "to object" extent recomputes per instance). | Transform plus Boolean. Feature patterns re-run the feature at each instance. |
-| **Draft** | Pull direction (plane), faces, angle, one side, two sides or symmetric. | Replace face (rotate each face about its neutral curve), re-intersect the neighbours. |
+| **Draft** | Pull direction (plane), faces, angle, one side, two sides or symmetric. | Replace face (rotate each face about its neutral curve), re-intersect the neighbors. |
 | **Press/Pull** | Context sensitive: a face becomes Offset Face, an edge becomes Fillet, a profile becomes Extrude. | Offset or replace face, then local re-intersection. |
 | Others | Hole (simple, counterbore, countersink, tapped), Thread (cosmetic or modeled), Rib, Web, Emboss, Boundary Fill, Thicken, Offset Face, Replace Face, Split Face, Split Body, Move/Copy, Scale. | Mostly combinations of the operations above. |
 
@@ -237,7 +237,7 @@ Repository layout (current master): `src/ModelingAlgorithms/...`.
   * `ChFi3d/ChFi3d_Builder*.cxx`: the generic engine. It (1) builds **stripes** (tangent-continuous edge
     chains, the "spine"); (2) computes the blend surface along each stripe; (3) computes **corners** at
     vertices (`ChFi3d_Builder_C1/C2`: one, two or three stripes meeting); (4) reconstructs the topology by
-    trimming the neighbouring faces along the contact curves and inserting the blend faces.
+    trimming the neighboring faces along the contact curves and inserting the blend faces.
   * `ChFi3d_FilBuilder.cxx` (fillets), `ChFi3d_ChBuilder.cxx` (chamfers, including two-distance and
     distance-angle).
   * **`ChFiKPart/`: analytic special cases.** `ChFiKPart_ComputeData_FilPlnPln` (plane/plane gives a
@@ -478,16 +478,16 @@ The aim is a lean combination of Onshape's queries with FreeCAD's generative nam
      side[c]`, and so on.
    * Revolve: `side[curve_id]`, `start`, `end`.
    * Boolean: faces keep their input names (`modified`). Faces split in pieces get a disambiguator computed
-     from a stable rule: the names of the neighbouring faces that bound the piece, never an index. New
+     from a stable rule: the names of the neighboring faces that bound the piece, never an index. New
      intersection edges are named `face_a ∩ face_b [#k]`, with k ordered along a deterministic parameter.
-   * Fillet and chamfer: `blend[edge_name]`, `corner[vertex_name]`; trimmed neighbours keep their names.
+   * Fillet and chamfer: `blend[edge_name]`, `corner[vertex_name]`; trimmed neighbors keep their names.
    * Pattern and mirror: `instance[i]` prepended.
    The sketch provides stable curve ids (the sketch entity ids), which makes most references to extrude
    faces immune to edits. This is the 80% case.
 3. **References stored by downstream nodes are queries**, Onshape-style: "faces whose name matches
    pattern P", plus, for edges, "the edge between faces A and B". A geometric **fingerprint** is stored
    alongside: surface type, normal or axis, centroid, area or length, and the bounding box at the time of
-   selection. Resolution: exact name match → if several, disambiguate by the fingerprint and neighbour names
+   selection. Resolution: exact name match → if several, disambiguate by the fingerprint and neighbor names
    → if none, follow `modified/generated` forward (it may be a split, so prefer the piece most like the
    fingerprint) → otherwise **fail visibly**.
 4. **UX for failure:** the node turns yellow (resolved by fallback, with "check this") or red (unresolved),
@@ -563,7 +563,7 @@ This is the biggest phase. Use the GFA structure (§3.1):
 4. Split edges (pave blocks), split faces (2D loop building in UV, reusing the Phase 1 arrangement code),
    classify the pieces (point-in-solid by ray casting with a fallback to a different ray on a degenerate hit,
    then propagate across connected pieces), select the pieces per operation, and sew with shared edges.
-5. Post-process: merge coplanar or co-cylindrical neighbour faces created by the operation (optional, but it
+5. Post-process: merge coplanar or co-cylindrical neighbor faces created by the operation (optional, but it
    gives cleaner topology for later fillets). Run the validity check.
 * Approximated intersection curves raise the edge tolerance. They never "snap" the surfaces.
 * Defer to later: tangent intersections between curved faces (fail with a clear error first), NURBS/NURBS
@@ -575,10 +575,10 @@ This is the biggest phase. Use the GFA structure (§3.1):
   **plane/cone** (a cone). This is the KPart idea.
 * General case: compute the contact curves on each face (the intersection of the face with the offset of the
   other, or a geodesic distance approximation), then build a **ruled surface** between them.
-* Topology: remove the edge, trim the neighbour faces along the contact curves, insert the chamfer face. At
+* Topology: remove the edge, trim the neighbor faces along the contact curves, insert the chamfer face. At
   vertices where 2 or 3 chamfered edges meet, use a planar or ruled corner patch (convex corner: intersect the
   chamfer faces; mixed corners: a small corner face). Chain propagation along tangent-continuous edges.
-* SSI needed: plane/plane, plane/cylinder, plane/cone, and the Phase 3 machinery to trim the neighbours.
+* SSI needed: plane/plane, plane/cylinder, plane/cone, and the Phase 3 machinery to trim the neighbors.
 
 ### Phase 5: Fillet
 * Constant-radius rolling ball. KPart cases first: **plane/plane** → cylinder; **plane/cylinder** (circle
@@ -598,7 +598,7 @@ This is the biggest phase. Use the GFA structure (§3.1):
 
 ### Phase 6 and later (deferred)
 * **Shell, Offset Face, Draft, Press/Pull, Replace Face, Delete Face.** All of them are "move or replace face
-  surfaces, then re-intersect the neighbours and re-trim" (local operations). Shell adds self-intersection
+  surfaces, then re-intersect the neighbors and re-trim" (local operations). Shell adds self-intersection
   handling for large thicknesses. Draft is easiest on plane and cylinder faces. This family is what makes
   Plasticity-style direct editing possible, so it is worth doing right after fillets.
 * **Sweep and Loft:** constructive NURBS skinning, which is simple to *build*. But they produce NURBS faces,

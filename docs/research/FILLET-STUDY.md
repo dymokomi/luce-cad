@@ -51,7 +51,7 @@ Inside `PerformThreeCorner` there is a cascade:
 `GeomPlate_BuildPlateSurface` (TKGeomAlgo) deforms an initial surface to satisfy G0, G1 and **G2**
 curve constraints (`GeomPlate_CurveConstraint` order −1..2). It is a thin-plate solve over the
 constraints sampled as points (`Plate/`). `GeomPlate_MakeApprox` then converts the result to a
-B-spline within tolerance. The result meets its neighbours only within tolerance, and the edges carry
+B-spline within tolerance. The result meets its neighbors only within tolerance, and the edges carry
 that tolerance.
 
 **Parasolid, ACIS and ShapeManager (Fusion, SolidWorks, NX, Onshape).** The documentation is
@@ -265,7 +265,7 @@ e1, e2, e3 with G2 profiles.
    | G2 on B | `N_k·D_ww S = 0`, `N_k·D_t D_w S = 0` |
 
    II along the boundary tangent matches automatically once G0 and G1 hold (Meusnier). The last
-   column is the key result: **because the neighbours are planes and straight sweeps, G2 is linear.**
+   column is the key result: **because the neighbors are planes and straight sweeps, G2 is linear.**
    Fixing the cross-boundary direction at A costs a little freedom and removes the only nonlinearity.
 
    Minimize
@@ -428,7 +428,7 @@ blend(body, edges, r):
   the planes) minus ball, is mirrored correctly, and add a test.
 
 None of this needs new SSI. Plane/torus with the axis across the plane, coaxial cylinder/torus and
-torus/torus about one axis are all in the table. The sweep joints are tangent, so neighbouring tool
+torus/torus about one axis are all in the table. The sweep joints are tangent, so neighboring tool
 faces meet along shared circles or lines, and these must be imprinted as shared, like the existing
 vertex/edge interference.
 
@@ -450,7 +450,7 @@ vertex/edge interference.
 are known from the blend computation. Only the blend-to-blend checks are new intersections.
 
 Parasolid and ACIS do the same at a higher level: "local operations" that replace face geometry and
-re-trim neighbours. CAD-MODELING-STUDY §5 phase 6 already lists them.
+re-trim neighbors. CAD-MODELING-STUDY §5 phase 6 already lists them.
 
 ### 3.2 Local face replacement for planar-faced bodies with cylinder and sphere blends
 
@@ -616,7 +616,7 @@ conformity.
    Pairing by arc length means both chains advance together, so no triangle can cross between them.
    Only the first triangle is thin, by necessity. Exclude the region `s < s_end` from the grid cut;
    it becomes a hole bounded by `a`, `b` and the segment `a(s_end)–b(s_end)`. The samples on `a` and
-   `b` are also the shared edge samples of the neighbouring faces, so conformity holds.
+   `b` are also the shared edge samples of the neighboring faces, so conformity holds.
 3. **Boundary spacing rule.** Two boundary samples belonging to different chains, closer than
    `ρ = 0.25 × the local pitch` but farther apart than tol, are a sliver seed. Move the sample on the
    more flexible chain: an interior trim before a CAD edge, and never a CAD vertex. Do it in the edge
@@ -628,7 +628,7 @@ conformity.
      `P(i,j,k) = C + R·normalize(i·A + j·B + k·C')/n` for corners A, B, C' (unit vectors from the
      center C), so `i + j + k = n`.
    - For a boundary point to lie on the great circle, use **slerp** along each side, so the samples
-     sit at equal angles and match the neighbouring cylinder's arc samples exactly.
+     sit at equal angles and match the neighboring cylinder's arc samples exactly.
    - For the interior, normalize the barycentric combination.
 
    Every triangle is close to equilateral, there is no pole and no seam, and a patch beyond an
@@ -655,7 +655,7 @@ conformity.
 | 3 | **Radius too large: a face is consumed, or an edge is shorter than its setback or contact distance** | OCCT mostly fails with a stripe error (`ChFiDS_ErrorStatus`). It can continue the walk onto the next face ("bypass of obstacle", `ChFi3d_Builder_6.cxx`). Parasolid has overflow modes: smooth overflow, retain cliff edges (a ball tangent to one face, rolling on the kept edge), and notch ([T-FLEX overflow](https://tflex.com/help/eng/T-FLEX%20CAD/17/blendedges_overflowprocessing.htm)). Fusion fails, or rolls onto the next face in simple cases. | First, detect it in §3.2 step 3 (a trimmed edge of length ≤ 0) and in the boolean path (a contact line leaving its face), with a precise error: "radius 5 is larger than face X allows (max 3.2)". Compute the max from the 2D offset. Later, the "rolls onto the next face" case for planes: when contact line c1 leaves F1 across edge a into F1', recompute the stripe against F1' (a new plane/plane cylinder); the junction is a ball corner touching the edge a. |
 | 4 | **Holes or other features near the edge** (a contact line crosses an inner loop) | Kernels split the stripe where it meets the hole (TopOpeBRep handles it). It works in Fusion when the hole's rim is outside the blend surface. | The boolean path handles this already. The local path detects it (an inner loop crossing the new outer loop) and falls back. |
 | 5 | **Edges between two curved faces** (a pipe tee: cylinder/cylinder; a boss on a cylinder; cylinder/sphere) | A rolling-ball walk: `BRepBlend_Walking` with `BlendFunc_ConstRad`, approximated by `AppBlend` | The ball center curve is the meet of the two offset surfaces (an offset cylinder is a cylinder of R ± r), which `march.lucb` already traces. At each center point, the contact points are the feet on each surface (closed form for quadrics). Interpolate the circular arcs into a B-spline (or a rational sweep). Booleans with it then need §1.2(a). |
-| 6 | **Chamfer corner setback triangle** (Fusion's default chamfer corner "Chamfer"; "Miter" is what luce-cad makes) | Fusion: Chamfer, Miter, Blend corner types ([Fusion Chamfer](https://help.autodesk.com/cloudhelp/ENU/Fusion-Model/files/SLD-CHAMFER-SOLID.htm)). OCCT: `ChFi3d_ChBuilder_C3.cxx`, planar where it can, else `GeomFill_ConstrainedFilling`. | At a three-chamfer corner, each chamfer face is cut by the plane through the three points where neighbouring chamfers' edges meet the original edges. A three-chamfer corner of equal distance on a box: the triangle through the three points at distance d along each edge from V, an extra planar face. In §3.2 this is one more corner type. With booleans, a tetrahedral corner tool. |
+| 6 | **Chamfer corner setback triangle** (Fusion's default chamfer corner "Chamfer"; "Miter" is what luce-cad makes) | Fusion: Chamfer, Miter, Blend corner types ([Fusion Chamfer](https://help.autodesk.com/cloudhelp/ENU/Fusion-Model/files/SLD-CHAMFER-SOLID.htm)). OCCT: `ChFi3d_ChBuilder_C3.cxx`, planar where it can, else `GeomFill_ConstrainedFilling`. | At a three-chamfer corner, each chamfer face is cut by the plane through the three points where neighboring chamfers' edges meet the original edges. A three-chamfer corner of equal distance on a box: the triangle through the three points at distance d along each edge from V, an extra planar face. In §3.2 this is one more corner type. With booleans, a tetrahedral corner tool. |
 | 7 | **Seam, smooth and degenerate edges** | Fillets aren't offered on smooth (G1) edges, and seams aren't edges to the user. OCCT rejects edges whose faces are tangent (`ChFi3d_Builder_1.cxx`, tangent-face tests). | Exclude edges whose two faces are the same face (seams) or are tangent along the edge (G1). "Every edge" already takes only sharp straight edges. |
 | 8 | **Variable radius** | OCCT `BlendFunc_EvolRad` with a radius law. Fusion: points along the edge. | Linear radius on plane/plane: the envelope of balls of linearly varying radius along a line is a **cone** (exact). A general law: a B-spline sweep of circular arcs whose radius follows the law, with the cross-section plane normal to the ball-center path C'(t), not to the edge. |
 | 9 | **Setback corners and unequal radii at three-edge corners** | OCCT: pivot plus torus, else GeomFill or plate. Fusion: setback. | §1.3's fit with the G1 rows only (G2 rows dropped) gives G1 setback corners for any radii, from the same code. |
