@@ -6,15 +6,19 @@
 ## spline's point takes the spline and its points; a text set at its
 ## height, reading back.
 from luce_std import math
+from luce_geocore.geocore import Vector3
+from solids import CadSolids
+from modeling import CadModeling
 from luce_geocore.geocore import invalid
 from luce_geocore.core.growing import Growing
-from sketch import Sketch, Net, Lettering, new_lettering, letter, new_sketch, solve_sketch, ConstraintKind, EntityKind, write_sketch, read_sketch, new_net, net_of, end_curvature_factor, spline_degree
+from sketch import Sketch, Net, CadProjection, add_shadow, relink_sketch, projection_samples, projection_per_edge, Lettering, new_lettering, letter, new_sketch, solve_sketch, ConstraintKind, EntityKind, write_sketch, read_sketch, new_net, net_of, end_curvature_factor, spline_degree
 
 pub func sketch_shapes_contracts() -> !:
     try nets()
     try constraints()
     try removal()
     try lettering()
+    try projection()
 
 func nets() -> !:
     var s = new_sketch()
@@ -173,3 +177,39 @@ func lettering() -> !:
     try write_sketch(&back, &again)
     if (str)written.view() != (str)again.view() or back.text_content(back.entity((i64)back.entities.count - 1)) != "two words\n100% sure":
         error(invalid, "a text does not read back from its text")
+
+## A 20 mm box's edges cast onto the plane 30 above it (XZ seen from
+## above): its four top edges and four bottom edges land on one square,
+## its upright edges are points; a top edge projected is a fixed line,
+## linked; the box made taller and relinked, the line stays (it is the
+## same square), and the text reads the link back.
+func projection() -> !:
+    let box = try CadModeling.tagged(try CadSolids.box(20.0, 20.0, 20.0), "#1")
+    defer box.release()
+    let origin = Vector3(0.0, 30.0, 0.0)
+    let u = Vector3(1.0, 0.0, 0.0)
+    let v = Vector3(0.0, 0.0, -1.0)
+    let cast = try CadProjection.of(box, origin, u, v)
+    defer cast.release()
+    let p = try cast.get()
+    if p.edge_count() != 12: error(invalid, "a box does not cast twelve edges")
+    # A top or bottom edge passes (10, 0) on the plane.
+    let edge = p.nearest(10.0, 0.0, 0.5)
+    if edge < 0: error(invalid, "no edge's shadow passes the box's side")
+    var s = new_sketch()
+    defer s.close()
+    var reference = try p.reference(edge)
+    defer reference.release()
+    let per = projection_per_edge()
+    let line = try add_shadow(&s, projection_samples(p)[(usize)edge * 2 * per..<((usize)edge + 1) * 2 * per], reference.value)
+    let e = s.entity(line)
+    if e.kind != EntityKind.line or s.links.count != 1: error(invalid, "a box's edge does not cast a linked line")
+    try near(math.abs(s.x(e.first)), 10.0)
+    try near(math.abs(s.x(e.second)), 10.0)
+    if (try relink_sketch(&s, box.value(), origin, u, v)) != 0: error(invalid, "a box's edge is not found again")
+    var text = Growing[u8]()
+    defer text.close()
+    try write_sketch(&s, &text)
+    var back = try read_sketch((str)text.view())
+    defer back.close()
+    if back.links.count != 1 or back.link_reference(back.links.items[0]) != reference.value: error(invalid, "a projected curve's link does not read back")

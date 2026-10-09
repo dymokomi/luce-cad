@@ -31,6 +31,8 @@ from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import CurvesBuilder, CurveType, SketchPlane, empty_set, dispose_set, adopt_set, with_curves
 from luce_std import files, utf8
 from luce_fonts import opentype
+from model import CadModel
+from modeling import Shape, shape_of, resolve_edges, references_of
 
 pub enum EntityKind as u8:
     point = 0
@@ -118,6 +120,13 @@ pub struct Label:
     pub var font: usize
     pub var font_length: usize
 
+## A projected curve (`entity`, fixed) and the reference of the body edge
+## it is the shadow of, a run of a sketch's `chars`.
+pub struct Link:
+    pub var entity: i64
+    pub var reference: usize
+    pub var reference_length: usize
+
 pub struct SketchConstraint:
     pub var kind: ConstraintKind
     ## The entities it holds (-1: none).
@@ -140,6 +149,8 @@ pub struct Sketch:
     ## The texts' labels, their bytes in `chars`.
     pub var labels: Growing[Label]
     pub var chars: Growing[u8]
+    ## Projected curves and the body edges they follow (projection.lucb).
+    pub var links: Growing[Link]
 
     pub func close():
         self.params.close()
@@ -148,6 +159,7 @@ pub struct Sketch:
         self.lists.close()
         self.labels.close()
         self.chars.close()
+        self.links.close()
 
     ## A new point at (`x`, `y`).
     pub func add_point(x: f64, y: f64, construction: bool = false) -> i64!:
@@ -238,6 +250,16 @@ pub struct Sketch:
     pub func text_font(e: SketchEntity) -> str:
         let label = self.labels.items[(usize)e.third]
         return (str)self.chars.view()[label.font..<label.font + label.font_length]
+
+    ## Link `link`'s edge reference.
+    pub func link_reference(link: Link) -> str:
+        return (str)self.chars.view()[link.reference..<link.reference + link.reference_length]
+
+    ## Link curve `entity` to the edge `reference` names.
+    pub func link(entity: i64, reference: str) -> !:
+        let at = self.chars.count
+        for byte in reference.bytes: try self.chars.push(byte)
+        try self.links.push(Link(entity, at, reference.length))
 
     ## The point entities curve `e` is drawn on, in order (a spline's
     ## list; an arc's center, start and end; a conic's start, end, apex).
@@ -391,11 +413,25 @@ pub struct Sketch:
             c.second = renumbered.items[(usize)k.second] if k.second >= 0 else -1
             c.third = renumbered.items[(usize)k.third] if k.third >= 0 else -1
             try constraints.push(c)
+        # Links of curves that stay.
+        var links = Growing[Link]()
+        errdefer links.close()
+        for l in self.links.view():
+            let moved = renumbered.items[(usize)l.entity]
+            if moved < 0: continue
+            try links.push(Link(moved, l.reference, l.reference_length))
+        let labels = self.labels
+        let chars = self.chars
+        self.labels = Growing[Label]()
+        self.chars = Growing[u8]()
         self.close()
         self.params = params
         self.entities = kept
         self.constraints = constraints
         self.lists = lists
+        self.labels = labels
+        self.chars = chars
+        self.links = links
 
     ## Whether constraint `kind` joins entities `first`, `second` and
     ## `third` of their kinds.
@@ -448,4 +484,4 @@ pub struct Sketch:
 
 ## An empty sketch.
 pub func new_sketch() -> Sketch:
-    return Sketch(Growing[f64](), Growing[SketchEntity](), Growing[SketchConstraint](), Growing[i64](), Growing[Label](), Growing[u8]())
+    return Sketch(Growing[f64](), Growing[SketchEntity](), Growing[SketchConstraint](), Growing[i64](), Growing[Label](), Growing[u8](), Growing[Link]())

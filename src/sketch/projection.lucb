@@ -1,0 +1,197 @@
+## Fusion's Project: a body's edges cast straight onto the sketch's plane.
+## A CadProjection holds every edge of a body as samples on the plane (the
+## editor draws them and finds the one clicked); projecting one adds its
+## shadow to the sketch as a line, circle or arc when it is one (to the
+## sketch's precision), else a fit point spline through its samples, fixed
+## and linked to the edge by its reference. relink_sketch casts each linked
+## edge again from the body as it is now, so the projection follows changes
+## upstream.
+
+## Samples per projected edge (its ends among them).
+let per_edge: usize = 33
+
+## A body's edges on a sketch plane: `per_edge` x, y samples each, in the
+## body's edge order, and the body (for the edges' references).
+pub struct CadProjection:
+    var samples: Growing[f64]
+    var model: interop.Reference[CadModel]
+
+    pub func close():
+        self.samples.close()
+        self.model.release()
+
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        _ = visit
+        _ = context
+
+    ## `model`'s edges cast onto the plane through `origin` whose x and y
+    ## run along `u` and `v`.
+    pub static func of(model: interop.Reference[CadModel], origin: Vector3, u: Vector3, v: Vector3) -> interop.Reference[CadProjection]!:
+        var samples = Growing[f64]()
+        errdefer samples.close()
+        var w = try shape_of(model.value())
+        defer w.close()
+        for e in 0..<w.edges.count:
+            try cast_edge(&w, e, origin, u, v, &samples)
+        return try interop.Reference[CadProjection].adopt(new CadProjection(samples, model.clone()) in memory.heap, cad_projection_type, memory.heap)
+
+    pub func edge_count() -> i64:
+        return (i64)(self.samples.count // (2 * per_edge))
+
+    ## The edge whose shadow passes nearest (`x`, `y`), within `reach`, or -1.
+    pub func nearest(x: f64, y: f64, reach: f64) -> i64:
+        var best: i64 = -1
+        var best_distance = reach
+        for e in 0..<self.samples.count // (2 * per_edge):
+            let run = self.samples.view()[e * 2 * per_edge..<(e + 1) * 2 * per_edge]
+            if end_on(run, 1e-9 * math.max(1.0, reach)): continue
+            for k in 0..<per_edge - 1:
+                let d = segment_distance(x, y, run[2 * k], run[2 * k + 1], run[2 * k + 2], run[2 * k + 3])
+                if d <= best_distance:
+                    best_distance = d
+                    best = (i64)e
+        return best
+
+    ## Edge `edge`'s reference (modeling's names).
+    pub func reference(edge: i64) -> interop.Owned[str]!:
+        var w = try shape_of(self.model.value())
+        defer w.close()
+        var text = Growing[u8]()
+        defer text.close()
+        try references_of(&w, [edge], &text)
+        return try interop.copy_text((str)text.view())
+
+pub let cad_projection_type: interop.Type[CadProjection] = interop.Type[CadProjection]("CadProjection", CadProjection.close, CadProjection.trace, closeable = true)
+
+## The samples of a projection (x, y pairs, `per_edge` an edge), for the
+## editor's drawing.
+pub func projection_samples(p: const CadProjection*) -> const f64[]:
+    return p.samples.view()
+
+pub func projection_per_edge() -> usize:
+    return per_edge
+
+## Edge `e` of `w` sampled and cast onto the plane, onto `out`.
+func cast_edge(w: const Shape*, e: usize, origin: Vector3, u: Vector3, v: Vector3, out: Growing[f64]*) -> !:
+    for k in 0..<per_edge:
+        let p = try w.edge_at(e, (f64)k / (f64)(per_edge - 1))
+        let d = p.subtract(origin)
+        try out.push(d.dot(u))
+        try out.push(d.dot(v))
+
+## Add the shadow of the edge whose samples are `run` to `sketch`, fixed
+## and linked to `reference`; the curve made.
+pub func add_shadow(sketch: Sketch*, run: const f64[], reference: str) -> i64!:
+    let tolerance = 1e-6 * math.max(1.0, size_of(sketch))
+    if end_on(run, tolerance): error(invalid, "this edge runs straight at the sketch's plane: it casts only a point")
+    let n = run.length // 2
+    let closed = math.hypot(run[0] - run[2 * n - 2], run[1] - run[2 * n - 1]) <= tolerance
+    var made: i64 = -1
+    if not closed and straight(run, tolerance):
+        made = try sketch.add_line(try sketch.add_point(run[0], run[1]), try sketch.add_point(run[2 * n - 2], run[2 * n - 1]))
+    elif let circle = circle_through(run, tolerance):
+        if closed:
+            made = try sketch.add_circle(try sketch.add_point(circle[0], circle[1]), circle[2])
+        else:
+            # Counterclockwise from whichever end the samples turn away from.
+            let center = try sketch.add_point(circle[0], circle[1])
+            let a = try sketch.add_point(run[0], run[1])
+            let b = try sketch.add_point(run[2 * n - 2], run[2 * n - 1])
+            let turning = (run[2] - run[0]) * (run[1] - circle[1]) - (run[3] - run[1]) * (run[0] - circle[0])
+            made = try sketch.add_arc(center, b if turning > 0.0 else a, a if turning > 0.0 else b)
+    else:
+        # A fit point spline through every fourth sample (and its end).
+        var points = Growing[i64]()
+        defer points.close()
+        var k: usize = 0
+        while k < n:
+            if not (closed and k == n - 1): try points.push(try sketch.add_point(run[2 * k], run[2 * k + 1]))
+            k = k + 4 if k + 4 < n or k == n - 1 else n - 1
+        if closed: try points.push(points.items[0])
+        made = try sketch.add_spline(points.view(), true)
+    _ = try sketch.constrain(ConstraintKind.fix, made)
+    try sketch.link(made, reference)
+    return made
+
+## Whether every sample is at the first's place (an edge seen end-on).
+func end_on(run: const f64[], tolerance: f64) -> bool:
+    for k in 1..<run.length // 2:
+        if math.hypot(run[2 * k] - run[0], run[2 * k + 1] - run[1]) > tolerance: return false
+    return true
+
+## Whether the samples lie on their chord.
+func straight(run: const f64[], tolerance: f64) -> bool:
+    let n = run.length // 2
+    let dx = run[2 * n - 2] - run[0]
+    let dy = run[2 * n - 1] - run[1]
+    let length = math.hypot(dx, dy)
+    if length <= tolerance: return false
+    for k in 1..<n - 1:
+        if math.abs(dx * (run[2 * k + 1] - run[1]) - dy * (run[2 * k] - run[0])) / length > tolerance: return false
+    return true
+
+## The circle the samples lie on, [x, y, r], or none when they do not.
+func circle_through(run: const f64[], tolerance: f64) -> f64[3]?:
+    let n = run.length // 2
+    let m = n // 3
+    let q = (2 * n) // 3
+    let (ax, ay, bx, by, cx, cy) = (run[0], run[1], run[2 * m], run[2 * m + 1], run[2 * q], run[2 * q + 1])
+    let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if math.abs(d) <= 1e-12: return none
+    let a2 = ax * ax + ay * ay
+    let b2 = bx * bx + by * by
+    let c2 = cx * cx + cy * cy
+    let ox = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d
+    let oy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d
+    let r = math.hypot(ax - ox, ay - oy)
+    for k in 0..<n:
+        if math.abs(math.hypot(run[2 * k] - ox, run[2 * k + 1] - oy) - r) > tolerance: return none
+    return [ox, oy, r]
+
+## Cast every linked edge of `sketch` again from `model` onto the plane
+## through `origin` (axes `u`, `v`): each shadow's points and radius follow
+## its edge. How many links no longer find their edge (they stay as they
+## were).
+pub func relink_sketch(sketch: Sketch*, model: const CadModel*, origin: Vector3, u: Vector3, v: Vector3) -> i64!:
+    if sketch.links.count == 0: return 0
+    var w = try shape_of(model)
+    defer w.close()
+    var edges = Growing[usize]()
+    defer edges.close()
+    var run = Growing[f64]()
+    defer run.close()
+    var lost: i64 = 0
+    for l in sketch.links.view():
+        resolve_edges(&w, sketch.link_reference(l), &edges) catch failure:
+            lost += 1
+            continue
+        if edges.count != 1:
+            lost += 1
+            continue
+        run.clear()
+        try cast_edge(&w, edges.items[0], origin, u, v, &run)
+        try follow(sketch, l.entity, run.view())
+    return lost
+
+## Shadow curve `curve` moved onto the samples `run` of its edge now.
+func follow(sketch: Sketch*, curve: i64, run: const f64[]) -> !:
+    let e = sketch.entity(curve)
+    let n = run.length // 2
+    if e.kind == EntityKind.line:
+        sketch.place(e.first, run[0], run[1])
+        sketch.place(e.second, run[2 * n - 2], run[2 * n - 1])
+    elif e.kind == EntityKind.circle or e.kind == EntityKind.arc:
+        let circle = circle_through(run, 1e300) else return
+        sketch.place(e.first, circle[0], circle[1])
+        sketch.params.items[(usize)e.second] = circle[2]
+        if e.kind == EntityKind.arc:
+            let turning = (run[2] - run[0]) * (run[1] - circle[1]) - (run[3] - run[1]) * (run[0] - circle[0])
+            let (start, end) = (n - 1, (usize)0) if turning > 0.0 else ((usize)0, n - 1)
+            sketch.place(e.third, run[2 * start], run[2 * start + 1])
+            sketch.place(e.fourth, run[2 * end], run[2 * end + 1])
+    elif e.kind == EntityKind.spline:
+        # Its points over the samples again, evenly.
+        let count = (usize)e.second
+        for k in 0..<count:
+            let sample = (k * (n - 1)) // (count - 1)
+            sketch.place(sketch.spline_point(e, (i64)k), run[2 * sample], run[2 * sample + 1])
