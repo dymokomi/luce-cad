@@ -1,0 +1,161 @@
+## Planar polygon meshing (polygons/): TrimPolygon's triangulation and
+## quadrangulation keep holes open (also where a hole touches the outer
+## loop) and refuse self-crossing loops; a narrow strip is refined along
+## it. TrimGrid's cut cells keep every seam sample where the caller put it,
+## keep holes inside a cell open, split oversized cut boundaries, share a
+## vertex only by identity (never by position), keep a thin strip beside a
+## grid line, and refuse a grid line along a hole's edge.
+from luce_std import math
+from luce_geocore.geocore import Vector3, Mesh, invalid
+from polygons import TrimPolygon, TrimGrid
+
+pub func polygons_contracts() -> !:
+    try trimmed()
+    try strips()
+    try grids()
+
+func near(a: f64, b: f64, what: str) -> !:
+    if math.abs(a - b) >= 1e-6: error(invalid, what)
+
+## The area of a mesh in the z = 0 plane: each face's shoelace.
+func area(mesh: const Mesh*) -> f64!:
+    var total = 0.0
+    for face in 0..<mesh.face_count():
+        let count = try mesh.face_size(face)
+        for corner in 0..<count:
+            let a = try mesh.point(try mesh.face_point(face, corner))
+            let b = try mesh.point(try mesh.face_point(face, (corner + 1) % count))
+            total += (a.x * b.y - b.x * a.y) * 0.5
+    return total
+
+## Whether a ray straight down from (x, y, 2) misses `mesh`.
+func open_at(mesh: const Mesh*, x: f64, y: f64) -> bool!:
+    return try mesh.ray_face(Vector3(x, y, 2.0), Vector3(0.0, 0.0, -1.0)) == -1
+
+func trimmed() -> !:
+    let z = Vector3(0.0, 0.0, 1.0)
+    # An 8 x 8 square with two square holes.
+    let points: Vector3[12] = [Vector3(), Vector3(8.0, 0.0, 0.0), Vector3(8.0, 8.0, 0.0), Vector3(0.0, 8.0, 0.0),
+                               Vector3(1.0, 1.0, 0.0), Vector3(3.0, 1.0, 0.0), Vector3(3.0, 3.0, 0.0), Vector3(1.0, 3.0, 0.0),
+                               Vector3(5.0, 5.0, 0.0), Vector3(7.0, 5.0, 0.0), Vector3(7.0, 7.0, 0.0), Vector3(5.0, 7.0, 0.0)]
+    let three: i64[3] = [4, 4, 4]
+    let one: i64[1] = [4]
+    let holes = try TrimPolygon.triangulate(points[..<12], three[..<3], z)
+    defer holes.release()
+    if holes.value().point_count() != 12 or holes.value().face_count() != 14: error(invalid, "a square with two holes triangulates wrongly")
+    if not try open_at(holes.value(), 2.0, 2.0) or not try open_at(holes.value(), 6.0, 6.0): error(invalid, "a triangulated hole was filled")
+    try near(try holes.value().ray_distance(Vector3(4.0, 4.0, 2.0), Vector3(0.0, 0.0, -1.0)), 2.0, "a triangulated square misses its middle")
+    let rectangle = try TrimPolygon.quadrangulate(points[..<4], one[..<1], z)
+    defer rectangle.release()
+    if rectangle.value().point_count() != 4 or rectangle.value().face_count() != 1 or try rectangle.value().face_size(0) != 4: error(invalid, "a square quadrangulates wrongly")
+    let paired = try TrimPolygon.quadrangulate(points[..<12], three[..<3], z)
+    defer paired.release()
+    if paired.value().point_count() != 12 or not try open_at(paired.value(), 2.0, 2.0) or not try open_at(paired.value(), 6.0, 6.0): error(invalid, "a quadrangulated hole was filled")
+    try near(try paired.value().ray_distance(Vector3(4.0, 4.0, 2.0), Vector3(0.0, 0.0, -1.0)), 2.0, "a quadrangulated square misses its middle")
+    # A hole touching the outer loop at (4, 2).
+    let touching_points: Vector3[9] = [Vector3(), Vector3(4.0, 0.0, 0.0), Vector3(4.0, 2.0, 0.0), Vector3(3.0, 1.0, 0.0), Vector3(2.0, 2.0, 0.0),
+                                       Vector3(3.0, 3.0, 0.0), Vector3(4.0, 2.0, 0.0), Vector3(4.0, 4.0, 0.0), Vector3(0.0, 4.0, 0.0)]
+    let nine: i64[1] = [9]
+    let touching = try TrimPolygon.triangulate(touching_points[..<9], nine[..<1], z)
+    defer touching.release()
+    if not try open_at(touching.value(), 3.0, 2.0): error(invalid, "a hole touching its outer loop was filled")
+    try near(try touching.value().ray_distance(Vector3(1.0, 2.0, 2.0), Vector3(0.0, 0.0, -1.0)), 2.0, "a loop with a touching hole misses its middle")
+    # A bow tie crosses itself.
+    let bow: Vector3[4] = [Vector3(), Vector3(2.0, 2.0, 0.0), Vector3(0.0, 2.0, 0.0), Vector3(2.0, 0.0, 0.0)]
+    let crossed = TrimPolygon.triangulate(bow[..<4], one[..<1], z) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return
+    crossed.release()
+    error(invalid, "a self-crossing loop was triangulated")
+
+## A 20 x 0.2 strip quadrangulated at spacing 2 across 0.025: refined along
+## its middle, not left as one long quad.
+func strips() -> !:
+    let strip_points: Vector3[4] = [Vector3(), Vector3(20.0, 0.0, 0.0), Vector3(20.0, 0.2, 0.0), Vector3(0.0, 0.2, 0.0)]
+    let one: i64[1] = [4]
+    let strip = try TrimPolygon.quadrangulate(strip_points[..<4], one[..<1], Vector3(0.0, 0.0, 1.0), 2.0, 0.025)
+    defer strip.release()
+    var interior = 0
+    for index in 0..<strip.value().point_count():
+        let p = try strip.value().point(index)
+        if p.y > 0.0 and p.y < 0.2: interior += 1
+    if interior <= 40: error(invalid, "a narrow strip was not refined across")
+
+## Two subdivided squares (each corner and edge middle) onto `out`.
+func subdivided(outer: const Vector3[], inner: const Vector3[], out: Vector3[16]*):
+    for at in 0..<(usize)4:
+        (*out)[at * 2] = outer[at]
+        (*out)[at * 2 + 1] = outer[at].add(outer[(at + 1) % 4]).multiply_scalar(0.5)
+        (*out)[8 + at * 2] = inner[at]
+        (*out)[8 + at * 2 + 1] = inner[at].add(inner[(at + 1) % 4]).multiply_scalar(0.5)
+
+func grids() -> !:
+    # An L-ish octagon over a 2 x 2 lattice: four quads.
+    let points: Vector3[8] = [Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0), Vector3(2.0, 1.0, 0.0), Vector3(1.5, 1.5, 0.0), Vector3(1.0, 2.0, 0.0), Vector3(0.0, 2.0, 0.0), Vector3(0.0, 1.0, 0.0)]
+    let eight: i64[1] = [8]
+    let thirds: f64[3] = [0.0, 1.0, 2.0]
+    let mesh = try TrimGrid.clip(points[..<8], eight[..<1], thirds[..<3], thirds[..<3])
+    defer mesh.release()
+    if mesh.value().face_count() != 4: error(invalid, "a clipped octagon has the wrong faces")
+    for face in 0..<mesh.value().face_count():
+        if try mesh.value().face_size(face) != 4: error(invalid, "a clipped octagon's cells are not quads")
+    # A hole inside one cell stays a hole.
+    let hole: Vector3[8] = [Vector3(), Vector3(3.0, 0.0, 0.0), Vector3(3.0, 3.0, 0.0), Vector3(0.0, 3.0, 0.0), Vector3(1.0, 1.0, 0.0), Vector3(1.0, 2.0, 0.0), Vector3(2.0, 2.0, 0.0), Vector3(2.0, 1.0, 0.0)]
+    let two: i64[2] = [4, 4]
+    let ends: f64[2] = [0.0, 3.0]
+    let cut = try TrimGrid.clip(hole[..<8], two[..<2], ends[..<2], ends[..<2])
+    defer cut.release()
+    try near(try area(cut.value()), 8.0, "a hole inside a cell was filled")
+    # A hole crossing grid lines on all four sides: no cell fills it, and
+    # every seam sample stays exactly where it was given.
+    var crossing: Vector3[16] = ---
+    subdivided(hole[..<4], hole[4..<8], &crossing)
+    let sixteen: i64[2] = [8, 8]
+    let halves: f64[3] = [0.0, 1.5, 3.0]
+    let crossed = try TrimGrid.clip(crossing[..<16], sixteen[..<2], halves[..<3], halves[..<3])
+    defer crossed.release()
+    try near(try area(crossed.value()), 8.0, "a hole crossing grid lines was filled")
+    if not try open_at(crossed.value(), 1.5, 1.5): error(invalid, "a hole crossing grid lines was filled")
+    for at in 0..<(usize)16:
+        if (try crossed.value().point((i64)at)).subtract(crossing[at]).length() != 0.0: error(invalid, "a seam sample moved")
+    # A 300-sided circle in one cell: split, not past the 256-corner limit.
+    var ring: Vector3[300] = ---
+    for at in 0..<(usize)300:
+        let angle = (f64)at * 2.0 * math.pi / 300.0
+        ring[at] = Vector3(math.cos(angle), math.sin(angle), 0.0)
+    let three_hundred: i64[1] = [300]
+    let wide: f64[2] = [-2.0, 2.0]
+    let dense = try TrimGrid.clip(ring[..<300], three_hundred[..<1], wide[..<2], wide[..<2])
+    defer dense.release()
+    try near(try area(dense.value()), 150.0 * math.sin(2.0 * math.pi / 300.0), "a dense circle's cells lost area")
+    # Two lobes sharing one vertex by identity (8): its repeat is no second
+    # vertex; by position alone it is refused.
+    let pinched: Vector3[8] = [Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(), Vector3(-1.0, 0.0, 0.0), Vector3(-1.0, -1.0, 0.0), Vector3(0.0, -1.0, 0.0)]
+    let identities: i64[8] = [8, 9, 10, 11, 8, 12, 13, 14]
+    let unit_cells: f64[3] = [-1.0, 0.0, 1.0]
+    let identified = try TrimGrid.clip_identified(pinched[..<8], eight[..<1], unit_cells[..<3], unit_cells[..<3], identities[..<8])
+    defer identified.release()
+    try near(try area(identified.value()), 2.0, "a pinched loop's cells lost area")
+    if identified.value().face_count() != 2: error(invalid, "a pinched loop has the wrong faces")
+    for face in 0..<identified.value().face_count():
+        if try identified.value().face_size(face) != 4: error(invalid, "a pinched loop's cells are not quads")
+        for at in 0..<(i64)4:
+            if try identified.value().face_point(face, at) == 4: error(invalid, "a repeated vertex was used as a second vertex")
+    try refused(pinched[..<8], eight[..<1], unit_cells[..<3], "a vertex was shared by position alone")
+    # A thin strip just past a grid line keeps its own corners.
+    let d = 0.00000003
+    let narrow: Vector3[8] = [Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(1.0 + d, 0.0, 0.0), Vector3(1.0 + d, 1.0, 0.0), Vector3(1.0 + d, 2.0, 0.0), Vector3(1.0, 2.0, 0.0), Vector3(0.0, 2.0, 0.0), Vector3(0.0, 1.0, 0.0)]
+    let beside = try TrimGrid.clip(narrow[..<8], eight[..<1], thirds[..<3], thirds[..<3])
+    defer beside.release()
+    if beside.value().face_count() != 4 or math.abs(try area(beside.value()) - (2.0 + 2.0 * d)) >= 1e-12: error(invalid, "a thin strip beside a grid line collapsed")
+    # A grid line along a hole's edge is refused.
+    try refused(hole[..<8], two[..<2], halves[..<3], "a grid line along a hole's edge was accepted")
+
+## Clipping `points` (loops `sizes`) by cells `cells` both ways must fail;
+## else error `what`.
+func refused(points: const Vector3[], sizes: const i64[], cells: const f64[], what: str) -> !:
+    let mesh = TrimGrid.clip(points, sizes, cells, cells) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return
+    mesh.release()
+    error(invalid, what)

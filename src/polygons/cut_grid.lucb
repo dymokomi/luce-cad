@@ -1,12 +1,6 @@
 ## Polygon/cell intersection in a shared UV arrangement. Input trim chains must
 ## already be split at grid crossings: this keeps ownership of CAD seams in CAD.
 ## Whole cells remain quads; clipped cells retain their polygon boundary.
-import memory
-from luce_std import math
-import interop
-from luce_geocore.geocore import Vector3, Mesh, MeshBuilder, invalid
-from tessellation.trim import TrimPolygon
-import tessellation.cut_topology as topology
 
 struct Segment:
     var a: i64 = -1
@@ -81,7 +75,7 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
     # CAD fitting tolerance is not topological equality. Near-tangent trim
     # points must not be treated as lying on a grid side or on each other.
     let incidence = math.max(1e-13, extent * 1e-12)
-    let aliases = try topology.identify(points, identities)
+    let aliases = try identify(points, identities)
     defer free(aliases) in memory.heap
     let nx = us.length - 1
     let ny = vs.length - 1
@@ -126,8 +120,8 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
                 error(invalid, "trim edge crosses an unsplit grid line")
             boundary[ai] = Segment(aliases[ai if forward else bi], aliases[bi if forward else ai], heads[y * nx + x])
             heads[y * nx + x] = (i64)ai
-            let gx = nearest(us, points[ai].x)
-            let gy = nearest(vs, points[ai].y)
+            let gx = nearest_line(us, points[ai].x)
+            let gy = nearest_line(vs, points[ai].y)
             if math.abs(us[gx] - points[ai].x) < incidence and math.abs(vs[gy] - points[ai].y) < incidence:
                 let previous = grid[gy * us.length + gx]
                 if previous >= 0 and previous != aliases[ai]:
@@ -174,13 +168,13 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
                 for at in 0..<(usize)4: try mesh.corner(try grid_point(&mesh, grid, corner_grid[at], corners[at]))
                 continue
             let trim_count = length
-            for side in 0..<(usize)4:
-                let a = corners[side]
-                let b = corners[(side + 1) % 4]
+            for corner_side in 0..<(usize)4:
+                let a = corners[corner_side]
+                let b = corners[(corner_side + 1) % 4]
                 let delta = b.subtract(a)
                 var count: usize = 2
-                side_ids[0] = -1 - (i64)corner_grid[side]
-                side_ids[1] = -1 - (i64)corner_grid[(side + 1) % 4]
+                side_ids[0] = -1 - (i64)corner_grid[corner_side]
+                side_ids[1] = -1 - (i64)corner_grid[(corner_side + 1) % 4]
                 side_values[0] = 0.0
                 side_values[1] = 1.0
                 for index in 0..<trim_count:
@@ -191,14 +185,14 @@ pub func cut_grid(points: const Vector3[], sizes: const i64[], us: const f64[], 
                     touching = touches[(usize)touching].next
                 for at in 0..<count - 1:
                     let p = a.add(delta.multiply_scalar((side_values[at] + side_values[at + 1]) * 0.5))
-                    if not inside(points, sizes, Vector3(inward(p.x, center.x), inward(p.y, center.y), 0.0)): continue
+                    if not inside_loops(points, sizes, Vector3(inward(p.x, center.x), inward(p.y, center.y), 0.0)): continue
                     let start = try resolve(&mesh, grid, us, vs, side_ids[at])
                     let end = try resolve(&mesh, grid, us, vs, side_ids[at + 1])
                     try add(edges, &length, start, end)
             try emit(&mesh, &scratch, length, epsilon)
     let result = try mesh.finish()
     errdefer result.release()
-    try topology.audit(result.value(), sizes, aliases)
+    try audit(result.value(), sizes, aliases)
     return result
 
 ## Insert trim vertex `id` into the sorted pieces of the grid side from `a`
@@ -226,8 +220,8 @@ func place(points: const Vector3[], id: i64, a: Vector3, delta: Vector3, inciden
 ## sharing that side (grid corners are identified through `grid` instead).
 func touch(us: const f64[], vs: const f64[], p: Vector3, id: i64, incidence: f64, heads: i64[], touches: Segment[], count: usize) -> usize:
     let nx = us.length - 1
-    let gx = nearest(us, p.x)
-    let gy = nearest(vs, p.y)
+    let gx = nearest_line(us, p.x)
+    let gy = nearest_line(vs, p.y)
     var result = count
     if math.abs(us[gx] - p.x) < incidence:
         let row = cell(vs, p.y)
@@ -272,12 +266,12 @@ pub func cell(values: const f64[], p: f64) -> usize:
         else: high = mid
     return low
 
-func nearest(values: const f64[], p: f64) -> usize:
+func nearest_line(values: const f64[], p: f64) -> usize:
     let at = cell(values, p)
     return at if math.abs(values[at] - p) < math.abs(values[at + 1] - p) else at + 1
 
 func owner(values: const f64[], p: f64, positive: bool, epsilon: f64) -> usize:
-    let line = nearest(values, p)
+    let line = nearest_line(values, p)
     if math.abs(values[line] - p) >= epsilon: return cell(values, p)
     if positive: return line
     return line - 1 if line > 0 else values.length - 1
@@ -287,7 +281,7 @@ func inward(value: f64, center: f64) -> f64:
     let distance = math.min(math.abs(delta) * 0.5, math.max(math.abs(delta) * 1e-12, (math.abs(value) + 1.0) * 2e-15))
     return value + distance if delta > 0.0 else value - distance
 
-func inside(points: const Vector3[], sizes: const i64[], p: Vector3) -> bool:
+func inside_loops(points: const Vector3[], sizes: const i64[], p: Vector3) -> bool:
     var result = false
     var offset: usize = 0
     for size in sizes:
