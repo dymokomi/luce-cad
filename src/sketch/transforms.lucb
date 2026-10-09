@@ -1,0 +1,164 @@
+## Move/Copy, Mirror, the Patterns and Scale: entities moved, copied
+## (mirrored copies held symmetric), and scaled about a point with their
+## dimensions.
+
+## Move the points of `entities` by (`dx`, `dy`), or move copies of them
+## (`copy`): the copies onto `out`.
+pub func move_entities(sketch: Sketch*, entities: const i64[], dx: f64, dy: f64, copy: bool, out: Growing[i64]*) -> !:
+    var points = Growing[i64]()
+    defer points.close()
+    for e in entities: try gather_points(sketch, e, &points)
+    if not copy:
+        for p in points.view():
+            sketch.place(p, sketch.x(p) + dx, sketch.y(p) + dy)
+        return
+    # Copies: each point once, the curves on the copied points.
+    var copies = Growing[i64]()
+    defer copies.close()
+    for p in points.view(): try copies.push(try sketch.add_point(sketch.x(p) + dx, sketch.y(p) + dy))
+    for e in entities:
+        let made = try copied(sketch, e, &points, &copies)
+        if made >= 0: try out.push(made)
+
+## Copies of `entities` mirrored about line `axis`, each copied point held
+## symmetric to its original about it; the copies onto `out`.
+pub func mirror_entities(sketch: Sketch*, entities: const i64[], axis: i64, out: Growing[i64]*) -> !:
+    let a = sketch.entity(axis)
+    if a.kind != EntityKind.line: error(invalid, "a mirror is about a line")
+    let (ax, ay, dx, dy) = line_of(sketch, a)
+    let (ux, uy) = unit_vector(dx, dy)
+    var points = Growing[i64]()
+    defer points.close()
+    for e in entities:
+        if e != axis: try gather_points(sketch, e, &points)
+    var copies = Growing[i64]()
+    defer copies.close()
+    for p in points.view():
+        # Reflect across the line: p' = 2 (a + ((p - a)·u) u) - p.
+        let wx = sketch.x(p) - ax
+        let wy = sketch.y(p) - ay
+        let along = wx * ux + wy * uy
+        let fx = ax + along * ux
+        let fy = ay + along * uy
+        let made = try sketch.add_point(2.0 * fx - sketch.x(p), 2.0 * fy - sketch.y(p))
+        try copies.push(made)
+        _ = try sketch.constrain(ConstraintKind.symmetric, p, made, axis)
+    for e in entities:
+        if e == axis: continue
+        let made = try copied(sketch, e, &points, &copies)
+        # A mirrored arc turns the other way: its ends swap.
+        if made >= 0 and sketch.entity(made).kind == EntityKind.arc:
+            let start = sketch.entity(made).third
+            sketch.entities.items[(usize)made].third = sketch.entity(made).fourth
+            sketch.entities.items[(usize)made].fourth = start
+        if made >= 0: try out.push(made)
+
+## `count` - 1 copies of `entities`, each turned `angle` (radians) further
+## about plane point (`cx`, `cy`) (Circular Pattern); the copies onto `out`.
+pub func pattern_round(sketch: Sketch*, entities: const i64[], cx: f64, cy: f64, count: i64, angle: f64, out: Growing[i64]*) -> !:
+    if count < 2: error(invalid, "a pattern needs two or more")
+    for k in 1..<count:
+        let turn = angle * (f64)k
+        try copy_placed(sketch, entities, cx, cy, math.cos(turn), math.sin(turn), 0.0, 0.0, out)
+
+## `count` - 1 copies of `entities`, each (`dx`, `dy`) further on
+## (Rectangular Pattern, one direction); the copies onto `out`.
+pub func pattern_along(sketch: Sketch*, entities: const i64[], dx: f64, dy: f64, count: i64, out: Growing[i64]*) -> !:
+    if count < 2: error(invalid, "a pattern needs two or more")
+    for k in 1..<count:
+        try copy_placed(sketch, entities, 0.0, 0.0, 1.0, 0.0, dx * (f64)k, dy * (f64)k, out)
+
+## Copies of `entities` turned (cosine `c`, sine `s`) about (`cx`, `cy`)
+## then moved (`tx`, `ty`).
+func copy_placed(sketch: Sketch*, entities: const i64[], cx: f64, cy: f64, c: f64, s: f64, tx: f64, ty: f64, out: Growing[i64]*) -> !:
+    var points = Growing[i64]()
+    defer points.close()
+    for e in entities: try gather_points(sketch, e, &points)
+    var copies = Growing[i64]()
+    defer copies.close()
+    for p in points.view():
+        let x = sketch.x(p) - cx
+        let y = sketch.y(p) - cy
+        try copies.push(try sketch.add_point(cx + c * x - s * y + tx, cy + s * x + c * y + ty))
+    for e in entities:
+        let made = try copied(sketch, e, &points, &copies)
+        if made >= 0: try out.push(made)
+
+## Scale `entities` about plane point (`cx`, `cy`) by `factor`.
+pub func scale_entities(sketch: Sketch*, entities: const i64[], cx: f64, cy: f64, factor: f64) -> !:
+    if not (factor > 0.0): error(invalid, "a scale needs a positive factor")
+    var points = Growing[i64]()
+    defer points.close()
+    for e in entities: try gather_points(sketch, e, &points)
+    for p in points.view():
+        sketch.place(p, cx + (sketch.x(p) - cx) * factor, cy + (sketch.y(p) - cy) * factor)
+    for e in entities:
+        let k = sketch.entity(e).kind
+        # Radii scale; a conic's rho is a ratio and stays.
+        if k == EntityKind.circle or k == EntityKind.arc or k == EntityKind.ellipse or k == EntityKind.text:
+            sketch.params.items[(usize)sketch.entity(e).second] *= factor
+    # Dimensions of what scaled scale with it.
+    for at in 0..<sketch.constraints.count:
+        let c = sketch.constraints.items[at]
+        if c.kind == ConstraintKind.angle or (u8)c.kind < (u8)ConstraintKind.distance: continue
+        if contains(entities, c.first) or contains(entities, c.second) or touches(sketch, entities, c.first):
+            sketch.constraints.items[at].value = c.value * factor
+
+# -- Crossings.
+
+## The points of entity `e` added to `out` (each once).
+func gather_points(sketch: const Sketch*, e: i64, out: Growing[i64]*) -> !:
+    let x = sketch.entity(e)
+    if x.kind == EntityKind.point:
+        try add_once(out, e)
+        return
+    var own = Growing[i64]()
+    defer own.close()
+    try sketch.points_of(x, &own)
+    for p in own.view(): try add_once(out, p)
+
+## A copy of entity `e` on the copied points (`points`' copies in
+## `copies`), or -1 for a point (copied already).
+func copied(sketch: Sketch*, e: i64, points: const Growing[i64]*, copies: const Growing[i64]*) -> i64!:
+    let x = sketch.entity(e)
+    if x.kind == EntityKind.point: return copies.items[index_in(points, e)]
+    if x.kind == EntityKind.spline:
+        var own = Growing[i64]()
+        defer own.close()
+        try sketch.points_of(x, &own)
+        for at in 0..<own.count: own.items[at] = copies.items[index_in(points, own.items[at])]
+        return try sketch.add_spline(own.view(), x.fourth != 0, x.third, x.construction)
+    let first = copies.items[index_in(points, x.first)]
+    if x.kind == EntityKind.line: return try sketch.add_line(first, copies.items[index_in(points, x.second)], x.construction)
+    if x.kind == EntityKind.circle: return try sketch.add_circle(first, sketch.radius_of(e), x.construction)
+    if x.kind == EntityKind.text: return try sketch.add_text(first, sketch.radius_of(e), sketch.text_content(x), sketch.text_font(x), x.construction)
+    if x.kind == EntityKind.ellipse: return try sketch.add_ellipse(first, copies.items[index_in(points, x.third)], sketch.radius_of(e), x.construction)
+    if x.kind == EntityKind.conic: return try sketch.add_conic(first, copies.items[index_in(points, x.third)], copies.items[index_in(points, x.fourth)], sketch.radius_of(e), x.construction)
+    return try sketch.add_arc(first, copies.items[index_in(points, x.third)], copies.items[index_in(points, x.fourth)], x.construction)
+
+func index_in(values: const Growing[i64]*, value: i64) -> usize:
+    for at in 0..<values.count:
+        if values.items[at] == value: return at
+    return 0
+
+func add_once(out: Growing[i64]*, value: i64) -> !:
+    for v in out.view():
+        if v == value: return
+    try out.push(value)
+
+func contains(values: const i64[], value: i64) -> bool:
+    for v in values:
+        if v == value: return true
+    return false
+
+## Whether point `at` is a point of one of `entities`.
+func touches(sketch: const Sketch*, entities: const i64[], at: i64) -> bool:
+    if at < 0 or sketch.entity(at).kind != EntityKind.point: return false
+    var points = Growing[i64]()
+    defer points.close()
+    for e in entities:
+        gather_points(sketch, e, &points) catch failure:
+            return false
+    for p in points.view():
+        if p == at: return true
+    return false

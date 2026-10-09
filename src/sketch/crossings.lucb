@@ -1,0 +1,173 @@
+## Where curves cross: each place another curve crosses or touches a
+## line, circle or arc (exactly for lines and circles, by sampling and
+## bisection for splines, ellipses and conics), sorted along it, and the
+## crossings around a place (Trim's and Break's pieces).
+
+## Where curve `other` crosses (or touches) a curve: the place along it and
+## the point.
+struct Crossing:
+    var place: f64
+    var x: f64
+    var y: f64
+    var other: i64
+
+## Every place other curves cross or touch curve `curve`, sorted.
+func crossings(sketch: const Sketch*, curve: i64, out: Growing[Crossing]*) -> !:
+    for other in 0..<(i64)sketch.entities.count:
+        # Lines, circles, arcs, splines, ellipses and conics cut it.
+        if other == curve or (u8)sketch.entity(other).kind < 1 or sketch.entity(other).kind == EntityKind.text: continue
+        try meet(sketch, curve, other, false, out)
+    # Places sorted, near repeats once.
+    for i in 1..<out.count:
+        let v = out.items[i]
+        var j = i
+        while j > 0 and out.items[j - 1].place > v.place:
+            out.items[j] = out.items[j - 1]
+            j -= 1
+        out.items[j] = v
+    var kept: usize = 0
+    for at in 0..<out.count:
+        if kept > 0 and math.abs(out.items[at].place - out.items[kept - 1].place) <= 1e-9: continue
+        out.items[kept] = out.items[at]
+        kept += 1
+    out.count = kept
+
+## Where curve `other` meets curve `curve` (as places along `curve`); with
+## `beyond`, `curve` counts as running on past its end_xy (lines as lines,
+## arcs round their circle), for Extend.
+func meet(sketch: const Sketch*, curve: i64, other: i64, beyond: bool, out: Growing[Crossing]*) -> !:
+    let a = sketch.entity(curve)
+    let b = sketch.entity(other)
+    if (u8)a.kind > 3 or a.kind == EntityKind.point or b.kind == EntityKind.point or b.kind == EntityKind.text: return
+    let size = size_of(sketch)
+    let tolerance = 1e-9 * size
+    var hits = Growing[f64]()
+    defer hits.close()
+    # Points (x, y) common to both carriers.
+    if (u8)b.kind > 3:
+        try free_hits(sketch, a, b, beyond, &hits)
+    elif a.kind == EntityKind.line and b.kind == EntityKind.line:
+        let (ax, ay, dx, dy) = line_of(sketch, a)
+        let (bx, by, ex, ey) = line_of(sketch, b)
+        let d = dx * ey - dy * ex
+        if math.abs(d) <= 1e-12 * math.hypot(dx, dy) * math.hypot(ex, ey): return
+        let t = ((bx - ax) * ey - (by - ay) * ex) / d
+        try hits.push(ax + t * dx)
+        try hits.push(ay + t * dy)
+    elif a.kind == EntityKind.line or b.kind == EntityKind.line:
+        let line = a if a.kind == EntityKind.line else b
+        let round = b if a.kind == EntityKind.line else a
+        let (sx, sy, dx, dy) = line_of(sketch, line)
+        let cx = sketch.x(round.first)
+        let cy = sketch.y(round.first)
+        let r = sketch.params.items[(usize)round.second]
+        let l2 = dx * dx + dy * dy
+        let fx = sx - cx
+        let fy = sy - cy
+        let half_b = fx * dx + fy * dy
+        let disc = half_b * half_b - l2 * (fx * fx + fy * fy - r * r)
+        if disc < -2.0 * r * tolerance * l2: return
+        let root = math.sqrt(math.max(0.0, disc))
+        for t in [(-half_b - root) / l2, (-half_b + root) / l2]:
+            try hits.push(sx + t * dx)
+            try hits.push(sy + t * dy)
+            if root == 0.0: break
+    else:
+        let c1x = sketch.x(a.first)
+        let c1y = sketch.y(a.first)
+        let c2x = sketch.x(b.first)
+        let c2y = sketch.y(b.first)
+        let r1 = sketch.params.items[(usize)a.second]
+        let r2 = sketch.params.items[(usize)b.second]
+        let d = math.hypot(c2x - c1x, c2y - c1y)
+        if d <= tolerance or d > r1 + r2 + tolerance or d < math.abs(r1 - r2) - tolerance: return
+        let along = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d)
+        let h = math.sqrt(math.max(0.0, r1 * r1 - along * along))
+        let ux = (c2x - c1x) / d
+        let uy = (c2y - c1y) / d
+        for s in [-1.0, 1.0]:
+            try hits.push(c1x + along * ux - s * h * uy)
+            try hits.push(c1y + along * uy + s * h * ux)
+            if h == 0.0: break
+    var at: usize = 0
+    while at + 1 < hits.count:
+        let x = hits.items[at]
+        let y = hits.items[at + 1]
+        at += 2
+        # On `other` as it is, on `curve` (as far as it runs).
+        if not on_curve(sketch, other, x, y, tolerance * 1000.0, false): continue
+        if not on_curve(sketch, curve, x, y, tolerance * 1000.0, beyond): continue
+        try out.push(Crossing(place_of(sketch, curve, x, y), x, y, other))
+
+## Where spline, ellipse or conic `b` crosses line, circle or arc `a`'s
+## carrier, onto `hits` as x, y: its samples' sign changes against the
+## carrier, each refined by bisection along it to the sketch's precision.
+func free_hits(sketch: const Sketch*, a: SketchEntity, b: SketchEntity, beyond: bool, hits: Growing[f64]*) -> !:
+    _ = beyond
+    var net = new_net()
+    defer net.close()
+    try net_of(sketch, b, &net)
+    let (low, high) = net.range()
+    let steps: usize = 256
+    var previous = carrier_side(sketch, a, net.at(low))
+    for k in 1..<steps + 1:
+        let t1 = low + (high - low) * (f64)k / (f64)steps
+        let now = carrier_side(sketch, a, net.at(t1))
+        if (previous < 0.0) != (now < 0.0) or now == 0.0:
+            var lo = t1 - (high - low) / (f64)steps
+            var hi = t1
+            let below = previous < 0.0
+            for i in 0..<(usize)60:
+                let middle = (lo + hi) * 0.5
+                if (carrier_side(sketch, a, net.at(middle)) < 0.0) == below: lo = middle
+                else: hi = middle
+            let (x, y) = net.at((lo + hi) * 0.5)
+            try hits.push(x)
+            try hits.push(y)
+        previous = now
+
+## Which side of line, circle or arc `a`'s carrier point `at` is (its
+## signed distance: left of a line, outside a circle).
+func carrier_side(sketch: const Sketch*, a: SketchEntity, at: (f64, f64)) -> f64:
+    let (x, y) = at
+    if a.kind == EntityKind.line:
+        let (ax, ay, dx, dy) = line_of(sketch, a)
+        return (dx * (y - ay) - dy * (x - ax)) / math.max(math.hypot(dx, dy), 1e-300)
+    return math.hypot(x - sketch.x(a.first), y - sketch.y(a.first)) - sketch.params.items[(usize)a.second]
+
+## Whether (`x`, `y`) on its curve's carrier lies on curve `curve` itself
+## (with `beyond`, anywhere on a line's line or an arc's circle).
+func on_curve(sketch: const Sketch*, curve: i64, x: f64, y: f64, slack: f64, beyond: bool) -> bool:
+    let e = sketch.entity(curve)
+    # A free-form curve's hits come from its own samples: on it.
+    if e.kind == EntityKind.circle or beyond or (u8)e.kind > 3: return true
+    let length = curve_length(sketch, curve)
+    let place = place_of(sketch, curve, x, y)
+    return place >= -slack / length and place <= 1.0 + slack / length
+
+## The crossings just before and after place `here` (-1: none, the curve's
+## own end).
+func around(found: const Growing[Crossing]*, here: f64) -> (i64, i64):
+    var low: i64 = -1
+    var high: i64 = -1
+    for at in 0..<found.count:
+        let p = found.items[at].place
+        # Crossings at a curve's own end_xy are its end_xy.
+        if p <= 1e-9 or p >= 1.0 - 1e-9: continue
+        if p < here: low = (i64)at
+        elif high < 0: high = (i64)at
+    return (low, high)
+
+## On a circle: the crossings before and after angle `here`, round.
+func around_angle(found: const Growing[Crossing]*, here: f64) -> (usize, usize):
+    var after: usize = 0
+    var seen = false
+    for at in 0..<found.count:
+        if found.items[at].place > here and not seen:
+            after = at
+            seen = true
+    if not seen: after = 0
+    let before = (after + found.count - 1) % found.count
+    return (before, after)
+
+# -- Edits.

@@ -1,0 +1,250 @@
+## Offset: copies of a chain of curves a distance to one side, neighbors
+## meeting again where their copies cross; and what it would make (its
+## preview).
+
+## Copies of the chain `curves` (end to end, in order) `distance` to the
+## side of plane point (`qx`, `qy`), neighbors meeting again where their
+## copies cross; the new curves onto `out`. Line copies stay parallel to
+## theirs, `distance` away by a dimension (so the offset is a value to
+## change); arc and circle copies keep their center; a spline's, ellipse's
+## or conic's copy is a fit point spline through its offset samples.
+pub func offset_chain(sketch: Sketch*, curves: const i64[], distance: f64, qx: f64, qy: f64, out: Growing[i64]*) -> !:
+    if curves.length == 0: error(invalid, "offset needs curves")
+    for c in curves:
+        if c < 0 or c >= (i64)sketch.entities.count or sketch.entity(c).kind == EntityKind.point or sketch.entity(c).kind == EntityKind.text:
+            error(invalid, "Offset copies curves (not points or text)")
+    let side = 1.0 if signed_side(sketch, curves[0], qx, qy) >= 0.0 else -1.0
+    # Each copy's carrier and its ends as offset (before joining); a
+    # free-form copy's samples in `runs`.
+    var carriers = Growing[Carrier]()
+    defer carriers.close()
+    var runs = Growing[f64]()
+    defer runs.close()
+    for c in curves: try carriers.push(try offset_carrier(sketch, c, distance, side, qx, qy, &runs))
+    let n = curves.length
+    let single_loop = n == 1 and carriers.items[0].freeform and math.hypot(carriers.items[0].sx - carriers.items[0].ex, carriers.items[0].sy - carriers.items[0].ey) <= 1e-9 * math.max(1.0, size_of(sketch))
+    let closed = single_loop or (n > 1 and try chain_closed(sketch, curves))
+    # Where each copy starts and ends: at its neighbors' meeting points.
+    var start_xy = Growing[f64]()
+    defer start_xy.close()
+    var end_xy = Growing[f64]()
+    defer end_xy.close()
+    for at in 0..<n:
+        let k = carriers.items[at]
+        try start_xy.push(k.sx)
+        try start_xy.push(k.sy)
+        try end_xy.push(k.ex)
+        try end_xy.push(k.ey)
+    for at in 0..<n:
+        if at + 1 == n and not closed: break
+        if single_loop: break
+        let next = (at + 1) % n
+        let (x, y) = joint(&carriers.items[at], &carriers.items[next])
+        end_xy.items[at * 2] = x
+        end_xy.items[at * 2 + 1] = y
+        start_xy.items[next * 2] = x
+        start_xy.items[next * 2 + 1] = y
+    # Points, each joint once: a copy starts where the one before ends.
+    var start_points = Growing[i64]()
+    defer start_points.close()
+    var end_points = Growing[i64]()
+    defer end_points.close()
+    try start_points.push(try sketch.add_point(start_xy.items[0], start_xy.items[1]))
+    for at in 0..<n:
+        let last = at + 1 == n
+        let p = start_points.items[0] if last and closed else try sketch.add_point(end_xy.items[at * 2], end_xy.items[at * 2 + 1])
+        try end_points.push(p)
+        if not last: try start_points.push(p)
+    for at in 0..<n:
+        let c = curves[at]
+        let e = sketch.entity(c)
+        let k = carriers.items[at]
+        if k.freeform:
+            # Through every fourth offset sample, from the copy's start to
+            # its end.
+            var points = Growing[i64]()
+            defer points.close()
+            try points.push(start_points.items[at])
+            var sample: usize = 4
+            while sample + 1 < k.count:
+                try points.push(try sketch.add_point(runs.items[k.run + 2 * sample], runs.items[k.run + 2 * sample + 1]))
+                sample += 4
+            try points.push(end_points.items[at])
+            try out.push(try sketch.add_spline(points.view(), true, construction = e.construction))
+        elif k.line:
+            let made = try sketch.add_line(start_points.items[at], end_points.items[at], e.construction)
+            try out.push(made)
+            _ = try sketch.constrain(ConstraintKind.parallel, c, made)
+            _ = try sketch.constrain(ConstraintKind.line_distance, start_points.items[at], c, value = distance, side = side)
+        elif e.kind == EntityKind.circle:
+            try out.push(try sketch.add_circle(e.first, k.r, e.construction))
+        else:
+            let made = try sketch.add_arc(e.first, start_points.items[at], end_points.items[at], e.construction)
+            sketch.params.items[(usize)sketch.entity(made).second] = k.r
+            try out.push(made)
+
+## What Offset would make: `curves` offset as offset_chain does, on a copy
+## of `sketch`, as points along each new curve onto `out` (x, y pairs, a
+## NaN pair after each curve).
+pub func offset_preview(sketch: const Sketch*, curves: const i64[], distance: f64, qx: f64, qy: f64, out: Growing[f64]*) -> !:
+    out.clear()
+    var text = Growing[u8]()
+    defer text.close()
+    try write_sketch(sketch, &text)
+    var copy = try read_sketch((str)text.view())
+    defer copy.close()
+    var made = Growing[i64]()
+    defer made.close()
+    try offset_chain(&copy, curves, distance, qx, qy, &made)
+    for c in made.view(): try curve_samples(&copy, copy.entity(c), out)
+
+## Points along curve `e` onto `out` (appended), then a NaN pair.
+func curve_samples(sketch: const Sketch*, e: SketchEntity, out: Growing[f64]*) -> !:
+    if e.kind == EntityKind.line:
+        for p in [e.first, e.second]:
+            try out.push(sketch.x(p))
+            try out.push(sketch.y(p))
+    elif e.kind == EntityKind.circle or e.kind == EntityKind.arc:
+        let cx = sketch.x(e.first)
+        let cy = sketch.y(e.first)
+        let r = sketch.params.items[(usize)e.second]
+        var start = 0.0
+        var sweep = 2.0 * math.pi
+        if e.kind == EntityKind.arc:
+            start = math.atan2(sketch.y(e.third) - cy, sketch.x(e.third) - cx)
+            sweep = math.atan2(sketch.y(e.fourth) - cy, sketch.x(e.fourth) - cx) - start
+            while sweep <= 0.0: sweep += 2.0 * math.pi
+        for k in 0..<(usize)49:
+            let angle = start + sweep * (f64)k / 48.0
+            try out.push(cx + r * math.cos(angle))
+            try out.push(cy + r * math.sin(angle))
+    else:
+        var net = new_net()
+        defer net.close()
+        try net_of(sketch, e, &net)
+        var points = Growing[f64]()
+        defer points.close()
+        try net.sample(96, &points)
+        for v in points.view(): try out.push(v)
+    try out.push(math.nan)
+    try out.push(math.nan)
+
+## A curve's offset copy as a line or a circle (or, free-form, its offset
+## samples in `runs`), with its ends.
+struct Carrier:
+    var line: bool
+    var x: f64
+    var y: f64
+    var dx: f64
+    var dy: f64
+    var r: f64
+    var sx: f64
+    var sy: f64
+    var ex: f64
+    var ey: f64
+    var freeform: bool
+    var run: usize
+    var count: usize
+
+## Curve `c` moved `distance` to `side` of it (lines and free-form curves:
+## left is +1; arcs and circles: toward plane point (`qx`, `qy`) when it is
+## outside them, the radius growing).
+func offset_carrier(sketch: const Sketch*, c: i64, distance: f64, side: f64, qx: f64, qy: f64, runs: Growing[f64]*) -> Carrier!:
+    let e = sketch.entity(c)
+    if e.kind == EntityKind.line:
+        let (ax, ay, dx, dy) = line_of(sketch, e)
+        let (ux, uy) = unit_vector(dx, dy)
+        let d = distance * side
+        return Carrier(true, ax - uy * d, ay + ux * d, dx, dy, 0.0, ax - uy * d, ay + ux * d, ax + dx - uy * d, ay + dy + ux * d, false, 0, 0)
+    if (u8)e.kind > 3:
+        # Each sample moved along the curve's left normal.
+        var net = new_net()
+        defer net.close()
+        try net_of(sketch, e, &net)
+        var samples = Growing[f64]()
+        defer samples.close()
+        try net.sample(32, &samples)
+        let count = samples.count // 2
+        let run = runs.count
+        let local = 1.0 if signed_side(sketch, c, qx, qy) >= 0.0 else -1.0
+        for k in 0..<count:
+            let a = k - 1 if k > 0 else k
+            let b = k + 1 if k + 1 < count else k
+            let (tx, ty) = unit_vector(samples.items[2 * b] - samples.items[2 * a], samples.items[2 * b + 1] - samples.items[2 * a + 1])
+            try runs.push(samples.items[2 * k] - ty * distance * local)
+            try runs.push(samples.items[2 * k + 1] + tx * distance * local)
+        _ = side
+        return Carrier(false, 0.0, 0.0, 0.0, 0.0, 0.0, runs.items[run], runs.items[run + 1], runs.items[run + 2 * count - 2], runs.items[run + 2 * count - 1], true, run, count)
+    let cx = sketch.x(e.first)
+    let cy = sketch.y(e.first)
+    let r = sketch.radius_of(c)
+    let outward = math.hypot(qx - cx, qy - cy) > r
+    let nr = r + distance if outward else r - distance
+    if nr <= 0.0: error(invalid, "the offset is larger than an arc's radius")
+    if e.kind == EntityKind.circle: return Carrier(false, cx, cy, 0.0, 0.0, nr, cx, cy, cx, cy, false, 0, 0)
+    let (sx, sy) = scaled_from(sketch, e.first, e.third, nr / r)
+    let (tx, ty) = scaled_from(sketch, e.first, e.fourth, nr / r)
+    return Carrier(false, cx, cy, 0.0, 0.0, nr, sx, sy, tx, ty, false, 0, 0)
+
+## Where copies `a` (its end) and `b` (its start) meet: their carriers'
+## crossing nearest the gap between them, or the gap's middle.
+func joint(a: const Carrier*, b: const Carrier*) -> (f64, f64):
+    let gx = (a.ex + b.sx) * 0.5
+    let gy = (a.ey + b.sy) * 0.5
+    # A free-form copy meets its neighbor halfway between their ends.
+    if a.freeform or b.freeform: return (gx, gy)
+    var best_x = gx
+    var best_y = gy
+    var best = math.infinity
+    var hits: f64[4] = [0.0, 0.0, 0.0, 0.0]
+    var count: usize = 0
+    if a.line and b.line:
+        let d = a.dx * b.dy - a.dy * b.dx
+        if math.abs(d) > 1e-12 * math.hypot(a.dx, a.dy) * math.hypot(b.dx, b.dy):
+            let t = ((b.x - a.x) * b.dy - (b.y - a.y) * b.dx) / d
+            hits[0] = a.x + t * a.dx
+            hits[1] = a.y + t * a.dy
+            count = 1
+    elif a.line or b.line:
+        let line = a if a.line else b
+        let round = b if a.line else a
+        let l2 = line.dx * line.dx + line.dy * line.dy
+        let fx = line.x - round.x
+        let fy = line.y - round.y
+        let half_b = fx * line.dx + fy * line.dy
+        let disc = half_b * half_b - l2 * (fx * fx + fy * fy - round.r * round.r)
+        if disc >= 0.0:
+            let root = math.sqrt(disc)
+            for at in 0..<(usize)2:
+                let t = (-half_b + (root if at == 1 else -root)) / l2
+                hits[at * 2] = line.x + t * line.dx
+                hits[at * 2 + 1] = line.y + t * line.dy
+            count = 2
+    else:
+        let d = math.hypot(b.x - a.x, b.y - a.y)
+        if d > 0.0 and d <= a.r + b.r and d >= math.abs(a.r - b.r):
+            let along = (a.r * a.r - b.r * b.r + d * d) / (2.0 * d)
+            let h = math.sqrt(math.max(0.0, a.r * a.r - along * along))
+            let ux = (b.x - a.x) / d
+            let uy = (b.y - a.y) / d
+            for at in 0..<(usize)2:
+                let s = -1.0 if at == 0 else 1.0
+                hits[at * 2] = a.x + along * ux - s * h * uy
+                hits[at * 2 + 1] = a.y + along * uy + s * h * ux
+            count = 2
+    for at in 0..<count:
+        let dist = math.hypot(hits[at * 2] - gx, hits[at * 2 + 1] - gy)
+        if dist < best:
+            best = dist
+            best_x = hits[at * 2]
+            best_y = hits[at * 2 + 1]
+    return (best_x, best_y)
+
+## Whether the chain `curves` closes (its last curve end_xy where the first
+## start_xy).
+func chain_closed(sketch: const Sketch*, curves: const i64[]) -> bool!:
+    let first = sketch.entity(curves[0])
+    let last = sketch.entity(curves[curves.length - 1])
+    let start = first.first if first.kind == EntityKind.line else first.third
+    let end = last.second if last.kind == EntityKind.line else last.fourth
+    return start == end or math.hypot(sketch.x(start) - sketch.x(end), sketch.y(start) - sketch.y(end)) <= 1e-9 * size_of(sketch)

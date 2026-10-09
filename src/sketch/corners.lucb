@@ -1,0 +1,65 @@
+## Fillet and Chamfer: round or cut the corner where two lines meet, their
+## ends moved back to the new arc or line.
+
+## Round the corner of lines `first` and `second` (sharing a point) with an
+## arc of `radius` tangent to both, the lines shortened to it: Fusion's
+## sketch fillet (tangent constraints and a radius dimension added).
+pub func fillet_corner(sketch: Sketch*, first: i64, second: i64, radius: f64) -> i64!:
+    let (corner, a_far, b_far) = try corner_of(sketch, first, second)
+    let cx = sketch.x(corner)
+    let cy = sketch.y(corner)
+    let (ux, uy) = unit_vector(sketch.x(a_far) - cx, sketch.y(a_far) - cy)
+    let (vx, vy) = unit_vector(sketch.x(b_far) - cx, sketch.y(b_far) - cy)
+    let turn = math.acos(math.max(-1.0, math.min(1.0, ux * vx + uy * vy)))
+    if turn < 1e-6 or turn > math.pi - 1e-6: error(invalid, "lines in line have no corner to fillet")
+    let reach = radius / math.tan(turn * 0.5)
+    if reach >= math.hypot(sketch.x(a_far) - cx, sketch.y(a_far) - cy) or reach >= math.hypot(sketch.x(b_far) - cx, sketch.y(b_far) - cy):
+        error(invalid, "the fillet is larger than its lines")
+    let (bx, by) = unit_vector(ux + vx, uy + vy)
+    let away = radius / math.sin(turn * 0.5)
+    let ta = try sketch.add_point(cx + ux * reach, cy + uy * reach)
+    let tb = try sketch.add_point(cx + vx * reach, cy + vy * reach)
+    try replace_end(sketch, first, corner, ta)
+    try replace_end(sketch, second, corner, tb)
+    # The corner, used by nothing else now, is the arc's center.
+    let center = try reused(sketch, corner, cx + bx * away, cy + by * away)
+    # Counterclockwise from one tangent point to the other the short way.
+    let cross = ux * vy - uy * vx
+    let arc = try sketch.add_arc(center, tb if cross > 0.0 else ta, ta if cross > 0.0 else tb)
+    _ = try sketch.constrain(ConstraintKind.tangent, first, arc, side = line_side(sketch, first, center))
+    _ = try sketch.constrain(ConstraintKind.tangent, second, arc, side = line_side(sketch, second, center))
+    _ = try sketch.constrain(ConstraintKind.radius, arc, value = radius)
+    return arc
+
+## Cut the corner of lines `first` and `second` (sharing a point) by a line
+## `distance` along each from it, the lines shortened to it.
+pub func chamfer_corner(sketch: Sketch*, first: i64, second: i64, distance: f64) -> i64!:
+    let (corner, a_far, b_far) = try corner_of(sketch, first, second)
+    let cx = sketch.x(corner)
+    let cy = sketch.y(corner)
+    if distance >= math.hypot(sketch.x(a_far) - cx, sketch.y(a_far) - cy) or distance >= math.hypot(sketch.x(b_far) - cx, sketch.y(b_far) - cy):
+        error(invalid, "the chamfer is longer than its lines")
+    let (ux, uy) = unit_vector(sketch.x(a_far) - cx, sketch.y(a_far) - cy)
+    let (vx, vy) = unit_vector(sketch.x(b_far) - cx, sketch.y(b_far) - cy)
+    let tb = try sketch.add_point(cx + vx * distance, cy + vy * distance)
+    try replace_end(sketch, second, corner, tb)
+    # The corner, now only the first line's, moves to its end of the cut.
+    let ta = try reused(sketch, corner, cx + ux * distance, cy + uy * distance, first)
+    if ta != corner: try replace_end(sketch, first, corner, ta)
+    return try sketch.add_line(ta, tb)
+
+## Lines `first` and `second`: the point they share and each one's other end.
+func corner_of(sketch: const Sketch*, first: i64, second: i64) -> (i64, i64, i64)!:
+    let a = sketch.entity(first)
+    let b = sketch.entity(second)
+    if a.kind != EntityKind.line or b.kind != EntityKind.line: error(invalid, "a sketch fillet or chamfer joins two lines")
+    if a.first == b.first: return (a.first, a.second, b.second)
+    if a.first == b.second: return (a.first, a.second, b.first)
+    if a.second == b.first: return (a.second, a.first, b.second)
+    if a.second == b.second: return (a.second, a.first, b.first)
+    error(invalid, "the lines do not meet at a point: pick two that share a corner")
+
+## Which side of line `line` point `point` is (+1 left, -1 right), as the
+## tangent constraint keeps it.
+func line_side(sketch: const Sketch*, line: i64, point: i64) -> f64:
+    return 1.0 if signed_side(sketch, line, sketch.x(point), sketch.y(point)) >= 0.0 else -1.0

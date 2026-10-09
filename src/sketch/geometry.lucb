@@ -1,0 +1,224 @@
+## Geometry of a sketch's curves shared by its tools: a line's start and
+## direction, unit vectors, lengths, which side of a curve a point is, the
+## place along a curve and the point at a place, how far a point is from
+## an entity and the entity nearest it (picking), points along any curve
+## (sampling) and the place on a curve nearest a point.
+##
+## A place along a curve: a line's from 0 at its start to 1 at its end; an
+## arc's the same along its sweep; a circle's an angle (radians).
+
+## A line's start and direction.
+func line_of(sketch: const Sketch*, e: SketchEntity) -> (f64, f64, f64, f64):
+    let ax = sketch.x(e.first)
+    let ay = sketch.y(e.first)
+    return (ax, ay, sketch.x(e.second) - ax, sketch.y(e.second) - ay)
+
+func unit_vector(x: f64, y: f64) -> (f64, f64):
+    let l = math.max(math.hypot(x, y), 1e-300)
+    return (x / l, y / l)
+
+## Point `point` scaled from `center` by `factor`.
+func scaled_from(sketch: const Sketch*, center: i64, point: i64, factor: f64) -> (f64, f64):
+    let cx = sketch.x(center)
+    let cy = sketch.y(center)
+    return (cx + (sketch.x(point) - cx) * factor, cy + (sketch.y(point) - cy) * factor)
+
+func curve_length(sketch: const Sketch*, curve: i64) -> f64:
+    let e = sketch.entity(curve)
+    if e.kind == EntityKind.line:
+        let (ax, ay, dx, dy) = line_of(sketch, e)
+        _ = ax
+        _ = ay
+        return math.max(math.hypot(dx, dy), 1e-300)
+    return math.max(sketch.radius_of(curve) * 2.0 * math.pi, 1e-300)
+
+## How far left of curve `curve` (`x`, `y`) is (a line: of its direction;
+## an arc or circle: outside it is positive).
+func signed_side(sketch: const Sketch*, curve: i64, x: f64, y: f64) -> f64:
+    let e = sketch.entity(curve)
+    if e.kind == EntityKind.line:
+        let (ax, ay, dx, dy) = line_of(sketch, e)
+        return (dx * (y - ay) - dy * (x - ax)) / math.max(math.hypot(dx, dy), 1e-300)
+    if (u8)e.kind > 3:
+        # Left (+) or right of the curve where it passes nearest.
+        var net = new_net()
+        defer net.close()
+        net_of(sketch, e, &net) catch failure:
+            return 1.0
+        var samples = Growing[f64]()
+        defer samples.close()
+        net.sample(96, &samples) catch failure:
+            return 1.0
+        var best = 1e300
+        var cross = 1.0
+        for k in 0..<samples.count // 2 - 1:
+            let (ax, ay, bx, by) = (samples.items[2 * k], samples.items[2 * k + 1], samples.items[2 * k + 2], samples.items[2 * k + 3])
+            let d = segment_distance(x, y, ax, ay, bx, by)
+            if d < best:
+                best = d
+                cross = (bx - ax) * (y - ay) - (by - ay) * (x - ax)
+        return cross
+    return math.hypot(x - sketch.x(e.first), y - sketch.y(e.first)) - sketch.radius_of(curve)
+
+## The point at place `place` along line, circle or arc `curve`.
+func at_place(sketch: const Sketch*, curve: i64, place: f64) -> (f64, f64):
+    let e = sketch.entity(curve)
+    if e.kind == EntityKind.line:
+        let (ax, ay, dx, dy) = line_of(sketch, e)
+        return (ax + dx * place, ay + dy * place)
+    let cx = sketch.x(e.first)
+    let cy = sketch.y(e.first)
+    let r = sketch.radius_of(curve)
+    var angle = place
+    if e.kind == EntityKind.arc:
+        let start = math.atan2(sketch.y(e.third) - cy, sketch.x(e.third) - cx)
+        var sweep = math.atan2(sketch.y(e.fourth) - cy, sketch.x(e.fourth) - cx) - start
+        while sweep <= 0.0: sweep += 2.0 * math.pi
+        angle = start + sweep * place
+    return (cx + r * math.cos(angle), cy + r * math.sin(angle))
+
+## The place along curve `curve` nearest (`x`, `y`) (not limited to the
+## curve: a line's place can be below 0 or above 1, an arc's past its
+## sweep counts round from its start).
+func place_of(sketch: const Sketch*, curve: i64, x: f64, y: f64) -> f64:
+    let e = sketch.entity(curve)
+    if e.kind == EntityKind.line:
+        let (ax, ay, dx, dy) = line_of(sketch, e)
+        return ((x - ax) * dx + (y - ay) * dy) / math.max(dx * dx + dy * dy, 1e-300)
+    let cx = sketch.x(e.first)
+    let cy = sketch.y(e.first)
+    let angle = math.atan2(y - cy, x - cx)
+    if e.kind == EntityKind.circle:
+        return angle if angle >= 0.0 else angle + 2.0 * math.pi
+    let start = math.atan2(sketch.y(e.third) - cy, sketch.x(e.third) - cx)
+    var sweep = math.atan2(sketch.y(e.fourth) - cy, sketch.x(e.fourth) - cx) - start
+    while sweep <= 0.0: sweep += 2.0 * math.pi
+    var turn = angle - start
+    while turn < 0.0: turn += 2.0 * math.pi
+    # Past the end: the shorter way, before the start (negative) or after
+    # the end.
+    if turn > sweep and turn - sweep > 2.0 * math.pi - turn: turn -= 2.0 * math.pi
+    return turn / sweep
+
+## Whether a point can be held on a curve of kind `kind`.
+func holds_points(kind: EntityKind) -> bool:
+    return kind == EntityKind.line or kind == EntityKind.circle or kind == EntityKind.arc or kind == EntityKind.ellipse
+
+func require_curve(sketch: const Sketch*, curve: i64) -> !:
+    if curve < 0 or curve >= (i64)sketch.entities.count or sketch.entity(curve).kind == EntityKind.point:
+        error(invalid, "this works on a sketch's curves")
+    if (u8)sketch.entity(curve).kind > 3:
+        error(invalid, "this works on lines, circles and arcs (a spline, ellipse or conic goes whole with Delete)")
+
+## The entity of `sketch` nearest (`x`, `y`) within `reach`: a point if one
+## is that near, else the nearest curve (`only` as pick has it).
+func nearest(sketch: const Sketch*, x: f64, y: f64, reach: f64, only: i64) -> i64:
+    var best: i64 = -1
+    var best_distance = reach
+    for pass in 0..<(usize)2:
+        if (only == 1 and pass == 1) or (only == 2 and pass == 0): continue
+        for index in 0..<sketch.entities.count:
+            let e = sketch.entities.items[index]
+            if (pass == 0) != (e.kind == EntityKind.point): continue
+            let d = distance_to(sketch, e, (i64)index, x, y)
+            if d <= best_distance:
+                best = (i64)index
+                best_distance = d
+        if best >= 0: return best
+    return -1
+
+func samples_of(sketch: const Sketch*, e: SketchEntity, count: usize, out: Growing[f64]*) -> !:
+    if e.kind == EntityKind.text:
+        out.clear()
+        var letters = new_lettering()
+        defer letters.close()
+        try letter(sketch, e, &letters)
+        for piece in 0..<letters.count():
+            let steps: usize = 1 if letters.degrees.items[piece] == 1 else 8
+            for k in 0..<steps + 1:
+                let (x, y) = letters.at(piece, (f64)k / (f64)steps)
+                try out.push(x)
+                try out.push(y)
+            try out.push(math.nan)
+            try out.push(math.nan)
+        return
+    var net = new_net()
+    defer net.close()
+    try net_of(sketch, e, &net)
+    try net.sample(count, out)
+
+## How far (`x`, `y`) is from entity `e` (index `at`).
+func distance_to(sketch: const Sketch*, e: SketchEntity, at: i64, x: f64, y: f64) -> f64:
+    if e.kind == EntityKind.point: return math.hypot(sketch.x(at) - x, sketch.y(at) - y)
+    if (u8)e.kind > 3:
+        # A spline, ellipse, conic or text: its samples as polylines.
+        var points = Growing[f64]()
+        defer points.close()
+        samples_of(sketch, e, 96, &points) catch failure:
+            return 1e300
+        var best = 1e300
+        for k in 0..<points.count // 2 - 1:
+            if math.is_nan(points.items[2 * k]) or math.is_nan(points.items[2 * k + 2]): continue
+            best = math.min(best, segment_distance(x, y, points.items[2 * k], points.items[2 * k + 1], points.items[2 * k + 2], points.items[2 * k + 3]))
+        return best
+    if e.kind == EntityKind.line:
+        let ax = sketch.x(e.first)
+        let ay = sketch.y(e.first)
+        let dx = sketch.x(e.second) - ax
+        let dy = sketch.y(e.second) - ay
+        let l2 = dx * dx + dy * dy
+        let t = math.max(0.0, math.min(1.0, ((x - ax) * dx + (y - ay) * dy) / l2)) if l2 > 0.0 else 0.0
+        return math.hypot(ax + t * dx - x, ay + t * dy - y)
+    let cx = sketch.x(e.first)
+    let cy = sketch.y(e.first)
+    let r = sketch.params.items[(usize)e.second]
+    let off = math.abs(math.hypot(x - cx, y - cy) - r)
+    if e.kind == EntityKind.circle: return off
+    # An arc: on its sweep, the distance to its circle; else to its ends.
+    let start = math.atan2(sketch.y(e.third) - cy, sketch.x(e.third) - cx)
+    var sweep = math.atan2(sketch.y(e.fourth) - cy, sketch.x(e.fourth) - cx) - start
+    while sweep <= 0.0: sweep += 2.0 * math.pi
+    var along = math.atan2(y - cy, x - cx) - start
+    while along < 0.0: along += 2.0 * math.pi
+    if along <= sweep: return off
+    return math.min(math.hypot(sketch.x(e.third) - x, sketch.y(e.third) - y), math.hypot(sketch.x(e.fourth) - x, sketch.y(e.fourth) - y))
+
+## How far (`x`, `y`) is from the segment (`ax`, `ay`)-(`bx`, `by`).
+func segment_distance(x: f64, y: f64, ax: f64, ay: f64, bx: f64, by: f64) -> f64:
+    let dx = bx - ax
+    let dy = by - ay
+    let l2 = dx * dx + dy * dy
+    let t = math.max(0.0, math.min(1.0, ((x - ax) * dx + (y - ay) * dy) / l2)) if l2 > 0.0 else 0.0
+    return math.hypot(ax + t * dx - x, ay + t * dy - y)
+
+## The place on curve `curve` closest (`x`, `y`).
+func nearest_on(sketch: const Sketch*, curve: i64, x: f64, y: f64) -> (f64, f64):
+    let e = sketch.entity(curve)
+    if e.kind == EntityKind.line:
+        let place = math.max(0.0, math.min(1.0, place_of(sketch, curve, x, y)))
+        return at_place(sketch, curve, place)
+    if e.kind == EntityKind.circle or e.kind == EntityKind.arc:
+        let cx = sketch.x(e.first)
+        let cy = sketch.y(e.first)
+        let d = math.hypot(x - cx, y - cy)
+        if d <= 0.0: return (x, y)
+        if e.kind == EntityKind.arc:
+            let place = place_of(sketch, curve, x, y)
+            if place < 0.0 or place > 1.0: return at_place(sketch, curve, math.max(0.0, math.min(1.0, place)))
+        let r = sketch.radius_of(curve)
+        return (cx + (x - cx) * r / d, cy + (y - cy) * r / d)
+    # A free-form curve: its closest sample.
+    var points = Growing[f64]()
+    defer points.close()
+    samples_of(sketch, e, 192, &points) catch failure:
+        return (x, y)
+    var best = 1e300
+    var bx = x
+    var by = y
+    for k in 0..<points.count // 2:
+        let d = math.hypot(points.items[2 * k] - x, points.items[2 * k + 1] - y)
+        if d < best:
+            best = d
+            bx = points.items[2 * k]
+            by = points.items[2 * k + 1]
+    return (bx, by)

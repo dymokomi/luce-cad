@@ -1,0 +1,199 @@
+## Fusion 360's Trim, Extend and Break: Trim takes away the piece of a
+## curve between the nearest crossings round where it is picked; Extend
+## runs a line's or arc's nearest end on to the next curve in its way;
+## Break splits a curve at the crossings round where it is picked. New ends
+## lie on the curves they were cut at (point-on-curve constraints keep them
+## there), as Fusion's coincident constraints do. A piece split off a line
+## stays collinear with it; one split off an arc keeps its circle (the
+## center shared, the radius equal). trim_piece is what Trim would take
+## (the editor shows it).
+
+## Remove the piece of curve `curve` round plane point (`qx`, `qy`) between
+## its nearest crossings (or its end_xy): the whole curve when nothing
+## crosses it.
+pub func trim_curve(sketch: Sketch*, curve: i64, qx: f64, qy: f64) -> !:
+    try require_curve(sketch, curve)
+    var found = Growing[Crossing]()
+    defer found.close()
+    try crossings(sketch, curve, &found)
+    let e = sketch.entity(curve)
+    let here = place_of(sketch, curve, qx, qy)
+    if e.kind == EntityKind.circle:
+        if found.count < 2:
+            try sketch.remove(curve)
+            return
+        # The arc kept runs counterclockwise from the crossing after the
+        # pick round to the one before it.
+        let (before, after) = around_angle(&found, here)
+        # The circle becomes the arc in place (its center and radius kept).
+        try to_arc(sketch, curve, try point_at(sketch, &found.items[after]), try point_at(sketch, &found.items[before]))
+        return
+    let (low, high) = around(&found, here)
+    if low < 0 and high < 0:
+        try sketch.remove(curve)
+        return
+    if low < 0:
+        # The start piece goes: the curve start_xy at the crossing after.
+        try set_end(sketch, curve, true, &found.items[(usize)high])
+    elif high < 0:
+        try set_end(sketch, curve, false, &found.items[(usize)low])
+    else:
+        # A middle piece: the curve end_xy at the crossing before; a new
+        # piece goes on from the crossing after to the old end.
+        let piece = try split_off(sketch, curve, &found.items[(usize)high])
+        _ = piece
+        try set_end(sketch, curve, false, &found.items[(usize)low])
+
+## Split curve `curve` at the crossings round plane point (`qx`, `qy`):
+## the piece between them becomes a curve of its own.
+pub func break_curve(sketch: Sketch*, curve: i64, qx: f64, qy: f64) -> !:
+    try require_curve(sketch, curve)
+    var found = Growing[Crossing]()
+    defer found.close()
+    try crossings(sketch, curve, &found)
+    let e = sketch.entity(curve)
+    if e.kind == EntityKind.circle:
+        # A circle breaks into two arcs at the crossings round the pick.
+        if found.count < 2: error(invalid, "a circle breaks where two curves cross it")
+        let (before, after) = around_angle(&found, place_of(sketch, curve, qx, qy))
+        let a = try point_at(sketch, &found.items[before])
+        let b = try point_at(sketch, &found.items[after])
+        # The circle becomes one arc in place; the other is new, on its
+        # circle.
+        try to_arc(sketch, curve, a, b)
+        let other = try sketch.add_arc(e.first, b, a, e.construction)
+        _ = try sketch.constrain(ConstraintKind.equal, curve, other)
+        return
+    let (low, high) = around(&found, place_of(sketch, curve, qx, qy))
+    if low < 0 and high < 0: error(invalid, "no curve crosses this one to break it at")
+    # The far crossing first, so the near one's place still holds.
+    if high >= 0: _ = try split_off(sketch, curve, &found.items[(usize)high])
+    if low >= 0: _ = try split_off(sketch, curve, &found.items[(usize)low])
+
+## Run the end of line or arc `curve` nearest plane point (`qx`, `qy`) on to
+## the first curve in its way.
+pub func extend_curve(sketch: Sketch*, curve: i64, qx: f64, qy: f64) -> !:
+    try require_curve(sketch, curve)
+    let e = sketch.entity(curve)
+    if e.kind == EntityKind.circle: error(invalid, "a circle has no end to extend")
+    let here = place_of(sketch, curve, qx, qy)
+    let at_start = here < 0.5
+    var best = Crossing(0.0, 0.0, 0.0, -1)
+    var best_reach = math.infinity
+    for other in 0..<(i64)sketch.entities.count:
+        if other == curve or sketch.entity(other).kind == EntityKind.point: continue
+        var hits = Growing[Crossing]()
+        defer hits.close()
+        try meet(sketch, curve, other, true, &hits)
+        for h in hits.view():
+            # Beyond the end being extended: below 0 for the start, above 1
+            # for the end (arcs: past their sweep, the shorter way round).
+            let reach = -h.place if at_start else h.place - 1.0
+            if reach > 1e-9 and reach < best_reach:
+                best_reach = reach
+                best = h
+    if best.other < 0: error(invalid, "nothing lies in this end's way to extend it to")
+    try set_end(sketch, curve, at_start, &best)
+
+## The piece Trim would take from curve `curve` round (`qx`, `qy`), as
+## points along it onto `out` (x, y pairs): the whole curve when nothing
+## crosses it.
+pub func trim_piece(sketch: const Sketch*, curve: i64, qx: f64, qy: f64, out: Growing[f64]*) -> !:
+    out.clear()
+    try require_curve(sketch, curve)
+    var found = Growing[Crossing]()
+    defer found.close()
+    try crossings(sketch, curve, &found)
+    let e = sketch.entity(curve)
+    let here = place_of(sketch, curve, qx, qy)
+    var from_place = 0.0
+    var to_place = 1.0
+    if e.kind == EntityKind.circle:
+        if found.count < 2:
+            from_place = 0.0
+            to_place = 2.0 * math.pi
+        else:
+            let (before, after) = around_angle(&found, here)
+            from_place = found.items[before].place
+            to_place = found.items[after].place
+            while to_place <= from_place: to_place += 2.0 * math.pi
+    else:
+        let (low, high) = around(&found, here)
+        if low >= 0: from_place = found.items[(usize)low].place
+        if high >= 0: to_place = found.items[(usize)high].place
+    let steps: usize = 1 if e.kind == EntityKind.line else 48
+    for k in 0..<steps + 1:
+        let (x, y) = at_place(sketch, curve, from_place + (to_place - from_place) * (f64)k / (f64)steps)
+        try out.push(x)
+        try out.push(y)
+
+## Curve `curve`'s start (`start`) or end moved to crossing `c`: a new
+## point there on the curve that crossed, the old point dropped when
+## nothing else uses it.
+func set_end(sketch: Sketch*, curve: i64, start: bool, c: const Crossing*) -> !:
+    let e = sketch.entity(curve)
+    let old = (e.first if start else e.second) if e.kind == EntityKind.line else (e.third if start else e.fourth)
+    # The old end moves there when nothing else uses it (its constraints
+    # go: they held the part cut away); else the curve gets a new point.
+    let p = try reused(sketch, old, c.x, c.y, curve)
+    if c.other >= 0 and holds_points(sketch.entity(c.other).kind): _ = try sketch.constrain(ConstraintKind.on_curve, p, c.other)
+    if p == old: return
+    if e.kind == EntityKind.line:
+        if start: sketch.entities.items[(usize)curve].first = p
+        else: sketch.entities.items[(usize)curve].second = p
+    else:
+        if start: sketch.entities.items[(usize)curve].third = p
+        else: sketch.entities.items[(usize)curve].fourth = p
+
+## A new curve from crossing `c` on to curve `curve`'s end, `curve` then
+## ending at the crossing (a new point, on the curve that crossed); the new
+## curve, collinear with a line or on an arc's circle.
+func split_off(sketch: Sketch*, curve: i64, c: const Crossing*) -> i64!:
+    let e = sketch.entity(curve)
+    let p = try point_at(sketch, c)
+    var made: i64 = -1
+    if e.kind == EntityKind.line:
+        made = try sketch.add_line(p, e.second, e.construction)
+        sketch.entities.items[(usize)curve].second = p
+        _ = try sketch.constrain(ConstraintKind.collinear, curve, made)
+    else:
+        made = try sketch.add_arc(e.first, p, e.fourth, e.construction)
+        sketch.entities.items[(usize)curve].fourth = p
+        _ = try sketch.constrain(ConstraintKind.equal, curve, made)
+    return made
+
+## A point at crossing `c`, held on the curve that crossed there.
+func point_at(sketch: Sketch*, c: const Crossing*) -> i64!:
+    let p = try sketch.add_point(c.x, c.y)
+    if c.other >= 0 and holds_points(sketch.entity(c.other).kind): _ = try sketch.constrain(ConstraintKind.on_curve, p, c.other)
+    return p
+
+## `curve`'s end at point `old` moved to point `new`.
+func replace_end(sketch: Sketch*, curve: i64, old: i64, new_point: i64) -> !:
+    let e = sketch.entity(curve)
+    if e.first == old: sketch.entities.items[(usize)curve].first = new_point
+    elif e.second == old: sketch.entities.items[(usize)curve].second = new_point
+    else: error(invalid, "a line does not end at the corner")
+
+## Point `point` moved to (`x`, `y`) when no curve but `owner` uses it
+## (its constraints going with what it was), else a new point there.
+func reused(sketch: Sketch*, point: i64, x: f64, y: f64, owner: i64 = -1) -> i64!:
+    for at in 0..<sketch.entities.count:
+        let e = sketch.entities.items[at]
+        if e.kind == EntityKind.point or (i64)at == owner: continue
+        let uses = e.first == point or e.third == point or e.fourth == point or (e.kind == EntityKind.line and e.second == point)
+        if uses: return try sketch.add_point(x, y)
+    var at = sketch.constraints.count
+    while at > 0:
+        at -= 1
+        let k = sketch.constraints.items[at]
+        if k.first == point or k.second == point or k.third == point: try sketch.unconstrain((i64)at)
+    sketch.place(point, x, y)
+    return point
+
+## Circle `curve` as an arc in place, from point `start` counterclockwise
+## to `end` (its center and radius kept; constraints on the circle stay).
+func to_arc(sketch: Sketch*, curve: i64, start: i64, end: i64) -> !:
+    sketch.entities.items[(usize)curve].kind = EntityKind.arc
+    sketch.entities.items[(usize)curve].third = start
+    sketch.entities.items[(usize)curve].fourth = end
