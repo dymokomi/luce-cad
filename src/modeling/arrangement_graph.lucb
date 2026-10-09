@@ -1,0 +1,180 @@
+## A sketch arrangement's graph (arrangement.lucb): sub-edges' ends merged
+## into vertices, half-edges sorted round each vertex, faces traced as the
+## next half-edge clockwise.
+
+## A half-edge: sub-edge `edge` run forward or backward, from vertex `tail`
+## to `head`, leaving at angle `angle` turning by `curving` (signed
+## curvature, for touching curves), on face `face`.
+struct SketchHalf:
+    var edge: usize
+    var backward: bool
+    var tail: usize
+    var head: usize
+    var angle: f64
+    var curving: f64
+    var face: i64
+    var alive: bool
+
+## The sub-edges as a graph: their ends merged into vertices within
+## `tolerance`, each a pair of half-edges (repeats of one sub-edge, as
+## overlapping curves make, kept once), and pieces left dangling dropped.
+func build_graph(result: Profiles*, subs: Growing[ProfileEdge]*, tolerance: f64, vertices: Growing[Vector3]*, halves: Growing[SketchHalf]*) -> !:
+    var ends = Growing[usize]()
+    defer ends.close()
+    for e in subs.view():
+        try ends.push(try vertex_of(vertices, e.start, tolerance))
+        try ends.push(try vertex_of(vertices, e.end, tolerance))
+    for index in 0..<subs.count:
+        let tail = ends.items[2 * index]
+        let head = ends.items[2 * index + 1]
+        let e = subs.items[index]
+        if tail == head and e.kind == profile_line: continue
+        if try repeats_earlier(result, subs, &ends, index, tolerance): continue
+        let (forward_angle, forward_curving) = try leaving_way(result, &e, false)
+        let (backward_angle, backward_curving) = try leaving_way(result, &e, true)
+        try halves.push(SketchHalf(index, false, tail, head, forward_angle, forward_curving, -1, true))
+        try halves.push(SketchHalf(index, true, head, tail, backward_angle, backward_curving, -1, true))
+    # Dangling pieces go, one end at a time.
+    var degree = Growing[i64]()
+    defer degree.close()
+    try degree.fill(vertices.count, 0)
+    for h in halves.view(): degree.items[h.tail] += 1
+    var pruned = true
+    while pruned:
+        pruned = false
+        var at: usize = 0
+        while at < halves.count:
+            let h = halves.items[at]
+            if h.alive and (degree.items[h.tail] == 1 or degree.items[h.head] == 1):
+                halves.items[at].alive = false
+                halves.items[at + 1].alive = false
+                degree.items[h.tail] -= 1
+                degree.items[h.head] -= 1
+                pruned = true
+            at += 2
+
+## Whether sub-edge `index` repeats an earlier one: the same ends and the
+## same middle.
+func repeats_earlier(result: Profiles*, subs: Growing[ProfileEdge]*, ends: const Growing[usize]*, index: usize, tolerance: f64) -> bool!:
+    let a = ends.items[2 * index]
+    let b = ends.items[2 * index + 1]
+    let middle = try result.edge_at(&subs.items[index], 0.5)
+    for other in 0..<index:
+        let c = ends.items[2 * other]
+        let d = ends.items[2 * other + 1]
+        if not ((a == c and b == d) or (a == d and b == c)): continue
+        if middle.subtract(try result.edge_at(&subs.items[other], 0.5)).length() <= tolerance: return true
+    return false
+
+## The vertex at `p` (an existing one within `tolerance`, else a new one).
+func vertex_of(vertices: Growing[Vector3]*, p: Vector3, tolerance: f64) -> usize!:
+    for at in 0..<vertices.count:
+        if vertices.items[at].subtract(p).length() <= tolerance: return at
+    try vertices.push(p)
+    return vertices.count - 1
+
+## The direction (angle in plane coordinates) a sub-edge leaves its tail
+## (`backward`: leaves its end going back), and how it turns from there
+## (signed curvature: positive to the left).
+func leaving_way(result: Profiles*, e: const ProfileEdge*, backward: bool) -> (f64, f64)!:
+    if e.kind == profile_line:
+        let (sx, sy) = result.planar(e.start)
+        let (ex, ey) = result.planar(e.end)
+        return (math.atan2(sy - ey, sx - ex), 0.0) if backward else (math.atan2(ey - sy, ex - sx), 0.0)
+    if e.kind == profile_arc:
+        let (cx, cy) = result.planar(e.center)
+        let (px, py) = result.planar(e.end if backward else e.start)
+        # Counterclockwise arcs leave square to the radius, to the left.
+        let left = (e.sweep > 0.0) != backward
+        let rx = px - cx
+        let ry = py - cy
+        let direction = math.atan2(rx, -ry) if left else math.atan2(-rx, ry)
+        return (direction, (1.0 if left else -1.0) / e.radius)
+    # A spline: its first and second differences at the end it leaves.
+    let h = 1e-5
+    let f0 = 1.0 if backward else 0.0
+    let s = -1.0 if backward else 1.0
+    let (x0, y0) = result.planar(try result.edge_at(e, f0))
+    let (x1, y1) = result.planar(try result.edge_at(e, f0 + s * h))
+    let (x2, y2) = result.planar(try result.edge_at(e, f0 + s * 2.0 * h))
+    let dx = (x1 - x0) / h
+    let dy = (y1 - y0) / h
+    let ddx = (x2 - 2.0 * x1 + x0) / (h * h)
+    let ddy = (y2 - 2.0 * y1 + y0) / (h * h)
+    let speed = math.hypot(dx, dy)
+    let curving = (dx * ddy - dy * ddx) / math.max(speed * speed * speed, 1e-300)
+    return (math.atan2(dy, dx), curving)
+
+## The faces: from each half-edge not yet on one, at its head the next
+## edge clockwise from the way back (the face kept on the left), until
+## back where it began.
+func trace_faces(halves: Growing[SketchHalf]*, vertex_count: usize, faces: Growing[usize]*, offsets: Growing[usize]*) -> !:
+    try offsets.push(0)
+    for start in 0..<halves.count:
+        if not halves.items[start].alive or halves.items[start].face >= 0: continue
+        let face = (i64)offsets.count - 1
+        var at = start
+        var guard: usize = 0
+        while halves.items[at].face < 0:
+            halves.items[at].face = face
+            try faces.push(at)
+            at = next_of(halves, at)
+            guard += 1
+            if guard > halves.count: error(invalid, "a sketch's curves could not be traced into faces")
+        try offsets.push(faces.count)
+    _ = vertex_count
+
+## The half-edge after `at` round its face: at its head, the outgoing edge
+## just clockwise of the twin (the way back).
+func next_of(halves: Growing[SketchHalf]*, at: usize) -> usize:
+    let h = halves.items[at]
+    let twin = twin_of(at)
+    let back = halves.items[twin]
+    var best: usize = twin
+    var best_turn = 10.0
+    for index in 0..<halves.count:
+        let o = halves.items[index]
+        if not o.alive or o.tail != h.head or index == twin: continue
+        let turn = clockwise_turn(&back, &o)
+        if turn < best_turn:
+            best_turn = turn
+            best = index
+    return best
+
+## The outline of a face's half-edges (plane coordinates), for its area.
+func face_outline(result: Profiles*, subs: Growing[ProfileEdge]*, halves: Growing[SketchHalf]*, loop: const usize[], out: Growing[Vector3]*) -> !:
+    out.clear()
+    for at in loop:
+        let h = halves.items[at]
+        let e = subs.items[h.edge]
+        var steps: usize = 1
+        if e.kind == profile_arc: steps = (usize)math.max(2.0, math.ceil(math.abs(e.sweep) / 0.1745))
+        if e.kind == profile_spline: steps = 32
+        for step in 0..<steps:
+            let f = (f64)step / (f64)steps
+            let (x, y) = result.planar(try result.edge_at(&e, 1.0 - f if h.backward else f))
+            try out.push(Vector3(x, y, 0.0))
+
+## How far clockwise from the way back (`back`'s direction) `o` leaves,
+## in (0, 2π]: among edges leaving the same way, one curving more to the
+## right of it comes first.
+func clockwise_turn(back: const SketchHalf*, o: const SketchHalf*) -> f64:
+    var turn = back.angle - o.angle
+    while turn <= 0.0: turn += 2.0 * math.pi
+    while turn > 2.0 * math.pi: turn -= 2.0 * math.pi
+    if turn <= 1e-9 or turn >= 2.0 * math.pi - 1e-9:
+        turn = 2.0 * math.pi if o.curving > back.curving else 1e-10
+    return turn
+
+## The other half of half-edge `at`'s pair.
+func twin_of(at: usize) -> usize:
+    return at + 1 if at % 2 == 0 else at - 1
+
+func sort_codes(values: Growing[i64]*):
+    for i in 1..<values.count:
+        let v = values.items[i]
+        var j = i
+        while j > 0 and values.items[j - 1] > v:
+            values.items[j] = values.items[j - 1]
+            j -= 1
+        values.items[j] = v

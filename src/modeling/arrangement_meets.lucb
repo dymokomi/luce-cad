@@ -1,0 +1,331 @@
+## Where a sketch's pieces meet, for its arrangement (arrangement.lucb):
+## lines and arcs in closed form, pieces with a B-spline by their samples
+## refined by Newton, each piece cut there into sub-edges.
+
+## A piece cut: piece `piece` at `fraction` of the way along it.
+struct PieceCut:
+    var piece: usize
+    var fraction: f64
+
+## Every piece cut where it meets another, as sub-edges onto `out`
+## (sketch curve and piece numbers kept: a piece's parts number on from it
+## along its curve).
+func split_pieces(result: Profiles*, pieces: const Growing[ProfileEdge]*, tolerance: f64, out: Growing[ProfileEdge]*) -> !:
+    var cuts = Growing[PieceCut]()
+    defer cuts.close()
+    for i in 0..<pieces.count:
+        for j in (i + 1)..<pieces.count:
+            try pieces_meet(result, pieces, i, j, tolerance, &cuts)
+    # Pieces of one curve number on along it, parts included.
+    var curve: i64 = -2
+    var number: i64 = 0
+    var fractions = Growing[f64]()
+    defer fractions.close()
+    for i in 0..<pieces.count:
+        let piece = pieces.items[i]
+        if piece.curve != curve:
+            curve = piece.curve
+            number = 0
+        fractions.clear()
+        try fractions.push(0.0)
+        for c in cuts.view():
+            if c.piece == i: try fractions.push(c.fraction)
+        try fractions.push(1.0)
+        sort_fractions(&fractions)
+        let length = try piece_length(result, &piece)
+        # A whole circle cut somewhere splits only there: its last part runs
+        # on round its seam to the first cut.
+        if piece.kind == profile_arc and math.abs(math.abs(piece.sweep) - 2.0 * math.pi) <= 1e-9 and fractions.count > 2:
+            try split_circle(result, &piece, fractions.view()[1..<fractions.count - 1], length, tolerance, number, out)
+            number += (i64)fractions.count - 2
+            continue
+        var last = 0.0
+        for at in 1..<fractions.count:
+            let next = fractions.items[at]
+            # Parts shorter than the tolerance are not parts.
+            if (next - last) * length <= tolerance and at + 1 < fractions.count: continue
+            if (next - last) * length <= tolerance: break
+            var part = try piece_part(result, &piece, last, next)
+            part.curve = piece.curve
+            part.piece = number
+            number += 1
+            try out.push(part)
+            last = next
+
+## Whole circle `piece` cut at `fractions` (sorted, inside 0..1): an arc
+## from each cut to the next, the last one round through the circle's seam.
+func split_circle(result: Profiles*, piece: const ProfileEdge*, fractions: const f64[], length: f64, tolerance: f64, first_number: i64, out: Growing[ProfileEdge]*) -> !:
+    var cuts = Growing[f64]()
+    defer cuts.close()
+    for f in fractions:
+        if cuts.count == 0 or (f - cuts.items[cuts.count - 1]) * length > tolerance: try cuts.push(f)
+    if cuts.count > 1 and (cuts.items[0] + 1.0 - cuts.items[cuts.count - 1]) * length <= tolerance: cuts.count -= 1
+    var number = first_number
+    for at in 0..<cuts.count:
+        let low = cuts.items[at]
+        let high = cuts.items[at + 1] if at + 1 < cuts.count else cuts.items[0] + 1.0
+        let start = try result.edge_at(piece, low)
+        let end = try result.edge_at(piece, high - 1.0 if high > 1.0 else high)
+        try out.push(ProfileEdge(1, start, end, piece.center, piece.radius, piece.sweep * (high - low), -1, piece.curve, number))
+        number += 1
+
+## Where pieces `i` and `j` meet, as cuts of both (a curve's end on the
+## other piece cuts it there too).
+func pieces_meet(result: Profiles*, pieces: const Growing[ProfileEdge]*, i: usize, j: usize, tolerance: f64, cuts: Growing[PieceCut]*) -> !:
+    let a = pieces.items[i]
+    let b = pieces.items[j]
+    var found = Growing[f64]()
+    defer found.close()
+    if a.kind != profile_spline and b.kind != profile_spline:
+        try exact_meets(result, &a, &b, tolerance, &found)
+    else:
+        try sampled_meets(result, &a, &b, tolerance, &found)
+    # Ends on the other piece: touching, T-junctions, overlaps.
+    try ends_on(result, &a, &b, false, tolerance, &found)
+    try ends_on(result, &b, &a, true, tolerance, &found)
+    var at: usize = 0
+    while at + 1 < found.count:
+        try cuts.push(PieceCut(i, clamp_fraction(found.items[at])))
+        try cuts.push(PieceCut(j, clamp_fraction(found.items[at + 1])))
+        at += 2
+
+## The ends of `piece` lying on `other`: fraction pairs onto `found` (the
+## pair's order swapped when `swapped`).
+func ends_on(result: Profiles*, piece: const ProfileEdge*, other: const ProfileEdge*, swapped: bool, tolerance: f64, found: Growing[f64]*) -> !:
+    for own in [0.0, 1.0]:
+        let end = piece.start if own == 0.0 else piece.end
+        let (on, fraction) = try arranged_nearest_on(result, other, end)
+        if on > tolerance: continue
+        try found.push(fraction if swapped else own)
+        try found.push(own if swapped else fraction)
+
+## Lines and arcs meeting, in closed form: fraction pairs onto `found`.
+func exact_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdge*, tolerance: f64, found: Growing[f64]*) -> !:
+    let (ax, ay) = result.planar(a.start)
+    let (bx, by) = result.planar(b.start)
+    if a.kind == profile_line and b.kind == profile_line:
+        let (ex, ey) = result.planar(a.end)
+        let (fx, fy) = result.planar(b.end)
+        let dax = ex - ax
+        let day = ey - ay
+        let dbx = fx - bx
+        let dby = fy - by
+        let d = dax * dby - day * dbx
+        let la = math.hypot(dax, day)
+        let lb = math.hypot(dbx, dby)
+        # Parallel lines meet only end on line (handled by the caller).
+        if math.abs(d) <= 1e-12 * la * lb: return
+        let s = ((bx - ax) * dby - (by - ay) * dbx) / d
+        let t = ((bx - ax) * day - (by - ay) * dax) / d
+        if within_slack(s, tolerance / la) and within_slack(t, tolerance / lb):
+            try found.push(s)
+            try found.push(t)
+        return
+    if a.kind == profile_line or b.kind == profile_line:
+        let flip = b.kind == profile_line
+        let line = b if flip else a
+        let arc = a if flip else b
+        let (sx, sy) = result.planar(line.start)
+        let (ex, ey) = result.planar(line.end)
+        let (cx, cy) = result.planar(arc.center)
+        let dx = ex - sx
+        let dy = ey - sy
+        let l2 = dx * dx + dy * dy
+        let fx = sx - cx
+        let fy = sy - cy
+        # |s + t d - c|² = r²: t² l2 + 2 t (f·d) + |f|² - r² = 0.
+        let half_b = fx * dx + fy * dy
+        let c = fx * fx + fy * fy - arc.radius * arc.radius
+        var disc = half_b * half_b - l2 * c
+        # A line within tolerance of touching touches.
+        let reach = 2.0 * arc.radius * tolerance * l2
+        if disc < -reach: return
+        disc = math.max(disc, 0.0)
+        let spread = math.sqrt(disc)
+        for t in [(-half_b - spread) / l2, (-half_b + spread) / l2]:
+            if not within_slack(t, tolerance / math.sqrt(l2)): continue
+            let p = Vector3(sx + t * dx, sy + t * dy, 0.0)
+            let (onto, fraction) = arc_fraction(result, arc, p)
+            if not onto: continue
+            try found.push(fraction if flip else t)
+            try found.push(t if flip else fraction)
+            if spread <= 1e-12 * l2: break
+        return
+    # Two circles.
+    let (c1x, c1y) = result.planar(a.center)
+    let (c2x, c2y) = result.planar(b.center)
+    let d = math.hypot(c2x - c1x, c2y - c1y)
+    if d <= tolerance: return
+    if d > a.radius + b.radius + tolerance or d < math.abs(a.radius - b.radius) - tolerance: return
+    let along = (a.radius * a.radius - b.radius * b.radius + d * d) / (2.0 * d)
+    let h = math.sqrt(math.max(0.0, a.radius * a.radius - along * along))
+    let ux = (c2x - c1x) / d
+    let uy = (c2y - c1y) / d
+    let mx = c1x + along * ux
+    let my = c1y + along * uy
+    for side in [-1.0, 1.0]:
+        let p = Vector3(mx - side * h * uy, my + side * h * ux, 0.0)
+        let (on_a, fa) = arc_fraction(result, a, p)
+        let (on_b, fb) = arc_fraction(result, b, p)
+        if on_a and on_b:
+            try found.push(fa)
+            try found.push(fb)
+        if h <= tolerance: break
+
+## Where a point (plane coordinates) lies along arc `arc`, as a fraction;
+## whether it is on the arc's sweep.
+func arc_fraction(result: Profiles*, arc: const ProfileEdge*, p: Vector3) -> (bool, f64):
+    let (cx, cy) = result.planar(arc.center)
+    let (sx, sy) = result.planar(arc.start)
+    var turn = math.atan2(p.y - cy, p.x - cx) - math.atan2(sy - cy, sx - cx)
+    if arc.sweep < 0.0: turn = -turn
+    while turn < -1e-9: turn += 2.0 * math.pi
+    while turn >= 2.0 * math.pi - 1e-9: turn -= 2.0 * math.pi
+    let sweep = math.abs(arc.sweep)
+    let slack = 1e-7
+    if turn <= sweep + slack: return (true, turn / sweep)
+    # Just before the start wraps to near a whole turn.
+    if 2.0 * math.pi - turn <= slack: return (true, 0.0)
+    return (false, 0.0)
+
+## Pieces with a B-spline: their samples' crossings, refined by Newton on
+## the exact curves.
+func sampled_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdge*, tolerance: f64, found: Growing[f64]*) -> !:
+    let n: usize = 64
+    var pa = Growing[Vector3]()
+    defer pa.close()
+    var pb = Growing[Vector3]()
+    defer pb.close()
+    for at in 0..<n + 1:
+        let (x, y) = result.planar(try result.edge_at(a, (f64)at / (f64)n))
+        try pa.push(Vector3(x, y, 0.0))
+        let (u, v) = result.planar(try result.edge_at(b, (f64)at / (f64)n))
+        try pb.push(Vector3(u, v, 0.0))
+    for i in 0..<n:
+        for j in 0..<n:
+            let p0 = pa.items[i]
+            let p1 = pa.items[i + 1]
+            let q0 = pb.items[j]
+            let q1 = pb.items[j + 1]
+            let dx = p1.x - p0.x
+            let dy = p1.y - p0.y
+            let ex = q1.x - q0.x
+            let ey = q1.y - q0.y
+            let d = dx * ey - dy * ex
+            if math.abs(d) <= 1e-18: continue
+            let s = ((q0.x - p0.x) * ey - (q0.y - p0.y) * ex) / d
+            let t = ((q0.x - p0.x) * dy - (q0.y - p0.y) * dx) / d
+            if s < -0.01 or s > 1.01 or t < -0.01 or t > 1.01: continue
+            var fa = ((f64)i + s) / (f64)n
+            var fb = ((f64)j + t) / (f64)n
+            # Newton on P(fa) - Q(fb) = 0, slopes by central differences.
+            for _ in 0..<(usize)20:
+                let (px, py) = result.planar(try result.edge_at(a, fa))
+                let (qx, qy) = result.planar(try result.edge_at(b, fb))
+                let rx = px - qx
+                let ry = py - qy
+                if math.hypot(rx, ry) <= tolerance * 1e-3: break
+                let h = 1e-6
+                let (pxa, pya) = result.planar(try result.edge_at(a, clamp_fraction(fa + h)))
+                let (pxb, pyb) = result.planar(try result.edge_at(a, clamp_fraction(fa - h)))
+                let (qxa, qya) = result.planar(try result.edge_at(b, clamp_fraction(fb + h)))
+                let (qxb, qyb) = result.planar(try result.edge_at(b, clamp_fraction(fb - h)))
+                let ja = Vector3((pxa - pxb) / (2.0 * h), (pya - pyb) / (2.0 * h), 0.0)
+                let jb = Vector3((qxa - qxb) / (2.0 * h), (qya - qyb) / (2.0 * h), 0.0)
+                let det = -ja.x * jb.y + ja.y * jb.x
+                if math.abs(det) <= 1e-18: break
+                fa -= (-rx * jb.y + ry * jb.x) / det
+                fb -= (ja.x * ry - ja.y * rx) / det
+                fa = clamp_fraction(fa)
+                fb = clamp_fraction(fb)
+            let (px, py) = result.planar(try result.edge_at(a, fa))
+            let (qx, qy) = result.planar(try result.edge_at(b, fb))
+            if math.hypot(px - qx, py - qy) <= tolerance:
+                try found.push(fa)
+                try found.push(fb)
+
+## The point of `piece` nearest `p`: its distance and fraction.
+func arranged_nearest_on(result: Profiles*, piece: const ProfileEdge*, p: Vector3) -> (f64, f64)!:
+    let (x, y) = result.planar(p)
+    if piece.kind == profile_line:
+        let (sx, sy) = result.planar(piece.start)
+        let (ex, ey) = result.planar(piece.end)
+        let dx = ex - sx
+        let dy = ey - sy
+        let l2 = dx * dx + dy * dy
+        let t = math.max(0.0, math.min(1.0, ((x - sx) * dx + (y - sy) * dy) / l2)) if l2 > 0.0 else 0.0
+        return (math.hypot(sx + t * dx - x, sy + t * dy - y), t)
+    if piece.kind == profile_arc:
+        let (cx, cy) = result.planar(piece.center)
+        let (on, fraction) = arc_fraction(result, piece, Vector3(x, y, 0.0))
+        if on: return (math.abs(math.hypot(x - cx, y - cy) - piece.radius), fraction)
+        let (sx, sy) = result.planar(piece.start)
+        let (ex, ey) = result.planar(piece.end)
+        let ds = math.hypot(sx - x, sy - y)
+        let de = math.hypot(ex - x, ey - y)
+        return (ds, 0.0) if ds <= de else (de, 1.0)
+    # A spline: the nearest of its samples, refined by bisection-free
+    # Newton on the distance's slope.
+    let n: usize = 64
+    var best = 0.0
+    var best_distance = 1.0e300
+    for at in 0..<n + 1:
+        let f = (f64)at / (f64)n
+        let (sx, sy) = result.planar(try result.edge_at(piece, f))
+        let d = math.hypot(sx - x, sy - y)
+        if d < best_distance:
+            best_distance = d
+            best = f
+    let h = 1e-6
+    for _ in 0..<(usize)20:
+        let (sx, sy) = result.planar(try result.edge_at(piece, best))
+        let (ax, ay) = result.planar(try result.edge_at(piece, clamp_fraction(best + h)))
+        let (bx, by) = result.planar(try result.edge_at(piece, clamp_fraction(best - h)))
+        let tx = (ax - bx) / (2.0 * h)
+        let ty = (ay - by) / (2.0 * h)
+        let t2 = tx * tx + ty * ty
+        if t2 <= 0.0: break
+        let step = ((sx - x) * tx + (sy - y) * ty) / t2
+        best = clamp_fraction(best - step)
+        if math.abs(step) <= 1e-12: break
+    let (sx, sy) = result.planar(try result.edge_at(piece, best))
+    return (math.hypot(sx - x, sy - y), best)
+
+## A piece's length (arcs by their sweep, splines by their samples).
+func piece_length(result: Profiles*, piece: const ProfileEdge*) -> f64!:
+    if piece.kind == profile_line: return piece.end.subtract(piece.start).length()
+    if piece.kind == profile_arc: return math.abs(piece.sweep) * piece.radius
+    var total = 0.0
+    var previous = piece.start
+    for at in 1..<(usize)65:
+        let p = try result.edge_at(piece, (f64)at / 64.0)
+        total += p.subtract(previous).length()
+        previous = p
+    return total
+
+## The part of `piece` from fraction `low` to `high`.
+func piece_part(result: Profiles*, piece: const ProfileEdge*, low: f64, high: f64) -> ProfileEdge!:
+    let start = try result.edge_at(piece, low)
+    let end = try result.edge_at(piece, high)
+    if piece.kind == profile_line: return ProfileEdge(0, start, end, Vector3(), 0.0, 0.0, -1)
+    if piece.kind == profile_arc:
+        let whole = low == 0.0 and high == 1.0
+        return ProfileEdge(1, piece.start if whole else start, piece.end if whole else end, piece.center, piece.radius, piece.sweep * (high - low), -1)
+    if low == 0.0 and high == 1.0: return ProfileEdge(2, piece.start, piece.end, Vector3(), 0.0, 0.0, piece.spline)
+    let spline = try result.spline_part(piece.spline, low, high)
+    return ProfileEdge(2, start, end, Vector3(), 0.0, 0.0, spline)
+
+func within_slack(t: f64, slack: f64) -> bool:
+    return t >= -slack and t <= 1.0 + slack
+
+func clamp_fraction(t: f64) -> f64:
+    return math.max(0.0, math.min(1.0, t))
+
+func sort_fractions(values: Growing[f64]*):
+    for i in 1..<values.count:
+        let v = values.items[i]
+        var j = i
+        while j > 0 and values.items[j - 1] > v:
+            values.items[j] = values.items[j - 1]
+            j -= 1
+        values.items[j] = v

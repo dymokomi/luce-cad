@@ -1,0 +1,222 @@
+## Writing a direct fillet's result (local_blend.lucb): the body's faces
+## with their loops rebuilt around the strips and corners, the strips' and
+## corners' faces, every loop oriented, as a new B-rep.
+
+## The result's faces and B-rep: the body's faces rebuilt (or copied),
+## the strips', the corners'; turned to agree and checked closed.
+func local_result(b: Local*, tag: str) -> interop.Reference[CadModel]!:
+    let w = b.w
+    var uses = Growing[i64]()
+    defer uses.close()
+    var sizes = Growing[i64]()
+    defer sizes.close()
+    # Faces of the body.
+    for f in 0..<w.faces.count:
+        uses.clear()
+        sizes.clear()
+        let face_uses = w.face_uses(f)
+        var at: usize = 0
+        for size in w.face_sizes(f):
+            let before = uses.count
+            try rebuild_loop(b, f, face_uses[at..<at + (usize)size], &uses)
+            try sizes.push((i64)(uses.count - before))
+            at += (usize)size
+        let face = w.faces.items[f]
+        try b.out.add_face(face.surface, face.sense, uses.view(), sizes.view(), try b.out.add_name(w.face_name(f)))
+    let fixed = b.out.faces.count
+    # The strips.
+    for s in 0..<b.strips.count:
+        let strip = b.strips.items[s]
+        uses.clear()
+        let line0 = strip.lines[0]
+        let line1 = strip.lines[1]
+        if line0 < 0 or line1 < 0: error(invalid, "a fillet's contact line was not made")
+        try uses.push(line0 + 1)
+        try b.walk((usize)strip.sections[1], strip.contacts[2], &uses)
+        try uses.push(-(line1 + 1))
+        try b.walk((usize)strip.sections[0], strip.contacts[1], &uses)
+        sizes.clear()
+        try sizes.push((i64)uses.count)
+        b.name.clear()
+        try blend_name(w, strip.edge, tag, &b.name)
+        try b.out.add_face(strip.surface, strip.sense, uses.view(), sizes.view(), try b.out.add_name((str)b.name.view()))
+    # The corners'.
+    for extra in b.extras.view():
+        sizes.clear()
+        try sizes.push((i64)extra.count)
+        try b.out.add_face(extra.surface, extra.sense, b.store.view()[extra.first..<extra.first + extra.count], sizes.view(), extra.name)
+    try orient(&b.out, fixed)
+    let solid = try used_brep(&b.out)
+    defer solid.release()
+    return try CadModel.of_brep(solid)
+
+## Body face `f`'s loop `loop` rebuilt onto `out`: each edge as it now
+## runs (a chosen one by its contact line), and at each corner the curves
+## the corner leaves on the face.
+func rebuild_loop(b: Local*, f: usize, loop: const i64[], out: Growing[i64]*) -> !:
+    let w = b.w
+    let n = loop.length
+    for k in 0..<n:
+        let use = loop[k]
+        let e = edge_index(use)
+        let edge = w.edges.items[e]
+        let forward = use > 0
+        let tail = edge.end if forward else edge.start
+        # This use, then what the corner at its tail leaves on the face.
+        let (id, tail_point) = try edge_on_face(b, e, f, forward)
+        try out.push((id + 1) if forward else -(id + 1))
+        let next_use = loop[(k + 1) % n]
+        let next_e = edge_index(next_use)
+        let next_point = try head_point(b, next_e, f, next_use > 0)
+        if next_point == tail_point: continue
+        var linked = false
+        for link in b.links.view():
+            if link.vertex != tail or link.face != f: continue
+            try b.walk(link.chain, tail_point, out)
+            if b.other_end(link.chain, tail_point) != next_point: error(invalid, "a corner's curve on a face does not reach the next edge")
+            linked = true
+            break
+        if not linked: error(invalid, "a face's loop does not close at a corner")
+
+## Body edge `e` on face `f` as the result has it, and the out point its
+## use ends at (`forward`: from its start to its end): a chosen edge's
+## contact line on `f`; a sharp edge, shortened at a rounded corner, or as
+## it was.
+func edge_on_face(b: Local*, e: usize, f: usize, forward: bool) -> (i64, i64)!:
+    let w = b.w
+    let s = b.strip_of.items[e]
+    if s >= 0:
+        let strip = &b.strips.items[(usize)s]
+        let side: usize = 0 if strip.faces[0] == f else 1
+        if strip.lines[side] < 0:
+            # The contact line must keep the edge's way: else the corners
+            # at its ends overlap (the radius is too large for it).
+            if b.at(strip.contacts[2 + side]).subtract(b.at(strip.contacts[side])).dot(strip.along) <= b.w.tolerance: error(invalid, "a fillet's contact line has no length left")
+            strip.lines[side] = try b.line(strip.contacts[side], strip.contacts[2 + side])
+        return (strip.lines[side], strip.contacts[2 + side] if forward else strip.contacts[side])
+    let edge = w.edges.items[e]
+    let start = b.ends.items[e * 2] if b.ends.items[e * 2] >= 0 else try b.point(edge.start)
+    let end = b.ends.items[e * 2 + 1] if b.ends.items[e * 2 + 1] >= 0 else try b.point(edge.end)
+    if b.kept.items[e] < 0:
+        if b.ends.items[e * 2] < 0 and b.ends.items[e * 2 + 1] < 0:
+            b.kept.items[e] = try b.out.add_edge(ShapeEdge(edge.carrier, edge.t0, edge.t1, start, end))
+        else:
+            if w.carriers.items[(usize)edge.carrier].kind != curve_line: error(invalid, "a curved sharp edge meets a rounded corner")
+            # Shortened, it must keep its way.
+            let before = w.points.items[(usize)edge.end].subtract(w.points.items[(usize)edge.start])
+            if b.at(end).subtract(b.at(start)).dot(before) <= 0.0: error(invalid, "a fillet consumes an edge")
+            b.kept.items[e] = try b.line(start, end)
+    return (b.kept.items[e], end if forward else start)
+
+## The out point body edge `e`'s use on face `f` starts at.
+func head_point(b: Local*, e: usize, f: usize, forward: bool) -> i64!:
+    let s = b.strip_of.items[e]
+    if s >= 0:
+        let strip = b.strips.items[(usize)s]
+        let side: usize = 0 if strip.faces[0] == f else 1
+        return strip.contacts[side] if forward else strip.contacts[2 + side]
+    let edge = b.w.edges.items[e]
+    if forward: return b.ends.items[e * 2] if b.ends.items[e * 2] >= 0 else try b.point(edge.start)
+    return b.ends.items[e * 2 + 1] if b.ends.items[e * 2 + 1] >= 0 else try b.point(edge.end)
+
+## Faces after the first `fixed` turned to agree with their neighbours
+## (each edge used once each way), from the fixed ones outward; then every
+## edge checked to be used twice, once each way.
+func orient(s: Shape*, fixed: usize) -> !:
+    let faces = s.faces.count
+    var done = Growing[bool]()
+    defer done.close()
+    try done.fill(faces, false)
+    for f in 0..<fixed: done.items[f] = true
+    # Each edge's signed use by an oriented face (0: none yet).
+    var signs = Growing[i64]()
+    defer signs.close()
+    try signs.fill(s.edges.count, 0)
+    for f in 0..<fixed:
+        for use in s.face_uses(f): signs.items[edge_index(use)] = 1 if use > 0 else -1
+    var progress = true
+    while progress:
+        progress = false
+        for f in fixed..<faces:
+            if done.items[f]: continue
+            var vote = 0
+            for use in s.face_uses(f):
+                let sign = signs.items[edge_index(use)]
+                if sign == 0: continue
+                vote = -1 if sign == (1 if use > 0 else -1) else 1
+                break
+            if vote == 0: continue
+            if vote < 0:
+                # Each loop backwards.
+                let face = s.faces.items[f]
+                var at = face.first
+                for size in s.face_sizes(f):
+                    let count = (usize)size
+                    for k in 0..<count // 2:
+                        let left = s.uses.items[at + k]
+                        s.uses.items[at + k] = -s.uses.items[at + count - 1 - k]
+                        s.uses.items[at + count - 1 - k] = -left
+                    if count % 2 == 1: s.uses.items[at + count // 2] = -s.uses.items[at + count // 2]
+                    at += count
+            for use in s.face_uses(f): signs.items[edge_index(use)] = 1 if use > 0 else -1
+            done.items[f] = true
+            progress = true
+    for f in 0..<faces:
+        if not done.items[f]: error(invalid, "a direct fillet's face touches nothing")
+    var count = Growing[i64]()
+    defer count.close()
+    try count.fill(s.edges.count * 2, 0)
+    for f in 0..<faces:
+        for use in s.face_uses(f):
+            let e = edge_index(use)
+            count.items[e * 2 + (0 if use > 0 else 1)] += 1
+    for e in 0..<s.edges.count:
+        let forward = count.items[e * 2]
+        let backward = count.items[e * 2 + 1]
+        if forward + backward == 0: continue
+        if forward != 1 or backward != 1: error(invalid, "a direct fillet is not closed")
+
+## `s` as a B-rep, its points, edges and surfaces only where faces use them.
+func used_brep(s: const Shape*) -> interop.Reference[BrepModel]!:
+    let output = try BrepModel.held(math.max(s.tolerance, least_tolerance))
+    errdefer output.release()
+    let b = output.value()
+    var points = Growing[i64]()
+    defer points.close()
+    try points.fill(s.points.count, -1)
+    var edges = Growing[i64]()
+    defer edges.close()
+    try edges.fill(s.edges.count, -1)
+    var surfaces = Growing[i64]()
+    defer surfaces.close()
+    try surfaces.fill(s.surfaces.count, -1)
+    var uses = Growing[i64]()
+    defer uses.close()
+    for f in 0..<s.faces.count:
+        uses.clear()
+        for use in s.face_uses(f):
+            let e = edge_index(use)
+            if edges.items[e] < 0:
+                let edge = s.edges.items[e]
+                let ends: i64[2] = [edge.start, edge.end]
+                for v in ends:
+                    if points.items[(usize)v] < 0: points.items[(usize)v] = try b.add_vertex(s.points.items[(usize)v])
+                let start = points.items[(usize)edge.start]
+                let end = points.items[(usize)edge.end]
+                let c = s.carriers.items[(usize)edge.carrier]
+                let forward = edge.t1 > edge.t0
+                if c.kind == curve_line: edges.items[e] = try b.add_line(start, end)
+                elif c.kind == curve_circle: edges.items[e] = try b.add_circle(start, end, c.origin, c.x.cross(c.y), c.x, c.a, forward)
+                elif c.kind == curve_ellipse: edges.items[e] = try b.add_ellipse(start, end, c.origin, c.x.cross(c.y), c.x, c.a, c.b, forward)
+                else:
+                    let (net, weights, knots, degree) = s.spline_net(c.spline)
+                    edges.items[e] = try b.add_spline_edge(start, end, net, weights, degree, knots, forward)
+            try uses.push((edges.items[e] + 1) * (1 if use > 0 else -1))
+        let face = s.faces.items[f]
+        let si = (usize)face.surface
+        if surfaces.items[si] < 0:
+            let su = s.surfaces.items[si]
+            surfaces.items[si] = (try b.add_spline_surface(su.points, su.weights, su.nu, su.nv, su.du, su.dv, su.ku, su.kv)) if su.kind == surface_spline else (try b.add_surface(su.kind, su.origin, su.z, su.x, su.radius, su.angle))
+        let made = try b.add_face(surfaces.items[si], uses.view(), s.face_sizes(f), face.sense)
+        try b.set_face_name(made, s.face_name(f))
+    return output

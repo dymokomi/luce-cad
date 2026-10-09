@@ -1,0 +1,68 @@
+## A B-rep's display meshes: the whole model's (kept by settings), one
+## face's preview, and one face's planned mesh.
+extend BrepModel:
+    ## Disposable per-face display mesh; independent of the whole-model budget.
+    pub func preview_face(face: i64, divisions: i64 = 8) -> interop.Reference[Mesh]!:
+        try self.check_face(face)
+        let records = try self.tessellation_records()
+        let entry = records.faces[(usize)face]
+        return try published(try face_mesh(self.vertices.view(), records.edges, records.surfaces[(usize)entry.surface], entry, divisions, self.tolerance))
+
+    ## Boundary-conforming tessellation; each shared edge is sampled once.
+    ## `curvature` adds corner attributes curvature.k1/k2 (principal
+    ## curvatures, k1 >= k2, positive where convex); `directions` adds the unit
+    ## principal directions curvature.d1/d2. Both are off by default.
+    ## With `quick`, a copy with moved cvs may answer with its quick preview
+    ## (quick.lucb) instead of tessellating.
+    pub func mesh(divisions: i64 = 16, edge_size: f64 = 0.0, progress: interop.Callback[f64, unit]? = none, curvature: bool = false, directions: bool = false, quick: bool = false) -> interop.Reference[Mesh]!:
+        if not math.is_finite(edge_size) or edge_size < 0.0:
+            error(invalid, "edge size must be finite and nonnegative")
+        # The same parameters give the same mesh: share the kept one.
+        if let kept = self.kept_mesh(divisions, edge_size, curvature, directions): return kept
+        if quick:
+            if let fast = try self.quick_mesh(divisions, edge_size, curvature, directions): return fast
+        let records = try self.tessellation_records()
+        let raw = try published(try tessellate(self.vertices.view(), records.edges, records.surfaces, records.faces, divisions, self.tolerance, edge_size, progress, -1, curvature, directions, try self.face_cache()))
+        let made = try self.with_paths(raw)
+        errdefer made.release()
+        try self.keep_mesh(divisions, edge_size, curvature, directions, made)
+        return made
+
+    ## Takes `mesh`: with each face's B-rep path (by its `cad_face`) in the
+    ## `path` text attribute, when any face has one.
+    func with_paths(mesh: interop.Reference[Mesh]) -> interop.Reference[Mesh]!:
+        let any = self.face_paths.any()
+        let source = mesh.value().find_attribute("cad_face", 2)
+        if not any or source < 0: return mesh
+        defer mesh.release()
+        var strings = TableBuilder()
+        defer strings.close()
+        let count = self.face_paths.count()
+        let face_paths = try new i32[count] --- in memory.heap
+        defer free(face_paths) in memory.heap
+        for face in 0..<count:
+            let text = self.face_paths.get(face)
+            face_paths[face] = (try strings.intern(text)) if text != "" else -1
+        let faces = (usize)mesh.value().face_count()
+        let values = try new i32[faces] --- in memory.heap
+        defer free(values) in memory.heap
+        for face in 0..<faces:
+            let original = (i64)(try mesh.value().attribute_value(source, (i64)face))
+            values[face] = face_paths[(usize)original] if original >= 0 and (usize)original < count else -1
+        return try mesh.value().with_attribute_entry(try text_attribute("path", Domain.face, faces, &strings, values))
+
+    ## Diagnostic face mesh using the complete model's shared edge/layout plan.
+    ## Other face jobs are skipped; success does not establish whole-model validity.
+    pub func planned_face(face: i64, divisions: i64 = 16, edge_size: f64 = 0.0) -> interop.Reference[Mesh]!:
+        try self.check_face(face)
+        if not math.is_finite(edge_size) or edge_size < 0.0: error(invalid, "edge size must be finite and nonnegative")
+        let records = try self.tessellation_records()
+        let result = try tessellate(self.vertices.view(), records.edges, records.surfaces, records.faces, divisions, self.tolerance, edge_size, none, face)
+        defer result.release()
+        return try published(try result.value().compacted())
+
+## Tessellation works on precise meshes (f64 points; see geocore's
+## Mesh); what it hands out is an ordinary f32 mesh. Takes `mesh`.
+pub func published(mesh: interop.Reference[Mesh]) -> interop.Reference[Mesh]!:
+    defer mesh.release()
+    return try mesh.value().without_precision()

@@ -1,0 +1,284 @@
+## Blend tools (blend.lucb): the solids the booleans take away or add for
+## each blended edge. A corner profile (a chamfer's triangle, a fillet's
+## circle or G2/G3 B-spline section) between the edge's faces, swept along
+## a straight edge or turned about a rim's axis, reaching past an end only
+## where nothing is there; concave edges' tools end flush with the face at
+## each end. A plane meeting a cylinder along the edge has its own section
+## (ruled_profile).
+
+## The section of edge `e`'s blend at `p` (its start), swept along `along`:
+## the corner profile between two planes, or between a plane and a
+## cylinder along the edge (ruled_profile).
+func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, round: bool, continuity: i64) -> Profiles!:
+    let (fa, fb) = try edge_faces(w, e)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let cylinder = ruled_pair(w, e, fa, fb)
+    if cylinder < 0: return try corner_profile(p, along, ua, ub, size, round, continuity)
+    if round and continuity > 1: error(invalid, "G2 and G3 fillets between a plane and a cylinder are not supported yet")
+    let plane = fb if (usize)cylinder == fa else fa
+    return try ruled_profile(w, plane, (usize)cylinder, p, along, ua if plane == fa else ub, ub if plane == fa else ua, size, round, try convex(w, e))
+
+## The section of a blend between plane face `plane` and cylinder face
+## `cylinder` (its axis along the edge), at edge point `p`: the region
+## between the edge, the contacts and the blend (a fillet's circle touching
+## the plane and the cylinder, its center where the plane and the cylinder
+## moved by the radius meet; a chamfer's line `size` along each), closed
+## back along the cylinder's own circle. `into_plane` and `into_round` are
+## the directions into each face from the edge.
+func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool) -> Profiles!:
+    let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
+    let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+    let radius = s.radius
+    let (ta, tb, center) = try ruled_contacts(w, plane, cylinder, p, into_plane, into_round, size, round, outward)
+    var profile = Profiles(p, along, into_plane, along.cross(into_plane), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+                           Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+    errdefer profile.close()
+    try profile.loop_offsets.push(0)
+    try profile.edges.push(line_edge(p, ta))
+    if round:
+        let leaving = ta.subtract(center)
+        let arriving = tb.subtract(center)
+        try profile.edges.push(ProfileEdge(1, ta, tb, center, size, math.atan2(along.dot(leaving.cross(arriving)), leaving.dot(arriving)), -1))
+    else:
+        try profile.edges.push(line_edge(ta, tb))
+    let back = tb.subtract(axis_point)
+    let home = p.subtract(axis_point)
+    try profile.edges.push(ProfileEdge(1, tb, p, axis_point, radius, math.atan2(along.dot(back.cross(home)), back.dot(home)), -1))
+    try profile.loop_offsets.push(profile.edges.count)
+    try single_region(&profile)
+    return profile
+
+## A plane/cylinder blend's contacts at edge point `p`: on the plane, on
+## the cylinder, and a fillet's center (see ruled_profile).
+func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool) -> (Vector3, Vector3, Vector3)!:
+    let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
+    let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+    let radius = s.radius
+    let n_plane = try w.face_normal(plane, p)
+    # Away from the axis, the cylinder's outward normal at p, or toward it.
+    let away = (try w.face_normal(cylinder, p)).dot(p.subtract(axis_point)) > 0.0
+    var ta = Vector3()
+    var tb = Vector3()
+    var center = Vector3()
+    if round:
+        # The center: `size` from the plane (inside an outside corner, in
+        # the air at an inside one), the cylinder's radius moved likewise.
+        let toward = n_plane.multiply_scalar(-size if outward else size)
+        let moved = radius - size if outward == away else radius + size
+        if moved <= 0.0: error(invalid, "a fillet radius is larger than the cylinder it meets allows")
+        let q = p.add(toward).subtract(axis_point)
+        let b = q.dot(into_plane)
+        let disc = b * b - (q.dot(q) - moved * moved)
+        if disc < 0.0: error(invalid, "a fillet this large finds no circle touching both faces")
+        let spread = math.sqrt(disc)
+        # The nearer place along the plane into its face.
+        var t = -b - spread
+        if t <= 0.0: t = -b + spread
+        center = p.add(toward).add(into_plane.multiply_scalar(t))
+        ta = center.subtract(toward)
+        tb = axis_point.add(try center.subtract(axis_point).normalized().multiply_scalar(radius))
+    else:
+        ta = p.add(into_plane.multiply_scalar(size))
+        # `size` along the cylinder's circle, the way into its face.
+        let r0 = p.subtract(axis_point)
+        let turn = 1.0 if s.z.cross(r0).dot(into_round) > 0.0 else -1.0
+        tb = axis_point.add(turned_direction(r0, s.z, turn * size / radius))
+    return (ta, tb, center)
+
+## The tool that blends edge `e` from `start` to `end` (its chain's ends),
+## a fillet of `size` radius when `round`, else a chamfer `size` along each
+## face, as a closed solid.
+## `body` holds rays against the solid's faces: the tool reaches past an
+## end only where nothing is there (an outside corner), and stops flush
+## where the solid goes on (a wall the edge runs into).
+## An end marked exact (where a corner ball takes over) stops right there.
+## Its blend face is named `name`.
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str) -> interop.Reference[CadModel]!:
+    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_circle: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name)
+    let length = end.subtract(start).length()
+    let along = try end.subtract(start).normalized()
+    let (fa, fb) = try edge_faces(w, e)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    # Past each end by a margin, where the corner beyond is empty.
+    let margin = size * 2.0 + length * 0.01
+    let corner = try ua.add(ub).normalized().multiply_scalar(size * 0.25)
+    let extent = math.max(length, size) * 4.0
+    let before = 0.0 if exact_start or try body.inside(w, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
+    let after = 0.0 if exact_end or try body.inside(w, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
+    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity)
+    defer profile.close()
+    let solid = try BrepModel.sized(length + margin * 2.0)
+    defer solid.release()
+    try extrude_into(solid.value(), &profile, length + before + after, "")
+    try name_tool(solid.value(), name)
+    return try CadModel.of_brep(solid)
+
+## The corner profile at `p` on an edge running `along`, between its faces'
+## directions `ua` and `ub` (into each face): a chamfer's triangle `size`
+## along each, or a fillet's region between them and its curve. A fillet of
+## continuity 1 (G1) is the circle of radius `size` touching both faces; of
+## 2 or 3 (G2, G3) a Bezier curve between the same contact points whose
+## first three or four control points lie along each face, so its
+## curvature (and for G3 its change) is zero where it meets them. Its
+## middle edge is the blend's.
+func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool, continuity: i64) -> Profiles!:
+    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    let reach = size / math.tan(angle * 0.5) if round else size
+    let ta = p.add(ua.multiply_scalar(reach))
+    let tb = p.add(ub.multiply_scalar(reach))
+    var profile = Profiles(p, along, ua, along.cross(ua), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+                           Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+    errdefer profile.close()
+    try profile.loop_offsets.push(0)
+    try profile.edges.push(line_edge(p, ta))
+    if round and continuity > 1:
+        let first = profile.spline_points.count
+        let knot_first = profile.spline_knots.count
+        try fillet_section(ta, tb, p, continuity, &profile.spline_points, &profile.spline_knots)
+        let count = profile.spline_points.count - first
+        for _ in 0..<count: try profile.spline_weights.push(1.0)
+        try profile.splines.push(ProfileSpline(first, count, knot_first, 5))
+        try profile.edges.push(ProfileEdge(2, ta, tb, Vector3(), 0.0, 0.0, (i64)profile.splines.count - 1))
+    elif round:
+        let bisector = try ua.add(ub).normalized()
+        let center = p.add(bisector.multiply_scalar(size / math.sin(angle * 0.5)))
+        let leaving = ta.subtract(center)
+        let arriving = tb.subtract(center)
+        let sweep = math.atan2(along.dot(leaving.cross(arriving)), leaving.dot(arriving))
+        try profile.edges.push(ProfileEdge(1, ta, tb, center, size, sweep, -1))
+    else:
+        try profile.edges.push(line_edge(ta, tb))
+    try profile.edges.push(line_edge(tb, p))
+    try profile.loop_offsets.push(profile.edges.count)
+    try single_region(&profile)
+    return profile
+
+## A G2 or G3 fillet's section from contact `ta` to contact `tb`, whose
+## legs run along the faces to the corner `p`: a degree 5 B-spline (the
+## degree of every freeform element), its control points onto `points`
+## and its knots onto `knots`. The first three (G2) or four (G3) control
+## points lie along each leg, so the curvature (and for G3 its change) is
+## zero where it meets each face. G2 is one span (six points); G3 three
+## spans (eight points, knots at the thirds). At a square corner with
+## contacts a unit from it, both curves' curvature peaks at 1.17 times the
+## circle's, and their middles are 0.376 (G2) and 0.360 (G3) from the
+## corner, the circle's 0.414.
+func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, points: Growing[Vector3]*, knots: Growing[f64]*) -> !:
+    let g2: f64[3] = [0.0, 0.3, 0.6]
+    let g3: f64[4] = [0.0, 0.1, 0.2, 0.6]
+    let half: usize = 3 if continuity == 2 else 4
+    for k in 0..<half: try points.push(ta.add(p.subtract(ta).multiply_scalar(g2[k] if half == 3 else g3[k])))
+    for k in 0..<half:
+        let f = g2[half - 1 - k] if half == 3 else g3[half - 1 - k]
+        try points.push(tb.add(p.subtract(tb).multiply_scalar(f)))
+    for _ in 0..<(usize)6: try knots.push(0.0)
+    if half == 4:
+        try knots.push(1.0 / 3.0)
+        try knots.push(2.0 / 3.0)
+    for _ in 0..<(usize)6: try knots.push(1.0)
+
+## A concave edge's tool, added to the solid: the corner profile (in the
+## air between its faces) swept from `start` to `end`, ending flush with
+## the face at each end: exactly there when that face is square to the
+## edge, else swept past and cut by the face's plane.
+## An end marked exact (where a corner ball takes over) ends square there.
+func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, name: str) -> interop.Reference[CadModel]!:
+    let length = end.subtract(start).length()
+    let along = try end.subtract(start).normalized()
+    let (fa, fb) = try edge_faces(w, e)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let (n0, h0) = (along.multiply_scalar(-1.0), -along.dot(start)) if exact_start else try end_plane(w, start, fa, fb)
+    let (n1, h1) = (along, along.dot(end)) if exact_end else try end_plane(w, end, fa, fb)
+    let square = math.abs(n0.dot(along)) > 1.0 - 1e-9 and math.abs(n1.dot(along)) > 1.0 - 1e-9
+    let margin = 0.0 if square else size * 4.0 + length * 0.1
+    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(margin)), along, size, round, continuity)
+    defer profile.close()
+    let solid = try BrepModel.sized(length + margin * 2.0)
+    defer solid.release()
+    try extrude_into(solid.value(), &profile, length + margin * 2.0, "")
+    try name_tool(solid.value(), name)
+    let swept = try CadModel.of_brep(solid)
+    if square: return swept
+    defer swept.release()
+    # Cut by the end faces' planes; the sides far off.
+    let s1 = try ua.add(ub).normalized()
+    let s2 = along.cross(s1)
+    let far = (size * 8.0 + length) * 2.0
+    let normals: Vector3[6] = [n0, s1, s2, n1, s1.multiply_scalar(-1.0), s2.multiply_scalar(-1.0)]
+    let offsets: f64[6] = [h0, s1.dot(start) + far, s2.dot(start) + far, h1, -s1.dot(start) + far, -s2.dot(start) + far]
+    let cell = try hexahedron(normals[..<6], offsets[..<6], far)
+    defer cell.release()
+    return try combine(swept.value(), cell.value(), op_intersect)
+
+## The plane of the face at the end of an edge between faces `fa` and `fb`
+## (at its vertex at `point`): its outward normal and offset.
+func end_plane(w: const Shape*, point: Vector3, fa: usize, fb: usize) -> (Vector3, f64)!:
+    var vertex: i64 = -1
+    for v in 0..<w.points.count:
+        if w.points.items[v].subtract(point).length() <= w.tolerance * 10.0: vertex = (i64)v
+    if vertex < 0: error(invalid, "a concave blend's end is not a corner of the body")
+    var found: i64 = -1
+    for f in 0..<w.faces.count:
+        if f == fa or f == fb: continue
+        for use in w.face_uses(f):
+            let edge = w.edges.items[edge_index(use)]
+            if edge.start == vertex or edge.end == vertex:
+                if found >= 0 and found != (i64)f: error(invalid, "a concave blend must end at one flat face")
+                found = (i64)f
+    if found < 0 or w.surfaces.items[(usize)w.faces.items[(usize)found].surface].kind != surface_plane: error(invalid, "a concave blend must end at one flat face")
+    let n = face_outward(w, (usize)found)
+    return (n, n.dot(w.surfaces.items[(usize)w.faces.items[(usize)found].surface].origin))
+
+## A tool's faces: the one its corner profile's middle edge made (the
+## profile's order survives nesting: three edges reversed keep their
+## middle) is the blend, named `name`; the rest go with the corner and
+## stay unnamed.
+func name_tool(b: BrepModel*, name: str) -> !:
+    for face in 0..<b.face_count():
+        try b.set_face_name(face, name if face == 1 else "")
+
+## A rim's tool: the corner profile (a triangle `size` along each face,
+## or the region between them and the circle of radius `size` touching
+## both) turned about the rim's axis: a cone, or a torus. A whole circle's
+## turns all the way; an arc's turns along it, reaching past an end where
+## the corner beyond is empty and stopping at an exact one (a tangent
+## joint with the next edge of a chain).
+func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str) -> interop.Reference[CadModel]!:
+    let edge = w.edges.items[e]
+    let carrier = w.carriers.items[(usize)edge.carrier]
+    let (fa, fb) = try edge_faces(w, e)
+    let along = try along_edge(w, e)
+    let p = try w.edge_at(e, 0.5)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let normal = carrier.x.cross(carrier.y)
+    let solid = try BrepModel.sized(carrier.a + size * 4.0)
+    defer solid.release()
+    if edge.start == edge.end:
+        var profile = try corner_profile(p, along, ua, ub, size, round, continuity)
+        defer profile.close()
+        try revolve_into(solid.value(), &profile, carrier.origin, normal, (carrier.a + size) * 1e-7, "")
+        try name_tool(solid.value(), name)
+        return try CadModel.of_brep(solid)
+    # The axis turning the way the edge runs.
+    var a = normal
+    if a.cross(p.subtract(carrier.origin)).dot(along) < 0.0: a = normal.multiply_scalar(-1.0)
+    let sweep = math.abs(edge.t1 - edge.t0)
+    # Past a free end, by a margin where the corner beyond is empty.
+    let margin = math.min(math.pi * 0.25, size * 2.0 / carrier.a)
+    let corner = try ua.add(ub).normalized().multiply_scalar(size * 0.25)
+    let extent = (carrier.a + size) * 4.0
+    let first = try w.edge_at(e, 0.0)
+    let last = try w.edge_at(e, 1.0)
+    let before = 0.0 if exact_start or try body.inside(w, turned_point(first, carrier.origin, a, -size * 0.5 / carrier.a).add(turned_direction(corner, a, -sweep * 0.5)), extent) else margin
+    let after = 0.0 if exact_end or try body.inside(w, turned_point(last, carrier.origin, a, size * 0.5 / carrier.a).add(turned_direction(corner, a, sweep * 0.5)), extent) else margin
+    # The profile where the tool starts: the middle's turned back.
+    let back = -(sweep * 0.5 + before)
+    var profile = try corner_profile(turned_point(p, carrier.origin, a, back), turned_direction(along, a, back), turned_direction(ua, a, back), turned_direction(ub, a, back), size, round, continuity)
+    defer profile.close()
+    try revolve_into(solid.value(), &profile, carrier.origin, a, (carrier.a + size) * 1e-7, "", sweep + before + after)
+    try name_tool(solid.value(), name)
+    return try CadModel.of_brep(solid)

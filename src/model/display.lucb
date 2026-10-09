@@ -1,0 +1,356 @@
+## What a CadModel shows: its meshes (tessellate, planned_face, a face's
+## preview and the pooled preview set) and the lines drawn over it (edges,
+## hull, normal guides), for independent faces and a B-rep alike.
+extend CadModel:
+    ## What its edges' drawn lines depend on (0: not known, draw them anew):
+    ## a B-rep's edges and the model's placement. A copy with moved control
+    ## vertices keeps the key; the viewport keeps its lines.
+    pub func edges_key() -> i64:
+        if self.count != 0: return 0
+        let boundary = self.boundary else return 0
+        var key = boundary_key(boundary.value())
+        let m = self.placement
+        let values: f64[12] = [m.x.x, m.x.y, m.x.z, m.y.x, m.y.y, m.y.z, m.z.x, m.z.y, m.z.z, m.translation.x, m.translation.y, m.translation.z]
+        for value in values: key = (key ^ value.bits()) *% 0x100000001B3
+        return (i64)(key >> 1) | 1
+
+    ## Lines to draw over the model: its edges, its hull and a normal guide
+    ## per face of `mesh` (its tessellation).
+    pub func overlay(mesh: interop.Reference[Mesh]) -> interop.Reference[CadOverlay]!:
+        let result = try interop.Reference[CadOverlay].adopt(new CadOverlay() in memory.heap, cad_overlay_type, memory.heap)
+        errdefer result.release()
+        let boundaries = boundary_list(result.value())
+        let hull = hull_list(result.value())
+        if let boundary = self.boundary:
+            try boundary_lines(boundary.value(), self.placement, boundaries)
+            try hull_lines(boundary.value(), self.placement, hull)
+        for index in 0..<self.count:
+            let entry = self.faces[index]
+            let edges = try self.edge_count_in(none, (i64)index)
+            for edge in 0..<edges:
+                let chords = 1 if entry.nu == 0 else 64
+                var previous = try self.edge_point_in(none, (i64)index, edge, 0.0)
+                for step in 1..<chords + 1:
+                    let next = try self.edge_point_in(none, (i64)index, edge, (f64)step / (f64)chords)
+                    try boundaries.push(previous)
+                    try boundaries.push(next)
+                    previous = next
+            for u in 0..<(usize)entry.nu:
+                for v in 0..<(usize)entry.nv:
+                    let here = self.placement.transform_point(entry.points[u * (usize)entry.nv + v])
+                    if v + 1 < (usize)entry.nv:
+                        try hull.push(here)
+                        try hull.push(self.placement.transform_point(entry.points[u * (usize)entry.nv + v + 1]))
+                    if u + 1 < (usize)entry.nu:
+                        try hull.push(here)
+                        try hull.push(self.placement.transform_point(entry.points[(u + 1) * (usize)entry.nv + v]))
+        try face_guides(mesh.value(), guide_list(result.value()))
+        return result
+
+    ## The B-rep, resolved on the calling thread: preview workers may use the
+    ## pointer but not the reference, whose owner belongs to this thread.
+    func topology() -> BrepModel*?:
+        if let value = self.boundary:
+            return value.value()
+        return none
+
+    ## Produce a disposable display mesh; the analytic model is unchanged.
+    pub func face_edge_count(face: i64) -> i64!:
+        return try self.edge_count_in(self.topology(), face)
+
+    pub func face_edge_point(face: i64, edge: i64, fraction: f64) -> Vector3!:
+        return try self.edge_point_in(self.topology(), face, edge, fraction)
+
+    pub func face_edge_linear(face: i64, edge: i64) -> bool!:
+        return try self.edge_linear_in(self.topology(), face, edge)
+
+    pub func face_edge_id(face: i64, edge: i64) -> i64!:
+        return try self.edge_id_in(self.topology(), face, edge)
+
+    pub func preview_face(face: i64, divisions: i64 = 8) -> interop.Reference[Mesh]!:
+        return try self.preview_in(self.topology(), face, divisions)
+
+    ## Every face's preview (see preview_face), meshed on the worker pool and
+    ## merged into display batches in face order, with deduplicated analytic
+    ## boundary polylines and a normal guide per face. Failed faces are
+    ## counted and keep their boundaries.
+    pub func preview(progress: interop.Callback[f64, unit]? = none) -> interop.Reference[CadPreviewSet]!:
+        var job = PreviewJob(model = &self, topology = self.topology())
+        return try collect_preview((usize)self.face_count(), (usize)self.edge_count(), make_preview_part, (void*)&job, progress)
+
+    func edge_count_in(topology: BrepModel*?, face: i64) -> i64!:
+        if face < 0 or face >= self.face_count_in(topology):
+            error(invalid, "CAD face index out of range")
+        if let boundary = topology:
+            if face >= (i64)self.count:
+                return try boundary.face_edge_count(face - (i64)self.count)
+        return (i64)self.faces[(usize)face].points.length if self.faces[(usize)face].nu == 0 else 4
+
+    func face_count_in(topology: BrepModel*?) -> i64:
+        if let boundary = topology:
+            return (i64)self.count + boundary.face_count()
+        return (i64)self.count
+
+    func edge_point_in(topology: BrepModel*?, face: i64, edge: i64, fraction: f64) -> Vector3!:
+        let count = try self.edge_count_in(topology, face)
+        if edge < 0 or edge >= count or fraction < 0.0 or fraction > 1.0 or not math.is_finite(fraction):
+            error(invalid, "invalid CAD boundary sample")
+        if let boundary = topology:
+            if face >= (i64)self.count:
+                return self.placement.transform_point(try boundary.face_edge_point(face - (i64)self.count, edge, fraction))
+        let entry = self.faces[(usize)face]
+        if entry.nu == 0:
+            let a = entry.points[(usize)edge]
+            let b = entry.points[(usize)((edge + 1) % count)]
+            return a.add(b.subtract(a).multiply_scalar(fraction))
+        let u = entry.u0 + (entry.u1 - entry.u0) * fraction
+        let v = entry.v0 + (entry.v1 - entry.v0) * fraction
+        return try NurbsSurface.at(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv,
+                                   u if edge == 0 or edge == 2 else (entry.u1 if edge == 1 else entry.u0), v if edge == 1 or edge == 3 else (entry.v0 if edge == 0 else entry.v1))
+
+    func edge_linear_in(topology: BrepModel*?, face: i64, edge: i64) -> bool!:
+        let count = try self.edge_count_in(topology, face)
+        if edge < 0 or edge >= count:
+            error(invalid, "CAD edge use index out of range")
+        if let boundary = topology:
+            if face >= (i64)self.count:
+                return try boundary.face_edge_linear(face - (i64)self.count, edge)
+        return self.faces[(usize)face].nu == 0
+
+    func edge_id_in(topology: BrepModel*?, face: i64, edge: i64) -> i64!:
+        let count = try self.edge_count_in(topology, face)
+        if edge < 0 or edge >= count:
+            error(invalid, "CAD edge use index out of range")
+        if let boundary = topology:
+            if face >= (i64)self.count:
+                return try boundary.face_edge_id(face - (i64)self.count, edge)
+        # Independent faces' edges follow the B-rep's, 2^32 ids per face.
+        return (i64)CadModel.count_edges_in(topology) + face * 4294967296 + edge
+
+    static func count_edges_in(topology: BrepModel*?) -> i64:
+        if let boundary = topology:
+            return boundary.edge_count()
+        return 0
+
+    func preview_in(topology: BrepModel*?, face: i64, divisions: i64) -> interop.Reference[Mesh]!:
+        if face < 0 or face >= self.face_count_in(topology):
+            error(invalid, "CAD preview face index out of range")
+        if let boundary = topology:
+            if face >= (i64)self.count:
+                let part = try boundary.preview_face(face - (i64)self.count, divisions)
+                defer part.release()
+                return try part.value().placed(self.placement)
+        let entry = self.faces[(usize)face]
+        if entry.nu == 0:
+            return try planar_mesh(entry.points)
+        let part = try nurbs_grid(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv, entry.u0, entry.u1, entry.v0, entry.v1, divisions)
+        defer part.release()
+        var output = try MeshBuilder()
+        defer output.close()
+        try output.copy_points(part.value())
+        for at in 0..<part.value().face_count():
+            let count = try part.value().face_size(at)
+            try output.face(count)
+            for corner in 0..<count:
+                try output.corner(try part.value().face_point(at, count - 1 - corner if entry.reversed else corner))
+        let raw = try output.finish()
+        defer raw.release()
+        var groups: i64[1]
+        # The NURBS grid comes from precise tessellation; publish it in f32.
+        return try brep.published(try MeshNormals.generate(raw, groups[..<0]))
+
+    ## Diagnostic B-rep face using global shared-edge/layout planning, unlike
+    ## the independent preview. Other face jobs are not validated by this call.
+    pub func planned_face(face: i64, segments: i64 = 16, edge_size: f64 = 0.0) -> interop.Reference[Mesh]!:
+        if self.count != 0: error(invalid, "planned face diagnostics require B-rep topology")
+        let boundary = self.boundary else error(invalid, "CAD model has no B-rep")
+        let part = try boundary.value().planned_face(face, segments, edge_size)
+        defer part.release()
+        return try part.value().placed(self.placement)
+
+    ## Whether `tessellate` can add curvature attributes: a B-rep model under a
+    ## uniform-scale placement.
+    pub func supports_curvature() -> bool:
+        if self.count != 0 or self.boundary == none: return false
+        let matrix = self.placement
+        let scale = matrix.x.length()
+        let tolerance = scale * 1e-9
+        return math.abs(matrix.y.length() - scale) <= tolerance and math.abs(matrix.z.length() - scale) <= tolerance and math.abs(matrix.x.dot(matrix.y)) <= tolerance * scale and math.abs(matrix.y.dot(matrix.z)) <= tolerance * scale and math.abs(matrix.x.dot(matrix.z)) <= tolerance * scale
+
+    ## `curvature`/`directions` add principal curvature corner attributes
+    ## (BrepModel.mesh); B-rep models only, under a uniform-scale placement.
+    ## `quick` lets a copy with moved cvs answer with its quick preview (a
+    ## drag's frames; brep/quick.lucb).
+    pub func tessellate(segments: i64 = 16, edge_size: f64 = 0.0, progress: interop.Callback[f64, unit]? = none, curvature: bool = false, directions: bool = false, quick: bool = false) -> interop.Reference[Mesh]!:
+        if not math.is_finite(edge_size) or edge_size < 0.0:
+            error(invalid, "edge size must be finite and nonnegative")
+        if segments < 1 or segments > 64:
+            error(invalid, "CAD tessellation segments must be 1..64")
+        if self.face_count() == 0:
+            error(invalid, "CAD model has no faces")
+        let analysis = curvature or directions
+        if analysis and self.count != 0:
+            error(invalid, "curvature attributes require B-rep topology")
+        # The common STEP path needs no second mesh rebuild, recoloring, BVH or
+        # normal generation. Placement is applied only when nonidentity.
+        if self.count == 0:
+            if let boundary = self.boundary:
+                let part = try boundary.value().mesh(segments, edge_size, progress, curvature, directions, quick)
+                defer part.release()
+                # An identity placement shares the mesh as it is.
+                if self.placement.is_identity(): return part.clone()
+                let placed = try part.value().placed(self.placement)
+                if not analysis or self.placement.is_identity(): return placed
+                defer placed.release()
+                return try scaled_curvature(placed, self.placement, directions)
+        # `cad_face` numbers faces as face_count() does: independent faces
+        # first, then the B-rep's (after `count`).
+        var output = try MeshBuilder()
+        defer output.close()
+        # The B-rep's polygon colors (white for the independent faces).
+        var colors = Growing[f64]()
+        defer colors.close()
+        var has_colors = false
+        if let boundary = self.boundary:
+            let part = try boundary.value().mesh(segments, edge_size, progress)
+            defer part.release()
+            for point in 0..<part.value().point_count():
+                _ = try output.point(self.placement.transform_point(try part.value().point(point)))
+            let reversed = self.placement.determinant() < 0.0
+            let groups = part.value().find_attribute("cad_face", 2)
+            let cd = part.value().find_attribute("Cd", 2)
+            has_colors = cd >= 0
+            for face in 0..<part.value().face_count():
+                let count = try part.value().face_size(face)
+                if cd >= 0:
+                    for component in 0..<3:
+                        try colors.push(try part.value().attribute_value(cd, face, component))
+                try output.face(count, (i64)self.count + (i64)(try part.value().attribute_value(groups, face, 0)))
+                for corner in 0..<count:
+                    try output.corner(try part.value().face_point(face, count - 1 - corner if reversed else corner))
+        for face_id in 0..<self.count:
+            let entry = self.faces[face_id]
+            if entry.nu == 0 and edge_size == 0.0:
+                try output.face((i64)entry.points.length, (i64)face_id)
+                for point in entry.points:
+                    try output.corner(try output.point(point))
+                continue
+            var resolution = segments
+            if entry.nu > 0 and edge_size > 0.0:
+                var span: f64 = 0.0
+                for point in entry.points:
+                    span = math.max(span, point.subtract(entry.points[0]).length())
+                let needed = math.ceil(span / edge_size)
+                if needed > 64.0:
+                    error(invalid, "edge size exceeds independent NURBS grid budget; increase it")
+                resolution = (i64)math.max((f64)segments, needed)
+            let part = try planar_grid(entry.points, edge_size) if entry.nu == 0 else (try nurbs_grid(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv, entry.u0, entry.u1, entry.v0, entry.v1, resolution))
+            defer part.release()
+            let offset = (i64)output.np
+            for point in 0..<part.value().point_count():
+                _ = try output.point(try part.value().point(point))
+            for face in 0..<part.value().face_count():
+                let count = try part.value().face_size(face)
+                try output.face(count, (i64)face_id)
+                for corner in 0..<count:
+                    try output.corner(offset + (try part.value().face_point(face, count - 1 - corner if entry.reversed else corner)))
+        let raw = try output.finish()
+        defer raw.release()
+        for index in 0..<output.nf:
+            if output.face_parents[index] < 0:
+                output.face_parents[index] = self.face_count() + (i64)index
+        let values = try new f64[output.nf] --- in memory.heap
+        defer free(values) in memory.heap
+        for index in 0..<output.nf:
+            values[index] = (f64)output.face_parents[index]
+        let tagged = try raw.value().with_attribute("cad_face", 2, 1, values, true)
+        defer tagged.release()
+        if has_colors:
+            try colors.extend(output.nf * 3, 1.0)
+            let colored = try tagged.value().with_attribute("Cd", 2, 3, colors.view())
+            defer colored.release()
+            return try MeshNormals.generate(colored, output.face_parents[..<output.nf])
+        return try MeshNormals.generate(tagged, output.face_parents[..<output.nf])
+
+## Curvature under a similarity placement: a uniform scale s divides it by s
+## (a reflection keeps it, as corners reverse to keep normals outward), and
+## directions turn with the placement.
+func scaled_curvature(mesh: interop.Reference[Mesh], matrix: Matrix4, directions: bool) -> interop.Reference[Mesh]!:
+    let scale = matrix.x.length()
+    let tolerance = scale * 1e-9
+    if math.abs(matrix.y.length() - scale) > tolerance or math.abs(matrix.z.length() - scale) > tolerance or math.abs(matrix.x.dot(matrix.y)) > tolerance * scale or math.abs(matrix.y.dot(matrix.z)) > tolerance * scale or math.abs(matrix.x.dot(matrix.z)) > tolerance * scale:
+        error(invalid, "curvature analysis needs a uniform-scale CAD placement")
+    let corners = (usize)mesh.value().vertex_count()
+    let values = try new f64[corners * 3] --- in memory.heap
+    defer free(values) in memory.heap
+    var current = mesh.clone()
+    defer current.release()
+    for name in ["curvature.k1", "curvature.k2"]:
+        let index = current.value().find_attribute(name, 1)
+        if index < 0: continue
+        for corner in 0..<corners: values[corner] = (try current.value().attribute_value(index, (i64)corner)) / scale
+        let next = try current.value().with_attribute(name, 1, 1, values[..<corners], false, true)
+        current.release()
+        current = next
+    for name in ["curvature.d1", "curvature.d2"]:
+        let index = current.value().find_attribute(name, 1)
+        if index < 0 or not directions: continue
+        for corner in 0..<corners:
+            let d = Vector3(try current.value().attribute_value(index, (i64)corner, 0), try current.value().attribute_value(index, (i64)corner, 1), try current.value().attribute_value(index, (i64)corner, 2))
+            let turned = matrix.transform_direction(d).multiply_scalar(1.0 / scale)
+            values[corner * 3] = turned.x
+            values[corner * 3 + 1] = turned.y
+            values[corner * 3 + 2] = turned.z
+        let next = try current.value().with_attribute(name, 1, 3, values, false, true)
+        current.release()
+        current = next
+    return current.clone()
+
+struct PreviewJob:
+    let model: const CadModel*
+    let topology: BrepModel*?
+
+## One face's preview on a pool worker, as luced-3d's per-patch preview did:
+## 8 divisions for faces with many edges, else 16; then 4; then 16 again.
+func make_preview_part(raw: void*?, face: usize, part: PreviewPart*):
+    let job = (PreviewJob*)(raw else return)
+    let index = (i64)face
+    # Boundary sampling errors stopped the whole serial preview; they stay fatal.
+    fill_boundaries(job, index, part) catch failure:
+        part.fatal(failure.message)
+        return
+    let edges = job.model.edge_count_in(job.topology, index) catch failure:
+        part.fatal(failure.message)
+        return
+    let mesh = fallback_preview(job, index, 8 if edges > 32 else 16) catch failure:
+        part.fail(failure.message)
+        return
+    defer mesh.release()
+    part.adopt(mesh) catch failure: part.fail(failure.message)
+
+func fallback_preview(job: PreviewJob*, index: i64, divisions: i64) -> interop.Reference[Mesh]!:
+    let first = job.model.preview_in(job.topology, index, divisions) catch failure:
+        let coarse = job.model.preview_in(job.topology, index, 4) catch coarse_failure:
+            return try job.model.preview_in(job.topology, index, 16)
+        return coarse
+    return first
+
+## Each edge use's analytic polyline (64 chords when curved, as the display's
+## full-circle resolution: a coarse chord sinks into the shaded mesh).
+func fill_boundaries(job: PreviewJob*, face: i64, part: PreviewPart*) -> !:
+    let model = job.model
+    let uses = try model.edge_count_in(job.topology, face)
+    try part.open_boundaries((usize)uses)
+    for use in 0..<uses:
+        let divisions = 1 if (try model.edge_linear_in(job.topology, face, use)) else 64
+        try part.begin_use(try model.edge_id_in(job.topology, face, use))
+        for step in 0..<divisions + 1:
+            try part.boundary_point(try model.edge_point_in(job.topology, face, use, (f64)step / (f64)divisions))
+
+func planar_mesh(points: const Vector3[]) -> interop.Reference[Mesh]!:
+    var builder = try MeshBuilder()
+    defer builder.close()
+    try builder.face((i64)points.length)
+    for point in points:
+        try builder.corner(try builder.point(point))
+    return try builder.finish()

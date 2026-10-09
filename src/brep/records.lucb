@@ -1,0 +1,138 @@
+## Owned records of a B-rep's edges, surfaces and faces (what modeling
+## and the tessellator read), made once per model and kept, with its
+## meshes, until the model changes.
+extend BrepModel:
+    ## For modeling (luce-cad's modeling module): the tolerance, vertex
+    ## `index`, and owned records of an edge, a surface and a face.
+    pub func model_tolerance() -> f64:
+        return self.tolerance
+
+    pub func vertex_at(index: i64) -> Vector3!:
+        if index < 0 or index >= self.vertex_count(): error(invalid, "B-rep vertex out of range")
+        return self.vertices.get((usize)index)
+
+    pub func edge_record(index: i64) -> Curve!:
+        if index < 0 or index >= self.edge_count(): error(invalid, "B-rep edge out of range")
+        return try self.curve((usize)index)
+
+    pub func surface_record(index: i64) -> Surface!:
+        if index < 0 or index >= self.surface_count(): error(invalid, "B-rep surface out of range")
+        return try self.surface((usize)index)
+
+    pub func face_record(index: i64) -> BrepFace!:
+        try self.check_face(index)
+        return try self.face((usize)index)
+
+    ## Owned records of curve `index` and surface `index`, and of face `index`
+    ## (edge uses, loops, sense, placement, color).
+    func curve(index: usize) -> Curve!:
+        let frame = self.curve_frame.range(index * curve_stride, (index + 1) * curve_stride)
+        return try Curve((i64)self.curve_kind.get(index), (i64)self.curve_ends.get(index * 2), (i64)self.curve_ends.get(index * 2 + 1),
+                         Vector3(frame[0], frame[1], frame[2]), Vector3(frame[3], frame[4], frame[5]), Vector3(frame[6], frame[7], frame[8]), frame[9],
+                         self.curve_points_of(index), self.curve_weights_of(index), self.curve_knots_of(index), (i64)self.curve_degree.get(index),
+                         self.curve_sense.get(index) == 1, frame[10], frame[11])
+
+    func surface(index: usize) -> Surface!:
+        let frame = self.surface_frame.range(index * surface_stride, (index + 1) * surface_stride)
+        let dims = self.surface_dims.range(index * 4, index * 4 + 4)
+        var record = try Surface((i64)self.surface_kind.get(index), Vector3(frame[0], frame[1], frame[2]), Vector3(frame[3], frame[4], frame[5]), Vector3(frame[6], frame[7], frame[8]),
+                                 frame[9], frame[10], self.cvs_of(index), self.cv_weights_of(index), self.knots_of(index, 0), self.knots_of(index, 1),
+                                 (i64)dims[0], (i64)dims[1], (i64)dims[2], (i64)dims[3])
+        record.edited = self.surface_edited.get(index) == 1
+        return record
+
+    func face(index: usize) -> BrepFace!:
+        var uses = Growing[i64]()
+        defer uses.close()
+        var sizes = Growing[i64]()
+        defer sizes.close()
+        for use in self.uses_of(index): try uses.push((i64)use)
+        for size in self.loops_of(index): try sizes.push((i64)size)
+        var record = try BrepFace((i64)self.face_surface.get(index), uses.view(), sizes.view(), self.face_sense.get(index) == 1)
+        record.placement = self.face_placement.get(index)
+        record.color = self.face_color.get(index)
+        record.colored = self.face_colored.get(index) == 1
+        return record
+
+    ## The tessellator's records: made on first use, kept until a change.
+    func tessellation_records() -> const Records*!:
+        let derived = self.derived
+        derived.lock.lock()
+        defer derived.lock.unlock()
+        if let made = derived.records: return made
+        let made = try make_records(&self)
+        derived.records = made
+        return made
+
+    ## The per-face tessellation cache, made on first use.
+    func face_cache() -> FaceCache*!:
+        let derived = self.derived
+        derived.lock.lock()
+        defer derived.lock.unlock()
+        if let made = derived.faces: return made
+        let made = try new FaceCache() in memory.heap
+        derived.faces = made
+        return made
+
+    ## A kept tessellation for these parameters (another owner), or none.
+    func kept_mesh(divisions: i64, edge_size: f64, curvature: bool, directions: bool) -> interop.Reference[Mesh]?:
+        let derived = self.derived
+        derived.lock.lock()
+        defer derived.lock.unlock()
+        for kept in derived.meshes.view():
+            if kept.divisions == divisions and kept.edge_size == edge_size and kept.curvature == curvature and kept.directions == directions: return kept.mesh.clone()
+        return none
+
+    ## Keep `mesh` for these parameters (the last four are kept).
+    func keep_mesh(divisions: i64, edge_size: f64, curvature: bool, directions: bool, mesh: interop.Reference[Mesh]) -> !:
+        let derived = self.derived
+        derived.lock.lock()
+        defer derived.lock.unlock()
+        if derived.meshes.count == 4:
+            derived.meshes.items[0].mesh.release()
+            for at in 1..<4: derived.meshes.items[at - 1] = derived.meshes.items[at]
+            derived.meshes.count = 3
+        let owner = mesh.clone()
+        derived.meshes.push(KeptMesh(divisions, edge_size, curvature, directions, owner)) catch failure:
+            owner.release()
+            error(failure.code, failure.message)
+
+    ## Drop what was derived before a change.
+    func changed():
+        let derived = self.derived
+        if let made = derived.records:
+            made.close()
+            free(made) in memory.heap
+            derived.records = none
+        if let cache = derived.faces:
+            dispose_cache(cache)
+            derived.faces = none
+        for kept in derived.meshes.view(): kept.mesh.release()
+        derived.meshes.count = 0
+        drop_quick(derived)
+        derived.boundaries.clear()
+
+## Every record, in model order.
+func make_records(model: const BrepModel*) -> Records*!:
+    let edges = try new Curve[(usize)model.edge_count()] --- in memory.heap
+    errdefer free(edges) in memory.heap
+    let surfaces = try new Surface[(usize)model.surface_count()] --- in memory.heap
+    errdefer free(surfaces) in memory.heap
+    let faces = try new BrepFace[(usize)model.face_count()] --- in memory.heap
+    errdefer free(faces) in memory.heap
+    let made = try new Records(edges, surfaces, faces) in memory.heap
+    errdefer:
+        for edge in made.edges[..<made.made_edges]: edge.close()
+        for surface in made.surfaces[..<made.made_surfaces]: surface.close()
+        for face in made.faces[..<made.made_faces]: face.close()
+        free(made) in memory.heap
+    for index in 0..<edges.length:
+        edges[index] = try model.curve(index)
+        made.made_edges += 1
+    for index in 0..<surfaces.length:
+        surfaces[index] = try model.surface(index)
+        made.made_surfaces += 1
+    for index in 0..<faces.length:
+        faces[index] = try model.face(index)
+        made.made_faces += 1
+    return made

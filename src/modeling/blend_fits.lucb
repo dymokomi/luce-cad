@@ -1,0 +1,103 @@
+## Whether a blend fits its edge's faces (blend.lucb): how far it reaches
+## into each face against how far the face goes, said with the size that
+## would fit when it does not.
+
+## How far along each face from edge `e` a blend of `size` reaches (a
+## fillet's contact distance, a chamfer's own size).
+func reach_of(w: const Shape*, e: usize, size: f64, round: bool) -> f64!:
+    if not round: return size
+    let (fa, fb) = try edge_faces(w, e)
+    let along = try along_edge(w, e)
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    return size / math.tan(angle * 0.5)
+
+## How far into face `f` from edge `e` the blend's contact can reach before
+## leaving it: over samples along the edge, the least distance to the
+## face's boundary going straight in.
+## On a cylinder along the edge (`around`), the step goes around its
+## circle.
+func room(w: const Shape*, e: usize, f: usize, limit: f64, around: bool = false) -> f64!:
+    let edge = w.edges.items[e]
+    var least = limit
+    for k in 1..<8:
+        let fraction = (f64)k / 8.0
+        let p = try w.edge_at(e, fraction)
+        let t = edge.t0 + (edge.t1 - edge.t0) * fraction
+        let along = (try w.tangent(edge.carrier, t)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
+        let n = try w.face_normal(f, p)
+        var side = try n.cross(try along.normalized()).normalized()
+        let probe = try stepped(w, f, p, side, least * 1e-3 + w.tolerance * 100.0, around)
+        if try face_contains(w, f, probe, w.tolerance) != inside_face: side = side.multiply_scalar(-1.0)
+        # On a rim's cylinder the straight step runs along the axis, on the
+        # face; one leaving the surface has left the face.
+        let far = try stepped(w, f, p, side, least, around)
+        if try face_contains(w, f, far, w.tolerance) != outside and try on_face_surface(w, f, far): continue
+        var inside_at = 0.0
+        var outside_at = least
+        for _ in 0..<40:
+            let middle = (inside_at + outside_at) * 0.5
+            let q = try stepped(w, f, p, side, middle, around)
+            if try on_face_surface(w, f, q) and try face_contains(w, f, q, w.tolerance) != outside: inside_at = middle
+            else: outside_at = middle
+        least = inside_at
+    return least
+
+## `p` moved `distance` along `side` on face `f`: straight, or (around)
+## that far around its cylinder's circle.
+func stepped(w: const Shape*, f: usize, p: Vector3, side: Vector3, distance: f64, around: bool) -> Vector3!:
+    if not around: return p.add(side.multiply_scalar(distance))
+    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+    let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+    let r0 = p.subtract(axis_point)
+    let turn = 1.0 if s.z.cross(r0).dot(side) > 0.0 else -1.0
+    return axis_point.add(turned_direction(r0, s.z, turn * distance / s.radius))
+
+func on_face_surface(w: const Shape*, f: usize, p: Vector3) -> bool!:
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    if s.kind == surface_spline: return true
+    return surface_distance(s, p) <= w.tolerance * 10.0
+
+## A blend of `size` on edge `e` must reach less far than its faces go
+## (all the way, a face would vanish): else an error saying so, and the
+## size it must stay under.
+func check_fits(w: const Shape*, e: usize, size: f64, round: bool) -> !:
+    let (fa, fb) = try edge_faces(w, e)
+    # How far the blend reaches along each face: alike between planes (and
+    # at rims), each its own between a plane and a cylinder (the
+    # cylinder's along its circle).
+    var reach_a = try reach_of(w, e, size, round)
+    var reach_b = reach_a
+    var around: i64 = -1
+    let edge = w.edges.items[e]
+    if w.carriers.items[(usize)edge.carrier].kind == curve_line:
+        let cylinder = ruled_pair(w, e, fa, fb)
+        if cylinder >= 0:
+            around = cylinder
+            let along = try along_edge(w, e)
+            let p = try w.edge_at(e, 0.5)
+            let plane = fb if (usize)cylinder == fa else fa
+            let into_plane = try into_face(w, plane, e, along)
+            let into_round = try into_face(w, (usize)cylinder, e, along)
+            let (ta, tb, _) = try ruled_contacts(w, plane, (usize)cylinder, p, into_plane, into_round, size, round, try convex(w, e))
+            let s = w.surfaces.items[(usize)w.faces.items[(usize)cylinder].surface]
+            let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+            let arc = s.radius * math.acos(math.clamp(tb.subtract(axis_point).dot(p.subtract(axis_point)) / (s.radius * s.radius), -1.0, 1.0))
+            reach_a = ta.subtract(p).length() if fa == plane else arc
+            reach_b = arc if fa == plane else ta.subtract(p).length()
+    let room_a = try room(w, e, fa, reach_a * 1.01 + w.tolerance * 100.0, around == (i64)fa)
+    let room_b = try room(w, e, fb, reach_b * 1.01 + w.tolerance * 100.0, around == (i64)fb)
+    if room_a > reach_a + w.tolerance * 10.0 and room_b > reach_b + w.tolerance * 10.0: return
+    let most = size * math.min(room_a / reach_a, room_b / reach_b)
+    var buffer: u8[256]
+    let text = try strings.format(buffer, f"a fillet radius of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}") if round else try strings.format(buffer, f"a chamfer of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}")
+    let owned = try interop.copy_text(text)
+    if let owner = owned.owner: _ = ownership.pool_object(owner)
+    error(invalid, owned.value)
+
+## `value` to four significant places, for messages.
+func rounded_text(value: f64) -> f64:
+    if value == 0.0 or not math.is_finite(value): return value
+    let scale = math.pow(10.0, 3.0 - math.floor(math.log10(math.abs(value))))
+    return math.round(value * scale) / scale

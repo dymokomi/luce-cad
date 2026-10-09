@@ -1,0 +1,184 @@
+## Building a B-rep: vertices, edges (lines, arcs, ellipses, B-splines),
+## surfaces and faces, each checked as it is added.
+extend BrepModel:
+    pub func add_vertex(point: Vector3) -> i64!:
+        if not point.is_finite(): error(invalid, "invalid B-rep vertex")
+        try self.vertices.push(point)
+        self.changed()
+        return self.vertex_count() - 1
+
+    func check_edge(start: i64, end: i64) -> !:
+        if start < 0 or end < 0 or start >= self.vertex_count() or end >= self.vertex_count():
+            error(invalid, "invalid B-rep edge endpoints")
+
+    ## Append one curve's columns.
+    func push_curve(kind: u8, start: i64, end: i64, frame: const f64[], points: const Vector3[], weights: const f64[], knots: const f64[], degree: i64, sense: bool) -> !:
+        try self.curve_kind.push(kind)
+        try self.curve_ends.push((i32)start)
+        try self.curve_ends.push((i32)end)
+        try self.curve_frame.append(frame)
+        try self.curve_degree.push((i32)degree)
+        try self.curve_sense.push(1 if sense else 0)
+        try self.curve_points.append(points)
+        try self.curve_point_offsets.push((i32)self.curve_points.count)
+        try self.curve_weights.append(weights)
+        try self.curve_weight_offsets.push((i32)self.curve_weights.count)
+        try self.curve_knots.append(knots)
+        try self.curve_knot_offsets.push((i32)self.curve_knots.count)
+        self.changed()
+
+    pub func add_line(start: i64, end: i64) -> i64!:
+        try self.check_edge(start, end)
+        if start == end:
+            error(invalid, "collapsed B-rep line")
+        var empty: f64[1]
+        let frame = curve_frame(Vector3(), Vector3(), Vector3(), 0.0, 0.0, 0.0)
+        try self.push_curve(0, start, end, frame[..<frame.length], [self.vertices.get((usize)start), self.vertices.get((usize)end)], empty[..<0], empty[..<0], 0, true)
+        return self.edge_count() - 1
+
+    pub func add_circle(start: i64, end: i64, origin: Vector3, axis: Vector3, reference: Vector3, radius: f64, sense: bool = true) -> i64!:
+        try self.check_edge(start, end)
+        let z = try axis.normalized()
+        let x = try reference.subtract(z.multiply_scalar(reference.dot(z))).normalized()
+        let y = z.cross(x)
+        if not origin.is_finite() or not math.is_finite(radius) or radius <= 0.0:
+            error(invalid, "invalid B-rep circle")
+        let a = self.vertices.get((usize)start).subtract(origin)
+        let b = self.vertices.get((usize)end).subtract(origin)
+        if math.abs(a.dot(z)) > self.tolerance or math.abs(b.dot(z)) > self.tolerance or math.abs(a.length() - radius) > self.tolerance or math.abs(b.length() - radius) > self.tolerance:
+            error(invalid, "circle endpoints are not on the curve")
+        let angle = math.atan2(a.dot(y), a.dot(x))
+        let sweep = swept(math.atan2(b.dot(y), b.dot(x)) - angle, sense)
+        var empty: f64[1]
+        let frame = curve_frame(origin, x, y, radius, angle, sweep)
+        try self.push_curve(1, start, end, frame[..<frame.length], self.vertices.view()[..<0], empty[..<0], empty[..<0], 0, sense)
+        return self.edge_count() - 1
+
+    ## Retain an exact elliptical arc, with angles recovered from its endpoints.
+    pub func add_ellipse(start: i64, end: i64, origin: Vector3, axis: Vector3, reference: Vector3, major: f64, minor: f64, sense: bool = true) -> i64!:
+        try self.check_edge(start, end)
+        if not origin.is_finite() or not math.is_finite(major) or not math.is_finite(minor) or major <= 0.0 or minor <= 0.0:
+            error(invalid, "invalid B-rep ellipse")
+        let z = try axis.normalized()
+        let x = try reference.subtract(z.multiply_scalar(reference.dot(z))).normalized()
+        let y = z.cross(x)
+        let a = self.vertices.get((usize)start).subtract(origin)
+        let b = self.vertices.get((usize)end).subtract(origin)
+        let angle = math.atan2(a.dot(y) / minor, a.dot(x) / major)
+        let end_angle = math.atan2(b.dot(y) / minor, b.dot(x) / major)
+        if a.subtract(x.multiply_scalar(major * math.cos(angle)).add(y.multiply_scalar(minor * math.sin(angle)))).length() > self.tolerance or b.subtract(x.multiply_scalar(major * math.cos(end_angle)).add(y.multiply_scalar(minor * math.sin(end_angle)))).length() > self.tolerance:
+            error(invalid, "ellipse endpoints are not on the curve")
+        let sweep = swept(end_angle - angle, sense)
+        var empty: f64[1]
+        let frame = curve_frame(origin, x, y, major, angle, sweep)
+        try self.push_curve(3, start, end, frame[..<frame.length], self.vertices.view()[..<0], [minor], empty[..<0], 0, sense)
+        return self.edge_count() - 1
+
+    pub func add_spline_edge(start: i64, end: i64, points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], sense: bool) -> i64!:
+        try self.check_edge(start, end)
+        if degree < 1 or (usize)degree >= knots.length or points.length >= knots.length:
+            error(invalid, "invalid B-spline edge")
+        let low = knots[(usize)degree]
+        let high = knots[points.length]
+        # Inversion may land a hair outside the knots: the ends are in them.
+        let a = math.clamp(try curve_parameter(points, weights, degree, knots, self.vertices.get((usize)start), low if sense else high, self.tolerance), low, high)
+        let b = math.clamp(try curve_parameter(points, weights, degree, knots, self.vertices.get((usize)end), high if sense else low, self.tolerance), low, high)
+        var sweep = b - a
+        if (sense and sweep <= 0.0) or (not sense and sweep >= 0.0):
+            let first = try NurbsCurve.at(points, weights, degree, knots, low)
+            let last = try NurbsCurve.at(points, weights, degree, knots, high)
+            if first.subtract(last).length() > self.tolerance:
+                error(invalid, "B-spline trim orientation contradicts the edge sense")
+            sweep += (high - low) * (1.0 if sense else -1.0)
+        let frame = curve_frame(Vector3(), Vector3(), Vector3(), 0.0, a, sweep)
+        try self.push_curve(2, start, end, frame[..<frame.length], points, weights, knots, degree, sense)
+        return self.edge_count() - 1
+
+    ## Append one surface's columns.
+    func push_surface(kind: u8, frame: const f64[], points: const Vector3[], weights: const f64[], ku: const f64[], kv: const f64[], dims: const i32[]) -> !:
+        try self.surface_kind.push(kind)
+        try self.surface_edited.push(0)
+        try self.surface_frame.append(frame)
+        try self.surface_dims.append(dims)
+        try self.cv_positions.append(points)
+        try self.surface_cv_offsets.push((i32)self.cv_positions.count)
+        try self.cv_weights.append(weights)
+        try self.surface_weight_offsets.push((i32)self.cv_weights.count)
+        try self.surface_knots.append(ku)
+        try self.surface_knot_offsets.push((i32)self.surface_knots.count)
+        try self.surface_knots.append(kv)
+        try self.surface_knot_offsets.push((i32)self.surface_knots.count)
+        self.changed()
+
+    ## kind 0 plane, 1 cylinder, 2 cone, 4 sphere, 5 torus.
+    ## For a torus radius/angle are major/minor radii. Placements stay exact.
+    pub func add_surface(kind: i64, origin: Vector3, axis: Vector3, reference: Vector3, radius: f64 = 0.0, angle: f64 = 0.0) -> i64!:
+        if kind < surface_plane or kind == surface_spline or kind > surface_torus or not origin.is_finite() or not math.is_finite(radius) or not math.is_finite(angle) or (kind > surface_plane and radius <= 0.0) or (kind == surface_cone and math.abs(angle) >= 1.5707963267948966) or (kind == surface_torus and angle <= 0.0):
+            error(invalid, "invalid analytic B-rep surface")
+        let z = try axis.normalized()
+        let x = try reference.subtract(z.multiply_scalar(reference.dot(z))).normalized()
+        let frame: f64[11] = [origin.x, origin.y, origin.z, x.x, x.y, x.z, z.x, z.y, z.z, radius, angle]
+        var empty: f64[1]
+        let dims: i32[4] = [0, 0, 0, 0]
+        try self.push_surface((u8)kind, frame[..<frame.length], self.vertices.view()[..<0], empty[..<0], empty[..<0], empty[..<0], dims[..<4])
+        return self.surface_count() - 1
+
+    pub func add_spline_surface(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[]) -> i64!:
+        try NurbsSurface.check(points, weights, nu, nv, du, dv, ku, kv)
+        let frame: f64[11] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        let dims: i32[4] = [(i32)nu, (i32)nv, (i32)du, (i32)dv]
+        try self.push_surface(3, frame[..<frame.length], points, weights, ku, kv, dims[..<4])
+        return self.surface_count() - 1
+
+    ## Signed edge uses: +(edge ID + 1) forward, -(edge ID + 1) reversed.
+    ## Outer loop first, holes afterward, any number of each. Reject
+    ## disconnected topological loops.
+    pub func add_face(surface: i64, uses: const i64[], sizes: const i64[], sense: bool = true) -> i64!:
+        if surface < 0 or surface >= self.surface_count() or sizes.length == 0:
+            error(invalid, "invalid B-rep face")
+        let edges = self.edge_count()
+        for use in uses:
+            if use == 0 or use < -edges or use > edges:
+                error(invalid, "B-rep face references a missing edge")
+        var offset: usize = 0
+        for size in sizes:
+            if size < 1 or (usize)size > uses.length - offset:
+                error(invalid, "invalid B-rep loop size")
+            for at in 0..<(usize)size:
+                let use = uses[offset + at]
+                let next = uses[offset + (at + 1) % (usize)size]
+                let edge = edge_index(use)
+                let following = edge_index(next)
+                let arrives = self.curve_ends.get(edge * 2 + (1 if use > 0 else 0))
+                let leaves = self.curve_ends.get(following * 2 + (0 if next > 0 else 1))
+                if arrives != leaves:
+                    error(invalid, "disconnected B-rep loop")
+            offset += (usize)size
+        if offset != uses.length:
+            error(invalid, "B-rep loop sizes do not describe every edge use")
+        try self.face_surface.push((i32)surface)
+        try self.face_sense.push(1 if sense else 0)
+        for use in uses: try self.face_uses.push((i32)use)
+        try self.face_use_offsets.push((i32)self.face_uses.count)
+        for size in sizes: try self.loop_sizes.push((i32)size)
+        try self.face_loop_offsets.push((i32)self.loop_sizes.count)
+        try self.face_placement.push(Matrix4())
+        try self.face_color.push(Vector3(1.0, 1.0, 1.0))
+        try self.face_colored.push(0)
+        try self.face_paths.push_empty()
+        try self.face_names.push_empty()
+        self.changed()
+        return self.face_count() - 1
+
+## A curve frame's values.
+func curve_frame(origin: Vector3, x: Vector3, y: Vector3, radius: f64, angle: f64, sweep: f64) -> f64[12]:
+    return [origin.x, origin.y, origin.z, x.x, x.y, x.z, y.x, y.y, y.z, radius, angle, sweep]
+
+## A sweep taken the way `sense` runs, never zero.
+func swept(value: f64, sense: bool) -> f64:
+    var sweep = value
+    if sense:
+        while sweep <= 0.000000000001: sweep += 6.283185307179586
+    else:
+        while sweep >= -0.000000000001: sweep -= 6.283185307179586
+    return sweep

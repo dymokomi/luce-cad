@@ -1,0 +1,198 @@
+## A boolean's result (boolean.lucb steps 6 and 7): the pieces the
+## operation keeps, merged where they lie on one surface, written as a new
+## B-rep; an edge not used exactly twice, once each way, is an error.
+
+## Steps 4 to 7: split, classify, select and write.
+func assemble(work: Work*, op: i64, others: Others*) -> interop.Reference[CadModel]!:
+    let w = &work.w
+    var traced = try final_shape(work)
+    defer traced.close()
+    var halves = Growing[HalfEdge]()
+    defer halves.close()
+    var kept = Growing[(usize, usize, bool)]()
+    defer kept.close()
+    var pieces = try new_pieces()
+    defer pieces.close()
+    var piece_face = Growing[usize]()
+    defer piece_face.close()
+    # Each piece's name: its face's, or merged faces' names together.
+    var piece_name = Growing[i64]()
+    defer piece_name.close()
+    for f in 0..<w.faces.count:
+        halves.clear()
+        # The boundary, piece by piece, the way the face uses each edge.
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            let first = work.piece_starts.items[e]
+            let last = work.piece_starts.items[e + 1]
+            for k in 0..<last - first:
+                let id = work.piece_ids.items[first + k if use > 0 else last - 1 - k]
+                let forward = (id > 0) == (use > 0)
+                try halves.push(HalfEdge((id if id > 0 else -id) - 1, forward))
+        let boundary = halves.count
+        # New edges across it, both ways, unless already on its boundary.
+        for at in 0..<work.sections.count:
+            let section = work.sections.items[at]
+            if section.fa != (i64)f and section.fb != (i64)f: continue
+            try add_both(&halves, boundary, work.section_ids.items[at])
+        for mark in work.imprints.view():
+            if mark.face != f: continue
+            let first = work.piece_starts.items[mark.edge]
+            let last = work.piece_starts.items[mark.edge + 1]
+            for k in first..<last:
+                let id = work.piece_ids.items[k]
+                let final = work.finals.items[edge_index(id)]
+                let middle = try w.at(final.carrier, (final.t0 + final.t1) * 0.5)
+                if try face_contains(w, f, middle, work.tol) == inside_face: try add_both(&halves, boundary, id)
+        let before = pieces.piece_count()
+        try split_face(&traced, f, halves.view(), try face_pole(w, f), &pieces)
+        for _ in before..<pieces.piece_count():
+            try piece_face.push(f)
+            try piece_name.push(w.faces.items[f].name)
+    # Classify and select.
+    try find_blocks(work, &traced, &pieces, piece_face.view(), others)
+    var keep = Growing[bool]()
+    defer keep.close()
+    var turn = Growing[bool]()
+    defer turn.close()
+    for p in 0..<pieces.piece_count():
+        let f = piece_face.items[p]
+        let class = try classify(work, &traced, f, &pieces, p, others)
+        let first = work.is_a(f)
+        var take = false
+        var flip = false
+        if op == op_union:
+            take = class == class_out or (class == class_same and first)
+        elif op == op_subtract:
+            if first: take = class == class_out or class == class_opposite
+            else:
+                take = class == class_in
+                flip = true
+        else:
+            take = class == class_in or (class == class_same and first)
+        try keep.push(take)
+        try turn.push(flip)
+    try merge_pieces(work, &traced, &pieces, &piece_face, &piece_name, &keep, &turn)
+    try seam_zones(work, &traced, &pieces, piece_face.view(), keep.view())
+    return try write_result(work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view())
+
+## Add final edge `id` (signed) to `halves` both ways, unless one of the
+## first `boundary` halves is it.
+func add_both(halves: Growing[HalfEdge]*, boundary: usize, id: i64) -> !:
+    let edge = (id if id > 0 else -id) - 1
+    for at in 0..<boundary:
+        if halves.items[at].edge == edge: return
+    for at in boundary..<halves.count:
+        if halves.items[at].edge == edge: return
+    try halves.push(HalfEdge(edge, true))
+    try halves.push(HalfEdge(edge, false))
+
+## The shape faces are split in: the final edges over the merged
+## vertices, with the work shape's carriers, surfaces and faces (their
+## surfaces and senses; their loops are what is being split).
+func final_shape(work: Work*) -> Shape!:
+    var s = empty_shape(work.tol)
+    errdefer s.close()
+    for p in work.vertices.view(): try s.points.push(p)
+    for c in work.w.carriers.view(): try s.carriers.push(c)
+    for sp in work.w.splines.view(): try s.splines.push(sp)
+    for p in work.w.spline_points.view(): try s.spline_points.push(p)
+    for x in work.w.spline_weights.view(): try s.spline_weights.push(x)
+    for k in work.w.spline_knots.view(): try s.spline_knots.push(k)
+    for e in work.finals.view(): try s.edges.push(e)
+    for su in work.w.surfaces.view():
+        try s.surfaces.push(try Surface(su.kind, su.origin, su.x, su.z, su.radius, su.angle, su.points, su.weights, su.ku, su.kv, su.nu, su.nv, su.du, su.dv))
+    for face in work.w.faces.view():
+        try s.faces.push(ShapeFace(face.surface, face.sense, 0, 0, 0, 0))
+    return s
+
+## Step 7: the kept pieces as a new B-rep.
+func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[], piece_name: const i64[], keep: const bool[], turn: const bool[]) -> interop.Reference[CadModel]!:
+    let w = &work.w
+    var uses_count = Growing[i64]()
+    defer uses_count.close()
+    var direction = Growing[i64]()
+    defer direction.close()
+    for _ in 0..<work.finals.count:
+        try uses_count.push(0)
+        try direction.push(0)
+    for p in 0..<pieces.piece_count():
+        if not keep[p]: continue
+        for c in pieces.piece_cycles(p):
+            for use in pieces.cycle(c):
+                let e = edge_index(use)
+                uses_count.items[e] += 1
+                direction.items[e] += (1 if use > 0 else -1) * (-1 if turn[p] else 1)
+    var open_edges = 0
+    for e in 0..<work.finals.count:
+        if uses_count.items[e] != 0 and (uses_count.items[e] != 2 or direction.items[e] != 0):
+            open_edges += 1
+    if open_edges > 0:
+        error(invalid, "the result is not a closed solid (some edges are not shared by two faces); this operation is not supported for these shapes yet")
+    # Merged vertices sit within ten tolerances of their curves.
+    let output = try BrepModel.held(math.max(work.tol * 20.0, least_tolerance))
+    defer output.release()
+    let b = output.value()
+    var vertex_ids = Growing[i64]()
+    defer vertex_ids.close()
+    for _ in work.vertices.view(): try vertex_ids.push(-1)
+    var edge_ids = Growing[i64]()
+    defer edge_ids.close()
+    for e in 0..<work.finals.count:
+        if uses_count.items[e] == 0:
+            try edge_ids.push(-1)
+            continue
+        let edge = work.finals.items[e]
+        if vertex_ids.items[(usize)edge.start] < 0: vertex_ids.items[(usize)edge.start] = try b.add_vertex(work.vertices.items[(usize)edge.start])
+        if vertex_ids.items[(usize)edge.end] < 0: vertex_ids.items[(usize)edge.end] = try b.add_vertex(work.vertices.items[(usize)edge.end])
+        let start = vertex_ids.items[(usize)edge.start]
+        let end = vertex_ids.items[(usize)edge.end]
+        let c = w.carriers.items[(usize)edge.carrier]
+        let forward = edge.t1 > edge.t0
+        var id: i64 = -1
+        if c.kind == curve_line: id = try b.add_line(start, end)
+        elif c.kind == curve_circle: id = try b.add_circle(start, end, c.origin, c.x.cross(c.y), c.x, c.a, forward)
+        elif c.kind == curve_ellipse: id = try b.add_ellipse(start, end, c.origin, c.x.cross(c.y), c.x, c.a, c.b, forward)
+        else:
+            let (points, weights, knots, degree) = w.spline_net(c.spline)
+            id = try b.add_spline_edge(start, end, points, weights, degree, knots, forward)
+        try edge_ids.push(id)
+    var surface_ids = Growing[i64]()
+    defer surface_ids.close()
+    for _ in w.surfaces.view(): try surface_ids.push(-1)
+    var uses = Growing[i64]()
+    defer uses.close()
+    var sizes = Growing[i64]()
+    defer sizes.close()
+    for p in 0..<pieces.piece_count():
+        if not keep[p]: continue
+        let face = w.faces.items[piece_face[p]]
+        let si = (usize)face.surface
+        if surface_ids.items[si] < 0:
+            let s = w.surfaces.items[si]
+            surface_ids.items[si] = (try b.add_spline_surface(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv)) if s.kind == surface_spline else (try b.add_surface(s.kind, s.origin, s.z, s.x, s.radius, s.angle))
+        uses.clear()
+        sizes.clear()
+        for c in pieces.piece_cycles(p):
+            let cycle = pieces.cycle(c)
+            if cycle.length == 0: continue
+            for k in 0..<cycle.length:
+                # A turned piece runs each loop backwards.
+                var use = cycle[k]
+                if turn[p]: use = -cycle[cycle.length - 1 - k]
+                let e = edge_index(use)
+                try uses.push((edge_ids.items[e] + 1) * (1 if use > 0 else -1))
+            try sizes.push((i64)cycle.length)
+        let made = try b.add_face(surface_ids.items[si], uses.view(), sizes.view(), face.sense != turn[p])
+        try b.set_face_name(made, w.name(piece_name[p]))
+    return try CadModel.of_brep(output)
+
+## Insertion sort (the lists are short).
+func sort(values: Growing[f64]*) -> !:
+    for i in 1..<values.count:
+        let value = values.items[i]
+        var j = i
+        while j > 0 and values.items[j - 1] > value:
+            values.items[j] = values.items[j - 1]
+            j -= 1
+        values.items[j] = value
