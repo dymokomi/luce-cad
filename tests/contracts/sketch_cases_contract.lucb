@@ -1,0 +1,117 @@
+## Sketch cases the other contracts leave out: a line extended onto a fit
+## point spline; a conic's start held along a line; a cylinder's top rim
+## cast as a circle that follows the body, and a link whose edge is gone
+## counted lost; a text mirrored (its words kept, its anchor across);
+## a second line of text set below the first; a corner point removed with
+## both lines on it.
+from luce_std import math
+from luce_geocore.geocore import Vector3, invalid
+from luce_geocore.core.growing import Growing
+from solids import CadSolids
+from modeling import CadModeling
+from sketch import Sketch, new_sketch, solve_sketch, ConstraintKind, EntityKind, extend_curve, mirror_entities, remove_entity, CadProjection, add_shadow, relink_sketch, projection_samples, projection_per_edge, new_lettering, letter
+
+pub func sketch_cases_contracts() -> !:
+    try extend_onto_spline()
+    try conic_tangent()
+    try cylinder_rim()
+    try text_cases()
+    try corner_removed()
+
+func near(value: f64, expected: f64, why: str) -> !:
+    if math.abs(value - expected) > 1e-6 * math.max(1.0, math.abs(expected)): error(invalid, why)
+
+## A line from (0, 0) to (5, 0) extended onto a fit spline through
+## (10, -5), (12, 0), (10, 5): its end lands on (12, 0).
+func extend_onto_spline() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let line = try s.add_line(try s.add_point(0.0, 0.0), try s.add_point(5.0, 0.0))
+    _ = try s.add_spline([try s.add_point(10.0, -5.0), try s.add_point(12.0, 0.0), try s.add_point(10.0, 5.0)], true, degree = 2)
+    try extend_curve(&s, line, 4.0, 0.0)
+    let end = s.entity(line).second
+    try near(s.x(end), 12.0, "a line extended onto a spline does not end on it")
+    try near(s.y(end), 0.0, "a line extended onto a spline leaves its line")
+
+## A conic from (0, 0) to (20, 0) with its apex at (10, 10), held tangent
+## at its start to a line running (2, 1): after the solve its start leg
+## runs along the line.
+func conic_tangent() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let line = try s.add_line(try s.add_point(-20.0, -10.0), try s.add_point(0.0, 0.0))
+    _ = try s.constrain(ConstraintKind.fix, line)
+    let apex = try s.add_point(10.0, 10.0)
+    let conic = try s.add_conic(s.entity(line).second, try s.add_point(20.0, 0.0), apex, 0.5)
+    _ = try s.constrain(ConstraintKind.tangent, conic, line, side = 1.0)
+    let solved = try solve_sketch(&s)
+    _ = solved
+    let start = s.entity(conic).first
+    let leg_x = s.x(apex) - s.x(start)
+    let leg_y = s.y(apex) - s.y(start)
+    if math.abs(leg_x * 1.0 - leg_y * 2.0) > 1e-6 * math.hypot(leg_x, leg_y): error(invalid, "a conic held tangent does not leave along its line")
+
+## A cylinder of radius 5 cast from 30 above: its top rim's shadow is a
+## circle of 5, fixed and linked; relinked to the body made wider it
+## follows; a link naming no edge is lost.
+func cylinder_rim() -> !:
+    let origin = Vector3(0.0, 30.0, 0.0)
+    let u = Vector3(1.0, 0.0, 0.0)
+    let v = Vector3(0.0, 0.0, -1.0)
+    let body = try CadModeling.tagged(try CadSolids.cylinder(5.0, 10.0), "#1")
+    defer body.release()
+    let cast = try CadProjection.of(body, origin, u, v)
+    defer cast.release()
+    let p = try cast.get()
+    let edge = p.nearest(5.0, 0.0, 0.5)
+    if edge < 0: error(invalid, "no edge's shadow passes a cylinder's rim")
+    var s = new_sketch()
+    defer s.close()
+    var reference = try p.reference(edge)
+    defer reference.release()
+    let per = projection_per_edge()
+    let rim = try add_shadow(&s, projection_samples(p)[(usize)edge * 2 * per..<((usize)edge + 1) * 2 * per], reference.value)
+    if s.entity(rim).kind != EntityKind.circle: error(invalid, "a cylinder's rim does not cast a circle")
+    try near(s.radius_of(rim), 5.0, "a cylinder's rim casts a circle of another radius")
+    let wider = try CadModeling.tagged(try CadSolids.cylinder(7.0, 10.0), "#1")
+    defer wider.release()
+    if (try relink_sketch(&s, wider.value(), origin, u, v)) != 0: error(invalid, "a wider cylinder's rim is not found again")
+    try near(s.radius_of(rim), 7.0, "a relinked rim does not follow the body")
+    let stray = try s.add_line(try s.add_point(0.0, 0.0), try s.add_point(1.0, 0.0))
+    try s.link(stray, "no such edge")
+    if (try relink_sketch(&s, wider.value(), origin, u, v)) != 1: error(invalid, "a link naming no edge is not counted lost")
+
+## "A" mirrored about the y axis keeps its words with its anchor across;
+## "H" over "H" sets its second line below its first.
+func text_cases() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let text = try s.add_text(try s.add_point(10.0, 0.0), 5.0, "A", "")
+    let axis = try s.add_line(try s.add_point(0.0, -10.0), try s.add_point(0.0, 10.0))
+    var copies = Growing[i64]()
+    defer copies.close()
+    try mirror_entities(&s, [text], axis, &copies)
+    var mirrored: i64 = -1
+    for c in copies.view():
+        if s.entity(c).kind == EntityKind.text: mirrored = c
+    if mirrored < 0 or s.text_content(s.entity(mirrored)) != "A": error(invalid, "a mirrored text does not say what it said")
+    try near(s.x(s.entity(mirrored).first), -10.0, "a mirrored text's anchor is not across the axis")
+    let two = try s.add_text(try s.add_point(0.0, 50.0), 10.0, "H\nH", "")
+    var letters = new_lettering()
+    defer letters.close()
+    try letter(&s, s.entity(two), &letters)
+    var low = 1e300
+    for y in letters.ys.view(): low = math.min(low, y)
+    if low > 50.0 - 10.0: error(invalid, "a text's second line is not below its first")
+
+## Two lines on a corner point: removing the corner takes both lines and
+## their other ends (nothing else uses them), and the constraint on them.
+func corner_removed() -> !:
+    var s = new_sketch()
+    defer s.close()
+    let corner = try s.add_point(0.0, 0.0)
+    let a = try s.add_line(corner, try s.add_point(10.0, 0.0))
+    let b = try s.add_line(corner, try s.add_point(0.0, 10.0))
+    _ = try s.constrain(ConstraintKind.perpendicular, a, b)
+    try remove_entity(&s, corner)
+    if s.entities.count != 0 or s.constraints.count != 0: error(invalid, "a removed corner leaves its lines or their constraint")
