@@ -1,15 +1,54 @@
-## Edge references (modeling/references.lucb) at scale: a prism of many
+## Edge references (modeling/references.lucb). At scale: a prism of many
 ## sides has every edge indexed to its two faces once (Shape.index_sides),
-## and every edge's reference resolves back to that edge alone. Resolving
-## used to scan every face's uses per edge per reference: at this size
-## that was billions of steps.
+## and every edge's reference resolves back to that edge alone (resolving
+## used to scan every face's uses per edge per reference: at this size that
+## was billions of steps). Across a split: an edge picked on a box, then cut
+## in two by a slot, resolves by its recorded place to both pieces.
 from luce_std import math
 from luce_geocore.geocore import Vector3, invalid
 from luce_geocore.core.growing import Growing
 from geometry import Surface
-from modeling import Shape, Carrier, ShapeEdge, empty_shape, references_of, resolve_edges
+from solids import CadSolids
+from modeling import Shape, Carrier, ShapeEdge, CadModeling, empty_shape, shape_of, references_of, resolve_edges
 
 pub func references_contracts() -> !:
+    try split_edge()
+    try at_scale()
+
+## The box's top front edge (y = 1, z = 1), picked, then a slot cut across
+## its middle: the reference finds both pieces on the edge's line, and
+## nothing else between those faces.
+func split_edge() -> !:
+    let box = try CadModeling.tagged(try CadSolids.box(2.0, 2.0, 2.0), "#b")
+    defer box.release()
+    var w = try shape_of(box.value())
+    defer w.close()
+    var picked = Growing[i64]()
+    defer picked.close()
+    for e in 0..<w.edges.count:
+        let a = w.points.items[(usize)w.edges.items[e].start]
+        let b = w.points.items[(usize)w.edges.items[e].end]
+        if a.y > 0.99 and b.y > 0.99 and a.z > 0.99 and b.z > 0.99: try picked.push((i64)e)
+    if picked.count != 1: error(invalid, "a box has no single top front edge")
+    let text = try CadModeling.edge_references(box, picked.view())
+    defer text.release()
+    let slot = try (try CadModeling.tagged(try CadSolids.box(0.4, 1.0, 4.0), "#s")).value().transformed(Vector3(0.0, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer slot.release()
+    let cut = try CadModeling.combined(box, slot, 1)
+    defer cut.release()
+    var after = try shape_of(cut.value())
+    defer after.close()
+    var resolved = Growing[usize]()
+    defer resolved.close()
+    try resolve_edges(&after, text.value, &resolved)
+    if resolved.count != 2: error(invalid, "an edge cut in two did not resolve to both pieces")
+    for e in resolved.view():
+        let a = after.points.items[(usize)after.edges.items[e].start]
+        let b = after.points.items[(usize)after.edges.items[e].end]
+        if math.abs(a.y - 1.0) > 1e-9 or math.abs(b.y - 1.0) > 1e-9 or math.abs(a.z - 1.0) > 1e-9 or math.abs(b.z - 1.0) > 1e-9: error(invalid, "a split edge's reference resolved off its line")
+
+## Every edge of a 400-sided prism, referred to and resolved back.
+func at_scale() -> !:
     let sides: usize = 400
     var w = try prism(sides)
     defer w.close()

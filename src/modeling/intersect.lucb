@@ -38,18 +38,18 @@ pub func meet(s1: const Surface*, s2: const Surface*, tol: f64, out: Growing[Car
     if s1.kind > s2.kind: return try meet(s2, s1, tol, out)
     let k1 = s1.kind
     let k2 = s2.kind
-    if k1 == 0 and k2 == 0: return try plane_plane(s1, s2, tol, out)
-    if k1 == 0 and k2 == 1: return try plane_cylinder(s1, s2, tol, out)
-    if k1 == 0 and k2 == 2: return try plane_cone(s1, s2, tol, out)
-    if k1 == 0 and k2 == 4: return try plane_sphere(s1, s2, tol, out)
-    if k1 == 1 and k2 == 1: return try cylinder_cylinder(s1, s2, tol, out)
-    if k1 == 1 and k2 == 4: return try cylinder_sphere(s1, s2, tol, out)
-    if k1 == 4 and k2 == 4: return try sphere_sphere(s1, s2, tol, out)
-    if k1 == 0 and k2 == 5: return try plane_torus(s1, s2, tol, out)
+    if k1 == surface_plane and k2 == surface_plane: return try plane_plane(s1, s2, tol, out)
+    if k1 == surface_plane and k2 == surface_cylinder: return try plane_cylinder(s1, s2, tol, out)
+    if k1 == surface_plane and k2 == surface_cone: return try plane_cone(s1, s2, tol, out)
+    if k1 == surface_plane and k2 == surface_sphere: return try plane_sphere(s1, s2, tol, out)
+    if k1 == surface_cylinder and k2 == surface_cylinder: return try cylinder_cylinder(s1, s2, tol, out)
+    if k1 == surface_cylinder and k2 == surface_sphere: return try cylinder_sphere(s1, s2, tol, out)
+    if k1 == surface_sphere and k2 == surface_sphere: return try sphere_sphere(s1, s2, tol, out)
+    if k1 == surface_plane and k2 == surface_torus: return try plane_torus(s1, s2, tol, out)
     # One cone or torus twice (a blend tool's side lying on the body's).
-    if k1 == k2 and (k1 == 2 or k1 == 5) and try same_revolution(s1, s2, tol): return meet_same
+    if k1 == k2 and (k1 == surface_cone or k1 == surface_torus) and try same_revolution(s1, s2, tol): return meet_same
     # Surfaces of revolution about one axis meet in circles.
-    if (k1 == 1 or k1 == 2 or k1 == 4 or k1 == 5) and (k2 == 1 or k2 == 2 or k2 == 4 or k2 == 5):
+    if k1 != surface_plane and k1 != surface_spline and k2 != surface_plane and k2 != surface_spline:
         if try coaxial(s1, s2, tol, out): return meet_curves
     return meet_march
 
@@ -256,32 +256,66 @@ func coaxial(a: const Surface*, b: const Surface*, tol: f64, out: Growing[Carrie
     # Heights along a's axis from a's origin where some radius of each agrees.
     let reach = (a.radius + a.angle + b.radius + b.angle + offset.length()) * 4.0 + 1.0
     let steps = 4096
+    let step = 2.0 * reach / (f64)steps
     for which_a in 0..<2:
         for which_b in 0..<2:
             var previous = 0.0
+            var previous_h = 0.0
             var have = false
             for k in 0..<steps + 1:
-                let h = -reach + 2.0 * reach * (f64)k / (f64)steps
+                let h = -reach + step * (f64)k
                 let value = difference(a, b, h, which_a, which_b)
                 if not math.is_finite(value):
+                    # A radius ends between the last sample and this one (a
+                    # sphere's or torus's top): a crossing just short of the
+                    # end falls between no two samples, so the end is looked
+                    # at too.
+                    if have:
+                        let end = range_end(a, b, previous_h, h, which_a, which_b)
+                        let at_end = difference(a, b, end, which_a, which_b)
+                        if (previous <= 0.0) != (at_end <= 0.0): try push_circle(a, tol, radii_crossing(a, b, previous_h, end, previous, which_a, which_b), which_a, out)
                     have = false
                     continue
-                if have and (previous <= 0.0) != (value <= 0.0):
-                    var low = h - 2.0 * reach / (f64)steps
-                    var high = h
-                    for _ in 0..<80:
-                        let middle = (low + high) * 0.5
-                        let m = difference(a, b, middle, which_a, which_b)
-                        if not math.is_finite(m): break
-                        if (m <= 0.0) == (previous <= 0.0): low = middle
-                        else: high = middle
-                    let at = (low + high) * 0.5
-                    let r = pick(radii_at(a, a.origin, a.z, at), which_a)
-                    if r > tol:
-                        try out.push(Carrier(1, a.origin.add(a.z.multiply_scalar(at)), a.x, a.z.cross(a.x), r, 0.0, -1))
+                if not have and k > 0:
+                    # A radius begins between the last sample and this one.
+                    let start = range_end(a, b, h, h - step, which_a, which_b)
+                    let at_start = difference(a, b, start, which_a, which_b)
+                    if (at_start <= 0.0) != (value <= 0.0): try push_circle(a, tol, radii_crossing(a, b, start, h, at_start, which_a, which_b), which_a, out)
+                if have and (previous <= 0.0) != (value <= 0.0): try push_circle(a, tol, radii_crossing(a, b, previous_h, h, previous, which_a, which_b), which_a, out)
                 previous = value
+                previous_h = h
                 have = true
     return true
+
+## Where the radii's difference changes sign between heights `low` (where it
+## is `at_low`) and `high`, bisected.
+func radii_crossing(a: const Surface*, b: const Surface*, low: f64, high: f64, at_low: f64, which_a: i64, which_b: i64) -> f64:
+    var below = low
+    var above = high
+    for _ in 0..<80:
+        let middle = (below + above) * 0.5
+        let m = difference(a, b, middle, which_a, which_b)
+        if not math.is_finite(m): break
+        if (m <= 0.0) == (at_low <= 0.0): below = middle
+        else: above = middle
+    return (below + above) * 0.5
+
+## The last height from `within` (where both radii exist) toward `beyond`
+## (where one does not) where both still do, bisected.
+func range_end(a: const Surface*, b: const Surface*, within: f64, beyond: f64, which_a: i64, which_b: i64) -> f64:
+    var good = within
+    var bad = beyond
+    for _ in 0..<80:
+        let middle = (good + bad) * 0.5
+        if math.is_finite(difference(a, b, middle, which_a, which_b)): good = middle
+        else: bad = middle
+    return good
+
+## The circle of `a` at height `at` (its radius `which_a`) onto `out`, when
+## it is no point.
+func push_circle(a: const Surface*, tol: f64, at: f64, which_a: i64, out: Growing[Carrier]*) -> !:
+    let r = pick(radii_at(a, a.origin, a.z, at), which_a)
+    if r > tol: try out.push(Carrier(curve_circle, a.origin.add(a.z.multiply_scalar(at)), a.x, a.z.cross(a.x), r, 0.0, -1))
 
 func pick(radii: (f64, f64), which: i64) -> f64:
     let (first, second) = radii
