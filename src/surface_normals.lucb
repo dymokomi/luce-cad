@@ -3,9 +3,7 @@
 import memory
 from luce_std import math
 from luce_geocore.geocore import Vector3, MeshBuilder
-import support_normals as support
-from brep_types import Surface, BrepFace
-from mapped_patch import parameter
+from geometry import Surface, BrepFace, chart_parameter, nurbs_normal, support_normal, surface_plane, surface_cone, surface_spline, surface_sphere, surface_torus
 from layout_types import GridLayout
 
 ## Owned, placed corner normals for one analytic face's contiguous corner range.
@@ -27,24 +25,24 @@ pub func face_normals(mesh: MeshBuilder*, first: usize, count: usize, face: Brep
         if keys[slot] < 0:
             let p = mesh.points[(usize)id]
             var n = s.z
-            if s.kind == 3:
-                uv = try parameter(s, p, uv, tolerance)
+            if s.kind == surface_spline:
+                uv = try chart_parameter(s, p, uv, tolerance)
                 n = try nurbs_normal(s, uv)
                 if n.length() < 1e-15:
                     # At a collapsed domain edge use the limiting interior normal.
                     n = try nurbs_normal(s, Vector3(math.clamp(uv.x, 1e-7, 1.0 - 1e-7), math.clamp(uv.y, 1e-7, 1.0 - 1e-7), 0.0))
-            elif s.kind == 4:
+            elif s.kind == surface_sphere:
                 n = try p.subtract(s.origin).normalized()
-            elif s.kind != 0:
+            elif s.kind != surface_plane:
                 let relative = p.subtract(s.origin)
                 let offset = relative.subtract(s.z.multiply_scalar(relative.dot(s.z)))
-                if s.kind == 2 and offset.length() <= tolerance:
+                if s.kind == surface_cone and offset.length() <= tolerance:
                     # A cone's apex: the limit of the side's normals, along
                     # the axis toward the apex.
                     n = s.z.multiply_scalar(-1.0 if math.tan(s.angle) > 0.0 else 1.0)
                 else:
                     let radial = try offset.normalized()
-                    n = try relative.subtract(radial.multiply_scalar(s.radius)).normalized() if s.kind == 5 else (try radial.subtract(s.z.multiply_scalar(math.tan(s.angle) if s.kind == 2 else 0.0)).normalized())
+                    n = try relative.subtract(radial.multiply_scalar(s.radius)).normalized() if s.kind == surface_torus else (try radial.subtract(s.z.multiply_scalar(math.tan(s.angle) if s.kind == surface_cone else 0.0)).normalized())
             normals[slot] = try face.placement.transform_normal(n.multiply_scalar(1.0 if face.sense else -1.0))
             keys[slot] = id
         let n = normals[slot]
@@ -52,15 +50,6 @@ pub func face_normals(mesh: MeshBuilder*, first: usize, count: usize, face: Brep
         result[corner * 3 + 1] = n.y
         result[corner * 3 + 2] = n.z
     return result
-
-## Exact support normal at a known normalized UV, without inverse projection.
-pub func nurbs_normal(s: Surface, uv: Vector3) -> Vector3!:
-    return try support.nurbs_normal(s, uv)
-
-## Unplaced support normal at the same chart coordinates used by mapped.point.
-## Analytic charts must not index the empty knot arrays of a NURBS evaluator.
-pub func support_normal(s: Surface, uv: Vector3) -> Vector3!:
-    return try support.support_normal(s, uv)
 
 ## Sequential small-model path; full models prepare the same data in face jobs.
 pub func model_normals(mesh: MeshBuilder*, faces: const BrepFace[], surfaces: const Surface[], plans: const GridLayout[], tolerance: f64) -> f64[]!:

@@ -15,19 +15,19 @@ func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face
     defer group.close()
     for f in 0..<work.w.faces.count: try group.push(f)
     for pair in work.coincident.view():
-        let a = root(&group, pair.fa)
-        let b = root(&group, pair.fb)
+        let a = union_root(group.items, pair.fa)
+        let b = union_root(group.items, pair.fb)
         if a < b: group.items[b] = a
         elif b < a: group.items[a] = b
     # Whether each face faces against its group's first face.
     var against = Growing[bool]()
     defer against.close()
     for f in 0..<work.w.faces.count:
-        let r = root(&group, f)
+        let r = union_root(group.items, f)
         var differs = false
         if r != f:
             let use = work.w.face_uses(f)[0]
-            let point = try work.w.edge_at((usize)((use if use > 0 else -use) - 1), 0.5)
+            let point = try work.w.edge_at(edge_index(use), 0.5)
             differs = (try work.w.face_normal(f, point)).dot(try work.w.face_normal(r, point)) < 0.0
         try against.push(differs)
     var halves = Growing[HalfEdge]()
@@ -43,14 +43,14 @@ func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face
     var joined = Growing[u8]()
     defer joined.close()
     for f in 0..<work.w.faces.count:
-        if root(&group, f) != f: continue
+        if union_root(group.items, f) != f: continue
         for side in 0..<2:
             let flip = side == 1
             halves.clear()
             owner.clear()
             var count = 0
             for p in 0..<original:
-                if not keep.items[p] or root(&group, piece_face.items[p]) != f: continue
+                if not keep.items[p] or union_root(group.items, piece_face.items[p]) != f: continue
                 # Its loops in the first face's terms (reversed when its own
                 # face faces against it), and which way it ends up facing.
                 let reversed = against.items[piece_face.items[p]]
@@ -58,7 +58,7 @@ func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face
                 count += 1
                 for c in pieces.piece_cycles(p):
                     for use in pieces.cycle(c):
-                        try halves.push(HalfEdge((use if use > 0 else -use) - 1, (use > 0) != reversed))
+                        try halves.push(HalfEdge((i64)edge_index(use), (use > 0) != reversed))
                         try owner.push(p)
             if count < 2: continue
             # Drop both ways of edges two different pieces share.
@@ -79,7 +79,7 @@ func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face
             try split_face(traced, f, remaining.view(), try face_pole(&work.w, f), pieces)
             names.clear()
             for p in 0..<original:
-                if keep.items[p] and root(&group, piece_face.items[p]) == f and (turn.items[p] != against.items[piece_face.items[p]]) == flip:
+                if keep.items[p] and union_root(group.items, piece_face.items[p]) == f and (turn.items[p] != against.items[piece_face.items[p]]) == flip:
                     keep.items[p] = false
                     try names.push(work.w.name(piece_name.items[p]))
             try joined_names(names.view(), &joined)
@@ -90,33 +90,28 @@ func merge_pieces(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face
                 try keep.push(true)
                 try turn.push(flip)
 
-func root(group: Growing[usize]*, f: usize) -> usize:
-    var at = f
-    while group.items[at] != at: at = group.items[at]
-    return at
-
 ## Where closed curve `c` crosses the seam meridian (chart angle 0) of
 ## whichever of faces fa and fb lies on a sphere (0 when neither does), so
 ## a closed edge on a sphere has its vertex where seam_zones can join it.
 func seam_parameter(work: Work*, c: i64, fa: usize, fb: usize) -> f64!:
     let w = &work.w
     var surface: i64 = -1
-    if w.surfaces.items[(usize)w.faces.items[fa].surface].kind == 4: surface = w.faces.items[fa].surface
-    if w.surfaces.items[(usize)w.faces.items[fb].surface].kind == 4: surface = w.faces.items[fb].surface
+    if w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_sphere: surface = w.faces.items[fa].surface
+    if w.surfaces.items[(usize)w.faces.items[fb].surface].kind == surface_sphere: surface = w.faces.items[fb].surface
     if surface < 0: return 0.0
     let s = &w.surfaces.items[(usize)surface]
     let steps = 256
-    var previous = (try surface_uv(s, try w.at(c, 0.0))).0
+    var previous = (try surface_uv(s, try w.at(c, 0.0), w.tolerance)).0
     for at in 1..<steps + 1:
         let t = 2.0 * math.pi * (f64)at / (f64)steps
-        let u = (try surface_uv(s, try w.at(c, t))).0
+        let u = (try surface_uv(s, try w.at(c, t), w.tolerance)).0
         # Through angle 0, not across the far side's wrap.
         if (previous <= 0.0) != (u <= 0.0) and math.abs(u - previous) < math.pi:
             var low = t - 2.0 * math.pi / (f64)steps
             var high = t
             for _ in 0..<60:
                 let middle = (low + high) * 0.5
-                if ((try surface_uv(s, try w.at(c, middle))).0 <= 0.0) == (previous <= 0.0): low = middle
+                if ((try surface_uv(s, try w.at(c, middle), w.tolerance)).0 <= 0.0) == (previous <= 0.0): low = middle
                 else: high = middle
             return (low + high) * 0.5
         previous = u
@@ -138,7 +133,7 @@ func seam_zones(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face: 
         if not keep[p]: continue
         let face = w.faces.items[piece_face[p]]
         let s = &w.surfaces.items[(usize)face.surface]
-        if s.kind != 4: continue
+        if s.kind != surface_sphere: continue
         wrapping.clear()
         let first = pieces.piece_starts.items[p]
         let last = pieces.piece_starts.items[p + 1]
@@ -152,8 +147,8 @@ func seam_zones(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face: 
         let hole = pieces.pieces.items[wrapping.items[1]]
         let (outer_at, v_outer) = try seam_vertex(work, s, pieces.cycle(outer))
         let (hole_at, v_hole) = try seam_vertex(work, s, pieces.cycle(hole))
-        let lat_outer = (try surface_uv(s, work.vertices.items[(usize)v_outer])).1
-        let lat_hole = (try surface_uv(s, work.vertices.items[(usize)v_hole])).1
+        let lat_outer = (try surface_uv(s, work.vertices.items[(usize)v_outer], work.w.tolerance)).1
+        let lat_hole = (try surface_uv(s, work.vertices.items[(usize)v_hole], work.w.tolerance)).1
         let c = try w.add_carrier(Carrier(1, s.origin, s.x, s.z, s.radius, s.radius, -1))
         let (id, forward) = try work.final_edge(ShapeEdge(c, lat_outer, lat_hole, v_outer, v_hole))
         let seam = (id + 1) * (1 if forward else -1)
@@ -176,7 +171,7 @@ func seam_zones(work: Work*, traced: const Shape*, pieces: Pieces*, piece_face: 
 func seam_vertex(work: Work*, s: const Surface*, cycle: const i64[]) -> (usize, i64)!:
     for k in 0..<cycle.length:
         let use = cycle[k]
-        let edge = work.finals.items[(usize)((use if use > 0 else -use) - 1)]
+        let edge = work.finals.items[edge_index(use)]
         let v = edge.start if use > 0 else edge.end
         let d = work.vertices.items[(usize)v].subtract(s.origin)
         if math.abs(d.dot(s.y)) <= work.tol * 10.0 and d.dot(s.x) > 0.0: return (k, v)

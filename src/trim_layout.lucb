@@ -4,14 +4,14 @@
 import memory
 from luce_std import math
 from luce_geocore.geocore import Vector3, invalid
-from brep_types import Surface, Curve, BrepFace
+from geometry import Surface, Curve, BrepFace, edge_index, surface_plane, surface_cylinder, surface_cone, surface_spline
 from layout_types import Stations, GridLayout, UVChain, NormalCache, check_grid_size
 from layout_density import fill, fill_plane, refine_axis
 from layout_cell_error import refine_cells
 from layout_balance import balance, Settled
 from layout_rails import rail_axis, bounds
 from layout_bounds import include_conics
-from patch_sides import edge_index, PatchSides
+from patch_sides import PatchSides
 from curve_spacing import ArcMetric
 from row_redistribution import redistribute
 from mapped_extrusion import regularize
@@ -115,7 +115,7 @@ func seed_face(job: Seeding*, at: usize) -> !:
     # Cylinders/cones have regular analytic charts too. An oblique end trim
     # must be allowed to cut those rows instead of forcing the entire fillet
     # through the legacy constrained triangle path.
-    if s.kind != 0 and s.kind != 1 and s.kind != 2 and s.kind != 3: return
+    if s.kind != surface_plane and s.kind != surface_cylinder and s.kind != surface_cone and s.kind != surface_spline: return
     # Most four-sided domains retain their transfinite layout. A stopped
     # oblique trim instead cuts a support grid;
     # the number of CAD coedges alone cannot make that mapping compatible.
@@ -124,14 +124,14 @@ func seed_face(job: Seeding*, at: usize) -> !:
             if failure.code != invalid: error(failure.code, failure.message)
             recover false
         plans[at].cut_first = plans[at].cut_first or preferred
-        if not plans[at].cut_first and s.kind == 0:
+        if not plans[at].cut_first and s.kind == surface_plane:
             plans[at].cut_first = not (try can_map_plane(vertices, edges, faces[at], s, plans[at].rows, tolerance, divisions))
         # A closed NURBS band can fail the single-seed mapped inverse at
         # its duplicated seam. Prepare its branch-aware cut chart while
         # shared cuts are still mutable, even if mapped quads get first
         # refusal. The legacy trim fallback has no seam chart identity.
         var periodic_fallback = false
-        if s.kind == 3:
+        if s.kind == surface_spline:
             for use in 0..<faces[at].uses.length:
                 for before in 0..<use:
                     periodic_fallback = periodic_fallback or edge_index(faces[at].uses[use]) == edge_index(faces[at].uses[before])
@@ -180,7 +180,7 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
     let margin = high.subtract(low).multiply_scalar(0.01)
     low = low.subtract(margin)
     high = high.add(margin)
-    if s.kind == 3:
+    if s.kind == surface_spline:
         low = Vector3(math.max(0.0, low.x), math.max(0.0, low.y), 0.0)
         high = Vector3(math.min(1.0, high.x), math.min(1.0, high.y), 0.0)
     plan.epsilon = math.max(high.x - low.x, high.y - low.y) * 1e-7
@@ -191,7 +191,7 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
     # Actual rectangular trim limits remain mandatory. An affine extrusion can
     # let a stopped oblique end cut its grid: that end's envelope extrema are
     # not additional interior rows. Curved axes retain their existing support.
-    let rails = (try trim_rails(s, plan.chains, trim_low, trim_high, plan.epsilon, tolerance)) if s.kind == 3 and plan.cut_first else [true, true, true, true]
+    let rails = (try trim_rails(s, plan.chains, trim_low, trim_high, plan.epsilon, tolerance)) if s.kind == surface_spline and plan.cut_first else [true, true, true, true]
     if rails[0]: _ = try plan.u.insert(trim_low.x, plan.epsilon)
     if rails[1]: _ = try plan.u.insert(trim_high.x, plan.epsilon)
     if rails[2]: _ = try plan.v.insert(trim_low.y, plan.epsilon)
@@ -228,11 +228,11 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
         if (try same_rail(s, plan.chains, at, dominant_u, 0, plan.epsilon, tolerance)) or (try same_rail(s, plan.chains, at, dominant_v, 1, plan.epsilon, tolerance)):
             _ = try inherit(plan, s, face, at, tolerance)
     var planar_support: usize = 1
-    if s.kind == 0:
+    if s.kind == surface_plane:
         var samples: usize = 0
         for use in face.uses: samples += cuts[edge_index(use)].count - 1
         if samples > 8: planar_support = (usize)math.min(math.max(32.0, (f64)divisions), math.max((f64)divisions, (f64)samples / 4.0))
-    if s.kind == 0: plan.independent_phase = try fill_plane(&plan.u, &plan.v, trim_low, trim_high, planar_support, plan.epsilon)
+    if s.kind == surface_plane: plan.independent_phase = try fill_plane(&plan.u, &plan.v, trim_low, trim_high, planar_support, plan.epsilon)
     else:
         try fill(&plan.u, planar_support, plan.epsilon)
         try fill(&plan.v, planar_support, plan.epsilon)

@@ -13,8 +13,8 @@ pub struct Hit:
 ## against `size`, conics by angle, splines evenly.
 func sample_count(w: const Shape*, c: i64, low: f64, high: f64, size: f64) -> usize:
     let kind = w.carriers.items[(usize)c].kind
-    if kind == 0: return (usize)math.clamp(math.abs(high - low) / size * 64.0, 4.0, 4096.0)
-    if kind == 1 or kind == 3: return (usize)math.clamp(math.abs(high - low) / 0.05, 8.0, 512.0)
+    if kind == curve_line: return (usize)math.clamp(math.abs(high - low) / size * 64.0, 4.0, 4096.0)
+    if kind == curve_circle or kind == curve_ellipse: return (usize)math.clamp(math.abs(high - low) / 0.05, 8.0, 512.0)
     # A spline: by its control points (traced curves have many).
     let (points, weights, knots, degree) = w.spline_net(w.carriers.items[(usize)c].spline)
     _ = weights
@@ -27,7 +27,7 @@ pub func nearest_on(w: const Shape*, c: i64, p: Vector3, low: f64, high: f64) ->
     let carrier = w.carriers.items[(usize)c]
     let a = math.min(low, high)
     let b = math.max(low, high)
-    if carrier.kind == 0: return math.clamp(p.subtract(carrier.origin).dot(carrier.x), a, b)
+    if carrier.kind == curve_line: return math.clamp(p.subtract(carrier.origin).dot(carrier.x), a, b)
     var best = a
     var best_distance = 1.0e300
     let count = 64
@@ -68,7 +68,7 @@ pub func crossings(w: const Shape*, c: i64, low: f64, high: f64, e: usize, size:
         try overlap_ends(w, c, low, high, e, tol, out)
         return
     # Two lines: where they come closest, in closed form.
-    if w.carriers.items[(usize)c].kind == 0 and w.carriers.items[(usize)ec].kind == 0:
+    if w.carriers.items[(usize)c].kind == curve_line and w.carriers.items[(usize)ec].kind == curve_line:
         try line_crossing(w, c, low, high, e, tol, out)
         return
     let n = sample_count(w, c, low, high, size)
@@ -213,8 +213,8 @@ func box_of(points: const Vector3[]) -> (Vector3, Vector3):
 ## The parameter range of carrier `c` to search all of it (a line: far).
 func full_range(w: const Shape*, c: i64) -> (f64, f64):
     let carrier = w.carriers.items[(usize)c]
-    if carrier.kind == 0: return (-1.0e12, 1.0e12)
-    if carrier.kind == 1 or carrier.kind == 3: return (-math.pi, 3.0 * math.pi)
+    if carrier.kind == curve_line: return (-1.0e12, 1.0e12)
+    if carrier.kind == curve_circle or carrier.kind == curve_ellipse: return (-math.pi, 3.0 * math.pi)
     let (points, weights, knots, degree) = w.spline_net(carrier.spline)
     _ = weights
     return (knots[(usize)degree], knots[points.length])
@@ -322,7 +322,7 @@ pub func face_chart(w: const Shape*, f: usize, points: Growing[Vector3]*, starts
 ## the other way.
 pub func face_pole(w: const Shape*, f: usize) -> f64!:
     let face = w.faces.items[f]
-    if w.surfaces.items[(usize)face.surface].kind != 4: return 0.0
+    if w.surfaces.items[(usize)face.surface].kind != surface_sphere: return 0.0
     var points = Growing[Vector3]()
     defer points.close()
     let sizes = w.face_sizes(f)
@@ -337,43 +337,39 @@ pub func loop_chart(w: const Shape*, surface: i64, pole: f64, uses: const i64[],
     let s = &w.surfaces.items[(usize)surface]
     let wraps = periodic(s)
     # A torus's tube angle wraps too.
-    let wraps_v = s.kind == 5
+    let wraps_v = s.kind == surface_torus
     let first_point = points.count
     var previous = 0.0
     var previous_v = 0.0
     var first = true
     for use in uses:
-        let e = (usize)(use - 1 if use > 0 else -use - 1)
+        let e = edge_index(use)
         let edge = w.edges.items[e]
         let kind = w.carriers.items[(usize)edge.carrier].kind
         var steps: usize = 1
-        if kind == 1 or kind == 3: steps = (usize)math.clamp(math.abs(edge.t1 - edge.t0) / 0.05, 2.0, 512.0)
-        if kind == 2:
+        if kind == curve_circle or kind == curve_ellipse: steps = (usize)math.clamp(math.abs(edge.t1 - edge.t0) / 0.05, 2.0, 512.0)
+        if kind == curve_spline:
             let (net, weights, knots, degree) = w.spline_net(w.carriers.items[(usize)edge.carrier].spline)
             _ = weights
             _ = knots
             _ = degree
             steps = (usize)math.clamp((f64)net.length, 48.0, 2048.0)
-        if kind == 0 and wraps: steps = 8
+        if kind == curve_line and wraps: steps = 8
         for step in 0..<steps:
             let fraction = (f64)step / (f64)steps
             let p = try w.edge_at(e, fraction if use > 0 else 1.0 - fraction)
             # Along a loop on a B-spline, the last point's parameters seed
             # the next's.
-            let (raw, raw_v) = try spline_uv(s, p, Vector3(previous, previous_v, 0.0)) if s.kind == 3 and not first else try surface_uv(s, p)
+            let (raw, raw_v) = try spline_uv(s, p, w.tolerance, Vector3(previous, previous_v, 0.0)) if s.kind == surface_spline and not first else try surface_uv(s, p, w.tolerance)
             var u = raw
             var v = raw_v
-            if wraps and not first:
-                while u - previous > math.pi: u -= 2.0 * math.pi
-                while previous - u > math.pi: u += 2.0 * math.pi
-            if wraps_v and not first:
-                while v - previous_v > math.pi: v -= 2.0 * math.pi
-                while previous_v - v > math.pi: v += 2.0 * math.pi
+            if wraps and not first: u = wrap(u, previous)
+            if wraps_v and not first: v = wrap(v, previous_v)
             previous = u
             previous_v = v
             first = false
             try points.push(Vector3(u, v, 0.0))
-    if s.kind == 4 and points.count > first_point and pole != 0.0:
+    if s.kind == surface_sphere and points.count > first_point and pole != 0.0:
         let turned = previous - points.items[first_point].x
         if math.abs(turned) > math.pi:
             # Back to the start a whole turn on, then over the pole.
@@ -430,7 +426,7 @@ pub func chart_winding(points: const Vector3[], starts: const usize[], u: f64, v
 pub func face_contains(w: const Shape*, f: usize, p: Vector3, tol: f64) -> i64!:
     let uses = w.face_uses(f)
     for use in uses:
-        let e = (usize)(use - 1 if use > 0 else -use - 1)
+        let e = edge_index(use)
         let edge = w.edges.items[e]
         let t = try nearest_on(w, edge.carrier, p, edge.t0, edge.t1)
         if (try w.at(edge.carrier, t)).subtract(p).length() <= tol * 10.0: return on_boundary
@@ -441,7 +437,7 @@ pub func face_contains(w: const Shape*, f: usize, p: Vector3, tol: f64) -> i64!:
     try face_chart(w, f, &points, &starts)
     let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
     # Off a B-spline surface (no parameters there) is outside its face.
-    let (u, v) = surface_uv(s, p) catch failure:
+    let (u, v) = surface_uv(s, p, w.tolerance) catch failure:
         if failure.code != invalid: error(failure.code, failure.message)
         return outside
-    return inside_face if chart_winding(points.view(), starts.view(), u, v, periodic(s), s.kind == 5) != 0 else outside
+    return inside_face if chart_winding(points.view(), starts.view(), u, v, periodic(s), s.kind == surface_torus) != 0 else outside

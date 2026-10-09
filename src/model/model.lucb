@@ -8,8 +8,8 @@ import brep
 pub type BrepModel = brep.BrepModel
 pub let brep_model_type = brep.brep_model_type
 from luce_geocore.geocore import Mesh, MeshBuilder, MeshNormals, Vector3, Matrix4, invalid
-from tessellation.surface import NurbsSurface
-from patch_grid import planar_grid
+from geometry import NurbsSurface, copied, push_decimal
+from patch_grid import planar_grid, nurbs_grid
 import preview_set
 from preview_set import PreviewPart, collect_preview
 pub type CadPreviewSet = preview_set.CadPreviewSet
@@ -38,10 +38,10 @@ struct Face:
     var reversed: bool
 
     func close():
-        free(self.points) in memory.heap
-        free(self.weights) in memory.heap
-        free(self.ku) in memory.heap
-        free(self.kv) in memory.heap
+        if self.points.length > 0: free(self.points) in memory.heap
+        if self.weights.length > 0: free(self.weights) in memory.heap
+        if self.ku.length > 0: free(self.ku) in memory.heap
+        if self.kv.length > 0: free(self.kv) in memory.heap
 
 pub struct CadModel:
     ## Independent faces: the first `count` of `faces`, which grows by
@@ -71,6 +71,13 @@ pub struct CadModel:
 
     pub func brep_placement() -> Matrix4:
         return self.placement
+
+    ## A new model, held by reference, of B-rep `solid` (shared with it).
+    pub static func of_brep(solid: interop.Reference[BrepModel]) -> interop.Reference[CadModel]!:
+        let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
+        errdefer result.release()
+        try result.value().attach_brep(solid)
+        return result
 
     pub func independent_faces() -> i64:
         return (i64)self.count
@@ -391,7 +398,7 @@ pub struct CadModel:
         let entry = self.faces[(usize)face]
         if entry.nu == 0:
             return try planar_mesh(entry.points)
-        let part = try NurbsSurface.tessellate_region(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv, entry.u0, entry.u1, entry.v0, entry.v1, divisions)
+        let part = try nurbs_grid(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv, entry.u0, entry.u1, entry.v0, entry.v1, divisions)
         defer part.release()
         var output = try MeshBuilder()
         defer output.close()
@@ -492,7 +499,7 @@ pub struct CadModel:
                 if needed > 64.0:
                     error(invalid, "edge size exceeds independent NURBS grid budget; increase it")
                 resolution = (i64)math.max((f64)segments, needed)
-            let part = try planar_grid(entry.points, edge_size) if entry.nu == 0 else (try NurbsSurface.tessellate_region(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv, entry.u0, entry.u1, entry.v0, entry.v1, resolution))
+            let part = try planar_grid(entry.points, edge_size) if entry.nu == 0 else (try nurbs_grid(entry.points, entry.weights, entry.nu, entry.nv, entry.du, entry.dv, entry.ku, entry.kv, entry.u0, entry.u1, entry.v0, entry.v1, resolution))
             defer part.release()
             let offset = (i64)output.np
             for point in 0..<part.value().point_count():
@@ -526,16 +533,17 @@ pub struct CadModel:
             memory.copy(grown, self.faces, self.count)
             free(self.faces) in memory.heap
             self.faces = grown
-        let copied = try new Vector3[points.length] --- in memory.heap
-        errdefer free(copied) in memory.heap
-        for index in 0..<points.length:
-            copied[index] = points[index]
-        let w = try copy_values(weights)
-        errdefer free(w) in memory.heap
-        let u = try copy_values(ku)
-        errdefer free(u) in memory.heap
-        let v = try copy_values(kv)
-        self.faces[self.count] = Face(copied, w, u, v, nu, nv, du, dv,
+        let p = try copied[Vector3](points)
+        errdefer:
+            if p.length > 0: free(p) in memory.heap
+        let w = try copied[f64](weights)
+        errdefer:
+            if w.length > 0: free(w) in memory.heap
+        let u = try copied[f64](ku)
+        errdefer:
+            if u.length > 0: free(u) in memory.heap
+        let v = try copied[f64](kv)
+        self.faces[self.count] = Face(p, w, u, v, nu, nv, du, dv,
                                       ku[(usize)du] if nu > 0 else 0.0, ku[(usize)nu] if nu > 0 else 0.0,
                                       kv[(usize)dv] if nv > 0 else 0.0, kv[(usize)nv] if nv > 0 else 0.0, false)
         self.count += 1
@@ -641,12 +649,6 @@ func fill_boundaries(job: PreviewJob*, face: i64, part: PreviewPart*) -> !:
         for step in 0..<divisions + 1:
             try part.boundary_point(try model.edge_point_in(job.topology, face, use, (f64)step / (f64)divisions))
 
-func copy_values(values: const f64[]) -> f64[]!:
-    let output = try new f64[values.length] --- in memory.heap
-    for index in 0..<values.length:
-        output[index] = values[index]
-    return output
-
 func planar_mesh(points: const Vector3[]) -> interop.Reference[Mesh]!:
     var builder = try MeshBuilder()
     defer builder.close()
@@ -669,7 +671,8 @@ pub func encode_model(model: const CadModel*, writer: GeometryWriter*, path: str
     defer name.close()
     for index in 0..<model.count:
         let face = model.faces[index]
-        try numbered(&name, "f", index)
+        try name.assign("f".bytes)
+        try push_decimal(&name, (i64)index)
         try writer.crate.element(try writer.child((str)base.view(), (str)name.view()), "cad_face")
         try writer.column("points", dtype_float64, face.points.length, 3, u8[]((u8*)face.points.data, face.points.length * 24))
         try writer.column("weights", dtype_float64, face.weights.length, 1, u8[]((u8*)face.weights.data, face.weights.length * 8))
@@ -743,21 +746,6 @@ func copied_path(path: str) -> Growing[u8]!:
     var copy = Growing[u8]()
     try copy.assign(path.bytes)
     return copy
-
-## `prefix` followed by `number` in decimal, into `out`.
-pub func numbered(out: Growing[u8]*, prefix: str, number: usize) -> !:
-    try out.assign(prefix.bytes)
-    var digits: u8[24]
-    var count: usize = 0
-    var rest = number
-    while true:
-        digits[count] = (u8)(48 + rest % 10)
-        count += 1
-        rest = rest // 10
-        if rest == 0: break
-    while count > 0:
-        count -= 1
-        try out.push(digits[count])
 
 ## Every cv of `model` placed (as cv_position), appended to `out`.
 pub func placed_cvs(model: const CadModel*, out: Growing[Vector3]*) -> !:

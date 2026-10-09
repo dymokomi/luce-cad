@@ -3,15 +3,14 @@
 import memory
 from luce_std import math
 from luce_geocore.geocore import Vector3
-from brep_types import Curve, Surface, BrepFace
-from mapped_patch import parameter, point
+from geometry import Curve, Surface, BrepFace, edge_index, chart_parameter, surface_point, surface_spline
 from patch_sides import PatchSides, patch_sides, side_count
 from curve_spacing import ArcMetric, raise_side
 from layout_cell_error import turn_sag
 
 ## Raise opposite edge counts from sampled interior curvature, never lower them.
 pub func patch_density(face: BrepFace, surface: Surface, edges: const Curve[], counts: usize[], metrics: const ArcMetric[], divisions: i64, tolerance: f64) -> !:
-    if surface.kind != 3: return
+    if surface.kind != surface_spline: return
     let sides = try patch_sides(face, surface, edges, tolerance)
     if not sides.valid: return
     let boundary = try new Vector3[36] --- in memory.heap
@@ -20,7 +19,7 @@ pub func patch_density(face: BrepFace, surface: Surface, edges: const Curve[], c
     for side in 0..<(usize)4:
         for at in 0..<(usize)9:
             let t = (f64)at / 8.0
-            seed = try parameter(surface, try side_position(face, sides, side, t, edges, counts, metrics), seed, tolerance)
+            seed = try chart_parameter(surface, try side_position(face, sides, side, t, edges, counts, metrics), seed, tolerance)
             boundary[side * 9 + at] = seed
     let cosine = math.cos(0.75 * 2.0 * math.pi / (4.0 * (f64)divisions))
     for axis in 0..<(usize)2:
@@ -61,15 +60,13 @@ func side_position(face: BrepFace, sides: PatchSides, side: usize, fraction: f64
     var position = fraction * (f64)side_count(face, sides, side, counts)
     for segment in 0..<sides.lengths[side]:
         let use = face.uses[(sides.starts[side] + segment) % face.uses.length]
-        let count = (f64)counts[index(use)]
+        let count = (f64)counts[edge_index(use)]
         if position <= count or segment + 1 == sides.lengths[side]:
             let t = math.clamp(position / count, 0.0, 1.0)
-            return try edges[index(use)].at(metrics[index(use)].station(t if use > 0 else 1.0 - t))
+            return try edges[edge_index(use)].at(metrics[edge_index(use)].station(t if use > 0 else 1.0 - t))
         position -= count
     return Vector3()
 
-func index(use: i64) -> usize:
-    return (usize)(use - 1 if use > 0 else -use - 1)
 
 func interpolate(boundary: const Vector3[], side: usize, fraction: f64) -> Vector3:
     let scaled = math.clamp(fraction, 0.0, 1.0) * 8.0
@@ -86,4 +83,4 @@ func sample_cross(s: Surface, boundary: const Vector3[], along: f64, other: f64,
     let d = boundary[27]
     let bilinear = a.multiply_scalar((1.0 - u) * (1.0 - v)).add(b.multiply_scalar(u * (1.0 - v))).add(c.multiply_scalar(u * v)).add(d.multiply_scalar((1.0 - u) * v))
     let uv = interpolate(boundary, 0, u).multiply_scalar(1.0 - v).add(interpolate(boundary, 2, 1.0 - u).multiply_scalar(v)).add(interpolate(boundary, 3, 1.0 - v).multiply_scalar(1.0 - u)).add(interpolate(boundary, 1, v).multiply_scalar(u)).subtract(bilinear)
-    return try point(s, uv)
+    return try surface_point(s, uv)

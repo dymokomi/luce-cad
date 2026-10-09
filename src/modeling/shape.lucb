@@ -107,9 +107,9 @@ pub struct Shape:
     ## Carrier `c` at parameter `t`.
     pub func at(c: i64, t: f64) -> Vector3!:
         let carrier = self.carriers.items[(usize)c]
-        if carrier.kind == 0: return carrier.origin.add(carrier.x.multiply_scalar(t))
-        if carrier.kind == 1: return carrier.origin.add(carrier.x.multiply_scalar(carrier.a * math.cos(t))).add(carrier.y.multiply_scalar(carrier.a * math.sin(t)))
-        if carrier.kind == 3: return carrier.origin.add(carrier.x.multiply_scalar(carrier.a * math.cos(t))).add(carrier.y.multiply_scalar(carrier.b * math.sin(t)))
+        if carrier.kind == curve_line: return carrier.origin.add(carrier.x.multiply_scalar(t))
+        if carrier.kind == curve_circle: return carrier.origin.add(carrier.x.multiply_scalar(carrier.a * math.cos(t))).add(carrier.y.multiply_scalar(carrier.a * math.sin(t)))
+        if carrier.kind == curve_ellipse: return carrier.origin.add(carrier.x.multiply_scalar(carrier.a * math.cos(t))).add(carrier.y.multiply_scalar(carrier.b * math.sin(t)))
         let (points, weights, knots, degree) = self.spline_net(carrier.spline)
         let low = knots[(usize)degree]
         let high = knots[points.length]
@@ -123,9 +123,9 @@ pub struct Shape:
     ## Carrier `c` at `t`, and its first and second derivatives, exactly.
     pub func derivatives(c: i64, t: f64) -> (Vector3, Vector3, Vector3)!:
         let carrier = self.carriers.items[(usize)c]
-        if carrier.kind == 0: return (carrier.origin.add(carrier.x.multiply_scalar(t)), carrier.x, Vector3())
-        if carrier.kind == 1 or carrier.kind == 3:
-            let b = carrier.a if carrier.kind == 1 else carrier.b
+        if carrier.kind == curve_line: return (carrier.origin.add(carrier.x.multiply_scalar(t)), carrier.x, Vector3())
+        if carrier.kind == curve_circle or carrier.kind == curve_ellipse:
+            let b = carrier.a if carrier.kind == curve_circle else carrier.b
             let cx = carrier.x.multiply_scalar(carrier.a * math.cos(t))
             let sy = carrier.y.multiply_scalar(b * math.sin(t))
             let d1 = carrier.x.multiply_scalar(-carrier.a * math.sin(t)).add(carrier.y.multiply_scalar(b * math.cos(t)))
@@ -174,7 +174,7 @@ pub struct Shape:
         try self.sides.fill(self.edges.count * 2, -1)
         for f in 0..<self.faces.count:
             for use in self.face_uses(f):
-                let e = (usize)((use if use > 0 else -use) - 1)
+                let e = edge_index(use)
                 if self.sides.items[e * 2] < 0: self.sides.items[e * 2] = (i64)f
                 elif self.sides.items[e * 2 + 1] < 0 and self.sides.items[e * 2] != (i64)f: self.sides.items[e * 2 + 1] = (i64)f
 
@@ -189,7 +189,7 @@ pub struct Shape:
     ## The outward normal of face `f` at `p` (on its surface).
     pub func face_normal(f: usize, p: Vector3) -> Vector3!:
         let face = self.faces.items[f]
-        let n = try surface_normal(&self.surfaces.items[(usize)face.surface], p)
+        let n = try normal_at(&self.surfaces.items[(usize)face.surface], p, self.tolerance)
         return n if face.sense else n.multiply_scalar(-1.0)
 
     ## A copy of spline net `points` (moved by `matrix`) in the store.
@@ -209,39 +209,17 @@ pub func empty_shape(tolerance: f64) -> Shape:
     return Shape(tolerance, Growing[Vector3](), Growing[Carrier](), Growing[ShapeEdge](), Growing[Surface](), Growing[ShapeFace](),
                  Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize](), Growing[i64]())
 
-## Surface `s`'s unit normal at `p`.
-pub func surface_normal(s: const Surface*, p: Vector3) -> Vector3!:
-    let d = p.subtract(s.origin)
-    if s.kind == 0: return s.z
-    if s.kind == 1:
-        return try d.subtract(s.z.multiply_scalar(d.dot(s.z))).normalized()
-    if s.kind == 4: return try d.normalized()
-    if s.kind == 2:
-        # A cone opening by its half angle: radial out, tilted against the axis.
-        let radial = try d.subtract(s.z.multiply_scalar(d.dot(s.z))).normalized()
-        return try radial.multiply_scalar(math.cos(s.angle)).subtract(s.z.multiply_scalar(math.sin(s.angle))).normalized()
-    if s.kind == 5:
-        let radial = try d.subtract(s.z.multiply_scalar(d.dot(s.z))).normalized()
-        return try p.subtract(s.origin.add(radial.multiply_scalar(s.radius))).normalized()
-    return try spline_normal(s, p)
-
 ## Surface coordinates of `p` on `s`: a plane's (x, y); an angle about the
 ## axis and a height (cylinder, cone); longitude and latitude (sphere); a
-## B-spline's own parameters (an error when `p` is not on it).
-pub func surface_uv(s: const Surface*, p: Vector3) -> (f64, f64)!:
-    let d = p.subtract(s.origin)
-    if s.kind == 0: return (d.dot(s.x), d.dot(s.y))
-    if s.kind == 3: return try spline_uv(s, p)
-    let angle = math.atan2(d.dot(s.y), d.dot(s.x))
-    if s.kind == 4: return (angle, math.asin(math.clamp(d.dot(s.z) / math.max(s.radius, 1e-300), -1.0, 1.0)))
-    if s.kind == 5:
-        let ring = math.sqrt(d.dot(s.x) * d.dot(s.x) + d.dot(s.y) * d.dot(s.y)) - s.radius
-        return (angle, math.atan2(d.dot(s.z), ring))
-    return (angle, d.dot(s.z))
+## B-spline's own parameters (an error when `p` is not on it within `tol`).
+pub func surface_uv(s: const Surface*, p: Vector3, tol: f64) -> (f64, f64)!:
+    if s.kind == surface_spline: return try spline_uv(s, p, tol)
+    let uv = chart_uv(*s, p, Vector3(), false)
+    return (uv.x, uv.y)
 
 ## Whether `s`'s first coordinate is an angle (it wraps).
 pub func periodic(s: const Surface*) -> bool:
-    return s.kind != 0 and s.kind != 3
+    return s.kind != surface_plane and s.kind != surface_spline
 
 ## The shape of `model` (its B-rep, placed). Independent faces are not
 ## solids: they are refused.
@@ -266,16 +244,16 @@ pub func shape_of(model: const CadModel*) -> Shape!:
     for e in 0..<b.edge_count():
         var curve = try b.edge_record(e)
         defer curve.close()
-        if curve.kind == 0:
+        if curve.kind == curve_line:
             let a = placement.transform_point(curve.points[0])
             let z = placement.transform_point(curve.points[1])
             let along = z.subtract(a)
             let c = try shape.add_carrier(Carrier(0, a, try along.normalized(), Vector3(), 0.0, 0.0, -1))
             _ = try shape.add_edge(ShapeEdge(c, 0.0, along.length(), curve.start, curve.end))
-        elif curve.kind == 1 or curve.kind == 3:
+        elif curve.kind == curve_circle or curve.kind == curve_ellipse:
             let x = try placement.transform_direction(curve.x).normalized()
             let y = try placement.transform_direction(curve.y).normalized()
-            let minor = curve.weights[0] * scale if curve.kind == 3 else curve.radius * scale
+            let minor = curve.weights[0] * scale if curve.kind == curve_ellipse else curve.radius * scale
             let c = try shape.add_carrier(Carrier(curve.kind, placement.transform_point(curve.origin), x, y, curve.radius * scale, minor, -1))
             _ = try shape.add_edge(ShapeEdge(c, curve.angle, curve.angle + curve.sweep, curve.start, curve.end))
         else:
@@ -290,11 +268,11 @@ pub func shape_of(model: const CadModel*) -> Shape!:
         for p in record.points: try moved.push(placement.transform_point(p))
         let radius = record.radius * scale
         # A torus keeps its minor radius in `angle`.
-        let angle = record.angle * scale if record.kind == 5 else record.angle
+        let angle = record.angle * scale if record.kind == surface_torus else record.angle
         # A B-spline's frame is unused (its control points place it).
         let x = placement.transform_direction(record.x)
         let z = placement.transform_direction(record.z)
-        let spline = record.kind == 3
+        let spline = record.kind == surface_spline
         try shape.surfaces.push(try Surface(record.kind, placement.transform_point(record.origin), x if spline else try x.normalized(),
                                             z if spline else try z.normalized(), radius, angle, moved.view(), record.weights,
                                             record.ku, record.kv, record.nu, record.nv, record.du, record.dv))
@@ -324,24 +302,24 @@ pub func shape_of(model: const CadModel*) -> Shape!:
 
 ## `shape` as a new B-rep: its points, edges, surfaces and faces as they are.
 pub func brep_of(shape: const Shape*) -> interop.Reference[BrepModel]!:
-    let output = try interop.Reference[BrepModel].adopt(new BrepModel(math.max(shape.tolerance, 1e-9)) in memory.heap, brep_model_type, memory.heap)
+    let output = try BrepModel.held(math.max(shape.tolerance, least_tolerance))
     errdefer output.release()
     let b = output.value()
     for p in shape.points.view(): _ = try b.add_vertex(p)
     for edge in shape.edges.view():
         let c = shape.carriers.items[(usize)edge.carrier]
         let forward = edge.t1 > edge.t0
-        if c.kind == 0:
+        if c.kind == curve_line:
             _ = try b.add_line(edge.start, edge.end)
-        elif c.kind == 1:
+        elif c.kind == curve_circle:
             _ = try b.add_circle(edge.start, edge.end, c.origin, c.x.cross(c.y), c.x, c.a, forward)
-        elif c.kind == 3:
+        elif c.kind == curve_ellipse:
             _ = try b.add_ellipse(edge.start, edge.end, c.origin, c.x.cross(c.y), c.x, c.a, c.b, forward)
         else:
             let (points, weights, knots, degree) = shape.spline_net(c.spline)
             _ = try b.add_spline_edge(edge.start, edge.end, points, weights, degree, knots, forward)
     for s in shape.surfaces.view():
-        if s.kind == 3:
+        if s.kind == surface_spline:
             _ = try b.add_spline_surface(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv)
         else:
             _ = try b.add_surface(s.kind, s.origin, s.z, s.x, s.radius, s.angle)

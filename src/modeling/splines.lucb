@@ -5,21 +5,16 @@
 ## G3 continuity are such surfaces (blend.lucb), as are extruded splines.
 ## Other pairs with B-spline surfaces are not supported yet.
 
-## Surface `s`'s parameters at `p` (on it), by inversion from `seed`; an
-## error when `p` is not on it.
-func spline_uv(s: const Surface*, p: Vector3, seed: Vector3 = Vector3(0.5, 0.5, 0.0)) -> (f64, f64)!:
-    let uv = try project(*s, p, seed, 1e-7)
+## Surface `s`'s parameters at `p` (on it within `tol`), by inversion
+## from `seed`; an error when `p` is not on it.
+func spline_uv(s: const Surface*, p: Vector3, tol: f64, seed: Vector3 = Vector3(0.5, 0.5, 0.0)) -> (f64, f64)!:
+    let uv = try project(*s, p, seed, tol)
     return (uv.x, uv.y)
-
-## Surface `s`'s unit normal at `p` (du x dv, exactly).
-func spline_normal(s: const Surface*, p: Vector3) -> Vector3!:
-    let (u, v) = try spline_uv(s, p)
-    return try nurbs_normal(*s, Vector3(u, v, 0.0))
 
 ## Whether `s` is a profile swept straight, and the sweep (the second row's
 ## offset from the first).
 func extrusion_of(s: const Surface*) -> (bool, Vector3):
-    if s.kind != 3 or s.nv != 2 or s.dv != 1: return (false, Vector3())
+    if s.kind != surface_spline or s.nv != 2 or s.dv != 1: return (false, Vector3())
     let sweep = s.points[1].subtract(s.points[0])
     let reach = sweep.length()
     if reach <= 0.0: return (false, Vector3())
@@ -92,9 +87,9 @@ func plane_extrusion(w: Shape*, p: const Surface*, s: const Surface*, sweep: Vec
 func spline_meet(w: Shape*, fa: usize, fb: usize, tol: f64, out: Growing[Carrier]*) -> !:
     let sa = &w.surfaces.items[(usize)w.faces.items[fa].surface]
     let sb = &w.surfaces.items[(usize)w.faces.items[fb].surface]
-    let spline = sa if sa.kind == 3 else sb
-    let other = sb if sa.kind == 3 else sa
-    if other.kind == 0:
+    let spline = sa if sa.kind == surface_spline else sb
+    let other = sb if sa.kind == surface_spline else sa
+    if other.kind == surface_plane:
         let (swept, sweep) = extrusion_of(spline)
         if swept:
             try plane_extrusion(w, other, spline, sweep, tol, out)
@@ -102,13 +97,13 @@ func spline_meet(w: Shape*, fa: usize, fb: usize, tol: f64, out: Growing[Carrier
     # Two profiles swept straight along different ways (two G2 fillets
     # meeting at a corner): their curve lies in a plane bisecting the
     # sweeps, as an affine copy of either profile.
-    if sa.kind == 3 and sb.kind == 3:
+    if sa.kind == surface_spline and sb.kind == surface_spline:
         let (swept_a, sweep_a) = extrusion_of(sa)
         let (swept_b, sweep_b) = extrusion_of(sb)
         if swept_a and swept_b:
             if try extrusion_pair(w, sa, sweep_a, sb, sweep_b, tol, out): return
     let (turned, center, axis) = revolution_of(spline, tol)
-    if turned and other.kind != 3:
+    if turned and other.kind != surface_spline:
         if try coaxial_spline(spline, center, axis, other, tol, out): return
     # Kept apart by a plane, they touch at most, along curves their
     # boundaries carry: nothing to add.
@@ -123,9 +118,9 @@ func spline_meet(w: Shape*, fa: usize, fb: usize, tol: f64, out: Growing[Carrier
 ## other's control points beyond one. A setback corner's patch meets the
 ## faces and fillets about it this way (setback.lucb).
 func kept_apart(sa: const Surface*, sb: const Surface*, tol: f64) -> bool!:
-    if sa.kind == 3 and sb.kind == 0: return one_side(sa.points, sb.z, sb.z.dot(sb.origin), tol)
-    if sb.kind == 3 and sa.kind == 0: return one_side(sb.points, sa.z, sa.z.dot(sa.origin), tol)
-    if sa.kind != 3 or sb.kind != 3: return false
+    if sa.kind == surface_spline and sb.kind == surface_plane: return one_side(sa.points, sb.z, sb.z.dot(sb.origin), tol)
+    if sb.kind == surface_spline and sa.kind == surface_plane: return one_side(sb.points, sa.z, sa.z.dot(sa.origin), tol)
+    if sa.kind != surface_spline or sb.kind != surface_spline: return false
     for pass in 0..<2:
         let swept = sa if pass == 0 else sb
         let other = sb if pass == 0 else sa
@@ -161,7 +156,7 @@ func along_range(points: const Vector3[], d: Vector3) -> (f64, f64):
 ## rim blends make of splines: rows of five control points, two rational
 ## quadratic arcs), and that axis: a point on it and its direction.
 func revolution_of(s: const Surface*, tol: f64) -> (bool, Vector3, Vector3):
-    if s.kind != 3 or s.nv != 5 or s.dv != 2: return (false, Vector3(), Vector3())
+    if s.kind != surface_spline or s.nv != 5 or s.dv != 2: return (false, Vector3(), Vector3())
     for u in 0..<(usize)s.nu:
         let q0 = s.points[u * 5]
         let q2 = s.points[u * 5 + 2]
@@ -188,9 +183,9 @@ func revolution_of(s: const Surface*, tol: f64) -> (bool, Vector3, Vector3):
 ## when `other` is none of these.
 func coaxial_spline(s: const Surface*, center: Vector3, axis: Vector3, other: const Surface*, tol: f64, out: Growing[Carrier]*) -> bool!:
     let kind = other.kind
-    if kind == 0:
+    if kind == surface_plane:
         if math.abs(math.abs(other.z.dot(axis)) - 1.0) > 1e-9: return false
-    elif kind == 1 or kind == 2:
+    elif kind == surface_cylinder or kind == surface_cone:
         if math.abs(math.abs(other.z.dot(axis)) - 1.0) > 1e-9: return false
         let offset = other.origin.subtract(center)
         if offset.subtract(axis.multiply_scalar(offset.dot(axis))).length() > tol: return false
@@ -226,11 +221,11 @@ func coaxial_spline(s: const Surface*, center: Vector3, axis: Vector3, other: co
 ## How far profile point `p` is from `other` (a plane across the axis: in
 ## height; a cylinder or cone about it: in radius), signed.
 func coaxial_gap(p: Vector3, center: Vector3, axis: Vector3, other: const Surface*) -> f64:
-    if other.kind == 0: return p.subtract(other.origin).dot(other.z)
+    if other.kind == surface_plane: return p.subtract(other.origin).dot(other.z)
     let d = p.subtract(other.origin)
     let h = d.dot(other.z)
     let radial = d.subtract(other.z.multiply_scalar(h)).length()
-    if other.kind == 1: return radial - other.radius
+    if other.kind == surface_cylinder: return radial - other.radius
     return radial - (other.radius + h * math.tan(other.angle))
 
 ## Where profiles swept straight `a` (along `sweep_a`) and `b` meet, when
@@ -265,13 +260,13 @@ func extrusion_pair(w: Shape*, a: const Surface*, sweep_a: Vector3, b: const Sur
                 var curves = Growing[Carrier]()
                 defer curves.close()
                 try plane_extrusion(w, &plane, a, sweep_a, tol, &curves)
-                if curves.count != 1 or curves.items[0].kind != 2: continue
+                if curves.count != 1 or curves.items[0].kind != curve_spline: continue
                 # On `b` too, sampled.
                 var on = true
                 for step in 0..<9:
                     let q = try spline_point(w, curves.items[0].spline, (f64)step / 8.0)
                     # Off `b` where it cannot be inverted there.
-                    let uv = project(*b, q, Vector3(0.5, 0.5, 0.0), 1e-7) catch failure:
+                    let uv = project(*b, q, Vector3(0.5, 0.5, 0.0), tol * 100.0) catch failure:
                         if failure.code != invalid: error(failure.code, failure.message)
                         on = false
                         break

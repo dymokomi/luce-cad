@@ -11,16 +11,16 @@
 ## Surface `s`'s implicit value at `p` (zero on it) and its gradient.
 func implicit(s: const Surface*, p: Vector3) -> (f64, Vector3)!:
     let d = p.subtract(s.origin)
-    if s.kind == 0: return (d.dot(s.z), s.z)
-    if s.kind == 4: return (d.dot(d) - s.radius * s.radius, d.multiply_scalar(2.0))
+    if s.kind == surface_plane: return (d.dot(s.z), s.z)
+    if s.kind == surface_sphere: return (d.dot(d) - s.radius * s.radius, d.multiply_scalar(2.0))
     let h = d.dot(s.z)
     let q = d.subtract(s.z.multiply_scalar(h))
-    if s.kind == 1: return (q.dot(q) - s.radius * s.radius, q.multiply_scalar(2.0))
+    if s.kind == surface_cylinder: return (q.dot(q) - s.radius * s.radius, q.multiply_scalar(2.0))
     let length = math.max(q.length(), 1e-300)
-    if s.kind == 2:
+    if s.kind == surface_cone:
         let slope = math.tan(s.angle)
         return (length - (s.radius + h * slope), q.multiply_scalar(1.0 / length).subtract(s.z.multiply_scalar(slope)))
-    if s.kind == 5:
+    if s.kind == surface_torus:
         let ring = s.origin.add(q.multiply_scalar(s.radius / length))
         let offset = p.subtract(ring)
         return (offset.dot(offset) - s.angle * s.angle, offset.multiply_scalar(2.0))
@@ -77,86 +77,6 @@ func trace(s1: const Surface*, s2: const Surface*, seed: Vector3, heading: Vecto
         p = next
     return true
 
-## Cubic B-spline through `points` (chord-length parameters, clamped ends,
-## knots by averaging; the Piegl-Tiller interpolation): its net and knots.
-pub func interpolate(points: const Vector3[], net: Growing[Vector3]*, knots: Growing[f64]*) -> !:
-    let n = points.length
-    if n < 4: error(invalid, "a traced curve needs more points")
-    var u = Growing[f64]()
-    defer u.close()
-    var total = 0.0
-    for at in 1..<n: total += points[at].subtract(points[at - 1]).length()
-    try u.push(0.0)
-    var run = 0.0
-    for at in 1..<n:
-        run += points[at].subtract(points[at - 1]).length()
-        try u.push(run / total)
-    knots.clear()
-    for _ in 0..<(usize)4: try knots.push(0.0)
-    for j in 1..<n - 3:
-        try knots.push((u.items[j] + u.items[j + 1] + u.items[j + 2]) / 3.0)
-    for _ in 0..<(usize)4: try knots.push(1.0)
-    # The banded system N P = Q: row k's four basis values start at column
-    # span - 3, all within three of the diagonal (Schoenberg-Whitney, with
-    # averaged knots). Only that band is stored: entry (r, c) at
-    # band[r * 7 + c + 3 - r]. Gaussian elimination without pivoting (the
-    # system is totally positive) keeps the band.
-    var band = Growing[f64]()
-    defer band.close()
-    try band.fill(n * 7, 0.0)
-    for k in 0..<n:
-        var values: f64[9]
-        let span = basis_at(knots.view(), n, u.items[k], &values)
-        for c in 0..<(usize)4:
-            let column = span - 3 + c
-            if column >= n or values[c] == 0.0: continue
-            if column + 3 < k or column > k + 3: error(invalid, "a traced curve could not be fitted")
-            band.items[k * 7 + column + 3 - k] = values[c]
-    net.clear()
-    for p in points: try net.push(p)
-    for k in 0..<n:
-        let pivot = band.items[k * 7 + 3]
-        if math.abs(pivot) < 1e-300: error(invalid, "a traced curve could not be fitted")
-        for r in k + 1..<lesser(n, k + 4):
-            let factor = band.items[r * 7 + k + 3 - r] / pivot
-            if factor == 0.0: continue
-            for c in k..<lesser(n, k + 4): band.items[r * 7 + c + 3 - r] -= factor * band.items[k * 7 + c + 3 - k]
-            net.items[r] = net.items[r].subtract(net.items[k].multiply_scalar(factor))
-    var k = n
-    while k > 0:
-        k -= 1
-        var value = net.items[k]
-        for c in k + 1..<lesser(n, k + 4): value = value.subtract(net.items[c].multiply_scalar(band.items[k * 7 + c + 3 - k]))
-        net.items[k] = value.multiply_scalar(1.0 / band.items[k * 7 + 3])
-
-func lesser(a: usize, b: usize) -> usize:
-    return a if a < b else b
-
-## The cubic basis values at `t` (into values[0..4]) and the span index.
-func basis_at(knots: const f64[], count: usize, t: f64, values: f64[9]*) -> usize:
-    # The span: the last knot interval starting at or before t (bisected).
-    var span: usize = 3
-    var above = count
-    while above - span > 1:
-        let middle = (span + above) // 2
-        if knots[middle] <= t: span = middle
-        else: above = middle
-    # Cox-de Boor, degree 3.
-    var left: f64[4]
-    var right: f64[4]
-    (*values)[0] = 1.0
-    for j in 1..<(usize)4:
-        left[j] = t - knots[span + 1 - j]
-        right[j] = knots[span + j] - t
-        var saved = 0.0
-        for r in 0..<j:
-            let denominator = right[r + 1] + left[j - r]
-            let temp = 0.0 if denominator == 0.0 else (*values)[r] / denominator
-            (*values)[r] = saved + right[r + 1] * temp
-            saved = left[j - r] * temp
-        (*values)[j] = saved
-    return span
-
 ## The curves where faces fa and fb of `w` meet, traced, as spline
 ## carriers onto `out`; `low`..`high` bounds where both faces are.
 pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, size: f64, tol: f64, out: Growing[Carrier]*) -> !:
@@ -209,7 +129,7 @@ pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, s
             try line.push(seed)
         if line.count < 4: continue
         for p in line.view(): try traced.add(p)
-        try interpolate(line.view(), &net, &knots)
+        try interpolate_cubic(line.view(), &net, &knots)
         weights.clear()
         for _ in net.view(): try weights.push(1.0)
         let spline = try w.store_spline(net.view(), weights.view(), knots.view(), 3, Matrix4())
@@ -269,7 +189,7 @@ func new_point_cells(reach: f64) -> PointCells!:
 ## lies on `own`), refined onto both, onto `seeds`.
 func boundary_seeds(w: const Shape*, f: usize, other: const Surface*, own: const Surface*, tol: f64, seeds: Growing[Vector3]*) -> !:
     for use in w.face_uses(f):
-        let e = (usize)(use - 1 if use > 0 else -use - 1)
+        let e = edge_index(use)
         let count = 128
         var previous = (try implicit(other, try w.edge_at(e, 0.0))).0
         for k in 1..<count + 1:
@@ -304,7 +224,7 @@ func grid_seeds(w: const Shape*, f: usize, other: const Surface*, own: const Sur
         for j in 0..<n + 1:
             let u = low.x + (high.x - low.x) * (f64)i / (f64)n
             let v = low.y + (high.y - low.y) * (f64)j / (f64)n
-            let p = try surface_point(own, u, v)
+            let p = try surface_point(*own, Vector3(u, v, 0.0))
             let value = (try implicit(other, p)).0
             if j > 0 and (previous <= 0.0) != (value <= 0.0):
                 if let q = try onto_both(own, other, p, tol): try seeds.push(q)

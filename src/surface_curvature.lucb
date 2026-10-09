@@ -11,9 +11,7 @@ import memory
 from luce_geocore.geocore import Vector3, MeshBuilder, invalid
 from face_errors import FaceErrors
 from luce_geocore.core import parallel
-from brep_types import Surface, BrepFace
-from mapped_patch import parameter
-from tessellation.surface import basis_derivatives
+from geometry import Surface, BrepFace, chart_parameter, basis_derivatives, surface_plane, surface_cylinder, surface_cone, surface_spline, surface_sphere, surface_torus
 
 pub struct Curvature:
     pub var k1: f64 = 0.0
@@ -32,11 +30,11 @@ struct Chart:
 ## Curvature at `point` of support `s` oriented by `sense`. `seed` carries the
 ## previous normalized NURBS parameter between neighbouring corners.
 pub func curvature_at(s: Surface, point: Vector3, sense: bool, seed: Vector3*, tolerance: f64) -> Curvature!:
-    if s.kind == 0: return flat(s)
+    if s.kind == surface_plane: return flat(s)
     var chart = Chart()
     var ok = false
-    if s.kind == 3:
-        let uv = try parameter(s, point, *seed, tolerance)
+    if s.kind == surface_spline:
+        let uv = try chart_parameter(s, point, *seed, tolerance)
         *seed = uv
         ok = try nurbs_chart(s, uv, &chart)
         if not ok:
@@ -44,7 +42,7 @@ pub func curvature_at(s: Surface, point: Vector3, sense: bool, seed: Vector3*, t
             # shading normals do.
             ok = try nurbs_chart(s, Vector3(math.clamp(uv.x, 1e-7, 1.0 - 1e-7), math.clamp(uv.y, 1e-7, 1.0 - 1e-7), 0.0), &chart)
     else:
-        let uv = try parameter(s, point, *seed, tolerance, false)
+        let uv = try chart_parameter(s, point, *seed, tolerance, false)
         ok = analytic_chart(s, uv, &chart)
         if not ok:
             # A sphere or torus pole: step off it along the meridian.
@@ -99,19 +97,19 @@ func direction(c: Chart, n: Vector3, l: f64, m: f64, o: f64, e: f64, f: f64, g: 
 func analytic_chart(s: Surface, uv: Vector3, c: Chart*) -> bool:
     let radial = s.x.multiply_scalar(math.cos(uv.x)).add(s.y.multiply_scalar(math.sin(uv.x)))
     let tangent = s.x.multiply_scalar(-math.sin(uv.x)).add(s.y.multiply_scalar(math.cos(uv.x)))
-    if s.kind == 1 or s.kind == 2:
-        let slope = math.tan(s.angle) if s.kind == 2 else 0.0
+    if s.kind == surface_cylinder or s.kind == surface_cone:
+        let slope = math.tan(s.angle) if s.kind == surface_cone else 0.0
         let rho = s.radius + uv.y * slope
         c.su = tangent.multiply_scalar(rho)
         c.sv = radial.multiply_scalar(slope).add(s.z)
         c.suu = radial.multiply_scalar(-rho)
         c.suv = tangent.multiply_scalar(slope)
         c.svv = Vector3()
-    elif s.kind == 4 or s.kind == 5:
+    elif s.kind == surface_sphere or s.kind == surface_torus:
         # Sphere: tube radius = radius about the centre; torus: minor radius
         # `angle` about a circle of radius `radius`.
-        let minor = s.radius if s.kind == 4 else s.angle
-        let major = 0.0 if s.kind == 4 else s.radius
+        let minor = s.radius if s.kind == surface_sphere else s.angle
+        let major = 0.0 if s.kind == surface_sphere else s.radius
         let ring = major + minor * math.cos(uv.y)
         c.su = tangent.multiply_scalar(ring)
         c.sv = radial.multiply_scalar(-minor * math.sin(uv.y)).add(s.z.multiply_scalar(minor * math.cos(uv.y)))

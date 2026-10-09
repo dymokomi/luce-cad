@@ -129,11 +129,11 @@ func arranged(result: Profiles*, pieces: const Growing[ProfileEdge]*, tolerance:
     for v in 0..<vertices.count: try parent.push(v)
     for h in a.halves.view():
         if not h.alive: continue
-        let x = root_of(&parent, h.tail)
-        let y = root_of(&parent, h.head)
+        let x = union_root(parent.items, h.tail)
+        let y = union_root(parent.items, h.head)
         if x != y: parent.items[x] = y
     for f in 0..<a.face_offsets.count - 1:
-        try a.pieces_of.push(root_of(&parent, a.halves.items[a.loop(f)[0]].tail))
+        try a.pieces_of.push(union_root(parent.items, a.halves.items[a.loop(f)[0]].tail))
     return a
 
 ## The outlines of `set`'s faces named by `keys` (apart by `;`), as closed
@@ -202,7 +202,7 @@ func split_pieces(result: Profiles*, pieces: const Growing[ProfileEdge]*, tolera
         let length = try piece_length(result, &piece)
         # A whole circle cut somewhere splits only there: its last part runs
         # on round its seam to the first cut.
-        if piece.kind == 1 and math.abs(math.abs(piece.sweep) - 2.0 * math.pi) <= 1e-9 and fractions.count > 2:
+        if piece.kind == profile_arc and math.abs(math.abs(piece.sweep) - 2.0 * math.pi) <= 1e-9 and fractions.count > 2:
             try split_circle(result, &piece, fractions.view()[1..<fractions.count - 1], length, tolerance, number, out)
             number += (i64)fractions.count - 2
             continue
@@ -243,7 +243,7 @@ func pieces_meet(result: Profiles*, pieces: const Growing[ProfileEdge]*, i: usiz
     let b = pieces.items[j]
     var found = Growing[f64]()
     defer found.close()
-    if a.kind != 2 and b.kind != 2:
+    if a.kind != profile_spline and b.kind != profile_spline:
         try exact_meets(result, &a, &b, tolerance, &found)
     else:
         try sampled_meets(result, &a, &b, tolerance, &found)
@@ -270,7 +270,7 @@ func ends_on(result: Profiles*, piece: const ProfileEdge*, other: const ProfileE
 func exact_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdge*, tolerance: f64, found: Growing[f64]*) -> !:
     let (ax, ay) = result.planar(a.start)
     let (bx, by) = result.planar(b.start)
-    if a.kind == 0 and b.kind == 0:
+    if a.kind == profile_line and b.kind == profile_line:
         let (ex, ey) = result.planar(a.end)
         let (fx, fy) = result.planar(b.end)
         let dax = ex - ax
@@ -288,8 +288,8 @@ func exact_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdge*
             try found.push(s)
             try found.push(t)
         return
-    if a.kind == 0 or b.kind == 0:
-        let flip = b.kind == 0
+    if a.kind == profile_line or b.kind == profile_line:
+        let flip = b.kind == profile_line
         let line = b if flip else a
         let arc = a if flip else b
         let (sx, sy) = result.planar(line.start)
@@ -414,7 +414,7 @@ func sampled_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdg
 ## The point of `piece` nearest `p`: its distance and fraction.
 func arranged_nearest_on(result: Profiles*, piece: const ProfileEdge*, p: Vector3) -> (f64, f64)!:
     let (x, y) = result.planar(p)
-    if piece.kind == 0:
+    if piece.kind == profile_line:
         let (sx, sy) = result.planar(piece.start)
         let (ex, ey) = result.planar(piece.end)
         let dx = ex - sx
@@ -422,7 +422,7 @@ func arranged_nearest_on(result: Profiles*, piece: const ProfileEdge*, p: Vector
         let l2 = dx * dx + dy * dy
         let t = math.max(0.0, math.min(1.0, ((x - sx) * dx + (y - sy) * dy) / l2)) if l2 > 0.0 else 0.0
         return (math.hypot(sx + t * dx - x, sy + t * dy - y), t)
-    if piece.kind == 1:
+    if piece.kind == profile_arc:
         let (cx, cy) = result.planar(piece.center)
         let (on, fraction) = arc_fraction(result, piece, Vector3(x, y, 0.0))
         if on: return (math.abs(math.hypot(x - cx, y - cy) - piece.radius), fraction)
@@ -460,8 +460,8 @@ func arranged_nearest_on(result: Profiles*, piece: const ProfileEdge*, p: Vector
 
 ## A piece's length (arcs by their sweep, splines by their samples).
 func piece_length(result: Profiles*, piece: const ProfileEdge*) -> f64!:
-    if piece.kind == 0: return piece.end.subtract(piece.start).length()
-    if piece.kind == 1: return math.abs(piece.sweep) * piece.radius
+    if piece.kind == profile_line: return piece.end.subtract(piece.start).length()
+    if piece.kind == profile_arc: return math.abs(piece.sweep) * piece.radius
     var total = 0.0
     var previous = piece.start
     for at in 1..<(usize)65:
@@ -474,8 +474,8 @@ func piece_length(result: Profiles*, piece: const ProfileEdge*) -> f64!:
 func piece_part(result: Profiles*, piece: const ProfileEdge*, low: f64, high: f64) -> ProfileEdge!:
     let start = try result.edge_at(piece, low)
     let end = try result.edge_at(piece, high)
-    if piece.kind == 0: return ProfileEdge(0, start, end, Vector3(), 0.0, 0.0, -1)
-    if piece.kind == 1:
+    if piece.kind == profile_line: return ProfileEdge(0, start, end, Vector3(), 0.0, 0.0, -1)
+    if piece.kind == profile_arc:
         let whole = low == 0.0 and high == 1.0
         return ProfileEdge(1, piece.start if whole else start, piece.end if whole else end, piece.center, piece.radius, piece.sweep * (high - low), -1)
     if low == 0.0 and high == 1.0: return ProfileEdge(2, piece.start, piece.end, Vector3(), 0.0, 0.0, piece.spline)
@@ -495,7 +495,7 @@ func build_graph(result: Profiles*, subs: Growing[ProfileEdge]*, tolerance: f64,
         let tail = ends.items[2 * index]
         let head = ends.items[2 * index + 1]
         let e = subs.items[index]
-        if tail == head and e.kind == 0: continue
+        if tail == head and e.kind == profile_line: continue
         if try repeats_earlier(result, subs, &ends, index, tolerance): continue
         let (forward_angle, forward_curving) = try leaving_way(result, &e, false)
         let (backward_angle, backward_curving) = try leaving_way(result, &e, true)
@@ -544,11 +544,11 @@ func vertex_of(vertices: Growing[Vector3]*, p: Vector3, tolerance: f64) -> usize
 ## (`backward`: leaves its end going back), and how it turns from there
 ## (signed curvature: positive to the left).
 func leaving_way(result: Profiles*, e: const ProfileEdge*, backward: bool) -> (f64, f64)!:
-    if e.kind == 0:
+    if e.kind == profile_line:
         let (sx, sy) = result.planar(e.start)
         let (ex, ey) = result.planar(e.end)
         return (math.atan2(sy - ey, sx - ex), 0.0) if backward else (math.atan2(ey - sy, ex - sx), 0.0)
-    if e.kind == 1:
+    if e.kind == profile_arc:
         let (cx, cy) = result.planar(e.center)
         let (px, py) = result.planar(e.end if backward else e.start)
         # Counterclockwise arcs leave square to the radius, to the left.
@@ -615,8 +615,8 @@ func face_outline(result: Profiles*, subs: Growing[ProfileEdge]*, halves: Growin
         let h = halves.items[at]
         let e = subs.items[h.edge]
         var steps: usize = 1
-        if e.kind == 1: steps = (usize)math.max(2.0, math.ceil(math.abs(e.sweep) / 0.1745))
-        if e.kind == 2: steps = 32
+        if e.kind == profile_arc: steps = (usize)math.max(2.0, math.ceil(math.abs(e.sweep) / 0.1745))
+        if e.kind == profile_spline: steps = 32
         for step in 0..<steps:
             let f = (f64)step / (f64)steps
             let (x, y) = result.planar(try result.edge_at(&e, 1.0 - f if h.backward else f))
@@ -635,14 +635,6 @@ func alternate_islands(a: const Arranged*, take: Growing[bool]*) -> !:
             if a.areas.items[other] <= 0.0 or a.pieces_of.items[other] == a.pieces_of.items[f]: continue
             if inside(a.outline_of(other), probe): depth += 1
         take.items[f] = depth % 2 == 0
-
-## Union-find's root of `at`.
-func root_of(parent: Growing[usize]*, at: usize) -> usize:
-    var x = at
-    while parent.items[x] != x:
-        parent.items[x] = parent.items[parent.items[x]]
-        x = parent.items[x]
-    return x
 
 ## A point just left of an outline's first segment's middle: inside a
 ## counterclockwise outline, outside a clockwise one.
@@ -670,7 +662,7 @@ func face_key(subs: Growing[ProfileEdge]*, halves: Growing[SketchHalf]*, loop: c
     sort_codes(&parts)
     for index in 0..<parts.count:
         if index > 0: try out.push(44)
-        try push_number(out, parts.items[index] // 2)
+        try push_decimal(out, parts.items[index] // 2)
         try out.push(45 if parts.items[index] % 2 == 1 else 43)
 
 ## Whether `key` is one of `keys` (apart by `;`).
@@ -755,8 +747,8 @@ func join_parts(result: Profiles*, first: usize, tolerance: f64) -> !:
 ## Whether `b` goes on from `a` as one curve: the same sketch curve, both
 ## lines in line, or both arcs of one circle turning one way.
 func continues(a: const ProfileEdge*, b: const ProfileEdge*, tolerance: f64) -> bool:
-    if a.curve < 0 or a.curve != b.curve or a.kind != b.kind or a.kind == 2: return false
-    if a.kind == 0:
+    if a.curve < 0 or a.curve != b.curve or a.kind != b.kind or a.kind == profile_spline: return false
+    if a.kind == profile_line:
         let d1 = a.end.subtract(a.start)
         let d2 = b.end.subtract(b.start)
         return d1.cross(d2).length() <= tolerance * math.max(d1.length(), d2.length()) and d1.dot(d2) > 0.0

@@ -3,21 +3,12 @@ import memory
 from luce_std import math
 from luce_geocore.geocore import Vector3, MeshBuilder, invalid
 from tessellation.surface import TrimPolygon, TrimConstraints
-from brep_types import Surface
-from analytic_eval import evaluate
+from geometry import Surface, analytic_point, wrap, surface_cylinder, surface_cone, surface_sphere, surface_torus
 from adaptive_uv import refine_uv
 from sphere_chart import local_sphere, touches_pole
 
-func wrap(value: f64, previous: f64) -> f64:
-    var result = value
-    while result - previous > math.pi:
-        result -= 2.0 * math.pi
-    while result - previous < -math.pi:
-        result += 2.0 * math.pi
-    return result
-
 pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
-    if s.kind == 4 and touches_pole(s, mesh.points[..<mesh.np], ids):
+    if s.kind == surface_sphere and touches_pole(s, mesh.points[..<mesh.np], ids):
         let chart = try local_sphere(s, mesh.points[..<mesh.np], ids)
         defer chart.close()
         try mesh_in_chart(mesh, ids, sizes, chart, sense, divisions, tolerance, edge_size)
@@ -26,7 +17,7 @@ pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[],
     let nf = mesh.nf
     let nc = mesh.nc
     mesh_in_chart(mesh, ids, sizes, s, sense, divisions, tolerance, edge_size) catch failure:
-        if failure.code != invalid or s.kind != 4: error(failure.code, failure.message)
+        if failure.code != invalid or s.kind != surface_sphere: error(failure.code, failure.message)
         mesh.np = np
         mesh.nf = nf
         mesh.nc = nc
@@ -41,7 +32,7 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
     let uv = try new Vector3[ids.length] --- in memory.heap
     defer free(uv) in memory.heap
     let uscale = math.max(s.radius, tolerance)
-    let vscale = s.radius if s.kind == 4 else (s.angle if s.kind == 5 else 1.0)
+    let vscale = s.radius if s.kind == surface_sphere else (s.angle if s.kind == surface_torus else 1.0)
     var offset: usize = 0
     var anchor = Vector3()
     for loop in 0..<sizes.length:
@@ -53,12 +44,12 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
             let z = p.dot(s.z)
             let radius = math.sqrt(x * x + y * y)
             var u = math.atan2(y, x)
-            var v = math.atan2(z, radius) if s.kind == 4 else (math.atan2(z, radius - s.radius) if s.kind == 5 else z)
+            var v = math.atan2(z, radius) if s.kind == surface_sphere else (math.atan2(z, radius - s.radius) if s.kind == surface_torus else z)
             if at > 0 or loop > 0:
                 u = wrap(u, previous.x)
-                if s.kind == 5:
+                if s.kind == surface_torus:
                     v = wrap(v, previous.y)
-            if evaluate(s, u, v).subtract(mesh.points[(usize)ids[offset + at]]).length() > tolerance:
+            if analytic_point(s, u, v).subtract(mesh.points[(usize)ids[offset + at]]).length() > tolerance:
                 error(invalid, "analytic trim is outside its support tolerance")
             previous = Vector3(u, v, 0.0)
             uv[offset + at] = Vector3(u * uscale, v * vscale, 0.0)
@@ -66,7 +57,7 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
                 anchor = previous
         offset += (usize)sizes[loop]
     # A single latitude loop bounds a spherical cap; UV has a singular pole.
-    if s.kind == 4 and sizes.length == 1:
+    if s.kind == surface_sphere and sizes.length == 1:
         var latitude = true
         for p in uv:
             latitude = latitude and math.abs(p.y - uv[0].y) <= tolerance
@@ -74,7 +65,7 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
             try spherical_cap(mesh, ids, uv, s, sense, divisions)
             return
     var spacing = uscale * math.pi / (2.0 * (f64)divisions)
-    var vertical = vscale * math.pi / (2.0 * (f64)divisions) if s.kind == 4 or s.kind == 5 else spacing
+    var vertical = vscale * math.pi / (2.0 * (f64)divisions) if s.kind == surface_sphere or s.kind == surface_torus else spacing
     if edge_size == 0.0:
         var minimum = uv[0]
         var maximum = uv[0]
@@ -101,9 +92,9 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
     # larger (a sphere's, a torus's, a cylinder's section), so a small
     # patch is meshed as densely as its surface would be, not more.
     var extent = high.subtract(low).length()
-    if s.kind == 4: extent = math.max(extent, s.radius * 3.4641016151377544)
-    elif s.kind == 5: extent = math.max(extent, (s.radius + s.angle) * 2.0)
-    elif s.kind == 1 or s.kind == 2: extent = math.max(extent, s.radius * 2.0)
+    if s.kind == surface_sphere: extent = math.max(extent, s.radius * 3.4641016151377544)
+    elif s.kind == surface_torus: extent = math.max(extent, (s.radius + s.angle) * 2.0)
+    elif s.kind == surface_cylinder or s.kind == surface_cone: extent = math.max(extent, s.radius * 2.0)
     let deviation = math.max(tolerance, extent / ((f64)divisions * (f64)divisions * 16.0))
     let constraints = try TrimConstraints.build(uv, ids, sizes)
     defer constraints.close()
@@ -113,7 +104,7 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
     defer free(mapped) in memory.heap
     for at in 0..<mapped.length:
         let p = try part.value().point((i64)at)
-        mapped[at] = ids[at] if at < ids.length else (try mesh.point(evaluate(s, p.x / uscale, p.y / vscale)))
+        mapped[at] = ids[at] if at < ids.length else (try mesh.point(analytic_point(s, p.x / uscale, p.y / vscale)))
     for face in 0..<part.value().face_count():
         let count = try part.value().face_size(face)
         try mesh.face(count)
@@ -133,7 +124,7 @@ func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s:
     for row in 1..<divisions:
         let v = start_v + (pole_v - start_v) * (f64)row / (f64)divisions
         for at in 0..<ids.length:
-            next[at] = try mesh.point(evaluate(s, uv[at].x / s.radius, v))
+            next[at] = try mesh.point(analytic_point(s, uv[at].x / s.radius, v))
         for at in 0..<ids.length:
             let following = (at + 1) % ids.length
             let corners = [previous[at], previous[following], next[following], next[at]]
@@ -142,7 +133,7 @@ func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s:
                 try mesh.corner(corners[index if sense else 3 - index])
         for at in 0..<ids.length:
             previous[at] = next[at]
-    let pole = try mesh.point(evaluate(s, 0.0, pole_v))
+    let pole = try mesh.point(analytic_point(s, 0.0, pole_v))
     for at in 0..<ids.length:
         let corners = [previous[at], previous[(at + 1) % ids.length], pole]
         try mesh.face(3)

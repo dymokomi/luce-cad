@@ -106,8 +106,6 @@ struct Local:
     var radius: f64
     var continuity: i64
     var patches: PatchCache*?
-    ## Each edge's two faces.
-    var edge_faces: Growing[usize]
     ## Each edge's strip, or -1.
     var strip_of: Growing[i64]
     var strips: Growing[Strip]
@@ -127,7 +125,6 @@ struct Local:
 
     func close():
         self.out.close()
-        self.edge_faces.close()
         self.strip_of.close()
         self.strips.close()
         self.points.close()
@@ -272,18 +269,14 @@ func new_local(w: const Shape*, radius: f64, continuity: i64, patches: PatchCach
     for k in w.spline_knots.view(): try out.spline_knots.push(k)
     for s in w.surfaces.view():
         try out.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
-    var made = Local(w, out, radius, continuity, patches, Growing[usize](), Growing[i64](), Growing[Strip](), Growing[i64](), Growing[i64](), Growing[i64](),
+    var made = Local(w, out, radius, continuity, patches, Growing[i64](), Growing[Strip](), Growing[i64](), Growing[i64](), Growing[i64](),
                      Growing[Chain](), Growing[i64](), Growing[Link](), Growing[Extra](), Growing[u8]())
     errdefer made.close()
-    try made.edge_faces.fill(w.edges.count * 2, 0)
+    # Every edge used exactly twice (its faces: faces_of).
     var seen = Growing[i64]()
     defer seen.close()
     try seen.fill(w.edges.count, 0)
-    for f in 0..<w.faces.count:
-        for use in w.face_uses(f):
-            let e = (usize)((use if use > 0 else -use) - 1)
-            if seen.items[e] < 2: made.edge_faces.items[e * 2 + (usize)seen.items[e]] = f
-            seen.items[e] += 1
+    for use in w.uses.view(): seen.items[edge_index(use)] += 1
     for e in 0..<w.edges.count:
         if seen.items[e] != 2: error(invalid, "an edge must lie between two faces")
     try made.strip_of.fill(w.edges.count, -1)
@@ -292,16 +285,22 @@ func new_local(w: const Shape*, radius: f64, continuity: i64, patches: PatchCach
     try made.ends.fill(w.edges.count * 2, -1)
     return made
 
+## Edge `e`'s two faces (one face twice for a seam), from the body's
+## sides (Shape.index_sides).
+func faces_of(b: const Local*, e: usize) -> (usize, usize):
+    let first = b.w.sides.items[e * 2]
+    let second = b.w.sides.items[e * 2 + 1]
+    return ((usize)first, (usize)(second if second >= 0 else first))
+
 ## Whether this builds `chosen`: straight edges between two planes, and at
 ## each of their ends exactly three edges and three flat faces.
 func eligible(b: Local*, chosen: const usize[]) -> bool!:
     let w = b.w
     for e in chosen:
-        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != 0: return false
-        let fa = b.edge_faces.items[e * 2]
-        let fb = b.edge_faces.items[e * 2 + 1]
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line: return false
+        let (fa, fb) = faces_of(b, e)
         if fa == fb: return false
-        if w.surfaces.items[(usize)w.faces.items[fa].surface].kind != 0 or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != 0: return false
+        if w.surfaces.items[(usize)w.faces.items[fa].surface].kind != surface_plane or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != surface_plane: return false
         if b.strip_of.items[e] >= 0: return false
         b.strip_of.items[e] = 0
         let edge = w.edges.items[e]
@@ -309,7 +308,7 @@ func eligible(b: Local*, chosen: const usize[]) -> bool!:
         for v in ends:
             if edge_degree(w, v) != 3: return false
             for f in try vertex_faces(b, v):
-                if w.surfaces.items[(usize)w.faces.items[f].surface].kind != 0: return false
+                if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: return false
     for e in chosen: b.strip_of.items[e] = -1
     return true
 
@@ -321,8 +320,9 @@ func vertex_faces(b: const Local*, v: i64) -> usize[3]!:
     for e in 0..<w.edges.count:
         let edge = w.edges.items[e]
         if edge.start != v and edge.end != v: continue
-        for side in 0..<(usize)2:
-            let f = b.edge_faces.items[e * 2 + side]
+        let (fa, fb) = faces_of(b, e)
+        let sides: usize[2] = [fa, fb]
+        for f in sides:
             var known = false
             for k in 0..<count:
                 if faces[k] == f: known = true
@@ -336,8 +336,7 @@ func vertex_faces(b: const Local*, v: i64) -> usize[3]!:
 ## Edge `e`'s strip: its frame, its ends still open.
 func begin_strip(b: Local*, e: usize) -> !:
     let w = b.w
-    let fa = b.edge_faces.items[e * 2]
-    let fb = b.edge_faces.items[e * 2 + 1]
+    let (fa, fb) = faces_of(b, e)
     let edge = w.edges.items[e]
     let origin = w.points.items[(usize)edge.start]
     let along = try w.points.items[(usize)edge.end].subtract(origin).normalized()
@@ -500,7 +499,7 @@ func local_result(b: Local*, tag: str) -> interop.Reference[CadModel]!:
     try orient(&b.out, fixed)
     let solid = try used_brep(&b.out)
     defer solid.release()
-    return try model_of(solid)
+    return try CadModel.of_brep(solid)
 
 ## Body face `f`'s loop `loop` rebuilt onto `out`: each edge as it now
 ## runs (a chosen one by its contact line), and at each corner the curves
@@ -510,7 +509,7 @@ func rebuild_loop(b: Local*, f: usize, loop: const i64[], out: Growing[i64]*) ->
     let n = loop.length
     for k in 0..<n:
         let use = loop[k]
-        let e = (usize)((use if use > 0 else -use) - 1)
+        let e = edge_index(use)
         let edge = w.edges.items[e]
         let forward = use > 0
         let tail = edge.end if forward else edge.start
@@ -518,7 +517,7 @@ func rebuild_loop(b: Local*, f: usize, loop: const i64[], out: Growing[i64]*) ->
         let (id, tail_point) = try edge_on_face(b, e, f, forward)
         try out.push((id + 1) if forward else -(id + 1))
         let next_use = loop[(k + 1) % n]
-        let next_e = (usize)((next_use if next_use > 0 else -next_use) - 1)
+        let next_e = edge_index(next_use)
         let next_point = try head_point(b, next_e, f, next_use > 0)
         if next_point == tail_point: continue
         var linked = false
@@ -553,7 +552,7 @@ func edge_on_face(b: Local*, e: usize, f: usize, forward: bool) -> (i64, i64)!:
         if b.ends.items[e * 2] < 0 and b.ends.items[e * 2 + 1] < 0:
             b.kept.items[e] = try b.out.add_edge(ShapeEdge(edge.carrier, edge.t0, edge.t1, start, end))
         else:
-            if w.carriers.items[(usize)edge.carrier].kind != 0: error(invalid, "a curved sharp edge meets a rounded corner")
+            if w.carriers.items[(usize)edge.carrier].kind != curve_line: error(invalid, "a curved sharp edge meets a rounded corner")
             # Shortened, it must keep its way.
             let before = w.points.items[(usize)edge.end].subtract(w.points.items[(usize)edge.start])
             if b.at(end).subtract(b.at(start)).dot(before) <= 0.0: error(invalid, "a fillet consumes an edge")
@@ -585,7 +584,7 @@ func orient(s: Shape*, fixed: usize) -> !:
     defer signs.close()
     try signs.fill(s.edges.count, 0)
     for f in 0..<fixed:
-        for use in s.face_uses(f): signs.items[(usize)((use if use > 0 else -use) - 1)] = 1 if use > 0 else -1
+        for use in s.face_uses(f): signs.items[edge_index(use)] = 1 if use > 0 else -1
     var progress = true
     while progress:
         progress = false
@@ -593,7 +592,7 @@ func orient(s: Shape*, fixed: usize) -> !:
             if done.items[f]: continue
             var vote = 0
             for use in s.face_uses(f):
-                let sign = signs.items[(usize)((use if use > 0 else -use) - 1)]
+                let sign = signs.items[edge_index(use)]
                 if sign == 0: continue
                 vote = -1 if sign == (1 if use > 0 else -1) else 1
                 break
@@ -610,7 +609,7 @@ func orient(s: Shape*, fixed: usize) -> !:
                         s.uses.items[at + count - 1 - k] = -left
                     if count % 2 == 1: s.uses.items[at + count // 2] = -s.uses.items[at + count // 2]
                     at += count
-            for use in s.face_uses(f): signs.items[(usize)((use if use > 0 else -use) - 1)] = 1 if use > 0 else -1
+            for use in s.face_uses(f): signs.items[edge_index(use)] = 1 if use > 0 else -1
             done.items[f] = true
             progress = true
     for f in 0..<faces:
@@ -620,7 +619,7 @@ func orient(s: Shape*, fixed: usize) -> !:
     try count.fill(s.edges.count * 2, 0)
     for f in 0..<faces:
         for use in s.face_uses(f):
-            let e = (usize)((use if use > 0 else -use) - 1)
+            let e = edge_index(use)
             count.items[e * 2 + (0 if use > 0 else 1)] += 1
     for e in 0..<s.edges.count:
         let forward = count.items[e * 2]
@@ -630,7 +629,7 @@ func orient(s: Shape*, fixed: usize) -> !:
 
 ## `s` as a B-rep, its points, edges and surfaces only where faces use them.
 func used_brep(s: const Shape*) -> interop.Reference[BrepModel]!:
-    let output = try interop.Reference[BrepModel].adopt(new BrepModel(math.max(s.tolerance, 1e-9)) in memory.heap, brep_model_type, memory.heap)
+    let output = try BrepModel.held(math.max(s.tolerance, least_tolerance))
     errdefer output.release()
     let b = output.value()
     var points = Growing[i64]()
@@ -647,7 +646,7 @@ func used_brep(s: const Shape*) -> interop.Reference[BrepModel]!:
     for f in 0..<s.faces.count:
         uses.clear()
         for use in s.face_uses(f):
-            let e = (usize)((use if use > 0 else -use) - 1)
+            let e = edge_index(use)
             if edges.items[e] < 0:
                 let edge = s.edges.items[e]
                 let ends: i64[2] = [edge.start, edge.end]
@@ -657,9 +656,9 @@ func used_brep(s: const Shape*) -> interop.Reference[BrepModel]!:
                 let end = points.items[(usize)edge.end]
                 let c = s.carriers.items[(usize)edge.carrier]
                 let forward = edge.t1 > edge.t0
-                if c.kind == 0: edges.items[e] = try b.add_line(start, end)
-                elif c.kind == 1: edges.items[e] = try b.add_circle(start, end, c.origin, c.x.cross(c.y), c.x, c.a, forward)
-                elif c.kind == 3: edges.items[e] = try b.add_ellipse(start, end, c.origin, c.x.cross(c.y), c.x, c.a, c.b, forward)
+                if c.kind == curve_line: edges.items[e] = try b.add_line(start, end)
+                elif c.kind == curve_circle: edges.items[e] = try b.add_circle(start, end, c.origin, c.x.cross(c.y), c.x, c.a, forward)
+                elif c.kind == curve_ellipse: edges.items[e] = try b.add_ellipse(start, end, c.origin, c.x.cross(c.y), c.x, c.a, c.b, forward)
                 else:
                     let (net, weights, knots, degree) = s.spline_net(c.spline)
                     edges.items[e] = try b.add_spline_edge(start, end, net, weights, degree, knots, forward)
@@ -668,7 +667,7 @@ func used_brep(s: const Shape*) -> interop.Reference[BrepModel]!:
         let si = (usize)face.surface
         if surfaces.items[si] < 0:
             let su = s.surfaces.items[si]
-            surfaces.items[si] = (try b.add_spline_surface(su.points, su.weights, su.nu, su.nv, su.du, su.dv, su.ku, su.kv)) if su.kind == 3 else (try b.add_surface(su.kind, su.origin, su.z, su.x, su.radius, su.angle))
+            surfaces.items[si] = (try b.add_spline_surface(su.points, su.weights, su.nu, su.nv, su.du, su.dv, su.ku, su.kv)) if su.kind == surface_spline else (try b.add_surface(su.kind, su.origin, su.z, su.x, su.radius, su.angle))
         let made = try b.add_face(surfaces.items[si], uses.view(), s.face_sizes(f), face.sense)
         try b.set_face_name(made, s.face_name(f))
     return output

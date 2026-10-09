@@ -32,19 +32,19 @@ func along_edge(w: const Shape*, e: usize) -> Vector3!:
 func is_rim(w: const Shape*, e: usize, fa: usize, fb: usize) -> bool:
     let edge = w.edges.items[e]
     let c = w.carriers.items[(usize)edge.carrier]
-    if c.kind != 1: return false
+    if c.kind != curve_circle: return false
     let axis = c.x.cross(c.y)
     let sa = w.surfaces.items[(usize)w.faces.items[fa].surface]
     let sb = w.surfaces.items[(usize)w.faces.items[fb].surface]
-    let plane = sa if sa.kind == 0 else sb
-    let round = sb if sa.kind == 0 else sa
-    if plane.kind != 0 or (round.kind != 1 and round.kind != 2): return false
+    let plane = sa if sa.kind == surface_plane else sb
+    let round = sb if sa.kind == surface_plane else sa
+    if plane.kind != surface_plane or (round.kind != surface_cylinder and round.kind != surface_cone): return false
     if math.abs(math.abs(plane.z.dot(axis)) - 1.0) > 1e-9 or math.abs(math.abs(round.z.dot(axis)) - 1.0) > 1e-9: return false
     # On the cylinder or cone, about its axis: its radius there is the
     # circle's (a cone's along its height).
     let offset = c.origin.subtract(round.origin)
     let height = offset.dot(round.z)
-    let radius = round.radius + (height * math.tan(round.angle) if round.kind == 2 else 0.0)
+    let radius = round.radius + (height * math.tan(round.angle) if round.kind == surface_cone else 0.0)
     return offset.subtract(round.z.multiply_scalar(height)).length() < c.a * 1e-6 and math.abs(radius - c.a) < c.a * 1e-6
 
 ## Whether edge `e` can be blended: a line between two planar faces, or a
@@ -52,12 +52,12 @@ func is_rim(w: const Shape*, e: usize, fa: usize, fb: usize) -> bool:
 func blendable(w: const Shape*, e: usize) -> bool!:
     let edge = w.edges.items[e]
     let kind = w.carriers.items[(usize)edge.carrier].kind
-    if kind != 0 and kind != 1: return false
+    if kind != curve_line and kind != curve_circle: return false
     # A seam (one face's both ways) is no edge between two faces.
     let (fa, fb) = edge_faces(w, e) catch failure:
         _ = failure
         return false
-    if kind == 1:
+    if kind == curve_circle:
         if not is_rim(w, e, fa, fb): return false
     elif not flat_pair(w, fa, fb) and ruled_pair(w, e, fa, fb) < 0: return false
     let along = try along_edge(w, e)
@@ -66,7 +66,7 @@ func blendable(w: const Shape*, e: usize) -> bool!:
     return ua.cross(ub).length() > 1e-9
 
 func flat_pair(w: const Shape*, fa: usize, fb: usize) -> bool:
-    return w.surfaces.items[(usize)w.faces.items[fa].surface].kind == 0 and w.surfaces.items[(usize)w.faces.items[fb].surface].kind == 0
+    return w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_plane and w.surfaces.items[(usize)w.faces.items[fb].surface].kind == surface_plane
 
 ## Of a straight edge `e` between a plane and a cylinder along it (a
 ## D-shaft's flat, a slot's side meeting its round end), the cylinder's
@@ -75,8 +75,8 @@ func ruled_pair(w: const Shape*, e: usize, fa: usize, fb: usize) -> i64:
     let sa = w.surfaces.items[(usize)w.faces.items[fa].surface]
     let sb = w.surfaces.items[(usize)w.faces.items[fb].surface]
     var cylinder: i64 = -1
-    if sa.kind == 0 and sb.kind == 1: cylinder = (i64)fb
-    elif sa.kind == 1 and sb.kind == 0: cylinder = (i64)fa
+    if sa.kind == surface_plane and sb.kind == surface_cylinder: cylinder = (i64)fb
+    elif sa.kind == surface_cylinder and sb.kind == surface_plane: cylinder = (i64)fa
     else: return -1
     let c = w.surfaces.items[(usize)w.faces.items[(usize)cylinder].surface]
     let edge = w.edges.items[e]
@@ -181,7 +181,7 @@ func convex(w: const Shape*, e: usize) -> bool!:
 ## An end marked exact (where a corner ball takes over) stops right there.
 ## Its blend face is named `name`.
 func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str) -> interop.Reference[CadModel]!:
-    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 1: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name)
+    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_circle: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -195,11 +195,11 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i6
     let after = 0.0 if exact_end or try body.inside(w, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
     var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity)
     defer profile.close()
-    let solid = try new_solid(length + margin * 2.0)
+    let solid = try BrepModel.sized(length + margin * 2.0)
     defer solid.release()
     try extrude_into(solid.value(), &profile, length + before + after, "")
     try name_tool(solid.value(), name)
-    return try model_of(solid)
+    return try CadModel.of_brep(solid)
 
 ## The corner profile at `p` on an edge running `along`, between its faces'
 ## directions `ua` and `ub` (into each face): a chamfer's triangle `size`
@@ -282,11 +282,11 @@ func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity:
     let margin = 0.0 if square else size * 4.0 + length * 0.1
     var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(margin)), along, size, round, continuity)
     defer profile.close()
-    let solid = try new_solid(length + margin * 2.0)
+    let solid = try BrepModel.sized(length + margin * 2.0)
     defer solid.release()
     try extrude_into(solid.value(), &profile, length + margin * 2.0, "")
     try name_tool(solid.value(), name)
-    let swept = try model_of(solid)
+    let swept = try CadModel.of_brep(solid)
     if square: return swept
     defer swept.release()
     # Cut by the end faces' planes; the sides far off.
@@ -310,11 +310,11 @@ func end_plane(w: const Shape*, point: Vector3, fa: usize, fb: usize) -> (Vector
     for f in 0..<w.faces.count:
         if f == fa or f == fb: continue
         for use in w.face_uses(f):
-            let edge = w.edges.items[(usize)((use if use > 0 else -use) - 1)]
+            let edge = w.edges.items[edge_index(use)]
             if edge.start == vertex or edge.end == vertex:
                 if found >= 0 and found != (i64)f: error(invalid, "a concave blend must end at one flat face")
                 found = (i64)f
-    if found < 0 or w.surfaces.items[(usize)w.faces.items[(usize)found].surface].kind != 0: error(invalid, "a concave blend must end at one flat face")
+    if found < 0 or w.surfaces.items[(usize)w.faces.items[(usize)found].surface].kind != surface_plane: error(invalid, "a concave blend must end at one flat face")
     let n = face_outward(w, (usize)found)
     return (n, n.dot(w.surfaces.items[(usize)w.faces.items[(usize)found].surface].origin))
 
@@ -341,14 +341,14 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     let normal = carrier.x.cross(carrier.y)
-    let solid = try new_solid(carrier.a + size * 4.0)
+    let solid = try BrepModel.sized(carrier.a + size * 4.0)
     defer solid.release()
     if edge.start == edge.end:
         var profile = try corner_profile(p, along, ua, ub, size, round, continuity)
         defer profile.close()
         try revolve_into(solid.value(), &profile, carrier.origin, normal, (carrier.a + size) * 1e-7, "")
         try name_tool(solid.value(), name)
-        return try model_of(solid)
+        return try CadModel.of_brep(solid)
     # The axis turning the way the edge runs.
     var a = normal
     if a.cross(p.subtract(carrier.origin)).dot(along) < 0.0: a = normal.multiply_scalar(-1.0)
@@ -367,7 +367,7 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     defer profile.close()
     try revolve_into(solid.value(), &profile, carrier.origin, a, (carrier.a + size) * 1e-7, "", sweep + before + after)
     try name_tool(solid.value(), name)
-    return try model_of(solid)
+    return try CadModel.of_brep(solid)
 
 ## `model` with the edges `references` refers to (references.lucb; empty:
 ## every straight convex edge between two planes) blended: filleted to
@@ -393,7 +393,7 @@ pub func blended(model: const CadModel*, references: str, size: f64, round: bool
 func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize]*) -> !:
     if trimmed(references) == "":
         for e in 0..<w.edges.count:
-            if w.carriers.items[(usize)w.edges.items[e].carrier].kind == 0 and try blendable(w, e) and try convex(w, e): try chosen.push(e)
+            if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_line and try blendable(w, e) and try convex(w, e): try chosen.push(e)
     else:
         try resolve_edges(w, references, chosen)
         for e in chosen.view():
@@ -473,7 +473,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
         try blend_name(w, e, tag, &name)
         let adding = not try convex(w, e)
         # A rim is its own tool.
-        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != 0:
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line:
             let edge = w.edges.items[e]
             let at_start = vertex_in(joints.view(), edge.start)
             let at_end = vertex_in(joints.view(), edge.end)
@@ -608,7 +608,7 @@ func stepped(w: const Shape*, f: usize, p: Vector3, side: Vector3, distance: f64
 
 func on_face_surface(w: const Shape*, f: usize, p: Vector3) -> bool!:
     let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
-    if s.kind == 3: return true
+    if s.kind == surface_spline: return true
     return surface_distance(s, p) <= w.tolerance * 10.0
 
 ## A blend of `size` on edge `e` must reach less far than its faces go
@@ -623,7 +623,7 @@ func check_fits(w: const Shape*, e: usize, size: f64, round: bool) -> !:
     var reach_b = reach_a
     var around: i64 = -1
     let edge = w.edges.items[e]
-    if w.carriers.items[(usize)edge.carrier].kind == 0:
+    if w.carriers.items[(usize)edge.carrier].kind == curve_line:
         let cylinder = ruled_pair(w, e, fa, fb)
         if cylinder >= 0:
             around = cylinder
@@ -752,4 +752,4 @@ func copy_model(model: const CadModel*) -> interop.Reference[CadModel]!:
     defer w.close()
     let b = try brep_of(&w)
     defer b.release()
-    return try model_of(b)
+    return try CadModel.of_brep(b)

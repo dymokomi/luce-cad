@@ -1,0 +1,365 @@
+## Rational B-splines: curves and tensor-product surfaces evaluated by
+## local Cox-de Boor bases (only degree + 1 functions are nonzero at a
+## parameter), their bases' derivatives, exact surface normals, and the
+## checks a stored net passes once.
+
+pub struct NurbsCurve:
+    let reserved: u8 = 0
+
+    ## Rational B-spline curve at an actual knot-domain parameter.
+    pub static func at(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], t: f64) -> Vector3!:
+        try NurbsCurve.check(points, weights, degree, knots)
+        return try NurbsCurve.at_checked(points, weights, degree, knots, t)
+
+    ## Validate a curve's control net and knots once.
+    pub static func check(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[]) -> !:
+        let count = (i64)points.length
+        if count < 2 or weights.length != points.length:
+            error(invalid, "invalid B-spline curve control net")
+        try check_knots(knots, count, degree)
+        for index in 0..<points.length:
+            if not points[index].is_finite() or not math.is_finite(weights[index]) or weights[index] <= 0.0:
+                error(invalid, "invalid rational curve control point or weight")
+
+    ## A curve already accepted by check(), at a parameter: only the
+    ## parameter is checked, so stored curves are not revalidated per point.
+    pub static func at_checked(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], t: f64) -> Vector3!:
+        let count = (i64)points.length
+        if not math.is_finite(t) or t < knots[(usize)degree] or t > knots[(usize)count]:
+            error(invalid, "curve parameter outside knot domain")
+        var values: f64[9]
+        let first = nurbs_basis(knots, count, degree, t, &values)
+        var total: f64 = 0.0
+        var position = Vector3()
+        for at in 0..<(usize)degree + 1:
+            let index = first + at
+            let weight = values[at] * weights[index]
+            total += weight
+            position = position.add(points[index].multiply_scalar(weight))
+        if total <= 0.0 or not math.is_finite(total):
+            error(invalid, "invalid rational curve denominator")
+        return position.multiply_scalar(1.0 / total)
+
+    ## A curve already accepted by check(): its point and first and second
+    ## derivatives (by parameter) at `parameter`, exactly (the rational
+    ## quotient rule on the bases' derivatives).
+    pub static func derivatives_checked(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], t: f64) -> (Vector3, Vector3, Vector3)!:
+        let count = (i64)points.length
+        if not math.is_finite(t) or t < knots[(usize)degree] or t > knots[(usize)count]:
+            error(invalid, "curve parameter outside knot domain")
+        var ders: f64[27]
+        let first = basis_derivatives(knots, count, degree, t, &ders)
+        var a = [Vector3(), Vector3(), Vector3()]
+        var w: f64[3] = [0.0, 0.0, 0.0]
+        for k in 0..<(usize)3:
+            for at in 0..<(usize)degree + 1:
+                let index = first + at
+                let weight = ders[k * 9 + at] * weights[index]
+                w[k] += weight
+                a[k] = a[k].add(points[index].multiply_scalar(weight))
+        if w[0] <= 0.0 or not math.is_finite(w[0]):
+            error(invalid, "invalid rational curve denominator")
+        let p = a[0].multiply_scalar(1.0 / w[0])
+        let d1 = a[1].subtract(p.multiply_scalar(w[1])).multiply_scalar(1.0 / w[0])
+        let d2 = a[2].subtract(d1.multiply_scalar(2.0 * w[1])).subtract(p.multiply_scalar(w[2])).multiply_scalar(1.0 / w[0])
+        return (p, d1, d2)
+
+pub struct NurbsSurface:
+    let reserved: u8 = 0
+
+    ## Evaluate the retained analytic surface without generating polygons.
+    pub static func at(points: const Vector3[], weights: const f64[], nu: i64, nv: i64,
+                       du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
+        try validate(points, weights, nu, nv, du, dv, ku, kv)
+        if not math.is_finite(u) or not math.is_finite(v) or u < ku[(usize)du] or u > ku[(usize)nu] or v < kv[(usize)dv] or v > kv[(usize)nv]:
+            error(invalid, "surface parameter outside knot domain")
+        return try net_point(points, weights, nu, nv, du, dv, ku, kv, u, v)
+
+    ## Validate an analytic control net without creating a display mesh.
+    pub static func check(points: const Vector3[], weights: const f64[], nu: i64, nv: i64,
+                          degree_u: i64, degree_v: i64, knots_u: const f64[], knots_v: const f64[]) -> !:
+        try validate(points, weights, nu, nv, degree_u, degree_v, knots_u, knots_v)
+
+    ## Sample a control net already accepted by check(). CAD retains immutable
+    ## validated nets; do not revalidate every control point per Newton iteration.
+    pub static func sample_checked(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
+        if not math.is_finite(u) or not math.is_finite(v) or u < ku[(usize)du] or u > ku[(usize)nu] or v < kv[(usize)dv] or v > kv[(usize)nv]:
+            error(invalid, "surface parameter outside knot domain")
+        return try net_point(points, weights, nu, nv, du, dv, ku, kv, u, v)
+
+    ## Validate a rectangular subdomain, including finite and ordered bounds.
+    pub static func check_region(ku: const f64[], kv: const f64[], nu: i64, nv: i64, du: i64, dv: i64,
+                                 u0: f64, u1: f64, v0: f64, v1: f64) -> !:
+        if nu < 2 or nu > 1024 or nv < 2 or nv > 1024 or nu * nv > 262144:
+            error(invalid, "invalid NURBS dimensions")
+        try check_knots(ku, nu, du)
+        try check_knots(kv, nv, dv)
+        if not math.is_finite(u0) or not math.is_finite(u1) or not math.is_finite(v0) or not math.is_finite(v1) or u0 >= u1 or v0 >= v1:
+            error(invalid, "invalid NURBS trim rectangle")
+        if u0 < ku[(usize)du] or u1 > ku[(usize)nu] or v0 < kv[(usize)dv] or v1 > kv[(usize)nv]:
+            error(invalid, "NURBS trim rectangle is outside the surface domain")
+
+func validate(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[]) -> !:
+    if nu < 2 or nu > 1024 or nv < 2 or nv > 1024 or nu * nv > 262144 or points.length != (usize)(nu * nv) or weights.length != points.length:
+        error(invalid, "invalid NURBS control net")
+    try check_knots(ku, nu, du)
+    try check_knots(kv, nv, dv)
+    for index in 0..<points.length:
+        if not points[index].is_finite() or not math.is_finite(weights[index]) or weights[index] <= 0.0:
+            error(invalid, "NURBS requires finite control points and positive weights")
+
+func check_knots(knots: const f64[], count: i64, degree: i64) -> !:
+    if degree < 1 or degree > 8 or degree >= count or knots.length != (usize)(count + degree + 1):
+        error(invalid, "invalid NURBS degree or knot count")
+    for index in 0..<knots.length:
+        if not math.is_finite(knots[index]) or (index > 0 and knots[index] < knots[index - 1]):
+            error(invalid, "NURBS knots must be finite and nondecreasing")
+    if knots[(usize)count] <= knots[(usize)degree]:
+        error(invalid, "NURBS has an empty parameter interval")
+
+## The nonzero bases at `t` (only degree + 1 have support there) into
+## `values`, and the first one's index: a bisected span, then local
+## Cox-de Boor, so sampling does not grow with the net. Evaluators that
+## share an isoparameter (Newton differences, line searches) reuse them.
+pub inline func nurbs_basis(knots: const f64[], count: i64, degree: i64, t: f64, values: f64[9]*) -> usize:
+    var low = (usize)degree
+    var high = (usize)count
+    while low + 1 < high:
+        let middle = (low + high) // 2
+        if t < knots[middle]: high = middle
+        else: low = middle
+    let span = low
+    var left: f64[9]
+    var right: f64[9]
+    (*values)[0] = 1.0
+    for level in 1..<(usize)degree + 1:
+        left[level] = t - knots[span + 1 - level]
+        right[level] = knots[span + level] - t
+        var saved: f64 = 0.0
+        for at in 0..<level:
+            let denominator = right[at + 1] + left[level - at]
+            let temporary = (*values)[at] / denominator if denominator > 0.0 else 0.0
+            (*values)[at] = saved + right[at + 1] * temporary
+            saved = left[level - at] * temporary
+        (*values)[level] = saved
+    return span - (usize)degree
+
+## Nonzero basis functions and their first two derivatives at `t` (Piegl and
+## Tiller, The NURBS Book, A2.3): `ders[k * 9 + j]` is the k-th derivative of
+## basis function first + j (zero beyond the degree). Returns `first`. A zero
+## knot difference (repeated knots) divides to 0: that basis is zero there.
+pub func basis_derivatives(knots: const f64[], count: i64, degree: i64, t: f64, ders: f64[27]*) -> usize:
+    var low = (usize)degree
+    var high = (usize)count
+    while low + 1 < high:
+        let middle = (low + high) // 2
+        if t < knots[middle]: high = middle
+        else: low = middle
+    let span = low
+    let p = (usize)degree
+    var ndu: f64[81]
+    var left: f64[9]
+    var right: f64[9]
+    ndu[0] = 1.0
+    for j in 1..<p + 1:
+        left[j] = t - knots[span + 1 - j]
+        right[j] = knots[span + j] - t
+        var saved: f64 = 0.0
+        for r in 0..<j:
+            ndu[j * 9 + r] = right[r + 1] + left[j - r]
+            let temporary = ndu[r * 9 + j - 1] / ndu[j * 9 + r] if ndu[j * 9 + r] != 0.0 else 0.0
+            ndu[r * 9 + j] = saved + right[r + 1] * temporary
+            saved = left[j - r] * temporary
+        ndu[j * 9 + j] = saved
+    for j in 0..<27: (*ders)[j] = 0.0
+    for j in 0..<p + 1: (*ders)[j] = ndu[j * 9 + p]
+    var a: f64[18]
+    for r in 0..<p + 1:
+        var s1: usize = 0
+        var s2: usize = 1
+        a[0] = 1.0
+        for k in 1..<(usize)3:
+            if k > p: break
+            var d: f64 = 0.0
+            let rk = (i64)r - (i64)k
+            let pk = p - k
+            if r >= k:
+                let denominator = ndu[(pk + 1) * 9 + (usize)rk]
+                a[s2 * 9] = a[s1 * 9] / denominator if denominator != 0.0 else 0.0
+                d = a[s2 * 9] * ndu[(usize)rk * 9 + pk]
+            let j1: i64 = 1 if rk >= -1 else -rk
+            let j2: i64 = (i64)k - 1 if (i64)r - 1 <= (i64)pk else (i64)(p - r)
+            var j = j1
+            while j <= j2:
+                let denominator = ndu[(pk + 1) * 9 + (usize)(rk + j)]
+                a[s2 * 9 + (usize)j] = (a[s1 * 9 + (usize)j] - a[s1 * 9 + (usize)j - 1]) / denominator if denominator != 0.0 else 0.0
+                d += a[s2 * 9 + (usize)j] * ndu[(usize)(rk + j) * 9 + pk]
+                j += 1
+            if r <= pk:
+                let denominator = ndu[(pk + 1) * 9 + r]
+                a[s2 * 9 + k] = -a[s1 * 9 + k - 1] / denominator if denominator != 0.0 else 0.0
+                d += a[s2 * 9 + k] * ndu[r * 9 + pk]
+            (*ders)[k * 9 + r] = d
+            let swap = s1
+            s1 = s2
+            s2 = swap
+    var factor = (f64)p
+    for k in 1..<(usize)3:
+        if k > p: break
+        for j in 0..<p + 1: (*ders)[k * 9 + j] *= factor
+        factor *= (f64)(p - k)
+    return span - p
+
+## A surface's point at knot parameters (u, v), the hottest function of
+## CAD import: scalar sums in the same order as the
+## Vector3 form (fp contraction is off), so results are bit-identical.
+func net_point(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
+    var bu: f64[9]
+    var bv: f64[9]
+    let first_u = nurbs_basis(ku, nu, du, u, &bu)
+    let first_v = nurbs_basis(kv, nv, dv, v, &bv)
+    return try nurbs_combine(points, weights, nv, du, dv, first_u, &bu, first_v, &bv)
+
+## The rational point for two precomputed bases, summed exactly as evaluate().
+pub func nurbs_combine(points: const Vector3[], weights: const f64[], nv: i64, du: i64, dv: i64, first_u: usize, bu: f64[9]*, first_v: usize, bv: f64[9]*) -> Vector3!:
+    var x: f64 = 0.0
+    var y: f64 = 0.0
+    var z: f64 = 0.0
+    var total: f64 = 0.0
+    let columns = (usize)nv
+    let span_v = (usize)dv + 1
+    for iu in 0..<(usize)du + 1:
+        let row = (first_u + iu) * columns + first_v
+        let basis = (*bu)[iu]
+        for iv in 0..<span_v:
+            let index = row + iv
+            let weight = basis * (*bv)[iv] * weights[index]
+            let p = points[index]
+            x = x + p.x * weight
+            y = y + p.y * weight
+            z = z + p.z * weight
+            total += weight
+    if not math.is_finite(total) or total <= 0.0:
+        error(invalid, "invalid rational surface denominator")
+    let scale = 1.0 / total
+    return Vector3(x * scale, y * scale, z * scale)
+
+## Exact rational first-derivative normal on an immutable, check()-validated net.
+## Zero indicates a singular parameterization; the CAD caller handles its pole.
+pub func surface_normal_checked(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
+    if not math.is_finite(u) or not math.is_finite(v) or u < ku[(usize)du] or u > ku[(usize)nu] or v < kv[(usize)dv] or v > kv[(usize)nv]:
+        error(invalid, "normal parameter outside knot domain")
+    # Bases at [0..9], first derivatives at [9..18].
+    var bu: f64[27]
+    var bv: f64[27]
+    let first_u = basis_derivatives(ku, nu, du, u, &bu)
+    let first_v = basis_derivatives(kv, nv, dv, v, &bv)
+    var px: f64 = 0.0
+    var py: f64 = 0.0
+    var pz: f64 = 0.0
+    var pux: f64 = 0.0
+    var puy: f64 = 0.0
+    var puz: f64 = 0.0
+    var pvx: f64 = 0.0
+    var pvy: f64 = 0.0
+    var pvz: f64 = 0.0
+    var w: f64 = 0.0
+    var wu: f64 = 0.0
+    var wv: f64 = 0.0
+    # Derivatives are translation invariant. Accumulate in a local frame so
+    # a small patch far from the origin does not subtract large world moments.
+    # Scalar sums in the Vector3 form's order keep results bit-identical.
+    let origin = points[first_u * (usize)nv + first_v]
+    for iu in 0..<(usize)du + 1:
+        for iv in 0..<(usize)dv + 1:
+            let index = (first_u + iu) * (usize)nv + first_v + iv
+            let weight = bu[iu] * bv[iv] * weights[index]
+            let uweight = bu[9 + iu] * bv[iv] * weights[index]
+            let vweight = bu[iu] * bv[9 + iv] * weights[index]
+            let q = points[index]
+            let rx = q.x - origin.x
+            let ry = q.y - origin.y
+            let rz = q.z - origin.z
+            px = px + rx * weight
+            py = py + ry * weight
+            pz = pz + rz * weight
+            pux = pux + rx * uweight
+            puy = puy + ry * uweight
+            puz = puz + rz * uweight
+            pvx = pvx + rx * vweight
+            pvy = pvy + ry * vweight
+            pvz = pvz + rz * vweight
+            w += weight
+            wu += uweight
+            wv += vweight
+    if w <= 0.0 or not math.is_finite(w): error(invalid, "invalid normal denominator")
+    let inverse = 1.0 / w
+    let p = Vector3(px * inverse, py * inverse, pz * inverse)
+    let pu = Vector3(pux, puy, puz)
+    let pv = Vector3(pvx, pvy, pvz)
+    let a = pu.subtract(p.multiply_scalar(wu))
+    let b = pv.subtract(p.multiply_scalar(wv))
+    let al = a.length()
+    let bl = b.length()
+    if not math.is_finite(al) or not math.is_finite(bl): error(invalid, "nonfinite surface derivative")
+    if al == 0.0 or bl == 0.0: return Vector3()
+    # Normalize tangent magnitudes before crossing. A normal is a direction,
+    # not an area in model units or knot-domain units. Generic Vector3's fixed
+    # length cutoff rejected regular tiny patches and near-pole derivatives.
+    let n = a.multiply_scalar(1.0 / al).cross(b.multiply_scalar(1.0 / bl))
+    let length = n.length()
+    return n.multiply_scalar(1.0 / length) if length > 1e-14 else Vector3()
+
+## The cubic B-spline through `points` (chord-length parameters, clamped
+## ends, knots by averaging: Piegl and Tiller's interpolation): its net and
+## knots.
+pub func interpolate_cubic(points: const Vector3[], net: Growing[Vector3]*, knots: Growing[f64]*) -> !:
+    let n = points.length
+    if n < 4: error(invalid, "a traced curve needs more points")
+    var u = Growing[f64]()
+    defer u.close()
+    var total = 0.0
+    for at in 1..<n: total += points[at].subtract(points[at - 1]).length()
+    try u.push(0.0)
+    var run = 0.0
+    for at in 1..<n:
+        run += points[at].subtract(points[at - 1]).length()
+        try u.push(run / total)
+    knots.clear()
+    for _ in 0..<(usize)4: try knots.push(0.0)
+    for j in 1..<n - 3:
+        try knots.push((u.items[j] + u.items[j + 1] + u.items[j + 2]) / 3.0)
+    for _ in 0..<(usize)4: try knots.push(1.0)
+    # The banded system N P = Q: row k's four basis values start at its
+    # first nonzero basis's column, all within three of the diagonal
+    # (Schoenberg-Whitney, with averaged knots). Only that band is stored: entry (r, c) at
+    # band[r * 7 + c + 3 - r]. Gaussian elimination without pivoting (the
+    # system is totally positive) keeps the band.
+    var band = Growing[f64]()
+    defer band.close()
+    try band.fill(n * 7, 0.0)
+    for k in 0..<n:
+        var values: f64[9]
+        let first = nurbs_basis(knots.view(), (i64)n, 3, u.items[k], &values)
+        for c in 0..<(usize)4:
+            let column = first + c
+            if column >= n or values[c] == 0.0: continue
+            if column + 3 < k or column > k + 3: error(invalid, "a traced curve could not be fitted")
+            band.items[k * 7 + column + 3 - k] = values[c]
+    net.clear()
+    for p in points: try net.push(p)
+    for k in 0..<n:
+        let pivot = band.items[k * 7 + 3]
+        if math.abs(pivot) < 1e-300: error(invalid, "a traced curve could not be fitted")
+        let last = n if n < k + 4 else k + 4
+        for r in k + 1..<last:
+            let factor = band.items[r * 7 + k + 3 - r] / pivot
+            if factor == 0.0: continue
+            for c in k..<last: band.items[r * 7 + c + 3 - r] -= factor * band.items[k * 7 + c + 3 - k]
+            net.items[r] = net.items[r].subtract(net.items[k].multiply_scalar(factor))
+    var k = n
+    while k > 0:
+        k -= 1
+        var value = net.items[k]
+        for c in k + 1..<(n if n < k + 4 else k + 4): value = value.subtract(net.items[c].multiply_scalar(band.items[k * 7 + c + 3 - k]))
+        net.items[k] = value.multiply_scalar(1.0 / band.items[k * 7 + 3])

@@ -3,10 +3,8 @@
 import memory
 from luce_std import math
 from luce_geocore.geocore import Vector3, invalid
-from brep_types import Surface, Curve, BrepFace
+from geometry import Surface, Curve, BrepFace, edge_index, surface_point, chart_gap, chart_near, surface_plane, surface_cylinder, surface_cone, surface_spline, surface_torus
 from layout_types import UVChain, Stations
-from patch_sides import edge_index
-from mapped_patch import point
 from trim_memo import TrimMemo, memo_parameter
 
 pub func initialize(chains: UVChain[], face: BrepFace, s: Surface, vertices: const Vector3[], edges: const Curve[], cuts: const Stations[], tolerance: f64) -> !:
@@ -18,12 +16,12 @@ pub func initialize(chains: UVChain[], face: BrepFace, s: Surface, vertices: con
     for use in 0..<face.uses.length:
         for before in 0..<use:
             seam = seam or edge_index(face.uses[use]) == edge_index(face.uses[before])
-    if not seam and s.kind != 1 and s.kind != 2: return
+    if not seam and s.kind != surface_cylinder and s.kind != surface_cone: return
     let gap = chart_gap(s, tolerance)
     let closed_u = try closed_axis(s, 0, tolerance)
     let closed_v = try closed_axis(s, 1, tolerance)
     var complete = false
-    for initial in [Vector3(0.5, 0.5, 0.0), Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, 0.0)]:
+    for initial in chart_seeds():
         var valid = true
         var offset: usize = 0
         var loop_seed = initial
@@ -44,59 +42,47 @@ pub func initialize(chains: UVChain[], face: BrepFace, s: Surface, vertices: con
                 seed = uv[uv.length - 1 if use > 0 else 0]
                 # A jump across a closed support inside one sampled coedge is
                 # not an edge across the surface. Reject that chart branch.
-                if s.kind == 3:
+                if s.kind == surface_spline:
                     for i in 1..<uv.length:
                         if (closed_u and math.abs(uv[i].x - uv[i - 1].x) > 0.5) or (closed_v and math.abs(uv[i].y - uv[i - 1].y) > 0.5): valid = false
             if not chart_near(seed, first, gap): valid = false
             # A hole may begin on the other side of atan2's branch. Seed it
             # inside the outer chart, not independently around zero. This is
             # an integer-period chart choice; canonical geometry is unchanged.
-            if offset == 0 and (s.kind == 1 or s.kind == 2):
-                var low: f64 = 1e100
-                var high: f64 = -1e100
-                for at in 0..<(usize)size:
-                    for p in chains[at].points:
-                        low = math.min(low, p.x)
-                        high = math.max(high, p.x)
-                loop_seed = Vector3((low + high) * 0.5, 0.0, 0.0)
+            if offset == 0 and (s.kind == surface_cylinder or s.kind == surface_cone):
+                var span = Vector3(1e100, -1e100, 0.0)
+                for at in 0..<(usize)size: span = angle_span(span, chains[at].points)
+                loop_seed = hole_seed(span)
             offset += (usize)size
         if valid:
             complete = true
             break
     if not complete: error(invalid, "trim loops do not close in one support chart")
 
-## How far apart two points of `s`'s chart may be and still be one point,
-## per coordinate: a hundred times `tolerance` in model units, turned into
-## an angle about the surface's radius on a cylinder, cone, sphere or torus,
-## or into a fraction of a B-spline's control net across its normalized
-## domain. (A fixed gap was a tenth of a micron on a meter-sized model and
-## a tenth of a millimeter on a micron-sized one.)
-pub func chart_gap(s: Surface, tolerance: f64) -> Vector3:
-    let reach = tolerance * 100.0
-    if s.kind == 0: return Vector3(reach, reach, 0.0)
-    if s.kind == 1 or s.kind == 2: return Vector3(reach / math.max(s.radius, reach), reach, 0.0)
-    if s.kind == 4:
-        let angle = reach / math.max(s.radius, reach)
-        return Vector3(angle, angle, 0.0)
-    if s.kind == 5: return Vector3(reach / math.max(s.radius - s.angle, reach), reach / math.max(s.angle, reach), 0.0)
-    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
-    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
-    for p in s.points:
-        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
-        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
-    let fraction = reach / math.max(high.subtract(low).length(), reach)
-    return Vector3(fraction, fraction, 0.0)
+## The chart seeds a face's loops are chained from, in the order tried
+## (the tessellator's and the exporter's alike): the chart's middle, then
+## its corners.
+pub func chart_seeds() -> Vector3[5]:
+    return [Vector3(0.5, 0.5, 0.0), Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, 0.0)]
 
-## Whether chart points `a` and `b` are one point (chart_gap's `gap`).
-pub func chart_near(a: Vector3, b: Vector3, gap: Vector3) -> bool:
-    return math.abs(a.x - b.x) <= gap.x and math.abs(a.y - b.y) <= gap.y
+## `span` (lowest and highest angle, in x and y) widened by `points`.
+pub func angle_span(span: Vector3, points: const Vector3[]) -> Vector3:
+    var widened = span
+    for p in points: widened = Vector3(math.min(widened.x, p.x), math.max(widened.y, p.x), 0.0)
+    return widened
+
+## Where a hole of a face on a cylinder or cone starts chaining: inside the
+## outer loop's angles (`span`, angle_span), not around zero, since a hole
+## may begin on the other side of atan2's branch.
+pub func hole_seed(span: Vector3) -> Vector3:
+    return Vector3((span.x + span.y) * 0.5, 0.0, 0.0)
 
 func closed_axis(s: Surface, axis: usize, tolerance: f64) -> bool!:
-    if s.kind != 3: return false
+    if s.kind != surface_spline: return false
     for at in 0..<5:
         let t = (f64)at / 4.0
-        let a = try point(s, Vector3(0.0 if axis == 0 else t, t if axis == 0 else 0.0, 0.0))
-        let b = try point(s, Vector3(1.0 if axis == 0 else t, t if axis == 0 else 1.0, 0.0))
+        let a = try surface_point(s, Vector3(0.0 if axis == 0 else t, t if axis == 0 else 0.0, 0.0))
+        let b = try surface_point(s, Vector3(1.0 if axis == 0 else t, t if axis == 0 else 1.0, 0.0))
         if a.subtract(b).length() > math.max(1e-9, tolerance * 0.1): return false
     return true
 
@@ -160,11 +146,11 @@ pub func chart_identities(s: Surface, uv: const Vector3[], ids: const i64[], tol
                     result[at] = (i64)before
                     break
                 if not checked:
-                    closed_u = (try closed_axis(s, 0, tolerance)) if s.kind == 3 else s.kind != 0
-                    closed_v = (try closed_axis(s, 1, tolerance)) if s.kind == 3 else s.kind == 5
+                    closed_u = (try closed_axis(s, 0, tolerance)) if s.kind == surface_spline else s.kind != surface_plane
+                    closed_v = (try closed_axis(s, 1, tolerance)) if s.kind == surface_spline else s.kind == surface_torus
                     checked = true
-                let period_u = 1.0 if s.kind == 3 else 2.0 * math.pi
-                let period_v = 1.0 if s.kind == 3 else (2.0 * math.pi if s.kind == 5 else 0.0)
+                let period_u = 1.0 if s.kind == surface_spline else 2.0 * math.pi
+                let period_v = 1.0 if s.kind == surface_spline else (2.0 * math.pi if s.kind == surface_torus else 0.0)
                 let du = math.abs(d.x)
                 let dv = math.abs(d.y)
                 let periodic_u = closed_u and math.abs(du - period_u) < 1e-8

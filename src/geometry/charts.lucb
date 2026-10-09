@@ -1,0 +1,110 @@
+## Surface charts: each support's own coordinates, the inverse of its
+## point. A plane's (x, y) in its frame; a cylinder's or cone's (angle,
+## height); a sphere's (angle, latitude); a torus's (angle, tube angle); a
+## B-spline's normalized knot domain [0, 1] x [0, 1]. Normals by chart
+## coordinates or by point, and how far apart chart points may be and
+## still be one.
+
+## The point of analytic surface `s` (not a B-spline) at chart
+## coordinates (u, v).
+pub func analytic_point(s: Surface, u: f64, v: f64) -> Vector3:
+    if s.kind == surface_plane: return s.origin.add(s.x.multiply_scalar(u)).add(s.y.multiply_scalar(v))
+    let radial = s.x.multiply_scalar(math.cos(u)).add(s.y.multiply_scalar(math.sin(u)))
+    if s.kind == surface_sphere: return s.origin.add(radial.multiply_scalar(s.radius * math.cos(v))).add(s.z.multiply_scalar(s.radius * math.sin(v)))
+    if s.kind == surface_torus: return s.origin.add(radial.multiply_scalar(s.radius + s.angle * math.cos(v))).add(s.z.multiply_scalar(s.angle * math.sin(v)))
+    let slope = math.tan(s.angle) if s.kind == surface_cone else 0.0
+    return s.origin.add(radial.multiply_scalar(s.radius + v * slope)).add(s.z.multiply_scalar(v))
+
+## The point of `s` at chart coordinates `uv`.
+pub func surface_point(s: Surface, uv: Vector3) -> Vector3!:
+    if s.kind == surface_spline: return try evaluate(s, uv)
+    return analytic_point(s, uv.x, uv.y)
+
+## Analytic surface `s`'s chart coordinates of `p` (its foot on the surface
+## for a point off it); with `unwrap`, angles moved by whole turns to run
+## on from `previous`.
+pub func chart_uv(s: Surface, p: Vector3, previous: Vector3, unwrap: bool) -> Vector3:
+    let relative = p.subtract(s.origin)
+    let x = relative.dot(s.x)
+    let y = relative.dot(s.y)
+    let z = relative.dot(s.z)
+    if s.kind == surface_plane: return Vector3(x, y, 0.0)
+    let radius = math.sqrt(x * x + y * y)
+    var u = math.atan2(y, x)
+    var v = z
+    if s.kind == surface_sphere: v = math.atan2(z, radius)
+    elif s.kind == surface_torus: v = math.atan2(z, radius - s.radius)
+    if unwrap:
+        u = wrap(u, previous.x)
+        if s.kind == surface_torus: v = wrap(v, previous.y)
+    return Vector3(u, v, 0.0)
+
+## The chart coordinates of `p` on support `s`, which it must lie on within
+## `tolerance`; B-splines inverted from `previous`, angles unwrapped from it
+## when `unwrap`.
+pub func chart_parameter(s: Surface, p: Vector3, previous: Vector3, tolerance: f64, unwrap: bool = true) -> Vector3!:
+    if s.kind == surface_spline: return try project(s, p, previous, tolerance)
+    let uv = chart_uv(s, p, previous, unwrap)
+    if s.kind == surface_plane:
+        if math.abs(p.subtract(s.origin).dot(s.z)) > tolerance: error(invalid, "mapped planar boundary is outside its support tolerance")
+        return uv
+    if analytic_point(s, uv.x, uv.y).subtract(p).length() > tolerance:
+        error(invalid, "mapped boundary is outside its support tolerance")
+    return uv
+
+## A B-spline's unit normal (du x dv) at normalized parameters `uv`.
+pub func nurbs_normal(s: Surface, uv: Vector3) -> Vector3!:
+    let u0 = s.ku[(usize)s.du]
+    let v0 = s.kv[(usize)s.dv]
+    let u1 = s.ku[(usize)s.nu]
+    let v1 = s.kv[(usize)s.nv]
+    return try surface_normal_checked(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv, math.clamp(u0 + (u1 - u0) * uv.x, u0, u1), math.clamp(v0 + (v1 - v0) * uv.y, v0, v1))
+
+## Support `s`'s unit normal at chart coordinates `uv` (unplaced; a
+## B-spline's du x dv, zero at a singular point).
+pub func support_normal(s: Surface, uv: Vector3) -> Vector3!:
+    if s.kind == surface_plane: return s.z
+    if s.kind == surface_spline: return try nurbs_normal(s, uv)
+    let radial = s.x.multiply_scalar(math.cos(uv.x)).add(s.y.multiply_scalar(math.sin(uv.x)))
+    if s.kind == surface_sphere or s.kind == surface_torus:
+        return radial.multiply_scalar(math.cos(uv.y)).add(s.z.multiply_scalar(math.sin(uv.y)))
+    return try radial.subtract(s.z.multiply_scalar(math.tan(s.angle) if s.kind == surface_cone else 0.0)).normalized()
+
+## Support `s`'s unit normal at point `p` (on it, within `tolerance` for a
+## B-spline, which is inverted for its parameters); an error on an axis.
+pub func normal_at(s: const Surface*, p: Vector3, tolerance: f64) -> Vector3!:
+    let d = p.subtract(s.origin)
+    if s.kind == surface_plane: return s.z
+    if s.kind == surface_spline: return try nurbs_normal(*s, try project(*s, p, Vector3(0.5, 0.5, 0.0), tolerance))
+    if s.kind == surface_sphere: return try d.normalized()
+    let radial = try d.subtract(s.z.multiply_scalar(d.dot(s.z))).normalized()
+    if s.kind == surface_cylinder: return radial
+    # A cone opening by its half angle: radial out, tilted against the axis.
+    if s.kind == surface_cone: return try radial.multiply_scalar(math.cos(s.angle)).subtract(s.z.multiply_scalar(math.sin(s.angle))).normalized()
+    return try p.subtract(s.origin.add(radial.multiply_scalar(s.radius))).normalized()
+
+## How far apart two points of `s`'s chart may be and still be one point,
+## per coordinate: a hundred times `tolerance` in model units, turned into
+## an angle about the surface's radius on a cylinder, cone, sphere or torus,
+## or into a fraction of a B-spline's control net across its normalized
+## domain. (A fixed gap was a tenth of a micron on a meter-sized model and
+## a tenth of a millimeter on a micron-sized one.)
+pub func chart_gap(s: Surface, tolerance: f64) -> Vector3:
+    let reach = tolerance * 100.0
+    if s.kind == surface_plane: return Vector3(reach, reach, 0.0)
+    if s.kind == surface_cylinder or s.kind == surface_cone: return Vector3(reach / math.max(s.radius, reach), reach, 0.0)
+    if s.kind == surface_sphere:
+        let angle = reach / math.max(s.radius, reach)
+        return Vector3(angle, angle, 0.0)
+    if s.kind == surface_torus: return Vector3(reach / math.max(s.radius - s.angle, reach), reach / math.max(s.angle, reach), 0.0)
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for p in s.points:
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    let fraction = reach / math.max(high.subtract(low).length(), reach)
+    return Vector3(fraction, fraction, 0.0)
+
+## Whether chart points `a` and `b` are one point (`gap` from chart_gap).
+pub func chart_near(a: Vector3, b: Vector3, gap: Vector3) -> bool:
+    return math.abs(a.x - b.x) <= gap.x and math.abs(a.y - b.y) <= gap.y

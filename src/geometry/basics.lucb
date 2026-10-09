@@ -1,0 +1,87 @@
+## The CAD model's shared geometry (internal): the kinds of surfaces and
+## curves, B-rep records, rational B-spline evaluation and inversion, and
+## surface charts. Everything above it (layout, meshing, modeling, the
+## B-rep) reads geometry from here.
+##
+## This file: kind numbers, edge uses, angle unwrapping, owned copies,
+## union-find roots and decimal text.
+import memory
+from luce_std import math
+from luce_geocore.geocore import Vector3, Matrix4, invalid
+from luce_geocore.core.growing import Growing
+import interop
+import ownership
+import strings
+
+## Surface kinds (Surface.kind, FaceSupport.kind). A cone's `angle` is its
+## semi-angle, a torus's its minor radius.
+pub let surface_plane: i64 = 0
+pub let surface_cylinder: i64 = 1
+pub let surface_cone: i64 = 2
+pub let surface_spline: i64 = 3
+pub let surface_sphere: i64 = 4
+pub let surface_torus: i64 = 5
+
+## Curve kinds (Curve.kind, the modeling shape's Carrier.kind).
+pub let curve_line: i64 = 0
+pub let curve_circle: i64 = 1
+pub let curve_spline: i64 = 2
+pub let curve_ellipse: i64 = 3
+
+## Tolerances. A model's tolerance is a millionth of its extent, never
+## under least_tolerance (tolerance_for): what a new solid gets, and what
+## file imports bring. Points within it are one point; chart points are
+## compared at a hundred times it, in each chart's units (chart_gap). A
+## boolean works to a tenth of its inputs' (1e-7 of their extent), so
+## results fed back in do not grow their tolerance, and writes its result
+## at twenty times that (boolean.lucb).
+pub let least_tolerance: f64 = 1e-9
+
+## The tolerance of a model of extent `size`.
+pub func tolerance_for(size: f64) -> f64:
+    return math.max(least_tolerance, size * 1e-6)
+
+## The zero-based edge of a signed one-based edge use (+(edge + 1) runs
+## the edge forward, -(edge + 1) backward).
+pub func edge_index(use: i64) -> usize:
+    return (usize)(use - 1 if use > 0 else -use - 1)
+
+## Angle `value` moved by whole turns to within half a turn of `previous`.
+pub func wrap(value: f64, previous: f64) -> f64:
+    var result = value
+    while result - previous > math.pi: result -= 2.0 * math.pi
+    while result - previous < -math.pi: result += 2.0 * math.pi
+    return result
+
+## A heap copy of `values`; empty (nothing allocated, nothing to free)
+## when `values` is.
+pub func copied[T](values: const T[]) -> T[]!:
+    var empty: T[]
+    if values.length == 0: return empty
+    let result = try new T[values.length] --- in memory.heap
+    memory.copy(result, values, values.length)
+    return result
+
+## Union-find: the root of `at` in `parents` (a root is its own parent),
+## halving the path on the way.
+pub func union_root(parents: usize[], at: usize) -> usize:
+    var node = at
+    while parents[node] != node:
+        parents[node] = parents[parents[node]]
+        node = parents[node]
+    return node
+
+## `number` in decimal onto `out`.
+pub func push_decimal(out: Growing[u8]*, number: i64) -> !:
+    if number < 0: try out.push(45)
+    var rest: u64 = (u64)number if number >= 0 else (u64)(-(number + 1)) + 1
+    var digits: u8[24]
+    var count: usize = 0
+    while true:
+        digits[count] = (u8)(48 + rest % 10)
+        count += 1
+        rest = rest // 10
+        if rest == 0: break
+    while count > 0:
+        count -= 1
+        try out.push(digits[count])

@@ -1,0 +1,78 @@
+## Rational B-spline evaluation (geometry/nurbs.lucb): a patch's grid, a
+## rational quarter circle and quarter cylinder (normals from the rational
+## quotient's derivative, on knot domains that are not [0, 1]), and local
+## support over a large net at both ends of its domain.
+from luce_std import math
+from luce_geocore.geocore import Vector3, invalid
+from geometry import NurbsCurve, NurbsSurface, surface_normal_checked
+from patch_grid import nurbs_grid
+
+pub func nurbs_contracts() -> !:
+    try grids()
+    try rational()
+    try local_support()
+
+func near(a: f64, b: f64, what: str) -> !:
+    if math.abs(a - b) >= 1e-6: error(invalid, what)
+
+## A bilinear patch's 2 x 2 grid (its middle point at the patch's middle),
+## and a rational quarter cylinder's (its middle on the circle).
+func grids() -> !:
+    let net: Vector3[4] = [Vector3(), Vector3(0.0, 0.0, 2.0), Vector3(2.0, 0.0, 0.0), Vector3(2.0, 0.0, 2.0)]
+    let ones: f64[4] = [1.0, 1.0, 1.0, 1.0]
+    let knots: f64[4] = [0.0, 0.0, 1.0, 1.0]
+    let patch = try nurbs_grid(net[..<4], ones[..<4], 2, 2, 1, 1, knots[..<4], knots[..<4], 0.0, 1.0, 0.0, 1.0, 2)
+    defer patch.release()
+    if patch.value().point_count() != 9 or patch.value().face_count() != 4: error(invalid, "a patch's grid has the wrong size")
+    let middle = try patch.value().point(4)
+    try near(middle.x, 1.0, "a patch's grid middle is off")
+    try near(middle.z, 1.0, "a patch's grid middle is off")
+    let curved: Vector3[6] = [Vector3(1.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.0), Vector3(1.0, 0.0, 1.0), Vector3(1.0, 1.0, 1.0), Vector3(0.0, 0.0, 1.0), Vector3(0.0, 1.0, 1.0)]
+    let weights: f64[6] = [1.0, 1.0, 0.7071067811865476, 0.7071067811865476, 1.0, 1.0]
+    let ku: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    let quarter = try nurbs_grid(curved[..<6], weights[..<6], 3, 2, 2, 1, ku[..<6], knots[..<4], 0.0, 1.0, 0.0, 1.0, 2)
+    defer quarter.release()
+    let arc = try quarter.value().point(4)
+    try near(arc.x, 0.7071067811865476, "a quarter cylinder's grid middle is off its circle")
+    try near(arc.z, 0.7071067811865476, "a quarter cylinder's grid middle is off its circle")
+
+## A rational quarter circle's middle, and a quarter cylinder's normals
+## (radial) over knot domains [7, 11] x [-2, 3].
+func rational() -> !:
+    let arc_net: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.0), Vector3(0.0, 1.0, 0.0)]
+    let arc_weights: f64[3] = [1.0, 0.7071067811865476, 1.0]
+    let arc_knots: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    let arc = try NurbsCurve.at(arc_net[..<3], arc_weights[..<3], 2, arc_knots[..<6], 0.5)
+    try near(arc.x, 0.7071067811865476, "a rational arc's middle is off its circle")
+    try near(arc.y, 0.7071067811865476, "a rational arc's middle is off its circle")
+    let net: Vector3[6] = [Vector3(1.0, 0.0, 0.0), Vector3(1.0, 0.0, 2.0), Vector3(1.0, 1.0, 0.0), Vector3(1.0, 1.0, 2.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 1.0, 2.0)]
+    let weights: f64[6] = [1.0, 1.0, 0.7071067811865476, 0.7071067811865476, 1.0, 1.0]
+    let ku: f64[6] = [7.0, 7.0, 7.0, 11.0, 11.0, 11.0]
+    let kv: f64[4] = [-2.0, -2.0, 3.0, 3.0]
+    try NurbsSurface.check(net[..<6], weights[..<6], 3, 2, 2, 1, ku[..<6], kv[..<4])
+    let us: f64[5] = [7.0, 8.0, 9.0, 10.0, 11.0]
+    let vs: f64[3] = [-2.0, 0.5, 3.0]
+    for u in us:
+        for v in vs:
+            let p = try NurbsSurface.at(net[..<6], weights[..<6], 3, 2, 2, 1, ku[..<6], kv[..<4], u, v)
+            let n = try surface_normal_checked(net[..<6], weights[..<6], 3, 2, 2, 1, ku[..<6], kv[..<4], u, v)
+            if n.subtract(Vector3(p.x, p.y, 0.0)).length() >= 1e-8: error(invalid, "a rational quarter cylinder's normal is not radial")
+
+## A 65 x 2 net, evaluated at its domain's ends and inside.
+func local_support() -> !:
+    var net: Vector3[130] = ---
+    var weights: f64[130] = ---
+    var knots: f64[67] = ---
+    knots[0] = 0.0
+    for u in 0..<(usize)65:
+        knots[u + 1] = (f64)u
+        for v in 0..<(usize)2:
+            net[u * 2 + v] = Vector3((f64)u, (f64)v, 0.0)
+            weights[u * 2 + v] = 1.0
+    knots[66] = 64.0
+    let kv: f64[4] = [0.0, 0.0, 1.0, 1.0]
+    let us: f64[3] = [0.0, 12.25, 64.0]
+    for u in us:
+        let p = try NurbsSurface.at(net[..<130], weights[..<130], 65, 2, 1, 1, knots[..<67], kv[..<4], u, 0.75)
+        try near(p.x, u, "local-support evaluation is off")
+        try near(p.y, 0.75, "local-support evaluation is off")

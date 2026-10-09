@@ -22,7 +22,7 @@ func piece_point(work: Work*, traced: const Shape*, f: usize, pieces: const Piec
     # Angles count by the radius, so clearances compare like lengths.
     let s = &work.w.surfaces.items[(usize)face.surface]
     let wraps = periodic(s)
-    let scale = 1.0 if s.kind == 0 or s.kind == 3 else math.max(s.radius, 1e-300)
+    let scale = 1.0 if s.kind == surface_plane or s.kind == surface_spline else math.max(s.radius, 1e-300)
     # The chart with angles scaled, for clearances.
     var scaled = Growing[Vector3]()
     defer scaled.close()
@@ -44,7 +44,7 @@ func piece_point(work: Work*, traced: const Shape*, f: usize, pieces: const Piec
             let v = from_v + cell_v * (f64)row
             for column in 0..<columns:
                 let u = from_u + cell_u * (f64)column
-                if chart_winding(chart.view(), starts.view(), u, v, wraps, s.kind == 5) == 0: continue
+                if chart_winding(chart.view(), starts.view(), u, v, wraps, s.kind == surface_torus) == 0: continue
                 let clearance = nearest_segment(scaled.view(), starts.view(), u * scale, v, best)
                 if clearance > best:
                     best = clearance
@@ -60,7 +60,7 @@ func piece_point(work: Work*, traced: const Shape*, f: usize, pieces: const Piec
         rows = 7
         _ = round
     if best < 0.0: error(invalid, "a face piece has no inside to classify")
-    return try surface_point(&work.w.surfaces.items[(usize)face.surface], best_u, best_v)
+    return try surface_point(work.w.surfaces.items[(usize)face.surface], Vector3(best_u, best_v, 0.0))
 
 ## The distance from (`u`, `v`) to the nearest segment of the loops of
 ## `points` (from `starts`), or a smaller one as soon as it is below
@@ -86,16 +86,6 @@ func nearest_segment(points: const Vector3[], starts: const usize[], u: f64, v: 
                 nearest = d
                 if nearest <= floor: return math.sqrt(nearest)
     return math.sqrt(nearest)
-
-## The point of `s` at chart coordinates (u, v) (surface_uv's inverse).
-func surface_point(s: const Surface*, u: f64, v: f64) -> Vector3!:
-    if s.kind == 0: return s.origin.add(s.x.multiply_scalar(u)).add(s.y.multiply_scalar(v))
-    if s.kind == 3: return try evaluate(*s, Vector3(u, v, 0.0))
-    let around = s.x.multiply_scalar(math.cos(u)).add(s.y.multiply_scalar(math.sin(u)))
-    if s.kind == 1: return s.origin.add(around.multiply_scalar(s.radius)).add(s.z.multiply_scalar(v))
-    if s.kind == 2: return s.origin.add(around.multiply_scalar(s.radius + v * math.tan(s.angle))).add(s.z.multiply_scalar(v))
-    if s.kind == 4: return s.origin.add(around.multiply_scalar(s.radius * math.cos(v))).add(s.z.multiply_scalar(s.radius * math.sin(v)))
-    return s.origin.add(around.multiply_scalar(s.radius + s.angle * math.cos(v))).add(s.z.multiply_scalar(s.angle * math.sin(v)))
 
 ## What pieces are classified against: both solids' faces (their charts,
 ## for exact rays, and boxes), B-spline surfaces' Bezier patches, and
@@ -159,22 +149,17 @@ func find_blocks(work: const Work*, traced: const Shape*, pieces: const Pieces*,
         let solid: usize = 0 if work.is_a(piece_face[p]) else 1
         for c in pieces.piece_cycles(p):
             for use in pieces.cycle(c):
-                let e = (usize)((use if use > 0 else -use) - 1)
+                let e = edge_index(use)
                 if clear.items[e] < 0: clear.items[e] = 1 if try keeps_clear(work, traced, e, solid) else 0
                 if clear.items[e] == 0: continue
                 let other = seen.items[e * 2 + solid]
                 if other < 0:
                     seen.items[e * 2 + solid] = (i64)p
                     continue
-                let ra = block_root(&others.block, p)
-                let rb = block_root(&others.block, (usize)other)
+                let ra = union_root(others.block.items, p)
+                let rb = union_root(others.block.items, (usize)other)
                 if ra < rb: others.block.items[rb] = ra
                 elif rb < ra: others.block.items[ra] = rb
-
-func block_root(block: Growing[usize]*, p: usize) -> usize:
-    var at = p
-    while block.items[at] != at: at = block.items[at]
-    return at
 
 ## Whether final edge `e`'s middle is well clear of every surface of the
 ## solid other than `solid` (B-spline surfaces: never assumed).
@@ -186,19 +171,19 @@ func keeps_clear(work: const Work*, traced: const Shape*, e: usize, solid: usize
     let last = w.faces.count if solid == 0 else work.faces_a
     for f in first..<last:
         let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
-        if s.kind == 3: return false
+        if s.kind == surface_spline: return false
         if surface_distance(s, middle) <= work.tol * 1000.0: return false
     return true
 
 ## How far `p` is from surface `s` (analytic).
 func surface_distance(s: const Surface*, p: Vector3) -> f64:
     let d = p.subtract(s.origin)
-    if s.kind == 0: return math.abs(d.dot(s.z))
-    if s.kind == 4: return math.abs(d.length() - s.radius)
+    if s.kind == surface_plane: return math.abs(d.dot(s.z))
+    if s.kind == surface_sphere: return math.abs(d.length() - s.radius)
     let h = d.dot(s.z)
     let radial = math.sqrt(math.max(0.0, d.dot(d) - h * h))
-    if s.kind == 1: return math.abs(radial - s.radius)
-    if s.kind == 2:
+    if s.kind == surface_cylinder: return math.abs(radial - s.radius)
+    if s.kind == surface_cone:
         # Across the cone's line: the radial gap, foreshortened.
         return math.abs(radial - (s.radius + h * math.tan(s.angle))) * math.cos(s.angle)
     let ring = radial - s.radius
@@ -221,7 +206,7 @@ func classify(work: Work*, traced: const Shape*, f: usize, pieces: const Pieces*
         if try face_contains(&work.w, partner, point, work.tol) != outside:
             return class_same if pair.same else class_opposite
     # Its block's, once known.
-    let block = block_root(&others.block, p)
+    let block = union_root(others.block.items, p)
     if others.block_class.items[block] >= 0: return others.block_class.items[block]
     let class = try ray_class(work, f, point, others)
     others.block_class.items[block] = class

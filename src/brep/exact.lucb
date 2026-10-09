@@ -4,7 +4,11 @@
 ## at the stations the display tessellation starts from (each edge's
 ## baseline intervals for the same divisions and the model's tolerance) and
 ## chained across coedges as the tessellator chains them (trim_chains), so
-## a periodic support keeps each loop in one chart.
+## a periodic support keeps each loop in one chart. Beyond the
+## tessellator's chaining (trim_chains.initialize: the same seeds, coedge
+## refreshes, hole seeding and chart gap), an exported outline closes
+## through singular points and along a pole or apex, which the layout
+## never needs.
 ##
 ## Charts (mapped_patch.parameter): a plane's (x, y) in its frame; a
 ## cylinder's or cone's (angle, height); a sphere's (angle, latitude); a
@@ -14,8 +18,8 @@
 import curve_spacing as spacing
 from edge_sampling import compact_seams, curve_intervals
 from layout_types import Stations, UVChain
-from trim_chains import refreshed, chart_gap, chart_near
-from patch_sides import edge_index
+from geometry import chart_gap, chart_near
+from trim_chains import refreshed, chart_seeds, angle_span, hole_seed
 
 ## A face's support, copied out of the model.
 pub struct FaceSupport:
@@ -63,7 +67,7 @@ pub struct FaceSupport:
 ## hemisphere, bounded by its equator alone) closes along the singular
 ## line on the face's side.
 func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], edges: const Curve[], stations: const Stations[], tolerance: f64, initial: Vector3, uv: Growing[Vector3]*, sizes: Growing[i64]*) -> bool!:
-    let period = 2.0 * math.pi if surface.kind == 1 or surface.kind == 2 or surface.kind == 4 or surface.kind == 5 else 0.0
+    let period = 2.0 * math.pi if surface.kind == surface_cylinder or surface.kind == surface_cone or surface.kind == surface_sphere or surface.kind == surface_torus else 0.0
     let gap = chart_gap(surface, tolerance)
     var offset: usize = 0
     var loop_seed = initial
@@ -101,13 +105,7 @@ func chain_loops(face: BrepFace, surface: Surface, vertices: const Vector3[], ed
             return false
         try sizes.push((i64)(uv.count - start))
         # A hole on a periodic support is seeded inside the outer loop's chart.
-        if offset == 0 and (surface.kind == 1 or surface.kind == 2):
-            var low: f64 = 1e100
-            var high: f64 = -1e100
-            for point in uv.view()[start..]:
-                low = math.min(low, point.x)
-                high = math.max(high, point.x)
-            loop_seed = Vector3((low + high) * 0.5, 0.0, 0.0)
+        if offset == 0 and (surface.kind == surface_cylinder or surface.kind == surface_cone): loop_seed = hole_seed(angle_span(Vector3(1e100, -1e100, 0.0), uv.view()[start..]))
         offset += (usize)size
     return true
 
@@ -136,15 +134,15 @@ func close_loop(face: BrepFace, surface: Surface, gap: Vector3, period: f64, uv:
 
 ## Whether chart point `p` is singular: a cone's apex or a sphere's pole.
 func singular(surface: Surface, p: Vector3, tolerance: f64) -> bool:
-    if surface.kind == 4: return math.abs(math.abs(p.y) - math.pi * 0.5) < 1e-6
-    if surface.kind == 2: return math.abs(surface.radius + p.y * math.tan(surface.angle)) <= tolerance
+    if surface.kind == surface_sphere: return math.abs(math.abs(p.y) - math.pi * 0.5) < 1e-6
+    if surface.kind == surface_cone: return math.abs(surface.radius + p.y * math.tan(surface.angle)) <= tolerance
     return false
 
 ## The singular line's v above `level` (`upward`) or below it: a sphere's
 ## pole, a cone's apex on that side; none elsewhere.
 func singular_height(surface: Surface, upward: bool, level: f64) -> f64?:
-    if surface.kind == 4: return math.pi * 0.5 if upward else -math.pi * 0.5
-    if surface.kind == 2:
+    if surface.kind == surface_sphere: return math.pi * 0.5 if upward else -math.pi * 0.5
+    if surface.kind == surface_cone:
         let slope = math.tan(surface.angle)
         if slope == 0.0: return none
         let apex = -surface.radius / slope
@@ -209,7 +207,7 @@ extend BrepModel:
             for step in 0..<count + 1: _ = try stations[at].insert(metrics[index].station((f64)step / (f64)count), 1e-12)
         let vertices = self.vertices.view()
         # Seeds as trim_chains.initialize tries them: one chart for every loop.
-        for initial in [Vector3(0.5, 0.5, 0.0), Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, 0.0)]:
+        for initial in chart_seeds():
             uv.clear()
             sizes.clear()
             if try chain_loops(entry, surface, vertices, edges, stations, self.tolerance, initial, uv, sizes): return

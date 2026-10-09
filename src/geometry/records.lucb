@@ -1,26 +1,10 @@
-## Owned exact B-rep curve/surface records, independent of file syntax.
-import memory
-import interop
-from luce_std import math
-from luce_geocore.geocore import Vector3, Matrix4, invalid
-from tessellation.surface import NurbsCurve, NurbsSurface
+## B-rep records the tessellator and exporters read: owned copies of a
+## model's curves, surfaces and faces, independent of file syntax.
 
 ## Shared, immutable boundary discretization borrowed by face workers.
 pub struct Samples:
     pub let ids: i64[]
     pub let baseline: i64[]
-
-pub func copy_numbers(values: const f64[]) -> f64[]!:
-    let result = try new f64[values.length] --- in memory.heap
-    for at in 0..<values.length:
-        result[at] = values[at]
-    return result
-
-pub func copy_points(values: const Vector3[]) -> Vector3[]!:
-    let result = try new Vector3[values.length] --- in memory.heap
-    for at in 0..<values.length:
-        result[at] = values[at]
-    return result
 
 pub struct Curve:
     pub let kind: i64
@@ -43,11 +27,13 @@ pub struct Curve:
     pub func init(kind: i64, start: i64, end: i64, origin: Vector3, x: Vector3, y: Vector3, radius: f64,
                   points: const Vector3[], weights: const f64[], knots: const f64[], degree: i64, sense: bool,
                   angle: f64 = 0.0, sweep: f64 = 0.0) -> !:
-        let p = try copy_points(points)
-        errdefer free(p) in memory.heap
-        let w = try copy_numbers(weights)
-        errdefer free(w) in memory.heap
-        let k = try copy_numbers(knots)
+        let p = try copied[Vector3](points)
+        errdefer:
+            if p.length > 0: free(p) in memory.heap
+        let w = try copied[f64](weights)
+        errdefer:
+            if w.length > 0: free(w) in memory.heap
+        let k = try copied[f64](knots)
         self.kind = kind
         self.start = start
         self.end = end
@@ -66,11 +52,11 @@ pub struct Curve:
     pub func at(fraction: f64) -> Vector3!:
         if fraction < 0.0 or fraction > 1.0 or not math.is_finite(fraction):
             error(invalid, "invalid curve fraction")
-        if self.kind == 0:
+        if self.kind == curve_line:
             return self.points[0].add(self.points[1].subtract(self.points[0]).multiply_scalar(fraction))
-        if self.kind == 1 or self.kind == 3:
+        if self.kind == curve_circle or self.kind == curve_ellipse:
             let a = self.angle + self.sweep * fraction
-            let minor = self.weights[0] if self.kind == 3 else self.radius
+            let minor = self.weights[0] if self.kind == curve_ellipse else self.radius
             return self.origin.add(self.x.multiply_scalar(self.radius * math.cos(a))).add(self.y.multiply_scalar(minor * math.sin(a)))
         let low = self.knots[(usize)self.degree]
         let high = self.knots[self.points.length]
@@ -89,9 +75,9 @@ pub struct Curve:
         return try NurbsCurve.at(self.points, self.weights, self.degree, self.knots, math.clamp(parameter, low, high))
 
     pub func close():
-        free(self.points) in memory.heap
-        free(self.weights) in memory.heap
-        free(self.knots) in memory.heap
+        if self.points.length > 0: free(self.points) in memory.heap
+        if self.weights.length > 0: free(self.weights) in memory.heap
+        if self.knots.length > 0: free(self.knots) in memory.heap
 
 pub struct Surface:
     pub let kind: i64
@@ -118,14 +104,17 @@ pub struct Surface:
     pub func init(kind: i64, origin: Vector3, x: Vector3, z: Vector3, radius: f64, angle: f64,
                   points: const Vector3[], weights: const f64[], ku: const f64[], kv: const f64[],
                   nu: i64, nv: i64, du: i64, dv: i64) -> !:
-        if kind == 3: try NurbsSurface.check(points, weights, nu, nv, du, dv, ku, kv)
-        let p = try copy_points(points)
-        errdefer free(p) in memory.heap
-        let w = try copy_numbers(weights)
-        errdefer free(w) in memory.heap
-        let u = try copy_numbers(ku)
-        errdefer free(u) in memory.heap
-        let v = try copy_numbers(kv)
+        if kind == surface_spline: try NurbsSurface.check(points, weights, nu, nv, du, dv, ku, kv)
+        let p = try copied[Vector3](points)
+        errdefer:
+            if p.length > 0: free(p) in memory.heap
+        let w = try copied[f64](weights)
+        errdefer:
+            if w.length > 0: free(w) in memory.heap
+        let u = try copied[f64](ku)
+        errdefer:
+            if u.length > 0: free(u) in memory.heap
+        let v = try copied[f64](kv)
         self.kind = kind
         self.origin = origin
         self.x = x
@@ -147,10 +136,10 @@ pub struct Surface:
         return try NurbsSurface.sample_checked(self.points, self.weights, self.nu, self.nv, self.du, self.dv, self.ku, self.kv, u, v)
 
     pub func close():
-        free(self.points) in memory.heap
-        free(self.weights) in memory.heap
-        free(self.ku) in memory.heap
-        free(self.kv) in memory.heap
+        if self.points.length > 0: free(self.points) in memory.heap
+        if self.weights.length > 0: free(self.weights) in memory.heap
+        if self.ku.length > 0: free(self.ku) in memory.heap
+        if self.kv.length > 0: free(self.kv) in memory.heap
 
 pub struct BrepFace:
     pub var path: interop.Packet[str]?
@@ -167,19 +156,16 @@ pub struct BrepFace:
         self.placement = Matrix4()
         self.color = Vector3(1.0, 1.0, 1.0)
         self.colored = false
-        let copied = try new i64[uses.length] --- in memory.heap
-        errdefer free(copied) in memory.heap
-        let counts = try new i64[sizes.length] --- in memory.heap
-        for at in 0..<uses.length:
-            copied[at] = uses[at]
-        for at in 0..<sizes.length:
-            counts[at] = sizes[at]
+        let owned_uses = try copied[i64](uses)
+        errdefer:
+            if owned_uses.length > 0: free(owned_uses) in memory.heap
+        let owned_sizes = try copied[i64](sizes)
         self.surface = surface
-        self.uses = copied
-        self.sizes = counts
+        self.uses = owned_uses
+        self.sizes = owned_sizes
         self.sense = sense
 
     pub func close():
-        free(self.uses) in memory.heap
-        free(self.sizes) in memory.heap
+        if self.uses.length > 0: free(self.uses) in memory.heap
+        if self.sizes.length > 0: free(self.sizes) in memory.heap
         if let path = self.path: path.release()

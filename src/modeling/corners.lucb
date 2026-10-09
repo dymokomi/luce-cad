@@ -103,7 +103,7 @@ func corner_tool(w: const Shape*, ball: const Ball*, radius: f64, name: str) -> 
             var at_corner = false
             var on_edge = false
             for use in w.face_uses(f):
-                let k = (usize)((use if use > 0 else -use) - 1)
+                let k = edge_index(use)
                 if k == e: on_edge = true
                 let other = w.edges.items[k]
                 if other.start == ball.vertex or other.end == ball.vertex: at_corner = true
@@ -129,12 +129,12 @@ func corner_tool(w: const Shape*, ball: const Ball*, radius: f64, name: str) -> 
     let named = try shape.add_name(name)
     for f in 0..<shape.faces.count:
         let kind = shape.surfaces.items[(usize)shape.faces.items[f].surface].kind
-        shape.faces.items[f].name = named if kind == 4 else -1
+        shape.faces.items[f].name = named if kind == surface_sphere else -1
     return try shape_model(&shape)
 
 ## A solid ball about `center`, its poles along `pole`.
 func ball_at(center: Vector3, pole: Vector3, radius: f64) -> interop.Reference[CadModel]!:
-    let solid = try new_solid(radius * 4.0)
+    let solid = try BrepModel.sized(radius * 4.0)
     defer solid.release()
     let b = solid.value()
     let x = try across(pole)
@@ -146,13 +146,13 @@ func ball_at(center: Vector3, pole: Vector3, radius: f64) -> interop.Reference[C
     _ = try b.add_face(sphere, north[..<1], sizes[..<1])
     let south: i64[1] = [-(equator + 1)]
     _ = try b.add_face(sphere, south[..<1], sizes[..<1])
-    return try model_of(solid)
+    return try CadModel.of_brep(solid)
 
 ## The hexahedron of six half-spaces n . p <= offset (outward `normals`),
 ## plane i opposite plane i + 3: corner bits (b0, b1, b2) where planes
 ## i + 3 b_i meet. `size` scales its tolerance.
 func hexahedron(normals: const Vector3[], offsets: const f64[], size: f64) -> interop.Reference[CadModel]!:
-    let solid = try new_solid(size * 8.0)
+    let solid = try BrepModel.sized(size * 8.0)
     defer solid.release()
     let b = solid.value()
     var three_normals: Vector3[3] = [Vector3(), Vector3(), Vector3()]
@@ -202,7 +202,7 @@ func hexahedron(normals: const Vector3[], offsets: const f64[], size: f64) -> in
         let plane = try b.add_surface(0, corners[ring[0]], normals[side], corners[ring[1]].subtract(corners[ring[0]]))
         let sizes: i64[1] = [4]
         _ = try b.add_face(plane, uses[..<4], sizes[..<1])
-    return try model_of(solid)
+    return try CadModel.of_brep(solid)
 
 ## How many edges meet at vertex `v`.
 func edge_degree(w: const Shape*, v: i64) -> i64:
@@ -222,11 +222,11 @@ func ball_center(w: const Shape*, v: i64, radius: f64) -> Vector3!:
     for f in 0..<w.faces.count:
         var touches = false
         for use in w.face_uses(f):
-            let edge = w.edges.items[(usize)((use if use > 0 else -use) - 1)]
+            let edge = w.edges.items[edge_index(use)]
             if edge.start == v or edge.end == v: touches = true
         if not touches: continue
         let s = w.surfaces.items[(usize)w.faces.items[f].surface]
-        if s.kind != 0: error(invalid, "fillets meeting at a corner need flat faces there")
+        if s.kind != surface_plane: error(invalid, "fillets meeting at a corner need flat faces there")
         let n = face_outward(w, f)
         try normals.push(n)
         try offsets.push(n.dot(s.origin) - radius)
@@ -240,7 +240,7 @@ func corner_name(w: const Shape*, v: usize, tag: str, out: Growing[u8]*) -> !:
     defer names.close()
     for f in 0..<w.faces.count:
         for use in w.face_uses(f):
-            let edge = w.edges.items[(usize)((use if use > 0 else -use) - 1)]
+            let edge = w.edges.items[edge_index(use)]
             if edge.start != (i64)v and edge.end != (i64)v: continue
             var known = false
             for other in names.view():

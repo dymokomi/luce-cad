@@ -25,10 +25,10 @@ pub struct CadModeling:
         var p = try profiles_of(source, size * 0.0001, profiles)
         defer p.close()
         if start != 0.0: p.moved(p.normal.multiply_scalar(start))
-        let solid = try new_solid(size)
+        let solid = try BrepModel.sized(size)
         defer solid.release()
         try extrude_into(solid.value(), &p, distance, tag)
-        return try model_of(solid)
+        return try CadModel.of_brep(solid)
 
     ## `a` and `b` combined: `operation` 0 their union, 1 `a` without
     ## `b`, 2 their intersection (both closed solids).
@@ -88,7 +88,7 @@ pub struct CadModeling:
         for f in 0..<w.faces.count:
             if w.faces.items[f].name >= 0: continue
             try role_name(&name, tag, "f")
-            try push_number(&name, (i64)f)
+            try push_decimal(&name, (i64)f)
             w.faces.items[f].name = try w.add_name((str)name.view())
         return try shape_model(&w)
 
@@ -115,10 +115,10 @@ pub struct CadModeling:
         let size = try sketch_size(source)
         var p = try profiles_of(source, size * 0.0001, profiles)
         defer p.close()
-        let solid = try new_solid(size)
+        let solid = try BrepModel.sized(size)
         defer solid.release()
         try revolve_into(solid.value(), &p, p.origin, p.u if axis == 0 else p.v, size * 0.000001, tag, angle)
-        return try model_of(solid)
+        return try CadModel.of_brep(solid)
 
     ## The keys of the sketch's profiles in `set` (the smallest regions its
     ## curves bound, as Fusion's profiles), apart by `;`: each names its
@@ -163,7 +163,7 @@ pub struct CadModeling:
             let face = w.faces.items[f]
             if face.name < 0 or not (try names_meet(w.face_name(f), name)): continue
             let s = w.surfaces.items[(usize)face.surface]
-            if s.kind != 0: continue
+            if s.kind != surface_plane: continue
             # The surface's z leaves the body when the face runs with it;
             # otherwise y turns over so x × y still leaves the body.
             return FaceFrame(true, s.origin, s.x, s.y if face.sense else s.y.multiply_scalar(-1.0))
@@ -193,18 +193,8 @@ func sketch_size(set: const GeometrySet*) -> f64!:
     if curves.point_count() == 0: return 1.0
     return math.max(1.0, high.subtract(low).length())
 
-## An empty B-rep with a tolerance for `size`.
-func new_solid(size: f64) -> interop.Reference[BrepModel]!:
-    return try interop.Reference[BrepModel].adopt(new BrepModel(math.max(0.000000001, size * 0.000001)) in memory.heap, brep_model_type, memory.heap)
-
 ## A model of shape `w`.
 func shape_model(w: const Shape*) -> interop.Reference[CadModel]!:
     let b = try brep_of(w)
     defer b.release()
-    return try model_of(b)
-
-func model_of(solid: interop.Reference[BrepModel]) -> interop.Reference[CadModel]!:
-    let result = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
-    errdefer result.release()
-    try result.value().attach_brep(solid)
-    return result
+    return try CadModel.of_brep(b)

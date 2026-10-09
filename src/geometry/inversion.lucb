@@ -1,0 +1,216 @@
+## Inverting a B-spline surface: the normalized parameters of a point on
+## it (Newton from a seed, then a lattice and the control points' Greville
+## parameters as further starts), and its point at normalized parameters.
+## Charts of B-spline faces are [0, 1] x [0, 1] over the knot domain.
+
+## Surface `surface` at normalized parameters `uv`.
+pub func evaluate(surface: Surface, uv: Vector3) -> Vector3!:
+    var u: Knot
+    var v: Knot
+    try u.at(surface.ku, surface.nu, surface.du, uv.x)
+    try v.at(surface.kv, surface.nv, surface.dv, uv.y)
+    return try point_of(surface, &u, &v)
+
+## One normalized parameter's knot value and nonzero basis. Newton steps
+## reuse them: finite differences share one parameter with the current point,
+## and an accepted line-search candidate is the next iteration's point.
+struct Knot:
+    var first: usize
+    var values: f64[9]
+
+    ## The clamp and domain check of Surface.at, then the basis.
+    func at(knots: const f64[], count: i64, degree: i64, fraction: f64) -> !:
+        let low = knots[(usize)degree]
+        let high = knots[(usize)count]
+        let t = math.clamp(low + (high - low) * fraction, low, high)
+        if not math.is_finite(t) or t < low or t > high:
+            error(invalid, "surface parameter outside knot domain")
+        self.first = nurbs_basis(knots, count, degree, t, &self.values)
+
+func point_of(surface: Surface, u: Knot*, v: Knot*) -> Vector3!:
+    return try nurbs_combine(surface.points, surface.weights, surface.nv, surface.du, surface.dv, u.first, &u.values, v.first, &v.values)
+
+## Distance as Vector3.length computes it.
+inline func separation(a: Vector3, b: Vector3) -> f64:
+    return math.hypot(math.hypot(a.x - b.x, a.y - b.y), a.z - b.z)
+
+## Newton inversion with finite-difference tangents. Every evaluation equals
+## the plain evaluate() of the same parameters; only repeated bases and the
+## accepted candidate's point are reused, so the iterates are unchanged.
+func improve(surface: Surface, target: Vector3, seed: Vector3) -> Vector3!:
+    var uv = seed
+    var u: Knot
+    var v: Knot
+    var p = Vector3()
+    var known = false
+    for iteration in 0..<48:
+        if not known:
+            # Evaluation order as before: the u check precedes the v check.
+            try u.at(surface.ku, surface.nu, surface.du, uv.x)
+            try v.at(surface.kv, surface.nv, surface.dv, uv.y)
+            p = try point_of(surface, &u, &v)
+        known = false
+        let residual = Vector3(target.x - p.x, target.y - p.y, target.z - p.z)
+        let residual_length = math.hypot(math.hypot(residual.x, residual.y), residual.z)
+        # Layout intersections need parameter precision finer than a grid snap.
+        # The acceptance tolerance below is unchanged; this only solves the UV
+        # inverse more accurately when the edge actually lies on the support.
+        if residual_length < 0.000000000001:
+            break
+        let ua = math.max(0.0, uv.x - 0.00001)
+        let ub = math.min(1.0, uv.x + 0.00001)
+        let va = math.max(0.0, uv.y - 0.00001)
+        let vb = math.min(1.0, uv.y + 0.00001)
+        var side: Knot
+        try side.at(surface.ku, surface.nu, surface.du, ub)
+        let pub_ = try point_of(surface, &side, &v)
+        try side.at(surface.ku, surface.nu, surface.du, ua)
+        let pua = try point_of(surface, &side, &v)
+        try side.at(surface.kv, surface.nv, surface.dv, vb)
+        let pvb = try point_of(surface, &u, &side)
+        try side.at(surface.kv, surface.nv, surface.dv, va)
+        let pva = try point_of(surface, &u, &side)
+        let su = 1.0 / (ub - ua)
+        let sv = 1.0 / (vb - va)
+        let du = Vector3((pub_.x - pua.x) * su, (pub_.y - pua.y) * su, (pub_.z - pua.z) * su)
+        let dv = Vector3((pvb.x - pva.x) * sv, (pvb.y - pva.y) * sv, (pvb.z - pva.z) * sv)
+        let aa = du.x * du.x + du.y * du.y + du.z * du.z
+        let ab = du.x * dv.x + du.y * dv.y + du.z * dv.z
+        let bb = dv.x * dv.x + dv.y * dv.y + dv.z * dv.z
+        let det = aa * bb - ab * ab
+        if det <= aa * bb * 0.000000000001:
+            break
+        let ur = du.x * residual.x + du.y * residual.y + du.z * residual.z
+        let vr = dv.x * residual.x + dv.y * residual.y + dv.z * residual.z
+        var dx = math.clamp((bb * ur - ab * vr) / det, -0.25, 0.25)
+        var dy = math.clamp((aa * vr - ab * ur) / det, -0.25, 0.25)
+        # Solve the remaining tangent when a constrained parameter cannot move.
+        # Clamping the unconstrained 2D Newton step alone made edge projections
+        # seed-dependent when STEP curves differ slightly from the support.
+        if (uv.x <= 1e-12 and dx < 0.0) or (uv.x >= 1.0 - 1e-12 and dx > 0.0):
+            dx = 0.0
+            dy = math.clamp(vr / bb, -0.25, 0.25)
+        if (uv.y <= 1e-12 and dy < 0.0) or (uv.y >= 1.0 - 1e-12 and dy > 0.0):
+            dy = 0.0
+            dx = math.clamp(ur / aa, -0.25, 0.25)
+        var accepted = false
+        var factor: f64 = 1.0
+        var cu: Knot
+        var cv: Knot
+        for step in 0..<12:
+            let candidate = Vector3(math.clamp(uv.x + dx * factor, 0.0, 1.0), math.clamp(uv.y + dy * factor, 0.0, 1.0), 0.0)
+            try cu.at(surface.ku, surface.nu, surface.du, candidate.x)
+            try cv.at(surface.kv, surface.nv, surface.dv, candidate.y)
+            let q = try point_of(surface, &cu, &cv)
+            if separation(q, target) < residual_length:
+                uv = candidate
+                u = cu
+                v = cv
+                p = q
+                known = true
+                accepted = true
+                break
+            factor *= 0.5
+        if not accepted:
+            break
+    return uv
+
+pub func project(surface: Surface, target: Vector3, seed: Vector3, tolerance: f64) -> Vector3!:
+    var uv = try improve(surface, target, seed)
+    if (try evaluate(surface, uv)).subtract(target).length() <= tolerance:
+        return uv
+    let first = uv
+    var best: f64 = 1e100
+    for u in 0..<9:
+        for v in 0..<9:
+            let candidate = Vector3((f64)u / 8.0, (f64)v / 8.0, 0.0)
+            let distance = (try evaluate(surface, candidate)).subtract(target).length()
+            if distance < best:
+                best = distance
+                uv = candidate
+    uv = try improve(surface, target, uv)
+    # An edited surface's trims may be off it by design: the nearest point
+    # found from the seed or the lattice is the answer (without the costlier
+    # local starts below).
+    if surface.edited:
+        if (try evaluate(surface, uv)).subtract(target).length() > (try evaluate(surface, first)).subtract(target).length(): return first
+        return uv
+    if (try evaluate(surface, uv)).subtract(target).length() > tolerance:
+        # Narrow knot spans can disappear entirely between uniform seeds. Use
+        # nearby control points' Greville parameters as additional local starts.
+        var distances: f64[16]
+        let seeds = try new Vector3[16] --- in memory.heap
+        defer free(seeds) in memory.heap
+        for index in 0..<(usize)16: seeds[index] = Vector3()
+        for index in 0..<(usize)16: distances[index] = 1e100
+        for u in 0..<(usize)surface.nu:
+            for v in 0..<(usize)surface.nv:
+                let delta = surface.points[u * (usize)surface.nv + v].subtract(target)
+                let distance = delta.dot(delta)
+                if distance >= distances[15]: continue
+                var index: usize = 15
+                while index > 0 and distance < distances[index - 1]:
+                    distances[index] = distances[index - 1]
+                    seeds[index] = seeds[index - 1]
+                    index -= 1
+                distances[index] = distance
+                seeds[index] = Vector3(greville(surface.ku, u, surface.nu, surface.du), greville(surface.kv, v, surface.nv, surface.dv), 0.0)
+        for index in 0..<(usize)16:
+            if distances[index] == 1e100: break
+            let candidate = try improve(surface, target, seeds[index])
+            if (try evaluate(surface, candidate)).subtract(target).length() <= tolerance: return candidate
+            if (try evaluate(surface, candidate)).subtract(target).length() < (try evaluate(surface, uv)).subtract(target).length(): uv = candidate
+        var buffer: u8[512]
+        let residual = (try evaluate(surface, uv)).subtract(target).length()
+        let owned = try interop.copy_text(try strings.format(buffer, f"NURBS boundary projection exceeds CAD tolerance: residual {residual}, tolerance {tolerance}"))
+        if let owner = owned.owner: _ = ownership.pool_object(owner)
+        error(invalid, owned.value)
+    return uv
+
+func greville(knots: const f64[], at: usize, count: i64, degree: i64) -> f64:
+    var sum: f64 = 0.0
+    for index in 1..<(usize)degree + 1: sum += knots[at + index]
+    let low = knots[(usize)degree]
+    return math.clamp((sum / (f64)degree - low) / (knots[(usize)count] - low), 0.0, 1.0)
+
+## The knot parameter of `target` on a B-spline curve (STEP edges trimmed
+## inside its knot domain), from `preferred`: each nonempty span searched
+## (golden sections over sixteen parts), not a uniform grid that misses
+## short spans; an error beyond `tolerance`.
+pub func curve_parameter(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], target: Vector3, preferred: f64, tolerance: f64) -> f64!:
+    var best = preferred
+    var distance = (try NurbsCurve.at(points, weights, degree, knots, best)).subtract(target).length()
+    if distance <= tolerance: return best
+    for span in (usize)degree..<points.length:
+        if knots[span + 1] <= knots[span]: continue
+        # Split each span before a bounded scalar minimization; a degree-eight
+        # curve may have several local distance minima in one span.
+        for part in 0..<16:
+            var a = knots[span] + (knots[span + 1] - knots[span]) * (f64)part / 16.0
+            var b = knots[span] + (knots[span + 1] - knots[span]) * (f64)(part + 1) / 16.0
+            var left = b - (b - a) * 0.6180339887498949
+            var right = a + (b - a) * 0.6180339887498949
+            var dl = (try NurbsCurve.at(points, weights, degree, knots, left)).subtract(target).length()
+            var dr = (try NurbsCurve.at(points, weights, degree, knots, right)).subtract(target).length()
+            for iteration in 0..<48:
+                if dl < dr:
+                    b = right
+                    right = left
+                    dr = dl
+                    left = b - (b - a) * 0.6180339887498949
+                    dl = (try NurbsCurve.at(points, weights, degree, knots, left)).subtract(target).length()
+                else:
+                    a = left
+                    left = right
+                    dl = dr
+                    right = a + (b - a) * 0.6180339887498949
+                    dr = (try NurbsCurve.at(points, weights, degree, knots, right)).subtract(target).length()
+            if math.min(dl, dr) < distance:
+                distance = math.min(dl, dr)
+                best = left if dl < dr else right
+    if distance > tolerance:
+        var buffer: u8[256]
+        let text = try interop.copy_text(try strings.format(buffer, f"B-spline endpoint residual {distance} exceeds tolerance {tolerance}"))
+        if let owner = text.owner: _ = ownership.pool_object(owner)
+        error(invalid, text.value)
+    return best

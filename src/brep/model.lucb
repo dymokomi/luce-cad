@@ -14,14 +14,11 @@ from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import BitsBuilder, GeometryWriter, GeometryReader, PropertyHeader, dtype_float64, dtype_int32, dtype_uint8
 from luce_geocore.core.shared import Column
 from luce_geocore.kernel import TableBuilder, Domain, text_attribute
-from tessellation.surface import NurbsSurface, NurbsCurve
-from brep_types import Curve, Surface, BrepFace
+from geometry import NurbsSurface, NurbsCurve, Curve, Surface, BrepFace, curve_parameter, project, evaluate, least_tolerance, tolerance_for, edge_index, surface_plane, surface_cylinder, surface_cone, surface_spline, surface_sphere, surface_torus, curve_line
 from brep_store import Store
 from brep_mesh import tessellate
 from face_cache import FaceCache, dispose_cache, inherited
 from face_mesh import face_mesh
-from curve_trim import parameter
-from surface_trim import project, evaluate
 from luce_geocore.kernel import moved_storage, mesh_adopt, precise_span, Float3, Attribute
 
 ## Values per curve frame: origin, x and y axes, radius, start angle, sweep.
@@ -118,7 +115,7 @@ pub struct BrepModel:
     var derived: Derived*
 
     pub func init(tolerance: f64 = 0.000001) -> !:
-        if not math.is_finite(tolerance) or tolerance < 0.000000001 or tolerance > 1.0:
+        if not math.is_finite(tolerance) or tolerance < least_tolerance or tolerance > 1.0:
             error(invalid, "CAD tolerance must be finite and between 1e-9 and 1 source unit")
         self.tolerance = tolerance
         self.vertices = Store[Vector3]()
@@ -165,6 +162,14 @@ pub struct BrepModel:
         try self.surface_knot_offsets.push(0)
         try self.face_use_offsets.push(0)
         try self.face_loop_offsets.push(0)
+
+    ## An empty B-rep of tolerance `tolerance`, held by reference.
+    pub static func held(tolerance: f64) -> interop.Reference[BrepModel]!:
+        return try interop.Reference[BrepModel].adopt(new BrepModel(tolerance) in memory.heap, brep_model_type, memory.heap)
+
+    ## An empty B-rep for a model of extent `size` (its tolerance_for).
+    pub static func sized(size: f64) -> interop.Reference[BrepModel]!:
+        return try BrepModel.held(tolerance_for(size))
 
     pub func face_count() -> i64:
         return (i64)self.face_surface.count
@@ -215,7 +220,7 @@ pub struct BrepModel:
     ## Extract faces with compact shared topology; unrelated points and curves
     ## are not copied into the result. Face paths/colors/placements survive.
     pub func subset(selection: const i64[]) -> interop.Reference[BrepModel]!:
-        let output = try interop.Reference[BrepModel].adopt(new BrepModel(self.tolerance) in memory.heap, brep_model_type, memory.heap)
+        let output = try BrepModel.held(self.tolerance)
         errdefer output.release()
         let target = output.value()
         let vertices = try new i64[self.vertices.count] --- in memory.heap
@@ -236,7 +241,7 @@ pub struct BrepModel:
             uses.clear()
             sizes.clear()
             for use in self.uses_of((usize)id):
-                let index = (usize)(use - 1 if use > 0 else -use - 1)
+                let index = edge_index(use)
                 if edges[index] < 0:
                     for side in 0..<(usize)2:
                         let point = (usize)self.curve_ends.get(index * 2 + side)
@@ -303,17 +308,17 @@ pub struct BrepModel:
 
     pub func face_edge_point(face: i64, use_index: i64, fraction: f64) -> Vector3!:
         let use = try self.use_at(face, use_index)
-        let edge = try self.curve((usize)(use - 1 if use > 0 else -use - 1))
+        let edge = try self.curve(edge_index(use))
         defer edge.close()
         return self.face_placement.get((usize)face).transform_point(try edge.at(fraction if use > 0 else 1.0 - fraction))
 
     pub func face_edge_linear(face: i64, use_index: i64) -> bool!:
         let use = try self.use_at(face, use_index)
-        return self.curve_kind.get((usize)(use - 1 if use > 0 else -use - 1)) == 0
+        return self.curve_kind.get(edge_index(use)) == 0
 
     pub func face_edge_id(face: i64, use_index: i64) -> i64!:
         let use = try self.use_at(face, use_index)
-        return use - 1 if use > 0 else -use - 1
+        return (i64)edge_index(use)
 
     pub func set_face_color(face: i64, color: Vector3) -> !:
         if face < 0 or face >= self.face_count() or not color.is_finite() or color.x < 0.0 or color.x > 1.0 or color.y < 0.0 or color.y > 1.0 or color.z < 0.0 or color.z > 1.0:
@@ -409,8 +414,8 @@ pub struct BrepModel:
         let low = knots[(usize)degree]
         let high = knots[points.length]
         # Inversion may land a hair outside the knots: the ends are in them.
-        let a = math.clamp(try parameter(points, weights, degree, knots, self.vertices.get((usize)start), low if sense else high, self.tolerance), low, high)
-        let b = math.clamp(try parameter(points, weights, degree, knots, self.vertices.get((usize)end), high if sense else low, self.tolerance), low, high)
+        let a = math.clamp(try curve_parameter(points, weights, degree, knots, self.vertices.get((usize)start), low if sense else high, self.tolerance), low, high)
+        let b = math.clamp(try curve_parameter(points, weights, degree, knots, self.vertices.get((usize)end), high if sense else low, self.tolerance), low, high)
         var sweep = b - a
         if (sense and sweep <= 0.0) or (not sense and sweep >= 0.0):
             let first = try NurbsCurve.at(points, weights, degree, knots, low)
@@ -441,7 +446,7 @@ pub struct BrepModel:
     ## kind 0 plane, 1 cylinder, 2 cone, 4 sphere, 5 torus.
     ## For a torus radius/angle are major/minor radii. Placements stay exact.
     pub func add_surface(kind: i64, origin: Vector3, axis: Vector3, reference: Vector3, radius: f64 = 0.0, angle: f64 = 0.0) -> i64!:
-        if kind < 0 or kind == 3 or kind > 5 or not origin.is_finite() or not math.is_finite(radius) or not math.is_finite(angle) or (kind > 0 and radius <= 0.0) or (kind == 2 and math.abs(angle) >= 1.5707963267948966) or (kind == 5 and angle <= 0.0):
+        if kind < surface_plane or kind == surface_spline or kind > surface_torus or not origin.is_finite() or not math.is_finite(radius) or not math.is_finite(angle) or (kind > surface_plane and radius <= 0.0) or (kind == surface_cone and math.abs(angle) >= 1.5707963267948966) or (kind == surface_torus and angle <= 0.0):
             error(invalid, "invalid analytic B-rep surface")
         let z = try axis.normalized()
         let x = try reference.subtract(z.multiply_scalar(reference.dot(z))).normalized()
@@ -475,8 +480,8 @@ pub struct BrepModel:
             for at in 0..<(usize)size:
                 let use = uses[offset + at]
                 let next = uses[offset + (at + 1) % (usize)size]
-                let edge = (usize)(use - 1 if use > 0 else -use - 1)
-                let following = (usize)(next - 1 if next > 0 else -next - 1)
+                let edge = edge_index(use)
+                let following = edge_index(next)
                 let arrives = self.curve_ends.get(edge * 2 + (1 if use > 0 else 0))
                 let leaves = self.curve_ends.get(following * 2 + (0 if next > 0 else 1))
                 if arrives != leaves:

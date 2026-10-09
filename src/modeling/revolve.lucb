@@ -39,7 +39,7 @@ pub func revolve_into(b: BrepModel*, p: Profiles*, origin: Vector3, axis: Vector
     # opens without a seam), a full turn as two halves.
     var splines = false
     for e in p.edges.view():
-        if e.kind == 2: splines = true
+        if e.kind == profile_spline: splines = true
     var edges = Growing[ProfileEdge]()
     defer edges.close()
     var halves = Growing[bool]()
@@ -55,7 +55,7 @@ pub func revolve_into(b: BrepModel*, p: Profiles*, origin: Vector3, axis: Vector
             halves.clear()
             for e in p.loop_edges(loop):
                 let ends_on_axis = axis_distance(e.start, origin, a).0 <= tol * 10.0 and axis_distance(e.end, origin, a).0 <= tol * 10.0
-                if e.kind == 1 and ends_on_axis:
+                if e.kind == profile_arc and ends_on_axis:
                     let middle = try p.edge_at(&e, 0.5)
                     try edges.push(ProfileEdge(1, e.start, middle, e.center, e.radius, e.sweep * 0.5, -1, e.curve, e.piece))
                     try edges.push(ProfileEdge(1, middle, e.end, e.center, e.radius, e.sweep * 0.5, -1, e.curve, e.piece))
@@ -99,7 +99,7 @@ func revolve_loop(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[],
         let e = &edges[at]
         let c0 = circles.items[at]
         let c1 = circles.items[next]
-        if c0 < 0 and c1 < 0 and e.kind == 0: continue
+        if c0 < 0 and c1 < 0 and e.kind == profile_line: continue
         # The face's outward normal at the seam: right of the edge.
         let middle = try p.edge_at(e, 0.5)
         let tangent = try (try p.edge_at(e, 0.501)).subtract(try p.edge_at(e, 0.499)).normalized()
@@ -147,7 +147,7 @@ func revolve_loop(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[],
 func swept_surface(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, origin: Vector3, a: Vector3, tol: f64, pole: Vector3 = Vector3()) -> (i64, bool)!:
     let (r0, f0) = axis_distance(e.start, origin, a)
     let (r1, f1) = axis_distance(e.end, origin, a)
-    if e.kind == 0:
+    if e.kind == profile_line:
         let h0 = e.start.subtract(origin).dot(a)
         let h1 = e.end.subtract(origin).dot(a)
         if math.abs(h1 - h0) <= tol:
@@ -158,7 +158,7 @@ func swept_surface(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, ori
         let angle = math.atan((r1 - r0) / (h1 - h0))
         if r0 >= r1: return (try b.add_surface(2, f0, a, e.start.subtract(f0), r0, angle), false)
         return (try b.add_surface(2, f1, a, e.end.subtract(f1), r1, angle), false)
-    if e.kind == 1:
+    if e.kind == profile_arc:
         let (rc, fc) = axis_distance(e.center, origin, a)
         if rc <= tol * 10.0:
             if pole.length() > 0.0:
@@ -173,7 +173,7 @@ func swept_surface(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, ori
 func surface_normal_at(b: const BrepModel*, s: i64, p: Vector3) -> Vector3!:
     var record = try b.surface_record(s)
     defer record.close()
-    return try surface_normal(&record, p)
+    return try normal_at(&record, p, b.model_tolerance())
 
 ## A part revolve's end caps: each loop's edges at the start and at the end
 ## (in profile order) and the loops' sizes.
@@ -256,7 +256,7 @@ func revolve_turn(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[],
         let a1 = arcs.items[next]
         let at_start = start.edges.items[at]
         # A line on the axis stays where it is: both ends share it.
-        let on_axis = a0 < 0 and a1 < 0 and e.kind == 0
+        let on_axis = a0 < 0 and a1 < 0 and e.kind == profile_line
         var at_end = at_start
         if not on_axis:
             if let ring = closing: at_end = ring.edges.items[at]
@@ -273,11 +273,11 @@ func revolve_turn(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[],
         # and away from the turn's middle.
         let radial = middle.subtract(axis_distance(middle, origin, a).1)
         var pole = Vector3()
-        if e.kind == 1 and radial.length() > tol:
+        if e.kind == profile_arc and radial.length() > tol:
             let side = 1.0 if middle.subtract(e.center).dot(a) >= 0.0 else -1.0
             pole = try a.multiply_scalar(side).subtract(turned_direction(try radial.normalized(), a, (begin + finish) * 0.5)).normalized()
         var surface: i64 = -1
-        if e.kind == 2: surface = try spline_revolution(b, p, e, origin, a, begin, finish - begin)
+        if e.kind == profile_spline: surface = try spline_revolution(b, p, e, origin, a, begin, finish - begin)
         else:
             let (made, cap) = try swept_surface(b, p, e, origin, a, tol, pole)
             _ = cap
@@ -329,8 +329,8 @@ func spline_revolution(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*,
 ## Profile edge `e` turned `angle` about the axis, between vertices
 ## `start` and `end` of `b` (its plane's normal turned: `normal`).
 func turned_edge(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, origin: Vector3, a: Vector3, angle: f64, normal: Vector3, start: i64, end: i64) -> i64!:
-    if e.kind == 0: return try b.add_line(start, end)
-    if e.kind == 1:
+    if e.kind == profile_line: return try b.add_line(start, end)
+    if e.kind == profile_arc:
         return try b.add_circle(start, end, turned_point(e.center, origin, a, angle), normal, turned_direction(e.start.subtract(e.center), a, angle), e.radius, e.sweep > 0.0)
     let (points, weights, knots, degree) = p.spline_net(e.spline)
     var moved = Growing[Vector3]()
@@ -344,7 +344,7 @@ func turned_edge(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, origi
 func revolve_parts(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[], origin: Vector3, a: Vector3, tol: f64, tag: str, angle: f64, partial: bool, caps: Caps*) -> !:
     var splines = false
     for e in edges:
-        if e.kind == 2: splines = true
+        if e.kind == profile_spline: splines = true
     let parts = (usize)math.max(1.0, math.ceil(angle / math.pi - 1e-9)) if splines else 1
     var first = new_ring()
     defer first.close()
@@ -383,7 +383,7 @@ func close_part(b: BrepModel*, p: const Profiles*, caps: const Caps*, origin: Ve
     var end = Growing[i64]()
     defer end.close()
     for e in caps.end.view(): try end.push(e + 1)
-    let reference = outer[0].end.subtract(outer[0].start) if outer[0].kind == 0 else outer[0].start.subtract(outer[0].center)
+    let reference = outer[0].end.subtract(outer[0].start) if outer[0].kind == profile_line else outer[0].start.subtract(outer[0].center)
     var name = Growing[u8]()
     defer name.close()
     let back = try b.add_surface(0, outer[0].start, p.normal.multiply_scalar(-1.0), reference)

@@ -7,14 +7,13 @@ from mapped_patch import mapped_patch
 from clipped_patch import clipped_patch
 from seam_conform import conform_seams
 from layout_types import GridLayout
-from patch_sides import edge_index
+from geometry import edge_index, Curve, Surface, BrepFace, Samples, surface_plane, surface_cone, surface_spline, curve_line, curve_circle
 from patch_validation import validate, validate_conformed
 from conformed_display import conform_display
 from conical_fan import apex_cone, conical_fan
 from spherical_triangle import sphere_triangle, barycentric_sphere
 from luce_geocore.geocore import Vector3, MeshBuilder, invalid
 from tessellation.surface import TrimPolygon
-from brep_types import Curve, Surface, BrepFace, Samples
 
 ## Each failed strategy rewinds scratch before the next strategy runs.
 pub func mesh_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, divisions: i64, tolerance: f64, edge_size: f64) -> !:
@@ -143,7 +142,7 @@ func legacy_checked(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const
     try validate(mesh, nf, nc)
 
 func legacy_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], divisions: i64, tolerance: f64, edge_size: f64, mapped_tried: bool = false) -> !:
-    if surface.kind == 0:
+    if surface.kind == surface_plane:
         if mapped_tried:
             try planar(mesh, face, surface, samples, tolerance, edge_size, divisions)
             return
@@ -171,7 +170,7 @@ func legacy_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: co
 
 func structured(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, mapped_tried: bool, divisions: i64) -> !:
     if mapped_tried:
-        if surface.kind == 3: try ruled(mesh, face, surface, edges, samples, tolerance)
+        if surface.kind == surface_spline: try ruled(mesh, face, surface, edges, samples, tolerance)
         else: try periodic_band(mesh, face, surface, edges, samples, tolerance)
         return
     let np = mesh.np
@@ -182,7 +181,7 @@ func structured(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: con
         mesh.nf = nf
         mesh.nc = nc
         if failure.code != invalid: error(failure.code, failure.message)
-        if surface.kind == 3:
+        if surface.kind == surface_spline:
             try ruled(mesh, face, surface, edges, samples, tolerance)
         else:
             try periodic_band(mesh, face, surface, edges, samples, tolerance)
@@ -212,7 +211,7 @@ func nurbs_trim(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: c
                 count += 1
         sizes[loop] = (i64)(count - first)
         offset += (usize)face.sizes[loop]
-    if surface.kind == 3:
+    if surface.kind == surface_spline:
         try mesh_trim(mesh, ids[..<count], sizes, surface, face.sense, divisions, edge_size, tolerance)
     else:
         try analytic_trim(mesh, ids[..<count], sizes, surface, face.sense, divisions, tolerance, edge_size)
@@ -370,7 +369,7 @@ func ruled(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Cu
         elif (close(start, c, tolerance) and close(end, d, tolerance)) or (close(start, d, tolerance) and close(end, c, tolerance)):
             upper = (i64)index
             high_forward = close(start, c, tolerance)
-        elif edge.kind == 0 and ((close(start, a, tolerance) and close(end, c, tolerance)) or (close(start, c, tolerance) and close(end, a, tolerance)) or (close(start, b, tolerance) and close(end, d, tolerance)) or (close(start, d, tolerance) and close(end, b, tolerance))):
+        elif edge.kind == curve_line and ((close(start, a, tolerance) and close(end, c, tolerance)) or (close(start, c, tolerance) and close(end, a, tolerance)) or (close(start, b, tolerance) and close(end, d, tolerance)) or (close(start, d, tolerance) and close(end, b, tolerance))):
             sides += 1
         else:
             error(invalid, "NURBS face boundary is not the complete ruled parameter rectangle")
@@ -452,10 +451,10 @@ func periodic_band(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: 
     for use in face.uses:
         let index = edge_index(use)
         let edge = edges[index]
-        if edge.kind == 1 and count < 2:
+        if edge.kind == curve_circle and count < 2:
             rings[count] = (i64)index
             count += 1
-        elif edge.kind == 0:
+        elif edge.kind == curve_line:
             seam = (i64)index
             seam_count += 1
         else:
@@ -466,7 +465,7 @@ func periodic_band(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: 
     let second = samples[(usize)rings[1]].ids
     if first.length != second.length or first.length < 4:
         error(invalid, "periodic rings have incompatible discretization")
-    let tangent = math.sin(surface.angle) / math.cos(surface.angle) if surface.kind == 2 else 0.0
+    let tangent = math.sin(surface.angle) / math.cos(surface.angle) if surface.kind == surface_cone else 0.0
     for ring in rings:
         for id in samples[(usize)ring].ids:
             let relative = mesh.points[(usize)id].subtract(surface.origin)
