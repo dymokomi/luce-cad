@@ -34,6 +34,10 @@ pub enum RowKind as u8:
     ## curved as radius parameter 6: `value` (the end's curvature factor)
     ## times cross(P1 - P0, P2 - P1) r / |P1 - P0|³ equals `side`.
     curvature = 10
+    ## The same end's curvature not changing along it (as a line's, circle's
+    ## or arc's does not): P0..P3 (0..7), `weights` its first knots after the
+    ## end (u_{p+1}, u_{p+2}, u_{p+3}) and its degree.
+    curvature_rate = 11
 
 pub struct Row:
     pub var kind: RowKind
@@ -63,8 +67,9 @@ pub func rows_of(sketch: const Sketch*, out: Growing[Row]*) -> !:
         if k.driven: continue
         try rows_for(sketch, k, (i64)index, out)
 
+
 func rows_for(sketch: const Sketch*, k: SketchConstraint, index: i64, out: Growing[Row]*) -> !:
-    if (k.kind == ConstraintKind.tangent or k.kind == ConstraintKind.curvature) and (sketch.entity(k.first).kind == EntityKind.spline or sketch.entity(k.first).kind == EntityKind.conic):
+    if (k.kind == ConstraintKind.tangent or k.kind == ConstraintKind.curvature or k.kind == ConstraintKind.smooth) and (sketch.entity(k.first).kind == EntityKind.spline or sketch.entity(k.first).kind == EntityKind.conic):
         try end_rows(sketch, k, index, out)
         return
     if k.kind == ConstraintKind.on_curve:
@@ -121,17 +126,28 @@ func end_rows(sketch: const Sketch*, k: SketchConstraint, index: i64, out: Growi
     let curve = sketch.entity(k.first)
     let other = sketch.entity(k.second)
     let (p0, p1, p2) = curve_end_points(sketch, curve, k.side)
+    let p3 = fourth_end_point(sketch, curve, k.side)
+    let curved = k.kind == ConstraintKind.curvature or k.kind == ConstraintKind.smooth
     if other.kind == EntityKind.line:
-        try out.push(row(RowKind.parallel, index, [px(sketch, p0), px(sketch, p0) + 1, px(sketch, p1), px(sketch, p1) + 1, px(sketch, other.first), px(sketch, other.first) + 1, px(sketch, other.second), px(sketch, other.second) + 1]))
-        if k.kind == ConstraintKind.curvature and p2 >= 0:
-            try out.push(row(RowKind.parallel, index, [px(sketch, p1), px(sketch, p1) + 1, px(sketch, p2), px(sketch, p2) + 1, px(sketch, other.first), px(sketch, other.first) + 1, px(sketch, other.second), px(sketch, other.second) + 1]))
+        # Along the line: P0 P1, and for G2 P1 P2, for G3 P2 P3 too.
+        let chain = [p0, p1, p2 if curved else -1, p3 if k.kind == ConstraintKind.smooth else -1]
+        for at in 0..<(usize)3:
+            let a = chain[at]
+            let b = chain[at + 1]
+            if a < 0 or b < 0: break
+            try out.push(row(RowKind.parallel, index, [px(sketch, a), px(sketch, a) + 1, px(sketch, b), px(sketch, b) + 1, px(sketch, other.first), px(sketch, other.first) + 1, px(sketch, other.second), px(sketch, other.second) + 1]))
         return
     let c = other.first
     try out.push(row(RowKind.perpendicular, index, [px(sketch, p0), px(sketch, p0) + 1, px(sketch, p1), px(sketch, p1) + 1, px(sketch, c), px(sketch, c) + 1, px(sketch, p0), px(sketch, p0) + 1]))
-    if k.kind == ConstraintKind.curvature and p2 >= 0:
+    if curved and p2 >= 0:
         var r = row(RowKind.curvature, index, [px(sketch, p0), px(sketch, p0) + 1, px(sketch, p1), px(sketch, p1) + 1, px(sketch, p2), px(sketch, p2) + 1, other.second, -1])
         r.value = end_curvature_factor(curve.second, spline_degree(curve))
         r.side = k.value
+        try out.push(r)
+    if k.kind == ConstraintKind.smooth and p3 >= 0:
+        var r = row(RowKind.curvature_rate, index, [px(sketch, p0), px(sketch, p0) + 1, px(sketch, p1), px(sketch, p1) + 1, px(sketch, p2), px(sketch, p2) + 1, px(sketch, p3), px(sketch, p3) + 1])
+        let extra = (f64)(curve.second - spline_degree(curve))
+        r.weights = [math.min(1.0, extra), math.min(2.0, extra), math.min(3.0, extra), (f64)spline_degree(curve)]
         try out.push(r)
 
 ## The first three points from a spline's or conic's end (`side` +1 its
@@ -144,6 +160,12 @@ pub func curve_end_points(sketch: const Sketch*, curve: SketchEntity, side: f64)
     if side >= 0.0:
         return (sketch.spline_point(curve, 0), sketch.spline_point(curve, 1), sketch.spline_point(curve, 2) if n > 2 else -1)
     return (sketch.spline_point(curve, n - 1), sketch.spline_point(curve, n - 2), sketch.spline_point(curve, n - 3) if n > 2 else -1)
+
+## A spline's fourth point from its end (`side` +1 its start, -1 its end),
+## or -1 when it has fewer.
+func fourth_end_point(sketch: const Sketch*, curve: SketchEntity, side: f64) -> i64:
+    if curve.kind != EntityKind.spline or curve.second < 4: return -1
+    return sketch.spline_point(curve, 3) if side >= 0.0 else sketch.spline_point(curve, curve.second - 4)
 
 ## A line, arc or circle touching a circle or arc: a line's distance from
 ## the center is the radius; two circles' centers are the sum (`side` +1)
@@ -230,7 +252,7 @@ pub func evaluate(r: const Row*, read: func(i64, void*) -> f64, context: void*, 
             e.partial[i] = r.weights[i]
     elif r.kind == RowKind.mirror_along or r.kind == RowKind.mirror_across:
         mirror_row(v[..<8], r.kind == RowKind.mirror_along, scale, &e)
-    elif r.kind == RowKind.on_ellipse or r.kind == RowKind.curvature:
+    elif r.kind == RowKind.on_ellipse or r.kind == RowKind.curvature or r.kind == RowKind.curvature_rate:
         # Central differences: these rows are smooth and cheap, and their
         # closed-form partials long.
         e.residual = curved_residual(v[..<8], r, scale)
@@ -349,8 +371,40 @@ func mirror_row(v: const f64[], along: bool, scale: f64, e: Evaluated*):
     e.partial[4] = -gx + 2.0 * dy / length
     e.partial[5] = -gy - 2.0 * dx / length
 
-## The on_ellipse and curvature rows' residuals (see RowKind).
+## The on_ellipse, curvature and curvature_rate rows' residuals (see
+## RowKind).
 func curved_residual(v: const f64[], r: const Row*, scale: f64) -> f64:
+    if r.kind == RowKind.curvature_rate:
+        # The end's first three derivatives C1, C2, C3 from its derivative
+        # control points (The NURBS Book, eq. 3.8), its knots clamped at the
+        # end: u_1 = u_2 = u_3 = 0, then u_{p+1}, u_{p+2}, u_{p+3}.
+        let p = r.weights[3]
+        let k1 = r.weights[0]
+        let k2 = r.weights[1]
+        let k3 = r.weights[2]
+        let q10x = p * (v[2] - v[0]) / k1
+        let q10y = p * (v[3] - v[1]) / k1
+        let q11x = p * (v[4] - v[2]) / k2
+        let q11y = p * (v[5] - v[3]) / k2
+        let q12x = p * (v[6] - v[4]) / k3
+        let q12y = p * (v[7] - v[5]) / k3
+        let q20x = (p - 1.0) * (q11x - q10x) / k1
+        let q20y = (p - 1.0) * (q11y - q10y) / k1
+        let q21x = (p - 1.0) * (q12x - q11x) / k2
+        let q21y = (p - 1.0) * (q12y - q11y) / k2
+        let q3x = (p - 2.0) * (q21x - q20x) / k1
+        let q3y = (p - 2.0) * (q21y - q20y) / k1
+        let speed = math.max(math.hypot(q10x, q10y), 1e-12)
+        let c2 = q10x * q20y - q10y * q20x
+        let c3 = q10x * q3y - q10y * q3x
+        let dot = q10x * q20x + q10y * q20y
+        # The curvature's rate along the curve: (C1 x C3 |C1|^2 - 3 (C1 x C2)(C1 . C2)) / |C1|^6.
+        let rate = (c3 * speed * speed - 3.0 * c2 * dot) / math.pow(speed, 6.0)
+        # A length: the rate times the end's first leg cubed (the sketch's
+        # size cubed would make the row too steep to settle).
+        _ = scale
+        let leg = math.max(math.hypot(v[2] - v[0], v[3] - v[1]), 1e-12)
+        return leg * leg * leg * rate
     if r.kind == RowKind.on_ellipse:
         let dx = v[4] - v[2]
         let dy = v[5] - v[3]

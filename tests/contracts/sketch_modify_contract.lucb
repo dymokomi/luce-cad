@@ -14,6 +14,9 @@ pub func sketch_modify_contracts() -> !:
     try corners()
     try offsets_moves_scales()
     try mirrors_patterns()
+    try free_form_modify()
+    try g3_between_lines()
+    try g3_editor_case()
 
 ## Lines crossing like an X at (5, 5); a line crossed twice; a circle cut by
 ## a line.
@@ -160,3 +163,98 @@ func mirrors_patterns() -> !:
     defer along.close()
     try pattern_along(&s, [line], 0.0, 5.0, 3, &along)
     try near(s.y(s.entity(along.items[1]).first), 10.0)
+
+## A line crossing a spline: Trim on its far piece ends it on the spline;
+## an open spline offset 2 is a fit spline 2 away, and a line's offset
+## holds its distance as a dimension; a quintic of eight control points
+## held G3 to a line at its start and an arc at its end solves, its
+## curvature not changing at the arc.
+func free_form_modify() -> !:
+    var s = new_sketch()
+    defer s.close()
+    var points = Growing[i64]()
+    defer points.close()
+    for (x, y) in [(0.0, 0.0), (10.0, 4.0), (20.0, -4.0), (30.0, 0.0)]:
+        try points.push(try s.add_point(x, y))
+    let spline = try s.add_spline(points.view(), true)
+    let line = try s.add_line(try s.add_point(15.0, -20.0), try s.add_point(15.0, 20.0))
+    try trim_curve(&s, line, 15.0, 15.0)
+    let end = s.entity(line).second
+    if math.abs(s.x(end) - 15.0) > 1e-9 or math.abs(s.y(end)) > 5.0: error(invalid, "a line trimmed at a spline does not end on it")
+    var made = Growing[i64]()
+    defer made.close()
+    try offset_chain(&s, [spline], 2.0, 15.0, 10.0, &made)
+    if made.count != 1 or s.entity(made.items[0]).kind != EntityKind.spline: error(invalid, "an offset spline is not a spline")
+    var lines = Growing[i64]()
+    defer lines.close()
+    let before = s.constraints.count
+    try offset_chain(&s, [line], 3.0, 20.0, 0.0, &lines)
+    var dimensioned = false
+    for at in before..<s.constraints.count:
+        let k = s.constraints.items[at]
+        if k.kind == ConstraintKind.line_distance and k.value == 3.0: dimensioned = true
+    if not dimensioned: error(invalid, "a line's offset has no distance dimension")
+    # G3: a line along y = 0 into the spline, an arc out of it.
+    var g = new_sketch()
+    defer g.close()
+    let a0 = try g.add_point(-10.0, 0.0)
+    let p0 = try g.add_point(0.0, 0.0)
+    let along = try g.add_line(a0, p0)
+    _ = try g.constrain(ConstraintKind.fix, along)
+    let center = try g.add_point(40.0, 10.0)
+    let q = try g.add_point(40.0, 0.0)
+    let arc_end = try g.add_point(50.0, 10.0)
+    let arc = try g.add_arc(center, q, arc_end)
+    _ = try g.constrain(ConstraintKind.fix, arc)
+    var cvs = Growing[i64]()
+    defer cvs.close()
+    try cvs.push(p0)
+    for (x, y) in [(5.0, 0.5), (10.0, 0.5), (15.0, 0.5), (25.0, -0.5), (30.0, -0.5), (35.0, -0.5)]:
+        try cvs.push(try g.add_point(x, y))
+    try cvs.push(q)
+    let blend = try g.add_spline(cvs.view(), false)
+    _ = try g.constrain(ConstraintKind.smooth, blend, along, side = 1.0)
+    _ = try g.constrain(ConstraintKind.smooth, blend, arc, value = -1.0, side = -1.0)
+    let solved = try solve_sketch(&g)
+    if not solved.converged: error(invalid, "a G3 blend does not solve")
+    # Its first four control points on the line's line.
+    let e = g.entity(blend)
+    for k in 0..<(i64)4:
+        if math.abs(g.y(g.spline_point(e, k))) > 1e-6: error(invalid, "a G3 blend's start is not along its line")
+
+func g3_between_lines() -> !:
+    var g = new_sketch()
+    defer g.close()
+    let a = try g.add_line(try g.add_point(0.0, 0.0), try g.add_point(20.0, 0.0))
+    let b = try g.add_line(try g.add_point(40.0, 10.0), try g.add_point(60.0, 10.0))
+    var cvs = Growing[i64]()
+    defer cvs.close()
+    try cvs.push(g.entity(a).second)
+    for (x, y) in [(23.0, 0.0), (26.0, 0.0), (29.0, 0.0), (31.0, 10.0), (34.0, 10.0), (37.0, 10.0)]:
+        try cvs.push(try g.add_point(x, y))
+    try cvs.push(g.entity(b).first)
+    let blend = try g.add_spline(cvs.view(), false)
+    _ = try g.constrain(ConstraintKind.smooth, blend, a, value = 1.0, side = 1.0)
+    _ = try g.constrain(ConstraintKind.smooth, blend, b, value = 1.0, side = -1.0)
+    let solved = try solve_sketch(&g)
+    if not solved.converged: error(invalid, "a G3 blend between lines does not solve")
+
+func g3_editor_case() -> !:
+    var g = new_sketch()
+    defer g.close()
+    let a = try g.add_line(try g.add_point(100.0, -100.0), try g.add_point(120.0, -100.0))
+    _ = try g.constrain(ConstraintKind.horizontal, a)
+    let b = try g.add_line(try g.add_point(140.0, -90.0), try g.add_point(160.0, -90.0))
+    _ = try g.constrain(ConstraintKind.horizontal, b)
+    let span = math.hypot(20.0, 10.0)
+    var cvs = Growing[i64]()
+    defer cvs.close()
+    try cvs.push(g.entity(a).second)
+    for reach in [0.15, 0.3, 0.45]: try cvs.push(try g.add_point(120.0 + span * reach, -100.0))
+    for reach in [0.45, 0.3, 0.15]: try cvs.push(try g.add_point(140.0 - span * reach, -90.0))
+    try cvs.push(g.entity(b).first)
+    let blend = try g.add_spline(cvs.view(), false)
+    _ = try g.constrain(ConstraintKind.smooth, blend, a, value = 1.0, side = 1.0)
+    _ = try g.constrain(ConstraintKind.smooth, blend, b, value = 1.0, side = -1.0)
+    let solved = try solve_sketch(&g)
+    if not solved.converged: error(invalid, "a G3 blend between level lines does not solve")
