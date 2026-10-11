@@ -5,6 +5,7 @@
 ## untagged), picked edges give each model its own references, a feature
 ## made from them replaces its model, and an untagged model has none.
 from luce_cad.solids import CadSolids
+from luce_cad.model import CadModel, BrepModel
 from luce_cad.modeling import CadModeling
 from luce_geocore.geocore import Vector3
 from luce_cad.cad_edits import CadEdits
@@ -37,6 +38,7 @@ pub func cad_edits_tests() -> unit!:
     let two = CadEdits.with_model(box, CadSolids.sphere(1.0))
     assert(CadGeometry.model_count(two) == 2 and CadEdits.pick_mesh(two).face_count() > 6)
     edge_references()
+    open_patches()
     print("PASS CAD edits: tagged pick mesh, whole-model moves (parts refused), face and model deletes, added models, per-model edge references, replaced models")
 
 func edge_references() -> unit!:
@@ -58,3 +60,38 @@ func edge_references() -> unit!:
     _ = CadEdits.replaced(models, 3, first) catch failure:
         refused = true
     assert(refused)
+
+## Two trimmed regions share a plane. One rim contains two collinear
+## edges: whole edges differ, but their tangent chain is shared.
+func open_patches() -> unit!:
+    let b = BrepModel()
+    for p in [Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0), Vector3(2.0, 2.0, 0.0), Vector3(0.0, 2.0, 0.0),
+              Vector3(3.0, 0.0, 0.0), Vector3(4.0, 0.0, 0.0), Vector3(4.0, 1.0, 0.0), Vector3(3.0, 1.0, 0.0)]:
+        _ = b.add_vertex(p)
+    for at in 0..<5: _ = b.add_line(at, (at + 1) % 5)
+    for at in 0..<4: _ = b.add_line(5 + at, 5 + (at + 1) % 4)
+    _ = b.add_surface(0, Vector3(), Vector3(0.0, 0.0, 1.0), Vector3(1.0, 0.0, 0.0))
+    _ = b.add_face(0, [1, 2, 3, 4, 5], [5])
+    _ = b.add_face(0, [6, 7, 8, 9], [4])
+    let model = CadModel()
+    model.attach_brep(b)
+    assert(model.face_surface_id(0) == model.face_surface_id(1))
+    let pick = CadEdits.pick_mesh(CadGeometry.of_model(model))
+    let surfaces = pick.find_attribute("cad_surface", 2)
+    for face in 0..<pick.face_count(): assert(pick.attribute_value(surfaces, face) == 0.0)
+    let edges = pick.find_attribute("cad_edge", 4)
+    let chains = pick.find_attribute("cad_edge_chain", 4)
+    let seen: list[int] = []
+    for edge in 0..<pick.edge_count():
+        let id = int(pick.attribute_value(edges, edge))
+        if id < 0: continue
+        if not (id in seen): seen.append(id)
+        let chain = int(pick.attribute_value(chains, edge))
+        assert(chain == (0 if id == 1 else id))
+    assert(seen.length == 9, f"open boundary owners: {seen}")
+    # Removing a box face keeps its four open rims pickable too.
+    let box = CadSolids.box(2.0, 2.0, 2.0).subset([1, 2, 3, 4, 5])
+    let open_pick = CadEdits.pick_mesh(CadGeometry.of_model(box))
+    let owners = open_pick.find_attribute("cad_edge", 4)
+    for edge in 0..<open_pick.edge_count(): assert(open_pick.attribute_value(owners, edge) >= 0.0)
+    print("PASS CAD pick topology: open boundaries, surface patch identity and tangent chains stopping at corners")

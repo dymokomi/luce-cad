@@ -14,7 +14,7 @@ from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import ComponentTransform, MeshPart, concatenated, group_bits_of, Domain, TableBuilder, text_attribute, append_text
 from model import CadModel
 from cad_geometry import set_models, with_models
-from modeling import reference_lines
+from modeling import reference_lines, shape_of
 from luce_std import sort
 
 ## Luce's CAD editing operations (Edit CAD).
@@ -44,7 +44,15 @@ pub struct CadEdits:
             for face in 0..<shown.value().face_count(): try owning.push((f64)index)
         let joined = try concatenated(parts.view())
         defer joined.release()
-        let tagged = try joined.value().with_attribute("cad_model", 2, 1, owning.view(), true)
+        let modeled = try joined.value().with_attribute("cad_model", 2, 1, owning.view(), true)
+        defer modeled.release()
+        var surfaces = Growing[f64]()
+        defer surfaces.close()
+        let faces = modeled.value().find_attribute("cad_face", 2)
+        for face in 0..<modeled.value().face_count():
+            let model = models[(usize)owning.items[(usize)face]].value()
+            try surfaces.push((f64)(try model.face_surface_id((i64)(try modeled.value().attribute_value(faces, face)))))
+        let tagged = try modeled.value().with_attribute("cad_surface", 2, 1, surfaces.view(), true)
         defer tagged.release()
         var edges = Growing[f64]()
         defer edges.close()
@@ -57,7 +65,8 @@ pub struct CadEdits:
         defer owners_of_edges.close()
         for model in edge_models.view(): try owners_of_edges.push((f64)model)
         let owned = try numbered.value().with_attribute("cad_edge_model", 4, 1, owners_of_edges.view(), true)
-        let referenced = try with_references(owned, models, edges.view(), edge_models.view())
+        let chained = try with_chains(owned, models, edges.view(), edge_models.view())
+        let referenced = try with_references(chained, models, edges.view(), edge_models.view())
         return try with_face_names(referenced, models, owning.view())
 
     ## `set` with the models `group` names on `pick` (whole models only)
@@ -249,11 +258,12 @@ func edge_owners(mesh: const Mesh*, owning: const f64[], models: const interop.R
     for edge in 0..<edges:
         let p = sides[edge * 2]
         let q = sides[edge * 2 + 1]
-        if p < 0 or q < 0: continue
+        if p < 0: continue
         let model = (usize)owning[(usize)p]
-        if model != (usize)owning[(usize)q] or model >= models.length: continue
+        if model >= models.length: continue
+        if q >= 0 and model != (usize)owning[(usize)q]: continue
         let a = (i64)faces.number((usize)p, 0)
-        let b = (i64)faces.number((usize)q, 0)
+        let b = (i64)faces.number((usize)q, 0) if q >= 0 else -1
         if a == b: continue
         let key = (i64)model * 1099511627776 + (a if a < b else b) * 1048576 + (b if a < b else a)
         let index = &pairs.items[model]
@@ -348,6 +358,9 @@ struct FacePairs:
         var result = FacePairs(Growing[i64]())
         errdefer result.close()
         let edges = (usize)model.edge_count()
+        var counts = Growing[i64]()
+        defer counts.close()
+        try counts.fill(edges, 0)
         let first = try new i64[edges] --- in memory.heap
         defer free(first) in memory.heap
         for at in 0..<edges: first[at] = -1
@@ -355,6 +368,7 @@ struct FacePairs:
             for use in 0..<(try model.face_edge_count(face)):
                 let id = try model.face_edge_id(face, use)
                 if id < 0 or (usize)id >= edges: continue
+                counts.items[(usize)id] += 1
                 let other = first[(usize)id]
                 if other < 0:
                     first[(usize)id] = face
@@ -363,6 +377,9 @@ struct FacePairs:
                     let high = face if other < face else other
                     # Key in the high bits, edge in the low 24.
                     try result.keys.push((low * 1048576 + high) * 16777216 + id)
+        for id in 0..<edges:
+            if counts.items[id] == 1:
+                try result.keys.push((-1048576 + first[id]) * 16777216 + (i64)id)
         sort.sort(result.keys.items[..<result.keys.count])
         return result
 
@@ -406,3 +423,54 @@ struct FacePairs:
     func close():
         self.keys.close()
 
+
+## Takes the mesh. Connected tangent edges share a model-local chain ID;
+## corners and ambiguous branches stop a chain. Failures leave single edges.
+func with_chains(mesh: interop.Reference[Mesh], models: const interop.Reference[CadModel][], edges: const f64[], edge_models: const i64[]) -> interop.Reference[Mesh]!:
+    defer mesh.release()
+    var ids = Growing[i64]()
+    defer ids.close()
+    var firsts = Growing[usize]()
+    defer firsts.close()
+    for model in models:
+        try firsts.push(ids.count)
+        var chains = Growing[i64]()
+        defer chains.close()
+        for edge in 0..<model.value().edge_count(): try chains.push(edge)
+        tangent_ids(model.value(), &chains) catch failure:
+            for edge in 0..<chains.count: chains.items[edge] = (i64)edge
+        for id in chains.view(): try ids.push(id)
+    var values = Growing[f64]()
+    defer values.close()
+    for at in 0..<edges.length:
+        let model = edge_models[at]
+        try values.push((f64)ids.items[firsts.items[(usize)model] + (usize)edges[at]] if model >= 0 and edges[at] >= 0.0 else -1.0)
+    return try mesh.value().with_attribute("cad_edge_chain", 4, 1, values.view(), true)
+
+func tangent_ids(model: const CadModel*, ids: Growing[i64]*) -> !:
+    if ids.count == 0: return
+    var shape = try shape_of(model)
+    defer shape.close()
+    for e in 0..<shape.edges.count:
+        for end in 0..<2:
+            let edge = shape.edges.items[e]
+            let vertex = edge.start if end == 0 else edge.end
+            let arriving = (try shape.leaving(e, (i64)end)).multiply_scalar(-1.0)
+            var candidate: i64 = -1
+            var count: usize = 0
+            for f in 0..<shape.edges.count:
+                if f == e: continue
+                let other = shape.edges.items[f]
+                if other.start != vertex and other.end != vertex: continue
+                let leaving = try shape.leaving(f, 0 if other.start == vertex else 1)
+                let alignment = leaving.dot(arriving)
+                if math.abs(alignment) < 1.0 - 1e-6: continue
+                count += 1
+                if alignment > 0.0: candidate = (i64)f
+            if count != 1 or candidate < 0: continue
+            let a = ids.items[e]
+            let b = ids.items[(usize)candidate]
+            if a == b: continue
+            let keep = a if a < b else b
+            for at in 0..<ids.count:
+                if ids.items[at] == a or ids.items[at] == b: ids.items[at] = keep
