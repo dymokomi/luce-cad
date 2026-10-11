@@ -9,7 +9,7 @@
 import interop
 import memory
 from luce_std import math
-from luce_geocore.geocore import Mesh, Vector3, Matrix4, invalid, GeometrySet
+from luce_geocore.geocore import Mesh, Vector3, Matrix4, invalid, GeometrySet, Selection
 from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import ComponentTransform, MeshPart, concatenated, group_bits_of, Domain, TableBuilder, text_attribute, append_text
 from model import CadModel
@@ -68,6 +68,32 @@ pub struct CadEdits:
         let chained = try with_chains(owned, models, edges.view(), edge_models.view())
         let referenced = try with_references(chained, models, edges.view(), edge_models.view())
         return try with_face_names(referenced, models, owning.view())
+
+    ## Count authored CAD entities, independent of display tessellation density.
+    ## Level 0 models, 1 CVs, 2 edges, 3 faces, 5 support patches.
+    pub static func selected_entities(pick: interop.Reference[Mesh], selection: interop.Reference[Selection], level: i64) -> i64!:
+        let mesh = try pick.get()
+        let chosen = try selection.get()
+        if level == 1: return chosen.count()
+        let domain: i64 = 4 if level == 2 else 2
+        if chosen.domain() != domain: return 0
+        let owners = mesh.find_attribute("cad_edge_model" if level == 2 else "cad_model", domain)
+        let ids = mesh.find_attribute("cad_edge" if level == 2 else ("cad_surface" if level == 5 else "cad_face"), domain)
+        if owners < 0 or ids < 0: return 0
+        var entities = Growing[i64]()
+        defer entities.close()
+        var at: i64 = -1
+        while true:
+            at = chosen.next(at)
+            if at < 0: break
+            let owner = (i64)(try mesh.attribute_value(owners, at))
+            let id = (i64)(try mesh.attribute_value(ids, at)) if level != 0 else 0
+            if owner >= 0 and id >= 0: try entities.push(owner * 4294967296 + id)
+        sort.sort(entities.items[..<entities.count])
+        var count: i64 = 0
+        for index in 0..<entities.count:
+            if index == 0 or entities.items[index] != entities.items[index - 1]: count += 1
+        return count
 
     ## `set` with the models `group` names on `pick` (whole models only)
     ## moved by Transform Components' numbers: translate, rotate (degrees),
