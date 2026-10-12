@@ -38,6 +38,7 @@ does today.
 | `chamfered(model, references, distance, tag, chain, corner)` | The referenced edges chamfered `distance` along each face; where three meet at a corner, Fusion's Corner Type: `0` Chamfer, `1` Miter, `2` Blend. |
 | `chord_radius(model, references, chord, chain)` | Fusion's Chord Length: the radius whose fillets leave the faces `chord` apart. |
 | `full_round(model, center, tag, continuity, side1, side2)` | Fusion's Full Round Fillet: the flat center face rounded away whole, tangent to it and its sides. |
+| `variable_filleted(model, reference, positions, radii, tag, smooth)` | Fusion's Variable radius: one straight edge between flat faces, radii at positions 0 to 1 along it, smooth or straight between. |
 | `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |
 | `rule_edges(model, rounds, fillets, faces, others)` | Fusion's Rule Fillet (`rules.lucb`): references to the blendable edges a rule takes, convex ones (rounds), concave ones (fillets) or both; with `faces` named, only edges on those faces, and with `others` too, only edges between the two sets. Made again on every cook, the edges follow the body. |
 | `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Every edge Equal distance takes (loops round a flat face, rims, curved faces, inside edges); each distance runs straight from the edge to the chamfer's contact in the plane square to the edge (`chamfers.lucb`). |
@@ -373,6 +374,17 @@ top, square or tapered), the circle tangent to the three planes in the section (
 n·X + r = h for each) gives the radius, and both the center face's edges with the sides are
 filleted to it: the two strips touch the center face at the same line, so it goes and the strips
 are one cylinder (G2 and G3: two strips meeting with zero curvature).
+
+**Variable radius** (`variable_fillet.lucb`): the rolling ball's circle swept with its radius
+changing. In each section square to the edge it is the rational quadratic arc from contact to
+contact whose middle control point is the edge's own point (weight sin(θ/2)); the contacts lie
+r cot(θ/2) along each face, so every row of the net is the edge's point plus a multiple of r(s).
+With r(s) a piecewise cubic (smooth: each radius held a moment at its point, t²(3 − 2t) between;
+or straight) the face is exactly a rational B-spline, degree 2 across and 3 along, a knot thrice
+at each point. Its tool, the region between the edge and that face, ends flush with the faces at
+the edge's ends, which must be square to it; taken away (added for an inside edge) by the
+booleans, its net keeping to one side of each face's plane. One straight edge between flat faces,
+G1; `fillet_option_tests` checks the volume taken against (1 − π/4) × length × ∫ r² ds.
 
 **Chamfer types and distances** (`chamfers.lucb`). Fusion's Chamfer has Equal distance, Two
 distances and Distance and angle. Each distance is measured from the original edge (what Autodesk's
@@ -907,7 +919,8 @@ Roughly in order of usefulness:
 
 1. **Fillet corners beyond three edges,** and G1 setback corners (the patch with one row, made
    rational to meet the circular strips exactly).
-2. **Variable radius fillets** (radii at points along an edge).
+2. **Variable radius fillets** beyond one straight edge between flat faces with square ends
+   (chains, curved faces, edges meeting other fillets at corners), and G2/G3 variable radii.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
    the loop turns a sharp corner rather than going on tangentially.

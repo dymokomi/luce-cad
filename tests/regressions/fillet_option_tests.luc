@@ -22,7 +22,8 @@ func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[
 pub func fillet_option_tests() -> unit!:
     chord_length()
     full_round()
-    print("PASS fillet options: chord length (c / √2 at a square corner, c / (2 cos 67.5°) on a 135° one, edges at mixed angles refused); full round of a square rib (its top gone, one round of half its width) and a tapered one (the round touching the top), G1 and G2")
+    variable_radius()
+    print("PASS fillet options: chord length (c / √2 at a square corner, c / (2 cos 67.5°) on a 135° one, edges at mixed angles refused); full round of a square rib (its top gone, one round of half its width) and a tapered one (the round touching the top), G1 and G2; variable radius along a box's edge, straight (1 to 3) and smooth (2, 1 in the middle, 2), against the integral of r² along it")
 
 func chord_length() -> unit!:
     let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
@@ -98,3 +99,38 @@ func full_round() -> unit!:
     let mesh = round.tessellate(32)
     manifold(mesh)
     assert(math.abs(mesh.bounds().maximum.y - 10.0) < 1e-3 and volume(mesh) < 100.0 * 20.0)
+
+## A 20 box's front top edge, radius 1 at its start to 3 at its end,
+## straight: (1 − π/4) × 20 × ∫ r² ds taken; smooth with 1 in the middle and
+## 2 at the ends: the same integral, of the smooth r.
+func variable_radius() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "box")
+    let front_top = func (a: Vector3, b: Vector3) -> bool:
+        return a.y > 9.99 and b.y > 9.99 and a.z > 9.99 and b.z > 9.99
+    let edge = CadModeling.edge_references(box, edges_where(box, front_top))
+    let straight = CadModeling.variable_filleted(box, edge, [0.0, 1.0], [1.0, 3.0], "v", smooth = false)
+    let mesh = straight.tessellate(32)
+    manifold(mesh)
+    let corner = 1.0 - math.pi * 0.25
+    let taken = 8000.0 - volume(mesh)
+    if math.abs(taken - corner * 20.0 * 13.0 / 3.0) > 0.05:
+        print(f"straight: taken {taken}, expected {corner * 20.0 * 13.0 / 3.0}")
+    assert(math.abs(taken - corner * 20.0 * 13.0 / 3.0) < 0.05)
+    assert(straight.face_count() == 7)
+    let smooth = CadModeling.variable_filleted(box, edge, [0.0, 0.5, 1.0], [2.0, 1.0, 2.0], "v")
+    let smooth_mesh = smooth.tessellate(32)
+    manifold(smooth_mesh)
+    # ∫ r² ds by Simpson's rule on r = 2 − t²(3 − 2t) each half.
+    var integral = 0.0
+    let steps = 2000
+    for k in 0..<steps + 1:
+        let x = float(k) / float(steps)
+        let t = x * 2.0 if x <= 0.5 else (1.0 - x) * 2.0
+        let r = 2.0 - t * t * (3.0 - 2.0 * t)
+        let factor = 1.0 if k == 0 or k == steps else (4.0 if k % 2 == 1 else 2.0)
+        integral += factor * r * r
+    integral = integral / (3.0 * float(steps))
+    let smooth_taken = 8000.0 - volume(smooth_mesh)
+    if math.abs(smooth_taken - corner * 20.0 * integral) > 0.05:
+        print(f"smooth: taken {smooth_taken}, expected {corner * 20.0 * integral}")
+    assert(math.abs(smooth_taken - corner * 20.0 * integral) < 0.05)

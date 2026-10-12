@@ -1,0 +1,205 @@
+## Fusion's Variable radius fillet: radii at points along one straight edge
+## between two flat faces (positions 0 to 1 along it, its start and end
+## among them), blending between them smoothly (each radius held a moment
+## at its point: a cubic with no slope there, Inventor's Smooth radius
+## transition, which Fusion's variable fillet looks like) or straight.
+##
+## The blend face is the rolling ball's circle swept with its radius
+## changing. In each section square to the edge it is the rational
+## quadratic arc from contact to contact whose middle control point is the
+## edge's own point, weighted sin(θ/2) for faces θ apart; the contacts lie
+## r cot(θ/2) along each face. So each row of the net is the edge's point
+## plus a multiple of r(s), and with r(s) a piecewise cubic the face is
+## exactly a rational B-spline, degree 2 across and 3 along (a knot thrice
+## at each point: each piece is a Bezier). The tool is the region between
+## the edge and that face, flush with the faces at the edge's ends (which
+## must be square to it); taken away (an inside edge: added) by the
+## booleans. Its net keeps to one side of each face's plane, touching it
+## only along the contact row, so it meets the body only along curves both
+## carry (kept_apart).
+
+## The radius at `s` (0 to 1) of points `positions` (ascending, 0 and 1
+## among them) with `radii`, `smooth` or straight between them.
+func radius_at(positions: const f64[], radii: const f64[], smooth: bool, s: f64) -> f64:
+    var k: usize = 0
+    while k + 2 < positions.length and s > positions[k + 1]: k += 1
+    let span = positions[k + 1] - positions[k]
+    var t = (s - positions[k]) / span if span > 0.0 else 0.0
+    t = math.clamp(t, 0.0, 1.0)
+    let blend = t * t * (3.0 - 2.0 * t) if smooth else t
+    return radii[k] + (radii[k + 1] - radii[k]) * blend
+
+## `model` with the edge `reference` names filleted with radii `radii` at
+## `positions` along it (0 its start, 1 its end; the ends are added from
+## the nearest radius when missing), smoothly or straight between them, the
+## blend named for feature `tag`.
+func variable_filleted_edge(model: const CadModel*, reference: str, positions: const f64[], radii: const f64[], smooth: bool, tag: str) -> interop.Reference[CadModel]!:
+    if positions.length != radii.length or positions.length == 0: error(invalid, "a variable radius needs a radius at each position")
+    var at = Growing[f64]()
+    defer at.close()
+    var sizes = Growing[f64]()
+    defer sizes.close()
+    for k in 0..<positions.length:
+        if not math.is_finite(positions[k]) or positions[k] < 0.0 or positions[k] > 1.0: error(invalid, "a variable radius's positions run from 0 to 1 along the edge")
+        if not math.is_finite(radii[k]) or radii[k] <= 0.0: error(invalid, "a variable radius's radii are positive")
+        if k > 0 and positions[k] <= positions[k - 1]: error(invalid, "a variable radius's positions must rise along the edge")
+    if positions[0] > 0.0:
+        try at.push(0.0)
+        try sizes.push(radii[0])
+    for k in 0..<positions.length:
+        try at.push(positions[k])
+        try sizes.push(radii[k])
+    if positions[positions.length - 1] < 1.0:
+        try at.push(1.0)
+        try sizes.push(radii[radii.length - 1])
+    var w = try shape_of(model)
+    defer w.close()
+    var chosen = Growing[usize]()
+    defer chosen.close()
+    try resolve_edges(&w, reference, &chosen)
+    if chosen.count != 1: error(invalid, "a variable radius fillet takes one edge")
+    let e = chosen.items[0]
+    let edge = w.edges.items[e]
+    if w.carriers.items[(usize)edge.carrier].kind != curve_line: error(invalid, "a variable radius fillet takes a straight edge between two flat faces")
+    let (fa, fb) = try edge_faces(&w, e)
+    if not flat_pair(&w, fa, fb): error(invalid, "a variable radius fillet takes a straight edge between two flat faces")
+    var largest = 0.0
+    for r in sizes.view(): largest = math.max(largest, r)
+    try check_fits(&w, e, largest, true)
+    let start = try w.edge_at(e, 0.0)
+    let end = try w.edge_at(e, 1.0)
+    let along = try end.subtract(start).normalized()
+    # The ends must meet faces square to the edge: the tool ends flush there.
+    for v in [edge.start, edge.end]:
+        var square = false
+        for f in 0..<w.faces.count:
+            if f == fa or f == fb: continue
+            var holds = false
+            for use in w.face_uses(f):
+                let o = w.edges.items[edge_index(use)]
+                if o.start == v or o.end == v: holds = true
+            if not holds: continue
+            let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+            square = square or (s.kind == surface_plane and math.abs(math.abs(s.z.dot(along)) - 1.0) < 1e-9)
+        if not square: error(invalid, "a variable radius fillet's edge must end at faces square to it")
+    let ua = try into_face(&w, fa, e, along)
+    let ub = try into_face(&w, fb, e, along)
+    let theta = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    let reach = 1.0 / math.tan(theta * 0.5)
+    let weight = math.sin(theta * 0.5)
+    var name = Growing[u8]()
+    defer name.close()
+    try blend_name(&w, e, tag, &name)
+    let convex_edge = try convex(&w, e)
+    let tool = try variable_tool(start, end, ua, ub, face_outward(&w, fa), face_outward(&w, fb), reach, weight, at.view(), sizes.view(), smooth, (str)name.view(), convex_edge)
+    defer tool.release()
+    return try combine(model, tool.value(), op_subtract if convex_edge else op_union)
+
+## The tool of a variable radius fillet of the edge from `start` to `end`
+## (faces' ways `ua`, `ub` into them and their outward normals `na`, `nb`,
+## contacts `reach` r along each, the arc's middle weight `weight`), its
+## blend face named `name`; `convex_edge` for an convex_edge edge (the tool taken
+## away; an inside one's, in the air, is added).
+func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, reach: f64, weight: f64, positions: const f64[], radii: const f64[], smooth: bool, name: str, convex_edge: bool) -> interop.Reference[CadModel]!:
+    let pieces = positions.length - 1
+    let count = 3 * pieces + 1
+    # Along: a cubic Bezier per piece, knots thrice at each point.
+    var knots = Growing[f64]()
+    defer knots.close()
+    for _ in 0..<4: try knots.push(0.0)
+    for k in 1..<pieces:
+        for _ in 0..<3: try knots.push(positions[k])
+    for _ in 0..<4: try knots.push(1.0)
+    # Each piece's Bezier values of r: held at its ends (smooth: no slope
+    # there), or straight (a line's thirds).
+    var r = Growing[f64]()
+    defer r.close()
+    var s = Growing[f64]()
+    defer s.close()
+    for k in 0..<pieces:
+        let low = radii[k]
+        let high = radii[k + 1]
+        let values: f64[4] = [low, low, high, high] if smooth else [low, low + (high - low) / 3.0, low + (high - low) * 2.0 / 3.0, high]
+        for j in 0..<(usize)4:
+            if k > 0 and j == 0: continue
+            try r.push(values[j])
+            try s.push(positions[k] + (positions[k + 1] - positions[k]) * (f64)j / 3.0)
+    # The net, u (across: contact a, the edge, contact b) by v (along).
+    var net = Growing[Vector3]()
+    defer net.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    let length = end.subtract(start)
+    for u in 0..<3:
+        for v in 0..<count:
+            let p = start.add(length.multiply_scalar(s.items[v]))
+            if u == 0: try net.push(p.add(ua.multiply_scalar(reach * r.items[v])))
+            elif u == 1: try net.push(p)
+            else: try net.push(p.add(ub.multiply_scalar(reach * r.items[v])))
+            try weights.push(weight if u == 1 else 1.0)
+    let section_knots: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    let size = length.length() + reach * radii[0] * 4.0
+    let solid = try BrepModel.sized(size)
+    defer solid.release()
+    let b = solid.value()
+    let e0 = try b.add_vertex(start)
+    let e1 = try b.add_vertex(end)
+    let a0 = try b.add_vertex(net.items[0])
+    let a1 = try b.add_vertex(net.items[count - 1])
+    let b0 = try b.add_vertex(net.items[2 * count])
+    let b1 = try b.add_vertex(net.items[3 * count - 1])
+    let ridge = try b.add_line(e0, e1)
+    let to_a0 = try b.add_line(e0, a0)
+    let to_b0 = try b.add_line(e0, b0)
+    let to_a1 = try b.add_line(e1, a1)
+    let to_b1 = try b.add_line(e1, b1)
+    var row = Growing[Vector3]()
+    defer row.close()
+    var ones = Growing[f64]()
+    defer ones.close()
+    try ones.fill(count, 1.0)
+    try row.assign(net.view()[0..<count])
+    let curve_a = try b.add_spline_edge(a0, a1, row.view(), ones.view(), 3, knots.view(), true)
+    try row.assign(net.view()[2 * count..<3 * count])
+    let curve_b = try b.add_spline_edge(b0, b1, row.view(), ones.view(), 3, knots.view(), true)
+    let arc_weights: f64[3] = [1.0, weight, 1.0]
+    let first: Vector3[3] = [net.items[0], net.items[count], net.items[2 * count]]
+    let last: Vector3[3] = [net.items[count - 1], net.items[2 * count - 1], net.items[3 * count - 1]]
+    let arc0 = try b.add_spline_edge(a0, b0, first[..<3], arc_weights[..<3], 2, section_knots[..<6], true)
+    let arc1 = try b.add_spline_edge(a1, b1, last[..<3], arc_weights[..<3], 2, section_knots[..<6], true)
+    # The blend face: outward toward the ball's center (away from the edge,
+    # the tool lying between the edge and the face, either way).
+    let surface = try b.add_spline_surface(net.view(), weights.view(), 3, (i64)count, 2, 3, section_knots[..<6], knots.view())
+    let middle = start.add(length.multiply_scalar(0.5))
+    let bisector = try ua.add(ub).normalized()
+    let middle_r = radius_at(positions, radii, smooth, 0.5)
+    let center = middle.add(bisector.multiply_scalar(middle_r / weight))
+    let arc_point = center.subtract(bisector.multiply_scalar(middle_r))
+    let toward = center.subtract(arc_point)
+    let sizes: i64[1] = [4]
+    # Counterclockwise in (u, v), across (a to b) by along: about du x dv.
+    let du = net.items[2 * count + count // 2].subtract(net.items[count // 2])
+    let forward = du.cross(length).dot(toward) > 0.0
+    let ahead: i64[4] = [arc0 + 1, curve_b + 1, -(arc1 + 1), -(curve_a + 1)]
+    let back: i64[4] = [curve_a + 1, arc1 + 1, -(curve_b + 1), -(arc0 + 1)]
+    let face = try b.add_face(surface, ahead[..<4] if forward else back[..<4], sizes[..<1], forward)
+    try b.set_face_name(face, name)
+    # The flat faces: on face a, on face b (the body's faces' own planes:
+    # outward as the body's for a tool taken away, inward for one added),
+    # and the two ends.
+    let normal_a = na if convex_edge else na.multiply_scalar(-1.0)
+    let normal_b = nb if convex_edge else nb.multiply_scalar(-1.0)
+    let on_a: i64[4] = [ridge + 1, to_a1 + 1, -(curve_a + 1), -(to_a0 + 1)]
+    let around_a: Vector3[4] = [start, end, net.items[count - 1], net.items[0]]
+    try flat_face(b, start, normal_a, on_a[..<4], around_a[..<4])
+    let on_b: i64[4] = [to_b0 + 1, curve_b + 1, -(to_b1 + 1), -(ridge + 1)]
+    let around_b: Vector3[4] = [start, net.items[2 * count], net.items[3 * count - 1], end]
+    try flat_face(b, start, normal_b, on_b[..<4], around_b[..<4])
+    let way = try length.normalized()
+    let at_start: i64[3] = [to_a0 + 1, arc0 + 1, -(to_b0 + 1)]
+    let around_start: Vector3[3] = [start, net.items[0], net.items[2 * count]]
+    try flat_face(b, start, way.multiply_scalar(-1.0), at_start[..<3], around_start[..<3])
+    let at_end: i64[3] = [to_b1 + 1, -(arc1 + 1), -(to_a1 + 1)]
+    let around_end: Vector3[3] = [end, net.items[3 * count - 1], net.items[count - 1]]
+    try flat_face(b, end, way, at_end[..<3], around_end[..<3])
+    return try CadModel.of_brep(solid)
