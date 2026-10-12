@@ -14,7 +14,12 @@ does today.
 | `CadModeling.` | What it does |
 |---|---|
 | `extruded(set, distance, start, tag)` | The sketch's closed curves in `set`, as profile regions, each swept `distance` along the plane's normal from `start` along it. |
+| `extruded_sides(set, distance, other, tag, taper, other_taper, start)` | Fusion's Extrude directions: `distance` along the normal and `other` against it (one side, two sides, or symmetric with both alike), each side leaning in by its taper angle. |
+| `extruded_through(set, model, tag, direction, taper)` | Extent All: past the whole body along the normal (`1`), against it (`-1`) or both ways (`0`). |
+| `extruded_to(set, model, tag, face, offset, taper)` | Extent To Object: until the extrusion meets the named face's surface (extended past the face), `offset` further; with no face, until it meets the body. |
 | `revolved(set, axis, tag, angle)` | Each region turned about the plane's u (`0`) or v (`1`) axis: a full turn, or `angle` radians closed by the profile at each end. |
+| `revolved_about(set, origin, direction, tag, angle)` | The same about any line in the sketch's plane: a sketch line, a body edge, a construction axis. |
+| `edge_axis(model, reference)` | A line edge's line, or a circular edge's axis, for Revolve. |
 | `profile_count(set)` | How many regions the sketch has. |
 | `profile_keys(set)`, `profile_at(set, point)` | The keys of the sketch's faces; the key of the face under a point (a click). `extruded` and `revolved` take keys to choose faces. |
 | `combined(a, b, operation)` | `0` union, `1` `a` without `b`, `2` intersection. |
@@ -108,6 +113,36 @@ Each region becomes a closed solid:
 
 Every loop runs counterclockwise about its face's outward normal, so every edge is used twice, in
 opposite directions.
+
+### Extents (`extents.lucb`, `extent_targets.lucb`)
+
+Fusion's Extrude dialog: two sides, each with its own distance and taper. The solid is built
+directly, without booleans, as **levels**: the profile at heights along its normal, each edge moved
+outward in the plane by the level's growth, `-height × tan(taper)`.
+- A line moves parallel to itself; an arc about its center, its radius changing by the growth.
+- Neighbors meet again where the moved edges cross (closed form: line/line, line/circle,
+  circle/circle, the crossing nearest the vertex); where they run on tangentially, the vertex moves
+  along its normal.
+- Between two levels each edge sweeps a face: a plane for a line (slanted by the taper), a cylinder
+  or a cone for an arc, a B-spline swept straight for a spline. A spline takes no taper (refused
+  with a message).
+- One side is two levels; two sides are three (the profile in the middle), or two when neither
+  side tapers. Where two sides of different taper meet at the profile, each side face breaks
+  there: the lower part is named `back<c>.<k>`.
+- A taper that shrinks an edge to nothing, turns an arc over, or keeps neighbors from meeting is
+  refused: "the taper is too steep for this profile".
+
+Extents that read a body:
+- **All**: the body's reach along the normal (its faces' boxes) and a margin. Refused when the body
+  is not on that side.
+- **To a face**: a plane parallel to the sketch is a distance. Any other plane, or a cylinder, cone,
+  sphere or torus, stops the extrusion where it meets the face's surface, extended past the face,
+  as Fusion's To Object does. The extrusion is made long; the half-space past a plane (a large box
+  on it), or the solid of a curved surface, is taken away, or kept when the sketch is inside it.
+  The lump holding the profile's start cap is the result (`lumps.lucb`), so whatever lies past
+  the surface is dropped. Offsets move the surface along the way the extrusion runs. B-spline faces
+  are refused.
+- **To a body**: the long extrusion less the body, the lump at the profile.
 
 ### Revolve (`revolve.lucb`)
 
@@ -545,6 +580,6 @@ Roughly in order of usefulness:
    chains along B-spline walls (a fillet ending where a tangent loop goes on).
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
    surfaces. Rays through them are exact (`spline_rays.lucb`).
-4. **Sweep and loft;** tapered extrudes; Extrude "to object".
+4. **Sweep and loft;** Extrude's Thin option and a start offset by a face.
 5. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
 6. **Shell,** offset, draft and press/pull.

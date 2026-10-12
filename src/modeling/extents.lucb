@@ -1,0 +1,275 @@
+## Extrude's extents beyond one straight distance (Fusion's Extrude
+## dialog): two sides, each with its own distance and taper. The solid is
+## built directly as levels: the profile at heights along its normal, each
+## edge moved outward in the plane by the level's growth (a line parallel
+## to itself, an arc about its center), neighbors meeting again where the
+## moved edges cross. Between two levels each edge sweeps a face: a plane
+## for a line, a cylinder or a cone for an arc, a B-spline swept straight
+## for a spline (which takes no taper). Caps close the lowest and highest
+## levels. Every loop runs as extrude.lucb's do, so each edge is used twice.
+
+## A level: the profile `height` along its normal, its edges moved `grow`
+## outward (0: as drawn).
+pub struct Level:
+    pub var height: f64
+    pub var grow: f64
+
+## One edge of a loop at a level: its ends (the moved neighbors' meeting
+## points) and, for an arc, its moved radius.
+struct LevelEdge:
+    var start: Vector3
+    var end: Vector3
+    var radius: f64
+
+## Every region of `p` extruded through `levels` (heights ascending, at
+## least two) into `b`; its faces named for feature `tag`: caps `start<c>`
+## and `end<c>`, sides `side<c>.<k>`, a lower part of a side `back<c>.<k>`
+## when two sides of differing taper meet at the profile.
+pub func extrude_levels(b: BrepModel*, p: const Profiles*, levels: const Level[], tag: str) -> !:
+    if levels.length < 2: error(invalid, "an extrusion needs two levels")
+    for at in 1..<levels.length:
+        if not (levels[at].height - levels[at - 1].height > 1e-9): error(invalid, "an extrusion needs a nonzero distance")
+    let tol = b.model_tolerance()
+    var moved = Growing[LevelEdge]()
+    defer moved.close()
+    var vertices = Growing[i64]()
+    defer vertices.close()
+    var curves = Growing[i64]()
+    defer curves.close()
+    var uprights = Growing[i64]()
+    defer uprights.close()
+    var bottom = Growing[i64]()
+    defer bottom.close()
+    var top = Growing[i64]()
+    defer top.close()
+    var bottom_sizes = Growing[i64]()
+    defer bottom_sizes.close()
+    var top_sizes = Growing[i64]()
+    defer top_sizes.close()
+    var name = Growing[u8]()
+    defer name.close()
+    let last = levels.length - 1
+    for region in 0..<p.region_count():
+        bottom.clear()
+        top.clear()
+        bottom_sizes.clear()
+        top_sizes.clear()
+        for loop in p.region(region):
+            let edges = p.loop_edges(loop)
+            let n = edges.length
+            # Each level's moved edges, vertices and curves: level l, edge i
+            # at l * n + i.
+            moved.clear()
+            vertices.clear()
+            curves.clear()
+            uprights.clear()
+            for level in levels:
+                try moved_loop(p, edges, level, tol, &moved)
+            for l in 0..<levels.length:
+                for i in 0..<n: try vertices.push(try b.add_vertex(moved.items[l * n + i].start))
+            for l in 0..<levels.length:
+                for i in 0..<n:
+                    try curves.push(try level_curve(b, p, &edges[i], &moved.items[l * n + i], levels[l].height, vertices.items[l * n + i], vertices.items[l * n + (i + 1) % n]))
+            for s in 0..<last:
+                for i in 0..<n: try uprights.push(try b.add_line(vertices.items[s * n + i], vertices.items[(s + 1) * n + i]))
+            # The sides, segment by segment.
+            for s in 0..<last:
+                for i in 0..<n:
+                    let next = (i + 1) % n
+                    let (surface, sense) = try level_surface(b, p, &edges[i], &moved.items[s * n + i], &moved.items[(s + 1) * n + i], levels[s], levels[s + 1])
+                    let uses: i64[4] = [curves.items[s * n + i] + 1, uprights.items[s * n + next] + 1, -(curves.items[(s + 1) * n + i] + 1), -(uprights.items[s * n + i] + 1)]
+                    let sizes: i64[1] = [4]
+                    let face = try b.add_face(surface, uses[..<4], sizes[..<1], sense)
+                    # Two parts: the lower one is the back side's.
+                    try side_name(&name, tag, &edges[i], "")
+                    if last == 2 and s == 0:
+                        try role_name(&name, tag, "back")
+                        try push_decimal(&name, edges[i].curve)
+                        try name.push(46)
+                        try push_decimal(&name, edges[i].piece)
+                    try b.set_face_name(face, (str)name.view())
+            # The caps: the top runs with the loop, the bottom against it.
+            for at in 0..<n:
+                try top.push(curves.items[last * n + at] + 1)
+                try bottom.push(-(curves.items[n - 1 - at] + 1))
+            try top_sizes.push((i64)n)
+            try bottom_sizes.push((i64)n)
+        let outer = p.loop_edges(p.region(region)[0])
+        let reference = outer[0].end.subtract(outer[0].start) if outer[0].kind == profile_line else outer[0].start.subtract(outer[0].center)
+        let floor = try b.add_surface(0, outer[0].start.add(p.normal.multiply_scalar(levels[0].height)), p.normal.multiply_scalar(-1.0), reference)
+        let low = try b.add_face(floor, bottom.view(), bottom_sizes.view())
+        try cap_name(&name, tag, "start", outer)
+        try b.set_face_name(low, (str)name.view())
+        let roof = try b.add_surface(0, outer[0].start.add(p.normal.multiply_scalar(levels[last].height)), p.normal, reference)
+        let high = try b.add_face(roof, top.view(), top_sizes.view())
+        try cap_name(&name, tag, "end", outer)
+        try b.set_face_name(high, (str)name.view())
+
+## The loop `edges` moved to `level`, onto `out`: each edge's ends where
+## its moved neighbors meet it, and an arc's moved radius.
+func moved_loop(p: const Profiles*, edges: const ProfileEdge[], level: Level, tol: f64, out: Growing[LevelEdge]*) -> !:
+    let lift = p.normal.multiply_scalar(level.height)
+    let n = edges.length
+    let first = out.count
+    for i in 0..<n:
+        let e = &edges[i]
+        if e.kind == profile_spline and level.grow != 0.0: error(invalid, "a taper needs lines and arcs: this profile has a spline")
+        var radius = e.radius
+        if e.kind == profile_arc:
+            radius = e.radius + level.grow * (1.0 if e.sweep > 0.0 else -1.0)
+            if radius <= tol * 10.0: error(invalid, "the taper is too steep for this profile: an arc shrinks to nothing")
+        let before = &edges[(i + n - 1) % n]
+        let start = (try joint(p, before, e, level.grow)).add(lift)
+        try out.push(LevelEdge(start, start, radius))
+    for i in 0..<n:
+        out.items[first + i].end = out.items[first + (i + 1) % n].start
+    if level.grow == 0.0: return
+    # Moved, each edge must still run its way.
+    for i in 0..<n:
+        let e = &edges[i]
+        let m = out.items[first + i]
+        if e.kind == profile_line and m.end.subtract(m.start).dot(e.end.subtract(e.start)) <= tol:
+            error(invalid, "the taper is too steep for this profile: an edge shrinks to nothing")
+        if e.kind == profile_arc and n > 1:
+            let turned = arc_turn(p, e.center.add(lift), m.start, m.end, e.sweep)
+            if not (turned > 0.0) or math.abs(turned - math.abs(e.sweep)) > math.pi * 0.5:
+                error(invalid, "the taper is too steep for this profile: an arc turns over")
+
+## How far an arc about `center` turns from `start` to `end`, the way
+## `sweep` runs about the plane's normal (0 to 2 pi).
+func arc_turn(p: const Profiles*, center: Vector3, start: Vector3, end: Vector3, sweep: f64) -> f64:
+    let a = start.subtract(center)
+    let z = end.subtract(center)
+    var angle = math.atan2(p.normal.dot(a.cross(z)), a.dot(z))
+    if sweep < 0.0: angle = -angle
+    if angle <= 0.0: angle += 2.0 * math.pi
+    return angle
+
+## Where edges `a` (its end) and `b` (its start), each moved `grow`
+## outward, meet: their vertex moved along its outward normal where they
+## run on tangentially, else the moved carriers' crossing nearest it.
+func joint(p: const Profiles*, a: const ProfileEdge*, b: const ProfileEdge*, grow: f64) -> Vector3!:
+    let v = b.start
+    if grow == 0.0: return v
+    let ta = try end_tangent(p, a, false)
+    let tb = try end_tangent(p, b, true)
+    let right_a = ta.cross(p.normal)
+    if ta.cross(tb).length() <= 1e-9 and ta.dot(tb) > 0.0: return v.add(right_a.multiply_scalar(grow))
+    let right_b = tb.cross(p.normal)
+    let guess = v.add(right_a.add(right_b).multiply_scalar(grow * 0.5))
+    var best = Vector3()
+    var best_distance = 1.0e300
+    var hits: Vector3[2] = [Vector3(), Vector3()]
+    var count: usize = 0
+    if a.kind == profile_line and b.kind == profile_line:
+        # a(s) = pa + ta s and b(t) = pb + tb t, in the plane.
+        let pa = v.add(right_a.multiply_scalar(grow))
+        let pb = v.add(right_b.multiply_scalar(grow))
+        let d = ta.cross(tb).dot(p.normal)
+        let s = pb.subtract(pa).cross(tb).dot(p.normal) / d
+        hits[0] = pa.add(ta.multiply_scalar(s))
+        count = 1
+    elif a.kind == profile_line or b.kind == profile_line:
+        let round = b if a.kind == profile_line else a
+        let along = ta if a.kind == profile_line else tb
+        let side = right_a if a.kind == profile_line else right_b
+        let origin = v.add(side.multiply_scalar(grow))
+        let r = round.radius + grow * (1.0 if round.sweep > 0.0 else -1.0)
+        count = line_circle(origin, along, round.center, r, &hits)
+    else:
+        let ra = a.radius + grow * (1.0 if a.sweep > 0.0 else -1.0)
+        let rb = b.radius + grow * (1.0 if b.sweep > 0.0 else -1.0)
+        count = circle_circle(p, a.center, ra, b.center, rb, &hits)
+    for at in 0..<count:
+        let d = hits[at].subtract(guess).length()
+        if d < best_distance:
+            best_distance = d
+            best = hits[at]
+    if count == 0: error(invalid, "the taper is too steep for this profile: neighboring edges no longer meet")
+    return best
+
+## The unit direction profile edge `e` runs at its start (`start`) or end.
+func end_tangent(p: const Profiles*, e: const ProfileEdge*, start: bool) -> Vector3!:
+    if e.kind == profile_line: return try e.end.subtract(e.start).normalized()
+    if e.kind == profile_arc:
+        let at = e.start if start else e.end
+        let t = p.normal.cross(at.subtract(e.center))
+        return try t.multiply_scalar(1.0 if e.sweep > 0.0 else -1.0).normalized()
+    let a = try p.edge_at(e, 0.0 if start else 0.999)
+    let z = try p.edge_at(e, 0.001 if start else 1.0)
+    return try z.subtract(a).normalized()
+
+## Where the line through `origin` along unit `along` meets the circle
+## about `center` of radius `r` (in one plane), onto `out`; how many.
+func line_circle(origin: Vector3, along: Vector3, center: Vector3, r: f64, out: Vector3[2]*) -> usize:
+    let f = origin.subtract(center)
+    let half_b = f.dot(along)
+    let disc = half_b * half_b - (f.dot(f) - r * r)
+    if disc < 0.0: return 0
+    let root = math.sqrt(disc)
+    (*out)[0] = origin.add(along.multiply_scalar(-half_b - root))
+    (*out)[1] = origin.add(along.multiply_scalar(-half_b + root))
+    return 2
+
+## Where two circles in the profile's plane meet, onto `out`; how many.
+func circle_circle(p: const Profiles*, a: Vector3, ra: f64, b: Vector3, rb: f64, out: Vector3[2]*) -> usize:
+    let d = b.subtract(a).length()
+    if d <= 0.0 or d > ra + rb or d < math.abs(ra - rb): return 0
+    let x = b.subtract(a).multiply_scalar(1.0 / d)
+    let y = p.normal.cross(x)
+    let along = (ra * ra - rb * rb + d * d) / (2.0 * d)
+    let h = math.sqrt(math.max(0.0, ra * ra - along * along))
+    (*out)[0] = a.add(x.multiply_scalar(along)).add(y.multiply_scalar(h))
+    (*out)[1] = a.add(x.multiply_scalar(along)).subtract(y.multiply_scalar(h))
+    return 2
+
+## Profile edge `e` moved to its level (`m`, at `height`) as an edge of `b`
+## between vertices `start` and `end`.
+func level_curve(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, m: const LevelEdge*, height: f64, start: i64, end: i64) -> i64!:
+    if e.kind == profile_line: return try b.add_line(start, end)
+    let lift = p.normal.multiply_scalar(height)
+    if e.kind == profile_arc:
+        let center = e.center.add(lift)
+        return try b.add_circle(start, end, center, p.normal, m.start.subtract(center), m.radius, e.sweep > 0.0)
+    let (points, weights, knots, degree) = p.spline_net(e.spline)
+    var net = Growing[Vector3]()
+    defer net.close()
+    for point in points: try net.push(point.add(lift))
+    return try b.add_spline_edge(start, end, net.view(), weights, degree, knots, true)
+
+## The surface edge `e` sweeps from its moved place `low` (level `a`) to
+## `high` (level `b`), and whether its normal leaves the solid (the right of
+## the edge as it runs).
+func level_surface(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, low: const LevelEdge*, high: const LevelEdge*, a: Level, z: Level) -> (i64, bool)!:
+    if e.kind == profile_line:
+        # Through the low edge and the high edge's start: (along) x (up) is
+        # its right, outward.
+        let along = low.end.subtract(low.start)
+        let normal = try along.cross(high.start.subtract(low.start)).normalized()
+        return (try b.add_surface(0, low.start, normal, along), true)
+    if e.kind == profile_arc:
+        let center = e.center.add(p.normal.multiply_scalar(a.height))
+        let radial = low.start.subtract(center)
+        var surface: i64 = -1
+        if math.abs(high.radius - low.radius) <= 1e-12 * math.max(1.0, low.radius):
+            surface = try b.add_surface(1, center, p.normal, radial, low.radius)
+        else:
+            surface = try b.add_surface(2, center, p.normal, radial, low.radius, math.atan((high.radius - low.radius) / (z.height - a.height)))
+        # Outward: the right of the arc as it runs.
+        let middle = try p.edge_at(e, 0.5)
+        let out = middle.subtract(e.center).multiply_scalar(1.0 if e.sweep > 0.0 else -1.0)
+        let on = center.add((try middle.subtract(e.center).normalized()).multiply_scalar(low.radius))
+        return (surface, (try surface_normal_at(b, surface, on)).dot(out) > 0.0)
+    # A spline swept straight from its low level to its high one.
+    let (points, weights, knots, degree) = p.spline_net(e.spline)
+    var net = Growing[Vector3]()
+    defer net.close()
+    var w = Growing[f64]()
+    defer w.close()
+    for at in 0..<points.length:
+        try net.push(points[at].add(p.normal.multiply_scalar(a.height)))
+        try net.push(points[at].add(p.normal.multiply_scalar(z.height)))
+        try w.push(weights[at])
+        try w.push(weights[at])
+    let kv: f64[4] = [0.0, 0.0, 1.0, 1.0]
+    return (try b.add_spline_surface(net.view(), w.view(), (i64)points.length, 2, degree, 1, knots, kv[..<4]), true)

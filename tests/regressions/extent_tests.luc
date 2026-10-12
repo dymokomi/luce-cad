@@ -1,0 +1,191 @@
+## Extrude's extents and Revolve's axes, checked against closed forms:
+## tapered sides (frusta, cones), two sides, through all, to a face (a
+## parallel plane, a slanted plane, a cylinder) and to a body; revolves
+## about axes anywhere in the sketch's plane. Every result is closed, faces
+## outward and has the volume geometry gives.
+from luce_cad.sketch import CadSketch
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3, GeometrySet
+from checks import manifold, volume
+from luce_std import math
+
+func solid(model: CadModel, expected: float, tolerance: float, what: str) -> unit!:
+    let mesh = model.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > tolerance:
+        print(f"{what}: volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= tolerance)
+
+## A sketch on the ground (XZ, normal +Y): x along u, z along -v.
+func ground(s: CadSketch) -> GeometrySet!:
+    return s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0))
+
+## A `w` by `h` rectangle centered at (`cx`, `cy`) on sketch `s`.
+func rectangle(s: CadSketch, cx: float, cy: float, w: float, h: float) -> unit!:
+    let p = [s.add_point(cx - w * 0.5, cy - h * 0.5), s.add_point(cx + w * 0.5, cy - h * 0.5), s.add_point(cx + w * 0.5, cy + h * 0.5), s.add_point(cx - w * 0.5, cy + h * 0.5)]
+    for at in 0..<4:
+        _ = s.add_line(p[at], p[(at + 1) % 4])
+
+pub func extent_tests() -> unit!:
+    tapers()
+    sides()
+    targets()
+    axes()
+    print("PASS extents: a square and a disc tapered in and out (frusta, cones), a plate's hole tapered with it, two sides of different tapers, symmetric; through all of a box (a drilled hole); to a parallel face, a slanted face, a cylinder's face and a body; revolves about a sketch line, a slanted axis and a box's edge; steep tapers, off-plane axes and faces behind the sketch refused")
+
+## A 2 x 2 square 1 high leaning in by 0.2 rad: a frustum of squares; a
+## disc of radius 1 leaning out: a cone's frustum; a plate's hole grows as
+## its outline shrinks.
+func tapers() -> unit!:
+    let square = CadSketch.parse("")
+    rectangle(square, 0.0, 0.0, 2.0, 2.0)
+    let t = math.tan(0.2)
+    let top = 2.0 - 2.0 * t
+    let frustum = (4.0 + top * top + 2.0 * top) / 3.0
+    solid(CadModeling.extruded_sides(ground(square), 1.0, 0.0, "e", taper = 0.2), frustum, 1e-6, "tapered square")
+    # Downward, the same shape.
+    solid(CadModeling.extruded_sides(ground(square), -1.0, 0.0, "e", taper = 0.2), frustum, 1e-6, "tapered square down")
+    let disc = CadSketch.parse("")
+    _ = disc.add_circle(disc.add_point(0.0, 0.0), 1.0)
+    let r1 = 1.0 + 2.0 * math.tan(0.1)
+    solid(CadModeling.extruded_sides(ground(disc), 2.0, 0.0, "e", taper = -0.1), math.pi * 2.0 * (1.0 + r1 + r1 * r1) / 3.0, 0.01, "disc leaning out")
+    # A 4 x 4 plate with a hole of radius 1, 1 high, leaning in by 0.1: the
+    # outline's frustum less the hole's (which grows).
+    let plate = CadSketch.parse("")
+    rectangle(plate, 0.0, 0.0, 4.0, 4.0)
+    _ = plate.add_circle(plate.add_point(0.0, 0.0), 1.0)
+    let g = math.tan(0.1)
+    let a = 4.0 - 2.0 * g
+    let hole_top = 1.0 + g
+    let expected = (16.0 + a * a + 4.0 * a) / 3.0 - math.pi * (1.0 + hole_top + hole_top * hole_top) / 3.0
+    solid(CadModeling.extruded_sides(ground(plate), 1.0, 0.0, "e", taper = 0.1), expected, 0.01, "tapered plate")
+    # Too steep: the square shrinks to nothing within 1.5 high.
+    var refused = false
+    _ = CadModeling.extruded_sides(ground(square), 1.5, 0.0, "e", taper = 0.6) catch failure:
+        refused = failure.message.contains("too steep")
+    assert(refused)
+
+## Two sides: 1 up leaning in 0.2, 0.5 down straight: a frustum on a
+## prism, meeting at the sketch; symmetric: 1 each way, a 2 x 2 x 2 box.
+func sides() -> unit!:
+    let square = CadSketch.parse("")
+    rectangle(square, 0.0, 0.0, 2.0, 2.0)
+    let top = 2.0 - 2.0 * math.tan(0.2)
+    let two = CadModeling.extruded_sides(ground(square), 1.0, 0.5, "e", taper = 0.2)
+    solid(two, (4.0 + top * top + 2.0 * top) / 3.0 + 2.0, 1e-6, "two sides")
+    # Each side face in two parts: 4 sides, 4 backs and 2 caps.
+    assert(two.face_count() == 10)
+    let symmetric = CadModeling.extruded_sides(ground(square), 1.0, 1.0, "e")
+    solid(symmetric, 8.0, 1e-9, "symmetric")
+    assert(symmetric.face_count() == 6)
+    # Both sides leaning in alike: two frusta.
+    solid(CadModeling.extruded_sides(ground(square), 1.0, 1.0, "e", taper = 0.2, other_taper = 0.2), 2.0 * (4.0 + top * top + 2.0 * top) / 3.0, 1e-6, "two tapered sides")
+    var refused = false
+    _ = CadModeling.extruded_sides(ground(square), -1.0, 1.0, "e") catch failure:
+        refused = failure.message.contains("positive")
+    assert(refused)
+
+## Extents that read a body.
+func targets() -> unit!:
+    let disc = CadSketch.parse("")
+    _ = disc.add_circle(disc.add_point(0.0, 0.0), 0.5)
+    # Through all of a 2 x 2 x 2 box standing on y 1..3: past its top; cut
+    # from the box, a hole through it.
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0).transformed(Vector3(0.0, 2.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), "box")
+    let through = CadModeling.extruded_through(ground(disc), box, "e")
+    solid(CadModeling.combined(box, through, 1), 8.0 - math.pi * 0.25 * 2.0, 0.01, "through all")
+    var refused = false
+    _ = CadModeling.extruded_through(ground(disc), box, "e", direction = -1) catch failure:
+        refused = failure.message.contains("other way")
+    assert(refused)
+    # Both ways: through a box about the sketch.
+    let around = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "around")
+    solid(CadModeling.combined(around, CadModeling.extruded_through(ground(disc), around, "e", direction = 0), 1), 8.0 - math.pi * 0.25 * 2.0, 0.01, "through both ways")
+    # To the box's bottom face (y = 1, parallel): a cylinder 1 high; 0.25
+    # further on.
+    var bottom = ""
+    for f in 0..<box.face_count():
+        let name = CadModeling.face_name_of(box, f)
+        let frame = CadModeling.face_frame(box, name)
+        if frame.found and frame.u.cross(frame.v).y < -0.99:
+            bottom = name
+    solid(CadModeling.extruded_to(ground(disc), box, "e", bottom), math.pi * 0.25, 1e-3, "to a parallel face")
+    solid(CadModeling.extruded_to(ground(disc), box, "e", bottom, offset = 0.25), math.pi * 0.25 * 1.25, 1e-3, "to a parallel face, offset")
+    # To a slanted face: a 4-box tilted 0.3 about Z, centered 5 up; its
+    # bottom plane over the unit square averages 5 - 2 / cos 0.3 high.
+    let tilt = 0.3
+    let tilted = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0).transformed(Vector3(0.0, 5.0, 0.0), Vector3(0.0, 0.0, tilt), Vector3(1.0, 1.0, 1.0)), "tilted")
+    var under = ""
+    for f in 0..<tilted.face_count():
+        let name = CadModeling.face_name_of(tilted, f)
+        let frame = CadModeling.face_frame(tilted, name)
+        if frame.found and frame.u.cross(frame.v).y < -0.9:
+            under = name
+    let square = CadSketch.parse("")
+    rectangle(square, 0.0, 0.0, 1.0, 1.0)
+    let slanted = CadModeling.extruded_to(ground(square), tilted, "e", under)
+    solid(slanted, 5.0 - 2.0 / math.cos(tilt), 1e-6, "to a slanted face")
+    # To a cylinder's face: a pipe of radius 1 along Z, 3 up; the square
+    # rises to its underside, 3 - sqrt(1 - x^2) high.
+    let pipe = CadModeling.tagged(CadSolids.cylinder(1.0, 6.0).transformed(Vector3(0.0, 3.0, 0.0), Vector3(math.pi * 0.5, 0.0, 0.0), Vector3(1.0, 1.0, 1.0)), "pipe")
+    var side = ""
+    for f in 0..<pipe.face_count():
+        if pipe.face_surface_kind(f) == 1:
+            side = CadModeling.face_name_of(pipe, f)
+    let under_pipe = 3.0 - (0.5 * math.sqrt(0.75) + math.asin(0.5))
+    solid(CadModeling.extruded_to(ground(square), pipe, "e", side), under_pipe, 2e-3, "to a cylinder")
+    # To the body: the same, the pipe whole.
+    solid(CadModeling.extruded_to(ground(square), pipe, "e"), under_pipe, 2e-3, "to a body")
+    # A face behind the sketch's plane is refused.
+    let below = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0).transformed(Vector3(0.0, -2.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), "below")
+    var below_top = ""
+    for f in 0..<below.face_count():
+        let name = CadModeling.face_name_of(below, f)
+        let frame = CadModeling.face_frame(below, name)
+        if frame.found and frame.u.cross(frame.v).y > 0.99:
+            below_top = name
+    # Its top is a parallel face below: the extrusion runs down to it.
+    solid(CadModeling.extruded_to(ground(disc), below, "e", below_top), math.pi * 0.25, 1e-3, "to a face below")
+    refused = false
+    _ = CadModeling.extruded_to(ground(disc), below, "e", below_top, offset = -2.0) catch failure:
+        refused = failure.message.contains("behind")
+    assert(refused)
+
+## Revolves: a 1 x 1 square from x 1 to 2 (on the XY plane) about the Y
+## axis through the origin: a tube, 3 pi; about the line y = 3 along X: radii
+## 2 to 3, 5 pi; about a box's upright edge.
+func axes() -> unit!:
+    let s = CadSketch.parse("")
+    rectangle(s, 1.5, 0.5, 1.0, 1.0)
+    let xy = s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0))
+    solid(CadModeling.revolved_about(xy, Vector3(), Vector3(0.0, 1.0, 0.0), "r"), 3.0 * math.pi, 0.01, "about Y")
+    solid(CadModeling.revolved_about(xy, Vector3(0.0, 3.0, 0.0), Vector3(1.0, 0.0, 0.0), "r"), 5.0 * math.pi, 0.01, "about y = 3")
+    solid(CadModeling.revolved_about(xy, Vector3(0.0, 3.0, 0.0), Vector3(1.0, 0.0, 0.0), "r", angle = math.pi * 0.5), 1.25 * math.pi, 0.01, "a quarter about y = 3")
+    # A slanted axis through the origin at 45 degrees: the square is on one
+    # side; its volume is 2 pi times its area times its centroid's distance.
+    # Through (-3, 0) along (1, 1): the centroid (1.5, 0.5) is 4 / sqrt 2
+    # from it.
+    solid(CadModeling.revolved_about(xy, Vector3(-3.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.0), "r"), 2.0 * math.pi * 4.0 / math.sqrt(2.0), 0.02, "about a slanted axis")
+    var refused = false
+    _ = CadModeling.revolved_about(xy, Vector3(), Vector3(0.0, 0.0, 1.0), "r") catch failure:
+        refused = failure.message.contains("plane")
+    assert(refused)
+    # A box's upright edge as the axis: the box's edge at x = 1, z = 1 runs
+    # along Y; the square at x 1..2 on the plane z = 1 turns about it.
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    var upright = -1
+    for e in 0..<box.edge_count():
+        let reference = CadModeling.edge_references(box, [e])
+        let axis = CadModeling.edge_axis(box, reference)
+        if axis.found and math.abs(axis.direction.y) > 0.99 and math.abs(axis.origin.x - 1.0) < 1e-9 and math.abs(axis.origin.z - 1.0) < 1e-9:
+            upright = e
+    assert(upright >= 0)
+    let axis = CadModeling.edge_axis(box, CadModeling.edge_references(box, [upright]))
+    let beside = CadSketch.parse("")
+    rectangle(beside, 2.5, 0.5, 1.0, 1.0)
+    let plane = beside.curves(Vector3(0.0, 0.0, 1.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0))
+    # Radii 1 to 2 about x = 1: 3 pi.
+    solid(CadModeling.revolved_about(plane, axis.origin, axis.direction, "r"), 3.0 * math.pi, 0.01, "about an edge")

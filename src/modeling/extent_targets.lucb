@@ -1,0 +1,216 @@
+## Extrude's extents that depend on a body (Fusion's Extent: All and To
+## Object), and the levels each side gives (extents.lucb builds them).
+##
+## - Through all: far enough along the normal (or against it, or both
+##   ways) to pass the whole body.
+## - To a face: a plane parallel to the sketch is a distance. Any other
+##   plane, cylinder, cone, sphere or torus stops the extrusion where it
+##   meets the face's surface, extended past the face: the extrusion is
+##   made long, the half-space beyond the surface taken away, and the lump
+##   at the profile kept.
+## - To a body: the long extrusion less the body, the lump at the profile.
+
+## The levels of an extrusion of `distance` along the normal and `other`
+## against it, from the plane moved `start` along it, each side leaning in
+## by its taper (radians; negative leans out), onto `out`. One side may run
+## either way (`other` 0, `distance` signed); two sides take positive
+## distances.
+func side_levels(distance: f64, other: f64, taper: f64, other_taper: f64, start: f64, out: Growing[Level]*) -> !:
+    out.clear()
+    for angle in [taper, other_taper]:
+        if not math.is_finite(angle) or math.abs(angle) >= math.pi * 0.5 - 1e-6: error(invalid, "a taper angle is between -90 and 90 degrees")
+    if not math.is_finite(distance) or not math.is_finite(other) or not math.is_finite(start): error(invalid, "an extrusion's distances must be finite")
+    if other < 0.0: error(invalid, "the second side's distance must be positive (or zero: one side)")
+    if other == 0.0:
+        if math.abs(distance) < 1e-9: error(invalid, "an extrusion needs a nonzero distance")
+        let grow = -math.abs(distance) * math.tan(taper)
+        if distance > 0.0:
+            try out.push(Level(start, 0.0))
+            try out.push(Level(start + distance, grow))
+        else:
+            try out.push(Level(start + distance, grow))
+            try out.push(Level(start, 0.0))
+        return
+    if not (distance > 0.0): error(invalid, "two sides take a positive distance each")
+    if taper == 0.0 and other_taper == 0.0:
+        try out.push(Level(start - other, 0.0))
+        try out.push(Level(start + distance, 0.0))
+        return
+    try out.push(Level(start - other, -other * math.tan(other_taper)))
+    try out.push(Level(start, 0.0))
+    try out.push(Level(start + distance, -distance * math.tan(taper)))
+
+## The profiles of `set` (keys `profiles`) extruded through `levels`.
+func extruded_levels(set: const GeometrySet*, profiles: str, levels: const Level[], tag: str) -> interop.Reference[CadModel]!:
+    let size = try sketch_size(set)
+    var p = try profiles_of(set, size * 0.0001, profiles)
+    defer p.close()
+    let solid = try BrepModel.sized(size)
+    defer solid.release()
+    try extrude_levels(solid.value(), &p, levels, tag)
+    return try CadModel.of_brep(solid)
+
+## How far `w` reaches along unit `normal` from `origin`: its lowest and
+## highest heights (by its faces' boxes, which hold them).
+func reach_along(w: const Shape*, origin: Vector3, normal: Vector3) -> (f64, f64)!:
+    var low = 1.0e300
+    var high = -1.0e300
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(w, f)
+        for corner in 0..<8:
+            let q = Vector3(h.x if corner % 2 == 1 else l.x, h.y if (corner // 2) % 2 == 1 else l.y, h.z if corner >= 4 else l.z)
+            let height = q.subtract(origin).dot(normal)
+            low = math.min(low, height)
+            high = math.max(high, height)
+    return (low, high)
+
+## Extent All: the profiles extruded past every part of `model` along the
+## normal (`direction` 1), against it (-1) or both ways (0).
+func extruded_through_body(set: const GeometrySet*, model: const CadModel*, tag: str, direction: i64, taper: f64, profiles: str) -> interop.Reference[CadModel]!:
+    if direction < -1 or direction > 1: error(invalid, "through all runs along the normal (1), against it (-1) or both ways (0)")
+    let size = try sketch_size(set)
+    let plane = try sketch_plane_of(set)
+    var w = try shape_of(model)
+    defer w.close()
+    let (low, high) = try reach_along(&w, plane.origin, plane.normal)
+    let margin = (high - low) * 0.01 + size * 0.001
+    var levels = Growing[Level]()
+    defer levels.close()
+    if direction == 1:
+        if high <= size * 1e-6: error(invalid, "the body is not on that side of the sketch: extrude the other way")
+        try side_levels(high + margin, 0.0, taper, 0.0, 0.0, &levels)
+    elif direction == -1:
+        if low >= -size * 1e-6: error(invalid, "the body is not on that side of the sketch: extrude the other way")
+        try side_levels(low - margin, 0.0, taper, 0.0, 0.0, &levels)
+    else:
+        try side_levels(math.max(high, 0.0) + margin, math.max(-low, 0.0) + margin, taper, taper, 0.0, &levels)
+    return try extruded_levels(set, profiles, levels.view(), tag)
+
+## Extent To Object: the profiles extruded until they meet face `face` of
+## `model` (its surface, extended past the face), or the body itself when
+## `face` is empty; `offset` further along the way they run.
+func extruded_to_target(set: const GeometrySet*, model: const CadModel*, tag: str, face: str, offset: f64, taper: f64, profiles: str) -> interop.Reference[CadModel]!:
+    let size = try sketch_size(set)
+    let plane = try sketch_plane_of(set)
+    var w = try shape_of(model)
+    defer w.close()
+    let n = plane.normal
+    var levels = Growing[Level]()
+    defer levels.close()
+    let (low, high) = try reach_along(&w, plane.origin, n)
+    var name = Growing[u8]()
+    defer name.close()
+    try role_name(&name, tag, "start")
+    if face == "":
+        # The body: whichever side it lies on.
+        var direction = 0.0
+        if high > size * 1e-6 and -low <= size * 1e-6: direction = 1.0
+        elif -low > size * 1e-6 and high <= size * 1e-6: direction = -1.0
+        else: error(invalid, "the body lies on both sides of the sketch: pick a face of it to extrude to")
+        let reach = (high if direction > 0.0 else -low) + (high - low) * 0.01 + size * 0.001
+        try side_levels(direction * reach, 0.0, taper, 0.0, 0.0, &levels)
+        let long = try extruded_levels(set, profiles, levels.view(), tag)
+        defer long.release()
+        let cut = try combine(long.value(), model, op_subtract)
+        defer cut.release()
+        return try lumps_named(cut.value(), (str)name.view(), "the extrusion does not reach the body")
+    let target = try named_face(&w, face)
+    let s = &w.surfaces.items[(usize)w.faces.items[target].surface]
+    if s.kind == surface_spline: error(invalid, "To Object stops at a plane, cylinder, cone, sphere or torus face")
+    # Which way the face is from the sketch: by its middle.
+    let middle = try face_middle(&w, target)
+    let side = middle.subtract(plane.origin).dot(n)
+    if math.abs(side) <= size * 1e-6: error(invalid, "the face touches the sketch's plane: there is nothing to extrude to")
+    let direction = 1.0 if side > 0.0 else -1.0
+    if s.kind == surface_plane and math.abs(math.abs(s.z.dot(n)) - 1.0) <= 1e-9:
+        # A parallel plane: a distance.
+        let h = s.origin.subtract(plane.origin).dot(n) + direction * offset
+        if h * direction <= size * 1e-6: error(invalid, "the offset takes the face behind the sketch")
+        try side_levels(h, 0.0, taper, 0.0, 0.0, &levels)
+        return try extruded_levels(set, profiles, levels.view(), tag)
+    # Long, then the half-space beyond the surface taken away.
+    let reach = math.max(math.abs(high), math.abs(low)) * 2.0 + size * 4.0 + math.abs(offset)
+    try side_levels(direction * reach, 0.0, taper, 0.0, 0.0, &levels)
+    let long = try extruded_levels(set, profiles, levels.view(), tag)
+    defer long.release()
+    let span = reach * 4.0 + (high - low)
+    # The profile inside the surface's solid: keep the inside; else take
+    # the solid away.
+    let (keep_inside, tool) = try surface_side(s, plane.origin, direction, n, offset, span, tag)
+    defer tool.release()
+    let cut = try combine(long.value(), tool.value(), op_intersect if keep_inside else op_subtract)
+    defer cut.release()
+    return try lumps_named(cut.value(), (str)name.view(), "the extrusion does not reach the face")
+
+## The face of `w` going by `name` (any alias): the first.
+func named_face(w: const Shape*, name: str) -> usize!:
+    for f in 0..<w.faces.count:
+        if try names_meet(w.face_name(f), name): return f
+    error(invalid, "the face to extrude to is no longer on the body: pick it again")
+
+## A point in the middle of face `f`'s boundary (its edges' middles,
+## averaged).
+func face_middle(w: const Shape*, f: usize) -> Vector3!:
+    var sum = Vector3()
+    var count = 0.0
+    for use in w.face_uses(f):
+        sum = sum.add(try w.edge_at(edge_index(use), 0.5))
+        count += 1.0
+    return sum.multiply_scalar(1.0 / count)
+
+## The solid bounded by surface `s` (a plane: the half-space past it the
+## way the extrusion runs, `direction` along unit `n`; a cylinder, cone,
+## sphere or torus: its inside), moved `offset` the way the extrusion runs,
+## `span` across, its faces named for `tag`; and whether the sketch's
+## origin `origin` is inside it (the extrusion keeps that side).
+func surface_side(s: const Surface*, origin: Vector3, direction: f64, n: Vector3, offset: f64, span: f64, tag: str) -> (bool, interop.Reference[CadModel])!:
+    var name = Growing[u8]()
+    defer name.close()
+    try role_name(&name, tag, "to")
+    let x = s.x
+    let z = s.z
+    if s.kind == surface_plane:
+        # Past the plane, away from the sketch: its normal turned to the
+        # far side, the plane moved along it by the offset.
+        let toward = direction * z.dot(n)
+        let away = z.multiply_scalar(1.0 if toward > 0.0 else -1.0)
+        let shift = away.multiply_scalar(offset / math.max(1e-9, math.abs(away.dot(n))))
+        let center = s.origin.add(shift).add(away.multiply_scalar(span * 0.5))
+        let box = try CadSolids.box(span, span, span)
+        defer box.release()
+        let placed = try box.value().placed(Matrix4(x, away.cross(x), away, center))
+        defer placed.release()
+        return (false, try CadModeling.tagged(placed, (str)name.view()))
+    let solid = try surface_solid(s, offset, span)
+    defer solid.release()
+    # CadSolids' solids stand along Y about the origin.
+    let placed = try solid.value().placed(Matrix4(x, z, x.cross(z), s.origin))
+    defer placed.release()
+    let named = try CadModeling.tagged(placed, (str)name.view())
+    errdefer named.release()
+    var w = try shape_of(named.value())
+    defer w.close()
+    var rays = try shape_rays(&w)
+    defer rays.close()
+    let holds = try rays.inside(&w, origin, span)
+    return (holds, named)
+
+## The solid inside curved surface `s`, its surface moved `offset` in,
+## `span` long where it is open (along Y about the origin, as CadSolids'
+## stand).
+func surface_solid(s: const Surface*, offset: f64, span: f64) -> interop.Reference[CadModel]!:
+    if s.kind == surface_cylinder:
+        if s.radius - offset <= 0.0: error(invalid, "the offset is larger than the cylinder's radius")
+        return try CadSolids.cylinder(s.radius - offset, span)
+    if s.kind == surface_cone:
+        # Its radius span / 2 below and above the origin.
+        let slope = math.tan(s.angle)
+        let r0 = s.radius - slope * span * 0.5 - offset
+        let r1 = s.radius + slope * span * 0.5 - offset
+        if r0 <= 0.0 or r1 <= 0.0: error(invalid, "To Object on a cone reaches past its apex")
+        return try CadSolids.cone(r0, span, r1)
+    if s.kind == surface_sphere:
+        if s.radius - offset <= 0.0: error(invalid, "the offset is larger than the sphere's radius")
+        return try CadSolids.sphere(s.radius - offset)
+    if s.angle - offset <= 0.0: error(invalid, "the offset is larger than the torus's tube")
+    return try CadSolids.torus(s.radius, s.angle - offset)

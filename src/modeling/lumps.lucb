@@ -1,0 +1,92 @@
+## Lumps: the connected pieces of a solid, faces joined by the edges they
+## share. A boolean or a split can leave a body in several pieces; Extrude
+## To keeps the piece at its profile, Split Body gives each piece.
+
+## Which lump each face of `w` belongs to (0, 1, ...) into `out`; how many
+## lumps there are.
+func lumps_of(w: const Shape*, out: Growing[usize]*) -> usize!:
+    let faces = w.faces.count
+    var parent = Growing[usize]()
+    defer parent.close()
+    for f in 0..<faces: try parent.push(f)
+    # The first face to use each edge, then every other joins it.
+    var first = Growing[i64]()
+    defer first.close()
+    try first.fill(w.edges.count, -1)
+    for f in 0..<faces:
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            if first.items[e] < 0:
+                first.items[e] = (i64)f
+                continue
+            let a = union_root(parent.items, (usize)first.items[e])
+            let b = union_root(parent.items, f)
+            if a < b: parent.items[b] = a
+            elif b < a: parent.items[a] = b
+    out.clear()
+    var numbers = Growing[i64]()
+    defer numbers.close()
+    try numbers.fill(faces, -1)
+    var count: usize = 0
+    for f in 0..<faces:
+        let root = union_root(parent.items, f)
+        if numbers.items[root] < 0:
+            numbers.items[root] = (i64)count
+            count += 1
+        try out.push((usize)numbers.items[root])
+    return count
+
+## Lump `lump` of `w` (by `lumps`, lumps_of's) as a model of its own.
+func lump_model(w: const Shape*, lumps: const usize[], lump: usize) -> interop.Reference[CadModel]!:
+    var keep = Growing[bool]()
+    defer keep.close()
+    for f in 0..<w.faces.count: try keep.push(lumps[f] == lump)
+    let b = try kept_brep(w, keep.view())
+    defer b.release()
+    return try CadModel.of_brep(b)
+
+## The lumps of `model` that hold a face whose name starts with `prefix`
+## (any alias), joined as one model; an error naming `what` when none does.
+func lumps_named(model: const CadModel*, prefix: str, what: str) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model)
+    defer w.close()
+    var lumps = Growing[usize]()
+    defer lumps.close()
+    let count = try lumps_of(&w, &lumps)
+    var wanted = Growing[bool]()
+    defer wanted.close()
+    try wanted.fill(count, false)
+    var any = false
+    for f in 0..<w.faces.count:
+        if alias_starts(w.face_name(f), prefix):
+            wanted.items[lumps.items[f]] = true
+            any = true
+    if not any: error(invalid, what)
+    var keep = Growing[bool]()
+    defer keep.close()
+    for f in 0..<w.faces.count: try keep.push(wanted.items[lumps.items[f]])
+    let b = try kept_brep(&w, keep.view())
+    defer b.release()
+    return try CadModel.of_brep(b)
+
+## Whether one of name `name`'s aliases starts with `prefix`.
+func alias_starts(name: str, prefix: str) -> bool:
+    let bytes = name.bytes
+    let p = prefix.bytes
+    var start: usize = 0
+    var depth = 0
+    for at in 0..<bytes.length + 1:
+        let ends = at == bytes.length or (bytes[at] == alias_separator and depth == 0)
+        if at < bytes.length:
+            if bytes[at] == 91: depth += 1
+            elif bytes[at] == 93: depth -= 1
+        if not ends: continue
+        if at - start >= p.length:
+            var same = true
+            for k in 0..<p.length:
+                if bytes[start + k] != p[k]:
+                    same = false
+                    break
+            if same: return true
+        start = at + 1
+    return false

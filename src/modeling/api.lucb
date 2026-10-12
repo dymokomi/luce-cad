@@ -10,6 +10,13 @@ pub struct FaceFrame:
     pub var u: Vector3
     pub var v: Vector3
 
+## A line in space (CadModeling.edge_axis): a point on it and its
+## direction; `found` false when there is none.
+pub struct AxisLine:
+    pub var found: bool
+    pub var origin: Vector3
+    pub var direction: Vector3
+
 ## The modeling features, as static functions on closed solids.
 pub struct CadModeling:
     let reserved: u8 = 0
@@ -182,6 +189,66 @@ pub struct CadModeling:
         var p = try profiles_of(source, try sketch_size(source) * 0.0001)
         defer p.close()
         return (i64)p.region_count()
+
+    # -- Extrude's extents (extents.lucb, extent_targets.lucb).
+
+    ## The sketch's profiles in `set` (as extruded's) extruded on two sides
+    ## of its plane moved `start` along the normal: `distance` along the
+    ## normal and `other` against it, each side leaning in by its taper
+    ## angle (radians; negative leans out: a cone from an arc, a slanted
+    ## plane from a line). One side (`other` 0) may run either way; two
+    ## sides take positive distances (symmetric: the same each way). Faces
+    ## as extruded's; the part of a side below the plane, when the two
+    ## sides' tapers differ, is `back<c>.<k>`.
+    pub static func extruded_sides(set: interop.Reference[GeometrySet], distance: f64, other: f64, tag: str, taper: f64 = 0.0, other_taper: f64 = 0.0, start: f64 = 0.0, profiles: str = "") -> interop.Reference[CadModel]!:
+        var levels = Growing[Level]()
+        defer levels.close()
+        try side_levels(distance, other, taper, other_taper, start, &levels)
+        return try extruded_levels(try set.get(), profiles, levels.view(), tag)
+
+    ## Extent All: the profiles extruded past the whole of `model` along
+    ## the normal (`direction` 1), against it (-1) or both ways (0).
+    pub static func extruded_through(set: interop.Reference[GeometrySet], model: interop.Reference[CadModel], tag: str, direction: i64 = 1, taper: f64 = 0.0, profiles: str = "") -> interop.Reference[CadModel]!:
+        return try extruded_through_body(try set.get(), model.value(), tag, direction, taper, profiles)
+
+    ## Extent To Object: the profiles extruded toward `model`'s face named
+    ## `face` until they meet its surface (extended past the face; a plane,
+    ## cylinder, cone, sphere or torus), `offset` further on; with `face`
+    ## empty, until they meet the body. The face that stops it is named
+    ## `<tag>/to/f<i>` (a plane parallel to the sketch: the end cap).
+    pub static func extruded_to(set: interop.Reference[GeometrySet], model: interop.Reference[CadModel], tag: str, face: str = "", offset: f64 = 0.0, taper: f64 = 0.0, profiles: str = "") -> interop.Reference[CadModel]!:
+        return try extruded_to_target(try set.get(), model.value(), tag, face, offset, taper, profiles)
+
+    ## The profiles turned about the line through `origin` along
+    ## `direction`, which must lie in the sketch's plane (a sketch line, a
+    ## body edge, a construction axis): as revolved's, a full turn or
+    ## `angle` radians toward the plane's normal.
+    pub static func revolved_about(set: interop.Reference[GeometrySet], origin: Vector3, direction: Vector3, tag: str, angle: f64 = 2.0 * math.pi, profiles: str = "") -> interop.Reference[CadModel]!:
+        let source = try set.get()
+        let size = try sketch_size(source)
+        var p = try profiles_of(source, size * 0.0001, profiles)
+        defer p.close()
+        let axis = direction.normalized() catch failure: error(invalid, "a revolve's axis needs a direction")
+        if math.abs(axis.dot(p.normal)) > 1e-9 or math.abs(origin.subtract(p.origin).dot(p.normal)) > size * 1e-7:
+            error(invalid, "a revolve's axis must lie in the sketch's plane")
+        let solid = try BrepModel.sized(size)
+        defer solid.release()
+        try revolve_into(solid.value(), &p, origin, axis, size * 0.000001, tag, angle)
+        return try CadModel.of_brep(solid)
+
+    ## The axis of `model`'s edge `reference` (edge_references'): a line
+    ## edge's line, a circular edge's axis (through its center, along its
+    ## normal); `found` false for any other edge.
+    pub static func edge_axis(model: interop.Reference[CadModel], reference: str) -> AxisLine!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var edges = Growing[usize]()
+        defer edges.close()
+        try resolve_edges(&w, reference, &edges)
+        let c = w.carriers.items[(usize)w.edges.items[edges.items[0]].carrier]
+        if c.kind == curve_line: return AxisLine(true, c.origin, c.x)
+        if c.kind == curve_circle: return AxisLine(true, c.origin, c.x.cross(c.y))
+        return AxisLine(false, Vector3(), Vector3(0.0, 0.0, 1.0))
 
 ## The extent of the sketch's curves (at least 1), which scales tolerances.
 func sketch_size(set: const GeometrySet*) -> f64!:
