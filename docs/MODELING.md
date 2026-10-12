@@ -501,6 +501,17 @@ section's area along the edge. The end face touches the face and the wall in cus
 tangent to both), which the tessellator samples finely; it equalizes opposite sides' sample counts up
 to 1024 (was 512) so the strip beside it stays a mapped patch.
 
+**Reflections at a G3 corner.** Where a box's top loop is blended around an earlier G3 upright,
+zebra stripes on the corner's strip converge to one point on its contact with the top. That is the
+G2/G3 contact itself, not a defect: along the contact the strip's normal is the face's, so the
+stripes' function is constant there and every stripe on the strip reaches the contact where the
+face's own single reflection boundary crosses it (a G1 strip would show a jump instead). The mesh
+there is a mapped grid whose sections fan toward the corner's center of curvature: its cells narrow
+on the contact's side, where the contact runs at about half the edge's radius of curvature (0.26
+against 0.51 for uprights of 0.6 and a loop of 0.25). A few boundary cells take an extra sample the
+top face puts on their shared contact (pentagons, nine in 4086 cells). No pole: no point where the
+patch's parameter lines meet.
+
 **Too large** is said with the size that fits. A contact on the face must stay short of where the
 edge's offset folds (the edge's least radius of curvature toward the face: 0.341 for G3 uprights of
 0.4). Each seam must keep some length (half its length when both its ends are blended). A drafted
