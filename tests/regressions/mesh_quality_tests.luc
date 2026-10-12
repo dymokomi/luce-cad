@@ -1,0 +1,109 @@
+## Mesh quality, not only closure: the largest angle, the largest aspect
+## and the slivers of each sphere face's triangles, and how many there are.
+##
+## Holes in a ball used to leave fans of long spikes round their rims: the
+## rims are sampled to their walls' targets, several times finer than the
+## sphere's lattice, and the lattice was refined by splitting triangles at
+## their centers, which made needles, in a latitude-longitude chart that
+## stretched them near its poles. A sphere face's chart is now refined by
+## Delaunay insertion judged on the sphere (chart_delaunay.lucb), its
+## lattice sized so its triangles keep the target (not split once more each),
+## and caps' rows thin out towards their poles. The ball with six holes
+## (through its poles) and the one with eight (the SMLib study's T2) at 16,
+## 32 and 64 divisions: no sphere triangle over 175 degrees (a hole's rim
+## meets the eight-hole ball's equator at under 2 degrees, a corner no mesh
+## fills without a flat triangle), at most 1% of them slivers, and T2 at 64 divisions under 450,000 triangles (it had
+## 510,396, with spikes). (A few needles remain where a grid line of a
+## neighboring face crosses a rim a hair from one of its samples: both
+## stay, as boundary samples, so the aspect is not bounded here.)
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import closed, face_quality, volume
+from luce_std import math
+
+## A ball of 10 with blind holes of 2, 8 deep from 4 off its center, along
+## each of `axes` (turned there by `turns`).
+func holed(axes: list[Vector3], turns: list[Vector3]) -> CadModel!:
+    var model = CadModeling.tagged(CadSolids.sphere(10.0), "ball")
+    for at in 0..<axes.length:
+        model = CadModeling.combined(model, CadModeling.tagged(CadSolids.cylinder(2.0, 8.0), f"h{at}").transformed(axes[at].multiply_scalar(8.0), turns[at], Vector3(1.0, 1.0, 1.0)), 1)
+    return model
+
+## Every sphere face of `model` at `divisions`: closed, and its triangles
+## within the bounds; the triangle count returned.
+func sphere_faces(name: str, model: CadModel, divisions: int) -> int!:
+    let mesh = model.tessellate(divisions)
+    closed(mesh)
+    let quality = face_quality(mesh, model.face_count())
+    for face in 0..<model.face_count():
+        if model.face_surface_kind(face) != 4: continue
+        let q = quality[face]
+        if q.angle > 175.0 or q.slivers * 100 > q.triangles:
+            print(f"{name} at {divisions}, face {face}: {q.triangles} triangles, largest angle {q.angle}, aspect {q.aspect}, {q.slivers} slivers")
+        assert(q.angle <= 175.0 and q.slivers * 100 <= q.triangles)
+    return mesh.index_count() // 3
+
+pub func mesh_quality_tests() -> unit!:
+    let x = Vector3(1.0, 0.0, 0.0)
+    let y = Vector3(0.0, 1.0, 0.0)
+    let z = Vector3(0.0, 0.0, 1.0)
+    let quarter = math.pi / 2.0
+    let six = holed([x, x.multiply_scalar(-1.0), y, y.multiply_scalar(-1.0), z, z.multiply_scalar(-1.0)], [Vector3(0.0, 0.0, quarter), Vector3(0.0, 0.0, quarter), Vector3(), Vector3(), Vector3(quarter, 0.0, 0.0), Vector3(quarter, 0.0, 0.0)])
+    let axes: list[Vector3] = []
+    let turns: list[Vector3] = []
+    for theta in [math.pi / 2.0, math.pi / 4.0, 3.0 * math.pi / 4.0, -math.pi / 2.0, -math.pi / 4.0, -3.0 * math.pi / 4.0]:
+        axes.append(Vector3(-math.sin(theta), math.cos(theta), 0.0))
+        turns.append(Vector3(0.0, 0.0, theta))
+    for phi in [quarter, -quarter]:
+        axes.append(Vector3(0.0, math.cos(phi), math.sin(phi)))
+        turns.append(Vector3(phi, 0.0, 0.0))
+    let eight = holed(axes, turns)
+    long_pipes()
+    for divisions in [16, 32, 64]:
+        _ = sphere_faces("six holes", six, divisions)
+        let count = sphere_faces("eight holes", eight, divisions)
+        if divisions == 64:
+            if count >= 300000: print(f"eight holes at 64: {count} triangles")
+            assert(count < 300000)
+    print("PASS mesh quality: balls with six and eight holes (SMLib's T2) at 16, 32 and 64 divisions, their sphere faces without spikes or slivers round the rims (largest angle 175 degrees, slivers under 1%), T2 under 300,000 triangles at 64; long pipes (a T, two crossed) converging to their exact volumes up to 64 divisions without falling back")
+
+## A long pipe at 64 divisions: its sag target is relative to its section,
+## so its layout needs about a thousand columns round its axis. The axis
+## refinement doubled intervals until the sag fitted, overshooting the
+## layout's station budget, and the pipe fell back to the trimmed chart,
+## whose target is relative to the face's length: the T of pipes (SMLib's
+## F7 before its fillet) was 0.39 under its exact volume at 64 divisions,
+## two crossed pipes (B4) further off at 64 than at 32. Now each interval
+## takes as many even pieces as its sag needs, a line passing a trim sample
+## by a hair snaps onto it, and the clipped grid settles trim points beside
+## a line onto it (an open cell boundary before). No side of the pipes
+## falls back at 64 divisions, and their volumes rise towards the exact
+## ones, within 0.05 of them at 64.
+func long_pipes() -> unit!:
+    let pipe = CadModeling.tagged(CadSolids.cylinder(5.0, 40.0), "m").transformed(Vector3(), Vector3(0.0, 0.0, math.pi / 2.0), Vector3(1.0, 1.0, 1.0))
+    let branch = CadModeling.tagged(CadSolids.cylinder(3.0, 15.0), "n").transformed(Vector3(0.0, 7.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let tee = CadModeling.combined(pipe, branch, 0)
+    let a = CadModeling.tagged(CadSolids.cylinder(5.0, 30.0), "a")
+    let b = CadModeling.tagged(CadSolids.cylinder(5.0, 30.0), "b").transformed(Vector3(), Vector3(0.0, 0.0, math.pi / 2.0), Vector3(1.0, 1.0, 1.0))
+    let crossed = CadModeling.combined(a, b, 0)
+    for (name, model, exact) in [("T of pipes", tee, 3431.022107), ("crossed pipes", crossed, 2.0 * math.pi * 25.0 * 30.0 - 16.0 * 125.0 / 3.0)]:
+        var previous = 0.0
+        for divisions in [16, 32, 48, 64]:
+            let mesh = model.tessellate(divisions)
+            closed(mesh)
+            let value = volume(mesh)
+            if value <= previous or value > exact: print(f"{name} at {divisions}: {value} after {previous}, exact {exact}")
+            assert(value > previous and value <= exact)
+            previous = value
+        if exact - previous > 0.05: print(f"{name} at 64: {previous}, exact {exact}")
+        assert(exact - previous <= 0.05)
+        # No side falls back to the trimmed chart (mesher 4).
+        let mesh = model.tessellate(64)
+        let parent = mesh.find_attribute("cad_face", 2)
+        let method = mesh.find_attribute("cad_mesher", 2)
+        for face in 0..<mesh.face_count():
+            if model.face_surface_kind(int(mesh.attribute_value(parent, face, 0))) != 1: continue
+            if mesh.attribute_value(method, face, 0) == 4.0: print(f"{name}: a side fell back to the trimmed chart")
+            assert(mesh.attribute_value(method, face, 0) != 4.0)

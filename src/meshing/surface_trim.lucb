@@ -1,6 +1,8 @@
 ## A trimmed B-spline face meshed in its normalized chart, stretched to
 ## its lengths along u and v so the lattice is square on the surface: the
-## loops quadrangulated, refined where the surface curves, lifted.
+## loops triangulated with a lattice, refined where the surface curves or
+## a triangle is badly shaped on it (chart_refine), paired into quads,
+## lifted.
 
 pub func mesh_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], surface: Surface, sense: bool, divisions: i64, edge_size: f64, tolerance: f64) -> !:
     # Approximate metric scaling avoids a square UV lattice on long thin strips.
@@ -27,12 +29,20 @@ pub func mesh_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], sur
     if edge_size > 0.0:
         spacing = math.min(spacing, edge_size)
         vertical = math.min(vertical, edge_size)
-    let initial = try TrimPolygon.quadrangulate_seams(uv, sizes, Vector3(0.0, 0.0, 1.0), ids, spacing, vertical)
-    defer initial.release()
+    let normal = Vector3(0.0, 0.0, 1.0)
+    let triangles = try TrimPolygon.triangulate_seams(uv, sizes, normal, ids)
+    defer triangles.release()
     let chord = spline_target(lengths, divisions, tolerance)
     let constraints = try TrimConstraints.build(uv, ids, sizes)
     defer constraints.close()
-    let part = try refine_uv(initial, surface, u_length, v_length, chord, constraints)
+    let gridded = try insert_grid(triangles, normal, spacing, vertical, constraints)
+    defer gridded.release()
+    let improved = try improve(gridded, normal, ids, constraints)
+    defer improved.release()
+    var lift = ChartLift(surface = surface, uscale = u_length, vscale = v_length)
+    let refined = try chart_refine(improved, &lift, chord, ids, constraints)
+    defer refined.release()
+    let part = try recombine(refined, normal, constraints)
     defer part.release()
     let mapped = try new i64[(usize)part.value().point_count()] --- in memory.heap
     defer free(mapped) in memory.heap

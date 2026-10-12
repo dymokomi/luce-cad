@@ -2013,3 +2013,7 @@ Roughly in order of usefulness:
    it, joined; a pipe inside a box touching its wall, subtracted) are refused as non-manifold.
 9. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face (strips apart, inside corners).
+10. **Needles where shared samples crowd:** a grid line of one face crossing a shared edge a hair
+   from one of its samples becomes a station beside it, and both faces keep a needle there (the
+   walls and floors of holes drilled in a ball). Sphere and other curved faces are otherwise
+   graded to their trims and shaped on the surface (`meshing/chart_delaunay.lucb`).

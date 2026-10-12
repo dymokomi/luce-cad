@@ -805,6 +805,37 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   exact with a third of the triangles (218,124 to 72,956). Triangles at 64: T2 93,540 (six faces
   missing) to 510,396; F7 152,894 (one missing) to 281,574.
 
+- **Mesh quality after 1 and 3 (owner's report).** The holed balls' sphere faces showed long
+  spikes fanning from the hole rims: the rims are sampled to their walls' targets, several times
+  finer than the sphere's lattice, the lattice was refined by splitting triangles at their
+  centers (needles), in latitude-longitude charts that stretch triangles near their poles, and the
+  caps' rows ran every column into the pole. Measured per face (largest angle, aspect, slivers
+  with an aspect over 10 or an angle over 150°), the six-hole ball's upper face at 16 divisions had
+  439 slivers and a 175° angle. Chart meshes are now refined by Delaunay insertion judged on the
+  surface (`meshing/chart_delaunay.lucb`), lattices are sized so their triangles keep the target,
+  cylinders' rows along the axis are spaced by the divisions (cells up to 3:1), and caps' columns
+  halve towards the pole: that face has 5 slivers and 162° at most, every sphere face of the six-
+  and eight-hole balls under 1% slivers and 175° (`mesh_quality_tests`; the one corner over 170°
+  is where a rim meets the equator at under 2°). With the long-cylinder work below, triangles at
+  64: T2 510,396 to 232,960 (volume extrapolated 3597.119, SMLib 3597.120), F7 281,574 to 115,750
+  (3433.164, SMLib 3433.167), B4 330,466 to 49,692 (4045.7218, exact 4045.7223); T1 51,032 to
+  157,474 and B3 65,036 to 162,632, whose spheres were meshed coarser than their target before
+  (T1's volume error 0.0065 to 0.0011). A few needles remain where one face's grid line crosses a
+  shared edge a hair from a sample it cannot snap to (both stay).
+
+- **Long cylinders at 64 divisions.** Their layouts need about a thousand columns round the axis
+  (the sag target is relative to the section); the axis refinement halved intervals until the sag
+  fitted and overshot the 1,025-station budget, so the faces fell back to the trimmed chart, whose
+  target is relative to the face's length: F7pre 0.39 under exact at 64, B4 worse at 64 than at 32.
+  Now an interval takes as many even pieces as its sag needs, lines snap onto trim samples they
+  nearly pass, the clipped grid settles trim points a hair beside a line onto it (the "open trim
+  cell boundary" that had blocked counted pieces), an axis may hold 2,049 stations and a shared edge
+  4,097 (both faces' lattices cross it), and a mapped analytic patch whose quads stray from the
+  surface is refused (a slanted pin's hole had passed sheared). F7pre at 16/32/48/64: 3430.647,
+  3430.926, 3430.979, 3430.997 (exact 3431.022; 3430.635 at 64 before, 151,882 triangles to
+  31,658); B4 4045.355, 4045.631, 4045.680, 4045.699 (exact 4045.722; 4045.460 at 64 before,
+  330,466 triangles to 49,692). Regression: `mesh_quality_tests` (long pipes).
+
 - **2, coincident B-spline faces (done).** A lattice of one surface's points projected onto the
   other decides it (`modeling/spline_coincidence.lucb`); the existing imprint then runs, and flush
   pieces on B-spline faces stay separate faces (no surface reaches over the other's part). B9:
@@ -838,8 +869,13 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   block, the block's class is asked before any point inside, each block is classified by its
   piece with the fewest boundary uses, and a few candidates come first (a point a quarter of the
   piece's narrower extent inside is enough). P1: 1975 to 790 ms (SMLib 290 ms, single-threaded).
-  What remains: every face of the plate split again for each hole (`face_pieces`, `split_face`,
-  about half of what is left) and the face-pair loop (`intersect_faces`, a third).
+  Then: a face no new edge crosses and no cut splits keeps its loops as one piece without
+  tracing (`whole_piece`: the other holes' walls), the face pairs' containment questions are
+  answered from a lookup that traces a face's loops once, and on a plane only the loops whose box
+  holds the point (`face_lookup.lucb`), and boundary edges whose box is far from a curve are not
+  sampled against it. P1: 790 to about 350 ms. What remains: the plate's top and bottom are still
+  traced whole for each hole (`group_cycles` charts every loop) and classified from a chart of
+  every loop (`inside_faces`); a chart cache shared by the boolean's steps would take most of it.
 
 ## 12. What not to take
 

@@ -1,0 +1,420 @@
+## This file: Delaunay refinement of a face's chart triangulation, judged
+## on the surface. The chart's triangles (trim loops, lattice points) are
+## lifted onto the surface; a triangle is refined when it strays further
+## from the surface than its target (as refine_uv's) or when it is badly
+## shaped there, by inserting its circumcenter on the surface (mapped into
+## the chart through the triangle's barycentric coordinates), and the
+## triangulation is kept Delaunay on the surface by flips. This grades a
+## lattice down to a finely sampled trim (a small hole's rim in a large
+## sphere) instead of fanning from one lattice point to many trim samples,
+## and a chart that stretches the surface (latitude and longitude near a
+## pole) still gives triangles shaped on the surface, not in the chart.
+##
+## Trim sides (the boundary's, and seams the constraints keep) are frozen:
+## they are never split or flipped, since the face's neighbors share them.
+## A point that would land on a trim side, or near enough to make a flat
+## triangle against one (inside its 120-degree lens), is not inserted; a
+## triangle that strays too far then takes its centroid, one badly shaped
+## is left as it is.
+
+## How far a triangle's circumradius may exceed its shortest side on the
+## surface (2: no angle under 14.5 degrees).
+let quality_bound: f64 = 2.0
+
+## Triangles whose shortest side is under this share of the median trim
+## side are never refined for their shape (it bounds the grading near tiny
+## trim features, as Ruppert's local feature size does).
+let shape_floor: f64 = 0.5
+
+## How a chart's points lie on the surface: the surface's own parameters
+## scaled by `uscale` and `vscale` (chart_sample), or, when `azimuthal`, a
+## sphere's azimuthal equidistant chart about `pole`, `x` and `y` across
+## it (sphere_disk).
+pub struct ChartLift:
+    var surface: Surface
+    var uscale: f64
+    var vscale: f64
+    var azimuthal: bool = false
+    var pole: Vector3 = Vector3()
+    var x: Vector3 = Vector3()
+    var y: Vector3 = Vector3()
+
+    func at(p: Vector3) -> Vector3!:
+        if self.azimuthal: return azimuthal_point(self.surface, self.pole, self.x, self.y, p)
+        return try chart_sample(self.surface, p, self.uscale, self.vscale)
+
+## A chart triangulation and its points on the surface. `twin[k]` is the
+## corner whose side runs back along corner k's side (corners[k] to the
+## next corner), -1 on a frozen side.
+struct Chart:
+    var chart: Growing[Vector3]
+    var world: Growing[Vector3]
+    var corners: Growing[i64]
+    var twin: Growing[i64]
+    ## Triangles to look at again.
+    var pending: Growing[i64]
+
+    func close():
+        self.chart.close()
+        self.world.close()
+        self.corners.close()
+        self.twin.close()
+        self.pending.close()
+
+## Refine the triangulation `source` of a face's chart (its points on the
+## surface where `lift` puts them; the first ones the trim's,
+## `boundary_ids` their CAD identities) towards `tolerance` from the
+## surface and good shapes on it. Returns triangles; at the face budget
+## it keeps the mesh it has.
+pub func chart_refine(source: interop.Reference[Mesh], lift: ChartLift*, tolerance: f64, boundary_ids: const i64[], constraints: TrimConstraints = TrimConstraints()) -> interop.Reference[Mesh]!:
+    let input = source.value()
+    var m = Chart(Growing[Vector3](), Growing[Vector3](), Growing[i64](), Growing[i64](), Growing[i64]())
+    defer m.close()
+    for at in 0..<input.point_count():
+        let p = try input.point(at)
+        try m.chart.push(p)
+        try m.world.push(try lift.at(p))
+    for face in 0..<input.face_count():
+        if (try input.face_size(face)) != 3: error(invalid, "chart refinement requires triangles")
+        for at in 0..<3: try m.corners.push(try input.face_point(face, at))
+    try link_twins(&m, constraints)
+    let floor = try median_frozen(&m) * shape_floor
+    # Delaunay on the surface first, then refine from every triangle.
+    var sides = Growing[i64]()
+    defer sides.close()
+    for corner in 0..<m.corners.count:
+        if m.twin.items[corner] > (i64)corner: try sides.push((i64)corner)
+    try legalize(&m, &sides, boundary_ids)
+    m.pending.clear()
+    for face in 0..<m.corners.count // 3: try m.pending.push((i64)face)
+    let target = tolerance * tolerance
+    while m.pending.count > 0 and m.corners.count // 3 < (usize)face_budget:
+        m.pending.count -= 1
+        let face = (usize)m.pending.items[m.pending.count]
+        let wanted = try assess(&m, face, lift, target, floor)
+        if wanted.z == 0.0: continue
+        if try insert(&m, face, Vector3(wanted.x, wanted.y, 0.0), lift, boundary_ids): continue
+        # A triangle too far from the surface whose circumcenter could not
+        # go in takes its centroid.
+        if wanted.z == 2.0: _ = try insert(&m, face, centroid(&m, face), lift, boundary_ids)
+    var output = try MeshBuilder(precise = true)
+    defer output.close()
+    for at in 0..<m.chart.count: _ = try output.point(m.chart.items[at])
+    for face in 0..<m.corners.count // 3:
+        try output.face(3)
+        for k in 0..<(usize)3: try output.corner(m.corners.items[face * 3 + k])
+    return try output.finish()
+
+func after_corner(corner: usize) -> usize:
+    return corner - corner % 3 + (corner % 3 + 1) % 3
+
+func before_corner(corner: usize) -> usize:
+    return corner - corner % 3 + (corner % 3 + 2) % 3
+
+## Each corner's twin through a table of sides keyed by their points; a
+## side the constraints keep, on the boundary, or used other than twice
+## the opposite ways is frozen.
+func link_twins(m: Chart*, constraints: TrimConstraints) -> !:
+    let count = m.corners.count
+    let corners = m.corners.items
+    try m.twin.fill(count, -1)
+    let slots = try new i64[count * 2 + 1] --- in memory.heap
+    defer free(slots) in memory.heap
+    for index in 0..<slots.length: slots[index] = -1
+    for corner in 0..<count:
+        let a = corners[corner]
+        let b = corners[after_corner(corner)]
+        if constraints.contains(a, b): continue
+        let lo = a if a < b else b
+        let hi = b if a < b else a
+        var slot = (usize)(lo * 8388609 + hi) % slots.length
+        while slots[slot] >= 0:
+            let seen = (usize)slots[slot]
+            let sa = corners[seen]
+            let sb = corners[after_corner(seen)]
+            if (sa == lo and sb == hi) or (sa == hi and sb == lo): break
+            slot = (slot + 1) % slots.length
+        if slots[slot] < 0:
+            slots[slot] = (i64)corner
+            continue
+        let seen = (usize)slots[slot]
+        if m.twin.items[seen] == -1 and corners[seen] == b and corners[after_corner(seen)] == a:
+            m.twin.items[seen] = (i64)corner
+            m.twin.items[corner] = (i64)seen
+        else:
+            if m.twin.items[seen] >= 0: m.twin.items[(usize)m.twin.items[seen]] = -2
+            m.twin.items[seen] = -2
+            m.twin.items[corner] = -2
+    for corner in 0..<count:
+        if m.twin.items[corner] < 0: m.twin.items[corner] = -1
+
+## The median length on the surface of the frozen sides.
+func median_frozen(m: const Chart*) -> f64!:
+    var lengths = Growing[f64]()
+    defer lengths.close()
+    for corner in 0..<m.corners.count:
+        if m.twin.items[corner] >= 0: continue
+        let a = m.world.items[(usize)m.corners.items[corner]]
+        let b = m.world.items[(usize)m.corners.items[after_corner(corner)]]
+        try lengths.push(b.subtract(a).length())
+    if lengths.count == 0: return 0.0
+    sort.sort(lengths.items[..<lengths.count])
+    return lengths.items[lengths.count // 2]
+
+## What triangle `face` needs: z 0 nothing, 1 a better shape, 2 to come
+## closer to the surface; x and y where its circumcenter on the surface
+## lies in the chart.
+func assess(m: const Chart*, face: usize, lift: ChartLift*, target: f64, floor: f64) -> Vector3!:
+    let ia = (usize)m.corners.items[face * 3]
+    let ib = (usize)m.corners.items[face * 3 + 1]
+    let ic = (usize)m.corners.items[face * 3 + 2]
+    let a = m.world.items[ia]
+    let b = m.world.items[ib]
+    let c = m.world.items[ic]
+    let ab = b.subtract(a).dot(b.subtract(a))
+    let bc = c.subtract(b).dot(c.subtract(b))
+    let ca = a.subtract(c).dot(a.subtract(c))
+    let area = b.subtract(a).cross(c.subtract(a)).length()
+    let longest = math.max(ab, math.max(bc, ca))
+    if area <= longest * 1e-12 or longest <= 0.0: return Vector3()
+    # Its target: the tolerance, or a frozen side's own sag (with a margin,
+    # as the sag is sampled at one point), which no split can lower.
+    var allowed = target
+    var deviation: f64 = 0.0
+    for k in 0..<(usize)3:
+        let p = m.chart.items[(usize)m.corners.items[face * 3 + k]]
+        let q = m.chart.items[(usize)m.corners.items[face * 3 + (k + 1) % 3]]
+        let middle = try lift.at(p.add(q).multiply_scalar(0.5))
+        let wp = m.world.items[(usize)m.corners.items[face * 3 + k]]
+        let wq = m.world.items[(usize)m.corners.items[face * 3 + (k + 1) % 3]]
+        if m.twin.items[face * 3 + k] < 0:
+            let sag = middle.subtract(wp.add(wq).multiply_scalar(0.5)).length() * 1.25
+            allowed = math.max(allowed, sag * sag)
+        else:
+            deviation = math.max(deviation, squared_triangle_distance(middle, a, b, c))
+    let center = try lift.at(m.chart.items[ia].add(m.chart.items[ib]).add(m.chart.items[ic]).multiply_scalar(1.0 / 3.0))
+    deviation = math.max(deviation, squared_triangle_distance(center, a, b, c))
+    # The circumcenter's barycentric weights: each corner's opposite side
+    # squared times how much the other two exceed it.
+    let wa = bc * (ca + ab - bc)
+    let wb = ca * (ab + bc - ca)
+    let wc = ab * (bc + ca - ab)
+    let sum = wa + wb + wc
+    let at = m.chart.items[ia].multiply_scalar(wa / sum).add(m.chart.items[ib].multiply_scalar(wb / sum)).add(m.chart.items[ic].multiply_scalar(wc / sum))
+    if deviation > allowed: return Vector3(at.x, at.y, 2.0)
+    let shortest = math.sqrt(math.min(ab, math.min(bc, ca)))
+    if shortest < floor: return Vector3()
+    # Circumradius over the shortest side.
+    let radius = math.sqrt(ab * bc * ca) / (2.0 * area)
+    if radius > quality_bound * shortest: return Vector3(at.x, at.y, 1.0)
+    return Vector3()
+
+func centroid(m: const Chart*, face: usize) -> Vector3:
+    let a = m.chart.items[(usize)m.corners.items[face * 3]]
+    let b = m.chart.items[(usize)m.corners.items[face * 3 + 1]]
+    let c = m.chart.items[(usize)m.corners.items[face * 3 + 2]]
+    return a.add(b).add(c).multiply_scalar(1.0 / 3.0)
+
+## Twice the chart area of a b c (counterclockwise positive).
+func chart_turn(a: Vector3, b: Vector3, c: Vector3) -> f64:
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+
+## Insert chart point `p`, walking to it from triangle `start`; false when
+## it lies beyond a frozen side, on one, or inside one's lens.
+func insert(m: Chart*, start: usize, p: Vector3, lift: ChartLift*, boundary_ids: const i64[]) -> bool!:
+    var face = start
+    var steps: usize = 0
+    var side: i64 = -1
+    while true:
+        steps += 1
+        if steps > 4096: return false
+        var moved = false
+        side = -1
+        for k in 0..<(usize)3:
+            let a = m.chart.items[(usize)m.corners.items[face * 3 + k]]
+            let b = m.chart.items[(usize)m.corners.items[face * 3 + (k + 1) % 3]]
+            let scale = b.subtract(a).dot(b.subtract(a))
+            let s = chart_turn(a, b, p)
+            if s < -scale * 1e-12:
+                let across = m.twin.items[face * 3 + k]
+                if across < 0: return false
+                face = (usize)across // 3
+                moved = true
+                break
+            if s <= scale * 1e-12: side = (i64)k
+        if not moved: break
+    if side >= 0 and m.twin.items[face * 3 + (usize)side] < 0: return false
+    # Not on a corner, and not inside the lens of a frozen side of this
+    # triangle or its neighbors: the point would make a flat triangle
+    # against it.
+    for k in 0..<(usize)3:
+        let q = m.chart.items[(usize)m.corners.items[face * 3 + k]]
+        let r = m.chart.items[(usize)m.corners.items[face * 3 + (k + 1) % 3]]
+        if p.subtract(q).dot(p.subtract(q)) <= r.subtract(q).dot(r.subtract(q)) * 1e-12: return false
+    if encroaches(m, face, p): return false
+    for k in 0..<(usize)3:
+        let across = m.twin.items[face * 3 + k]
+        if across >= 0 and encroaches(m, (usize)across // 3, p): return false
+    let id = (i64)m.chart.count
+    try m.chart.push(p)
+    try m.world.push(try lift.at(p))
+    var sides = Growing[i64]()
+    defer sides.close()
+    if side >= 0:
+        try split_side(m, face * 3 + (usize)side, id, &sides)
+    else:
+        try split_face(m, face, id, &sides)
+    try legalize(m, &sides, boundary_ids)
+    return true
+
+## Whether `p` lies inside the 120-degree lens of a frozen side of `face`.
+func encroaches(m: const Chart*, face: usize, p: Vector3) -> bool:
+    for k in 0..<(usize)3:
+        if m.twin.items[face * 3 + k] >= 0: continue
+        let a = m.chart.items[(usize)m.corners.items[face * 3 + k]]
+        let b = m.chart.items[(usize)m.corners.items[face * 3 + (k + 1) % 3]]
+        let pa = a.subtract(p)
+        let pb = b.subtract(p)
+        if pa.dot(pb) < -0.5 * pa.length() * pb.length(): return true
+    return false
+
+## Split triangle `face` (a b c) at point `id` into a b p, b c p, c a p.
+func split_face(m: Chart*, face: usize, id: i64, sides: Growing[i64]*) -> !:
+    let a = m.corners.items[face * 3]
+    let b = m.corners.items[face * 3 + 1]
+    let c = m.corners.items[face * 3 + 2]
+    let bc = m.twin.items[face * 3 + 1]
+    let ca = m.twin.items[face * 3 + 2]
+    let g = m.corners.count
+    let h = g + 3
+    for value in [b, c, id, c, a, id]: try m.corners.push(value)
+    try m.twin.extend(m.corners.count, -1)
+    m.corners.items[face * 3 + 2] = id
+    link(m, g, bc)
+    link(m, h, ca)
+    link(m, face * 3 + 1, (i64)(g + 2))
+    link(m, g + 1, (i64)(h + 2))
+    link(m, h + 1, (i64)(face * 3 + 2))
+    for corner in [face * 3, g, h]: try sides.push((i64)corner)
+    for value in [face, g // 3, h // 3]: try m.pending.push((i64)value)
+
+## Split the side at `corner` (triangle a b c, its twin b a d) at point
+## `id`: a p c, p b c, b p d, p a d.
+func split_side(m: Chart*, corner: usize, id: i64, sides: Growing[i64]*) -> !:
+    let other = (usize)m.twin.items[corner]
+    let a = m.corners.items[corner]
+    let b = m.corners.items[after_corner(corner)]
+    let c = m.corners.items[before_corner(corner)]
+    let d = m.corners.items[before_corner(other)]
+    let bc = m.twin.items[after_corner(corner)]
+    let ca = m.twin.items[before_corner(corner)]
+    let ad = m.twin.items[after_corner(other)]
+    let db = m.twin.items[before_corner(other)]
+    let face = corner - corner % 3
+    let o = other - other % 3
+    let g = m.corners.count
+    let h = g + 3
+    for value in [id, b, c, id, a, d]: try m.corners.push(value)
+    try m.twin.extend(m.corners.count, -1)
+    # a p c in place of a b c, and b p d in place of b a d.
+    m.corners.items[face] = a
+    m.corners.items[face + 1] = id
+    m.corners.items[face + 2] = c
+    m.corners.items[o] = b
+    m.corners.items[o + 1] = id
+    m.corners.items[o + 2] = d
+    # a p c: a-p twins p a d's p-a, p-c twins p b c's c-p.
+    link(m, face, (i64)(h))
+    link(m, face + 1, (i64)(g + 2))
+    link(m, face + 2, ca)
+    # p b c: p-b twins b p d's b-p; b-c outer; c-p done.
+    link(m, g, (i64)o)
+    link(m, g + 1, bc)
+    # b p d: p-d twins p a d's d-p; d-b outer.
+    link(m, o + 1, (i64)(h + 2))
+    link(m, o + 2, db)
+    # p a d: a-d outer.
+    link(m, h + 1, ad)
+    for at in [face + 2, g + 1, o + 2, h + 1]: try sides.push((i64)at)
+    for value in [face // 3, g // 3, o // 3, h // 3]: try m.pending.push((i64)value)
+
+func link(m: Chart*, corner: usize, other: i64):
+    m.twin.items[corner] = other
+    if other >= 0: m.twin.items[(usize)other] = (i64)corner
+
+## Flip sides from `sides` until every side is Delaunay on the surface
+## (the angles facing it sum to at most half a turn), each flip queueing
+## its quad's four sides.
+func legalize(m: Chart*, sides: Growing[i64]*, boundary_ids: const i64[]) -> !:
+    var budget = m.corners.count * 16 + 1024
+    while sides.count > 0 and budget > 0:
+        sides.count -= 1
+        let corner = (usize)sides.items[sides.count]
+        let other = m.twin.items[corner]
+        if other < 0: continue
+        let a = m.corners.items[corner]
+        let b = m.corners.items[after_corner(corner)]
+        let c = m.corners.items[before_corner(corner)]
+        let d = m.corners.items[before_corner((usize)other)]
+        if a == d or b == d or c == d: continue
+        # A new diagonal must not join two images of one CAD vertex.
+        if (usize)c < boundary_ids.length and (usize)d < boundary_ids.length and boundary_ids[(usize)c] == boundary_ids[(usize)d]: continue
+        if not should_flip(m, a, b, c, d): continue
+        budget -= 1
+        flip(m, corner, (usize)other)
+        let face = corner - corner % 3
+        let o = (usize)other - (usize)other % 3
+        for k in [face, face + 1, o + 1, o + 2]:
+            if m.twin.items[k] >= 0: try sides.push((i64)k)
+        try m.pending.push((i64)(face // 3))
+        try m.pending.push((i64)(o // 3))
+
+## Whether side a b (triangles a b c and b a d) should become c d: the
+## quad is strictly convex in the chart and the angles at c and d on the
+## surface sum to more than half a turn.
+func should_flip(m: const Chart*, a: i64, b: i64, c: i64, d: i64) -> bool:
+    let pa = m.chart.items[(usize)a]
+    let pb = m.chart.items[(usize)b]
+    let pc = m.chart.items[(usize)c]
+    let pd = m.chart.items[(usize)d]
+    let scale = math.max(pa.subtract(pc).dot(pa.subtract(pc)), math.max(pb.subtract(pc).dot(pb.subtract(pc)), pd.subtract(pc).dot(pd.subtract(pc))))
+    let epsilon = math.max(1e-30, scale * 1e-12)
+    if chart_turn(pc, pa, pd) <= epsilon or chart_turn(pc, pd, pb) <= epsilon: return false
+    let wa = m.world.items[(usize)a]
+    let wb = m.world.items[(usize)b]
+    let wc = m.world.items[(usize)c]
+    let wd = m.world.items[(usize)d]
+    # cot(angle at c) + cot(angle at d) < 0.
+    let ca = wa.subtract(wc)
+    let cb = wb.subtract(wc)
+    let da = wa.subtract(wd)
+    let db = wb.subtract(wd)
+    let sc = ca.cross(cb).length()
+    let sd = db.cross(da).length()
+    if sc <= 0.0 or sd <= 0.0: return sc <= 0.0 and sd > 0.0
+    return ca.dot(cb) * sd + db.dot(da) * sc < -1e-12 * sc * sd
+
+## Flip the side at `corner` (face a b c) and its twin `other` (face b a d)
+## to the diagonal c d: the faces become c a d and c d b.
+func flip(m: Chart*, corner: usize, other: usize):
+    let face = corner - corner % 3
+    let o = other - other % 3
+    let a = m.corners.items[corner]
+    let b = m.corners.items[after_corner(corner)]
+    let c = m.corners.items[before_corner(corner)]
+    let d = m.corners.items[before_corner(other)]
+    let bc = m.twin.items[after_corner(corner)]
+    let ca = m.twin.items[before_corner(corner)]
+    let ad = m.twin.items[after_corner(other)]
+    let db = m.twin.items[before_corner(other)]
+    m.corners.items[face] = c
+    m.corners.items[face + 1] = a
+    m.corners.items[face + 2] = d
+    m.corners.items[o] = c
+    m.corners.items[o + 1] = d
+    m.corners.items[o + 2] = b
+    link(m, face, ca)
+    link(m, face + 1, ad)
+    link(m, face + 2, (i64)o)
+    link(m, o + 1, db)
+    link(m, o + 2, bc)

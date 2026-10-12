@@ -57,27 +57,65 @@ pub func refine_axis(stations: Stations*, s: Surface, low: Vector3, high: Vector
     while at + 1 < stations.count:
         let a = stations.values[at]
         let b = stations.values[at + 1]
-        var accepted = true
+        # The worst chord sag over its target, and whether an edge is longer
+        # than the edge size.
+        var worst: f64 = 0.0
+        var long = false
         for cross in 0..<(usize)5:
             let other = (f64)cross / 4.0
             let pa = try density_point(s, low, high, (a - start) / span, other, axis)
             let pb = try density_point(s, low, high, (b - start) / span, other, axis)
             let delta = pb.subtract(pa)
-            if edge_size > 0.0 and delta.length() > edge_size: accepted = false
+            if edge_size > 0.0 and delta.length() > edge_size: long = true
             for sample in 1..<(usize)4:
                 let t = (a + (b - a) * (f64)sample / 4.0 - start) / span
                 let p = try density_point(s, low, high, t, other, axis)
                 let projection = math.clamp(p.subtract(pa).dot(delta) / delta.dot(delta), 0.0, 1.0) if delta.dot(delta) > 1e-30 else 0.0
-                if p.subtract(pa.add(delta.multiply_scalar(projection))).length() > targets[cross]: accepted = false
-            if not accepted: break
-        if accepted:
+                worst = math.max(worst, p.subtract(pa.add(delta.multiply_scalar(projection))).length() / targets[cross])
+        if worst <= 1.0 and not long:
             at += 1
             continue
+        # As many even pieces as the sag needs (it falls as the square of
+        # the piece), not halves until it fits: halving overshoots up to
+        # twice the count, past the station budget on long cylinders.
+        let pieces = (usize)math.max(2.0, math.ceil(math.sqrt(worst * 2.0)))
         # Curvature is a hard requirement: bypass optional row-phase spacing.
         let separation = stations.separation
         stations.separation = 0.0
-        let added = stations.insert((a + b) * 0.5, epsilon) catch failure:
-            stations.separation = separation
-            error(failure.code, failure.message)
-        stations.separation = separation
-        if not added: error(invalid, "curvature cannot be resolved within parameter precision")
+        defer stations.separation = separation
+        for piece in 1..<pieces:
+            let added = try stations.insert(a + (b - a) * (f64)piece / (f64)pieces, epsilon)
+            if not added: error(invalid, "curvature cannot be resolved within parameter precision")
+
+## Move each grid line that passes near a trim sample (within `fraction`
+## of its spacing to the next line) onto it, unless the line already runs
+## through a sample (a rail's, which it keeps). A line missing a sample by a
+## little crosses the trim beside it: the crossing becomes a station next to
+## the sample, a needle on both faces sharing the edge.
+pub func snap_lines(stations: Stations*, chains: const UVChain[], axis: usize, fraction: f64) -> !:
+    if stations.count < 3: return
+    let locked = try new bool[stations.count] --- in memory.heap
+    defer free(locked) in memory.heap
+    for at in 0..<locked.length: locked[at] = false
+    let exact = (stations.values[stations.count - 1] - stations.values[0]) * 1e-12
+    for pass in 0..<(usize)2:
+        for chain in chains:
+            for p in chain.points:
+                let value = p.x if axis == 0 else p.y
+                var low: usize = 0
+                var high = stations.count - 1
+                while high - low > 1:
+                    let mid = (low + high) // 2
+                    if stations.values[mid] <= value: low = mid
+                    else: high = mid
+                let line = low if math.abs(stations.values[low] - value) <= math.abs(stations.values[high] - value) else high
+                let distance = math.abs(stations.values[line] - value)
+                if pass == 0:
+                    if distance <= exact: locked[line] = true
+                    continue
+                # The domain's ends stay where they are.
+                if locked[line] or line == 0 or line == stations.count - 1: continue
+                let gap = math.min(stations.values[line] - stations.values[line - 1], stations.values[line + 1] - stations.values[line])
+                if distance < gap * fraction:
+                    stations.values[line] = value
+                    locked[line] = true

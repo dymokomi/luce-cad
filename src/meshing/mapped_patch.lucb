@@ -76,6 +76,7 @@ pub func mapped_patch(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: con
             else: mapped[at] = try mesh.point(try surface_point(s, grid[at]))
     let forward = (direction > 0.0) == face.sense
     let refine = s.kind != surface_plane and s.kind != surface_spline and face.uses.length > 4
+    if s.kind != surface_plane and s.kind != surface_spline and not refine: try check_sag(mesh, grid, mapped, nx, ny, s, tolerance, divisions)
     for row in 0..<ny:
         for column in 0..<nx:
             let at = row * (nx + 1) + column
@@ -98,6 +99,30 @@ pub func mapped_patch(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: con
                 try mesh.face(4)
                 for corner in 0..<(usize)4: try mesh.corner(corners[corner if forward else 3 - corner])
     if refine: try mapped_refine(mesh, grid, mapped, nx, ny, s, forward, tolerance, divisions)
+
+## Refuse a curved analytic patch whose cells stray from the surface by more than
+## twice the face's target (as display_error measures it) at their middles:
+## a Coons grid between sides parameterized differently shears its columns
+## round a cylinder, and its quads then cut through the surface (a pin's
+## hole between two slanted trims, its columns a quarter turn across).
+func check_sag(mesh: const MeshBuilder*, grid: const Vector3[], mapped: const i64[], nx: usize, ny: usize, s: Surface, tolerance: f64, divisions: i64) -> !:
+    var low = mesh.points[(usize)mapped[0]]
+    var high = low
+    for id in mapped:
+        let p = mesh.points[(usize)id]
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    let allowed = 2.0 * math.max(tolerance, high.subtract(low).length() / ((f64)divisions * (f64)divisions * 16.0))
+    for row in 0..<ny:
+        for column in 0..<nx:
+            let at = row * (nx + 1) + column
+            let cells = [at, at + 1, at + nx + 2, at + nx + 1]
+            let middle = try surface_point(s, grid[cells[0]].add(grid[cells[1]]).add(grid[cells[2]]).add(grid[cells[3]]).multiply_scalar(0.25))
+            let p = [mesh.points[(usize)mapped[cells[0]]], mesh.points[(usize)mapped[cells[1]]], mesh.points[(usize)mapped[cells[2]]], mesh.points[(usize)mapped[cells[3]]]]
+            # Whichever diagonal the display takes.
+            let first = math.min(squared_triangle_distance(middle, p[0], p[1], p[2]), squared_triangle_distance(middle, p[0], p[2], p[3]))
+            let second = math.min(squared_triangle_distance(middle, p[0], p[1], p[3]), squared_triangle_distance(middle, p[1], p[2], p[3]))
+            if math.min(first, second) > allowed * allowed: error(invalid, "mapped patch strays from its surface")
 
 ## The chart parameters of the patch's boundary samples (`ids`), side by
 ## side, each continuing from the one before; the first from `seed`.

@@ -90,7 +90,23 @@ func face_pieces(work: Work*, traced: const Shape*, faces: usize, pieces: Pieces
     let w = &work.w
     var halves = Growing[HalfEdge]()
     defer halves.close()
+    # The faces no new edge crosses and no cut splits keep their loops as
+    # they are: one piece each, with no tracing (drilling the hundredth
+    # hole in a plate leaves the other ninety-nine holes' walls whole).
+    var touched = Growing[bool]()
+    defer touched.close()
+    try touched.fill(faces, false)
+    for section in work.sections.view():
+        if section.fa >= 0 and (usize)section.fa < faces: touched.items[(usize)section.fa] = true
+        if section.fb >= 0 and (usize)section.fb < faces: touched.items[(usize)section.fb] = true
+    for mark in work.imprints.view():
+        if mark.face < faces: touched.items[mark.face] = true
     for f in 0..<faces:
+        if not touched.items[f] and not (try split_edges(work, f)):
+            try whole_piece(work, f, pieces)
+            try piece_face.push(f)
+            try piece_name.push(w.faces.items[f].name)
+            continue
         halves.clear()
         # The boundary, piece by piece, the way the face uses each edge.
         for use in w.face_uses(f):
@@ -121,6 +137,31 @@ func face_pieces(work: Work*, traced: const Shape*, faces: usize, pieces: Pieces
         for _ in before..<pieces.piece_count():
             try piece_face.push(f)
             try piece_name.push(w.faces.items[f].name)
+
+## Whether a cut splits one of face `f`'s edges into pieces.
+func split_edges(work: const Work*, f: usize) -> bool!:
+    for use in work.w.face_uses(f):
+        let e = edge_index(use)
+        if work.piece_starts.items[e + 1] - work.piece_starts.items[e] != 1: return true
+    return false
+
+## Face `f`, whose edges are each one piece, as one piece of its loops in
+## their order (its outer loop first).
+func whole_piece(work: const Work*, f: usize, pieces: Pieces*) -> !:
+    let w = &work.w
+    let uses = w.face_uses(f)
+    var at: usize = 0
+    for size in w.face_sizes(f):
+        for k in 0..<(usize)size:
+            let use = uses[at + k]
+            let id = work.piece_ids.items[work.piece_starts.items[edge_index(use)]]
+            let forward = (id > 0) == (use > 0)
+            let edge = (id if id > 0 else -id) - 1
+            try pieces.uses.push((edge + 1) * (1 if forward else -1))
+        try pieces.pieces.push(pieces.cycle_starts.count - 1)
+        try pieces.cycle_starts.push(pieces.uses.count)
+        at += (usize)size
+    try pieces.piece_starts.push(pieces.pieces.count)
 
 ## Add final edge `id` (signed) to `halves` both ways, unless one of the
 ## first `boundary` halves is it.

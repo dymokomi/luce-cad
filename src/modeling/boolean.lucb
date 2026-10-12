@@ -325,6 +325,9 @@ func intersect_faces(work: Work*) -> !:
     defer hits.close()
     var ts = Growing[f64]()
     defer ts.close()
+    # Faces and edges stay as they are until the cuts are made.
+    var lookup = try new_lookup(w)
+    defer lookup.close()
     for fa in 0..<work.faces_a:
         if work.chosen.count > 0 and not work.chosen.items[fa]: continue
         for fb in work.faces_a..<w.faces.count:
@@ -389,24 +392,34 @@ func intersect_faces(work: Work*) -> !:
                     highest += work.size * 0.1
                 hits.clear()
                 ts.clear()
+                # The curve's box, to pass over edges far from it (a plate's
+                # other holes) without sampling them.
+                var curve_low = Vector3(1e300, 1e300, 1e300)
+                var curve_high = Vector3(-1e300, -1e300, -1e300)
+                for at in 0..<129:
+                    let q = try w.at(c, lowest + (highest - lowest) * (f64)at / 128.0)
+                    curve_low = lower(curve_low, q)
+                    curve_high = upper(curve_high, q)
+                let curve_pad = curve_high.subtract(curve_low).length() / 64.0 + work.size * 1e-6
                 for side in 0..<2:
                     let f = fa if side == 0 else fb
                     let other = fb if side == 0 else fa
                     for use in w.face_uses(f):
                         let e = edge_index(use)
+                        if not boxes_meet((curve_low, curve_high), (lookup.edge_low.items[e], lookup.edge_high.items[e]), curve_pad + work.edge_tol(e) * 10.0): continue
                         let before = hits.count
                         try crossings(w, c, lowest, highest, e, work.size, work.edge_tol(e), &hits)
                         # A crossing cuts the boundary edge only where the
                         # other face is: elsewhere no section ends there,
                         # and the cut would leave a stray vertex on the edge.
                         for at in before..<hits.count:
-                            if try face_contains(w, other, try w.at(c, hits.items[at].t), work.tol) != outside: try work.cuts.push(Cut(e, hits.items[at].s))
+                            if try lookup_contains(&lookup, w, other, try w.at(c, hits.items[at].t), work.tol) != outside: try work.cuts.push(Cut(e, hits.items[at].s))
                 for hit in hits.view(): try ts.push(hit.t)
                 for p in crossing_points.view():
                     let t = try nearest_on(w, c, p, lowest, highest)
                     if (try w.at(c, t)).subtract(p).length() <= work.tol * 10.0: try ts.push(t)
                 sort.sort(ts.items[..<ts.count])
-                try add_sections(work, c, closed, lowest, highest, ts.view(), fa, fb)
+                try add_sections(work, &lookup, c, closed, lowest, highest, ts.view(), fa, fb)
 
 ## The points where the `count` curves from carrier `first` on cross one
 ## another, onto `out`: each curve sampled, the other's nearest point found,
@@ -467,7 +480,7 @@ func narrowed(w: const Shape*, a: i64, b: i64, low: f64, high: f64, high_b: f64)
 
 ## The stretches of carrier `c` between consecutive crossings `ts` that lie
 ## inside both faces, as sections.
-func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: const f64[], fa: usize, fb: usize) -> !:
+func add_sections(work: Work*, lookup: Lookup*, c: i64, closed: bool, low: f64, high: f64, ts: const f64[], fa: usize, fb: usize) -> !:
     let w = &work.w
     var bounds = Growing[f64]()
     defer bounds.close()
@@ -487,8 +500,8 @@ func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: co
         var halfway = (t0 + t1) * 0.5
         if halfway > high and w.carriers.items[(usize)c].kind == curve_spline: halfway -= high - low
         let middle = try w.at(c, halfway)
-        let ia = try face_contains(w, fa, middle, work.tol)
-        let ib = try face_contains(w, fb, middle, work.tol)
+        let ia = try lookup_contains(lookup, w, fa, middle, work.tol)
+        let ib = try lookup_contains(lookup, w, fb, middle, work.tol)
         if ia == outside or ib == outside or (ia == on_boundary and ib == on_boundary): continue
         # A closed traced curve's stretch may run past its end: wrap it.
         if t1 > high and w.carriers.items[(usize)c].kind == curve_spline:

@@ -142,9 +142,9 @@ func about_axis(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], direct
     return true
 
 ## The chart step: a quarter turn over `divisions`, or finer to keep the
-## sphere's target (or the edge size).
+## sphere's target inside its triangles (or the edge size).
 func seam_step(s: Surface, divisions: i64, tolerance: f64, edge_size: f64) -> f64:
-    var step = math.min(math.pi / (2.0 * (f64)divisions), sag_step(s.radius, analytic_target(s, 0.0, divisions, tolerance)))
+    var step = math.min(math.pi / (2.0 * (f64)divisions), sag_step(s.radius, analytic_target(s, 0.0, divisions, tolerance) * 0.45))
     if edge_size > 0.0: step = math.min(step, edge_size / s.radius)
     return step
 
@@ -314,33 +314,117 @@ func mesh_band(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], starts:
     if upper.loop < 0: try pole_cap(mesh, chart, north_ring, upper.latitude, step, sense)
     if lower.loop < 0: try pole_cap(mesh, chart, south_ring, lower.latitude, step, sense)
 
-## The cap from circle `circle` at `latitude` to its pole: rows of the
-## circle's columns a `step` apart, then a fan. East round the north pole
+## The cap from circle `circle` at `latitude` to its pole: rows a `step`
+## apart, their columns thinning towards the pole (polar_rows), then a fan. East round the north pole
 ## is counterclockwise seen from outside, round the south pole clockwise.
 func pole_cap(mesh: MeshBuilder*, chart: Surface, circle: const i64[], latitude: f64, step: f64, sense: bool) -> !:
     let pole_lat = 0.5 * math.pi if latitude > 0.0 else -0.5 * math.pi
-    let count = circle.length
     let rows = (usize)math.max(1.0, math.ceil(math.abs(pole_lat - latitude) / step))
-    let previous = try new i64[count] --- in memory.heap
-    defer free(previous) in memory.heap
-    let next = try new i64[count] --- in memory.heap
-    defer free(next) in memory.heap
-    for k in 0..<count: previous[k] = circle[k]
+    let longitudes = try new f64[circle.length] --- in memory.heap
+    defer free(longitudes) in memory.heap
+    let starts = try new f64[circle.length] --- in memory.heap
+    defer free(starts) in memory.heap
+    for k in 0..<circle.length:
+        longitudes[k] = 2.0 * math.pi * (f64)k / (f64)circle.length
+        starts[k] = latitude
     let north = latitude > 0.0
+    try polar_rows(mesh, chart, circle, longitudes, starts, pole_lat, rows, north != sense)
+
+## Rows from a ring of points `ring` (at `longitudes`, increasing or
+## decreasing once round, and latitudes `starts`) along meridians to the
+## pole at `pole_lat`, `rows` of them evenly, closed by a fan. The rows'
+## columns stand evenly round, as many as make square cells on the first
+## row (a multiple of 8), halved on each row where they crowd to under half
+## a row apart, so they neither close into needles at the pole nor depend
+## on how the ring is sampled; the ring is joined to the first row by
+## triangles in longitude order. A row's latitude at a longitude follows
+## the ring's there. The faces run ring k, k + 1, next row k + 1, k,
+## reversed when `flipped`.
+func polar_rows(mesh: MeshBuilder*, s: Surface, ring: const i64[], longitudes: const f64[], starts: const f64[], pole_lat: f64, rows: usize, flipped: bool) -> !:
+    let count = ring.length
+    let way: f64 = 1.0 if longitudes[count - 1] > longitudes[0] else -1.0
+    var mean: f64 = 0.0
+    for value in starts: mean += value
+    mean /= (f64)count
+    let row_step = math.abs(pole_lat - mean) / (f64)rows
+    if rows < 2:
+        let pole = try mesh.point(analytic_point(s, 0.0, pole_lat))
+        for k in 0..<count: try band_face(mesh, [ring[k], ring[(k + 1) % count], pole], flipped)
+        return
+    let first_lat = mean + (pole_lat - mean) / (f64)rows
+    var width = (usize)math.max(8.0, math.ceil(2.0 * math.pi * math.cos(first_lat) / row_step / 8.0) * 8.0)
+    let previous = try new i64[width] --- in memory.heap
+    defer free(previous) in memory.heap
+    let next = try new i64[width] --- in memory.heap
+    defer free(next) in memory.heap
+    let column_longitudes = try new f64[width + 1] --- in memory.heap
+    defer free(column_longitudes) in memory.heap
     for row in 1..<rows:
-        let v = latitude + (pole_lat - latitude) * (f64)row / (f64)rows
-        for k in 0..<count: next[k] = try mesh.point(analytic_point(chart, 2.0 * math.pi * (f64)k / (f64)count, v))
-        for k in 0..<count:
-            let after = (k + 1) % count
-            let corners = [previous[k], previous[after], next[after], next[k]] if north else [previous[after], previous[k], next[k], next[after]]
-            try mesh.face(4)
-            for at in 0..<(usize)4: try mesh.corner(corners[at if sense else 3 - at])
-        for k in 0..<count: previous[k] = next[k]
-    let pole = try mesh.point(analytic_point(chart, 0.0, pole_lat))
+        let fraction = (f64)row / (f64)rows
+        let v = mean + (pole_lat - mean) * fraction
+        var columns = width
+        if row > 1 and columns % 2 == 0 and columns >= 8 and 2.0 * math.pi * math.cos(v) / (f64)columns < 0.5 * row_step: columns = columns // 2
+        for j in 0..<columns:
+            let longitude = longitudes[0] + way * 2.0 * math.pi * (f64)j / (f64)columns
+            let start = ring_latitude(longitudes, starts, longitude, way)
+            next[j] = try mesh.point(analytic_point(s, longitude, start + (pole_lat - start) * fraction))
+            column_longitudes[j] = longitude
+        if row == 1: try zip_ring(mesh, ring, longitudes, next[..<columns], column_longitudes[..<columns], way, flipped)
+        else: try ring_band(mesh, previous[..<width], next[..<columns], flipped)
+        for j in 0..<columns: previous[j] = next[j]
+        width = columns
+    let pole = try mesh.point(analytic_point(s, 0.0, pole_lat))
+    for k in 0..<width: try band_face(mesh, [previous[k], previous[(k + 1) % width], pole], flipped)
+
+## The ring's latitude at `longitude` (its samples' linearly between them;
+## `way` the direction the longitudes run).
+func ring_latitude(longitudes: const f64[], starts: const f64[], longitude: f64, way: f64) -> f64:
+    let count = longitudes.length
+    let turn = 2.0 * math.pi
     for k in 0..<count:
-        let after = (k + 1) % count
-        if north: try fan(mesh, previous[k], previous[after], pole, sense)
-        else: try fan(mesh, previous[after], previous[k], pole, sense)
+        let a = longitudes[k]
+        let b = longitudes[k + 1] if k + 1 < count else longitudes[0] + way * turn
+        let t = (longitude - a) / (b - a) if b != a else 0.0
+        if t >= 0.0 and t <= 1.0: return starts[k] + (starts[(k + 1) % count] - starts[k]) * t
+    return starts[0]
+
+## Triangles joining the ring to the first row (both from the same
+## longitude, running `way`): each step takes the next point of whichever
+## comes first round the turn.
+func zip_ring(mesh: MeshBuilder*, ring: const i64[], longitudes: const f64[], row: const i64[], row_longitudes: const f64[], way: f64, flipped: bool) -> !:
+    let n = ring.length
+    let m = row.length
+    let turn = 2.0 * math.pi
+    var i: usize = 0
+    var j: usize = 0
+    while i < n or j < m:
+        let ring_next = (longitudes[i + 1] if i + 1 < n else longitudes[0] + way * turn) * way
+        let row_next = (row_longitudes[j + 1] if j + 1 < m else row_longitudes[0] + way * turn) * way
+        if j >= m or (i < n and ring_next <= row_next):
+            try band_face(mesh, [ring[i], ring[(i + 1) % n], row[j % m]], flipped)
+            i += 1
+        else:
+            try band_face(mesh, [ring[i % n], row[(j + 1) % m], row[j]], flipped)
+            j += 1
+
+## The faces between a row `previous` and the next row towards a pole,
+## `next`, of as many points or half as many (point j of `next` then on
+## point 2j's meridian): quads previous k, k + 1, next k + 1, k, and where
+## halved a triangle and a quad per pair.
+func ring_band(mesh: MeshBuilder*, previous: const i64[], next: const i64[], flipped: bool) -> !:
+    let halved = next.length < previous.length
+    let count = next.length
+    for j in 0..<count:
+        let after = (j + 1) % count
+        if halved:
+            try band_face(mesh, [previous[2 * j], previous[2 * j + 1], next[j]], flipped)
+            try band_face(mesh, [previous[2 * j + 1], previous[(2 * j + 2) % previous.length], next[after], next[j]], flipped)
+        else:
+            try band_face(mesh, [previous[j], previous[after], next[after], next[j]], flipped)
+
+func band_face(mesh: MeshBuilder*, corners: const i64[], flipped: bool) -> !:
+    try mesh.face((i64)corners.length)
+    for at in 0..<corners.length: try mesh.corner(corners[corners.length - 1 - at if flipped else at])
 
 ## A circle side's points, east from the seam (empty for a loop).
 func polar_ring(mesh: MeshBuilder*, chart: Surface, side: Side, count: usize) -> i64[]!:
@@ -378,7 +462,3 @@ func side_points(points: Growing[Vector3]*, chain: Growing[i64]*, ids: const i64
         try points.push(Vector3(u * r, lat[at] * r, 0.0))
         try chain.push(ids[at])
         previous = at
-
-func fan(mesh: MeshBuilder*, a: i64, b: i64, pole: i64, sense: bool) -> !:
-    try mesh.face(3)
-    for id in ([a, b, pole] if sense else [b, a, pole]): try mesh.corner(id)

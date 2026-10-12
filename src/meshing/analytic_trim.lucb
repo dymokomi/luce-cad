@@ -70,22 +70,22 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
     # (a latitude circle, or a wavy loop such as a variable fillet's
     # contact round a dome); UV has a singular pole.
     if s.kind == surface_sphere and sizes.length == 1 and winds_once(uv, uscale):
-        try spherical_cap(mesh, ids, uv, s, sense, divisions)
+        try spherical_cap(mesh, ids, uv, s, sense, divisions, tolerance)
         return
     # Such a loop with holes inside: an azimuthal chart about its pole.
     if s.kind == surface_sphere and sizes.length > 1:
         let outer = winding_loop(uv, sizes, uscale)
         if outer >= 0:
-            try sphere_disk(mesh, ids, sizes, uv, (usize)outer, s, sense, divisions)
+            try sphere_disk(mesh, ids, sizes, uv, (usize)outer, s, sense, divisions, tolerance)
             return
     var spacing = uscale * math.pi / (2.0 * (f64)divisions)
     var vertical = vscale * math.pi / (2.0 * (f64)divisions) if s.kind == surface_sphere or s.kind == surface_torus else spacing
+    var minimum = uv[0]
+    var maximum = uv[0]
+    for p in uv:
+        minimum = Vector3(math.min(minimum.x, p.x), math.min(minimum.y, p.y), 0.0)
+        maximum = Vector3(math.max(maximum.x, p.x), math.max(maximum.y, p.y), 0.0)
     if edge_size == 0.0:
-        var minimum = uv[0]
-        var maximum = uv[0]
-        for p in uv:
-            minimum = Vector3(math.min(minimum.x, p.x), math.min(minimum.y, p.y), 0.0)
-            maximum = Vector3(math.max(maximum.x, p.x), math.max(maximum.y, p.y), 0.0)
         # A tiny-radius, long axial strip must not request millions of square
         # cells when target edge length is off. Shared boundary samples retain
         # angular resolution; interior refinement stays bounded by divisions.
@@ -101,16 +101,24 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
         low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
         high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
     let deviation = analytic_target(s, high.subtract(low).length(), divisions, tolerance)
-    # The lattice no coarser than the target: rows round the axis sag at
-    # most `deviation` at the surface's widest circle (and a sphere's or a
-    # torus's rows along its meridians at theirs), so the refinement does
-    # not have to split every cell once.
-    if s.kind == surface_cylinder or s.kind == surface_sphere:
-        spacing = math.min(spacing, uscale * sag_step(s.radius, deviation))
+    # The lattice a little finer than the target, so the refinement does
+    # not have to split every cell: a cylinder's rows round the axis sag
+    # under `deviation`; a sphere's or a torus's triangles (whose middles
+    # stray twice as far as their sides) at their widest circles and
+    # meridians.
+    if s.kind == surface_cylinder:
+        spacing = math.min(spacing, uscale * sag_step(s.radius, deviation * 0.9))
+    elif s.kind == surface_sphere:
+        spacing = math.min(spacing, uscale * sag_step(s.radius, deviation * 0.45))
+        vertical = math.min(vertical, vscale * sag_step(s.radius, deviation * 0.45))
     elif s.kind == surface_torus:
-        spacing = math.min(spacing, uscale * sag_step(s.radius + s.angle, deviation))
-        vertical = math.min(vertical, vscale * sag_step(s.angle, deviation))
-    if s.kind == surface_sphere: vertical = math.min(vertical, vscale * sag_step(s.radius, deviation))
+        spacing = math.min(spacing, uscale * sag_step(s.radius + s.angle, deviation * 0.45))
+        vertical = math.min(vertical, vscale * sag_step(s.angle, deviation * 0.45))
+    # Along a cylinder's or a cone's axis nothing bends: rows there only
+    # shape the cells, so they are at most `divisions` apart over the face
+    # and cells at most three times as long as wide.
+    if (s.kind == surface_cylinder or s.kind == surface_cone) and edge_size == 0.0:
+        vertical = math.min(spacing * 3.0, math.max(vertical, (maximum.y - minimum.y) / (f64)divisions))
     try lift_chart(mesh, ids, sizes, uv, s, uscale, vscale, sense, spacing, vertical, deviation)
 
 ## The trim loops `ids` (by `sizes`; their chart points `uv`, scaled by
@@ -118,11 +126,19 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
 ## chart: a lattice of `spacing` by `vertical` quadrangulated, refined to
 ## `deviation`, lifted onto `s`; the polygons face its way (`sense`).
 func lift_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], uv: const Vector3[], s: Surface, uscale: f64, vscale: f64, sense: bool, spacing: f64, vertical: f64, deviation: f64) -> !:
-    let initial = try TrimPolygon.quadrangulate_seams(uv, sizes, Vector3(0.0, 0.0, 1.0), ids, spacing, vertical)
-    defer initial.release()
+    let normal = Vector3(0.0, 0.0, 1.0)
+    let triangles = try TrimPolygon.triangulate_seams(uv, sizes, normal, ids)
+    defer triangles.release()
     let constraints = try TrimConstraints.build(uv, ids, sizes)
     defer constraints.close()
-    let part = try refine_uv(initial, s, uscale, vscale, deviation, constraints)
+    let gridded = try insert_grid(triangles, normal, spacing, vertical, constraints)
+    defer gridded.release()
+    let improved = try improve(gridded, normal, ids, constraints)
+    defer improved.release()
+    var lift = ChartLift(surface = s, uscale = uscale, vscale = vscale)
+    let refined = try chart_refine(improved, &lift, deviation, ids, constraints)
+    defer refined.release()
+    let part = try recombine(refined, normal, constraints)
     defer part.release()
     let mapped = try new i64[(usize)part.value().point_count()] --- in memory.heap
     defer free(mapped) in memory.heap
@@ -154,31 +170,24 @@ func winds_once(uv: const Vector3[], uscale: f64) -> bool:
 
 ## A spherical cap's mesh: rows from each boundary point along its
 ## meridian to the pole the loop goes round (north when it turns
-## counterclockwise about the face's normal), `divisions` of them, closed
-## by a fan at the pole. Going east along the loop and north to the pole
-## faces out, so the corners' own order faces the face's way.
-func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s: Surface, sense: bool, divisions: i64) -> !:
+## counterclockwise about the face's normal), `divisions` of them or as
+## many as keep the sphere's target inside the cells, thinning out towards
+## the pole and closed by a fan there (polar_rows). Going east along the
+## loop and north to the pole faces out, so the corners' own order faces
+## the face's way.
+func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s: Surface, sense: bool, divisions: i64, tolerance: f64) -> !:
     let north = (uv[uv.length - 1].x > uv[0].x) == sense
     let pole_v = math.pi * (0.5 if north else -0.5)
-    let previous = try new i64[ids.length] --- in memory.heap
-    defer free(previous) in memory.heap
-    let next = try new i64[ids.length] --- in memory.heap
-    defer free(next) in memory.heap
+    let longitudes = try new f64[ids.length] --- in memory.heap
+    defer free(longitudes) in memory.heap
+    let starts = try new f64[ids.length] --- in memory.heap
+    defer free(starts) in memory.heap
+    var mean: f64 = 0.0
     for at in 0..<ids.length:
-        previous[at] = ids[at]
-    for row in 1..<divisions:
-        for at in 0..<ids.length:
-            let start_v = uv[at].y / s.radius
-            next[at] = try mesh.point(analytic_point(s, uv[at].x / s.radius, start_v + (pole_v - start_v) * (f64)row / (f64)divisions))
-        for at in 0..<ids.length:
-            let following = (at + 1) % ids.length
-            let corners = [previous[at], previous[following], next[following], next[at]]
-            try mesh.face(4)
-            for index in 0..<(usize)4: try mesh.corner(corners[index])
-        for at in 0..<ids.length:
-            previous[at] = next[at]
-    let pole = try mesh.point(analytic_point(s, 0.0, pole_v))
-    for at in 0..<ids.length:
-        let corners = [previous[at], previous[(at + 1) % ids.length], pole]
-        try mesh.face(3)
-        for index in 0..<(usize)3: try mesh.corner(corners[index])
+        longitudes[at] = uv[at].x / s.radius
+        starts[at] = uv[at].y / s.radius
+        mean += starts[at]
+    mean /= (f64)ids.length
+    let step = sag_step(s.radius, analytic_target(s, 0.0, divisions, tolerance) * 0.45)
+    let rows = (usize)math.max((f64)divisions, math.ceil(math.abs(pole_v - mean) / step))
+    try polar_rows(mesh, s, ids, longitudes, starts, pole_v, rows, false)

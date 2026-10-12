@@ -1,0 +1,119 @@
+## This file: where a point lies against a face, for the many questions a
+## boolean's face pairs ask (face_contains, with what it needs found once).
+## An edge's box is found once. A face's loops are traced into its chart
+## the first time one is needed, and kept with their box there; on a
+## plane a loop whose box the point is beside cannot wind round it, so it
+## is not traced at all. A plate with a hundred holes then answers from the
+## loops round the point, not by tracing and winding round every hole each
+## time.
+
+## Loop k of the faces the lookup has seen: its uses in its face, and
+## (once traced) its chart points and their box.
+struct LoopEntry:
+    var face: usize
+    var first_use: usize
+    var uses: usize
+    var low3: Vector3
+    var high3: Vector3
+    ## Its chart points points[start..<end]; end 0 until traced.
+    var start: usize = 0
+    var end: usize = 0
+    var low: Vector3 = Vector3()
+    var high: Vector3 = Vector3()
+
+struct Lookup:
+    var points: Growing[Vector3]
+    var loops: Growing[LoopEntry]
+    ## Face f's loops are loops[face_first[f]..] (face_loops[f] of them;
+    ## face_first -1 until the face is asked about).
+    var face_first: Growing[i64]
+    var face_loops: Growing[usize]
+    var edge_low: Growing[Vector3]
+    var edge_high: Growing[Vector3]
+
+    func close():
+        self.points.close()
+        self.loops.close()
+        self.face_first.close()
+        self.face_loops.close()
+        self.edge_low.close()
+        self.edge_high.close()
+
+## A lookup over `w`'s faces and edges as they are now (the faces and
+## edges must not change while it is used).
+func new_lookup(w: const Shape*) -> Lookup!:
+    var made = Lookup(Growing[Vector3](), Growing[LoopEntry](), Growing[i64](), Growing[usize](), Growing[Vector3](), Growing[Vector3]())
+    errdefer made.close()
+    try made.face_first.fill(w.faces.count, -1)
+    try made.face_loops.fill(w.faces.count, 0)
+    for e in 0..<w.edges.count:
+        let (low, high) = try edge_box(w, e)
+        try made.edge_low.push(low)
+        try made.edge_high.push(high)
+    return made
+
+## Where `p` lies against face `f` (face_contains's answer).
+func lookup_contains(lookup: Lookup*, w: const Shape*, f: usize, p: Vector3, tol: f64) -> i64!:
+    for use in w.face_uses(f):
+        let e = edge_index(use)
+        let reach = math.max(tol * 10.0, w.edge_slack_of(e))
+        if not inside_box(p, lookup.edge_low.items[e], lookup.edge_high.items[e], reach): continue
+        let edge = w.edges.items[e]
+        let t = try nearest_on(w, edge.carrier, p, edge.t0, edge.t1)
+        # A tolerant edge (Stitch's) holds what lies within its precision.
+        if (try w.at(edge.carrier, t)).subtract(p).length() <= reach: return on_boundary
+    if lookup.face_first.items[f] < 0: try list_loops(lookup, w, f)
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    # Off a B-spline surface (no parameters there) is outside its face.
+    let (u, v) = surface_uv(s, p, w.tolerance) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return outside
+    let wraps = periodic(s)
+    let wraps_v = s.kind == surface_torus
+    let first = (usize)lookup.face_first.items[f]
+    var total: i64 = 0
+    for k in first..<first + lookup.face_loops.items[f]:
+        # On a plane a loop winds only round points inside its box.
+        if s.kind == surface_plane and not inside_box(p, lookup.loops.items[k].low3, lookup.loops.items[k].high3, tol * 10.0): continue
+        if lookup.loops.items[k].end == 0: try trace_loop(lookup, w, f, k)
+        let entry = lookup.loops.items[k]
+        # A loop whose chart box the point is beside winds round it no
+        # times (a periodic chart's box is no guide).
+        if not wraps and not wraps_v and (u < entry.low.x or u > entry.high.x or v < entry.low.y or v > entry.high.y): continue
+        let range: usize[2] = [entry.start, entry.end]
+        total += chart_winding(lookup.points.view(), range[..<2], u, v, wraps, wraps_v)
+    return inside_face if total != 0 else outside
+
+func inside_box(p: Vector3, low: Vector3, high: Vector3, pad: f64) -> bool:
+    return p.x >= low.x - pad and p.y >= low.y - pad and p.z >= low.z - pad and p.x <= high.x + pad and p.y <= high.y + pad and p.z <= high.z + pad
+
+## Face `f`'s loops listed with their boxes (from their edges'), untraced.
+func list_loops(lookup: Lookup*, w: const Shape*, f: usize) -> !:
+    lookup.face_first.items[f] = (i64)lookup.loops.count
+    let uses = w.face_uses(f)
+    var at: usize = 0
+    for size in w.face_sizes(f):
+        var low = Vector3(1e300, 1e300, 1e300)
+        var high = Vector3(-1e300, -1e300, -1e300)
+        for use in uses[at..<at + (usize)size]:
+            let e = edge_index(use)
+            low = lower(low, lookup.edge_low.items[e])
+            high = upper(high, lookup.edge_high.items[e])
+        try lookup.loops.push(LoopEntry(f, at, (usize)size, low, high))
+        at += (usize)size
+    lookup.face_loops.items[f] = w.face_sizes(f).length
+
+## Loop `k` (of face `f`) traced into the chart, with its box there.
+func trace_loop(lookup: Lookup*, w: const Shape*, f: usize, k: usize) -> !:
+    let entry = lookup.loops.items[k]
+    let start = lookup.points.count
+    try loop_chart(w, w.faces.items[f].surface, try face_pole(w, f), w.face_uses(f)[entry.first_use..<entry.first_use + entry.uses], &lookup.points)
+    var low = Vector3(1e300, 1e300, 0.0)
+    var high = Vector3(-1e300, -1e300, 0.0)
+    for q in lookup.points.view()[start..<lookup.points.count]:
+        low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), 0.0)
+        high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), 0.0)
+    lookup.loops.items[k].start = start
+    lookup.loops.items[k].end = lookup.points.count
+    lookup.loops.items[k].low = low
+    lookup.loops.items[k].high = high

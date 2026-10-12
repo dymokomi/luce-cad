@@ -7,8 +7,9 @@
 ## pole and azimuth φ about it is the point θ R (cos φ, sin φ), so the face
 ## becomes a disk with holes, every loop closed, the chart's own lengths
 ## the sphere's along meridians and never longer across them. The trims
-## are triangulated with a lattice there (TrimPolygon) and the new points
-## lifted onto the sphere; boundary ids stay the face's own.
+## are triangulated with a lattice there, refined on the sphere
+## (chart_refine), paired into quads and lifted; boundary ids stay the
+## face's own.
 
 ## The loop of `uv` (loops by `sizes`, a sphere's chart points scaled by
 ## `uscale` in u) that goes round the axis once, -1 when none or more than
@@ -28,7 +29,7 @@ func winding_loop(uv: const Vector3[], sizes: const i64[], uscale: f64) -> i64:
 ## `uv`, u scaled by the radius) whose loop `outer` goes round the axis,
 ## the rest holes, in the azimuthal chart about the pole `outer` goes round
 ## (as spherical_cap picks it).
-func sphere_disk(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], uv: const Vector3[], outer: usize, s: Surface, sense: bool, divisions: i64) -> !:
+func sphere_disk(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], uv: const Vector3[], outer: usize, s: Surface, sense: bool, divisions: i64, tolerance: f64) -> !:
     var offset: usize = 0
     for loop in 0..<outer: offset += (usize)sizes[loop]
     let ring = uv[offset..<offset + (usize)sizes[outer]]
@@ -65,25 +66,41 @@ func sphere_disk(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], uv: c
                     at += 1
             start += count
     # A quarter turn in `divisions` steps, as the chart lattices space theirs,
-    # bounded by the disk's extent.
+    # bounded by the disk's extent, and fine enough to keep the sphere's
+    # target inside the cells.
     let extent = math.max(high.x - low.x, high.y - low.y)
-    let spacing = math.max(math.min(s.radius * math.pi / (2.0 * (f64)divisions), extent / (f64)divisions), extent / ((f64)divisions * 4.0))
-    let part = try TrimPolygon.quadrangulate_seams(points, counts, Vector3(0.0, 0.0, 1.0), order, spacing, spacing)
+    var spacing = math.max(math.min(s.radius * math.pi / (2.0 * (f64)divisions), extent / (f64)divisions), extent / ((f64)divisions * 4.0))
+    let deviation = analytic_target(s, 0.0, divisions, tolerance)
+    spacing = math.min(spacing, s.radius * sag_step(s.radius, deviation * 0.45))
+    let normal = Vector3(0.0, 0.0, 1.0)
+    let triangles = try TrimPolygon.triangulate_seams(points, counts, normal, order)
+    defer triangles.release()
+    let constraints = try TrimConstraints.build(points, order, counts)
+    defer constraints.close()
+    let gridded = try insert_grid(triangles, normal, spacing, spacing, constraints)
+    defer gridded.release()
+    let improved = try improve(gridded, normal, order, constraints)
+    defer improved.release()
+    var lift = ChartLift(surface = s, uscale = s.radius, vscale = s.radius, azimuthal = true, pole = pole, x = x, y = y)
+    let refined = try chart_refine(improved, &lift, deviation, order, constraints)
+    defer refined.release()
+    let part = try recombine(refined, normal, constraints)
     defer part.release()
     let mapped = try new i64[(usize)part.value().point_count()] --- in memory.heap
     defer free(mapped) in memory.heap
     for k in 0..<mapped.length:
-        if k < order.length:
-            mapped[k] = order[k]
-            continue
-        let q = try part.value().point((i64)k)
-        let theta = math.hypot(q.x, q.y) / s.radius
-        let phi = math.atan2(q.y, q.x)
-        let way = pole.multiply_scalar(math.cos(theta)).add(x.multiply_scalar(math.sin(theta) * math.cos(phi))).add(y.multiply_scalar(math.sin(theta) * math.sin(phi)))
-        mapped[k] = try mesh.point(s.origin.add(way.multiply_scalar(s.radius)))
+        mapped[k] = order[k] if k < order.length else (try mesh.point(azimuthal_point(s, pole, x, y, try part.value().point((i64)k))))
     # The chart's +z is the sphere's outward normal (x cross y is the pole).
     for face in 0..<part.value().face_count():
         let count = try part.value().face_size(face)
         try mesh.face(count)
         for k in 0..<count:
             try mesh.corner(mapped[(usize)(try part.value().face_point(face, k if sense else count - 1 - k))])
+
+## The point of a sphere's azimuthal equidistant chart about `pole` (`x`
+## and `y` across it) at chart point `q`.
+func azimuthal_point(s: Surface, pole: Vector3, x: Vector3, y: Vector3, q: Vector3) -> Vector3:
+    let theta = math.hypot(q.x, q.y) / s.radius
+    let phi = math.atan2(q.y, q.x)
+    let way = pole.multiply_scalar(math.cos(theta)).add(x.multiply_scalar(math.sin(theta) * math.cos(phi))).add(y.multiply_scalar(math.sin(theta) * math.sin(phi)))
+    return s.origin.add(way.multiply_scalar(s.radius))

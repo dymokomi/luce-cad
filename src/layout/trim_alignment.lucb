@@ -62,6 +62,47 @@ pub func align(uv: Vector3[], sizes: const i64[], ids: const i64[], canonical: c
                 if support.subtract(original).length() <= budget and support.subtract(p).length() <= tolerance: uv[index] = candidate
         begin += count
 
+## Put each trim point still beside a grid line by less than the layout's
+## own precision (`plan.epsilon`, half of it) onto that line, when the line
+## crosses one of the point's sides: crossings are solved only to that
+## precision, and clipping takes a trim side that far over a line as not
+## crossing it, so a point left a hair beside a line leaves a cell boundary
+## that does not close. Only chart coordinates move, by less than the
+## crossings' own error; a point whose identity repeats (a seam's two
+## images) stays.
+pub func settle(uv: Vector3[], sizes: const i64[], ids: const i64[], plan: GridLayout) -> !:
+    let reach = plan.epsilon * 0.5
+    let seen = try new i64[ids.length * 2 + 1] --- in memory.heap
+    defer free(seen) in memory.heap
+    let repeated = try new bool[ids.length] --- in memory.heap
+    defer free(repeated) in memory.heap
+    for at in 0..<seen.length: seen[at] = -1
+    for at in 0..<ids.length:
+        repeated[at] = false
+        var slot = (usize)ids[at] % seen.length
+        while seen[slot] >= 0 and ids[(usize)seen[slot]] != ids[at]: slot = (slot + 1) % seen.length
+        if seen[slot] < 0: seen[slot] = (i64)at
+        else:
+            repeated[at] = true
+            repeated[(usize)seen[slot]] = true
+    var begin: usize = 0
+    for size in sizes:
+        let count = (usize)size
+        for k in 0..<count:
+            let at = begin + k
+            if repeated[at]: continue
+            let previous = uv[begin + (k + count - 1) % count]
+            let next = uv[begin + (k + 1) % count]
+            for axis in 0..<(usize)2:
+                let value = coordinate(uv[at], axis)
+                let line = nearest(plan.u if axis == 0 else plan.v, value)
+                let distance = math.abs(line - value)
+                if distance == 0.0 or distance >= reach: continue
+                # The line must cross a side of the point's.
+                if (coordinate(previous, axis) - line) * (value - line) >= 0.0 and (coordinate(next, axis) - line) * (value - line) >= 0.0: continue
+                uv[at] = Vector3(line, uv[at].y, 0.0) if axis == 0 else Vector3(uv[at].x, line, 0.0)
+        begin += count
+
 func nearest(stations: Stations, value: f64) -> f64:
     var low: usize = 0
     var high = stations.count - 1
