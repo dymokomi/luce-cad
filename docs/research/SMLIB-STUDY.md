@@ -830,6 +830,17 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   `touching_tests`. Still open: tangency classified from the surfaces' curvatures, gap repair,
   zones as sums of tolerances.
 
+- **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
+  plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was
+  finding a point well inside a piece (`piece_point`), asked even of the plate's face with all its
+  holes: the walls far from the new hole were classified outside by their box alone, which did not
+  record the class for their connected block. Now a face classified by its box classifies its
+  block, the block's class is asked before any point inside, each block is classified by its
+  piece with the fewest boundary uses, and a few candidates come first (a point a quarter of the
+  piece's narrower extent inside is enough). P1: 1975 to 790 ms (SMLib 290 ms, single-threaded).
+  What remains: every face of the plate split again for each hole (`face_pieces`, `split_face`,
+  about half of what is left) and the face-pair loop (`intersect_faces`, a third).
+
 ## 12. What not to take
 
 - **Its surfaces.** Cubic approximations of circles by default, G1-within-an-angle corners, Coons

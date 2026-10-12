@@ -30,6 +30,22 @@ func piece_point(work: Work*, traced: const Shape*, f: usize, pieces: const Piec
     var best_u = 0.0
     var best_v = 0.0
     var best = -1.0
+    # First a few candidates: a point a quarter of the piece's narrower
+    # extent from every boundary segment is well inside already (a disk
+    # cut from a face by a hole is found at once).
+    let enough = 0.25 * math.min((high.x - low.x) * scale, high.y - low.y)
+    for row in 0..<3:
+        for column in 0..<5:
+            let u = low.x + (high.x - low.x) * ((f64)column + 0.5 + 0.0098765432) / 5.0
+            let v = low.y + (high.y - low.y) * ((f64)row + 0.5 + 0.0123456789) / 3.0
+            if chart_winding(chart.view(), starts.view(), u, v, wraps, s.kind == surface_torus) == 0: continue
+            let clearance = nearest_segment(scaled.view(), starts.view(), u * scale, v, best)
+            if clearance > best:
+                best = clearance
+                best_u = u
+                best_v = v
+    if enough > 0.0 and best >= enough: return try surface_point(work.w.surfaces.items[(usize)face.surface], Vector3(best_u, best_v, 0.0))
+    best = -1.0
     # A coarse grid of candidates off the vertices (an irrational step); of
     # those inside, the one farthest from every boundary segment; then
     # finer grids about the best so far.
@@ -226,15 +242,23 @@ func classify(work: Work*, traced: const Shape*, f: usize, pieces: const Pieces*
     let h = others.highs.items[f]
     let ol = others.solid_low[other]
     let oh = others.solid_high[other]
-    if l.x > oh.x + pad or l.y > oh.y + pad or l.z > oh.z + pad or ol.x > h.x + pad or ol.y > h.y + pad or ol.z > h.z + pad: return class_out
+    # Its block's, once known, unless its face lies on one of the other's
+    # (then the piece itself decides). A point inside a piece of a face
+    # with many holes is the costliest step here: found only when needed.
+    let block = union_root(others.block.items, p)
+    if l.x > oh.x + pad or l.y > oh.y + pad or l.z > oh.z + pad or ol.x > h.x + pad or ol.y > h.y + pad or ol.z > h.z + pad:
+        # So is its block (pieces of a block lie on one side).
+        others.block_class.items[block] = class_out
+        return class_out
+    var paired = false
+    for pair in work.coincident.view(): paired = paired or pair.fa == f or pair.fb == f
+    if not paired and others.block_class.items[block] >= 0: return others.block_class.items[block]
     let point = try piece_point(work, traced, f, pieces, p)
     for pair in work.coincident.view():
         let partner = pair.fb if pair.fa == f else (pair.fa if pair.fb == f else f)
         if partner == f: continue
         if try face_contains(&work.w, partner, point, work.tol) != outside:
             return class_same if pair.same else class_opposite
-    # Its block's, once known.
-    let block = union_root(others.block.items, p)
     if others.block_class.items[block] >= 0: return others.block_class.items[block]
     let class = try ray_class(work, f, point, others)
     others.block_class.items[block] = class
