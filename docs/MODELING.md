@@ -408,7 +408,9 @@ each chamfer and each face once. On a curved face the plane's side is that face'
 ellipse's arc on a cylinder, a conic on a cone), still one flat corner face, as long as the face
 bulges away from the plane (a convex corner: a pin's side, a boss's). Only where a face curves back
 across the plane (a hole's wall within the corner, a saddle) can no plane close it, and only there
-would a curved patch (the setback patch of `patch_fit.lucb`) be needed. The corner types act today
+would a curved patch (the setback patch of `patch_fit.lucb`) be needed. OpenCASCADE's chamfer corners
+follow the same rule (`ChFi3d_ChBuilder_C3`: a plane where one fits, else a constrained filling;
+FILLET-STUDY.md, row 6). The corner types act today
 where three straight chamfered edges meet (three lines at a vertex: their faces are flat, so a
 plane always closes it, and no patch is made); corners where a rim's arc meets straight edges take
 the edges' tools as they meet (a miter) for every corner type.
