@@ -1,0 +1,194 @@
+## Direct modeling's face operations (CadDirect): Offset Face, Move Face
+## (translated and turned), Replace Face and Delete with healing, each
+## checked closed, facing out, and of the volume geometry gives; moves too
+## far, and faces Delete cannot heal, refused.
+from luce_cad.sketch import CadSketch
+from luce_cad.modeling import CadModeling, CadDirect
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+func solid(model: CadModel, expected: float, tolerance: float, what: str) -> unit!:
+    let mesh = model.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > tolerance:
+        print(f"{what}: volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= tolerance)
+
+## The name of `model`'s flat face whose outward normal is `normal`, and
+## (when `along` is 0, 1 or 2) whose frame's x, y or z is `at`.
+func flat(model: CadModel, normal: Vector3, at: float = 0.0, along: int = -1) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let frame = CadModeling.face_frame(model, name)
+        if not frame.found or frame.u.cross(frame.v).dot(normal) < 0.999:
+            continue
+        if along >= 0:
+            let o = frame.origin
+            let c = o.x if along == 0 else (o.y if along == 1 else o.z)
+            if math.abs(c - at) > 1e-9:
+                continue
+        return name
+    assert(false, "no such face")
+    return ""
+
+## The name of `model`'s first face of surface kind `kind`.
+func of_kind(model: CadModel, kind: int) -> str!:
+    for f in 0..<model.face_count():
+        if model.face_surface_kind(f) == kind:
+            return CadModeling.face_name_of(model, f)
+    assert(false, "no face of that kind")
+    return ""
+
+pub func direct_tests() -> unit!:
+    offsets()
+    moves()
+    replaces()
+    deletes()
+    print("PASS direct modeling: a box's top pressed out and in, a hole's wall offset, a filleted box's top pulled, a rounded top refused alone and grown with its tangent chain; an L-bracket's inner wall moved 3, a top turned about its middle; a box's top replaced by a slanted face; a hole, a chamfer, a fillet and a cut corner deleted and healed back; moves too far and faces with nothing to close refused")
+
+## Offset Face (Press Pull): a 2-box's top out 0.5 and in 0.5; a drilled
+## box's hole wall offset 0.1 into the hole (the hole narrows); a box with
+## filleted uprights pulled up 0.5 by its top (the fillets' strips grow).
+func offsets() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = flat(box, Vector3(0.0, 1.0, 0.0))
+    solid(CadDirect.offset_faces(box, top, 0.5), 10.0, 1e-5, "top out")
+    solid(CadDirect.offset_faces(box, top, -0.5), 6.0, 1e-5, "top in")
+    let drilled = CadModeling.combined(box, CadModeling.tagged(CadSolids.cylinder(0.5, 3.0), "pin"), 1)
+    let wall = of_kind(drilled, 1)
+    solid(CadDirect.offset_faces(drilled, wall, 0.1), 8.0 - math.pi * 0.16 * 2.0, 0.01, "hole narrowed")
+    # Uprights filleted 0.3: the top's area is 4 less four corners.
+    let r = 0.3
+    let filleted = CadModeling.filleted(box, upright_references(box), r, "f")
+    let corner = r * r - math.pi * r * r * 0.25
+    let before = 8.0 - 8.0 * corner
+    let pulled = CadDirect.offset_faces(filleted, flat(filleted, Vector3(0.0, 1.0, 0.0)), 0.5)
+    solid(pulled, before + 0.5 * (4.0 - 4.0 * corner), 0.01, "filleted top pulled")
+    # A box whose top edges are rounded: its top meets the fillets'
+    # strips tangentially. Alone it cannot move; with its tangent chain
+    # (the strips, and the sides they round onto) it grows.
+    let rounded = CadModeling.filleted(box, top_references(box), r, "t")
+    let rounded_top = flat(rounded, Vector3(0.0, 1.0, 0.0))
+    var refusal = false
+    _ = CadDirect.offset_faces(rounded, rounded_top, 0.2, chain = false) catch failure:
+        refusal = failure.message.contains("tangent")
+    assert(refusal)
+    let grown = CadDirect.offset_faces(rounded, rounded_top, 0.2)
+    let mesh = grown.tessellate(32)
+    manifold(mesh)
+    let rounded_mesh = rounded.tessellate(32)
+    assert(volume(mesh) > volume(rounded_mesh) + 4.0 * 0.2)
+
+## References to the box's four top edges (at y = 1, level).
+func top_references(box: CadModel) -> str!:
+    let found: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let id = box.face_edge_id(face, use)
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            if math.abs(a.y - 1.0) < 1e-9 and math.abs(b.y - 1.0) < 1e-9 and not (id in found):
+                found.append(id)
+    return CadModeling.edge_references(box, found)
+
+## References to the box's four upright edges.
+func upright_references(box: CadModel) -> str!:
+    let found: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let id = box.face_edge_id(face, use)
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            if box.face_edge_linear(face, use) and math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9 and not (id in found):
+                found.append(id)
+    return CadModeling.edge_references(box, found)
+
+## An L-bracket (legs 2 thick, 10 by 8, 5 deep) by Extrude; its inner
+## upright wall (x = 2) moved 3 out: 3 x its area (6 x 5) more. Moved 2.5
+## the other way it would pass the outer wall: refused. A box's top turned
+## 0.2 about its middle line keeps its volume.
+func moves() -> unit!:
+    let s = CadSketch.parse("")
+    let corners = [[0.0, 0.0], [10.0, 0.0], [10.0, 2.0], [2.0, 2.0], [2.0, 8.0], [0.0, 8.0]]
+    let points: list[int] = []
+    for c in corners:
+        points.append(s.add_point(c[0], c[1]))
+    for at in 0..<6:
+        _ = s.add_line(points[at], points[(at + 1) % 6])
+    let bracket = CadModeling.extruded(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 5.0, 0.0, "l")
+    solid(bracket, 160.0, 1e-5, "bracket")
+    let inner = flat(bracket, Vector3(1.0, 0.0, 0.0), 2.0, 0)
+    solid(CadDirect.moved_faces(bracket, inner, Vector3(3.0, 0.0, 0.0)), 160.0 + 3.0 * 30.0, 1e-5, "inner wall moved")
+    # Along the wall's own plane: nothing changes but where it is.
+    solid(CadDirect.moved_faces(bracket, inner, Vector3(0.0, 0.0, 0.0)), 160.0, 1e-5, "inner wall kept")
+    var refusal = false
+    _ = CadDirect.moved_faces(bracket, inner, Vector3(-2.5, 0.0, 0.0)) catch failure:
+        refusal = failure.message.contains("too much")
+    assert(refusal)
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = flat(box, Vector3(0.0, 1.0, 0.0))
+    solid(CadDirect.rotated_faces(box, top, Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.2), 8.0, 1e-5, "top turned")
+    # Turned about an edge of it: a wedge added, 2 x 2 x 2 tan(0.2) / 2.
+    solid(CadDirect.rotated_faces(box, top, Vector3(-1.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.2), 8.0 + 4.0 * math.tan(0.2), 1e-5, "top turned on its edge")
+
+## Replace Face: a 2-box's top replaced by the underside of a 4-box tilted
+## 0.3 about Z, 5 up: its height over the box's middle is 5 - 2 / cos 0.3.
+func replaces() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = flat(box, Vector3(0.0, 1.0, 0.0))
+    let tilted = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0).transformed(Vector3(0.0, 5.0, 0.0), Vector3(0.0, 0.0, 0.3), Vector3(1.0, 1.0, 1.0)), "tilted")
+    var under = ""
+    for f in 0..<tilted.face_count():
+        let name = CadModeling.face_name_of(tilted, f)
+        let frame = CadModeling.face_frame(tilted, name)
+        if frame.found and frame.u.cross(frame.v).y < -0.9:
+            under = name
+    solid(CadDirect.replaced_faces(box, top, tilted, under), 4.0 * (5.0 - 2.0 / math.cos(0.3) + 1.0), 1e-5, "top replaced")
+
+## Delete with healing: a drilled box's hole; one of a box's chamfered and
+## filleted uprights; a corner cut off a box by a slanted plane. Each comes
+## back to its volume before; a box's top has nothing to close it.
+func deletes() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let drilled = CadModeling.combined(box, CadModeling.tagged(CadSolids.cylinder(0.5, 3.0), "pin"), 1)
+    let healed = CadDirect.deleted_faces(drilled, of_kind(drilled, 1))
+    solid(healed, 8.0, 1e-5, "hole deleted")
+    assert(healed.face_count() == 6)
+    let d = 0.2
+    let chamfered = CadModeling.chamfered(box, upright_references(box), d, "c")
+    var chamfer = ""
+    for f in 0..<chamfered.face_count():
+        let name = CadModeling.face_name_of(chamfered, f)
+        if name.contains("c/blend"):
+            chamfer = name
+    solid(CadDirect.deleted_faces(chamfered, chamfer), 8.0 - 3.0 * d * d, 1e-5, "a chamfer deleted")
+    let r = 0.3
+    let filleted = CadModeling.filleted(box, upright_references(box), r, "f")
+    let corner = r * r - math.pi * r * r * 0.25
+    let strip = of_kind(filleted, 1)
+    solid(CadDirect.deleted_faces(filleted, strip), 8.0 - 6.0 * corner, 0.005, "a fillet deleted")
+    # A corner cut off by the plane x + y + z = 2.4: a triangle face with
+    # three neighbors, a tetrahedron of legs 0.6 gone.
+    let n = Vector3(1.0, 1.0, 1.0).normalized()
+    let u = Vector3(1.0, -1.0, 0.0).normalized()
+    let square = CadSketch.parse("")
+    let p = [square.add_point(-2.0, -2.0), square.add_point(2.0, -2.0), square.add_point(2.0, 2.0), square.add_point(-2.0, 2.0)]
+    for at in 0..<4:
+        _ = square.add_line(p[at], p[(at + 1) % 4])
+    let tool = CadModeling.extruded(square.curves(n.multiply_scalar(2.4 / math.sqrt(3.0)), u, n.cross(u)), 3.0, 0.0, "cut")
+    let cut = CadModeling.combined(box, tool, 1)
+    solid(cut, 8.0 - 0.036, 1e-5, "corner cut")
+    var triangle = ""
+    for f in 0..<cut.face_count():
+        let name = CadModeling.face_name_of(cut, f)
+        if name.contains("cut/"):
+            triangle = name
+    solid(CadDirect.deleted_faces(cut, triangle), 8.0, 1e-5, "a cut corner deleted")
+    var refusal = false
+    _ = CadDirect.deleted_faces(box, flat(box, Vector3(0.0, 1.0, 0.0))) catch failure:
+        refusal = failure.message.contains("cannot")
+    assert(refusal)

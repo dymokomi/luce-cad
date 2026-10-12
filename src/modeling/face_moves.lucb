@@ -1,0 +1,444 @@
+## Direct modeling's local face operations, built without booleans as
+## Parasolid's local operations are: chosen faces take new surfaces (moved,
+## turned, offset, or another face's) and the body keeps its topology.
+## Every vertex on a chosen face is found again where the surfaces of its
+## faces now meet (Newton on their signed distances, the least move from
+## where it was), and every edge on a chosen face again where its two
+## faces' surfaces meet (intersect.lucb; between two planes, the line
+## through its new ends). Neighbors so extend or shrink to the moved faces.
+##
+## The topology must hold: an edge that would vanish or turn round, a
+## corner whose faces no longer meet in a point, a face that would turn
+## inside out, or a curved neighbor tangent to a moved face (which no
+## longer meets it) is an error saying so, never a broken solid.
+
+## How a face's surface changes (FaceMove.kind).
+pub let move_translate: i64 = 0
+pub let move_rotate: i64 = 1
+pub let move_offset: i64 = 2
+pub let move_replace: i64 = 3
+
+## A change of surface for the chosen faces: translate by `vector`;
+## rotate by `angle` about the line through `origin` along unit `axis`;
+## offset by `distance` along each face's outward normal; or replace by
+## another surface (substitute's `targets`).
+pub struct FaceMove:
+    pub var kind: i64
+    pub var vector: Vector3
+    pub var origin: Vector3
+    pub var axis: Vector3
+    pub var angle: f64
+    pub var distance: f64
+
+    ## Point `p` as the move takes it (a rigid move; an offset or a
+    ## replacement leaves points).
+    func point(p: Vector3) -> Vector3:
+        if self.kind == move_translate: return p.add(self.vector)
+        if self.kind == move_rotate: return self.origin.add(p.subtract(self.origin).rotated_about(self.axis, self.angle))
+        return p
+
+    ## Direction `d` as the move takes it.
+    func direction(d: Vector3) -> Vector3:
+        if self.kind == move_rotate: return d.rotated_about(self.axis, self.angle)
+        return d
+
+## Face `f`'s surface as `m` moves it: a rigid move of its frame (and net),
+## or its offset `m.distance` along the face's outward normal (a plane
+## moved, a cylinder's, cone's, sphere's or torus's radius changed).
+func moved_surface(w: const Shape*, f: usize, m: const FaceMove*) -> Surface!:
+    let face = w.faces.items[f]
+    let s = &w.surfaces.items[(usize)face.surface]
+    if m.kind == move_offset:
+        if s.kind == surface_spline: error(invalid, "Offset Face needs planes, cylinders, cones, spheres or tori: this face is a B-spline")
+        # Outward is the surface's normal when the face runs with it.
+        let d = m.distance if face.sense else -m.distance
+        if s.kind == surface_plane:
+            return try Surface(s.kind, s.origin.add(s.z.multiply_scalar(d)), s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv)
+        if s.kind == surface_torus:
+            if s.angle + d <= w.tolerance: error(invalid, "the offset is larger than the torus's tube")
+            return try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle + d, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv)
+        # A cone's radius at its origin moves by d / cos(angle).
+        let grown = s.radius + (d / math.cos(s.angle) if s.kind == surface_cone else d)
+        if grown <= w.tolerance: error(invalid, "the offset is larger than the face's radius")
+        return try Surface(s.kind, s.origin, s.x, s.z, grown, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv)
+    var net = Growing[Vector3]()
+    defer net.close()
+    for p in s.points: try net.push(m.point(p))
+    return try Surface(s.kind, m.point(s.origin), m.direction(s.x), m.direction(s.z), s.radius, s.angle, net.view(), s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv)
+
+## A surface record of its own with `s`'s geometry.
+func surface_copy(s: const Surface*) -> Surface!:
+    return try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv)
+
+## `p`'s signed distance from `s` (along its normal) and that normal.
+func signed_gap(s: const Surface*, p: Vector3, tol: f64) -> (f64, Vector3)!:
+    if s.kind == surface_spline:
+        let uv = try project(*s, p, Vector3(0.5, 0.5, 0.0), tol)
+        let q = try evaluate(*s, uv)
+        let n = try normal_at(s, q, tol)
+        return (p.subtract(q).dot(n), n)
+    let d = p.subtract(s.origin)
+    let n = try normal_at(s, p, tol)
+    if s.kind == surface_plane: return (d.dot(s.z), s.z)
+    if s.kind == surface_sphere: return (d.length() - s.radius, n)
+    let h = d.dot(s.z)
+    let radial = math.sqrt(math.max(0.0, d.dot(d) - h * h))
+    if s.kind == surface_cylinder: return (radial - s.radius, n)
+    if s.kind == surface_cone: return ((radial - (s.radius + h * math.tan(s.angle))) * math.cos(s.angle), n)
+    let ring = radial - s.radius
+    return (math.sqrt(ring * ring + h * h) - s.angle, n)
+
+## Where the surfaces `surfaces` of `w` meet nearest `seed`: Gauss-Newton
+## on their signed distances, each step the least move that zeroes them to
+## first order (so with two surfaces the point slides along their curve).
+## An error when they no longer meet there.
+func corner_point(w: const Shape*, surfaces: const i64[], seed: Vector3) -> Vector3!:
+    let count = surfaces.length
+    var x = seed
+    var rows: f64[24]
+    var residual: f64[8]
+    for _ in 0..<60:
+        var worst = 0.0
+        for at in 0..<count:
+            let (gap, n) = try signed_gap(&w.surfaces.items[(usize)surfaces[at]], x, w.tolerance)
+            residual[at] = gap
+            rows[at * 3] = n.x
+            rows[at * 3 + 1] = n.y
+            rows[at * 3 + 2] = n.z
+            worst = math.max(worst, math.abs(gap))
+        if worst <= w.tolerance * 0.01: return x
+        # (J Jᵀ + μI) z = r, step -Jᵀ z.
+        var a: f64[64]
+        for i in 0..<count:
+            for j in 0..<count:
+                a[i * count + j] = rows[i * 3] * rows[j * 3] + rows[i * 3 + 1] * rows[j * 3 + 1] + rows[i * 3 + 2] * rows[j * 3 + 2] + (1e-12 if i == j else 0.0)
+        var z: f64[8]
+        for i in 0..<count: z[i] = residual[i]
+        if not solve_small(a[..<count * count], z[..<count], count): break
+        var step = Vector3()
+        for i in 0..<count: step = step.add(Vector3(rows[i * 3], rows[i * 3 + 1], rows[i * 3 + 2]).multiply_scalar(z[i]))
+        x = x.subtract(step)
+    var worst = 0.0
+    for at in 0..<count:
+        let (gap, _) = try signed_gap(&w.surfaces.items[(usize)surfaces[at]], x, w.tolerance)
+        worst = math.max(worst, math.abs(gap))
+    if worst > w.tolerance * 10.0: error(invalid, "the faces at a corner no longer meet in one point: the move changes the body's shape too much")
+    return x
+
+## Solve the `n` x `n` system `a` z = `z` in place (Gaussian elimination
+## with partial pivoting); false when it is singular.
+func solve_small(a: f64[], z: f64[], n: usize) -> bool:
+    for col in 0..<n:
+        var pivot = col
+        for row in col + 1..<n:
+            if math.abs(a[row * n + col]) > math.abs(a[pivot * n + col]): pivot = row
+        if math.abs(a[pivot * n + col]) < 1e-14: return false
+        if pivot != col:
+            for k in 0..<n:
+                let swap = a[col * n + k]
+                a[col * n + k] = a[pivot * n + k]
+                a[pivot * n + k] = swap
+            let swap = z[col]
+            z[col] = z[pivot]
+            z[pivot] = swap
+        for row in col + 1..<n:
+            let f = a[row * n + col] / a[col * n + col]
+            for k in col..<n: a[row * n + k] -= f * a[col * n + k]
+            z[row] -= f * z[col]
+    var row = n
+    while row > 0:
+        row -= 1
+        var sum = z[row]
+        for k in row + 1..<n: sum -= a[row * n + k] * z[k]
+        z[row] = sum / a[row * n + row]
+    return true
+
+## `w` with faces `faces` moved by `m`: their surfaces replaced (by
+## `targets`, one per face, for move_replace, with `senses`), every vertex
+## and edge on them found again, checked, as a new model.
+func substitute(w: Shape*, faces: const usize[], m: const FaceMove*, targets: const Surface[], senses: const bool[]) -> interop.Reference[CadModel]!:
+    let moved_count = faces.length
+    if moved_count == 0: error(invalid, "pick the faces to move")
+    var moved = Growing[bool]()
+    defer moved.close()
+    try moved.fill(w.faces.count, false)
+    for f in faces: moved.items[f] = true
+    # Curved neighbors tangent to a moved face no longer meet it.
+    try refuse_tangent_neighbors(w, moved.view())
+    # Where each vertex was, to judge each edge's way after.
+    var old_points = try copied_points(w)
+    defer old_points.close()
+    for at in 0..<moved_count:
+        let f = faces[at]
+        let surface = (try surface_copy(&targets[at])) if m.kind == move_replace else (try moved_surface(w, f, m))
+        try w.surfaces.push(surface)
+        w.faces.items[f].surface = (i64)w.surfaces.count - 1
+        if m.kind == move_replace: w.faces.items[f].sense = senses[at]
+    # Each vertex's surfaces, from the faces of its edges.
+    var around = Growing[i64]()
+    defer around.close()
+    try around.fill(w.points.count * 8, -1)
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        for side in 0..<(usize)2:
+            let f = w.sides.items[e * 2 + side]
+            if f < 0: continue
+            for v in [edge.start, edge.end]: try note_face(w, &around, v, f)
+    var surfaces = Growing[i64]()
+    defer surfaces.close()
+    for v in 0..<w.points.count:
+        surfaces.clear()
+        var touched = false
+        for k in 0..<(usize)8:
+            let f = around.items[v * 8 + k]
+            if f < 0: break
+            if moved.items[(usize)f]: touched = true
+            let s = w.faces.items[(usize)f].surface
+            if not (try same_surface_listed(w, surfaces.view(), s)): try surfaces.push(s)
+        if not touched: continue
+        if m.kind == move_translate or m.kind == move_rotate:
+            # Every face rigidly moved: the vertex moves with them.
+            if all_moved(w, &around, v, moved.view()):
+                w.points.items[v] = m.point(w.points.items[v])
+                continue
+        w.points.items[v] = try corner_point(w, surfaces.view(), w.points.items[v])
+    # Edges on moved faces: carriers again; the rest: their intervals.
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        try refit_edge(w, e, moved.view(), m, old_points.items[(usize)edge.start], old_points.items[(usize)edge.end])
+    try check_loops(w)
+    try orient(w, w.faces.count)
+    let solid = try used_brep(w)
+    defer solid.release()
+    return try CadModel.of_brep(solid)
+
+## A shape of its own with everything `w` has.
+func shape_copy(w: const Shape*) -> Shape!:
+    var s = empty_shape(w.tolerance)
+    errdefer s.close()
+    try s.points.assign(w.points.view())
+    try s.carriers.assign(w.carriers.view())
+    try s.edges.assign(w.edges.view())
+    for surface in w.surfaces.view(): try s.surfaces.push(try surface_copy(&surface))
+    try s.faces.assign(w.faces.view())
+    try s.uses.assign(w.uses.view())
+    try s.sizes.assign(w.sizes.view())
+    try s.splines.assign(w.splines.view())
+    try s.spline_points.assign(w.spline_points.view())
+    try s.spline_weights.assign(w.spline_weights.view())
+    try s.spline_knots.assign(w.spline_knots.view())
+    try s.name_bytes.assign(w.name_bytes.view())
+    try s.name_offsets.assign(w.name_offsets.view())
+    try s.sides.assign(w.sides.view())
+    return s
+
+## A copy of `w`'s points (where each vertex was).
+func copied_points(w: const Shape*) -> Growing[Vector3]!:
+    var out = Growing[Vector3]()
+    errdefer out.close()
+    try out.assign(w.points.view())
+    return out
+
+## Note face `f` at vertex `v` (8 slots a vertex), once.
+func note_face(w: const Shape*, table: Growing[i64]*, v: i64, f: i64) -> !:
+    let base = (usize)v * 8
+    for k in 0..<(usize)8:
+        let at = table.items[base + k]
+        if at == f: return
+        if at < 0:
+            table.items[base + k] = f
+            return
+    error(invalid, "a vertex meets more than eight faces: too many to move")
+
+## Whether every face at vertex `v` moves.
+func all_moved(w: const Shape*, table: const Growing[i64]*, v: usize, moved: const bool[]) -> bool:
+    for k in 0..<(usize)8:
+        let f = table.items[v * 8 + k]
+        if f < 0: break
+        if not moved[(usize)f]: return false
+    return true
+
+## Whether surface `s` of `w` is one of `listed` (the same record, or the
+## same plane: two pieces of one face).
+func same_surface_listed(w: const Shape*, listed: const i64[], s: i64) -> bool!:
+    let a = &w.surfaces.items[(usize)s]
+    for other in listed:
+        if other == s: return true
+        let b = &w.surfaces.items[(usize)other]
+        if a.kind == surface_plane and b.kind == surface_plane and math.abs(a.z.dot(b.z)) > 1.0 - 1e-12 and math.abs(b.origin.subtract(a.origin).dot(a.z)) <= w.tolerance: return true
+    return false
+
+## An error when a moved face meets a face along an edge where their
+## normals agree (tangent: a fillet's strip, a cylinder's flat) and only
+## one of them moves: they would no longer meet.
+func refuse_tangent_neighbors(w: const Shape*, moved: const bool[]) -> !:
+    for e in 0..<w.edges.count:
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0 or moved[(usize)fa] == moved[(usize)fb]: continue
+        if try tangent_edge(w, e): error(invalid, "a face tangent to a moved face must move with it: pick the tangent faces too (Tangent chain)")
+
+## Whether edge `e`'s two faces meet tangentially (their outward normals
+## agree at its middle).
+pub func tangent_edge(w: const Shape*, e: usize) -> bool!:
+    let fa = w.sides.items[e * 2]
+    let fb = w.sides.items[e * 2 + 1]
+    if fa < 0 or fb < 0: return false
+    let middle = try w.edge_at(e, 0.5)
+    let na = try w.face_normal((usize)fa, middle)
+    let nb = try w.face_normal((usize)fb, middle)
+    return na.dot(nb) > 1.0 - 1e-6
+
+## Edge `e` of `w` again on its faces' surfaces now: a new carrier when a
+## moved face holds it, else its own; its interval from its ends' new
+## places, the way it ran before (from `old_start` to `old_end`).
+func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, old_start: Vector3, old_end: Vector3) -> !:
+    let edge = w.edges.items[e]
+    let fa = w.sides.items[e * 2]
+    let fb = w.sides.items[e * 2 + 1]
+    let on_moved = (fa >= 0 and moved[(usize)fa]) or (fb >= 0 and moved[(usize)fb])
+    let start = w.points.items[(usize)edge.start]
+    let end = w.points.items[(usize)edge.end]
+    if not on_moved and start.subtract(old_start).length() <= w.tolerance * 0.01 and end.subtract(old_end).length() <= w.tolerance * 0.01: return
+    let old = w.carriers.items[(usize)edge.carrier]
+    # The way it left its start, as the move turns it.
+    let old_way = m.direction((try w.tangent(edge.carrier, edge.t0)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0))
+    var carrier = edge.carrier
+    if on_moved:
+        let both = fa >= 0 and fb >= 0 and moved[(usize)fa] and moved[(usize)fb]
+        if both and (m.kind == move_translate or m.kind == move_rotate):
+            # Moved with both its faces: the carrier moves alike.
+            carrier = try w.add_carrier(rigid_carrier(&old, m))
+        elif fb < 0 or fa < 0:
+            # A seam (one face both ways): a line through its ends, or its
+            # circle about its center, grown with the face.
+            carrier = try w.add_carrier(try seam_carrier(w, &old, start, end, m))
+        else:
+            carrier = try w.add_carrier(try meeting_carrier(w, (usize)fa, (usize)fb, start, end, try w.edge_at(e, 0.5)))
+    let c = w.carriers.items[(usize)carrier]
+    var t0 = 0.0
+    var t1 = 0.0
+    if c.kind == curve_line:
+        t0 = start.subtract(c.origin).dot(c.x)
+        t1 = end.subtract(c.origin).dot(c.x)
+        let was = old_end.subtract(old_start)
+        let now = end.subtract(start)
+        if now.length() <= w.tolerance * 10.0: error(invalid, "an edge would shrink to nothing: the move changes the body's shape too much")
+        if m.kind != move_rotate and now.dot(was) <= 0.0: error(invalid, "an edge would turn round: the move changes the body's shape too much")
+    elif c.kind == curve_circle or c.kind == curve_ellipse:
+        let (a0, a1) = (angle_on(&c, start), angle_on(&c, end))
+        # Round the circle the way the edge ran (a new carrier's frame may
+        # turn the other way).
+        let forward = (try w.tangent(carrier, a0)).dot(old_way) > 0.0
+        let was = math.abs(edge.t1 - edge.t0)
+        t0 = a0
+        var span = a1 - a0
+        if not forward: span = -span
+        while span <= 1e-9: span += 2.0 * math.pi
+        while span > 2.0 * math.pi + 1e-9: span -= 2.0 * math.pi
+        # A whole circle stays whole.
+        if edge.start == edge.end: span = 2.0 * math.pi
+        if was < 2.0 * math.pi - 1e-6 and math.abs(span - was) > math.pi: error(invalid, "an arc would turn round: the move changes the body's shape too much")
+        t1 = t0 + (span if forward else -span)
+    else:
+        let (_, _, knots, degree) = w.spline_net(c.spline)
+        let low = knots[(usize)degree]
+        let high = knots[knots.length - 1 - (usize)degree]
+        t0 = try nearest_on(w, carrier, start, low, high)
+        t1 = try nearest_on(w, carrier, end, low, high)
+        if (try w.at(carrier, t0)).subtract(start).length() > w.tolerance * 100.0 or (try w.at(carrier, t1)).subtract(end).length() > w.tolerance * 100.0:
+            error(invalid, "a B-spline edge cannot reach its moved corner: the move changes the body's shape too much")
+    w.edges.items[e] = ShapeEdge(carrier, t0, t1, edge.start, edge.end)
+
+## Circle or ellipse `c`'s parameter at `p` (on it).
+func angle_on(c: const Carrier*, p: Vector3) -> f64:
+    let d = p.subtract(c.origin)
+    return math.atan2(d.dot(c.y) / (c.b if c.kind == curve_ellipse else c.a), d.dot(c.x) / c.a)
+
+## Carrier `c` moved rigidly by `m`.
+func rigid_carrier(c: const Carrier*, m: const FaceMove*) -> Carrier:
+    return Carrier(c.kind, m.point(c.origin), m.direction(c.x), m.direction(c.y), c.a, c.b, c.spline)
+
+## A seam's carrier on its moved face: a line through its new ends, or its
+## circle about its center (a sphere's or torus's meridian) through them.
+func seam_carrier(w: const Shape*, c: const Carrier*, start: Vector3, end: Vector3, m: const FaceMove*) -> Carrier!:
+    if c.kind == curve_line:
+        if start.subtract(end).length() <= w.tolerance: error(invalid, "a seam would shrink to nothing")
+        return Carrier(curve_line, start, try end.subtract(start).normalized(), Vector3(), 0.0, 0.0, -1)
+    if c.kind == curve_circle:
+        if m.kind == move_translate or m.kind == move_rotate: return rigid_carrier(c, m)
+        return Carrier(curve_circle, c.origin, c.x, c.y, start.subtract(c.origin).length(), start.subtract(c.origin).length(), -1)
+    error(invalid, "a B-spline seam cannot follow its moved face")
+
+## Where faces `fa` and `fb` of `w` meet from `start` to `end`: between
+## two planes the line through them; else the curve of their surfaces'
+## meeting through both, nearest `hint` (where the edge ran: a closed
+## edge's ends are one point).
+func meeting_carrier(w: const Shape*, fa: usize, fb: usize, start: Vector3, end: Vector3, hint: Vector3) -> Carrier!:
+    let sa = &w.surfaces.items[(usize)w.faces.items[fa].surface]
+    let sb = &w.surfaces.items[(usize)w.faces.items[fb].surface]
+    if sa.kind == surface_plane and sb.kind == surface_plane:
+        let d = end.subtract(start)
+        if d.length() <= w.tolerance * 10.0: error(invalid, "an edge would shrink to nothing: the move changes the body's shape too much")
+        return Carrier(curve_line, start, try d.normalized(), Vector3(), 0.0, 0.0, -1)
+    if sa.kind == surface_spline or sb.kind == surface_spline: error(invalid, "a B-spline face next to a moved face cannot follow it yet")
+    var curves = Growing[Carrier]()
+    defer curves.close()
+    let met = try meet(sa, sb, w.tolerance, &curves)
+    if met != meet_curves: error(invalid, "a moved face no longer meets its neighbor along a curve this can follow")
+    # The curve through both ends, nearest the hint.
+    var best = -1
+    var best_distance = 1.0e300
+    for at in 0..<curves.count:
+        let c = curves.items[at]
+        let gap = math.max(carrier_gap(&c, start), carrier_gap(&c, end))
+        if gap > w.tolerance * 100.0: continue
+        let away = carrier_gap(&c, hint)
+        if away < best_distance:
+            best_distance = away
+            best = (i64)at
+    if best < 0: error(invalid, "a moved face no longer meets its neighbor where the edge runs")
+    return curves.items[(usize)best]
+
+## How far `p` is from carrier `c` (a line, circle or ellipse).
+func carrier_gap(c: const Carrier*, p: Vector3) -> f64:
+    let d = p.subtract(c.origin)
+    if c.kind == curve_line: return d.subtract(c.x.multiply_scalar(d.dot(c.x))).length()
+    let normal = c.x.cross(c.y)
+    let h = d.dot(normal)
+    let a = d.dot(c.x)
+    let b = d.dot(c.y)
+    if c.kind == curve_circle: return math.sqrt(h * h + (math.hypot(a, b) - c.a) * (math.hypot(a, b) - c.a))
+    # An ellipse: from the point at the same angle (near enough to pick).
+    let t = math.atan2(b / c.b, a / c.a)
+    let q = c.x.multiply_scalar(c.a * math.cos(t)).add(c.y.multiply_scalar(c.b * math.sin(t)))
+    return d.subtract(q).length()
+
+## Every loop of a flat face must still turn the way
+## it did about the face's normal (the outer loop counterclockwise, holes
+## clockwise): else the face turned inside out.
+func check_loops(w: const Shape*) -> !:
+    var points = Growing[Vector3]()
+    defer points.close()
+    for f in 0..<w.faces.count:
+        let face = w.faces.items[f]
+        let s = &w.surfaces.items[(usize)face.surface]
+        if s.kind != surface_plane: continue
+        let n = s.z if face.sense else s.z.multiply_scalar(-1.0)
+        let uses = w.face_uses(f)
+        var at: usize = 0
+        var first = true
+        for size in w.face_sizes(f):
+            points.clear()
+            for use in uses[at..<at + (usize)size]:
+                let e = edge_index(use)
+                for k in 0..<8:
+                    let fraction = (f64)k / 8.0
+                    try points.push(try w.edge_at(e, fraction if use > 0 else 1.0 - fraction))
+            at += (usize)size
+            var area = Vector3()
+            for k in 0..<points.count:
+                area = area.add(points.items[k].cross(points.items[(k + 1) % points.count]))
+            let turn = area.dot(n)
+            if (turn > 0.0) != first: error(invalid, "a face would turn inside out: the move changes the body's shape too much")
+            first = false

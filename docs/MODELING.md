@@ -33,6 +33,17 @@ does today.
 | `tagged(model, tag)` | Unnamed faces named `tag/f<i>`, for bodies made without names, such as primitives. |
 | `prefixed(model, prefix)` | Every name with `prefix` in front, so a pattern's or mirror's copy is distinct. |
 
+Direct modeling's operations are on `CadDirect` (`direct_api.lucb`), on faces named as `face_frame`
+takes them, several apart by `;`:
+
+| `CadDirect.` | What it does |
+|---|---|
+| `offset_faces(model, faces, distance, chain)` | Offset Face, Press Pull on a face: each face moved along its outward normal (a plane moved, a cylinder's, cone's, sphere's or torus's radius changed). With `chain` (the default) the faces meeting them tangentially move too. |
+| `moved_faces(model, faces, by)`, `rotated_faces(model, faces, origin, axis, angle)` | Move Face: translated, or turned about a line. |
+| `replaced_faces(model, faces, target, target_face)` | Replace Face: the faces on another face's surface instead. |
+| `deleted_faces(model, faces)` | Delete with healing: holes and bosses whole, or one fillet, chamfer or corner face. |
+| `face_names(model, faces)` | The names of B-rep face numbers (a pick's), apart by `;`. |
+
 `tag` names the feature (luced-3d passes the node). Edges may be outside (convex) or inside
 (concave) corners. Empty `references` mean every straight convex edge between two flat faces. Rims
 are blended only when referenced. A rim is a circle, or an arc of one, between a flat face and a
@@ -492,6 +503,43 @@ are the corner directions weighted and normalized. This gives near-equilateral t
 It is used when the arcs are sampled alike and finely enough for the meshers' deviation; otherwise the
 general meshers take the patch.
 
+### Local face operations (`face_moves.lucb`, `face_delete.lucb`)
+
+Offset, Move and Replace Face are one operation, as Parasolid's local operations are: the chosen
+faces take new surfaces and the body keeps its topology. Built directly, without booleans:
+- **Vertices.** Each vertex on a chosen face is found again where the surfaces of its faces now
+  meet: Gauss–Newton on their signed distances, each step the least move that zeroes them to first
+  order, so with two surfaces (a circle's vertex) it slides along their curve. A vertex whose faces
+  all move rigidly moves with them.
+- **Edges.** An edge on a chosen face gets a new carrier where its two faces' surfaces meet: the
+  line through its new ends between two planes, else `intersect.lucb`'s curve through both ends. A
+  seam follows its face (a line through its ends, a meridian's circle grown with it). An edge
+  between two unchosen faces keeps its carrier with a new interval, so neighbors extend or shrink.
+  An arc runs round its circle the way it did, judged from its old tangent.
+- **Refusals.** An edge that would vanish or turn round, an arc that would turn over, a corner whose
+  faces no longer meet in one point, a flat face whose loop would turn inside out: "the move changes
+  the body's shape too much". A face tangent to a chosen one (a fillet's strip beside the face it
+  rounds) would no longer meet it, so it must move too: Offset's tangent chain takes it along; a
+  Move without it is refused. B-spline faces next to a chosen one, and B-spline chosen faces for an
+  offset, are refused.
+
+The result is checked closed. Not checked yet: a moved face passing through a far part of the
+body (a self-intersection), which needs the booleans' face pairs.
+
+**Delete with healing** takes the faces away and closes the gap with the faces around:
+- **Holes and bosses.** Deleted faces that leave whole inner loops on the faces around (a hole's
+  rim on a plate's top, a boss's footprint) take those loops with them.
+- **A strip** (one face with four neighbors: a fillet's or chamfer's face between two faces, ending
+  on two more). Its two long neighbors meet along a new edge where their surfaces cross, from their
+  corner with one end face to their corner with the other (each corner the three surfaces' point);
+  the end faces' loops shrink to those corners. Either opposite pair may be the long one; the one
+  whose surfaces cross into a proper edge is taken (parallel end faces never meet).
+- **A corner** (one face with three neighbors): the three surfaces' point.
+
+The edges running into the gap keep their carriers, lengthened to the new corners. Anything else is
+refused, saying what Delete heals. A box's top, say, has four parallel-sided neighbors that cannot
+close over it.
+
 ### Every edge rounded whole (`rounded.lucb`)
 
 When no edges are picked, filleting every edge of a convex polyhedron is built whole, as a
@@ -585,4 +633,5 @@ Roughly in order of usefulness:
    surfaces. Rays through them are exact (`spline_rays.lucb`).
 4. **Sweep and loft;** Extrude's Thin option and a start offset by a face.
 5. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
-6. **Shell,** offset, draft and press/pull.
+6. **Shell** and draft; Delete healing more than one strip or corner at a time (a chain of
+   fillets), and faces with more than four neighbors.

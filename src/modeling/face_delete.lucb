@@ -1,0 +1,296 @@
+## Delete Face with healing, as Fusion's Delete heals a body: the faces
+## are taken away and the faces around them extended until they close the
+## gap again (Parasolid's and OpenCASCADE's defeaturing, in its common
+## cases), built directly:
+##
+## - **A hole or a boss**: the deleted faces leave whole inner loops on the
+##   faces around them (a hole's rim on a plate's top); those loops go.
+## - **A strip** (a fillet's or chamfer's face between two faces, ends on
+##   two more): its two long neighbors meet again along a new edge where
+##   their surfaces cross, from the corner of them and one end face to the
+##   corner with the other; the end faces' loops shrink to those corners.
+## - **A corner** (a face with three neighbors: a setback corner's patch, a
+##   corner chamfer): the three neighbors meet in one new vertex.
+##
+## The edges running into the gap stay on their carriers, lengthened to
+## the new corners. Anything else is refused with what Delete can heal: it
+## never leaves a broken solid.
+
+## `w` without faces `deleted` (marked), healed (see above), as a model.
+func healed(w: Shape*, deleted: const bool[]) -> interop.Reference[CadModel]!:
+    var dropped = Growing[bool]()
+    defer dropped.close()
+    try dropped.fill(w.sizes.count, false)
+    var gap = Growing[bool]()
+    defer gap.close()
+    try gap.fill(w.edges.count, false)
+    var any = false
+    for e in 0..<w.edges.count:
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0: continue
+        if deleted[(usize)fa] != deleted[(usize)fb]:
+            gap.items[e] = true
+            any = true
+    var count: usize = 0
+    for d in deleted:
+        if d: count += 1
+    if count == 0: error(invalid, "pick the faces to delete")
+    if count == w.faces.count: error(invalid, "Delete would take every face of the body")
+    if not any: error(invalid, "the faces to delete are a body of their own: remove the body instead")
+    # Whole loops of kept faces on the gap: holes and bosses, dropped.
+    var left = false
+    for f in 0..<w.faces.count:
+        if deleted[f]: continue
+        let face = w.faces.items[f]
+        let uses = w.face_uses(f)
+        var at: usize = 0
+        for loop in 0..<face.loops:
+            let size = (usize)w.sizes.items[face.loop_first + loop]
+            var on_gap: usize = 0
+            for use in uses[at..<at + size]:
+                if gap.items[edge_index(use)]: on_gap += 1
+            if on_gap == size:
+                if loop == 0: error(invalid, "Delete would take a face's whole outline: the faces around cannot close the gap")
+                dropped.items[face.loop_first + loop] = true
+            elif on_gap > 0:
+                left = true
+            at += size
+    if not left: return try rebuilt(w, deleted, dropped.view())
+    # A strip or a corner: one face, one loop.
+    if count != 1: error(invalid, "Delete heals one fillet, chamfer or corner face at a time, or holes and bosses whole")
+    var f: usize = 0
+    for at in 0..<deleted.length:
+        if deleted[at]: f = at
+    if w.faces.items[f].loops != 1: error(invalid, "Delete heals a face with one outline (a fillet, a chamfer, a corner); this one has holes")
+    let loop = w.face_uses(f)
+    if loop.length == 3: return try closed_corner(w, f, deleted)
+    if loop.length == 4: return try closed_strip(w, f, deleted)
+    error(invalid, "Delete heals a face with three or four neighbors (a corner, a fillet, a chamfer): the faces around this one cannot close over it")
+
+## `w` without faces `deleted` and loops `dropped` (by their place in the
+## sizes), as a model.
+func rebuilt(w: Shape*, deleted: const bool[], dropped: const bool[]) -> interop.Reference[CadModel]!:
+    var faces = Growing[ShapeFace]()
+    errdefer faces.close()
+    var uses = Growing[i64]()
+    errdefer uses.close()
+    var sizes = Growing[i64]()
+    errdefer sizes.close()
+    for f in 0..<w.faces.count:
+        if deleted[f]: continue
+        let face = w.faces.items[f]
+        let first = uses.count
+        let loop_first = sizes.count
+        let old = w.face_uses(f)
+        var at: usize = 0
+        for loop in 0..<face.loops:
+            let size = (usize)w.sizes.items[face.loop_first + loop]
+            if not dropped[face.loop_first + loop]:
+                for use in old[at..<at + size]: try uses.push(use)
+                try sizes.push((i64)size)
+            at += size
+        try faces.push(ShapeFace(face.surface, face.sense, first, uses.count - first, loop_first, sizes.count - loop_first, face.name))
+    w.faces.close()
+    w.uses.close()
+    w.sizes.close()
+    w.faces = faces
+    w.uses = uses
+    w.sizes = sizes
+    try w.index_sides()
+    try check_loops(w)
+    try orient(w, w.faces.count)
+    let solid = try used_brep(w)
+    defer solid.release()
+    return try CadModel.of_brep(solid)
+
+## The face of `w` other than `f` across edge `e`.
+func across_face(w: const Shape*, e: usize, f: usize) -> usize!:
+    let fa = w.sides.items[e * 2]
+    let fb = w.sides.items[e * 2 + 1]
+    if fa < 0 or fb < 0: error(invalid, "Delete cannot heal across a seam")
+    return (usize)(fb if (usize)fa == f else fa)
+
+## The vertex loop use `use` starts at.
+func use_start(w: const Shape*, use: i64) -> i64:
+    let edge = w.edges.items[edge_index(use)]
+    return edge.start if use > 0 else edge.end
+
+## A corner face `f` (three neighbors) deleted: the neighbors' surfaces
+## meet in one new vertex, where the face's three vertices go.
+func closed_corner(w: Shape*, f: usize, deleted: const bool[]) -> interop.Reference[CadModel]!:
+    let loop = w.face_uses(f)
+    var neighbors: i64[3] = [0, 0, 0]
+    var middle = Vector3()
+    for k in 0..<(usize)3:
+        neighbors[k] = w.faces.items[try across_face(w, edge_index(loop[k]), f)].surface
+        middle = middle.add(w.points.items[(usize)use_start(w, loop[k])])
+    var before = try copied_points(w)
+    defer before.close()
+    let corner = try corner_point(w, neighbors[..<3], middle.multiply_scalar(1.0 / 3.0))
+    let p = try w.add_point(corner)
+    var map = Growing[i64]()
+    defer map.close()
+    for v in 0..<w.points.count: try map.push((i64)v)
+    for use in loop: map.items[(usize)use_start(w, use)] = p
+    try before.push(corner)
+    return try remapped(w, deleted, map.view(), -1, -1, -1, before.view())
+
+## A strip face `f` (four neighbors) deleted: two opposite neighbors meet
+## along a new edge, the other two shrink to its ends. Either pair may be
+## the one; the one whose surfaces cross into a proper edge is taken.
+func closed_strip(w: Shape*, f: usize, deleted: const bool[]) -> interop.Reference[CadModel]!:
+    let loop = w.face_uses(f)
+    var neighbors: usize[4] = [0, 0, 0, 0]
+    for k in 0..<(usize)4: neighbors[k] = try across_face(w, edge_index(loop[k]), f)
+    # Option 0: neighbors 0 and 2 meet; option 1: 1 and 3.
+    for option in 0..<(usize)2:
+        let made = strip_option(w, f, deleted, loop, neighbors[..<4], option) catch failure:
+            _ = failure
+            continue
+        return made
+    error(invalid, "Delete cannot heal this face: the faces beside it do not meet when extended")
+
+## One way of closing strip `f`: neighbors `option` and `option` + 2 meet
+## along a new edge between the corners they make with the other two.
+func strip_option(w: Shape*, f: usize, deleted: const bool[], loop: const i64[], neighbors: const usize[], option: usize) -> interop.Reference[CadModel]!:
+    # Work on a copy: a failed option leaves `w` as it was.
+    var copy = try shape_copy(w)
+    defer copy.close()
+    let a = neighbors[option]
+    let b = neighbors[option + 2]
+    let c = neighbors[option + 1]
+    let d = neighbors[(option + 3) % 4]
+    let s_a = copy.faces.items[a].surface
+    let s_b = copy.faces.items[b].surface
+    let s_c = copy.faces.items[c].surface
+    let s_d = copy.faces.items[d].surface
+    # The face's vertices at each short side: loop use k starts at vertex
+    # k; the short side toward c is use option + 1, from its start to the
+    # start of the use after.
+    let c_from = use_start(&copy, loop[option + 1])
+    let c_to = use_start(&copy, loop[(option + 2) % 4])
+    let d_from = use_start(&copy, loop[(option + 3) % 4])
+    let d_to = use_start(&copy, loop[option])
+    let seed_c = copy.points.items[(usize)c_from].add(copy.points.items[(usize)c_to]).multiply_scalar(0.5)
+    let seed_d = copy.points.items[(usize)d_from].add(copy.points.items[(usize)d_to]).multiply_scalar(0.5)
+    let three_c: i64[3] = [s_a, s_b, s_c]
+    let three_d: i64[3] = [s_a, s_b, s_d]
+    let pc = try corner_point(&copy, three_c[..<3], seed_c)
+    let pd = try corner_point(&copy, three_d[..<3], seed_d)
+    if pc.subtract(pd).length() <= copy.tolerance * 10.0: error(invalid, "the healed edge has no length")
+    var before = try copied_points(&copy)
+    defer before.close()
+    let vc = try copy.add_point(pc)
+    let vd = try copy.add_point(pd)
+    try before.push(pc)
+    try before.push(pd)
+    var map = Growing[i64]()
+    defer map.close()
+    for v in 0..<copy.points.count: try map.push((i64)v)
+    map.items[(usize)c_from] = vc
+    map.items[(usize)c_to] = vc
+    map.items[(usize)d_from] = vd
+    map.items[(usize)d_to] = vd
+    # The new edge, from c's corner to d's, where a and b meet.
+    let carrier = try copy.add_carrier(try meeting_carrier(&copy, a, b, pc, pd, pc.add(pd).multiply_scalar(0.5)))
+    let joined = try copy.add_edge(ShapeEdge(carrier, 0.0, 0.0, vc, vd))
+    try fit_interval(&copy, (usize)joined)
+    return try remapped(&copy, deleted, map.view(), (i64)edge_index(loop[option]), (i64)edge_index(loop[option + 2]), joined, before.view())
+
+## `w` without the faces `deleted`, its vertices merged by `map`, the
+## deleted face's edges `first` and `second` (on the two faces that meet
+## now) replaced by edge `joined` (-1: none), every edge whose ends moved
+## refitted on its carrier (`before`: where each old vertex was), as a
+## model.
+func remapped(w: Shape*, deleted: const bool[], map: const i64[], first: i64, second: i64, joined: i64, before: const Vector3[]) -> interop.Reference[CadModel]!:
+    var faces = Growing[ShapeFace]()
+    errdefer faces.close()
+    var uses = Growing[i64]()
+    errdefer uses.close()
+    var sizes = Growing[i64]()
+    errdefer sizes.close()
+    for f in 0..<w.faces.count:
+        if deleted[f]: continue
+        let face = w.faces.items[f]
+        let start_uses = uses.count
+        let start_sizes = sizes.count
+        let old = w.face_uses(f)
+        var at: usize = 0
+        for loop in 0..<face.loops:
+            let size = (usize)w.sizes.items[face.loop_first + loop]
+            let before_loop = uses.count
+            for use in old[at..<at + size]:
+                let e = (i64)edge_index(use)
+                if e == first or e == second:
+                    # The edge into the gap, now the new one: the same way
+                    # round from where its ends went.
+                    let edge = w.edges.items[(usize)e]
+                    let tail = map[(usize)(edge.start if use > 0 else edge.end)]
+                    let new_edge = w.edges.items[(usize)joined]
+                    try uses.push((joined + 1) if tail == new_edge.start else -(joined + 1))
+                    continue
+                let fa = w.sides.items[(usize)e * 2]
+                let fb = w.sides.items[(usize)e * 2 + 1]
+                # Edges on the deleted face go (its neighbors shrink).
+                if (fa >= 0 and deleted[(usize)fa]) or (fb >= 0 and deleted[(usize)fb]): continue
+                try uses.push(use)
+            at += size
+            let kept = uses.count - before_loop
+            if kept == 0: continue
+            try sizes.push((i64)kept)
+        if sizes.count == start_sizes: error(invalid, "Delete would leave a face with no outline")
+        try faces.push(ShapeFace(face.surface, face.sense, start_uses, uses.count - start_uses, start_sizes, sizes.count - start_sizes, face.name))
+    w.faces.close()
+    w.uses.close()
+    w.sizes.close()
+    w.faces = faces
+    w.uses = uses
+    w.sizes = sizes
+    # Vertices merged; edges whose ends moved refitted on their carriers,
+    # judged against where their ends were.
+    var was = Growing[Vector3]()
+    defer was.close()
+    for e in 0..<w.edges.count:
+        var edge = w.edges.items[e]
+        try was.push(before[(usize)edge.start])
+        try was.push(before[(usize)edge.end])
+        edge.start = map[(usize)edge.start]
+        edge.end = map[(usize)edge.end]
+        w.edges.items[e] = edge
+    try w.index_sides()
+    var still = Growing[bool]()
+    defer still.close()
+    try still.fill(w.faces.count, false)
+    let fixed = FaceMove(move_replace, Vector3(), Vector3(), Vector3(), 0.0, 0.0)
+    for e in 0..<w.edges.count:
+        if (i64)e == joined: continue
+        if w.sides.items[e * 2] < 0 and w.sides.items[e * 2 + 1] < 0: continue
+        try refit_edge(w, e, still.view(), &fixed, was.items[e * 2], was.items[e * 2 + 1])
+    try check_loops(w)
+    try orient(w, w.faces.count)
+    let solid = try used_brep(w)
+    defer solid.release()
+    return try CadModel.of_brep(solid)
+
+## Edge `e`'s interval on its carrier from its ends: a line's, or an arc's
+## the shorter way round.
+func fit_interval(w: Shape*, e: usize) -> !:
+    let edge = w.edges.items[e]
+    let c = w.carriers.items[(usize)edge.carrier]
+    let start = w.points.items[(usize)edge.start]
+    let end = w.points.items[(usize)edge.end]
+    var t0 = 0.0
+    var t1 = 0.0
+    if c.kind == curve_line:
+        t0 = start.subtract(c.origin).dot(c.x)
+        t1 = end.subtract(c.origin).dot(c.x)
+    elif c.kind == curve_circle or c.kind == curve_ellipse:
+        t0 = angle_on(&c, start)
+        t1 = angle_on(&c, end)
+        while t1 - t0 > math.pi: t1 -= 2.0 * math.pi
+        while t0 - t1 > math.pi: t1 += 2.0 * math.pi
+    else:
+        error(invalid, "a healed edge is not a line or an arc")
+    if math.abs(t1 - t0) <= w.tolerance: error(invalid, "the healed edge has no length")
+    w.edges.items[e] = ShapeEdge(edge.carrier, t0, t1, edge.start, edge.end)

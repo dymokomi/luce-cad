@@ -1,0 +1,167 @@
+## Direct modeling (Fusion's Modify tools for faces and bodies): Offset
+## Face (Press Pull on a face), Move Face, Replace Face and Delete with
+## healing, built without booleans (face_moves.lucb, face_delete.lucb).
+## Faces are named as face_frame's are (CadModeling.face_name_of), several
+## apart by `;`; a name split upstream into pieces is all of them.
+
+## Direct modeling's operations, as static functions on closed solids.
+pub struct CadDirect:
+    let reserved: u8 = 0
+
+    ## `model` with faces `faces` moved `distance` along their outward
+    ## normals (negative: in): planes moved, cylinders', cones', spheres'
+    ## and tori's radii changed, the faces around extended or shrunk to
+    ## meet them. With `chain`, faces meeting them tangentially move too
+    ## (an earlier fillet's strips with the face they round).
+    pub static func offset_faces(model: interop.Reference[CadModel], faces: str, distance: f64, chain: bool = true) -> interop.Reference[CadModel]!:
+        if not math.is_finite(distance): error(invalid, "an offset needs a finite distance")
+        var w = try shape_of(model.value())
+        defer w.close()
+        var picked = Growing[usize]()
+        defer picked.close()
+        try faces_named(&w, faces, &picked)
+        if chain: try tangent_chain(&w, &picked)
+        let m = FaceMove(move_offset, Vector3(), Vector3(), Vector3(), 0.0, distance)
+        var targets = Growing[Surface]()
+        defer targets.close()
+        var senses = Growing[bool]()
+        defer senses.close()
+        return try substitute(&w, picked.view(), &m, targets.view(), senses.view())
+
+    ## `model` with faces `faces` moved by `by`, the faces around following.
+    pub static func moved_faces(model: interop.Reference[CadModel], faces: str, by: Vector3) -> interop.Reference[CadModel]!:
+        if not by.is_finite(): error(invalid, "a move needs a finite distance")
+        var w = try shape_of(model.value())
+        defer w.close()
+        var picked = Growing[usize]()
+        defer picked.close()
+        try faces_named(&w, faces, &picked)
+        let m = FaceMove(move_translate, by, Vector3(), Vector3(), 0.0, 0.0)
+        var targets = Growing[Surface]()
+        defer targets.close()
+        var senses = Growing[bool]()
+        defer senses.close()
+        return try substitute(&w, picked.view(), &m, targets.view(), senses.view())
+
+    ## `model` with faces `faces` turned `angle` radians about the line
+    ## through `origin` along `axis`, the faces around following.
+    pub static func rotated_faces(model: interop.Reference[CadModel], faces: str, origin: Vector3, axis: Vector3, angle: f64) -> interop.Reference[CadModel]!:
+        let along = axis.normalized() catch failure: error(invalid, "a rotation needs an axis")
+        var w = try shape_of(model.value())
+        defer w.close()
+        var picked = Growing[usize]()
+        defer picked.close()
+        try faces_named(&w, faces, &picked)
+        let m = FaceMove(move_rotate, Vector3(), origin, along, angle, 0.0)
+        var targets = Growing[Surface]()
+        defer targets.close()
+        var senses = Growing[bool]()
+        defer senses.close()
+        return try substitute(&w, picked.view(), &m, targets.view(), senses.view())
+
+    ## `model` with faces `faces` on the surface of `target`'s face
+    ## `target_face` instead (Replace Face): the faces around extended or
+    ## trimmed to it. The surface's outside is the side the faces faced.
+    pub static func replaced_faces(model: interop.Reference[CadModel], faces: str, target: interop.Reference[CadModel], target_face: str) -> interop.Reference[CadModel]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var t = try shape_of(target.value())
+        defer t.close()
+        var picked = Growing[usize]()
+        defer picked.close()
+        try faces_named(&w, faces, &picked)
+        var found = Growing[usize]()
+        defer found.close()
+        try faces_named(&t, target_face, &found)
+        let s = &t.surfaces.items[(usize)t.faces.items[found.items[0]].surface]
+        if s.kind == surface_spline: error(invalid, "Replace Face takes a plane, cylinder, cone, sphere or torus face")
+        var surfaces = Growing[Surface]()
+        defer:
+            for surface in surfaces.view():
+                var owned = surface
+                owned.close()
+            surfaces.close()
+        var senses = Growing[bool]()
+        defer senses.close()
+        for f in picked.view():
+            try surfaces.push(try surface_copy(s))
+            # Facing the way the face did, at its middle.
+            let middle = try face_middle(&w, f)
+            let outward = try w.face_normal(f, try nearest_on_surface(&w, f, middle))
+            let (_, n) = try signed_gap(s, middle, w.tolerance)
+            try senses.push(n.dot(outward) > 0.0)
+        let m = FaceMove(move_replace, Vector3(), Vector3(), Vector3(), 0.0, 0.0)
+        return try substitute(&w, picked.view(), &m, surfaces.view(), senses.view())
+
+    ## `model` without faces `faces`, healed (Fusion's Delete): holes and
+    ## bosses whole, or one fillet, chamfer or corner face, the faces around
+    ## extended to close the gap. An error says when they cannot.
+    pub static func deleted_faces(model: interop.Reference[CadModel], faces: str) -> interop.Reference[CadModel]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var picked = Growing[usize]()
+        defer picked.close()
+        try faces_named(&w, faces, &picked)
+        var deleted = Growing[bool]()
+        defer deleted.close()
+        try deleted.fill(w.faces.count, false)
+        for f in picked.view(): deleted.items[f] = true
+        return try healed(&w, deleted.view())
+
+    ## The names of `model`'s faces `faces` (B-rep face numbers, as a pick
+    ## gives them), apart by `;`: what the operations here take.
+    pub static func face_names(model: interop.Reference[CadModel], faces: const i64[]) -> interop.Owned[str]!:
+        var out = Growing[u8]()
+        defer out.close()
+        for at in 0..<faces.length:
+            if at > 0: try out.push(59)
+            let name = try model.value().face_name(faces[at])
+            if name == "": error(invalid, "a face without a name cannot be referred to: name the body's faces first (CadModeling.tagged)")
+            for byte in name.bytes: try out.push(byte)
+        return try interop.copy_text((str)out.view())
+
+## The faces of `w` that `text` names (names apart by `;`, each any alias),
+## each once, onto `out`; an error when a name finds none.
+func faces_named(w: const Shape*, text: str, out: Growing[usize]*) -> !:
+    out.clear()
+    var parts = Growing[(usize, usize)]()
+    defer parts.close()
+    try top_parts(text, 59, &parts)
+    for part in parts.view():
+        let name = trimmed(part_of(text, part))
+        if name == "": continue
+        var found = false
+        for f in 0..<w.faces.count:
+            if not (try names_meet(w.face_name(f), name)): continue
+            found = true
+            var known = false
+            for g in out.view():
+                if g == f: known = true
+            if not known: try out.push(f)
+        if not found: error(invalid, "a face this operation refers to is gone: pick it again")
+    if out.count == 0: error(invalid, "pick the faces")
+
+## `faces` with every face meeting one of them tangentially, and so on.
+func tangent_chain(w: const Shape*, faces: Growing[usize]*) -> !:
+    var taken = Growing[bool]()
+    defer taken.close()
+    try taken.fill(w.faces.count, false)
+    for f in faces.view(): taken.items[f] = true
+    var grew = true
+    while grew:
+        grew = false
+        for e in 0..<w.edges.count:
+            let fa = w.sides.items[e * 2]
+            let fb = w.sides.items[e * 2 + 1]
+            if fa < 0 or fb < 0 or taken.items[(usize)fa] == taken.items[(usize)fb]: continue
+            if not (try tangent_edge(w, e)): continue
+            let other = (usize)(fb if taken.items[(usize)fa] else fa)
+            taken.items[other] = true
+            try faces.push(other)
+            grew = true
+
+## The point of face `f`'s surface nearest `p`.
+func nearest_on_surface(w: const Shape*, f: usize, p: Vector3) -> Vector3!:
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    let (gap, n) = try signed_gap(s, p, w.tolerance)
+    return p.subtract(n.multiply_scalar(gap))
