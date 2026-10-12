@@ -1,6 +1,9 @@
-## Replace Face onto a closed body that overlaps the one changed: what
-## Fusion does with the faces' surfaces alone, checked closed and of the
-## volume geometry gives.
+## Replace Face onto a closed body that overlaps the one changed, and
+## Delete healing beside curved faces beyond one face losing a whole outline
+## with a ring of several faces round it: an inside fillet or a chamfer at
+## a boss's foot, a hole's rounded rim, and groups of faces apart from each
+## other at once. What Fusion does, checked closed and of the volume
+## geometry gives, or refused with why.
 from luce_cad.modeling import CadModeling, CadDirect
 from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
@@ -10,7 +13,8 @@ from luce_std import math
 
 pub func heal_replace_tests() -> unit!:
     overlapping_replace()
-    print("PASS Replace Face of a top and its fillet onto an overlapping copy's top and fillet (a plane and a cylinder): the body 0.5 taller")
+    curved_rings()
+    print("PASS Replace Face of a top and its fillet onto an overlapping copy's top and fillet (a plane and a cylinder): the body 0.5 taller; Delete of a boss's foot fillet and chamfer, a hole's rounded rim, and a foot fillet with a rounded upright apart from it at once, each healed to the sharp body; the fillet with the plate's top refused")
 
 func solid(model: CadModel, expected: float, tolerance: float, what: str) -> unit!:
     let mesh = model.tessellate(32)
@@ -58,3 +62,45 @@ func overlapping_replace() -> unit!:
     assert(quilt.length == 3)
     let expected = 8.0 - 2.0 * (0.09 - 0.09 * math.pi / 4.0) + 2.0
     solid(CadDirect.replaced_faces(rounded, flat(rounded, Vector3(0.0, 1.0, 0.0)), copy, quilt.join(";"), chain = true), expected, 1e-3, "top and fillet onto an overlapping copy's")
+
+## The names of `model`'s faces whose names contain `part`.
+func named(model: CadModel, part: str) -> list[str]!:
+    let found: list[str] = []
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        if name.contains(part):
+            found.append(name)
+    return found
+
+## Delete beside a curved face whose gap closes on itself: a 4 × 1 × 4
+## plate with a pin of radius 0.5 standing on it, the pin's foot filleted
+## (an inside corner) or chamfered 0.2, deleted: the pin meets the plate
+## again along a circle, the plate and pin's volume. A hole of radius 0.5
+## through the plate, its rim rounded 0.2, deleted: the drilled plate. The
+## foot fillet and a rounded upright of the plate (apart from it) deleted
+## together: each healed in turn. The fillet with the plate's top: refused.
+func curved_rings() -> unit!:
+    let plate = CadModeling.tagged(CadSolids.box(4.0, 1.0, 4.0), "plate")
+    let pinned = CadModeling.combined(plate, CadModeling.moved_body(CadModeling.tagged(CadSolids.cylinder(0.5, 2.0), "pin"), Vector3(0.0, 0.5, 0.0)), 0)
+    let sharp = volume(pinned.tessellate(32))
+    let foot = edges_where(pinned, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.y - 0.5) < 1e-6 and math.abs(b.y - 0.5) < 1e-6 and a.length() < 1.0)
+    for chamfer in [false, true]:
+        let blended = CadModeling.chamfered(pinned, foot, 0.2, "f", true, 0) if chamfer else CadModeling.filleted(pinned, foot, 0.2, "f")
+        let gone = named(blended, "f/")
+        assert(gone.length == 1)
+        solid(CadDirect.deleted_faces(blended, gone[0]), sharp, 1e-4, "a boss's foot healed")
+    let drilled = CadModeling.combined(plate, CadModeling.tagged(CadSolids.cylinder(0.5, 3.0), "hole"), 1)
+    let rim = edges_where(drilled, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.y - 0.5) < 1e-6 and math.abs(b.y - 0.5) < 1e-6 and a.length() < 1.0)
+    let rounded = CadModeling.filleted(drilled, rim, 0.2, "f")
+    solid(CadDirect.deleted_faces(rounded, named(rounded, "f/").join(";")), volume(drilled.tessellate(32)), 1e-4, "a hole's rim healed")
+    # The foot fillet and the plate's upright at +X +Z rounded 0.3: apart.
+    let footed = CadModeling.filleted(pinned, foot, 0.2, "f")
+    let upright = edges_where(footed, func (a: Vector3, b: Vector3) -> bool: return a.x > 1.99 and b.x > 1.99 and a.z > 1.99 and b.z > 1.99)
+    let both = CadModeling.filleted(footed, upright, 0.3, "u")
+    let groups = named(both, "f/") + named(both, "u/")
+    assert(groups.length == 2)
+    solid(CadDirect.deleted_faces(both, groups.join(";")), sharp, 1e-4, "a foot fillet and an upright apart healed")
+    var refused = ""
+    _ = CadDirect.deleted_faces(footed, named(footed, "f/")[0] + ";" + flat(footed, Vector3(0.0, 1.0, 0.0))) catch failure:
+        refused = failure.message
+    assert(refused.contains("cannot"), refused)

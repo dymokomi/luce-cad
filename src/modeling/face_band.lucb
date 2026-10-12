@@ -14,6 +14,11 @@
 ##   carrier, lengthened until it reaches A's surface: there the two ring
 ##   edges and A meet;
 ## - A's loop on the gap becomes the new edges, the other way round.
+## A ring of one face whose run closes on itself (a boss's or a hole's
+## wall, round: its run a whole circle from its seam) meets A along one
+## closed curve: the seam runs on to A's surface and the new edge goes once
+## round the circle or ellipse the two surfaces share, from there (an inside
+## fillet at a boss's foot, a round on a hole's rim, deleted).
 ## The result is checked closed. Anything else is refused with why.
 
 ## One ring face's run of gap edges: face `face`, uses at..<at + count of
@@ -80,7 +85,7 @@ func healed_band(w: Shape*, deleted: const bool[]) -> interop.Reference[CadModel
                 try runs.push(BandRun(f, face.first + at, size, first, on_gap, use_start(w, start_use), use_end(w, end_use)))
             at += size
     if a < 0: error(invalid, "Delete cannot heal these faces: no face round them is left open all round")
-    if runs.count < 2: error(invalid, "Delete cannot heal these faces: too few faces round them")
+    if runs.count == 0 or (runs.count == 1 and runs.items[0].head != runs.items[0].tail): error(invalid, "Delete cannot heal these faces: too few faces round them")
     let sa = w.faces.items[(usize)a].surface
     # Where each run's ends go: along the ring edge running into the gap
     # there, onto A's surface.
@@ -107,17 +112,41 @@ func healed_band(w: Shape*, deleted: const bool[]) -> interop.Reference[CadModel
     for run in runs.view():
         let p0 = w.points.items[(usize)map.items[(usize)run.head]]
         let p1 = w.points.items[(usize)map.items[(usize)run.tail]]
-        if map.items[(usize)run.head] == map.items[(usize)run.tail]: error(invalid, "Delete cannot heal these faces: a face round them would meet the open face in a point")
         # Where the run ran, to choose among the curves the surfaces share.
         let middle_use = w.uses.items[run.loop_at + (run.start + run.count // 2) % run.loop_size]
         let hint = try w.edge_at(edge_index(middle_use), 0.5)
+        if run.head == run.tail:
+            if runs.count != 1: error(invalid, "Delete cannot heal these faces: a face round them closes on itself beside others")
+            try made.push(try closed_band_edge(w, (usize)a, run.face, map.items[(usize)run.head], hint, w.uses.items[run.loop_at + run.start]))
+            continue
+        if map.items[(usize)run.head] == map.items[(usize)run.tail]: error(invalid, "Delete cannot heal these faces: a face round them would meet the open face in a point")
         let carrier = try band_carrier(w, (usize)a, run.face, p0, p1, hint)
         let edge = try w.add_edge(ShapeEdge(carrier, 0.0, 0.0, map.items[(usize)run.head], map.items[(usize)run.tail]))
         try fit_band_interval(w, (usize)edge)
         try made.push(edge)
     return try banded(w, deleted, &gap, (usize)a, a_loop_at, a_loop_size, runs.view(), made.view(), map.view(), before.view())
 
-## The kept edge between two ring faces that ends at gap vertex `v`.
+## The closed edge where ring face `ring` meets face `a` once round, from
+## vertex `v` and back: on the circle or ellipse their surfaces share
+## nearest `hint`, running the way the ring's run did at its first use
+## `first`.
+func closed_band_edge(w: Shape*, a: usize, ring: usize, v: i64, hint: Vector3, first: i64) -> i64!:
+    let p = w.points.items[(usize)v]
+    let c = meeting_carrier(w, a, ring, p, p, hint) catch failure:
+        _ = failure
+        error(invalid, "Delete cannot heal these faces: the face round them meets the open face along no circle or ellipse")
+    if c.kind != curve_circle and c.kind != curve_ellipse: error(invalid, "Delete cannot heal these faces: the face round them meets the open face along no circle or ellipse")
+    let carrier = try w.add_carrier(c)
+    # The old run's way at its start, against the new circle's there.
+    let old = w.edges.items[edge_index(first)]
+    let at = old.t0 if first > 0 else old.t1
+    let way = (try w.tangent(old.carrier, at)).multiply_scalar(1.0 if (first > 0) == (old.t1 > old.t0) else -1.0)
+    let t0 = angle_on(&c, p)
+    let forward = (try w.tangent(carrier, t0)).dot(way) > 0.0
+    return try w.add_edge(ShapeEdge(carrier, t0, t0 + (2.0 * math.pi if forward else -2.0 * math.pi), v, v))
+
+## The kept edge between two ring faces (or a ring face's seam) that ends
+## at gap vertex `v`.
 func ring_edge(w: const Shape*, gap: const Growing[bool]*, deleted: const bool[], v: i64) -> usize!:
     var found: i64 = -1
     for e in 0..<w.edges.count:
@@ -126,7 +155,8 @@ func ring_edge(w: const Shape*, gap: const Growing[bool]*, deleted: const bool[]
         if edge.start != v and edge.end != v: continue
         let fa = w.sides.items[e * 2]
         let fb = w.sides.items[e * 2 + 1]
-        if fa < 0 or fb < 0 or deleted[(usize)fa] or deleted[(usize)fb]: continue
+        # A seam (one face both ways) has one side.
+        if (fa < 0 and fb < 0) or (fa >= 0 and deleted[(usize)fa]) or (fb >= 0 and deleted[(usize)fb]): continue
         if found >= 0: error(invalid, "Delete cannot heal these faces: more than one edge runs into the gap at a corner")
         found = (i64)e
     if found < 0: error(invalid, "Delete cannot heal these faces: two faces round them meet only at a point")

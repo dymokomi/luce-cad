@@ -814,7 +814,15 @@ G2/G3 B-spline strips). Each ring face meets the top along a new edge where thei
 line between planes, an analytic curve (a cylinder's circle), else traced on both surfaces and fitted
 by a cubic that stays on both (`march.lucb`'s steps). Each edge between two ring faces running into the
 gap keeps its carrier, lengthened by Newton along it until it reaches the top's surface. A rounded or
-chamfered top chain beside rounded uprights heals back to the rounded box exactly.
+chamfered top chain beside rounded uprights heals back to the rounded box exactly. A ring of one face
+whose run closes on itself (a pin's or a hole's wall, its run a whole circle from its seam) meets the
+open face along one closed curve: the seam runs on to the face's surface and the new edge goes once
+round the circle or ellipse the two share, the way the run went. An inside fillet or a chamfer at a
+boss's foot, or a hole's rounded rim, deleted, heals to the sharp body.
+
+**Groups apart** (`deleted_faces`): where none of the above takes the faces together, faces in groups
+not joined by an edge (a foot fillet and a rounded upright elsewhere) are healed group by group, each
+by whichever healing takes it; any group refused refuses the whole.
 
 **Replace Face onto several targets** (`face_replace.lucb`). Targets on one surface (coplanar faces,
 a split face's pieces) take the local operation. So do targets on several surfaces that match the

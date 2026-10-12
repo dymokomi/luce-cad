@@ -122,7 +122,10 @@ pub struct CadDirect:
     ## bosses whole, or one fillet, chamfer or corner face, the faces around
     ## extended to close the gap; between flat faces, any number of fillet,
     ## chamfer and corner faces at once (a rounded chain with its corners,
-    ## strips apart). An error says when they cannot.
+    ## strips apart); a band between one face and a ring round it, curved
+    ## ones too (a boss's foot fillet, a hole's rounded rim); faces in
+    ## groups apart from each other, each group in turn. An error says when
+    ## they cannot.
     pub static func deleted_faces(model: interop.Reference[CadModel], faces: str) -> interop.Reference[CadModel]!:
         var w = try shape_of(model.value())
         defer w.close()
@@ -143,7 +146,24 @@ pub struct CadDirect:
                 defer again.close()
                 let band = healed_band(&again, deleted.view()) catch third:
                     _ = third
-                    error(invalid, failure.message if picked.count == 1 else second.message)
+                    # Faces apart from each other (strips apart, a ring
+                    # beside curved faces and a strip elsewhere): each
+                    # group healed on its own, in turn.
+                    var text = Growing[u8]()
+                    defer text.close()
+                    var ends = Growing[usize]()
+                    defer ends.close()
+                    try deleted_groups(&w, deleted.view(), &text, &ends)
+                    if ends.count < 2: error(invalid, failure.message if picked.count == 1 else second.message)
+                    var current = model.clone()
+                    defer current.release()
+                    var begin: usize = 0
+                    for end in ends.view():
+                        let next = try CadDirect.deleted_faces(current, (str)text.view()[begin..<end])
+                        current.release()
+                        current = next
+                        begin = end
+                    return current.clone()
                 return band
             return more
         return local
@@ -296,6 +316,39 @@ pub func nearest_on_surface(w: const Shape*, f: usize, p: Vector3) -> Vector3!:
     return p.subtract(n.multiply_scalar(gap))
 
 ## The faces of `model` that `faces` names, marked.
+## The names of `w`'s faces `deleted` in groups joined across their edges,
+## each group's apart by `;`, back to back in `text`, each group ending at
+## its place in `ends`.
+func deleted_groups(w: const Shape*, deleted: const bool[], text: Growing[u8]*, ends: Growing[usize]*) -> !:
+    var group = Growing[i64]()
+    defer group.close()
+    try group.fill(w.faces.count, -1)
+    var stack = Growing[usize]()
+    defer stack.close()
+    var count: i64 = 0
+    for f in 0..<w.faces.count:
+        if not deleted[f] or group.items[f] >= 0: continue
+        group.items[f] = count
+        try stack.push(f)
+        while stack.count > 0:
+            let g = stack.items[stack.count - 1]
+            stack.count -= 1
+            for use in w.face_uses(g):
+                let e = edge_index(use)
+                for side in [w.sides.items[e * 2], w.sides.items[e * 2 + 1]]:
+                    if side < 0 or not deleted[(usize)side] or group.items[(usize)side] >= 0: continue
+                    group.items[(usize)side] = count
+                    try stack.push((usize)side)
+        count += 1
+    for k in 0..<count:
+        var first = true
+        for f in 0..<w.faces.count:
+            if group.items[f] != k: continue
+            if not first: try text.push(59)
+            first = false
+            for byte in w.face_name(f).bytes: try text.push(byte)
+        try ends.push(text.count)
+
 func chosen_faces(model: interop.Reference[CadModel], faces: str) -> Growing[bool]!:
     var w = try shape_of(model.value())
     defer w.close()
