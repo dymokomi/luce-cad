@@ -1,0 +1,53 @@
+## A sketch's profiles laid out once for pointing at: the arrangement of its
+## curves (arrangement.lucb) kept with every bounded face's key, so finding
+## the profile under the pointer is a containment test over the faces, not
+## an arrangement made again on every move (CadModeling.profile_at). The
+## editor keeps one per sketch revision.
+pub struct CadProfileMap:
+    var result: Profiles
+    var a: Arranged
+    ## Each face's key (empty for a face that is no profile), a run of
+    ## `names`.
+    var starts: Growing[usize]
+    var names: Growing[u8]
+
+    pub func close():
+        self.result.close()
+        self.a.close()
+        self.starts.close()
+        self.names.close()
+
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        _ = visit
+        _ = context
+
+    ## The profiles of the sketch in `set` (its curves on its plane).
+    pub static func of(set: interop.Reference[GeometrySet]) -> interop.Reference[CadProfileMap]!:
+        let source = try set.get()
+        let tolerance = try sketch_size(source) * 0.0001
+        var result = try empty_profiles(source)
+        errdefer result.close()
+        var pieces = Growing[ProfileEdge]()
+        defer pieces.close()
+        try read_pieces(source, &result, &pieces, tolerance)
+        var a = try arranged(&result, &pieces, tolerance)
+        errdefer a.close()
+        var starts = Growing[usize]()
+        errdefer starts.close()
+        var names = Growing[u8]()
+        errdefer names.close()
+        for f in 0..<a.areas.count:
+            try starts.push(names.count)
+            if a.areas.items[f] > 0.0: try face_key(&a.subs, &a.halves, a.loop(f), &names)
+        try starts.push(names.count)
+        return try interop.Reference[CadProfileMap].adopt(new CadProfileMap(result, a, starts, names) in memory.heap, cad_profile_map_type, memory.heap)
+
+    ## The key of the profile holding world point `at` (on the sketch
+    ## plane), or "" when none does: what CadModeling.profile_at gives.
+    pub func key_at(at: Vector3) -> interop.Owned[str]!:
+        let (x, y) = self.result.planar(at)
+        let f = self.a.holding(Vector3(x, y, 0.0))
+        if f < 0: return try interop.copy_text("")
+        return try interop.copy_text((str)self.names.view()[self.starts.items[(usize)f]..<self.starts.items[(usize)f + 1]])
+
+pub let cad_profile_map_type: interop.Type[CadProfileMap] = interop.Type[CadProfileMap]("CadProfileMap", CadProfileMap.close, CadProfileMap.trace, closeable = true)
