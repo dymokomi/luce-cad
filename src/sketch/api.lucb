@@ -23,6 +23,9 @@ pub struct CadSketch:
     var layout: DimensionLayout
     ## The curves whose links the last relink lost.
     var lost: Growing[i64]
+    ## The constraints the last find_dependent found an over-constraint
+    ## running through.
+    var dependents: Growing[i64]
 
     pub func close():
         self.sketch.close()
@@ -30,6 +33,7 @@ pub struct CadSketch:
         self.projected.close()
         self.layout.close()
         self.lost.close()
+        self.dependents.close()
         self.forget()
 
     func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
@@ -41,7 +45,7 @@ pub struct CadSketch:
     pub static func parse(text: str) -> interop.Reference[CadSketch]!:
         var s = try read_sketch(text)
         errdefer s.close()
-        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1), Growing[i64](), Growing[i64](), 0, new_dimension_layout(), Growing[i64]()) in memory.heap, cad_sketch_type, memory.heap)
+        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1), Growing[i64](), Growing[i64](), 0, new_dimension_layout(), Growing[i64](), Growing[i64]()) in memory.heap, cad_sketch_type, memory.heap)
 
     ## The sketch as text.
     pub func text() -> interop.Owned[str]!:
@@ -81,6 +85,21 @@ pub struct CadSketch:
     ## How many points entity `at` is drawn on (none for a point).
     pub func part_count(at: i64) -> i64:
         return self.sketch.point_count(self.sketch.entity(at))
+
+    ## Fusion's sketch origin, its point and its x and y axes (`which` 0,
+    ## 1, 2): the entity, made fixed when the sketch has none yet, so a
+    ## constraint or dimension can hold to it. The axes are construction
+    ## lines through the origin (their direction counts; they make no
+    ## profile), never picked, snapped to or boxed as themselves.
+    pub func origin(which: i64) -> i64!:
+        if which < 0 or which > 2: error(invalid, "the sketch origin is its point (0) and its x (1) and y (2) axes")
+        self.forget()
+        return try self.sketch.origin_entity(which + origin_point)
+
+    ## Which part of the sketch origin entity `at` is: 0 its point, 1 its x
+    ## axis, 2 its y axis, 3 an axis's far end; -1 for none.
+    pub func origin_part(at: i64) -> i64:
+        return self.sketch.entity(at).origin - 1
 
     ## Whether spline `at` passes through its points (else they are its
     ## control net).
@@ -306,6 +325,25 @@ pub struct CadSketch:
         defer reference.release()
         return try add_shadow(&self.sketch, s.run(edge), reference.value)
 
+    ## Project every edge of `shadows`' face `face` (CadShadows.face_at),
+    ## its outer and inner loops, as Fusion's Project of a face: fixed,
+    ## linked, neighbors sharing their points; the face remembered so edges
+    ## its loops gain upstream come too. How many curves were made (an edge
+    ## already projected is not made again); projected_curve(at) reads them.
+    pub func project_shadow_face(shadows: interop.Reference[CadShadows], face: i64) -> i64!:
+        self.forget()
+        try shadow_face_onto(&self.sketch, try shadows.get(), face, &self.projected)
+        return (i64)self.projected.count
+
+    ## Project the body's outline as seen from `toward` (+1 the plane's
+    ## normal side, -1 behind), Fusion's Project of a body: the edges
+    ## bounding its shadow (shadow_faces.lucb), fixed and linked, one closed
+    ## chain. How many curves were made; projected_curve(at) reads them.
+    pub func project_shadow_outline(shadows: interop.Reference[CadShadows], toward: f64) -> i64!:
+        self.forget()
+        try shadow_outline_onto(&self.sketch, try shadows.get(), toward, &self.projected)
+        return (i64)self.projected.count
+
     pub func gained() -> i64:
         return self.gained_edges
 
@@ -391,6 +429,17 @@ pub struct CadSketch:
         let f = self.freedom else return -1
         return f.conflicting.items[(usize)at]
 
+    ## The constraints an over-constraint runs through (sketch/freedom.lucb
+    ## dependent_constraints): each one that, let go, leaves fewer
+    ## redundant or conflicting; how many. dependent reads them, ascending.
+    pub func find_dependent() -> i64!:
+        try dependent_constraints(&self.sketch, &self.dependents)
+        return (i64)self.dependents.count
+
+    pub func dependent(at: i64) -> i64:
+        if at < 0 or (usize)at >= self.dependents.count: return -1
+        return self.dependents.items[(usize)at]
+
     pub func redundant_count() -> i64:
         let f = self.freedom else return 0
         return (i64)f.redundant.count
@@ -400,9 +449,11 @@ pub struct CadSketch:
     ## dimension or measures nothing. layout_line, layout_arrow and
     ## label_x, label_y read it: lines as x1, y1, x2, y2 (`which` 0 to 3),
     ## arrowheads as their tip and the unit way they point (x, y, dx, dy).
-    pub func lay_out(at: i64, pixel: f64) -> bool!:
+    ## An unplaced label goes `step` places on from its first (the editor
+    ## tries the next when another label is there); a placed one stays.
+    pub func lay_out(at: i64, pixel: f64, step: i64 = 0) -> bool!:
         if at < 0 or at >= (i64)self.sketch.constraints.count: return false
-        return try lay_out_dimension(&self.sketch, at, pixel, &self.layout)
+        return try lay_out_dimension(&self.sketch, at, pixel, &self.layout, step)
 
     pub func layout_line_count() -> i64:
         return (i64)self.layout.lines.count // 4

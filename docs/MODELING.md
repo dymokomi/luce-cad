@@ -30,6 +30,7 @@ does today.
 | `shelled(model, faces, thickness, tag, side)` | Shell: hollowed to a wall `thickness` thick, the faces named opened (none: a closed void), the wall inside (`0`), outside (`1`) or half each way (`2`). |
 | `combined(a, b, operation)` | Combine: `0` join, `1` cut (`a` without `b`), `2` intersect. Fusion's Keep Tools is the caller keeping `b`; several tools are combined one after another. |
 | `split_by_plane(model, origin, normal, tag)`, `split_by_face(model, tool, face, tag)` | Split Body: the piece on the plane's normal side (inside a curved face's surface) and the piece beyond, as two lumps of one model. |
+| `sliced(model, origin, normal, tag)` | Fusion's sketch Slice: what lies behind the plane (against its normal), the half-space in front taken away and the cut capped by faces named `<tag>/to/f<i>`; the model itself when nothing of it is in front; refused when all of it is. |
 | `lump_count(model)`, `lump(model, at)` | A model's separate pieces, each as a body of its own. |
 | `moved_body(model, by, origin, axis, angle, prefix)` | Move/Copy: turned about a line, then moved; a copy's faces take `prefix` so features tell it from the original. |
 | `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
@@ -279,7 +280,9 @@ grow from one operation to the next.
 solid and without it. A plane's solid is a large box on its normal side; a cylinder's, cone's,
 sphere's or torus's is the primitive of that surface, made long enough. The two results go side by
 side into one model, two lumps (`lumps.lucb` finds a model's pieces by the edges its faces share). A
-surface that misses the body is refused.
+surface that misses the body is refused. **Slice** (`behind_surface`) is the second boolean alone:
+the body without the plane's solid, capped where it was cut; the box round the body says first
+whether the plane cuts it at all.
 
 ### Chamfer and fillet (`blend.lucb`)
 
@@ -718,6 +721,28 @@ the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
   conics) are fit point splines outside the relation. Removing the constraint removes the
   relation. Without `relation`, each line copy gets its own parallel and distance (what the
   editor uses until Stage 3 moves it over).
+- **The origin** (`entities.lucb` `origin_entity`), Fusion's origin point and axes in every
+  sketch: `origin(which)` gives the point (0) or the x (1) or y (2) axis as an entity, made when
+  first asked for: the point fixed at (0, 0); an axis a construction line from it to a fixed point
+  a millimeter along (only its direction counts). Each carries its part (`SketchEntity.origin`;
+  the text's `r` lines), `origin_part(at)` reads it. They are references, not curves: never
+  picked, snapped to or boxed as themselves (the editor draws and picks them across the view),
+  never a crossing that trims, never a profile.
+- **Sweep** (`ConstraintKind.sweep`): an arc's sweep held at an angle, the angle row on its
+  center's rays to its ends (wrapped, so past half a turn holds), drawn as an angle at the center
+  inside the arc with extension lines out along the rays.
+- **What an over-constraint runs through** (`freedom.lucb` `dependent_constraints`,
+  `find_dependent`, `dependent(at)`): each constraint that, made driven in a copy, leaves fewer
+  constraints redundant or conflicting. The editor lights them when a new one over-constrains.
+- **Project of a face and of a body** (`shadow_faces.lucb`), from shadows carried without the
+  body (`shadows.lucb` now carries each edge's height off the plane and each face's name and
+  edges): `CadShadows.face_at(x, y, toward)` is the face whose shadow holds a point, the one
+  highest toward the camera where several do; `project_shadow_face(shadows, face)` brings every
+  edge of its loops, neighbors sharing points by place, the face remembered by name so relinking
+  adds edges it gains; `project_shadow_outline(shadows, toward)` brings the body's outline: the
+  edges whose shadow bounds the union of the faces' shadows, one of each pair casting the same
+  shadow (the higher). A silhouette that is no edge (a cylinder seen from its side) is not
+  brought. An edge already projected is not brought twice.
 - **Dimensions drawn** (`dimensions.lucb`), as drawings draw them. `lay_out(at, pixel)` gives a
   dimension's lines, arrowheads and label place on the plane, with screen sizes (gaps,
   overshoots, the default offset) in multiples of `pixel`, a screen point's length there:
@@ -731,7 +756,9 @@ the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
   `place_label(at, x, y)` keeps where a label was put as two numbers measured from what the
   dimension measures (`SketchConstraint.label_a`, `label_b`; the text's `g` lines), so it moves
   with the geometry. An unplaced label sits a little off the geometry, outward of the sketch's
-  middle.
+  middle; `lay_out(at, pixel, step)` puts it `step` places on (a length's on the other side, then a
+  row further out on each; a radius's round its circle; an angle's arc wider), which the editor
+  tries when another label is in the way. A placed label stays.
 
 Not yet: ellipses, splines, slots and text; curvature (G2) and polygon constraints; Blend Curve.
 

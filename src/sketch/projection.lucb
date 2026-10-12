@@ -11,13 +11,16 @@
 let per_edge: usize = 33
 
 ## A body's edges on a sketch plane: `per_edge` x, y samples each, in the
-## body's edge order, and the body (for the edges' references).
+## body's edge order, each edge's mean height off the plane (along its
+## normal, u × v), and the body (for the edges' references and faces).
 pub struct CadProjection:
     var samples: Growing[f64]
+    var heights: Growing[f64]
     var model: interop.Reference[CadModel]
 
     pub func close():
         self.samples.close()
+        self.heights.close()
         self.model.release()
 
     func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
@@ -29,11 +32,18 @@ pub struct CadProjection:
     pub static func of(model: interop.Reference[CadModel], origin: Vector3, u: Vector3, v: Vector3) -> interop.Reference[CadProjection]!:
         var samples = Growing[f64]()
         errdefer samples.close()
+        var heights = Growing[f64]()
+        errdefer heights.close()
         var w = try shape_of(model.value())
         defer w.close()
+        let n = u.cross(v)
         for e in 0..<w.edges.count:
             try cast_edge(&w, e, origin, u, v, &samples)
-        return try interop.Reference[CadProjection].adopt(new CadProjection(samples, model.clone()) in memory.heap, cad_projection_type, memory.heap)
+            var height = 0.0
+            for k in 0..<per_edge:
+                height += (try w.edge_at(e, (f64)k / (f64)(per_edge - 1))).subtract(origin).dot(n)
+            try heights.push(height / (f64)per_edge)
+        return try interop.Reference[CadProjection].adopt(new CadProjection(samples, heights, model.clone()) in memory.heap, cad_projection_type, memory.heap)
 
     pub func edge_count() -> i64:
         return (i64)(self.samples.count // (2 * per_edge))

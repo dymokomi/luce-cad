@@ -106,9 +106,12 @@ pub enum ConstraintKind as u8:
     ## copy's radius the source's plus `side` times the distance. One value
     ## for the whole chain: one dimension.
     offset = 22
+    ## Arc `first` sweeping `value` radians counterclockwise from its start
+    ## to its end (an angle dimension on the arc, as a typed Sweep makes).
+    sweep = 23
 
 ## How many kinds of constraint there are.
-pub let constraint_kind_count: usize = 23
+pub let constraint_kind_count: usize = 24
 
 ## Whether constraint kind `kind` is a length (a distance, a radius, a
 ## diameter): what scaling the sketch scales.
@@ -132,6 +135,18 @@ pub struct SketchEntity:
     pub var third: i64
     pub var fourth: i64
     pub var construction: bool
+    ## Which of the sketch's origin it is (origin_point, origin_x_axis,
+    ## origin_y_axis, an axis's far end origin_axis_end), 0 for none. The
+    ## origin is made when first used (origin_entity), fixed, and never
+    ## picked, snapped to or boxed as itself: the editor shows it apart.
+    pub var origin: i64 = 0
+
+## The sketch origin's parts, Fusion's origin point and axes (SketchEntity
+## .origin).
+pub let origin_point: i64 = 1
+pub let origin_x_axis: i64 = 2
+pub let origin_y_axis: i64 = 3
+pub let origin_axis_end: i64 = 4
 
 ## A text's label: what it says and its font file (empty: the system's
 ## sans), as runs of a sketch's `chars`.
@@ -333,6 +348,32 @@ pub struct Sketch:
         if not offset_fits(self.entity(source).kind, self.entity(copy).kind): error(invalid, "an offset copies a line to a line, a circle or arc to one about its center")
         try self.offsets.push(OffsetPair(group, source, copy, side))
 
+    ## The sketch origin's part `role` (origin_point, origin_x_axis or
+    ## origin_y_axis), made when the sketch has none yet: the point fixed at
+    ## (0, 0); an axis a construction line from it to a fixed point a
+    ## millimeter along x or y (its direction is what counts: the editor
+    ## draws the axis across the view).
+    pub func origin_entity(role: i64) -> i64!:
+        if role != origin_point and role != origin_x_axis and role != origin_y_axis: error(invalid, "the sketch origin has a point and two axes")
+        for at in 0..<self.entities.count:
+            if self.entities.items[at].origin == role: return (i64)at
+        if role == origin_point:
+            let p = try self.add_point(0.0, 0.0)
+            self.entities.items[(usize)p].origin = origin_point
+            _ = try self.constrain(ConstraintKind.fix, p)
+            return p
+        let o = try self.origin_entity(origin_point)
+        let end = try self.add_point(1.0 if role == origin_x_axis else 0.0, 1.0 if role == origin_y_axis else 0.0)
+        self.entities.items[(usize)end].origin = origin_axis_end
+        _ = try self.constrain(ConstraintKind.fix, end)
+        let axis = try self.add_line(o, end, true)
+        self.entities.items[(usize)axis].origin = role
+        return axis
+
+    ## Whether entity `at` is part of the sketch origin.
+    pub func is_origin(at: i64) -> bool:
+        return self.entities.items[(usize)at].origin != 0
+
     ## A sketch of its own with everything this one has.
     pub func copy() -> Sketch!:
         var s = new_sketch()
@@ -459,6 +500,7 @@ pub struct Sketch:
         if kind == ConstraintKind.midpoint or kind == ConstraintKind.line_distance: return a == point and b == line and third < 0
         if kind == ConstraintKind.concentric: return ra and rb and third < 0
         if kind == ConstraintKind.symmetric: return a == point and b == point and c == line
+        if kind == ConstraintKind.sweep: return a == (i64)(u8)EntityKind.arc and second < 0
         if kind == ConstraintKind.offset: return first >= 0 and second >= 0 and third < 0 and offset_fits(self.entities.items[(usize)first].kind, self.entities.items[(usize)second].kind)
         # Radius and diameter, the last kinds.
         return ra and second < 0

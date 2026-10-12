@@ -28,3 +28,33 @@ func split_by_surface(model: const CadModel*, s: const Surface*, tag: str) -> in
     defer beyond.release()
     if within.value().face_count() == 0 or beyond.value().face_count() == 0: error(invalid, "the split surface misses the body: it lies wholly on one side")
     return try side_by_side(within.value(), beyond.value())
+
+## Fusion's sketch Slice: what of `model` lies behind plane `s` (against
+## its normal), the half-space in front taken away, the cut capped by faces
+## named `<tag>/to/f<i>`. None when nothing of it is in front (it is all
+## behind); an error when all of it is.
+func behind_surface(model: const CadModel*, s: const Surface*, tag: str) -> interop.Reference[CadModel]?!:
+    var w = try shape_of(model)
+    defer w.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(&w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    if w.faces.count == 0: return none
+    # The box's corners either side of the plane.
+    let tolerance = 1e-7 * math.max(1.0, high.subtract(low).length())
+    var nearest = 1.0e300
+    var furthest = -1.0e300
+    for corner in 0..<8:
+        let p = Vector3(high.x if corner % 2 == 1 else low.x, high.y if (corner // 2) % 2 == 1 else low.y, high.z if corner // 4 == 1 else low.z)
+        let d = p.subtract(s.origin).dot(s.z)
+        nearest = math.min(nearest, d)
+        furthest = math.max(furthest, d)
+    if furthest <= tolerance: return none
+    if nearest >= -tolerance: error(invalid, "the whole body is in front of the sketch's plane")
+    let span = high.subtract(low).length() * 4.0 + s.origin.subtract(low).length() * 2.0
+    let (_, tool) = try surface_side(s, s.origin, 1.0, s.z, 0.0, span, tag)
+    defer tool.release()
+    return try combine(model, tool.value(), op_subtract)

@@ -1,0 +1,132 @@
+## Sketch references and dimensions as Fusion has them (sketch/
+## entities.lucb origin_entity, sketch/dimensions.lucb, sketch/
+## freedom.lucb): the origin's point and axes made when first used, fixed,
+## kept through the text and never picked, snapped to or boxed as
+## themselves; a line's angle held against the x axis; an arc's sweep as an
+## angle dimension; an unplaced label stepped on when its place is taken
+## (a placed one stays); and the constraints an over-constraint runs
+## through, found.
+from luce_cad.sketch import CadSketch
+from luce_std import math
+
+## ConstraintKind's order (sketch/entities.lucb).
+let horizontal = 2
+let fix = 8
+let distance = 13
+let angle = 17
+let radius = 18
+let sweep = 23
+
+func near(a: float, b: float) -> bool:
+    return math.abs(a - b) <= 1e-6 * math.max(1.0, math.abs(b))
+
+pub func sketch_origin_tests() -> unit!:
+    origin()
+    swept()
+    stepped_labels()
+    dependents()
+    print("PASS sketch origin and dimensions: the origin's point and axes made when used, fixed, kept as text, never picked or boxed; an angle from the x axis; an arc's sweep held; labels stepped off each other; an over-constraint's constraints found")
+
+## The origin's point and x axis made once, fixed; a line held 30° from
+## the x axis turns there; picking, snapping and boxing pass the origin by;
+## the text keeps which entity is which.
+func origin() -> unit!:
+    let s = CadSketch.parse("")
+    let x_axis = s.origin(1)
+    assert(s.origin(1) == x_axis and s.origin_part(x_axis) == 1)
+    let point = s.origin(0)
+    assert(s.origin_part(point) == 0 and s.part(x_axis, 0) == point)
+    assert(s.construction(x_axis))
+    let a = s.add_point(5.0, 5.0)
+    let b = s.add_point(25.0, 9.0)
+    let line = s.add_line(a, b)
+    _ = s.constrain(distance, a, b, value = 20.0)
+    _ = s.constrain(angle, x_axis, line, value = math.pi / 6.0)
+    assert(s.solve())
+    let turned = math.atan2(s.y(b) - s.y(a), s.x(b) - s.x(a))
+    assert(near(turned, math.pi / 6.0), f"{turned}")
+    # The origin did not move.
+    assert(near(s.x(point), 0.0) and near(s.y(point), 0.0) and near(s.x(s.part(x_axis, 1)), 1.0))
+    s.analyze()
+    assert(s.fixed(point) and s.fixed(x_axis))
+    # Not picked, snapped to or boxed as itself.
+    assert(s.pick(0.0, 0.0, 0.5) < 0 and s.pick(0.5, 0.0, 0.2) < 0)
+    assert(s.snap(0.0, 0.0, 0.5, 15) == 0)
+    assert(s.select_box([-1.0, -1.0, 2.0, -1.0, 2.0, 1.0, -1.0, 1.0]) == 0)
+    # The text keeps it: the same entities, made no second time.
+    let back = CadSketch.parse(s.text())
+    assert(back.text() == s.text() and back.origin_part(x_axis) == 1 and back.origin(0) == point and back.entity_count() == s.entity_count())
+    assert(back.origin_part(line) < 0)
+
+## A center point arc swept 90° held at 120°, past half a turn at 270°;
+## its sweep laid out as an angle at the center.
+func swept() -> unit!:
+    let s = CadSketch.parse("")
+    let c = s.add_point(0.0, 0.0)
+    let start = s.add_point(10.0, 0.0)
+    let end = s.add_point(0.0, 10.0)
+    let arc = s.add_arc(c, start, end)
+    _ = s.constrain(fix, c)
+    _ = s.constrain(fix, start)
+    _ = s.constrain(radius, arc, value = 10.0)
+    let held = s.constrain(sweep, arc, value = math.pi * 2.0 / 3.0)
+    assert(s.solve())
+    assert(near(math.atan2(s.y(end), s.x(end)), math.pi * 2.0 / 3.0), f"{s.x(end)}, {s.y(end)}")
+    s.set_value(held, math.pi * 1.5)
+    assert(s.solve())
+    assert(near(s.x(end), 0.0) and near(s.y(end), -10.0), f"{s.x(end)}, {s.y(end)}")
+    s.analyze()
+    assert(s.fixed(arc) and s.conflicting_count() == 0)
+    # Laid out at the center: an arc inside the arc, extension lines out
+    # from the center along each ray.
+    assert(s.lay_out(held, 0.1))
+    assert(near(math.hypot(s.label_x(), s.label_y()), 6.0))
+    assert(s.layout_arrow_count() == 2 and s.layout_line_count() == 34)
+    assert(CadSketch.parse(s.text()).constraint_kind(held) == sweep)
+
+## Each step puts an unplaced label elsewhere: a length's on the other
+## side, then a row further out (a radius's round the circle); a placed
+## label stays wherever it is stepped.
+func stepped_labels() -> unit!:
+    let s = CadSketch.parse("")
+    let a = s.add_point(0.0, 0.0)
+    let b = s.add_point(40.0, 0.0)
+    _ = s.add_line(a, b)
+    let d = s.constrain(distance, a, b, value = 40.0)
+    assert(s.lay_out(d, 0.1, 0))
+    let side = s.label_y()
+    assert(s.lay_out(d, 0.1, 1) and near(s.label_y(), -side))
+    assert(s.lay_out(d, 0.1, 2))
+    assert(near(s.label_y(), side + (2.4 if side > 0.0 else -2.4)), f"{s.label_y()}")
+    let c = s.add_circle(s.add_point(10.0, 10.0), 5.0)
+    let r = s.constrain(radius, c, value = 5.0)
+    assert(s.lay_out(r, 0.1, 0))
+    let x0 = s.label_x()
+    assert(s.lay_out(r, 0.1, 1) and not near(s.label_x(), x0))
+    s.place_label(d, 20.0, -9.0)
+    assert(s.lay_out(d, 0.1, 3) and near(s.label_y(), -9.0))
+
+## A square's sides held level and upright with its width given: a
+## second width across conflicts with the first, its sides' and their
+## fixes; what is not in the loop (a free line) is not.
+func dependents() -> unit!:
+    let s = CadSketch.parse("")
+    let a = s.add_point(0.0, 0.0)
+    let b = s.add_point(10.0, 0.0)
+    let bottom = s.add_line(a, b)
+    let free_line = s.add_line(s.add_point(20.0, 20.0), s.add_point(30.0, 25.0))
+    _ = s.constrain(fix, a)
+    let level = s.constrain(horizontal, bottom)
+    let width = s.constrain(distance, a, b, value = 10.0)
+    assert(s.solve())
+    assert(s.find_dependent() == 0)
+    let again = s.constrain(distance, a, b, value = 12.0)
+    _ = s.solve()
+    s.analyze()
+    assert(s.conflicting_count() + s.redundant_count() > 0)
+    let found: list[int] = []
+    for at in 0..<s.find_dependent():
+        found.append(s.dependent(at))
+    assert(width in found and again in found, f"{found}")
+    _ = level
+    _ = free_line

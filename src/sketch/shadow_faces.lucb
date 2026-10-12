@@ -1,0 +1,162 @@
+## Fusion's Project of a whole face and of a body, from a cast that travels
+## without its body (CadShadows, shadows.lucb): a face brings every edge of
+## its loops, a body its outline as seen along the plane's normal. Each
+## curve is fixed and linked to its edge as a single edge's projection is
+## (add_shadow), neighbors share their points (by place: the cast carries
+## no vertices), so a loop or the outline is one closed chain, a profile;
+## an edge already projected is not brought twice. A face is remembered by
+## name, as a sketch's own face is, so relinking projects the edges its
+## loops gain upstream.
+##
+## The outline: the edges whose shadow bounds the union of the faces'
+## shadows (one side of the edge inside a face's shadow, the other inside
+## none), where several cast the same shadow (a box's top and bottom seen
+## from above) the one standing highest toward the camera. A curved face's
+## silhouette that is no edge (a cylinder seen from its side) is not
+## brought: the outline is made of edges.
+
+## Project every edge of `shadows`' face `face` into `sketch`; the curves
+## made onto `out`.
+pub func shadow_face_onto(sketch: Sketch*, shadows: const CadShadows*, face: i64, out: Growing[i64]*) -> !:
+    out.clear()
+    if face < 0 or face >= shadows.face_count(): error(invalid, "the shadows have no such face")
+    var points = Growing[i64]()
+    defer points.close()
+    for e in shadows.edges_of(face):
+        let made = try add_shadow_shared(sketch, shadows, e, &points)
+        if made >= 0: try out.push(made)
+    try sketch.project_face_name(shadows.name_of(face))
+
+## Project the body's outline seen toward `toward` (+1 from the plane's
+## normal side, -1 from behind) into `sketch`; the curves made onto `out`.
+pub func shadow_outline_onto(sketch: Sketch*, shadows: const CadShadows*, toward: f64, out: Growing[i64]*) -> !:
+    out.clear()
+    var edges = Growing[i64]()
+    defer edges.close()
+    try outline_edges(shadows, toward, &edges)
+    if edges.count == 0: error(invalid, "the body casts no outline on the sketch's plane")
+    var points = Growing[i64]()
+    defer points.close()
+    for e in edges.view():
+        let made = try add_shadow_shared(sketch, shadows, e, &points)
+        if made >= 0: try out.push(made)
+
+## The edges of the body's outline (see the top), highest toward `toward`
+## first among those casting one shadow, onto `out`.
+pub func outline_edges(shadows: const CadShadows*, toward: f64, out: Growing[i64]*) -> !:
+    out.clear()
+    let per = projection_per_edge()
+    let count = shadows.edge_count()
+    if count == 0: return
+    let size = shadows_size(shadows)
+    let tolerance = 1e-6 * math.max(1.0, size)
+    let probe = 1e-4 * math.max(1.0, size)
+    # Highest toward the camera first, so a shadow cast twice keeps that
+    # edge.
+    var order = Growing[i64]()
+    defer order.close()
+    for e in 0..<count:
+        try order.push(e)
+        var at = order.count - 1
+        while at > 0 and shadows.heights.items[(usize)order.items[at - 1]] * toward < shadows.heights.items[(usize)e] * toward:
+            order.items[at] = order.items[at - 1]
+            at -= 1
+        order.items[at] = e
+    for e in order.view():
+        let run = shadows.run(e)
+        if end_on(run, tolerance): continue
+        # Either side of the edge's middle, just off it.
+        let k = per // 2
+        let tx = run[2 * k + 2] - run[2 * k - 2]
+        let ty = run[2 * k + 3] - run[2 * k - 1]
+        let length = math.hypot(tx, ty)
+        if length <= 0.0: continue
+        let nx = -ty / length * probe
+        let ny = tx / length * probe
+        let left = covered(shadows, run[2 * k] + nx, run[2 * k + 1] + ny)
+        let right = covered(shadows, run[2 * k] - nx, run[2 * k + 1] - ny)
+        if left == right: continue
+        var repeated = false
+        for kept in out.view():
+            repeated = repeated or same_shadow(run, shadows.run(kept), tolerance * 10.0)
+        if not repeated: try out.push(e)
+
+## Whether a face's shadow holds (`x`, `y`).
+func covered(shadows: const CadShadows*, x: f64, y: f64) -> bool:
+    for f in 0..<shadows.face_count():
+        if shadows.holds(f, x, y): return true
+    return false
+
+## Whether runs `a` and `b` cast one shadow: each of `a`'s samples on `b`.
+func same_shadow(a: const f64[], b: const f64[], tolerance: f64) -> bool:
+    let n = a.length // 2
+    for k in 0..<n:
+        var near = false
+        for j in 0..<n - 1:
+            near = near or segment_distance(a[2 * k], a[2 * k + 1], b[2 * j], b[2 * j + 1], b[2 * j + 2], b[2 * j + 3]) <= tolerance
+        if not near: return false
+    return true
+
+## How big the shadows are: their box's larger side.
+func shadows_size(shadows: const CadShadows*) -> f64:
+    let samples = shadows.samples.view()
+    if samples.length < 2: return 1.0
+    var low_x = samples[0]
+    var high_x = samples[0]
+    var low_y = samples[1]
+    var high_y = samples[1]
+    for k in 0..<samples.length // 2:
+        low_x = math.min(low_x, samples[2 * k])
+        high_x = math.max(high_x, samples[2 * k])
+        low_y = math.min(low_y, samples[2 * k + 1])
+        high_y = math.max(high_y, samples[2 * k + 1])
+    return math.max(high_x - low_x, high_y - low_y)
+
+## Edge `e`'s shadow into `sketch`, fixed and linked, its ends the points
+## in `points` at their places (made there and added when none is); -1
+## for an edge seen end-on or already projected.
+func add_shadow_shared(sketch: Sketch*, shadows: const CadShadows*, e: i64, points: Growing[i64]*) -> i64!:
+    let run = shadows.run(e)
+    let reference = shadows.reference_of(e)
+    for l in sketch.links.view():
+        if sketch.link_reference(l) == reference: return -1
+    let tolerance = 1e-6 * math.max(1.0, size_of(sketch))
+    if end_on(run, tolerance): return -1
+    let kind = shadow_kind(run, tolerance)
+    # A whole circle, or a closed edge: its own points (add_shadow).
+    if kind == EntityKind.circle or run_closed(run, tolerance): return try add_shadow(sketch, run, reference)
+    let n = run.length // 2
+    let a = try shared_point(sketch, points, run[0], run[1], tolerance)
+    let b = try shared_point(sketch, points, run[2 * n - 2], run[2 * n - 1], tolerance)
+    var made: i64 = -1
+    if kind == EntityKind.line:
+        made = try sketch.add_line(a, b)
+    elif kind == EntityKind.arc:
+        let circle = circle_through(run, tolerance) else error(invalid, "a circular shadow has no circle")
+        let center = try sketch.add_point(circle[0], circle[1])
+        let turning = (run[2] - run[0]) * (run[1] - circle[1]) - (run[3] - run[1]) * (run[0] - circle[0])
+        made = try sketch.add_arc(center, b if turning > 0.0 else a, a if turning > 0.0 else b)
+    else:
+        # A fit point spline through every fourth sample, between the
+        # shared ends.
+        var through = Growing[i64]()
+        defer through.close()
+        try through.push(a)
+        var k: usize = 4
+        while k + 1 < n:
+            try through.push(try sketch.add_point(run[2 * k], run[2 * k + 1]))
+            k += 4
+        try through.push(b)
+        made = try sketch.add_spline(through.view(), true)
+    _ = try sketch.constrain(ConstraintKind.fix, made)
+    try sketch.link(made, reference)
+    return made
+
+## The point of `points` at (`x`, `y`) within `tolerance`, else a new one
+## there (added to them).
+func shared_point(sketch: Sketch*, points: Growing[i64]*, x: f64, y: f64, tolerance: f64) -> i64!:
+    for p in points.view():
+        if math.hypot(sketch.x(p) - x, sketch.y(p) - y) <= tolerance: return p
+    let made = try sketch.add_point(x, y)
+    try points.push(made)
+    return made

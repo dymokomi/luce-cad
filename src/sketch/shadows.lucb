@@ -6,19 +6,36 @@
 ## under the pointer and projects it (CadSketch.project_shadow), linked by
 ## its reference as a projection made from the body is.
 ##
-## The text: a line per edge, `e <reference> <x> <y> …`, the reference
-## escaped as a sketch text's words, `projection_per_edge` x, y pairs.
+## The body's faces come too, for Project's whole face and body outline
+## (shadow_faces.lucb): each face's name and its edges.
+##
+## The text: a line per edge, `e <reference> <height> <x> <y> …`, the
+## reference escaped as a sketch text's words, its mean height off the plane
+## and `projection_per_edge` x, y pairs; then a line per face,
+## `f <name> <edge> …`, the name escaped alike.
 
 pub struct CadShadows:
     var samples: Growing[f64]
+    var heights: Growing[f64]
     ## Each edge's reference, a run of `names`.
     var starts: Growing[usize]
     var names: Growing[u8]
+    ## Each face's name (a run of `face_chars`) and edges (a run of
+    ## `face_edges`).
+    var face_starts: Growing[usize]
+    var face_chars: Growing[u8]
+    var edge_starts: Growing[usize]
+    var face_edges: Growing[i64]
 
     pub func close():
         self.samples.close()
+        self.heights.close()
         self.starts.close()
         self.names.close()
+        self.face_starts.close()
+        self.face_chars.close()
+        self.edge_starts.close()
+        self.face_edges.close()
 
     func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
         _ = visit
@@ -26,12 +43,8 @@ pub struct CadShadows:
 
     ## The shadows `text` describes (empty: none).
     pub static func parse(text: str) -> interop.Reference[CadShadows]!:
-        var samples = Growing[f64]()
-        errdefer samples.close()
-        var starts = Growing[usize]()
-        errdefer starts.close()
-        var names = Growing[u8]()
-        errdefer names.close()
+        var made = CadShadows(Growing[f64](), Growing[f64](), Growing[usize](), Growing[u8](), Growing[usize](), Growing[u8](), Growing[usize](), Growing[i64]())
+        errdefer made.close()
         let per = projection_per_edge()
         var fields: str[72] = ---
         for at in 0..<(usize)72: fields[at] = ""
@@ -40,16 +53,45 @@ pub struct CadShadows:
         while start < bytes.length:
             var end = start
             while end < bytes.length and bytes[end] != 10: end += 1
-            let count = split((str)bytes[start..<end], fields[0..])
+            let line = (str)bytes[start..<end]
             start = end + 1
+            if line.length > 1 and line.bytes[0] == 102 and line.bytes[1] == 32:
+                try made.read_face(line)
+                continue
+            let count = split(line, fields[0..])
             if count == 0: continue
-            if fields[0] != "e" or count != 2 + 2 * per: error(invalid, "a shadows text has a line it does not know")
-            try starts.push(names.count)
-            try unescape(fields[1], &names)
+            if fields[0] != "e" or count != 3 + 2 * per or made.face_starts.count > 0: error(invalid, "a shadows text has a line it does not know")
+            try made.starts.push(made.names.count)
+            try unescape(fields[1], &made.names)
+            try made.heights.push(try strings.parse_f64(fields[2]))
             for at in 0..<2 * per:
-                try samples.push(try strings.parse_f64(fields[2 + at]))
-        try starts.push(names.count)
-        return try interop.Reference[CadShadows].adopt(new CadShadows(samples, starts, names) in memory.heap, cad_shadows_type, memory.heap)
+                try made.samples.push(try strings.parse_f64(fields[3 + at]))
+        try made.starts.push(made.names.count)
+        try made.face_starts.push(made.face_chars.count)
+        try made.edge_starts.push(made.face_edges.count)
+        return try interop.Reference[CadShadows].adopt(new CadShadows(made.samples, made.heights, made.starts, made.names, made.face_starts, made.face_chars, made.edge_starts, made.face_edges) in memory.heap, cad_shadows_type, memory.heap)
+
+    ## A face's line, `f <name> <edge> …`, read (after the edges).
+    func read_face(line: str) -> !:
+        try self.face_starts.push(self.face_chars.count)
+        try self.edge_starts.push(self.face_edges.count)
+        let bytes = line.bytes
+        var at: usize = 2
+        var word = 0
+        while at < bytes.length:
+            while at < bytes.length and bytes[at] == 32: at += 1
+            if at >= bytes.length: break
+            var end = at
+            while end < bytes.length and bytes[end] != 32: end += 1
+            let field = (str)bytes[at..<end]
+            if word == 0: try unescape(field, &self.face_chars)
+            else:
+                let edge = strings.parse_i64(field) else error(invalid, "a shadows text's face names an edge that is not a whole number")
+                if edge < 0 or edge >= self.edge_count(): error(invalid, "a shadows text's face names an edge it does not have")
+                try self.face_edges.push(edge)
+            word += 1
+            at = end
+        if word < 2: error(invalid, "a shadows text's face has no name or no edges")
 
     pub func edge_count() -> i64:
         return (i64)(self.samples.count // (2 * projection_per_edge()))
@@ -63,8 +105,42 @@ pub struct CadShadows:
         if edge < 0 or edge >= self.edge_count(): error(invalid, "the shadows have no such edge")
         return try interop.copy_text((str)self.names.view()[self.starts.items[(usize)edge]..<self.starts.items[(usize)edge + 1]])
 
+    ## How many faces the body has.
+    pub func face_count() -> i64:
+        return (i64)self.face_starts.count - 1 if self.face_starts.count > 0 else 0
+
+    ## Face `face`'s name.
+    pub func face_name(face: i64) -> interop.Owned[str]!:
+        if face < 0 or face >= self.face_count(): error(invalid, "the shadows have no such face")
+        return try interop.copy_text(self.name_of(face))
+
+    ## How many edges face `face`'s loops have, and the `at`th of them.
+    pub func face_edge_count(face: i64) -> i64:
+        if face < 0 or face >= self.face_count(): return 0
+        return (i64)self.edges_of(face).length
+
+    pub func face_edge(face: i64, at: i64) -> i64:
+        if at < 0 or at >= self.face_edge_count(face): return -1
+        return self.edges_of(face)[(usize)at]
+
+    ## The face whose shadow holds (`x`, `y`), the one standing highest
+    ## toward `toward` (+1: the plane's normal side, where the camera is;
+    ## -1 the other) when several do (a box's top over its bottom); -1 for
+    ## none. A face seen edge-on holds nothing.
+    pub func face_at(x: f64, y: f64, toward: f64) -> i64:
+        var best: i64 = -1
+        var best_height = 0.0
+        for f in 0..<self.face_count():
+            if not self.holds(f, x, y): continue
+            let height = self.face_height(f) * toward
+            if best < 0 or height > best_height:
+                best = f
+                best_height = height
+        return best
+
     ## `projection`'s shadows as text, every edge's reference with its
-    ## samples (made where the body is).
+    ## height and samples, then every face's name and edges (made where the
+    ## body is).
     pub static func text_of(projection: interop.Reference[CadProjection]) -> interop.Owned[str]!:
         let p = try projection.get()
         let per = projection_per_edge()
@@ -80,10 +156,50 @@ pub struct CadShadows:
             try references_of(&w, [(i64)e], &reference)
             try put_text(&out, "e ")
             try put_escaped(&out, (str)reference.view())
+            try put_number(&out, p.heights.items[e])
             for value in samples[e * 2 * per..<(e + 1) * 2 * per]:
                 try put_number(&out, value)
             try out.push(10)
+        for f in 0..<w.faces.count:
+            try put_text(&out, "f ")
+            try put_escaped(&out, w.face_name(f))
+            for use in w.face_uses(f):
+                try put_index(&out, (i64)edge_index(use))
+            try out.push(10)
         return try interop.copy_text((str)out.view())
+
+    ## Edge `edge`'s reference, as kept.
+    func reference_of(edge: i64) -> str:
+        return (str)self.names.view()[self.starts.items[(usize)edge]..<self.starts.items[(usize)edge + 1]]
+
+    ## Face `face`'s name, edges and mean height.
+    func name_of(face: i64) -> str:
+        return (str)self.face_chars.view()[self.face_starts.items[(usize)face]..<self.face_starts.items[(usize)face + 1]]
+
+    func edges_of(face: i64) -> const i64[]:
+        return self.face_edges.view()[self.edge_starts.items[(usize)face]..<self.edge_starts.items[(usize)face + 1]]
+
+    func face_height(face: i64) -> f64:
+        var sum = 0.0
+        let edges = self.edges_of(face)
+        for e in edges: sum += self.heights.items[(usize)e]
+        return sum / (f64)(edges.length if edges.length > 0 else 1)
+
+    ## Whether face `face`'s shadow holds (`x`, `y`): its loops' samples
+    ## crossed an odd number of times by the ray to +x.
+    func holds(face: i64, x: f64, y: f64) -> bool:
+        var inside = false
+        let per = projection_per_edge()
+        for e in self.edges_of(face):
+            let run = self.run(e)
+            for k in 0..<per - 1:
+                let ay = run[2 * k + 1]
+                let by = run[2 * k + 3]
+                if (ay > y) == (by > y): continue
+                let ax = run[2 * k]
+                let bx = run[2 * k + 2]
+                if ax + (y - ay) / (by - ay) * (bx - ax) > x: inside = not inside
+        return inside
 
     ## Edge `edge`'s samples (x, y pairs on the plane).
     func run(edge: i64) -> const f64[]:

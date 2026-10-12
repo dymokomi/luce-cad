@@ -18,14 +18,21 @@
 ##   angles      the arc's radius (mm) and where along the sweep (0 at the
 ##               first line, 1 at the second)
 ## An unplaced label goes a little off the geometry, outward from the
-## sketch's middle.
+## sketch's middle; a `step` past that moves it on (a length's to the other
+## side, then a row further out on each; a radius's round its circle; an
+## angle's arc wider), for the editor to try when the first place is taken
+## by another label.
 
 ## Screen points from the geometry to an extension line's start, and past
 ## the dimension line to its end.
 let extension_gap = 3.0
 let extension_overshoot = 5.0
-## Screen points an unplaced label sits off the geometry.
+## Screen points an unplaced label sits off the geometry, and each step
+## further it goes when that place is taken.
 let default_offset = 26.0
+let step_offset = 24.0
+## Radians a radius's or diameter's label turns round per step.
+let step_turn = 0.6
 ## Below this many screen points between its ends, a length's arrows go
 ## outside, pointing in.
 let narrow_span = 28.0
@@ -145,7 +152,27 @@ pub func dimension_frame(sketch: const Sketch*, at: i64) -> DimensionFrame?:
         return f
     if k.kind == ConstraintKind.angle:
         return angle_frame(sketch, k.first, k.second, k.value)
+    if k.kind == ConstraintKind.sweep:
+        return sweep_frame(sketch, sketch.entity(k.first))
     return none
+
+## The frame of arc `e`'s sweep: an angle at its center from the ray to its
+## start round to the ray to its end, counterclockwise; the rays start at
+## the center (no segments on them: extension lines run out to the arc).
+func sweep_frame(sketch: const Sketch*, e: SketchEntity) -> DimensionFrame?:
+    var f = DimensionFrame()
+    f.shape = 3
+    f.cx = sketch.x(e.first)
+    f.cy = sketch.y(e.first)
+    f.r = sketch.params.items[(usize)e.second]
+    let start = math.atan2(sketch.y(e.third) - f.cy, sketch.x(e.third) - f.cx)
+    var end = math.atan2(sketch.y(e.fourth) - f.cy, sketch.x(e.fourth) - f.cx)
+    while end <= start: end += 2.0 * math.pi
+    if not (f.r > 0.0): return none
+    f.dx = math.cos(start)
+    f.dy = math.sin(start)
+    f.sweep = end - start
+    return f
 
 ## The frame of the distance of point (`point_x`, `point_y`) from line
 ## `line`: from the point's foot on the line to the point, the extension
@@ -283,22 +310,30 @@ pub func label_numbers(f: const DimensionFrame*, x: f64, y: f64) -> (f64, f64):
     return (radius, fraction)
 
 ## The label's two numbers for constraint `k` in frame `f`: where it was
-## put, else the default `pixel` points off the geometry.
-func label_of(k: SketchConstraint, f: const DimensionFrame*, pixel: f64) -> (f64, f64):
+## put, else the default `pixel` points off the geometry, `step` places on
+## (a length on the other side, then further out on each; a radius turned
+## round one way then the other; an angle's arc wider).
+func label_of(k: SketchConstraint, f: const DimensionFrame*, pixel: f64, step: i64) -> (f64, f64):
     if k.placed: return (k.label_a, k.label_b)
-    if f.shape == 0: return (f.out * default_offset * pixel, 0.0)
-    if f.shape == 1 or f.shape == 2: return (f.middle, f.r + default_offset * pixel)
-    let reach = math.max(math.max(math.abs(f.t0), math.abs(f.t1)), math.max(math.abs(f.u0), math.abs(f.u1)))
-    return (math.max(40.0 * pixel, reach * 0.6), 0.5)
+    let further = (f64)step * step_offset * pixel
+    if f.shape == 0:
+        let side = f.out if step % 2 == 0 else -f.out
+        return (side * (default_offset + (f64)(step // 2) * step_offset) * pixel, 0.0)
+    if f.shape == 1 or f.shape == 2:
+        let turns = (f64)((step + 1) // 2) * (1.0 if step % 2 == 1 else -1.0)
+        return (f.middle + turns * step_turn, f.r + default_offset * pixel)
+    # (An arc's sweep inside the arc, 0.6 of its radius.)
+    let reach = math.max(math.max(math.max(math.abs(f.t0), math.abs(f.t1)), math.max(math.abs(f.u0), math.abs(f.u1))), f.r)
+    return (math.max(40.0 * pixel, reach * 0.6) + further, 0.5)
 
 ## Lay out constraint `at` of `sketch` into `out` (cleared): false when it
 ## is no dimension, or what it measures has no size.
-pub func lay_out_dimension(sketch: const Sketch*, at: i64, pixel: f64, out: DimensionLayout*) -> bool!:
+pub func lay_out_dimension(sketch: const Sketch*, at: i64, pixel: f64, out: DimensionLayout*, step: i64 = 0) -> bool!:
     out.lines.clear()
     out.arrows.clear()
     let found = dimension_frame(sketch, at)
     let f = found else return false
-    let (first, second) = label_of(sketch.constraints.items[(usize)at], &f, pixel)
+    let (first, second) = label_of(sketch.constraints.items[(usize)at], &f, pixel, step)
     if f.shape == 0: try lay_out_length(&f, first, second, pixel, out)
     elif f.shape == 3: try lay_out_angle(&f, first, second, pixel, out)
     else: try lay_out_round(&f, first, second, out)
