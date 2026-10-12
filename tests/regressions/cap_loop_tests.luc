@@ -3,8 +3,9 @@
 ## uprights' sections, tangent where they meet) then filleted at G1, G2
 ## and G3 and chamfered, from one picked edge (a line or a curve: the
 ## tangent chain brings the rest), the bottom loop and both at once; a
-## line or a curve alone (Tangent chain off), its strip ending in flat
-## faces where the loop goes on.
+## line alone (Tangent chain off) running out round the uprights as
+## Fusion's does, a curve alone ending in flat faces (the sides it goes on
+## into do not turn away).
 ## Each result is closed, its display triangles facing out, of the volume
 ## the swept section takes: along a closed convex loop of length P the
 ## section (area A, centroid x̄ in from both faces) sweeps A (P - 2π x̄),
@@ -90,6 +91,27 @@ func checked(model: CadModel, picked: list[int], r: float, continuity: int, face
     if math.abs(v - expected) > 0.0003: print(f"volume {v}, expected {expected} (G{continuity})")
     assert(math.abs(v - expected) <= 0.0003)
 
+## What one run-out of a chamfer (`continuity` 0) or G1 fillet of `r`
+## takes past a line's end into a G1 upright of `radius`: the section
+## carried on, the upright's cylinder receding δ(s) = R - √(R² - s²) from
+## the line's wall s past the end, until δ reaches r. Each slice takes the
+## corner's part farther than δ from the wall.
+func run_out(continuity: int, radius: float, r: float) -> float:
+    let most = math.sqrt(radius * radius - (radius - r) * (radius - r))
+    var total = 0.0
+    let n = 400
+    for k in 0..<n:
+        let s = most * (float(k) + 0.5) / float(n)
+        let d = radius - math.sqrt(radius * radius - s * s)
+        var slice = (r - d) * (r - d) * 0.5
+        if continuity == 1:
+            slice = 0.0
+            for j in 0..<n:
+                let x = d + (r - d) * (float(j) + 0.5) / float(n)
+                slice += (r - math.sqrt(r * r - (r - x) * (r - x))) * (r - d) / float(n)
+        total += slice * most / float(n)
+    return total
+
 pub func cap_loop_tests() -> unit!:
     let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#b")
     let r = 0.2
@@ -126,20 +148,27 @@ pub func cap_loop_tests() -> unit!:
         _ = CadModeling.filleted(rounded, CadModeling.edge_references(rounded, [line]), 0.45, "#g", 2) catch failure:
             message = failure.message
         assert(message.starts_with("a fillet radius of 0.45 is too large for this curved edge: it must be less than "))
-        # Without Tangent chain, a line alone: its strip ends in a flat face
-        # at each end, where the loop goes on round the upright (the
-        # section's area along the line's 2 - 2 x 0.4).
+        # Without Tangent chain, a line alone: its blend runs out at each
+        # end, carried on past it and trimmed by the upright it runs into
+        # (a chamfer's and G1's strip running on in its plane or cylinder,
+        # G2's and G3's with a piece of their own). It takes the section
+        # along the line's 2 - 2 x 0.4, and more past each end.
         for continuity in 0..<4:
             let (area, _) = section(continuity, r)
             let refs = CadModeling.edge_references(rounded, [line])
             let alone = CadModeling.chamfered(rounded, refs, r, "#g", false) if continuity == 0 else CadModeling.filleted(rounded, refs, r, "#g", continuity, false)
-            assert(alone.face_count() == 13)
+            assert(alone.face_count() == (11 if continuity < 2 else 13))
             let mesh = alone.tessellate(64)
             closed(mesh)
             outward(mesh)
             let removed = volume(rounded.tessellate(64)) - volume(mesh)
-            if math.abs(removed - area * 1.2) > 0.0003: print(f"alone removed {removed}, expected {area * 1.2} (G{continuity})")
-            assert(math.abs(removed - area * 1.2) <= 0.0003)
+            assert(removed > area * 1.2 + 0.001)
+            # Round G1 uprights, a chamfer's and G1's run-outs by their
+            # slices.
+            if first == 1 and continuity < 2:
+                let expected = area * 1.2 + 2.0 * run_out(continuity, 0.4, r)
+                if math.abs(removed - expected) > 0.0001: print(f"alone removed {removed}, expected {expected} (G{continuity})")
+                assert(math.abs(removed - expected) <= 0.0001)
         # A curve alone (an upright's section on the top): open along its
         # B-spline wall, a flat face at each end.
         let curve_alone = CadModeling.filleted(rounded, CadModeling.edge_references(rounded, [curve]), r, "#g", first, false)
@@ -151,4 +180,4 @@ pub func cap_loop_tests() -> unit!:
         let plan = CadModeling.fillet_plan(rounded, CadModeling.edge_references(rounded, [curve]), 3, "#g")
         for size in [0.1, 0.2, 0.3]:
             assert(plan.filleted(size).face_count() == 18)
-    print("PASS cap loops: a box's top and bottom loops after its uprights were filleted (G1, G2, G3) filleted G1, G2, G3 and chamfered, from a line or a curve, one loop or both; closed, outward, of the swept volume; too large said; a line or a curve alone ending in flat faces")
+    print("PASS cap loops: a box's top and bottom loops after its uprights were filleted (G1, G2, G3) filleted G1, G2, G3 and chamfered, from a line or a curve, one loop or both; closed, outward, of the swept volume; too large said; a line alone running out round the uprights (its volume past the ends), a curve alone ending in flat faces")

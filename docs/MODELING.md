@@ -497,15 +497,29 @@ The face's loop moves onto the contacts. Each wall's edge moves along the ruling
 seam is shortened, and each joint gets one section edge, which both of its strips share. The result
 is closed by construction, and checked.
 
-**Open ends.** Without Tangent chain, a picked edge may stop where the loop goes on tangentially into
-an edge that is not picked (a fillet ending where a tangent loop goes on). The strip stops in the
-section's plane there, square to the edge. A flat end face (`<tag>/end[...]`, named by the edge going
-on) fills the corner between the section and the sharp edge, bounded by the section, the seam's upper
-part and a line on the face back to the corner. The seam is split at the wall's contact: the blended
-wall keeps the lower part, the wall going on keeps both. The removed volume is then exactly the
-section's area along the edge. The end face touches the face and the wall in cusps (the section is
-tangent to both), which the tessellator samples finely; it equalizes opposite sides' sample counts up
-to 1024 (was 512) so the strip beside it stays a mapped patch.
+**Open ends: run-outs.** Without Tangent chain, a picked edge may stop where the loop goes on
+tangentially into an edge that is not picked (a fillet ending where a tangent loop goes on). Fusion 360
+does not cap the blend there: the rolling ball runs on past the end and the blend runs out into the
+faces it meets, trimmed by them (`cap_runout.lucb`). Here the section at the end is carried straight
+on along the edge's way. Its contact with the face runs on as a straight line until it crosses the
+edge going on, at the run-out point P; every other point of the section is carried until it leaves
+the material through the wall going on (a rounded upright, which turns away), and those points make
+the trim curve on that wall, from P down to the wall contact (a cubic through graded samples, refined
+until it stays within half the tolerance of the wall). The edge going on is cut at P, and the seam
+is shortened to the wall contact as at a joint. A chamfer's or G1 fillet's strip along a line (a
+plane or a cylinder) simply runs on in its own surface; any other strip gets a run-out piece
+(`<tag>/run[...]`) on the section swept straight on. On a box whose uprights are rounded, one top
+line filleted alone takes the section along the line plus, past each end, the slices of the corner
+farther than δ(s) = R − √(R² − s²) from the wall, which `cap_loop_tests` checks.
+
+Where the wall going on does not turn away from the carried section (a flat side after a corner's
+arc, a hole's wall curving into the material), nothing trims the blend, so it stops flat: the strip
+ends in the section's plane, and a flat end face (`<tag>/end[...]`) fills the corner between the
+section and the sharp edge, bounded by the section, the seam's upper part and a line on the face
+back to the corner. The seam is split at the wall's contact. The end face touches the face and the
+wall in cusps, which the tessellator samples finely (opposite sides' sample counts are equalized up
+to 1024). What Fusion does in that case has not been checked against Fusion itself; concave chains'
+open ends stop flat too.
 
 **Reflections at a G3 corner.** Where a box's top loop is blended around an earlier G3 upright,
 zebra stripes on the corner's strip converge to one point on its contact with the top. That is the

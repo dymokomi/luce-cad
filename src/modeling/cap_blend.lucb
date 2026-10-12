@@ -22,10 +22,13 @@
 ## seam (the line between two walls, along their common ruling) is
 ## shortened; joints get one section edge both strips share. Every vertex
 ## of a picked edge is such a joint, or an open end: the loop goes on
-## tangentially into an edge that is not picked. There the strip stops in
-## the section's plane, a flat end face fills the corner between the
-## section and the sharp edge going on, and the seam is split at the wall's
-## contact. Anything else is declined (blend.lucb's booleans).
+## tangentially into an edge that is not picked. There the blend runs out
+## as Fusion 360's does (cap_runout.lucb): carried on past the end and
+## trimmed by the faces it runs into; where the face going on does not turn
+## away from it, the strip stops in the section's plane, a flat end face
+## fills the corner between the section and the sharp edge going on, and
+## the seam is split at the wall's contact. Anything else is declined
+## (blend.lucb's booleans).
 
 ## A picked edge of a cap loop: its cap and wall faces, the side of its
 ## cap normal its cap lies on (`sign`: the way into the cap is `sign`
@@ -57,8 +60,9 @@ struct CapSide:
 ## side (-1), whether it is a seam, and its new seam (-1, a split seam's
 ## upper part in `uppers`), for
 ## each body vertex its contacts on the cap and wall, its section (-1),
-## whether it is an open end (the edge going on there: `continues`) and
-## the line from its cap contact to it.
+## whether it is an open end (the edge going on there: `continues`), its
+## run-out (`runout_of`, into `runouts`; -1: a flat end) and a flat end's
+## line from its cap contact to it.
 struct Cap:
     var w: const Shape*
     var out: Shape
@@ -77,6 +81,8 @@ struct Cap:
     var open: Growing[bool]
     var continues: Growing[i64]
     var end_lines: Growing[i64]
+    var runouts: Growing[Runout]
+    var runout_of: Growing[i64]
     var name: Growing[u8]
 
     func close():
@@ -92,6 +98,8 @@ struct Cap:
         self.open.close()
         self.continues.close()
         self.end_lines.close()
+        self.runouts.close()
+        self.runout_of.close()
         self.name.close()
 
     func at(id: i64) -> Vector3:
@@ -143,7 +151,7 @@ func new_cap(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cap!:
     for s in w.surfaces.view():
         try out.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
     var made = Cap(w, out, size, round, continuity, math.sqrt(0.5), Growing[CapSide](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](),
-                   Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[u8]())
+                   Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[Runout](), Growing[i64](), Growing[u8]())
     errdefer made.close()
     try made.side_of.fill(w.edges.count, -1)
     try made.is_seam.fill(w.edges.count, false)
@@ -155,6 +163,7 @@ func new_cap(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cap!:
     try made.open.fill(w.points.count, false)
     try made.continues.fill(w.points.count, -1)
     try made.end_lines.fill(w.points.count, -1)
+    try made.runout_of.fill(w.points.count, -1)
     return made
 
 ## The G1 section's middle weight, sin(θ/2) for the chain's corner of
@@ -180,9 +189,9 @@ func into_cap(b: const Cap*, side: const CapSide*, t: f64) -> (Vector3, Vector3)
     return (u, du.multiply_scalar(side.sign))
 
 ## Each vertex's contacts on the cap (its contact distance into the cap)
-## and the wall (that far along the ruling), each seam shortened to its
-## wall contact (a joint's), or split there (an open end's: its upper part
-## meets the end face).
+## and the wall (that far along the ruling), the open ends' run-outs, each
+## seam shortened to its wall contact (a joint's, a run-out's), or split
+## there (a flat end's: its upper part meets the end face).
 func cap_contacts(b: Cap*) -> !:
     let w = b.w
     for side in b.sides.view():
@@ -197,7 +206,9 @@ func cap_contacts(b: Cap*) -> !:
             let p = w.points.items[(usize)v]
             b.on_cap.items[(usize)v] = try b.out.add_point(p.add(u.multiply_scalar(c)))
             b.on_wall.items[(usize)v] = try b.out.add_point(p.add(s.multiply_scalar(c)))
-            if b.open.items[(usize)v]: b.end_lines.items[(usize)v] = try b.line(b.on_cap.items[(usize)v], v)
+    try cap_runouts(b)
+    for v in 0..<w.points.count:
+        if flat_end(b, v): b.end_lines.items[v] = try b.line(b.on_cap.items[v], (i64)v)
     for g in 0..<w.edges.count:
         let seam = w.edges.items[g]
         if not b.is_seam.items[g]: continue
@@ -209,8 +220,12 @@ func cap_contacts(b: Cap*) -> !:
         b.seams.items[g] = try b.line(a, z)
         # At an open end the part above the contact stays, the way the seam
         # runs.
-        if low >= 0 and b.open.items[(usize)seam.start]: b.uppers.items[g] = try b.line(seam.start, low)
-        if high >= 0 and b.open.items[(usize)seam.end]: b.uppers.items[g] = try b.line(high, seam.end)
+        if low >= 0 and flat_end(b, (usize)seam.start): b.uppers.items[g] = try b.line(seam.start, low)
+        if high >= 0 and flat_end(b, (usize)seam.end): b.uppers.items[g] = try b.line(high, seam.end)
+
+## Whether vertex `v` is an open end that stops flat (no run-out).
+func flat_end(b: const Cap*, v: usize) -> bool:
+    return b.open.items[v] and b.runout_of.items[v] < 0
 
 ## The largest blend the loops take, an error when the blend is not
 ## smaller: each contact on the cap must stay short of where the edge's

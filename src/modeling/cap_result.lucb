@@ -1,10 +1,13 @@
 ## A cap loop's blend written out (cap_blend.lucb): the body's faces with
-## their loops on the contacts, the strips, and the open ends' flat faces.
+## their loops on the contacts, the strips, the run-outs' pieces and the
+## flat ends' faces.
 
 ## The result: the body's faces, the cap's loops on its contacts (and an
-## open end's line to its corner), each wall's edge on its contact and its
-## seams shortened or split, then the strips and the open ends' faces;
-## turned to agree and checked closed (local_blend_result.lucb's orient).
+## open end's line to its run-out point or corner), each wall's edge on its
+## contact, its seams shortened or split and the edges going on cut, then
+## the strips (running on over a run-out on their own surface), the
+## run-outs' own pieces and the flat ends' faces; turned to agree and
+## checked closed (local_blend_result.lucb's orient).
 func cap_result(b: Cap*, tag: str) -> interop.Reference[CadModel]!:
     let w = b.w
     var uses = Growing[i64]()
@@ -24,22 +27,64 @@ func cap_result(b: Cap*, tag: str) -> interop.Reference[CadModel]!:
         let face = w.faces.items[f]
         try b.out.add_face(face.surface, face.sense, uses.view(), sizes.view(), try b.out.add_name(w.face_name(f)))
     let fixed = b.out.faces.count
+    # A run-out past a strip on a plane or cylinder (a line's) runs on in
+    # it; any other gets its own piece.
+    for r in 0..<b.runouts.count:
+        let kind = b.out.surfaces.items[(usize)b.sides.items[b.runouts.items[r].side].surface].kind
+        if kind != surface_plane and kind != surface_cylinder: try runout_piece(b, &b.runouts.items[r])
     for side in b.sides.view():
         let edge = w.edges.items[side.edge]
-        # Against the cap's way along its contact, from that contact.
-        var loop: i64[4] = [side.outer + 1, b.sections.items[(usize)edge.end] + 1, -(side.inner + 1), -(b.sections.items[(usize)edge.start] + 1)]
+        # Against the cap's way along its contact, from that contact; a
+        # merged run-out's line and trim in place of its section.
+        uses.clear()
         if try cap_runs_forward(w, side.cap, side.edge):
-            loop = [-(side.outer + 1), b.sections.items[(usize)edge.start] + 1, side.inner + 1, -(b.sections.items[(usize)edge.end] + 1)]
-        let size: i64[1] = [4]
+            try uses.push(-(side.outer + 1))
+            try strip_end(b, edge.start, true, &uses)
+            try uses.push(side.inner + 1)
+            try strip_end(b, edge.end, false, &uses)
+        else:
+            try uses.push(side.outer + 1)
+            try strip_end(b, edge.end, true, &uses)
+            try uses.push(-(side.inner + 1))
+            try strip_end(b, edge.start, false, &uses)
+        sizes.clear()
+        try sizes.push((i64)uses.count)
         try blend_name(w, side.edge, tag, &b.name)
-        try b.out.add_face(side.surface, side.sense, loop[..<4], size[..<1], try b.out.add_name((str)b.name.view()))
-    # Each open end's flat face.
+        try b.out.add_face(side.surface, side.sense, uses.view(), sizes.view(), try b.out.add_name((str)b.name.view()))
+    # Each run-out's own piece, between its section, trim and line.
+    for r in b.runouts.view():
+        if r.surface < 0: continue
+        let v = (usize)r.vertex
+        let loop: i64[3] = [b.sections.items[v] + 1, -(r.trim + 1), -(r.line + 1)]
+        let size: i64[1] = [3]
+        try role_name(&b.name, tag, "run[")
+        try edge_name(w, (usize)r.goes_on, &b.name)
+        try b.name.push(93)
+        try b.out.add_face(r.surface, r.sense, loop[..<3], size[..<1], try b.out.add_name((str)b.name.view()))
+    # Each flat end's face.
     for v in 0..<w.points.count:
-        if b.open.items[v]: try end_face(b, v, tag)
+        if flat_end(b, v): try end_face(b, v, tag)
     try orient(&b.out, fixed)
     let solid = try used_brep(&b.out)
     defer solid.release()
     return try CadModel.of_brep(solid)
+
+## A strip's way across its end at vertex `v` onto `out`: from its cap
+## contact to its wall contact (`down`) or back; its section, or a merged
+## run-out's line to the run-out point and trim from there.
+func strip_end(b: const Cap*, v: i64, down: bool, out: Growing[i64]*) -> !:
+    let r = b.runout_of.items[(usize)v]
+    if r < 0 or b.runouts.items[(usize)r].surface >= 0:
+        let section = b.sections.items[(usize)v]
+        try out.push((section + 1) if down else -(section + 1))
+        return
+    let run = b.runouts.items[(usize)r]
+    if down:
+        try out.push(run.line + 1)
+        try out.push(run.trim + 1)
+    else:
+        try out.push(-(run.trim + 1))
+        try out.push(-(run.line + 1))
 
 ## Whether face `cap` of `w` uses edge `e` from its start to its end.
 func cap_runs_forward(w: const Shape*, cap: usize, e: usize) -> bool!:
@@ -64,9 +109,24 @@ func cap_use(b: Cap*, f: usize, use: i64, out: Growing[i64]*) -> !:
         let tail = (usize)(edge.end if forward else edge.start)
         # On the cap, an open end's line: from the corner to the contact
         # before, from the contact to the corner after.
-        if side.cap == f and b.open.items[head]: try out.push(-(b.end_lines.items[head] + 1))
+        if side.cap == f and b.open.items[head]: try out.push(-(end_line(b, head) + 1))
         try out.push((id + 1) if forward else -(id + 1))
-        if side.cap == f and b.open.items[tail]: try out.push(b.end_lines.items[tail] + 1)
+        if side.cap == f and b.open.items[tail]: try out.push(end_line(b, tail) + 1)
+        return
+    # An edge a run-out cuts: on the wall going on, with the trims up
+    # from the run-out points to the wall contacts.
+    var cut_by: i64 = -1
+    var on_wall = false
+    for r in b.runouts.view():
+        if r.goes_on != (i64)e: continue
+        cut_by = r.cut
+        on_wall = b.sides.items[r.side].cap != f
+    if cut_by >= 0:
+        let first = (usize)(edge.start if forward else edge.end)
+        let last = (usize)(edge.end if forward else edge.start)
+        if on_wall and b.runout_of.items[first] >= 0: try out.push(-(b.runouts.items[(usize)b.runout_of.items[first]].trim + 1))
+        try out.push((cut_by + 1) if forward else -(cut_by + 1))
+        if on_wall and b.runout_of.items[last] >= 0: try out.push(b.runouts.items[(usize)b.runout_of.items[last]].trim + 1)
         return
     let seam = b.seams.items[e]
     if seam < 0:
@@ -94,6 +154,12 @@ func cap_use(b: Cap*, f: usize, use: i64, out: Growing[i64]*) -> !:
     else:
         try out.push(-(second + 1))
         try out.push(-(first + 1))
+
+## An open end's line on the cap from its contact: to its run-out point,
+## or to the corner (a flat end).
+func end_line(b: const Cap*, v: usize) -> i64:
+    let r = b.runout_of.items[v]
+    return b.runouts.items[(usize)r].line if r >= 0 else b.end_lines.items[v]
 
 ## Open end `v`'s flat face, in its section's plane: from its cap contact
 ## along its section to its wall contact, up the seam's upper part to the

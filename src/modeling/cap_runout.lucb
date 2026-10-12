@@ -1,0 +1,266 @@
+## Where a cap loop's blend stops partway (Tangent chain off: the loop goes
+## on tangentially into an edge not picked), as Fusion 360 ends it: the
+## blend runs out. Its section at the end is carried straight on past the
+## end, along the edge's way there, and trimmed by the faces it runs into:
+## the cap (along the contact's straight run on) and the wall going on,
+## which turns away from it (a rounded upright's), so the swept corner
+## leaves the material. The trim on the wall is the curve where the
+## carried section meets it; it ends on the cap where the edge going on
+## crosses the contact's run, at the run-out point P. There the edge going
+## on is cut, and the wall's seam is shortened to the wall contact as at a
+## joint. No end face: the strip (or, past a curved edge, its straight
+## run-out piece) closes the corner.
+##
+## Where the wall going on does not turn away (a plane along the edge's
+## way, the straight run after a corner's arc), the carried section never
+## leaves the material, so there is nothing to trim it: the strip stops in
+## its section's plane and a flat end face fills the corner (cap_result's
+## end_face). A concave edge's blend (in the air) stops that way too.
+
+## An open end's run-out: the edge going on (`goes_on`, cut at `point`,
+## P, its parameter `at`, into `cut`), the line on the cap from the contact to P (`line`), the curve on the
+## wall going on from P to the wall contact (`trim`), the way the section
+## is carried (`way`), how far it goes (`reach`), and the run-out piece's
+## surface and sense (-1: none, the strip runs on itself).
+struct Runout:
+    var vertex: i64
+    var side: usize
+    var goes_on: i64
+    var point: i64
+    var at: f64
+    var line: i64
+    var trim: i64
+    var cut: i64
+    var way: Vector3
+    var reach: f64
+    var surface: i64
+    var sense: bool
+
+## Every open end's run-out onto `b.runouts` (after the contacts), where
+## it has one: `b.runout_of` its index for each such vertex.
+func cap_runouts(b: Cap*) -> !:
+    let w = b.w
+    for k in 0..<b.sides.count:
+        let side = b.sides.items[k]
+        let edge = w.edges.items[side.edge]
+        for end in 0..<(usize)2:
+            let v = edge.start if end == 0 else edge.end
+            if not b.open.items[(usize)v] or not side.convex or b.runout_of.items[(usize)v] >= 0: continue
+            if let r = try runout_at(b, k, v, end):
+                try b.runouts.push(r)
+                b.runout_of.items[(usize)v] = (i64)b.runouts.count - 1
+    try cap_cuts(b)
+
+## Open end `v` (the side's `end`: 0 its start) of side `k` run out, or
+## none when the wall going on does not turn away.
+func runout_at(b: Cap*, k: usize, v: i64, end: usize) -> Runout?!:
+    let w = b.w
+    let side = b.sides.items[k]
+    let edge = w.edges.items[side.edge]
+    let t = edge.t0 if end == 0 else edge.t1
+    let goes_on = b.continues.items[(usize)v]
+    # On past the end: against the way the picked edge leaves it.
+    let way = (try w.leaving(side.edge, (i64)end)).multiply_scalar(-1.0)
+    let (other_a, other_b) = try edge_faces(w, (usize)goes_on)
+    let wall = other_b if other_a == side.cap else other_a
+    var field = field_of(&w.surfaces.items[(usize)w.faces.items[wall].surface])
+    let sign = 1.0 if w.faces.items[wall].sense else -1.0
+    var samples = Growing[Vector3]()
+    defer samples.close()
+    try section_points(b, &side, t, v, 2, &samples)
+    # The section's cap contact carried on until it meets the wall: P.
+    let head = samples.items[0]
+    let run = (try carried(&field, sign, head, way, b.reach)) else return none
+    let p = head.add(way.multiply_scalar(run))
+    # The edge going on must still be there at P.
+    let g = w.edges.items[(usize)goes_on]
+    let tg = try nearest_on(w, g.carrier, p, g.t0, g.t1)
+    if (try w.at(g.carrier, tg)).subtract(p).length() > w.tolerance * 100.0: error(invalid, "a fillet runs out past the edge its loop goes on into: make it smaller, or turn Tangent chain on")
+    let point = try b.out.add_point(p)
+    let line = try b.line(b.on_cap.items[(usize)v], point)
+    # The trim on the wall, from P to the wall contact: the section's
+    # points each carried until they meet the wall, interpolated.
+    let (trim, most) = try runout_trim(b, &side, t, v, way, &field, sign, point, b.on_wall.items[(usize)v])
+    return Runout(v, k, goes_on, point, tg, line, trim, -1, way, math.max(run, most), -1, true)
+
+## Each edge going on cut where the run-outs leave it: from its run-out
+## point to its far end, or between two (one at each end).
+func cap_cuts(b: Cap*) -> !:
+    let w = b.w
+    for k in 0..<b.runouts.count:
+        if b.runouts.items[k].cut >= 0: continue
+        let r = b.runouts.items[k]
+        let g = w.edges.items[(usize)r.goes_on]
+        var t0 = g.t0
+        var t1 = g.t1
+        var start = g.start
+        var end = g.end
+        for j in 0..<b.runouts.count:
+            let q = b.runouts.items[j]
+            if q.goes_on != r.goes_on: continue
+            if q.vertex == g.start:
+                t0 = q.at
+                start = q.point
+            else:
+                t1 = q.at
+                end = q.point
+        # Still running the edge's way, with some length left.
+        if (t1 - t0) * (g.t1 - g.t0) <= 0.0 or math.abs(t1 - t0) <= 1e-9 * math.max(1.0, math.abs(g.t1 - g.t0)):
+            error(invalid, "a fillet runs out past the edge its loop goes on into: make it smaller, or turn Tangent chain on")
+        let cut = try b.out.add_edge(ShapeEdge(g.carrier, t0, t1, start, end))
+        for j in 0..<b.runouts.count:
+            if b.runouts.items[j].goes_on == r.goes_on: b.runouts.items[j].cut = cut
+
+## How far point `q` goes along `way` before it leaves the material through
+## the wall `field` (outward sign `sign`): the first sign change of the
+## wall's side, refined; none when it never leaves within 64 `scale`s.
+func carried(field: Field*, sign: f64, q: Vector3, way: Vector3, scale: f64) -> f64?!:
+    let step = scale / 32.0
+    var low = 0.0
+    var previous = sign * (try implicit(field, q)).0
+    for k in 1..<2049:
+        let s = step * (f64)k
+        let value = sign * (try implicit(field, q.add(way.multiply_scalar(s)))).0
+        if value > 0.0 and previous <= 0.0:
+            var a = low
+            var z = s
+            for _ in 0..<80:
+                let middle = (a + z) * 0.5
+                if sign * (try implicit(field, q.add(way.multiply_scalar(middle)))).0 > 0.0: z = middle
+                else: a = middle
+            return (a + z) * 0.5
+        previous = value
+        low = s
+    return none
+
+## `count` + 1 points along side `side`'s section at parameter `t` (vertex
+## `v`), from its cap contact to its wall contact, onto `out`.
+func section_points(b: const Cap*, side: const CapSide*, t: f64, v: i64, count: usize, out: Growing[Vector3]*) -> !:
+    var a = Growing[f64]()
+    defer a.close()
+    var z = Growing[f64]()
+    defer z.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    var net = Growing[Vector3]()
+    defer net.close()
+    try section_net(b, side, t, v, &net, &knots, &weights)
+    let degree = (i64)(knots.count - net.count - 1)
+    out.clear()
+    for k in 0..<count + 1:
+        try out.push(try NurbsCurve.at(net.view(), weights.view(), degree, knots.view(), (f64)k / (f64)count))
+
+## Side `side`'s section at parameter `t` (vertex `v`) as a curve: its
+## control points, knots and weights.
+func section_net(b: const Cap*, side: const CapSide*, t: f64, v: i64, net: Growing[Vector3]*, knots: Growing[f64]*, weights: Growing[f64]*) -> !:
+    var a = Growing[f64]()
+    defer a.close()
+    var z = Growing[f64]()
+    defer z.close()
+    let (lambda, _) = try corner_at(b, side, t)
+    _ = try section_at(b, lambda, &a, &z, knots, weights)
+    let (u, _) = try into_cap(b, side, t)
+    let s = try ruling_at(b, side, t)
+    let corner = b.w.points.items[(usize)v]
+    net.clear()
+    for i in 0..<a.count: try net.push(corner.add(u.multiply_scalar(a.items[i])).add(s.multiply_scalar(z.items[i])))
+
+## The trim curve of an open end: each point of the section at `t` carried
+## along `way` until it leaves the material through the wall, from the run-
+## out point (`head`, the cap contact's) to the wall contact (`tail`, which
+## stays), a cubic through more points until it stays within the tolerance
+## of the wall; and the farthest any point was carried.
+func runout_trim(b: Cap*, side: const CapSide*, t: f64, v: i64, way: Vector3, field: Field*, sign: f64, head: i64, tail: i64) -> (i64, f64)!:
+    let w = b.w
+    var points = Growing[Vector3]()
+    defer points.close()
+    var net = Growing[Vector3]()
+    defer net.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    var section = Growing[Vector3]()
+    defer section.close()
+    var section_knots = Growing[f64]()
+    defer section_knots.close()
+    var section_weights = Growing[f64]()
+    defer section_weights.close()
+    try section_net(b, side, t, v, &section, &section_knots, &section_weights)
+    let degree = (i64)(section_knots.count - section.count - 1)
+    var count: usize = 16
+    var most = 0.0
+    while true:
+        points.clear()
+        for k in 0..<count + 1:
+            # Graded toward both ends, where the trim turns fastest.
+            let f = 0.5 - 0.5 * math.cos(math.pi * (f64)k / (f64)count)
+            let q = try NurbsCurve.at(section.view(), section_weights.view(), degree, section_knots.view(), f)
+            if k == 0:
+                try points.push(b.at(head))
+                continue
+            if k == count:
+                try points.push(b.at(tail))
+                continue
+            let reached = (try carried(field, sign, q, way, b.reach)) else error(invalid, "a fillet's run-out does not leave the face its loop goes on into all across: turn Tangent chain on, or pick the whole loop")
+            most = math.max(most, reached)
+            try points.push(q.add(way.multiply_scalar(reached)))
+        try interpolate_cubic(points.view(), &net, &knots)
+        weights.clear()
+        try weights.fill(net.count, 1.0)
+        if count >= 1024 or (try trim_fits(field, net.view(), weights.view(), knots.view(), count * 4, w.tolerance)): break
+        count *= 2
+    let index = try b.out.store_spline(net.view(), weights.view(), knots.view(), 3, Matrix4())
+    let carrier = try b.out.add_carrier(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, index))
+    return (try b.out.add_edge(ShapeEdge(carrier, knots.items[3], knots.items[net.count], head, tail)), most)
+
+## Whether the cubic `net` stays on the wall `field` within half the
+## tolerance at `samples` points.
+func trim_fits(field: Field*, net: const Vector3[], weights: const f64[], knots: const f64[], samples: usize, tol: f64) -> bool!:
+    let low = knots[3]
+    let high = knots[net.length]
+    unseed(field)
+    for k in 0..<samples + 1:
+        let p = try NurbsCurve.at(net, weights, 3, knots, low + (high - low) * (f64)k / (f64)samples)
+        let (value, gradient) = try implicit(field, p)
+        if math.abs(value) / math.max(gradient.length(), 1e-300) > tol * 0.5: return false
+    return true
+
+## Run-out `r`'s own piece (past a curved edge, or a strip that does not
+## run on past its end): its section carried straight on, the surface made
+## and its sense, outward like the strip's.
+func runout_piece(b: Cap*, r: Runout*) -> !:
+    let w = b.w
+    let side = b.sides.items[r.side]
+    let edge = w.edges.items[side.edge]
+    let t = edge.t0 if edge.start == r.vertex else edge.t1
+    var net = Growing[Vector3]()
+    defer net.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    try section_net(b, &side, t, r.vertex, &net, &knots, &weights)
+    let degree = (i64)(knots.count - net.count - 1)
+    var points = Growing[Vector3]()
+    defer points.close()
+    var both = Growing[f64]()
+    defer both.close()
+    for i in 0..<net.count:
+        try points.push(net.items[i])
+        try points.push(net.items[i].add(r.way.multiply_scalar(r.reach * 1.01)))
+        try both.push(weights.items[i])
+        try both.push(weights.items[i])
+    let along: f64[4] = [0.0, 0.0, 1.0, 1.0]
+    try b.out.surfaces.push(try Surface(surface_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, points.view(), both.view(), knots.view(), along[..<4], (i64)net.count, 2, degree, 1))
+    r.surface = (i64)b.out.surfaces.count - 1
+    # Outward: from the section's middle away from the corner, as the
+    # strip's (a convex blend).
+    let surf = &b.out.surfaces.items[(usize)r.surface]
+    let normal = try surface_normal_checked(surf.points, surf.weights, surf.nu, surf.nv, surf.du, surf.dv, surf.ku, surf.kv, 0.5, 0.5)
+    let (u, _) = try into_cap(b, &side, t)
+    let s = try ruling_at(b, &side, t)
+    let bisector = try u.add(s).normalized()
+    r.sense = normal.dot(bisector) < 0.0
