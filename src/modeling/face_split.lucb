@@ -15,18 +15,19 @@
 ## cylinder, cone, sphere or torus) are named `<tag>/split[<name>]`, the
 ## others keep the face's name. Refused when the surface crosses none of
 ## the faces, or lies on one of them.
+##
+## With Extend splitting tool off the tool face itself is the sheet, not
+## its surface laid out past the body: it splits only where it reaches,
+## and each face it meets must be cut right across (a cut ending inside a
+## face is refused, naming the option).
+
+## Why an unextended tool face is refused.
+let reach_refusal = "the splitting face does not reach across the faces to split: turn Extend splitting tool on to split by its surface"
 
 ## `model` with its faces `chosen` (marked) split where surface `s` crosses
 ## them (see above).
 func split_faces_by(model: const CadModel*, chosen: const bool[], s: const Surface*, tag: str) -> interop.Reference[CadModel]!:
-    var first = try shape_of(model)
-    let faces_a = first.faces.count
-    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
-    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
-    for f in 0..<faces_a:
-        let (l, h) = try face_box(&first, f)
-        low = lower(low, l)
-        high = upper(high, h)
+    let (low, high) = try model_box(model)
     # The surface as faces: those of its solid lying on it, a plane's large
     # square or a curved surface's long wall.
     let span = high.subtract(low).length() * 4.0 + s.origin.subtract(low).length() * 2.0
@@ -46,7 +47,33 @@ func split_faces_by(model: const CadModel*, chosen: const bool[], s: const Surfa
             if math.abs(gap) > span * 1e-9: lies = false
         if lies: try on.push((i64)f)
     if on.count == 0: error(invalid, "Split Face could not lay out the splitting surface")
-    let sheet = try tool.value().subset(on.view())
+    return try split_faces_by_sheet(model, chosen, s, tool.value(), on.view(), tag, true)
+
+## `model` with its faces `chosen` split where faces `sheet` of `tool` (the
+## tool face, unextended; `s` its surface, the sides' judge) cross them.
+func split_faces_by_face(model: const CadModel*, chosen: const bool[], s: const Surface*, tool: const CadModel*, sheet: const i64[], tag: str) -> interop.Reference[CadModel]!:
+    return try split_faces_by_sheet(model, chosen, s, tool, sheet, tag, false)
+
+## The corners of the box round `model`'s faces.
+func model_box(model: const CadModel*) -> (Vector3, Vector3)!:
+    var w = try shape_of(model)
+    defer w.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(&w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    return (low, high)
+
+## The split itself: `tool`'s faces `on` laid into `model` (its faces
+## `chosen` the ones cut), `s` telling the sides; `extended` when the sheet
+## is the tool's whole surface (a cut then always runs across a face).
+func split_faces_by_sheet(model: const CadModel*, chosen: const bool[], s: const Surface*, tool: const CadModel*, on: const i64[], tag: str, extended: bool) -> interop.Reference[CadModel]!:
+    var first = try shape_of(model)
+    let faces_a = first.faces.count
+    let (low, high) = try model_box(model)
+    let sheet = try tool.subset(on)
     defer sheet.release()
     var second = try shape_of(sheet.value())
     defer second.close()
@@ -70,7 +97,21 @@ func split_faces_by(model: const CadModel*, chosen: const bool[], s: const Surfa
     defer piece_face.close()
     var piece_name = Growing[i64]()
     defer piece_name.close()
-    try face_pieces(&work, &traced, faces_a, &pieces, &piece_face, &piece_name)
+    face_pieces(&work, &traced, faces_a, &pieces, &piece_face, &piece_name) catch failure:
+        # Unextended, a cut ending inside a face leaves loose edges the
+        # pieces cannot be told apart by.
+        if extended: error(failure.code, failure.message)
+        error(invalid, reach_refusal)
+    if not extended:
+        # Unextended, a face the tool face meets must be cut right across:
+        # one cut ending inside it leaves it one piece.
+        for section in work.sections.view():
+            for side in [section.fa, section.fb]:
+                if side < 0 or (usize)side >= faces_a or not chosen[(usize)side]: continue
+                var count = 0
+                for q in 0..<pieces.piece_count():
+                    if piece_face.items[q] == (usize)side: count += 1
+                if count < 2: error(invalid, reach_refusal)
     # Every piece of the body kept as it is.
     var keep = Growing[bool]()
     defer keep.close()
@@ -92,7 +133,9 @@ func split_faces_by(model: const CadModel*, chosen: const bool[], s: const Surfa
             if piece_face.items[q] == f: count += 1
         if count < 2: continue
         split_any = true
-        let point = try piece_point(&work, &traced, f, &pieces, p)
+        let point = piece_point(&work, &traced, f, &pieces, p) catch failure:
+            if extended: error(failure.code, failure.message)
+            error(invalid, reach_refusal)
         let (gap, _) = try signed_gap(s, point, work.tol)
         if gap <= 0.0: continue
         name.clear()
@@ -100,6 +143,8 @@ func split_faces_by(model: const CadModel*, chosen: const bool[], s: const Surfa
         for byte in work.w.face_name(f).bytes: try name.push(byte)
         try name.push(93)
         piece_name.items[p] = try work.w.add_name((str)name.view())
-    if not split_any: error(invalid, "the splitting tool misses the faces to split")
+    if not split_any:
+        if not extended: error(invalid, reach_refusal)
+        error(invalid, "the splitting tool misses the faces to split")
     try seam_zones(&work, &traced, &pieces, piece_face.view(), keep.view())
     return try write_result(&work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view())

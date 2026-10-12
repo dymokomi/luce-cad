@@ -54,9 +54,9 @@ takes them, several apart by `;`:
 |---|---|
 | `offset_faces(model, faces, distance, chain)` | Offset Face, Press Pull on a face: each face moved along its outward normal (a plane moved, a cylinder's, cone's, sphere's or torus's radius changed). With `chain` (the default) the faces meeting them tangentially move too. |
 | `moved_faces(model, faces, by)`, `rotated_faces(model, faces, origin, axis, angle)` | Move Face: translated, or turned about a line. |
-| `replaced_faces(model, faces, target, target_faces, chain)` | Replace Face: the faces (with `chain`, their tangent chain too) on the target faces instead (names apart by `;`; empty: the whole target body). Targets on one surface move the faces onto it; targets on several surfaces, faces of a solid or of an open surface body, trim or extend the body to them (`face_replace.lucb`, `face_quilt.lucb`). |
+| `replaced_faces(model, faces, target, target_faces, chain)` | Replace Face: the faces (with `chain`, their tangent chain too) on the target faces instead (names apart by `;`; empty: the whole target body). Targets on one surface move the faces onto it, as do targets matching the faces one for one; other targets on several surfaces, faces of a solid or of an open surface body, trim or extend the body to them (`face_replace.lucb`, `face_quilt.lucb`). |
 | `deleted_faces(model, faces)` | Delete with healing: holes and bosses whole, one fillet, chamfer or corner face, between flat faces any number of them at once (a rounded chain and its corners, strips apart), or a band between one face and a ring of faces, curved ones too (a top chain beside rounded uprights). |
-| `split_faces(model, faces, tool, tool_face, tag)`, `split_faces_by_plane(model, faces, origin, normal, tag)` | Fusion's Split Face: the faces split where a face's surface (extended) or a plane crosses them; one closed solid with the new edges. The pieces on the surface's outer side (a plane's normal side, the side a tool face faces; outside a curved surface) are named `<tag>/split[<name>]`, the others keep the face's name, so each can be picked apart. |
+| `split_faces(model, faces, tool, tool_face, tag, extend)`, `split_faces_by_plane(model, faces, origin, normal, tag)` | Fusion's Split Face: the faces split where a face's surface (extended; with `extend` off, the face itself, right across each face) or a plane crosses them; one closed solid with the new edges. The pieces on the surface's outer side (a plane's normal side, the side a tool face faces; outside a curved surface) are named `<tag>/split[<name>]`, the others keep the face's name, so each can be picked apart. |
 | `tangent_chain(model, faces)` | Fusion's Tangent chain: the faces and every face meeting them tangentially, and so on, by name. |
 | `copied_faces(model, faces, prefix)` | Move/Copy of faces with Create copy: an open surface body of copies of the faces, their names with `prefix` before them. |
 | `face_names(model, faces)` | The names of B-rep face numbers (a pick's), apart by `;`. |
@@ -761,8 +761,11 @@ Offset, Move and Replace Face are one operation, as Parasolid's local operations
 faces take new surfaces and the body keeps its topology. Built directly, without booleans:
 - **Vertices.** Each vertex on a chosen face is found again where the surfaces of its faces now
   meet: Gauss–Newton on their signed distances, each step the least move that zeroes them to first
-  order, so with two surfaces (a circle's vertex) it slides along their curve. A vertex whose faces
-  all move rigidly moves with them.
+  order, so with two surfaces (a circle's vertex) it slides along their curve. It starts from the
+  old vertex projected onto the surfaces in turn, round after round: where two of them meet
+  tangentially (a top replaced with its fillet) Gauss–Newton's system is nearly singular far from the
+  corner and its steps can land anywhere, while projections close in on it steadily. A vertex whose
+  faces all move rigidly moves with them.
 - **Edges.** An edge on a chosen face gets a new carrier where its two faces' surfaces meet: the
   line through its new ends between two planes, else `intersect.lucb`'s curve through both ends. A
   seam follows its face (a line through its ends, a meridian's circle grown with it). An edge
@@ -813,7 +816,11 @@ gap keeps its carrier, lengthened by Newton along it until it reaches the top's 
 chamfered top chain beside rounded uprights heals back to the rounded box exactly.
 
 **Replace Face onto several targets** (`face_replace.lucb`). Targets on one surface (coplanar faces,
-a split face's pieces) take the local operation. Targets on several surfaces must be faces of a solid:
+a split face's pieces) take the local operation. So do targets on several surfaces that match the
+replaced faces one for one, as Fusion replaces a chain onto a like chain (a top, its fillet and the
+side it rounds onto, onto another body's): each face takes the target of its surface kind facing most
+nearly its way (within 25°, the nearer on a tie), every target taken; the target body's solid plays no
+part, so it may overlap the body. Other targets on several surfaces must be faces of a solid:
 the replaced faces are pushed far past them (Offset Face), the target solid is taken away where it lies
 beyond them (its faces facing the body) or kept where it lies behind, and the piece holding no replaced
 face and most of the body's other faces is kept. A quilt that does not reach across the faces, or a
@@ -830,7 +837,9 @@ goes through the booleans as a solid's faces do.
 its solid lying on it (a plane's large square, a curved surface's long wall), meets only the chosen
 faces; each is split along the new edges, whose ends cut the edges of the faces beside it, and every
 piece is kept as it is, none merged back. A surface that crosses none of the faces, or lies on one of
-them, is refused.
+them, is refused. With Fusion's **Extend splitting tool** off the tool face itself is the sheet (a
+B-spline face too, which cannot be extended): it splits only where it reaches, and a face it meets
+must be cut right across. A cut ending inside a face is refused, naming the option.
 
 ### Shell (`shell.lucb`)
 

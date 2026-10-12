@@ -14,6 +14,70 @@
 ## across them) and every other face of the body must still be there (the
 ## target solid must not cut into the body elsewhere); otherwise refused.
 
+## Targets on several surfaces that match the faces replaced one for one
+## (a top and its fillet onto another top and fillet, as Fusion replaces a
+## chain onto a like chain) take the local operation too, each face onto
+## its own target's surface (replaced_face_by_face), the target body's
+## solid not involved (it may overlap the body); the booleans only when
+## they do not match, or the local operation cannot.
+
+## `w`'s faces `picked` each moved onto the surface of the face of `t`'s
+## `found` like it: of its surface kind, facing at its middle most nearly
+## the way the face does at its own (within 25°; the nearer on a tie),
+## every target taken. Refused when a face finds none or a target is left.
+func replaced_face_by_face(w: Shape*, picked: const usize[], t: const Shape*, found: const usize[]) -> interop.Reference[CadModel]!:
+    var taken = Growing[bool]()
+    defer taken.close()
+    try taken.fill(found.length, false)
+    var surfaces = Growing[Surface]()
+    defer:
+        for surface in surfaces.view():
+            var owned = surface
+            owned.close()
+        surfaces.close()
+    var senses = Growing[bool]()
+    defer senses.close()
+    let least = math.cos(25.0 * math.pi / 180.0)
+    for f in picked:
+        let middle = try point_on_face(w, f)
+        let outward = try w.face_normal(f, middle)
+        let kind = w.surfaces.items[(usize)w.faces.items[f].surface].kind
+        var best: i64 = -1
+        var best_dot = least
+        var best_gap = 1.0e300
+        var best_sense = true
+        for k in 0..<found.length:
+            let g = found[k]
+            let s = &t.surfaces.items[(usize)t.faces.items[g].surface]
+            if s.kind == surface_spline or s.kind != kind: continue
+            # The target face's way at its own middle against the face's.
+            let there = try point_on_face(t, g)
+            let dot = (try t.face_normal(g, there)).dot(outward)
+            let gap = there.subtract(middle).length()
+            if dot > best_dot + 1e-9 or (dot > best_dot - 1e-9 and gap < best_gap):
+                best = (i64)k
+                best_dot = math.max(dot, best_dot)
+                best_gap = gap
+                let (_, n) = try signed_gap(s, there, w.tolerance)
+                best_sense = n.dot(outward) > 0.0
+        if best < 0: error(invalid, "a face to replace has no target face like it")
+        taken.items[(usize)best] = true
+        try surfaces.push(try surface_copy(&t.surfaces.items[(usize)t.faces.items[found[(usize)best]].surface]))
+        try senses.push(best_sense)
+    for k in 0..<found.length:
+        if not taken.items[k]: error(invalid, "a target face matches no face replaced")
+    let m = FaceMove(move_replace, Vector3(), Vector3(), Vector3(), 0.0, 0.0)
+    var distances = Growing[f64]()
+    defer distances.close()
+    return try substitute(w, picked, &m, surfaces.view(), senses.view(), distances.view())
+
+## `model` (as `w`) with faces `picked` replaced by `t`'s faces `found` on
+## several surfaces through the booleans: a surface body's faces closed
+## into a solid first (face_quilt.lucb), a closed solid's trimmed to.
+func replaced_by_booleans(model: interop.Reference[CadModel], w: const Shape*, picked: const usize[], target: interop.Reference[CadModel], t: const Shape*, found: const usize[]) -> interop.Reference[CadModel]!:
+    if try open_faces(t, found): return try replaced_by_open_quilt(model, w, picked, t, found)
+    return try replaced_by_quilt(model, w, picked, target, t, found)
+
 ## Whether faces `found` of `t` all lie on the surface of the first: the
 ## same kind, their boundaries on it.
 func on_one_surface(t: const Shape*, found: const usize[]) -> bool!:

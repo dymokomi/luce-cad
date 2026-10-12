@@ -71,8 +71,9 @@ pub struct CadDirect:
     ## extended or trimmed to it. With `chain` (Fusion's Tangent chain) the
     ## faces meeting the replaced ones tangentially are replaced too.
     ## Targets on one surface move the faces onto it (the surface's outside
-    ## is the side the faces faced); targets on several surfaces, faces of a
-    ## solid, trim the body to them (face_replace.lucb).
+    ## is the side the faces faced); targets on several surfaces matching
+    ## the faces one for one move each onto its own, else (faces of a
+    ## solid, or of a surface body) trim the body to them (face_replace.lucb).
     pub static func replaced_faces(model: interop.Reference[CadModel], faces: str, target: interop.Reference[CadModel], target_faces: str, chain: bool = false) -> interop.Reference[CadModel]!:
         var w = try shape_of(model.value())
         defer w.close()
@@ -90,10 +91,11 @@ pub struct CadDirect:
         else:
             try faces_named(&t, target_faces, &found)
         if not (try on_one_surface(&t, found.view())):
-            # A surface body's faces: closed into a solid first
-            # (face_quilt.lucb).
-            if try open_faces(&t, found.view()): return try replaced_by_open_quilt(model, &w, picked.view(), &t, found.view())
-            return try replaced_by_quilt(model, &w, picked.view(), target, &t, found.view())
+            # Face for face onto like targets, locally (face_replace.lucb).
+            let matched = replaced_face_by_face(&w, picked.view(), &t, found.view()) catch unmatched:
+                _ = unmatched
+                return try replaced_by_booleans(model, &w, picked.view(), target, &t, found.view())
+            return matched
         let s = &t.surfaces.items[(usize)t.faces.items[found.items[0]].surface]
         if s.kind == surface_spline: error(invalid, "Replace Face takes a plane, cylinder, cone, sphere or torus face")
         var surfaces = Growing[Surface]()
@@ -152,8 +154,10 @@ pub struct CadDirect:
     ## solid with the new edges. The pieces on the surface's outer side (a
     ## plane's side the tool face faces; outside a curved surface) are
     ## named `<tag>/split[<name>]`, the others keep their name
-    ## (face_split.lucb).
-    pub static func split_faces(model: interop.Reference[CadModel], faces: str, tool: interop.Reference[CadModel], tool_face: str, tag: str) -> interop.Reference[CadModel]!:
+    ## (face_split.lucb). With `extend` off (Fusion's Extend splitting
+    ## tool) only the tool face itself cuts, a B-spline face too: it must
+    ## reach across each face it splits.
+    pub static func split_faces(model: interop.Reference[CadModel], faces: str, tool: interop.Reference[CadModel], tool_face: str, tag: str, extend: bool = true) -> interop.Reference[CadModel]!:
         var t = try shape_of(tool.value())
         defer t.close()
         var found = Growing[usize]()
@@ -161,14 +165,19 @@ pub struct CadDirect:
         try faces_named(&t, tool_face, &found)
         let f = found.items[0]
         let s = &t.surfaces.items[(usize)t.faces.items[f].surface]
-        if s.kind == surface_spline: error(invalid, "Split Face takes a plane, cylinder, cone, sphere or torus as its tool")
+        if s.kind == surface_spline and extend: error(invalid, "Split Face extends a plane, cylinder, cone, sphere or torus face; turn Extend splitting tool off to split by a B-spline face")
         var chosen = try chosen_faces(model, faces)
         defer chosen.close()
+        var one = Growing[i64]()
+        defer one.close()
+        try one.push((i64)f)
         if s.kind == surface_plane and not t.faces.items[f].sense:
             # The plane turned to face the way the face does.
             var turned = try plane_surface(s.origin, s.x, s.z.multiply_scalar(-1.0))
             defer turned.close()
+            if not extend: return try split_faces_by_face(model.value(), chosen.view(), &turned, tool.value(), one.view(), tag)
             return try split_faces_by(model.value(), chosen.view(), &turned, tag)
+        if not extend: return try split_faces_by_face(model.value(), chosen.view(), s, tool.value(), one.view(), tag)
         return try split_faces_by(model.value(), chosen.view(), s, tag)
 
     ## Split Face by the plane through `origin` facing `normal`: the pieces

@@ -1,0 +1,91 @@
+## Split Face with Fusion's Extend splitting tool off: only the tool face
+## itself cuts. A 2-box's top by a wall standing right across it splits in
+## halves as the extended surface would; by a shorter wall ending inside
+## the top it is refused, naming the option (extended, the same wall's
+## plane halves it). A B-spline tool face is taken with Extend off only.
+from luce_cad.modeling import CadModeling, CadDirect
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+pub func split_reach_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = flat(box, Vector3(0.0, 1.0, 0.0))
+    # A wall at x = 0 from z = -1.5 to 1.5: right across the top.
+    let long = CadModeling.moved_body(CadModeling.tagged(CadSolids.box(1.0, 1.0, 3.0), "long"), Vector3(0.5, 1.0, 0.0))
+    let long_wall = flat(long, Vector3(-1.0, 0.0, 0.0))
+    let halves = CadDirect.split_faces(box, top, long, long_wall, "k", extend = false)
+    closed(halves, 8.0)
+    assert(halves.face_count() == 7, f"{halves.face_count()} faces")
+    let piece = CadModeling.face_point(halves, f"k/split[{top}]")
+    assert(piece.found and piece.point.x < 0.0 and piece.normal.y > 0.999)
+    # A wall from z = -0.5 to 0.5: its cut would end inside the top.
+    let short = CadModeling.moved_body(CadModeling.tagged(CadSolids.box(1.0, 1.0, 1.0), "short"), Vector3(0.5, 1.0, 0.0))
+    let short_wall = flat(short, Vector3(-1.0, 0.0, 0.0))
+    var refused = ""
+    _ = CadDirect.split_faces(box, top, short, short_wall, "k", extend = false) catch failure:
+        refused = failure.message
+    assert(refused.contains("Extend splitting tool"), refused)
+    let extended = CadDirect.split_faces(box, top, short, short_wall, "k")
+    closed(extended, 8.0)
+    assert(extended.face_count() == 7)
+    # The top and the +Z side together: the long wall runs right across
+    # the top but meets the side (z = 1) only from y = 0.5 up, its cut there
+    # ending inside the side: refused.
+    let side = flat(box, Vector3(0.0, 0.0, 1.0))
+    var partial = ""
+    _ = CadDirect.split_faces(box, f"{top};{side}", long, long_wall, "k", extend = false) catch failure:
+        partial = failure.message
+    assert(partial.contains("Extend splitting tool"), partial)
+    # A wall that stops short of the top's height misses it.
+    let low = CadModeling.moved_body(CadModeling.tagged(CadSolids.box(1.0, 0.5, 3.0), "low"), Vector3(0.5, 0.0, 0.0))
+    var missed = ""
+    _ = CadDirect.split_faces(box, top, low, flat(low, Vector3(-1.0, 0.0, 0.0)), "k", extend = false) catch failure:
+        missed = failure.message
+    assert(missed.contains("reach") or missed.contains("misses"), missed)
+    # A G2 fillet's B-spline face as the tool (the short wall's upright at
+    # z = 0.5 rounded, standing through the top): refused extended (no
+    # surface to extend); unextended it is taken, and its cut, ending
+    # inside the top, refused for that.
+    let rounded = CadModeling.filleted(short, edges_where(short, func (a: Vector3, b: Vector3) -> bool: return a.x < 0.01 and b.x < 0.01 and a.z > 0.49 and b.z > 0.49), 0.2, "g", continuity = 2)
+    var spline = ""
+    for f in 0..<rounded.face_count():
+        if rounded.face_surface_kind(f) == 3:
+            spline = CadModeling.face_name_of(rounded, f)
+    assert(spline != "")
+    var unextendable = ""
+    _ = CadDirect.split_faces(box, top, rounded, spline, "k") catch failure:
+        unextendable = failure.message
+    assert(unextendable.contains("Extend splitting tool off"), unextendable)
+    var spline_reach = ""
+    _ = CadDirect.split_faces(box, top, rounded, spline, "k", extend = false) catch failure:
+        spline_reach = failure.message
+    assert(spline_reach.contains("reach across"), spline_reach)
+    print("PASS Split Face with Extend splitting tool off: a wall right across the top halves it, one ending inside it (or inside a second face picked) is refused naming the option, one below it misses")
+
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> str!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return CadModeling.edge_references(model, found)
+
+func closed(model: CadModel, expected: float) -> unit!:
+    let mesh = model.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    assert(math.abs(v - expected) < 1e-6, f"volume {v}, expected {expected}")
+
+## The name of `model`'s flat face whose outward normal is `normal`.
+func flat(model: CadModel, normal: Vector3) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let frame = CadModeling.face_frame(model, name)
+        if frame.found and frame.u.cross(frame.v).dot(normal) > 0.999:
+            return name
+    assert(false, "no such face")
+    return ""
