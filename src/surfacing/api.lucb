@@ -80,6 +80,78 @@ pub struct CadTrimRegions:
 
 pub let cad_trim_regions_type: interop.Type[CadTrimRegions] = interop.Type[CadTrimRegions]("CadTrimRegions", CadTrimRegions.close, closeable = true)
 
+## What an Align made (CadSurfacing.aligned): the set, Alias's Diagnostic
+## Feedback (the smallest and largest gap, angle in degrees, curvature and
+## G3 differences in percent along the edge, and the start and end angles
+## against the master's own cross direction), whether every station met
+## the limits (else Alias's dashed edge), the side aligned and its order,
+## and the aligned rows' control points for the viewport (rows of
+## row_size, row 0 on the edge).
+pub struct CadAlignEdit:
+    var made: interop.Reference[GeometrySet]?
+    pub var gap_low: f64
+    pub var gap_high: f64
+    pub var angle_low: f64
+    pub var angle_high: f64
+    pub var curvature_low: f64
+    pub var curvature_high: f64
+    pub var rate_low: f64
+    pub var rate_high: f64
+    pub var start_angle: f64
+    pub var end_angle: f64
+    pub var met: bool
+    pub var side: i64
+    pub var order: i64
+    pub var row_size: i64
+    var rows: Growing[Vector3]
+    var proxy: Growing[Vector3]
+
+    pub func init():
+        self.made = none
+        self.gap_low = 0.0
+        self.gap_high = 0.0
+        self.angle_low = 0.0
+        self.angle_high = 0.0
+        self.curvature_low = 0.0
+        self.curvature_high = 0.0
+        self.rate_low = 0.0
+        self.rate_high = 0.0
+        self.start_angle = 0.0
+        self.end_angle = 0.0
+        self.met = true
+        self.side = 0
+        self.order = 0
+        self.row_size = 0
+        self.rows = Growing[Vector3]()
+        self.proxy = Growing[Vector3]()
+
+    pub func geometry() -> interop.Reference[GeometrySet]!:
+        let made = self.made else error(invalid, "an align has no geometry")
+        return made.clone()
+
+    ## How many rows it moved (the order's and the extra ones).
+    pub func row_count() -> i64:
+        if self.row_size == 0: return 0
+        return (i64)self.rows.count // self.row_size
+
+    ## Control point `index` of row `row`.
+    pub func row_point(row: i64, index: i64) -> Vector3!:
+        if row < 0 or index < 0 or index >= self.row_size or row >= self.row_count(): error(invalid, "align row point out of range")
+        return self.rows.items[(usize)(row * self.row_size + index)]
+
+    ## The same control point before the align (Alias's proxy display).
+    pub func proxy_point(row: i64, index: i64) -> Vector3!:
+        if row < 0 or index < 0 or index >= self.row_size or row >= self.row_count(): error(invalid, "align row point out of range")
+        return self.proxy.items[(usize)(row * self.row_size + index)]
+
+    pub func close():
+        if let made = self.made: made.release()
+        self.made = none
+        self.rows.close()
+        self.proxy.close()
+
+pub let cad_align_edit_type: interop.Type[CadAlignEdit] = interop.Type[CadAlignEdit]("CadAlignEdit", CadAlignEdit.close, closeable = true)
+
 ## Body `body` of `set`.
 func body_of(set: interop.Reference[GeometrySet], body: i64) -> const CadModel*!:
     let models = set_models(try set.get())
@@ -365,6 +437,79 @@ pub struct CadSurfacing:
             pieces.close()
         try unstitch_model(model, &pieces)
         return try with_body(set, body, pieces.view())
+
+    ## Align (align.lucb, align_master.lucb, align_apply.lucb; Alias's
+    ## Align): the input `input` ("face <name> x y z": the face's side
+    ## nearest the point; "curve <name> x y z": the curve's end nearest it)
+    ## moved onto the master `master` ("edge <face> x y z", "isoparm <face>
+    ## <0 or 1> <fraction>", "curve <name>", "face <name>", "plane ox oy oz
+    ## nx ny nz [free]": Symmetry Plane Align, free leaving the edge off the plane) and matched G`continuity` (0 to 3).
+    ## `second`: a second master, for the side nearest `second_near` (none
+    ## given: the side across). `kind`: 0 Edge, 1 Project (along `vector`;
+    ## the normals without one; `cos` leaves a curve on the master face,
+    ## `shrink` Shrink to Fit), 2 U/V (`vector`.x 0 U, 1 V), 3 Vector (rows
+    ## along `vector`). Position `influence` 0 to 1; Tangent `balance`;
+    ## `tangent`, `curvature`, `g3` the starting scales and the `_end` ones
+    ## the ending (each 1 the input's own hull); `auto_g2`, `auto_g3`;
+    ## `extra` rows blended by `blend`; `partial` from `start` to `end` of
+    ## the input's edge; Modify `both`; Explicit Control `explicit` with
+    ## degrees and spans (0: the input's own); `refine` up to `most` new
+    ## spans within the limits (G0 `gap`, G1 `angle` degrees, G2 and G3
+    ## `difference` percent); `skew` and `skew_end` in degrees; `attach`
+    ## for curves (0 to 1 on the master curve; -1 the nearest point).
+    pub static func aligned(set: interop.Reference[GeometrySet], input: str, master: str, continuity: i64 = 1, second: str = "", second_near: Vector3 = Vector3(),
+                            kind: i64 = 0, vector: Vector3 = Vector3(), influence: f64 = 0.0, balance: bool = false,
+                            tangent: f64 = 1.0, tangent_end: f64 = 1.0, curvature: f64 = 1.0, curvature_end: f64 = 1.0, g3: f64 = 1.0, g3_end: f64 = 1.0,
+                            auto_g2: bool = false, auto_g3: bool = false, extra: i64 = 0, blend: f64 = 0.0, partial: bool = false, start: f64 = 0.0, end: f64 = 1.0,
+                            both: bool = false, explicit: bool = false, degree_u: i64 = 0, spans_u: i64 = 0, degree_v: i64 = 0, spans_v: i64 = 0,
+                            refine: bool = false, most: i64 = 10, gap: f64 = 0.001, angle: f64 = 0.1, difference: f64 = 0.5,
+                            skew: f64 = 0.0, skew_end: f64 = 0.0, attach: f64 = -1.0, cos: bool = true, shrink: bool = true) -> interop.Reference[CadAlignEdit]!:
+        if continuity < 0 or continuity > 3: error(invalid, "Align's continuity is G0 to G3")
+        if kind < 0 or kind > 3: error(invalid, "Align's type is Edge, Project, U/V or Vector")
+        let opts = AlignOptions(continuity, kind, vector, influence, balance, [tangent, tangent_end, curvature, curvature_end, g3, g3_end], auto_g2, auto_g3, extra, blend,
+                                partial, start, end, both, explicit, degree_u, spans_u, degree_v, spans_v, refine, most, [gap, angle, difference, difference],
+                                [skew, skew_end], attach, cos, shrink)
+        var made = try aligned_refined(set, input, master, second, second_near, &opts)
+        let result = interop.Reference[CadAlignEdit].adopt(new CadAlignEdit() in memory.heap, cad_align_edit_type, memory.heap) catch failure:
+            made.close()
+            error(failure.code, failure.message)
+        let edit = result.value()
+        edit.made = made.set.clone()
+        let r = made.report
+        edit.gap_low = r.gap[0] if r.stations > 0 else 0.0
+        edit.gap_high = r.gap[1]
+        edit.angle_low = r.angle[0] if r.angle[0] < 1.0e299 else 0.0
+        edit.angle_high = r.angle[1]
+        edit.curvature_low = r.curvature[0] if r.curvature[0] < 1.0e299 else 0.0
+        edit.curvature_high = r.curvature[1]
+        edit.rate_low = r.rate[0] if r.rate[0] < 1.0e299 else 0.0
+        edit.rate_high = r.rate[1]
+        edit.start_angle = r.start_angle
+        edit.end_angle = r.end_angle
+        edit.met = r.met
+        edit.side = made.side
+        edit.order = made.order
+        edit.row_size = (i64)made.row_size
+        try edit.rows.assign(made.rows.view())
+        try edit.proxy.assign(made.proxy.view())
+        made.close()
+        return result
+
+    ## A body of one B-spline face over its whole domain: control points
+    ## `points` (u-major, index u nv + v) and `weights`, degrees `du`, `dv`,
+    ## clamped knots `ku`, `kv`, the face named `name` and facing along its
+    ## normal (Su x Sv). Surfacing's sheets start this way.
+    pub static func patch(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], name: str) -> interop.Reference[CadModel]!:
+        if nu < 2 or nv < 2 or points.length != (usize)(nu * nv) or weights.length != points.length: error(invalid, "a patch needs nu x nv control points and a weight each")
+        if du < 1 or dv < 1 or du > most_degree or dv > most_degree or du >= nu or dv >= nv: error(invalid, "a patch's degrees are 1 to 11 and below its counts")
+        if ku.length != (usize)(nu + du + 1) or kv.length != (usize)(nv + dv + 1): error(invalid, "a patch's knots are count + degree + 1 each way")
+        var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+        var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+        for q in points:
+            if not q.is_finite(): error(invalid, "a patch's control points must be finite")
+            low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), math.min(low.z, q.z))
+            high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), math.max(high.z, q.z))
+        return try spline_face(points, weights, nu, nv, du, dv, ku, kv, true, name, high.subtract(low).length() * 1e-9)
 
     ## Edge `edge`'s precision in `model` (Stitch's tolerant edges: how far
     ## its faces may lie from it; the model's tolerance otherwise).

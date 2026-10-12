@@ -1,0 +1,571 @@
+## Align (surfacing Stage 4: Alias's Align, Rhino's MatchSrf; §4.2 and §6.1
+## of luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md): an input
+## surface's edge (or a curve's end) moved onto a master and matched to it
+## G0 to G3 by its first CV rows.
+##
+## The input's net is turned so the side to align is its u = low rows
+## (rows P0, P1, ... away from the edge, each a curve along the edge). At a
+## clamped end the derivatives across the edge come from the first rows
+## alone, S^(k) = Σ_{i ≤ k} c_k^i P_i with c the bases' derivatives there
+## (a triangle), so row k is solved from the k-th derivative and the rows
+## before it. The derivatives asked are those of the master's cross curve
+## Q (align_master.lucb), reparameterized: with A the input's cross curve
+## run toward the master (A(x) = S(-x)), arc-length jet (T, K, K') of Q and
+## speeds v, v', v'' (Faa di Bruno):
+##   A' = v T,  A'' = v' T + v² K,  A''' = v'' T + 3 v v' K + v³ K'.
+## The speeds are Alias's sliders, by the hull: v sets how far row 1 lies
+## behind the edge along T (Tangent Scale times the input's own distance:
+## the CVs move least), v' row 2's distance behind row 1 (Curvature Scale),
+## v'' row 3's behind row 2 (G3 Scale); each scale runs from its Starting
+## to its Ending value along the edge; AutoScale G2 and G3 carry the
+## tangent scale into the later rows; Tangent Balance makes the distances
+## follow the master's own speed along the edge (its hull's ratio) at the
+## input's mean. Skew turns Q's chart direction in the tangent plane.
+##
+## Each row is fitted at stations along the edge (least squares on the
+## row's own knots, ends exact), the next row solved from the fitted ones,
+## so their errors do not add up. When the master's derivative fields lie
+## in the rows' space (a polynomial master along a parameter line, after
+## Explicit Control off has raised the degree and taken its knots) the
+## match is exact; otherwise Refine inserts knots where a check fails.
+##
+## Options: the Vector type moves rows 1 and 2 only along a vector (G0
+## first, then each row's normal component solved: G1, G2); Project casts
+## the input's edge onto the master face along a vector (a curve on it is
+## left there, Alias's COS); U/V matches a curve to a surface's U or V
+## direction; Position Influence blends the input's own parameterization
+## (CVs slide least) into the master's (the ends on its ends, its knots
+## taken); Extra CV Rows carry the last row's change further in, decaying
+## by the Blend Factor; Partial aligns only a range of the input's edge,
+## the knots there doubled to full multiplicity with a span either side
+## for the change to die out in; Modify Both moves the master too, both to
+## the averaged position and cross jet; two masters align two sides;
+## Symmetry Plane Align makes the input meet its mirror image (row 1
+## square to the plane; row 2 its curvature kept in the plane; row 3 the
+## rate square to it). Curves align the same way with one CV a row.
+
+## Alignment types (Alias's).
+pub let align_edge: i64 = 0
+pub let align_project: i64 = 1
+pub let align_uv: i64 = 2
+pub let align_vector: i64 = 3
+
+## Align's options (CadSurfacing.aligned's arguments).
+pub struct AlignOptions:
+    pub var continuity: i64
+    pub var kind: i64
+    pub var vector: Vector3
+    pub var influence: f64
+    pub var balance: bool
+    ## Tangent, Curvature and G3 Scale: starting and ending each.
+    pub var scales: f64[6]
+    pub var auto_g2: bool
+    pub var auto_g3: bool
+    pub var extra: i64
+    pub var blend: f64
+    pub var partial: bool
+    pub var start: f64
+    pub var end: f64
+    pub var both: bool
+    pub var explicit: bool
+    pub var degree_u: i64
+    pub var spans_u: i64
+    pub var degree_v: i64
+    pub var spans_v: i64
+    pub var refine: bool
+    pub var most: i64
+    ## G0 gap, G1 angle (degrees), G2 and G3 differences (percent).
+    pub var limits: f64[4]
+    ## Skew at the start and the end, degrees.
+    pub var skew: f64[2]
+    ## Curves: where on a master curve the end attaches (0 to 1; -1: the
+    ## nearest point).
+    pub var attach: f64
+    pub var cos: bool
+    pub var shrink: bool
+
+## How the match came out (Alias's Diagnostic Feedback): the smallest and
+## largest gap, angle (degrees), curvature and G3 differences (percent)
+## over the stations; the angle the input leaves the edge at against the
+## master's own cross direction, at the start and the end; whether every
+## station is within the limits; spans Refine added.
+pub struct AlignReport:
+    pub var gap: f64[2]
+    pub var angle: f64[2]
+    pub var curvature: f64[2]
+    pub var rate: f64[2]
+    pub var start_angle: f64
+    pub var end_angle: f64
+    pub var met: bool
+    pub var added: i64
+    pub var stations: i64
+
+pub func empty_report() -> AlignReport:
+    var r = AlignReport([1.0e300, 0.0], [1.0e300, 0.0], [1.0e300, 0.0], [1.0e300, 0.0], 0.0, 0.0, true, 0, 0)
+    return r
+
+## A station of an aligned side: its knot value along the edge and the
+## fraction of the edge, the input's rows there before the align, and the
+## master's answer.
+struct Station:
+    var s: f64
+    var f: f64
+    var cur: Vector3[4]
+    var target: Goal
+
+# -- The stations and their targets.
+
+## What the side's stations need: the master, the options, the turned net
+## before the align, its end coefficients, and the edge mapping onto the
+## master (Position Influence, Partial).
+struct Aligning:
+    var net: Net
+    var ends: Ends
+    var low: f64
+    var high: f64
+    ## Fractions of the master at the range's two ends (curve masters).
+    var m0: f64
+    var m1: f64
+    var mapped: bool
+
+    func close():
+        self.net.close()
+
+## The station at knot value `s` (fraction `f` of the aligned range).
+func station_of(side: const Aligning*, master: Master*, opts: const AlignOptions*, s: f64, f: f64) -> Station!:
+    let net = &side.net
+    var cur: Vector3[4] = [Vector3(), Vector3(), Vector3(), Vector3()]
+    for i in 0..<fewer(4, net.nu): cur[i] = row_point(net, i, s)
+    let out = cur[0].subtract(cur[1]).normalized() catch failure: recover Vector3()
+    let own = current_arc(&side.ends, &cur) catch failure: recover empty_jet()
+    let probe = Probe(cur[0], edge_along(net, s), out, own)
+    var m = 0.0
+    if side.mapped:
+        # Position Influence: the input's own parameterization (the
+        # nearest point, its ends moved onto the range's ends) blended into
+        # the master's (the range in equal steps).
+        let near = master.nearest(cur[0])
+        let near_low = master.nearest(row_point(net, 0, side.low))
+        let near_high = master.nearest(row_point(net, 0, side.high))
+        let natural_m = near + (1.0 - f) * (side.m0 - near_low) + f * (side.m1 - near_high)
+        let even = side.m0 + (side.m1 - side.m0) * f
+        m = natural_m + (even - natural_m) * math.clamp(opts.influence, 0.0, 1.0)
+    let skew = (opts.skew[0] + (opts.skew[1] - opts.skew[0]) * f) * math.pi / 180.0
+    let target = try master.target(m, &probe, skew)
+    return Station(s, f, cur, target)
+
+# -- Solving the rows.
+
+## Scale `which` (0 tangent, 1 curvature, 2 G3) at fraction `f` along the
+## edge, with AutoScale carrying the tangent's (and curvature's) in.
+func scale_at(opts: const AlignOptions*, which: usize, f: f64) -> f64:
+    let own = opts.scales[which * 2] + (opts.scales[which * 2 + 1] - opts.scales[which * 2]) * f
+    let tangent = opts.scales[0] + (opts.scales[1] - opts.scales[0]) * f
+    let curvature = opts.scales[2] + (opts.scales[3] - opts.scales[2]) * f
+    if which == 1 and opts.auto_g2: return own * tangent
+    if which == 2 and opts.auto_g3: return own * tangent * (curvature if opts.auto_g2 else 1.0)
+    return own
+
+## The input's own hull distances at a station: row 1 behind the edge,
+## row 2 behind row 1, row 3 behind row 2, along the direction `t`.
+func kept_lengths(cur: const Vector3[4]*, t: Vector3, out: f64[3]*):
+    for k in 0..<(usize)3:
+        let d = (*cur)[k].subtract((*cur)[k + 1])
+        let along = d.dot(t)
+        (*out)[k] = along if along > 1e-9 * d.length() else d.length()
+
+## The rows 0..`order` of the side's net matched to `stations` (see the
+## file's header): each row's values at the stations, fitted by `fit`
+## onto the net (cols first..last), the next solved from the fitted ones.
+## `order` 0..3; `columns` the control columns the stations cover.
+func solve_rows(side: Aligning*, stations: Growing[Station]*, opts: const AlignOptions*, order: usize, first: usize, last: usize) -> !:
+    let e = &side.ends
+    let n = stations.count
+    # Tangent Balance: the distances follow the master's speed at the
+    # input's mean.
+    var mean_kept: f64[3] = [0.0, 0.0, 0.0]
+    var mean_speed = 0.0
+    for st in stations.view():
+        var kept: f64[3]
+        kept_lengths(&st.cur, st.target.t, &kept)
+        for k in 0..<(usize)3: mean_kept[k] += kept[k] / (f64)n
+        mean_speed += st.target.speed / (f64)n
+    # Rows fitted so far, at the stations.
+    var fitted = Growing[Vector3]()
+    defer fitted.close()
+    try fitted.fill(n * 4, Vector3())
+    var values = Growing[Vector3]()
+    defer values.close()
+    var params = Growing[f64]()
+    defer params.close()
+    for st in stations.view(): try params.push(st.s)
+    for k in 0..<order + 1:
+        values.clear()
+        for at in 0..<n:
+            let st = &stations.items[at]
+            try values.push(try row_value(e, st, opts, k, fitted.view()[at * 4..<at * 4 + 4], mean_kept, mean_speed))
+        try fit_row(&side.net, k, params.view(), values.view(), first, last)
+        for at in 0..<n: fitted.items[at * 4 + k] = row_point(&side.net, k, stations.items[at].s)
+
+## Row `k`'s value at station `st` (the rows before it fitted, `rows`).
+func row_value(e: const Ends*, st: const Station*, opts: const AlignOptions*, k: usize, rows: const Vector3[], mean_kept: f64[3], mean_speed: f64) -> Vector3!:
+    let t = st.target
+    if k == 0: return t.p
+    var kept: f64[3]
+    kept_lengths(&st.cur, t.t, &kept)
+    var lengths: f64[3]
+    for i in 0..<(usize)3:
+        let base = (mean_kept[i] * t.speed / mean_speed) if opts.balance and mean_speed > 0.0 else kept[i]
+        lengths[i] = base * scale_at(opts, i, st.f)
+    # The rest of S^(k) from the rows before.
+    var rest = Vector3()
+    for i in 0..<k: rest = rest.add(rows[i].multiply_scalar(e.at(k, i)))
+    let ckk = e.at(k, k)
+    if opts.kind == align_vector:
+        return try vector_row(e, st, opts, k, rows, rest)
+    let big_k = t.k
+    let big_dk = t.dk
+    # v from row 1's distance behind the edge: P1 = P0 - v T / c11.
+    let v = lengths[0] * e.at(1, 1)
+    if k == 1: return rows[0].subtract(t.t.multiply_scalar(lengths[0]))
+    # S_uu = v' T + v² K; v' from row 2's distance behind row 1 (row 2
+    # as row 2 is solved: the second derivative's own coefficients).
+    let c22 = e.at(2, 2)
+    let rest2 = rows[0].multiply_scalar(e.at(2, 0)).add(rows[1].multiply_scalar(e.at(2, 1)))
+    let base2 = big_k.multiply_scalar(v * v).subtract(rest2).multiply_scalar(1.0 / c22)
+    let d0 = base2.subtract(rows[1]).dot(t.t)
+    let v1 = -c22 * (lengths[1] + d0)
+    if k == 2: return base2.add(t.t.multiply_scalar(v1 / c22))
+    # S_uuu = -(v'' T + 3 v v' K + v³ K'); v'' from row 3's distance.
+    let base3 = big_k.multiply_scalar(3.0 * v * v1).add(big_dk.multiply_scalar(v * v * v)).multiply_scalar(-1.0).subtract(rest).multiply_scalar(1.0 / ckk)
+    let e0 = rows[2].subtract(base3).dot(t.t)
+    let v2 = ckk * (lengths[2] - e0)
+    return base3.subtract(t.t.multiply_scalar(v2 / ckk))
+
+## The Vector type's row `k`: the row's CV moved only along the vector,
+## its normal component solved (G1: S_u in the master's tangent plane; G2:
+## the normal curvature along S_u the master's).
+func vector_row(e: const Ends*, st: const Station*, opts: const AlignOptions*, k: usize, rows: const Vector3[], rest: Vector3) -> Vector3!:
+    let t = st.target
+    if t.n.length() == 0.0: error(invalid, "Align (Vector) needs a surface master")
+    if k > 2: error(invalid, "Align (Vector) sets G1 and G2: choose G2 or less, or the Edge type")
+    let d = try opts.vector.normalized()
+    let nd = t.n.dot(d)
+    if math.abs(nd) < 1e-6: error(invalid, "Align (Vector): the vector lies in the master's tangent plane, so it cannot set the rows")
+    let ckk = e.at(k, k)
+    let p = st.cur[k]
+    if k == 1:
+        # n . (rest + c11 (P + λ d)) = 0.
+        let lambda = -t.n.dot(rest.add(p.multiply_scalar(ckk))) / (ckk * nd)
+        return p.add(d.multiply_scalar(lambda))
+    # n . S_uu = |S_u|² κ(S_u), κ the master's normal curvature that way.
+    let su = rows[0].multiply_scalar(e.at(1, 0)).add(rows[1].multiply_scalar(e.at(1, 1)))
+    let a = chart_direction(t.su, t.sv, su)
+    let g = su.dot(su)
+    if not (g > 0.0): error(invalid, "Align (Vector): the tangent row lies on the edge")
+    let second = t.l * a.x * a.x + 2.0 * t.m * a.x * a.y + t.nn * a.y * a.y
+    let mu = (second - t.n.dot(rest.add(p.multiply_scalar(ckk)))) / (ckk * nd)
+    return p.add(d.multiply_scalar(mu))
+
+## Row `k`'s control points `first..last` (columns of the net) fitted to
+## `values` at knot values `params` (least squares on the row's knots over
+## those columns, ends exact); the others stay.
+func fit_row(net: Net*, k: usize, params: const f64[], values: const Vector3[], first: usize, last: usize) -> !:
+    let p = (usize)net.dv
+    var knots = Growing[f64]()
+    defer knots.close()
+    # The columns' own clamped knots: those of the range, ends repeated.
+    let a = net.kv.items[first + p]
+    let b = net.kv.items[last + 1]
+    for _ in 0..<p + 1: try knots.push(a)
+    for at in first + p + 1..<last + 1: try knots.push(net.kv.items[at])
+    for _ in 0..<p + 1: try knots.push(b)
+    var fitter = try make_fitter(net.dv, knots.view(), params, 0)
+    defer fitter.close()
+    var samples = Growing[Weighted]()
+    defer samples.close()
+    for q in values: try samples.push(weighted(q, 1.0))
+    var starts: Weighted[4]
+    var ends: Weighted[4]
+    starts[0] = samples.items[0]
+    ends[0] = samples.items[samples.count - 1]
+    var out = Growing[Weighted]()
+    defer out.close()
+    try fitter.fit(samples.view(), &starts, &ends, &out)
+    for j in 0..<out.count: net.points.items[k * net.nv + first + j] = out.items[j]
+
+## Extra CV Rows: rows `order + 1 ..` carry the change of row `order`
+## (columns first..last), by weights falling to nothing past the last
+## (Blend Factor 0 linearly, above it faster, below it slower).
+func blend_rows(net: Net*, before: const Net*, order: usize, extra: usize, factor: f64, first: usize, last: usize):
+    let exponent = math.pow(2.0, factor)
+    for i in 1..<extra + 1:
+        let w = math.pow(1.0 - (f64)i / (f64)(extra + 1), exponent)
+        for j in first..<last + 1:
+            let change = net.points.items[order * net.nv + j].minus(before.points.items[order * net.nv + j])
+            let at = (order + i) * net.nv + j
+            net.points.items[at] = net.points.items[at].plus(change.times(w))
+
+# -- One side, whole.
+
+## The fraction `f` of the domain as a knot value of `net` along v.
+func v_at(net: const Net*, f: f64) -> f64:
+    return net.v_low() + (net.v_high() - net.v_low()) * f
+
+## Aligning `which` of `net` aligned to `master` by `opts` (see the file's
+## header), the report filled in; the net replaced.
+pub func align_side(net: Net*, which: i64, master: Master*, opts: const AlignOptions*, report: AlignReport*) -> !:
+    let order = (usize)math.clamp((f64)opts.continuity, 0.0, 3.0)
+    var turned_net = try turned(net, which, false)
+    defer turned_net.close()
+    try prepare(&turned_net, master, opts, order)
+    # Rows across: this side's order + 1, as many kept at the far side, and
+    # the extra rows between (§6.1).
+    let extra = (usize)math.max(0.0, (f64)opts.extra)
+    let needed = 2 * (order + 1) + extra
+    if turned_net.nu < needed:
+        if opts.explicit:
+            var buffer: u8[200]
+            error(invalid, try strings.format(buffer, f"Align G{order} needs {needed} rows across, has {turned_net.nu} (Explicit Control is on: raise its degree or spans, or turn it off)"))
+        # Spans in the middle of the widest, until there are enough rows.
+        while turned_net.nu < needed:
+            var widest = 0.0
+            var at = 0.5
+            for k in (usize)turned_net.du..<turned_net.nu:
+                let span = turned_net.ku.items[k + 1] - turned_net.ku.items[k]
+                if span > widest:
+                    widest = span
+                    at = ((turned_net.ku.items[k] + turned_net.ku.items[k + 1]) * 0.5 - turned_net.u_low()) / (turned_net.u_high() - turned_net.u_low())
+            _ = try net_insert(&turned_net, 0, at, 1)
+    # Partial: the range's ends to full multiplicity, and a span outside each
+    # for the change to die out in (the edge beyond it stays where it was).
+    var a = 0.0
+    var b = 1.0
+    if opts.partial:
+        a = math.clamp(math.min(opts.start, opts.end), 0.0, 1.0)
+        b = math.clamp(math.max(opts.start, opts.end), 0.0, 1.0)
+        if not (b - a > 1e-6): error(invalid, "Align (Partial): the range is empty")
+        let reach = (b - a) * 0.1
+        for f in [a - reach, a, b, b + reach]:
+            if f <= 1e-9 or f >= 1.0 - 1e-9: continue
+            let times = (usize)turned_net.dv - multiplicity(turned_net.kv.view(), v_at(&turned_net, f), 1e-12)
+            if times > 0: _ = try net_insert(&turned_net, 1, f, times)
+    # Refine: knots inserted along the edge in the spans whose stations miss
+    # the limits, and the align done again, up to Max New Spans.
+    var added: i64 = 0
+    while true:
+        var failing = Growing[f64]()
+        defer failing.close()
+        var attempt = empty_report()
+        var done = try align_once(&turned_net, master, opts, order, extra, v_at(&turned_net, a), v_at(&turned_net, b), &attempt, &failing)
+        let again = opts.refine and not attempt.met and added < opts.most
+        var inserted: i64 = 0
+        if again:
+            # Each failing station's span split in the middle, once.
+            var spans = Growing[f64]()
+            defer spans.close()
+            for s in failing.view():
+                let k = find_span(turned_net.kv.view(), turned_net.nv, turned_net.dv, s)
+                let middle = (turned_net.kv.items[k] + turned_net.kv.items[k + 1]) * 0.5
+                var known = false
+                for q in spans.view():
+                    if q == middle: known = true
+                if not known: try spans.push(middle)
+            for middle in spans.view():
+                if added + inserted >= opts.most: break
+                _ = try net_insert(&turned_net, 1, (middle - turned_net.v_low()) / (turned_net.v_high() - turned_net.v_low()), 1)
+                inserted += 1
+        if not again or inserted == 0:
+            attempt.added = added
+            merge_into(report, &attempt)
+            var back = try turned(&done, which, true)
+            done.close()
+            errdefer back.close()
+            net.close()
+            *net = back
+            return
+        done.close()
+        added += inserted
+
+## `into` given `other`'s measures (the first: taken whole).
+func merge_into(into: AlignReport*, other: const AlignReport*):
+    into.gap = [math.min(into.gap[0], other.gap[0]), math.max(into.gap[1], other.gap[1])]
+    into.angle = [math.min(into.angle[0], other.angle[0]), math.max(into.angle[1], other.angle[1])]
+    into.curvature = [math.min(into.curvature[0], other.curvature[0]), math.max(into.curvature[1], other.curvature[1])]
+    into.rate = [math.min(into.rate[0], other.rate[0]), math.max(into.rate[1], other.rate[1])]
+    into.met = into.met and other.met
+    into.added += other.added
+    if into.stations == 0:
+        into.start_angle = other.start_angle
+        into.end_angle = other.end_angle
+    into.stations += other.stations
+
+## One align of the turned net `net` (the structure ready) over the edge's
+## knot range `low`..`high`: the aligned net returned, the report and the
+## knot values of the stations missing the limits filled in.
+func align_once(net: const Net*, master: Master*, opts: const AlignOptions*, order: usize, extra: usize, low: f64, high: f64, report: AlignReport*, failing: Growing[f64]*) -> Net!:
+    # The columns the range covers: from the one at its start to the one at
+    # its end.
+    let p = (usize)net.dv
+    var first: usize = 0
+    var last = net.nv - 1
+    if opts.partial:
+        for k in 0..<net.kv.count:
+            if net.kv.items[k] >= low - 1e-12 * (1.0 + math.abs(low)):
+                first = k - 1 if k > 0 else 0
+                break
+        var k = net.kv.count
+        while k > 0:
+            k -= 1
+            if net.kv.items[k] <= high + 1e-12 * (1.0 + math.abs(high)):
+                last = fewer(net.nv - 1, k - p if k >= p else 0)
+                break
+    var side = Aligning(try net.copy(), ends_of(net.ku.view(), net.nu, net.du), low, high, 0.0, 1.0, false)
+    errdefer side.close()
+    let curve_like = master.kind == master_edge or master.kind == master_isoparm or master.kind == master_curve
+    if curve_like:
+        side.mapped = true
+        let near_low = master.nearest(row_point(&side.net, 0, low))
+        let near_high = master.nearest(row_point(&side.net, 0, high))
+        if opts.partial:
+            side.m0 = near_low
+            side.m1 = near_high
+        else:
+            let reversed = near_low > near_high
+            side.m0 = 1.0 if reversed else 0.0
+            side.m1 = 0.0 if reversed else 1.0
+    # Stations: the fit's parameters over the range's spans.
+    var knots = Growing[f64]()
+    defer knots.close()
+    for _ in 0..<p + 1: try knots.push(low)
+    for k in net.kv.view():
+        if k > low + 1e-12 * (1.0 + math.abs(low)) and k < high - 1e-12 * (1.0 + math.abs(high)): try knots.push(k)
+    for _ in 0..<p + 1: try knots.push(high)
+    var params = Growing[f64]()
+    defer params.close()
+    try fit_parameters(knots.view(), net.dv, 2 * (p + 1), &params)
+    var stations = Growing[Station]()
+    defer stations.close()
+    for at in 0..<params.count:
+        let s = params.items[at]
+        try stations.push(try station_of(&side, master, opts, s, (s - low) / (high - low)))
+    try solve_rows(&side, &stations, opts, order, first, last)
+    if extra > 0: blend_rows(&side.net, net, order, extra, opts.blend, first, last)
+    # The report, at stations between the fit's.
+    try check_side(&side, master, opts, order, report, failing)
+    let made = side.net
+    side.net = empty_net()
+    side.close()
+    return made
+
+## The turned net's structure before the align. Explicit Control on: the
+## degrees and spans asked (0: its own), refitted to them. Off: quintic
+## across at least (the multi-span quintic of §2.1), and with Position
+## Influence 1 on a B-spline master curve, its degree and knots along.
+func prepare(net: Net*, master: const Master*, opts: const AlignOptions*, order: usize) -> !:
+    if opts.explicit:
+        let du = opts.degree_u if opts.degree_u > 0 else net.du
+        let dv = opts.degree_v if opts.degree_v > 0 else net.dv
+        let su = (usize)opts.spans_u if opts.spans_u > 0 else distinct_spans(net.ku.view(), net.du)
+        let sv = (usize)opts.spans_v if opts.spans_v > 0 else distinct_spans(net.kv.view(), net.dv)
+        if du != net.du or dv != net.dv or su != distinct_spans(net.ku.view(), net.du) or sv != distinct_spans(net.kv.view(), net.dv):
+            if du < 1 or du > most_degree or dv < 1 or dv > most_degree: error(invalid, "Align: Explicit Control's degrees are 1 to 11")
+            var ku = Growing[f64]()
+            defer ku.close()
+            var kv = Growing[f64]()
+            defer kv.close()
+            try uniform_knots(du, su, net.u_low(), net.u_high(), &ku)
+            try uniform_knots(dv, sv, net.v_low(), net.v_high(), &kv)
+            let made = try refit_net(net, du, ku.view(), dv, kv.view(), 0, 0, false)
+            net.close()
+            *net = made
+        if (usize)net.du < order:
+            var buffer: u8[160]
+            error(invalid, try strings.format(buffer, f"Align G{order} needs degree {order} or more across (Explicit Control is on)"))
+        return
+    if net.du < 5: try net_elevate(net, 0, (usize)(5 - net.du))
+    if opts.influence >= 1.0 and (master.kind == master_edge or master.kind == master_isoparm or master.kind == master_curve):
+        let c = &master.curve
+        if c.degree > net.dv: try net_elevate(net, 1, (usize)(c.degree - net.dv))
+        let reversed = master.nearest(row_point(net, 0, net.v_low())) > master.nearest(row_point(net, 0, net.v_high()))
+        for k in c.knots.view():
+            if not (k > c.low() and k < c.high()): continue
+            let along = (k - c.low()) / (c.high() - c.low())
+            let f = 1.0 - along if reversed else along
+            let at = v_at(net, f)
+            let have = multiplicity(net.kv.view(), at, 1e-12 * (net.v_high() - net.v_low()))
+            let want = multiplicity(c.knots.view(), k, 1e-12)
+            if want > have: _ = try net_insert(net, 1, f, want - have)
+
+## The distinct spans of a clamped knot vector of `degree`.
+func distinct_spans(knots: const f64[], degree: i64) -> usize:
+    var spans: usize = 0
+    for i in (usize)degree..<knots.length - (usize)degree - 1:
+        if knots[i + 1] > knots[i]: spans += 1
+    return spans
+
+## Every station between the fit's checked against the master (a fresh
+## station before the align, the side after), into `report`.
+func check_side(side: const Aligning*, master: Master*, opts: const AlignOptions*, order: usize, report: AlignReport*, failing: Growing[f64]*) -> !:
+    let count: usize = 64
+    for at in 0..<count + 1:
+        let f = (f64)at / (f64)count
+        let s = side.low + (side.high - side.low) * f
+        var rows: Vector3[4] = [Vector3(), Vector3(), Vector3(), Vector3()]
+        for i in 0..<fewer(4, side.net.nu): rows[i] = row_point(&side.net, i, s)
+        let own = try current_arc(&side.ends, &rows)
+        # The master's answer where row 0 went (its point on the master).
+        let probe = Probe(rows[0], edge_along(&side.net, s), own.d[1], own)
+        var m = 0.0
+        if side.mapped: m = master.nearest(rows[0])
+        let skew = (opts.skew[0] + (opts.skew[1] - opts.skew[0]) * f) * math.pi / 180.0
+        let target = try master.target(m, &probe, skew)
+        let was = report.met
+        report.met = true
+        try measure_station(own, target, order, opts, report)
+        if not report.met: try failing.push(s)
+        report.met = was and report.met
+        if at == 0: report.start_angle = angle_between(own.d[1], target.reference)
+        if at == count: report.end_angle = angle_between(own.d[1], target.reference)
+        report.stations += 1
+
+## Degrees between two directions.
+func angle_between(a: Vector3, b: Vector3) -> f64:
+    let la = a.length()
+    let lb = b.length()
+    if not (la > 0.0 and lb > 0.0): return 0.0
+    return math.acos(math.clamp(a.dot(b) / (la * lb), -1.0, 1.0)) * 180.0 / math.pi
+
+## One station's measures (own: the input's cross jet by arc length, run
+## toward the master) against the target, into the report.
+func measure_station(own: Jet, target: Goal, order: usize, opts: const AlignOptions*, report: AlignReport*) -> !:
+    let gap = own.d[0].subtract(target.p).length()
+    var angle = 0.0
+    var curvature = 0.0
+    var rate = 0.0
+    if target.n.length() > 0.0:
+        # The tangent plane: the input's cross tangent's lean out of it.
+        angle = math.asin(math.clamp(math.abs(own.d[1].dot(target.n)), 0.0, 1.0)) * 180.0 / math.pi
+        let kn = own.d[2].dot(target.n)
+        let km = target.k.dot(target.n)
+        curvature = relative(kn, km)
+        rate = relative(own.d[3].dot(target.n), target.dk.dot(target.n))
+    else:
+        angle = angle_between(own.d[1], target.t)
+        curvature = relative(own.d[2].length(), target.k.length())
+        rate = relative(own.d[3].subtract(target.t.multiply_scalar(own.d[3].dot(target.t))).length(), target.dk.subtract(target.t.multiply_scalar(target.dk.dot(target.t))).length())
+    let measures: f64[4] = [gap, angle, curvature, rate]
+    for k in 0..<(usize)4:
+        if k > order: break
+        let value = measures[k]
+        if k == 0: report.gap = [math.min(report.gap[0], value), math.max(report.gap[1], value)]
+        if k == 1: report.angle = [math.min(report.angle[0], value), math.max(report.angle[1], value)]
+        if k == 2: report.curvature = [math.min(report.curvature[0], value), math.max(report.curvature[1], value)]
+        if k == 3: report.rate = [math.min(report.rate[0], value), math.max(report.rate[1], value)]
+        if value > opts.limits[k]: report.met = false
+
+## |a - b| relative to the larger, in percent (flat sides agree).
+func relative(a: f64, b: f64) -> f64:
+    let most = math.max(math.abs(a), math.abs(b))
+    if most <= 1e-9: return 0.0
+    return math.abs(a - b) / most * 100.0

@@ -1,0 +1,452 @@
+## Align's masters (surfacing Stage 4: Alias's Align; §4.2 and §6.1 of
+## luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md): what the input
+## is matched to, evaluated station by station.
+##
+## A master is a surface edge (the face lies on one side of it), an isoparm
+## of a face, a curve on a face, a free curve, a face itself (Alias's
+## Project type and, for curves, its U/V type) or a symmetry plane. At each
+## station it gives the point the input's edge goes to and the master's
+## cross curve Q through it: on a surface the curve whose chart is the
+## straight line across the edge there (for an edge along a parameter line
+## that line is the other parameter's isoparm, so a polynomial master's
+## derivative fields stay polynomial and the match can be exact), running
+## away from the input; on a free curve the curve itself. Q is handed on as
+## its arc-length jet: the unit tangent T, the curvature vector K and K's
+## rate. The input's cross curves are made to osculate Q to the order
+## asked, which is G0 to G3 across the edge: along the edge the shared
+## curve, and in one transversal direction the matched normal section,
+## give the rest (§6.1).
+
+## Master kinds.
+pub let master_edge: i64 = 0
+pub let master_isoparm: i64 = 1
+pub let master_curve: i64 = 2
+pub let master_face: i64 = 3
+pub let master_plane: i64 = 4
+## Modify Both: the other surface's side, averaged with the input.
+pub let master_average: i64 = 5
+
+## What the input looks like at a station, for the master to answer: the
+## input edge's point and its direction along the edge, the way out of the
+## input across the edge (toward the master), and the input's own cross
+## jet by arc length that way (a symmetry plane and Modify Both use it).
+pub struct Probe:
+    pub var e: Vector3
+    pub var along: Vector3
+    pub var out: Vector3
+    pub var own: Jet
+
+## The master's answer at a station: the point, Q's arc-length jet (t the
+## unit tangent leaving the input, k the curvature vector, dk its rate),
+## the master's unit normal there (zero off a surface), its speed |Q'| (by
+## the master's own chart: Tangent Balance), the cross direction before
+## any skew (the start and end angles), and the second fundamental form's
+## pieces for Vector alignment: the chart partials su, sv and n . suu, n .
+## suv, n . svv.
+pub struct Goal:
+    pub var p: Vector3
+    pub var t: Vector3
+    pub var k: Vector3
+    pub var dk: Vector3
+    pub var n: Vector3
+    pub var speed: f64
+    pub var reference: Vector3
+    pub var su: Vector3
+    pub var sv: Vector3
+    pub var l: f64
+    pub var m: f64
+    pub var nn: f64
+
+pub func empty_goal() -> Goal:
+    return Goal(Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), 0.0, Vector3(), Vector3(), Vector3(), 0.0, 0.0, 0.0)
+
+## A master, ready to evaluate.
+pub struct Master:
+    pub var kind: i64
+    ## The master's body and face (edge, isoparm, face kinds; a curve on a
+    ## face), its edge.
+    pub var w: Shape
+    pub var f: usize
+    pub var has_face: bool
+    ## The curve the stations run along: the edge's exact curve, the
+    ## isoparm, the master curve (unit domain).
+    pub var curve: Spline
+    ## Isoparm: which parameter runs across it (0 u, 1 v); U/V type: the
+    ## direction to match a curve to (-1: the edge's own rule).
+    pub var across: i64
+    ## Project type: the direction cast along (zero: the normals).
+    pub var vector: Vector3
+    ## Symmetry plane.
+    pub var origin: Vector3
+    pub var normal: Vector3
+    ## Symmetry plane: the edge moved onto it (Project For Position).
+    pub var onto: bool
+    ## Its chart's box (for steps) and the last chart point (seeds).
+    pub var seed: Vector3
+    pub var seeded: bool
+    ## The face's chart loops (which side of an edge the face lies on).
+    pub var chart: Growing[Vector3]
+    pub var starts: Growing[usize]
+    ## Modify Both: the other surface's net turned so its side is its
+    ## u = low rows, its end coefficients and its edge row, and how far
+    ## toward it the target lies (one half: the middle; one: the other).
+    pub var other: Net
+    pub var other_ends: Ends
+    pub var other_row: Spline
+    pub var weight: f64
+    ## An edge master: +1 when the face lies on the side n x along of its
+    ## edge, -1 the other, 0 not yet known.
+    pub var inward: i64
+
+    pub func close():
+        self.w.close()
+        self.curve.close()
+        self.chart.close()
+        self.starts.close()
+        self.other.close()
+        self.other_row.close()
+
+    func surface() -> const Surface*:
+        return &self.w.surfaces.items[(usize)self.w.faces.items[self.f].surface]
+
+    ## Whether chart point `uv` lies inside the master face.
+    func holds(uv: Vector3) -> bool:
+        let s = self.surface()
+        return chart_winding(self.chart.view(), self.starts.view(), uv.x, uv.y, periodic(s), s.kind == surface_torus) != 0
+
+    ## The chart point of `p` on the master face's surface, from the last.
+    func chart_of(p: Vector3) -> Vector3!:
+        let s = self.surface()
+        var uv = Vector3()
+        if s.kind == surface_spline:
+            uv = try nearest_parameters(*s, p, self.seed, not self.seeded)
+        else:
+            uv = chart_uv(*s, p, self.seed, self.seeded)
+        self.seed = uv
+        self.seeded = true
+        return uv
+
+    ## The master curve's fraction nearest `p`.
+    pub func nearest(p: Vector3) -> f64:
+        return spline_nearest(&self.curve, p)
+
+    ## The master's answer at fraction `m` of its curve (edge, isoparm and
+    ## curve kinds) or for the probe's point (face and plane kinds), the
+    ## cross direction skewed by `skew` radians toward the edge's own
+    ## direction (Alias's Skew).
+    pub func target(m: f64, probe: const Probe*, skew: f64) -> Goal!:
+        var out = empty_goal()
+        if self.kind == master_plane:
+            # The mirror half: the point on the plane (Project For Position),
+            # the cross curve square to it. Mirrored and run back, a curve
+            # keeps its curvature reflected and turns its rate: they agree
+            # when the curvature lies in the plane (the input's own, kept
+            # there) and its rate is square to it (-|K|² T by arc length).
+            let n = try self.normal.normalized()
+            out.p = probe.e.subtract(n.multiply_scalar(probe.e.subtract(self.origin).dot(n))) if self.onto else probe.e
+            out.t = n if probe.out.dot(n) >= 0.0 else n.multiply_scalar(-1.0)
+            out.k = probe.own.d[2].subtract(out.t.multiply_scalar(probe.own.d[2].dot(out.t)))
+            out.dk = out.t.multiply_scalar(-out.k.dot(out.k))
+            out.reference = out.t
+            out.speed = 1.0
+            return out
+        if self.kind == master_average:
+            # The other surface's edge and cross jet where it meets this
+            # one (its rows run toward it), weighed with this one's own.
+            let s = spline_nearest(&self.other_row, probe.e)
+            var rows: Vector3[4] = [Vector3(), Vector3(), Vector3(), Vector3()]
+            for i in 0..<fewer(4, self.other.nu): rows[i] = row_point(&self.other, i, s)
+            let theirs = try current_arc(&self.other_ends, &rows)
+            return averaged(probe.own, theirs, probe.along, self.weight)
+        var p = probe.e
+        var along = probe.along
+        if self.kind != master_face:
+            let c = &self.curve
+            let jet = try curve_jet(c, c.low() + (c.high() - c.low()) * math.clamp(m, 0.0, 1.0), 3, false)
+            p = jet.d[0]
+            along = jet.d[1]
+            if not self.has_face:
+                # A free curve: Q is the curve itself, leaving the joint
+                # the way the input does.
+                var run = jet
+                if jet.d[1].dot(probe.out) < 0.0: run = reversed_jet(&jet)
+                let arc = try arc_jet(&run)
+                out.p = p
+                out.t = arc.d[1]
+                out.k = arc.d[2]
+                out.dk = arc.d[3]
+                out.speed = jet.d[1].length()
+                out.reference = out.t
+                return out
+        let s = self.surface()
+        if self.kind == master_face and self.vector.length() > 0.0:
+            p = try self.cast(probe.e)
+        var uv = try self.chart_of(p)
+        if self.kind == master_face: p = try surface_point(*s, uv)
+        let flat = try surface_jet(s, uv, false, false)
+        var normal = flat.su.cross(flat.sv)
+        if self.has_face and not self.w.faces.items[self.f].sense: normal = normal.multiply_scalar(-1.0)
+        let n = normal.normalized() catch failure: error(invalid, "Align: the master surface is singular there (a pole); pick another master")
+        # The chart direction across: the other parameter where the edge
+        # runs along a parameter line, else square to it in the surface.
+        var t_along = along.subtract(n.multiply_scalar(along.dot(n)))
+        var a = Vector3()
+        if t_along.length() == 0.0 and self.across < 0:
+            # A curve's end on a face: on the way it leaves, in the face.
+            let leaving = probe.out.subtract(n.multiply_scalar(probe.out.dot(n)))
+            if not (leaving.length() > 0.0): error(invalid, "Align: the curve leaves square to the master surface; it has no direction on it")
+            t_along = n.cross(leaving)
+            a = chart_direction(flat.su, flat.sv, leaving)
+        elif self.kind == master_isoparm:
+            a = Vector3(1.0, 0.0, 0.0) if self.across == 0 else Vector3(0.0, 1.0, 0.0)
+        elif self.across >= 0:
+            a = Vector3(1.0, 0.0, 0.0) if self.across == 0 else Vector3(0.0, 1.0, 0.0)
+        else:
+            let a_along = chart_direction(flat.su, flat.sv, t_along)
+            let size = math.sqrt(a_along.x * a_along.x + a_along.y * a_along.y)
+            if size > 0.0 and math.abs(a_along.y) <= 1e-7 * size:
+                a = Vector3(0.0, 1.0, 0.0)
+            elif size > 0.0 and math.abs(a_along.x) <= 1e-7 * size:
+                a = Vector3(1.0, 0.0, 0.0)
+            else:
+                let square = (try t_along.normalized()).cross(n)
+                a = chart_direction(flat.su, flat.sv, square)
+        # Running away from the input: into the face beside an edge, else
+        # on the way the input leaves.
+        var cross = flat.su.multiply_scalar(a.x).add(flat.sv.multiply_scalar(a.y))
+        if self.kind == master_edge:
+            # Which side of the edge the face lies on, found once in the
+            # edge's middle (at a corner a step across can land on the
+            # boundary), as a turn about the normal from the edge's
+            # direction.
+            if self.inward == 0:
+                try self.find_inward()
+            if n.cross(along).dot(cross) * (f64)self.inward < 0.0: a = a.multiply_scalar(-1.0)
+        elif cross.dot(probe.out) < 0.0:
+            a = a.multiply_scalar(-1.0)
+        cross = flat.su.multiply_scalar(a.x).add(flat.sv.multiply_scalar(a.y))
+        let unskewed = try cross.normalized()
+        out.reference = unskewed
+        if skew != 0.0:
+            # Turned in the tangent plane toward the edge's direction.
+            let side = try t_along.normalized()
+            let rotated = unskewed.multiply_scalar(math.cos(skew)).add(side.multiply_scalar(math.sin(skew)))
+            a = chart_direction(flat.su, flat.sv, rotated.multiply_scalar(cross.length()))
+        # Q = S(uv + σ a): its derivatives from the surface's jet, from the
+        # side it runs to at knot lines.
+        let j = try surface_jet(s, uv, a.x < 0.0, a.y < 0.0)
+        var q = empty_jet()
+        q.d[0] = p
+        q.d[1] = j.su.multiply_scalar(a.x).add(j.sv.multiply_scalar(a.y))
+        q.d[2] = j.suu.multiply_scalar(a.x * a.x).add(j.suv.multiply_scalar(2.0 * a.x * a.y)).add(j.svv.multiply_scalar(a.y * a.y))
+        q.d[3] = j.suuu.multiply_scalar(a.x * a.x * a.x).add(j.suuv.multiply_scalar(3.0 * a.x * a.x * a.y)).add(j.suvv.multiply_scalar(3.0 * a.x * a.y * a.y)).add(j.svvv.multiply_scalar(a.y * a.y * a.y))
+        let arc = try arc_jet(&q)
+        out.p = p
+        out.t = arc.d[1]
+        out.k = arc.d[2]
+        out.dk = arc.d[3]
+        out.n = n
+        out.speed = q.d[1].length()
+        out.su = j.su
+        out.sv = j.sv
+        out.l = n.dot(j.suu)
+        out.m = n.dot(j.suv)
+        out.nn = n.dot(j.svv)
+        return out
+
+    ## Which side of the edge the face lies on (Master.inward), from the
+    ## edge's middle: a small step square to it in the chart, inside or not.
+    func find_inward() -> !:
+        let c = &self.curve
+        let jet = try curve_jet(c, (c.low() + c.high()) * 0.5, 1, false)
+        let uv = try self.chart_of(jet.d[0])
+        let s = self.surface()
+        let j = try surface_jet(s, uv, false, false)
+        var normal = j.su.cross(j.sv)
+        if not self.w.faces.items[self.f].sense: normal = normal.multiply_scalar(-1.0)
+        let side = normal.cross(jet.d[1])
+        let a = chart_direction(j.su, j.sv, side)
+        let size = math.sqrt(a.x * a.x + a.y * a.y)
+        if not (size > 0.0): error(invalid, "Align: the master edge's surface is singular in its middle")
+        var step = 1e-4
+        for _ in 0..<6:
+            let ahead = self.holds(uv.add(a.multiply_scalar(step / size)))
+            let behind = self.holds(uv.subtract(a.multiply_scalar(step / size)))
+            if ahead != behind:
+                self.inward = 1 if ahead else -1
+                return
+            step *= 10.0
+        error(invalid, "Align: cannot tell which side of the master edge its face lies on")
+
+    ## Project type: where the line through `p` along the vector (both
+    ## ways, the nearer hit) meets the master face's surface.
+    func cast(p: Vector3) -> Vector3!:
+        let s = self.surface()
+        let d = try self.vector.normalized()
+        # Newton on S(uv) - p - λ d from the nearest point's chart.
+        var uv = try self.chart_of(p)
+        var lambda = 0.0
+        for _ in 0..<40:
+            let j = try surface_jet(s, uv, false, false)
+            let r = j.p.subtract(p.add(d.multiply_scalar(lambda)))
+            if r.length() <= 1e-13 * math.max(1.0, p.length()): break
+            # [su sv -d] (du, dv, dλ) = -r, by Cramer's rule.
+            let c0 = j.su
+            let c1 = j.sv
+            let c2 = d.multiply_scalar(-1.0)
+            let det = c0.dot(c1.cross(c2))
+            if math.abs(det) <= 1e-300: error(invalid, "Align (Project): the vector runs along the master surface")
+            let rhs = r.multiply_scalar(-1.0)
+            let du = rhs.dot(c1.cross(c2)) / det
+            let dv = c0.dot(rhs.cross(c2)) / det
+            let dl = c0.dot(c1.cross(rhs)) / det
+            uv = Vector3(uv.x + du, uv.y + dv, 0.0)
+            lambda += dl
+        self.seed = uv
+        let hit = try surface_point(*s, uv)
+        if not self.holds(uv): error(invalid, "Align (Project): the input's edge cast along the vector misses the master face")
+        return hit
+
+## The target in the middle of two cross jets (Modify Both): `ours` the
+## input's run toward the joint, `theirs` the other side's run toward it
+## (so turned: T and K' change sign), `weight` how far toward theirs (one
+## half the middle, one all the way); `along` the edge's direction (the
+## normal).
+pub func averaged(ours: Jet, theirs: Jet, along: Vector3, weight: f64) -> Goal:
+    var out = empty_goal()
+    let w = weight
+    out.p = ours.d[0].multiply_scalar(1.0 - w).add(theirs.d[0].multiply_scalar(w))
+    let t = ours.d[1].multiply_scalar(1.0 - w).subtract(theirs.d[1].multiply_scalar(w))
+    out.t = t.normalized() catch failure: recover ours.d[1]
+    let k = ours.d[2].multiply_scalar(1.0 - w).add(theirs.d[2].multiply_scalar(w))
+    out.k = k.subtract(out.t.multiply_scalar(k.dot(out.t)))
+    let dk = ours.d[3].multiply_scalar(1.0 - w).subtract(theirs.d[3].multiply_scalar(w))
+    out.dk = dk.subtract(out.t.multiply_scalar(dk.dot(out.t) + out.k.dot(out.k)))
+    out.n = along.cross(out.t).normalized() catch failure: recover Vector3()
+    out.reference = out.t
+    out.speed = 1.0
+    return out
+
+## The chart direction (a, b) whose image a su + b sv is nearest `d`.
+func chart_direction(su: Vector3, sv: Vector3, d: Vector3) -> Vector3:
+    let e = su.dot(su)
+    let f = su.dot(sv)
+    let g = sv.dot(sv)
+    let det = e * g - f * f
+    if not (math.abs(det) > 0.0): return Vector3()
+    let x = su.dot(d)
+    let y = sv.dot(d)
+    return Vector3((g * x - f * y) / det, (e * y - f * x) / det, 0.0)
+
+## A master with nothing in it yet.
+pub func empty_master(across: i64, vector: Vector3) -> Master:
+    return Master(master_edge, empty_shape(0.0), 0, false, empty_spline(1), across, vector, Vector3(), Vector3(), true, Vector3(0.5, 0.5, 0.0), false,
+                  Growing[Vector3](), Growing[usize](), empty_net(), ends_of_nothing(), empty_spline(1), 0.5, 0)
+
+## A master named by `text` (CadSurfacing.aligned's words), in `set`:
+##   "edge <face> x y z": the face's boundary edge nearest the point;
+##   "isoparm <face> <0 or 1> <fraction>": the face's isoparm along v at
+##     that u (0) or along u at that v (1);
+##   "curve <name>": a curve of the set (on its face, when it lies on one);
+##   "face <name>": the face itself (Project type; U/V for curves);
+##   "plane ox oy oz nx ny nz": a symmetry plane.
+## `across` the U/V type's direction (-1: none); `vector` Project's.
+pub func master_of(set: interop.Reference[GeometrySet], text: str, across: i64, vector: Vector3) -> Master!:
+    var words = Growing[str]()
+    defer words.close()
+    try split_words(text, &words)
+    if words.count == 0: error(invalid, "Align: pick the master (an edge, an isoparm, a curve, a face or a plane)")
+    let head = words.items[0]
+    var m = empty_master(across, vector)
+    errdefer m.close()
+    if head == "plane":
+        if words.count != 7 and not (words.count == 8 and words.items[7] == "free"): error(invalid, "a symmetry plane is: plane ox oy oz nx ny nz [free]")
+        m.onto = words.count == 7
+        m.kind = master_plane
+        m.origin = Vector3(try strings.parse_f64(words.items[1]), try strings.parse_f64(words.items[2]), try strings.parse_f64(words.items[3]))
+        m.normal = Vector3(try strings.parse_f64(words.items[4]), try strings.parse_f64(words.items[5]), try strings.parse_f64(words.items[6]))
+        _ = m.normal.normalized() catch failure: error(invalid, "a symmetry plane needs a normal")
+        return m
+    if head == "curve":
+        if words.count < 2: error(invalid, "Align: name the master curve")
+        let index = try CadCurves.find(set, words.items[1])
+        if index < 0: error(invalid, "Align: the master curve is no longer in the model: pick it again")
+        m.kind = master_curve
+        let curve = try CadCurves.curve(set, index)
+        defer curve.release()
+        m.curve.close()
+        m.curve = try spline_in(curve.value()).copy()
+        unit_domain(&m.curve)
+        let on = try CadCurves.face(set, index)
+        defer on.release()
+        if on.value.length > 0: try m.on_face(set, on.value)
+        return m
+    if words.count < 2: error(invalid, "Align: name the master face")
+    let face = words.items[1]
+    try m.on_face(set, face)
+    if head == "face":
+        m.kind = master_face
+        return m
+    if head == "isoparm":
+        if words.count != 4: error(invalid, "an isoparm master is: isoparm <face> <0 or 1> <fraction>")
+        m.kind = master_isoparm
+        let direction = (i64)(try strings.parse_f64(words.items[2]))
+        let fraction = try strings.parse_f64(words.items[3])
+        var net = try surface_net(&m.w, (usize)m.w.faces.items[m.f].surface)
+        defer net.close()
+        m.curve.close()
+        m.curve = try isoparm_spline(&net, direction, fraction)
+        unit_domain(&m.curve)
+        # Along v at that u: u runs across it.
+        m.across = 0 if direction == 0 else 1
+        return m
+    if head == "edge":
+        if words.count != 5: error(invalid, "an edge master is: edge <face> x y z")
+        let near = Vector3(try strings.parse_f64(words.items[2]), try strings.parse_f64(words.items[3]), try strings.parse_f64(words.items[4]))
+        m.kind = master_edge
+        var best: i64 = -1
+        var best_distance = 1.0e300
+        for use in m.w.face_uses(m.f):
+            let e = edge_index(use)
+            let edge = m.w.edges.items[e]
+            let q = try m.w.at(edge.carrier, try nearest_on(&m.w, edge.carrier, near, edge.t0, edge.t1))
+            let d = q.subtract(near).length()
+            if d < best_distance:
+                best_distance = d
+                best = (i64)e
+        if best < 0: error(invalid, "Align: the master face has no edges")
+        m.curve.close()
+        m.curve = try edge_spline(&m.w, (usize)best)
+        return m
+    error(invalid, "Align: a master is an edge, an isoparm, a curve, a face or a plane")
+
+extend Master:
+    ## The master's face: face `face` of whichever body of `set` holds it.
+    func on_face(set: interop.Reference[GeometrySet], face: str) -> !:
+        let models = set_models(try set.get())
+        for model in models:
+            var w = try shape_of(model.value())
+            var found: i64 = -1
+            for f in 0..<w.faces.count:
+                if w.face_name(f) == face:
+                    found = (i64)f
+                    break
+            if found < 0:
+                w.close()
+                continue
+            self.w.close()
+            self.w = w
+            self.f = (usize)found
+            self.has_face = true
+            try face_chart(&self.w, self.f, &self.chart, &self.starts)
+            return
+        error(invalid, "Align: the master face is no longer in the model: pick it again")
+
+## `text`'s words (apart by spaces) onto `out`, views into it.
+pub func split_words(text: str, out: Growing[str]*) -> !:
+    let bytes = text.bytes
+    var start: usize = 0
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 32: continue
+        if at > start: try out.push((str)bytes[start..<at])
+        start = at + 1

@@ -1381,12 +1381,14 @@ by index and faces by name; curves on faces are the set's `CadCurves`.
 |---|---|
 | `projected(set, body, face, curves, direction, normal, both, original, tolerance, stem)` | Project: the curves named (apart by `;`) cast onto the face along `direction` (both ways, or only ahead) or along its normals (Pull), each piece a curve on the face; `original` keeps each curve's degree and spans (Alias's Match original). A `CadSurfaceEdit`: the set, how many pieces, the worst fit. |
 | `intersected(set, body, face, other, other_face, both)`, `intersected_plane(set, body, face, origin, normal)` | Intersect: where two faces meet (or a face and a plane), as curves on the first face, with `both` on the second too. |
-| `trim_regions(set, body, face, curves)` | The face cut by its curves: a marker inside each region (Alias's region markers), the crossings, and the loose ends that cut nothing (Show Intersections). |
-| `trimmed(set, body, face, picks, mode, curves, tag)` | Trim: the regions holding `picks` kept (0) or discarded (1), or every region its own face (2, Divide, named `<tag>/divide<k>[<face>]`); the face before it pushed as a trim stage. |
+| `trim_regions(set, body, face, curves, cast, direction, cutters, extend)` | The face cut by its curves: a marker inside each region (Alias's region markers), the crossings, and the loose ends that cut nothing (Show Intersections). `cast` 1 or 2 is Alias's 3D Trimming (curves off the face cast along `direction` or the normals as the trim runs), `cutters` faces cutting it where they meet it, `extend` short ends carried on. |
+| `trimmed(set, body, face, picks, mode, curves, tag, cast, direction, cutters, extend)` | Trim: the regions holding `picks` kept (0) or discarded (1), or every region its own face (2, Divide, named `<tag>/divide<k>[<face>]`); the face before it pushed as a trim stage. |
 | `untrimmed(set, body, face, all)`, `stages(set, face)` | Untrim Last (or All): the face's latest (first) stage back in place of its pieces, stitched to its neighbors; with no stage, its natural surface. |
 | `trim_converted(set, body, face, du, dv, su, sv, swap, keep)` | Trim Convert: a four-sided face an untrimmed B-spline face of those degrees and spans, its surface and edge deviations reported; `keep` keeps the original as a body of its own. |
 | `shrunk(set, body, face)` | Shrink: a B-spline face's net cut down to its loops' box. |
-| `stitched(set, bodies, gap)`, `unstitched(set, body)` | Shell Stitch within a gap (how many edges it joined, the widest gap, whether it closed into a solid), and Unstitch (every face an open body). |
+| `stitched(set, bodies, gap, detach_periodic, detach_single)`, `unstitched(set, body)` | Shell Stitch within a gap (how many edges it joined, the widest gap, whether it closed into a solid; with Alias's Detach options for export, how many faces and closed edges it split), and Unstitch (every face an open body). |
+| `patch(points, weights, nu, nv, du, dv, ku, kv, name)` | A body of one B-spline face over its whole domain. |
+| `aligned(set, input, master, continuity, …)` | Align (below): a `CadAlignEdit` with the set, Alias's Diagnostic Feedback, the side and the aligned rows. |
 | `edge_precision(model, edge)`, `vertex_precision(model, vertex)`, `is_closed(model)` | A tolerant edge's or vertex's precision; whether every edge is shared. |
 
 **Project** (`surfacing/project.lucb`). Along a vector d each point C(t) goes where the line
@@ -1466,9 +1468,143 @@ Tests (`tests/regressions/surfacing_tests.luc`), against closed forms:
   body closed with the same volume; Shrink of a disc trimmed on a converted top keeps area π, the
   net's corner moved in to the disc's box.
 
-Not yet: Alias's 3D Trimming (curves off the face projected as the trim runs), Trim's curves
-extended to the boundary, trims with Keep Originals on bodies, Stitch's detach of periodic surfaces
-and single-curve boundaries for export, Untrim of a cone's band reaching its apex.
+**The trim's curves** (`surfacing/trim_curves.lucb`). With Alias's **3D Trimming** the curves need
+not lie on the face: those off it are cast onto it as the trim runs (Project's casting, along a vector
+or the normals), and faces of any body cut it where they meet it (Intersect's meeting curves, pulled
+onto it); none of them is kept on the face. **Extend** carries a curve end that stops inside the face
+on along it: from the end's chart point, straight on in the chart along the end's own direction, in
+steps of a 512th of the chart, until the face's loops no longer hold it (then halved 48 times and put
+on the boundary edge exactly) or it comes within a step of another of the curves (then onto that
+curve's nearest point); the chart line, lifted onto the surface, is a curve of its own joining the
+first end to end, so the region it closes off is cut. An end within ten fit tolerances of the boundary
+or of another curve is not loose.
+
+**Tolerant edges in the booleans** (`modeling/shape.lucb`, `boolean.lucb`, `clip.lucb`). A shape keeps
+each edge's and vertex's precision beyond the tolerance (`edge_slack`, `point_slack`, from the B-rep's
+columns; `brep_of` writes them back). The booleans read them edge by edge, as Parasolid's tolerant
+modeling does, instead of the model's largest: vertices merge within their own precision, an edge's
+crossings and the boundary test (`face_contains`) reach as far as that edge's, new edges ending on a
+tolerant edge merge their ends within it (`Work.section_end`), and the pieces of a tolerant edge keep
+its precision in the result (`write_result`). The tessellator still works to the largest.
+
+**Untrim through an apex**: a cone's band whose height reaches the apex closes on it, as the pointed
+cone primitive is made (the seam from the circle to the apex vertex, no circle there).
+
+**Stitch's Detach options** (`modeling/stitch.lucb`'s `detached`), for systems that refuse faces
+wrapping round their surface and loops of one closed edge: Detach periodic splits each face that uses a
+seam edge both ways by the plane through the surface's axis and the seam (`split_faces_by`), so each
+half meets the seam once; a torus is cut again by its equator plane for its other seam; a periodic
+B-spline face is refused (rebuild it open). Detach single-curve boundaries splits each closed edge that
+alone makes a loop at its middle, every loop using it taking both halves.
+
+Tests (`tests/regressions/trim_followup_tests.luc`): a free circle cast down as the trim runs keeps a
+disc of area π and leaves no curve on the face, and without casting it is refused; a cylinder of radius
+1 through a box's top cuts the same disc by Intersect; a line stopping in the middle of the top,
+extended, cuts the strip z > 0.5 of area 6, and a second line stopping short of it runs on to meet it
+(the quarter of area 5); a pointed cone's side untrims to the whole side (area π r l, volume π r² h/3);
+a cylinder unstitched and stitched with Detach single-curve boundaries has its two caps' circles in two
+edges each, closed with its volume, and with Detach periodic its side in two halves none of which
+meets an edge twice; a rod cut from a stitched box through its tolerant top edges (gap 0.01) closes
+with the half rod's volume gone, the cut pieces of those edges keeping precision 0.01.
+
+Not yet: trims with Keep Originals on bodies; Detach periodic on closed B-spline faces.
+
+## Align (`surfacing/align*.lucb`)
+
+Stage 4 of the surfacing plan (luced-3d `docs/research/SURFACING-ALIAS-PLASTICITY.md` §4.2, §6.1):
+Alias's Align and Symmetry Plane Align, with every option of Alias's window, Align 2008's Modify Both
+and Rhino's Refine. `CadSurfacing.aligned(set, input, master, continuity, …)` moves an input surface's
+edge (or a curve's end) onto a master and matches it G0 to G3 by its first CV rows.
+
+**Words.** The input is "face <name> x y z" (the side of the face's net nearest the point) or "curve
+<name> x y z" (the curve's end nearest it). The master (`align_master.lucb`) is "edge <face> x y z" (the
+face's boundary edge nearest the point), "isoparm <face> <0 or 1> <fraction>", "curve <name>" (on its
+face when it lies on one), "face <name>" (Project and U/V types), or "plane ox oy oz nx ny nz [free]"
+(Symmetry Plane Align; `free` leaves the edge off the plane: Project For Position off).
+
+**The method** (`align.lucb`). The input's surface becomes a polynomial net (an analytic face's exact
+net, a rational one refitted non-rational within a ten-millionth of the body), turned so the side to
+align is its u = low rows (`align_rows.lucb`). At a clamped end the cross derivatives rest on the first
+rows alone, S^(k) = Σ_{i≤k} c_k^i P_i, so row k is solved from the k-th derivative and the rows before
+it. The master answers at each station along the edge with a point and its cross curve Q: on a surface
+the curve whose chart is the straight line across the edge (the other parameter's isoparm when the edge
+runs along a parameter line, which keeps a polynomial master's fields polynomial; square to the edge
+otherwise; on the face's side of an edge, found once in the edge's middle; for an isoparm or curve on a
+face, the way the input leaves), on a free curve the curve itself. Q is handed on as its arc-length jet
+(T, K, K'). The input's cross curve A, run toward the master, gets
+A' = vT, A'' = v'T + v²K, A''' = v''T + 3vv'K + v³K' (Faà di Bruno), which is G0 to G3 across the edge
+whatever the speeds: along the edge the shared curve and the matched normal section give the rest
+(G1 along the edge then fixes the mixed terms). The speeds are Alias's sliders by the hull: v puts row 1
+the input's own distance behind the edge along T times the Tangent Scale (the CVs move least), v' row 2
+behind row 1 times the Curvature Scale, v'' row 3 behind row 2 times the G3 Scale; Starting and Ending
+scales run linearly along the edge; AutoScale G2 and G3 carry the tangent (and curvature) scale into the
+later rows; Tangent Balance makes the distances follow the master's speed |Q'| along the edge at the
+input's mean (Alias's "mimic the master's inner hull"); Skew turns Q's chart direction in the tangent
+plane by an angle running from start to end. Each row is fitted at 2(p + 1) stations a span (least
+squares on the row's own knots, its ends exact) and the next row solved from the fitted ones, so their
+errors do not add up.
+
+**Exactness and Refine.** When the master's derivative fields lie in the rows' space the match is
+exact: Explicit Control off raises the input to quintic across (the multi-span quintic) and, with
+Position Influence 1, to the master curve's degree along the edge with its knots. Otherwise the
+stations are checked between the fitted ones (65 along the edge) against the limits (the G0 gap, the G1
+angle in degrees, the G2 and G3 differences in percent; the report is Alias's Diagnostic Feedback, its
+start and end angles against the master's own cross direction), and Refine inserts a knot in the
+middle of each span holding a station that misses, aligning again, up to Max New Spans.
+
+**Rows across.** The order's k + 1 rows, as many kept at the far side (its own continuity), and the
+extra rows between: 2(k + 1) + Extra CV Rows. Explicit Control on refuses fewer ("Align G3 needs 8 rows
+across, has 6") and refits the input to the degrees and spans asked; off inserts spans across, the
+widest first.
+
+**The options.**
+
+- **Position Influence** blends the input's own parameterization (each station to the master's nearest
+  point, the ends moved onto the master's ends) into the master's (the range in equal steps).
+- **Partial** aligns only a range of the input's edge: the range's ends and a span a tenth of it outside
+  each get knots of full multiplicity, the master's nearest part is matched inside, and the edge beyond
+  the outer knots stays exactly where it was.
+- **Extra CV Rows / Blend Factor**: rows k + 1 … k + E carry the last row's change by weights
+  (1 − i/(E + 1))^(2^factor): 0 linear, positive dying faster, negative lasting.
+- **Types**: Edge; Project (the input's edge cast along the vector onto the master face, the cross
+  direction square to the cast curve on the face, a curve on the face left there unless NoCOS);
+  U/V (a curve's end to the face's U or V direction); Vector (rows 1 and 2 move only along the vector,
+  their normal component solved: S_u in the master's tangent plane, the normal curvature along S_u the
+  master's).
+- **Two masters** align a second side (the one nearest its point, or the side across) after the first;
+  the far rows of each are the other's.
+- **Modify Both** (the master an edge of a B-spline-able face): the input to the middle of the two
+  edges and cross jets (T averaged, K averaged square to it, K' with its tangential part −|K|²), then
+  the master all the way to the input as it now is; both faces written.
+- **Symmetry Plane Align**: the edge onto the plane (Project For Position), T square to it, K the input's
+  own kept in the plane, K' = −|K|² T: what a curve and its mirror image run back need to meet G3.
+- **Curves**: the CVs from the end are the rows, one each; a free master curve gives Q itself (at its
+  nearest point or Attach Point), a face the U/V direction or the way the curve leaves; Modify Both on
+  two free curves moves both ends to the middle.
+
+The result writes a natural face as a new face of the same name, facing as before, stitched to its body
+where its edges still meet; a trimmed one on the moved surface, its trims taking their nearest
+parameters (`with_face_surface` with `edited`). It reports the aligned rows and the same rows before
+(Alias's proxy display), the side and the order (luced-3d re-runs an Align when a CV of those rows is
+dragged later).
+
+Tests (`tests/regressions/align_tests.luc`), measured by the Check tools across the stitched edge: a
+flat quintic strip aligned to a quarter cylinder of radius 2 measures exactly G1, G2 and G3 as asked
+(and fails the next), its normal curvature across the edge 1/2 to 1e-6 from G2 on; Tangent Scale 2
+doubles row 1's distance (0.56 to 1.12), 1 to 2 runs from one to the other, AutoScale G2 doubles row 2's
+too, Tangent Balance evens a fanned strip's distances, Skew 10° reports 10° at both ends still G1, Extra
+CV Rows 2 moves rows 2 and 3 by 2/3 and 1/3 of row 1's change and row 4 not at all; an isoparm master
+measures G2; a curve's end to the cylinder's U lands on it G1; Position Influence 0 keeps the knots
+along the edge; Explicit Control refuses G3 on six rows and off adds spans to eight; Partial 0.2–0.8
+leaves the edge outside 0.13–0.87 where it was and lies on the cylinder's edge inside; Modify Both on a
+symmetric roof leaves the halves mirror images, the ridge in place and the tangent rows level; Vector
+along X slides row 1 onto x = 2 only; two masters align both sides G1; Symmetry Plane Align puts the
+edge on x = 0 and row 1 square to it; Refine meets a quarter circle a cubic edge misses (gap 1e-6);
+a line's end aligns G2 to a circle (curve_join); Project casts a hanging strip's edge onto a floor and
+leaves Align1 on it.
+
+Not yet: Alias's Accept/Restore checkpoints (each Align is a step or node; undo and the history
+serve); the middle arrow that slides a whole row (the end arrows and the sliders do it).
 
 ## Sketches (`sketch/`)
 

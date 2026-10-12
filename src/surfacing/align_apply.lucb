@@ -1,0 +1,452 @@
+## Align on a geometry set (surfacing Stage 4; align.lucb has the method):
+## the input face's surface (or a curve) found from its words, aligned to
+## its masters, and written back: a natural face as a new face of the same
+## name, stitched to its body where its edges still meet; a trimmed one on
+## the moved surface, its trims taking their nearest parameters on it
+## (the CV edits' way). Modify Both writes the master's face too; Project
+## leaves a curve on the master face where the input meets it.
+
+## What an align made: the set, the report, the input's aligned rows
+## (rows 0..order and the extra ones, each a line of control points along
+## the edge, for the viewport's row tints), the side aligned (as
+## align_rows.lucb's turned: 0 u low, 1 u high, 2 v low, 3 v high; for a
+## curve 0 its start, 1 its end) and the order.
+pub struct Aligned:
+    pub var set: interop.Reference[GeometrySet]
+    pub var report: AlignReport
+    pub var rows: Growing[Vector3]
+    ## The same rows before the align (Alias's proxy display).
+    pub var proxy: Growing[Vector3]
+    pub var row_size: usize
+    pub var side: i64
+    pub var order: i64
+
+    pub func close():
+        self.set.release()
+        self.rows.close()
+        self.proxy.close()
+
+## The input's words: "face <name> x y z" (the face's side nearest the
+## point) or "curve <name> x y z" (the curve's end nearest it).
+struct Input:
+    var curve: bool
+    var name: str
+    var near: Vector3
+
+func input_of(text: str) -> Input!:
+    var words = Growing[str]()
+    defer words.close()
+    try split_words(text, &words)
+    if words.count != 5 or (words.items[0] != "face" and words.items[0] != "curve"): error(invalid, "Align: pick the input edge (a surface's edge or a curve's end)")
+    let near = Vector3(try strings.parse_f64(words.items[2]), try strings.parse_f64(words.items[3]), try strings.parse_f64(words.items[4]))
+    return Input(words.items[0] == "curve", words.items[1], near)
+
+## Where face `face` is: its body's index in `set` and the face's index in
+## the body's shape `out`.
+func face_place(set: interop.Reference[GeometrySet], face: str, out: Shape*) -> (usize, usize)!:
+    let models = set_models(try set.get())
+    for at in 0..<models.length:
+        var w = try shape_of(models[at].value())
+        for f in 0..<w.faces.count:
+            if w.face_name(f) == face:
+                out.close()
+                *out = w
+                return (at, f)
+        w.close()
+    error(invalid, "Align: the face is no longer in the model: pick it again")
+
+## Face `f`'s surface as a polynomial net: its own, an analytic one's exact
+## net made non-rational within `tolerance` (Align moves rows of plain
+## control points), a rational B-spline's likewise.
+func plain_net(w: const Shape*, f: usize, tolerance: f64) -> Net!:
+    var net = try surface_net(w, (usize)w.faces.items[f].surface)
+    if not net.rational():
+        # Weights all alike: plain points.
+        for at in 0..<net.points.count: net.points.items[at] = weighted(net.points.items[at].point(), 1.0)
+        return net
+    defer net.close()
+    var deviation = 0.0
+    let su = math.max(1.0, (f64)(net.nu - (usize)net.du))
+    let sv = math.max(1.0, (f64)(net.nv - (usize)net.dv))
+    return try refit_within(&net, (i64)math.max(5.0, (f64)net.du), (i64)math.max(5.0, (f64)net.dv), (usize)su, (usize)sv, 64, 0, 0, false, tolerance, &deviation)
+
+## Whether face `f` covers the whole domain of `net` (its surface's net as
+## Align took it: its own, or an analytic face's exact one): one loop, its
+## edges' points all on the domain's boundary.
+func natural(w: const Shape*, f: usize, net: const Net*) -> bool!:
+    if w.face_sizes(f).length != 1: return false
+    var s = try surface_of(net)
+    defer s.close()
+    var seed = Vector3(0.5, 0.5, 0.0)
+    var first = true
+    for use in w.face_uses(f):
+        for k in 0..<9:
+            let p = try w.edge_at(edge_index(use), (f64)k / 8.0)
+            let q = try nearest_parameters(s, p, seed, first)
+            first = false
+            seed = q
+            if (try evaluate(s, q)).subtract(p).length() > align_tolerance(w) * 10.0: return false
+            let off = math.min(math.min(math.abs(q.x), math.abs(1.0 - q.x)), math.min(math.abs(q.y), math.abs(1.0 - q.y)))
+            if off > 1e-6: return false
+    return true
+
+## `model` with face `f` (of its shape `w`) on `net`: natural, a new face
+## of the same name and facing (`before` the net it had, for the facing);
+## trimmed, its trims kept on the moved surface.
+func with_net(model: const CadModel*, w: const Shape*, f: usize, net: const Net*, before: const Net*) -> interop.Reference[CadModel]!:
+    let name = w.face_name(f)
+    var surface = try surface_of(net)
+    defer surface.close()
+    # The facing: the face's normal against the net's, where the net was.
+    let p = before.point_at((before.u_low() + before.u_high()) * 0.5, (before.v_low() + before.v_high()) * 0.5)
+    var old = try surface_of(before)
+    defer old.close()
+    let j = try surface_jet(&old, Vector3(0.5, 0.5, 0.0), false, false)
+    let sense = j.su.cross(j.sv).dot(try w.face_normal(f, p)) >= 0.0
+    if not try natural(w, f, before):
+        # Trimmed: its trims onto the moved surface (a CV edit's way).
+        # An analytic face's exact net may face the other way than the
+        # surface it had: the net's u turned round keeps the face's sense.
+        if sense == w.faces.items[f].sense: return try with_face_surface(model, name, &surface, true)
+        var turned_net = try u_reversed(net)
+        defer turned_net.close()
+        var flipped = try surface_of(&turned_net)
+        defer flipped.close()
+        return try with_face_surface(model, name, &flipped, true)
+    var points = Growing[Vector3]()
+    defer points.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    for q in net.points.view():
+        try points.push(q.point())
+        try weights.push(q.w)
+    let face = try spline_face(points.view(), weights.view(), (i64)net.nu, (i64)net.nv, net.du, net.dv, net.ku.view(), net.kv.view(), sense, name, w.tolerance)
+    defer face.release()
+    return try replaced_face(model, name, face.value())
+
+## The tolerance nets are rebuilt to: a ten-millionth of the body's size.
+func align_tolerance(w: const Shape*) -> f64:
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for p in w.points.view():
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    return math.max(w.tolerance, high.subtract(low).length() * 1e-7)
+
+## `set` aligned (see the file's header): `input` the input's words,
+## `master` the master's (align_master.lucb), `second` a second master's
+## for the side of the input nearest `second_near` (empty: none).
+pub func aligned_refined(set: interop.Reference[GeometrySet], input: str, master: str, second: str, second_near: Vector3, opts: const AlignOptions*) -> Aligned!:
+    let what = try input_of(input)
+    let across: i64 = -1
+    var m = try master_of(set, master, across if opts.kind != align_uv else uv_direction(opts), opts.vector)
+    defer m.close()
+    if what.curve: return try align_curve(set, &what, &m, opts)
+    var w = empty_shape(0.0)
+    defer w.close()
+    let (body, f) = try face_place(set, what.name, &w)
+    let tolerance = align_tolerance(&w)
+    var net = try plain_net(&w, f, tolerance)
+    defer net.close()
+    var before = try net.copy()
+    defer before.close()
+    let side = nearest_side(&net, what.near)
+    var report = empty_report()
+    var result = set.clone()
+    errdefer result.release()
+    if opts.both:
+        try align_both(&net, side, &m, opts, &report, &result)
+    else:
+        try align_side(&net, side, &m, opts, &report)
+    if second.length > 0:
+        var other = try master_of(set, second, across if opts.kind != align_uv else uv_direction(opts), opts.vector)
+        defer other.close()
+        # The second master's side: the one nearest its point, else the
+        # side across from the first.
+        let near_side = nearest_side(&net, second_near) if second_near.length() > 0.0 else opposite(side)
+        if near_side == side: error(invalid, "Align: the two masters are on one side of the input; pick another side for the second")
+        var second_report = empty_report()
+        try align_side(&net, near_side, &other, opts, &second_report)
+        merge_into(&report, &second_report)
+    # The input's face on its new net, in its body.
+    let models = set_models(try result.get())
+    var now = empty_shape(0.0)
+    defer now.close()
+    let (body_now, f_now) = try face_place(result, what.name, &now)
+    _ = body
+    let made = try with_net(models[body_now].value(), &now, f_now, &net, &before)
+    defer made.release()
+    let one: interop.Reference[CadModel][1] = [made]
+    let written = try with_body(result, (i64)body_now, one[..<1])
+    result.release()
+    result = written
+    # Project: the curve on the master face where the input's edge met it.
+    if opts.kind == align_project and opts.cos and m.has_face:
+        let next = try project_cos(result, &m, &net, side, opts)
+        result.release()
+        result = next
+    var rows = Growing[Vector3]()
+    errdefer rows.close()
+    var proxy = Growing[Vector3]()
+    errdefer proxy.close()
+    let order = (usize)math.clamp((f64)opts.continuity, 0.0, 3.0)
+    var turned_now = try turned(&net, side, false)
+    defer turned_now.close()
+    let count = fewer(turned_now.nu, order + 1 + (usize)math.max(0.0, (f64)opts.extra))
+    for i in 0..<count:
+        for j in 0..<turned_now.nv: try rows.push(turned_now.points.items[i * turned_now.nv + j].point())
+    # The hull as it was (Alias's proxy display): each aligned CV's place
+    # on the surface before the align, at its Greville parameters.
+    var turned_before = try turned(&before, side, false)
+    defer turned_before.close()
+    for i in 0..<count:
+        let gu = (greville(turned_now.ku.view(), i, turned_now.du) - turned_now.u_low()) / (turned_now.u_high() - turned_now.u_low())
+        for j in 0..<turned_now.nv:
+            let gv = (greville(turned_now.kv.view(), j, turned_now.dv) - turned_now.v_low()) / (turned_now.v_high() - turned_now.v_low())
+            try proxy.push(turned_before.point_at(turned_before.u_low() + (turned_before.u_high() - turned_before.u_low()) * gu, turned_before.v_low() + (turned_before.v_high() - turned_before.v_low()) * gv))
+    return Aligned(result, report, rows, proxy, turned_now.nv, side, (i64)order)
+
+## The U/V type's direction (Alias's: the master's U, else V), from the
+## vector's x: 0 U, 1 V.
+func uv_direction(opts: const AlignOptions*) -> i64:
+    return 1 if opts.vector.x > 0.5 else 0
+
+## The side across from `side`.
+func opposite(side: i64) -> i64:
+    if side == 0: return 1
+    if side == 1: return 0
+    if side == 2: return 3
+    return 2
+
+## Modify Both (Align 2008's Both, Rhino's Average): the input to the middle
+## of itself and the master's face (its B-spline side nearest the master
+## edge), then the master's face to the input as it now is; the master's
+## face written into `result`.
+func align_both(net: Net*, side: i64, m: Master*, opts: const AlignOptions*, report: AlignReport*, result: interop.Reference[GeometrySet]*) -> !:
+    if m.kind != master_edge or not m.has_face: error(invalid, "Align (Modify Both): the master must be a surface's edge")
+    let other_face = m.w.face_name(m.f)
+    let tolerance = align_tolerance(&m.w)
+    var other = try plain_net(&m.w, m.f, tolerance)
+    defer other.close()
+    var other_before = try other.copy()
+    defer other_before.close()
+    let edge_middle = m.curve.point_at((m.curve.low() + m.curve.high()) * 0.5)
+    let other_side = nearest_side(&other, edge_middle)
+    # The input to the middle.
+    var middle = empty_master(-1, Vector3())
+    defer middle.close()
+    middle.kind = master_average
+    middle.weight = 0.5
+    middle.other.close()
+    middle.other = try turned(&other, other_side, false)
+    middle.other_ends = ends_of(middle.other.ku.view(), middle.other.nu, middle.other.du)
+    middle.other_row.close()
+    middle.other_row = try row_of(&middle.other, 0)
+    var first = empty_report()
+    try align_side(net, side, &middle, opts, &first)
+    # The master to the input as it is now (all the way to it).
+    var back = empty_master(-1, Vector3())
+    defer back.close()
+    back.kind = master_average
+    back.weight = 1.0
+    back.other.close()
+    back.other = try turned(net, side, false)
+    back.other_ends = ends_of(back.other.ku.view(), back.other.nu, back.other.du)
+    back.other_row.close()
+    back.other_row = try row_of(&back.other, 0)
+    try align_side(&other, other_side, &back, opts, report)
+    # The master's face on its new net.
+    var w = empty_shape(0.0)
+    defer w.close()
+    let (body, f) = try face_place(*result, other_face, &w)
+    let models = set_models(try result.get())
+    let made = try with_net(models[body].value(), &w, f, &other, &other_before)
+    defer made.release()
+    let one: interop.Reference[CadModel][1] = [made]
+    let written = try with_body(*result, (i64)body, one[..<1])
+    result.release()
+    *result = written
+
+## Project's curve on the master face: the input's aligned edge, cast onto
+## it along the vector (the normals without one), named Align1, Align2, ...
+func project_cos(set: interop.Reference[GeometrySet], m: const Master*, net: const Net*, side: i64, opts: const AlignOptions*) -> interop.Reference[GeometrySet]!:
+    var turned_net = try turned(net, side, false)
+    defer turned_net.close()
+    var edge = try row_of(&turned_net, 0)
+    defer edge.close()
+    let face = m.w.face_name(m.f)
+    let models = set_models(try set.get())
+    var owner: const CadModel*? = none
+    for model in models:
+        for f in 0..<model.value().face_count():
+            if (try model.value().face_name(f)) == face: owner = model.value()
+    let model = owner else error(invalid, "Align (Project): the master face is no longer in the model")
+    var charts = Growing[Spline]()
+    defer close_splines(&charts)
+    var lifted = Growing[Spline]()
+    defer close_splines(&lifted)
+    let fit = try fit_tolerance(model)
+    _ = try project_curve(model, face, &edge, Casting(opts.vector, opts.vector.length() == 0.0, true), fit, false, &charts, &lifted)
+    var result = set.clone()
+    for k in 0..<charts.count:
+        let next = try add_on_face(result, "Align", face, &lifted.items[k], &charts.items[k], "align")
+        result.release()
+        result = next
+    return result
+
+## A curve's end aligned: its CVs from that end are the rows, one each
+## (align.lucb's rows at a single station); the curve replaced in the set.
+## Modify Both on a free master curve moves its end to the middle too.
+func align_curve(set: interop.Reference[GeometrySet], what: const Input*, m: Master*, opts: const AlignOptions*) -> Aligned!:
+    let index = try CadCurves.find(set, what.name)
+    if index < 0: error(invalid, "Align: the curve is no longer in the model: pick it again")
+    let on = try CadCurves.face(set, index)
+    defer on.release()
+    if on.value.length > 0: error(invalid, "Align moves a curve's end off its face: duplicate it as a free curve first")
+    let held = try CadCurves.curve(set, index)
+    defer held.release()
+    var c = try spline_in(held.value()).copy()
+    defer c.close()
+    let at_end = c.point_at(c.high()).subtract(what.near).length() < c.point_at(c.low()).subtract(what.near).length()
+    if at_end:
+        let turned_curve = try reversed_spline(&c)
+        c.close()
+        c = turned_curve
+    let order = (usize)math.clamp((f64)opts.continuity, 0.0, 3.0)
+    let extra = (usize)math.max(0.0, (f64)opts.extra)
+    try prepare_curve(&c, order, extra, opts)
+    var start_cvs = Growing[Vector3]()
+    defer start_cvs.close()
+    for q in c.points.view(): try start_cvs.push(q.point())
+    var report = empty_report()
+    var result = set.clone()
+    errdefer result.release()
+    if opts.both:
+        if m.kind != master_curve or m.has_face: error(invalid, "Align (Modify Both) on a curve needs a free master curve")
+        let other_index = try master_curve_index(set, m)
+        let other_held = try CadCurves.curve(set, other_index)
+        defer other_held.release()
+        var other = try spline_in(other_held.value()).copy()
+        defer other.close()
+        let near = c.point_at(c.low())
+        let other_end = other.point_at(other.high()).subtract(near).length() < other.point_at(other.low()).subtract(near).length()
+        if other_end:
+            let turned_other = try reversed_spline(&other)
+            other.close()
+            other = turned_other
+        try prepare_curve(&other, order, extra, opts)
+        let ours = try curve_arc(&c)
+        let theirs = try curve_arc(&other)
+        let middle = averaged(ours, theirs, Vector3(), 0.5)
+        try align_curve_end(&c, middle, opts, order, extra, &report)
+        let now = try curve_arc(&c)
+        let back = averaged(theirs, now, Vector3(), 1.0)
+        try align_curve_end(&other, back, opts, order, extra, &report)
+        if other_end:
+            let restored = try reversed_spline(&other)
+            other.close()
+            other = restored
+        let name = try CadCurves.name(set, other_index)
+        defer name.release()
+        let moved = try held_spline(try other.copy())
+        defer moved.release()
+        let next = try CadCurves.with_curve(result, name.value, moved)
+        result.release()
+        result = next
+    else:
+        let p0 = c.point_at(c.low())
+        let own = try curve_arc(&c)
+        let out = own.d[1]
+        var mm = 0.0
+        if m.kind == master_edge or m.kind == master_isoparm or m.kind == master_curve:
+            mm = opts.attach if opts.attach >= 0.0 else m.nearest(p0)
+        let probe = Probe(p0, Vector3(), out, own)
+        let skew = opts.skew[0] * math.pi / 180.0
+        let target = try m.target(mm, &probe, skew)
+        try align_curve_end(&c, target, opts, order, extra, &report)
+    var rows = Growing[Vector3]()
+    errdefer rows.close()
+    var proxy = Growing[Vector3]()
+    errdefer proxy.close()
+    for i in 0..<fewer(c.points.count, order + 1 + extra):
+        try rows.push(c.points.items[i].point())
+        try proxy.push(start_cvs.items[fewer(i, start_cvs.count - 1)])
+    if at_end:
+        let restored = try reversed_spline(&c)
+        c.close()
+        c = restored
+    let aligned_curve = try held_spline(try c.copy())
+    defer aligned_curve.release()
+    let next = try CadCurves.with_curve(result, what.name, aligned_curve)
+    result.release()
+    result = next
+    return Aligned(result, report, rows, proxy, 1, 1 if at_end else 0, (i64)order)
+
+## The set's index of a free master curve.
+func master_curve_index(set: interop.Reference[GeometrySet], m: const Master*) -> i64!:
+    let count = try CadCurves.count(set)
+    for index in 0..<count:
+        let curve = try CadCurves.curve(set, index)
+        defer curve.release()
+        let c = spline_in(curve.value())
+        if c.points.count == m.curve.points.count and c.point_at(c.low()).subtract(m.curve.point_at(m.curve.low())).length() < 1e-12 and c.point_at(c.high()).subtract(m.curve.point_at(m.curve.high())).length() < 1e-12: return index
+    error(invalid, "Align: the master curve is no longer in the model")
+
+## A curve ready for an align from its start: non-rational, quintic at
+## least (Explicit Control off), enough CVs for the rows (refused with
+## Explicit Control on).
+func prepare_curve(c: Spline*, order: usize, extra: usize, opts: const AlignOptions*) -> !:
+    for q in c.points.view():
+        if math.abs(q.w - c.points.items[0].w) > 1e-12 * math.abs(c.points.items[0].w): error(invalid, "Align works on polynomial curves: rebuild the curve non-rational first")
+    for at in 0..<c.points.count: c.points.items[at] = weighted(c.points.items[at].point(), 1.0)
+    let needed = 2 * (order + 1) + extra
+    if opts.explicit:
+        if c.points.count < needed or (usize)c.degree < order:
+            var buffer: u8[200]
+            error(invalid, try strings.format(buffer, f"Align G{order} needs {needed} CVs on the curve, has {c.points.count} (Explicit Control is on)"))
+        return
+    if c.degree < 5: try elevate(c, (usize)(5 - c.degree))
+    while c.points.count < needed:
+        var widest = 0.0
+        var at = 0.5
+        for k in (usize)c.degree..<c.points.count:
+            let span = c.knots.items[k + 1] - c.knots.items[k]
+            if span > widest:
+                widest = span
+                at = (c.knots.items[k] + c.knots.items[k + 1]) * 0.5
+        _ = try insert_knot(c, at, 1)
+
+## The curve's cross jet at its start, run backwards (toward the joint):
+## its first CVs as rows.
+func curve_arc(c: const Spline*) -> Jet!:
+    let e = ends_of(c.knots.view(), c.points.count, c.degree)
+    var cur: Vector3[4] = [Vector3(), Vector3(), Vector3(), Vector3()]
+    for i in 0..<fewer(4, c.points.count): cur[i] = c.points.items[i].point()
+    return try current_arc(&e, &cur)
+
+## The curve's start matched to `target`: its CVs 0..order solved as the
+## rows are at one station, the extra ones carrying the change.
+func align_curve_end(c: Spline*, target: Goal, opts: const AlignOptions*, order: usize, extra: usize, report: AlignReport*) -> !:
+    let e = ends_of(c.knots.view(), c.points.count, c.degree)
+    var cur: Vector3[4] = [Vector3(), Vector3(), Vector3(), Vector3()]
+    for i in 0..<fewer(4, c.points.count): cur[i] = c.points.items[i].point()
+    let st = Station(c.low(), 0.0, cur, target)
+    var kept: f64[3]
+    kept_lengths(&cur, target.t, &kept)
+    var rows: Vector3[4] = [Vector3(), Vector3(), Vector3(), Vector3()]
+    let last_before = c.points.items[order].point()
+    for k in 0..<order + 1:
+        rows[k] = try row_value(&e, &st, opts, k, rows[..<4], kept, target.speed)
+        c.points.items[k] = weighted(rows[k], 1.0)
+    let change = rows[order].subtract(last_before)
+    let exponent = math.pow(2.0, opts.blend)
+    for i in 1..<extra + 1:
+        let w = math.pow(1.0 - (f64)i / (f64)(extra + 1), exponent)
+        let at = order + i
+        if at < c.points.count: c.points.items[at] = weighted(c.points.items[at].point().add(change.multiply_scalar(w)), 1.0)
+    let now = try curve_arc(c)
+    try measure_station(now, target, order, opts, report)
+    report.start_angle = angle_between(now.d[1], target.reference)
+    report.end_angle = report.start_angle
+    report.stations += 1
+

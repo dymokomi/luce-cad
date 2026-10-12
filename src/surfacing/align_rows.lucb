@@ -1,0 +1,126 @@
+## Align's rows (surfacing Stage 4; align.lucb has the method): a net
+## turned so the side to align is its u = low rows, the rows' derivative
+## coefficients at that end, and the input's cross jet from its rows.
+
+## The rows' derivative coefficients at a clamped end: S^(k) = Σ c[k][i] P_i.
+struct Ends:
+    var c: f64[16]
+
+    func at(k: usize, i: usize) -> f64:
+        return self.c[k * 4 + i]
+
+func ends_of_nothing() -> Ends:
+    return Ends([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+## The coefficients of `knots` (degree `degree`, `count` control points)
+## at its low end.
+func ends_of(knots: const f64[], count: usize, degree: i64) -> Ends:
+    var ders: f64[48]
+    _ = basis_jet(knots, (i64)count, degree, knots[(usize)degree], false, &ders)
+    var e = Ends([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    for k in 0..<(usize)4:
+        for i in 0..<(usize)4:
+            if i <= (usize)degree and k <= (usize)degree: e.c[k * 4 + i] = ders[k * 12 + i]
+    return e
+
+# -- Turning a net so a side is its u = low rows.
+
+## `net` transposed (u and v exchanged).
+func transposed(net: const Net*) -> Net!:
+    var made = empty_net()
+    errdefer made.close()
+    made.du = net.dv
+    made.dv = net.du
+    made.nu = net.nv
+    made.nv = net.nu
+    try made.ku.assign(net.kv.view())
+    try made.kv.assign(net.ku.view())
+    for j in 0..<net.nv:
+        for i in 0..<net.nu: try made.points.push(net.points.items[i * net.nv + j])
+    return made
+
+## `net` with u running the other way (its knots mirrored).
+func u_reversed(net: const Net*) -> Net!:
+    var made = empty_net()
+    errdefer made.close()
+    made.du = net.du
+    made.dv = net.dv
+    made.nu = net.nu
+    made.nv = net.nv
+    let low = net.u_low()
+    let high = net.u_high()
+    var k = net.ku.count
+    while k > 0:
+        k -= 1
+        try made.ku.push(low + high - net.ku.items[k])
+    try made.kv.assign(net.kv.view())
+    var i = net.nu
+    while i > 0:
+        i -= 1
+        for j in 0..<net.nv: try made.points.push(net.points.items[i * net.nv + j])
+    return made
+
+## `net` turned so side `side` (0 u low, 1 u high, 2 v low, 3 v high) is
+## its u = low rows; `back` turns it back.
+func turned(net: const Net*, side: i64, back: bool) -> Net!:
+    if side == 0: return try net.copy()
+    if side == 1: return try u_reversed(net)
+    if side == 2: return try transposed(net)
+    if back:
+        var flipped = try u_reversed(net)
+        defer flipped.close()
+        return try transposed(&flipped)
+    var swapped = try transposed(net)
+    defer swapped.close()
+    return try u_reversed(&swapped)
+
+## The side of `net` (as turned's) whose boundary row lies nearest `p`.
+func nearest_side(net: const Net*, p: Vector3) -> i64:
+    var best: i64 = 0
+    var best_distance = 1.0e300
+    for side in 0..<(i64)4:
+        for k in 0..<33:
+            let f = (f64)k / 32.0
+            let u = net.u_low() if side == 0 else (net.u_high() if side == 1 else net.u_low() + (net.u_high() - net.u_low()) * f)
+            let v = net.v_low() if side == 2 else (net.v_high() if side == 3 else net.v_low() + (net.v_high() - net.v_low()) * f)
+            let d = net.point_at(u, v).subtract(p).length()
+            if d < best_distance:
+                best_distance = d
+                best = side
+    return best
+
+## Row `i` of a (turned) net as a curve along v.
+func row_of(net: const Net*, i: usize) -> Spline!:
+    var c = empty_spline(net.dv)
+    errdefer c.close()
+    try c.knots.assign(net.kv.view())
+    for j in 0..<net.nv: try c.points.push(net.points.items[i * net.nv + j])
+    return c
+
+## The point of row `i` of `net` at `s`.
+func row_point(net: const Net*, i: usize, s: f64) -> Vector3:
+    var bv: f64[12]
+    let first = nurbs_basis(net.kv.view(), (i64)net.nv, net.dv, math.clamp(s, net.v_low(), net.v_high()), &bv)
+    var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+    for j in 0..<(usize)net.dv + 1: sum = sum.plus(net.points.items[i * net.nv + first + j].times(bv[j]))
+    return sum.point()
+
+## Row 0's direction along the edge at `s` (by a small chord).
+func edge_along(net: const Net*, s: f64) -> Vector3:
+    let h = (net.v_high() - net.v_low()) * 1e-5
+    let a = math.max(net.v_low(), s - h)
+    let b = math.min(net.v_high(), s + h)
+    return row_point(net, 0, b).subtract(row_point(net, 0, a))
+
+## The input's current cross jet at a station run toward the master, by
+## arc length (Symmetry Plane Align keeps its curvature).
+func current_arc(e: const Ends*, cur: const Vector3[4]*) -> Jet!:
+    var j = empty_jet()
+    j.d[0] = (*cur)[0]
+    for k in 1..<(usize)4:
+        var sum = Vector3()
+        for i in 0..<k + 1: sum = sum.add((*cur)[i].multiply_scalar(e.at(k, i)))
+        # A(x) = S(-x): odd orders turn.
+        j.d[k] = sum.multiply_scalar(-1.0 if k % 2 == 1 else 1.0)
+    return try arc_jet(&j)
+

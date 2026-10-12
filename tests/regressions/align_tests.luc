@@ -1,0 +1,355 @@
+## Align (surfacing Stage 4, luce_cad.surfacing's CadSurfacing.aligned)
+## against closed forms, measured by the Check tools (CadMeasure.check
+## across the edge once the two are stitched): a flat strip aligned to a
+## quarter cylinder of radius 2 measures G1, G2 and G3 exactly as asked
+## (and fails the next order), its curvature at the edge 1/2 from G2 on;
+## with Position Influence 0 its knots along the edge stay; Extra CV Rows
+## move one more row and none beyond; Explicit Control on refuses G3 on six
+## rows ("needs 8 rows across, has 6"), off adds spans; Partial 0.2 to 0.8
+## leaves the edge outside the range where it was; Modify Both moves a
+## symmetric roof's two halves symmetrically, the ridge staying put; the
+## Vector type slides rows only along its vector; two masters align both
+## sides; Symmetry Plane Align leaves the tangent row square to the plane
+## and its curvature in it; Refine meets a curved edge a cubic misses; a
+## curve's end aligns G2 to another curve; Project casts the edge onto a
+## face and leaves a curve there.
+from luce_cad.surfacing import CadSurfacing
+from luce_cad.cad_geometry import CadGeometry
+from luce_cad.cad_curves import CadCurves
+from luce_cad.measure import CadMeasure
+from luce_cad.model import CadModel
+from luce_cad.nurbs import CadNurbs, CadSpline
+from luce_cad.curves import CadCurveTools
+from luce_cad.modeling import CadModeling
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3, GeometrySet
+from luce_std import math
+
+pub func align_tests() -> unit!:
+    orders()
+    sliders()
+    box_tops()
+    knots_and_rows()
+    partial_range()
+    modify_both()
+    vector_type()
+    two_masters()
+    symmetry()
+    refined()
+    curve_ends()
+    projected()
+    print("PASS align: a strip on a cylinder measures G1, G2 and G3 as asked (curvature 1/2 from G2); Tangent Scale, AutoScale, Balance, Skew, Blend Factor, isoparm and U/V masters as Alias has them; its knots stay at Position Influence 0; extra rows move one more row; Explicit Control refuses G3 on six rows, off adds spans; Partial keeps the edge outside its range; Modify Both is symmetric; Vector slides along its vector; two masters; Symmetry Plane Align; Refine meets a curved edge; curves align G2; Project leaves a curve on the face")
+
+## A quarter cylinder of radius `r` about Z from (r, 0) round to (0, r), z
+## from 0 to `length`: its edge x = r, y = 0 the master's.
+func quarter(r: float, length: float) -> CadModel!:
+    let w = math.sqrt(0.5)
+    let points = [Vector3(r, 0.0, 0.0), Vector3(r, 0.0, length), Vector3(r, r, 0.0), Vector3(r, r, length), Vector3(0.0, r, 0.0), Vector3(0.0, r, length)]
+    return CadSurfacing.patch(points, [1.0, 1.0, w, w, 1.0, 1.0], 3, 2, 2, 1, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], "cylinder")
+
+## A flat strip, quintic across (`rows` rows, one span when six) and cubic
+## along Z, from row 0 at `near` to the last at `far` (each a point at z 0).
+func strip(near: Vector3, far: Vector3, length: float, name: str) -> CadModel!:
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    for i in 0..<6:
+        let base = near.add(far.subtract(near).multiply_scalar(float(i) / 5.0))
+        for j in 0..<4:
+            points.append(base.add(Vector3(0.0, 0.0, length * float(j) / 3.0)))
+            weights.append(1.0)
+    return CadSurfacing.patch(points, weights, 6, 4, 5, 3, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], name)
+
+## The strip leaning in toward the cylinder's edge, and the cylinder.
+func scene() -> GeometrySet!:
+    let input = strip(Vector3(2.15, -0.2, 0.0), Vector3(3.0, -3.0, 0.0), 4.0, "strip")
+    return CadGeometry.of_model(input).merged(CadGeometry.of_model(quarter(2.0, 4.0)))
+
+## The models of `data` stitched into one, and the check of its one shared
+## edge at level 3.
+func shared_edge(data: GeometrySet) -> (CadModel, int)!:
+    let sewn = CadSurfacing.stitched(data, [], 0.0001)
+    assert(sewn.count >= 1, "the aligned strip does not meet its master")
+    let model = CadGeometry.model(sewn.geometry(), 0)
+    let check = CadMeasure.check(model, "", 3, 16, 0.0001, 0.1, 0.5, 1.0, false, 8, false, 1.0, true)
+    assert(check.edge_count() == 1, f"{check.edge_count()} shared edges")
+    return (model, check.edge(0).level)
+
+## Control point (u, v) of the face named `face` in `model`.
+func cv(model: CadModel, face: str, u: int, v: int) -> Vector3!:
+    let s = CadNurbs.surface_of_face(model, face)
+    let shape = CadNurbs.structure(model, s)
+    return model.cv_position(CadNurbs.first_cv(model, s) + u * shape.nv + v)
+
+## The model of `data` holding the face `face`.
+func holding(data: GeometrySet, face: str) -> CadModel!:
+    for k in 0..<CadGeometry.model_count(data):
+        let m = CadGeometry.model(data, k)
+        for f in 0..<m.face_count():
+            if m.face_name(f) == face:
+                return m
+    assert(false, f"no face {face}")
+    return CadGeometry.model(data, 0)
+
+func orders() -> unit!:
+    for order in 1..<4:
+        let made = CadSurfacing.aligned(scene(), "face strip 2.1 -0.1 2", "edge cylinder 2 0 2", order)
+        assert(made.met, f"G{order}: gap {made.gap_high} angle {made.angle_high} curvature {made.curvature_high} rate {made.rate_high}")
+        let (model, level) = shared_edge(made.geometry())
+        assert(level == order, f"G{order} align measured G{level}")
+        # The strip's curvature across the edge is the cylinder's from G2.
+        let check = CadMeasure.check(model, "", 3, 8, 0.0001, 0.1, 0.5, 1.0, false, 8, false, 1.0, true)
+        let edge = check.edge(0)
+        for at in edge.first..<edge.first + edge.count:
+            let s = check.station(at)
+            assert(math.abs(s.point.x - 2.0) < 1e-9 and math.abs(s.point.y) < 1e-9, f"edge at {s.point}")
+            if order >= 2:
+                assert(math.abs(math.abs(s.curvature1) - 0.5) < 1e-6 and math.abs(math.abs(s.curvature2) - 0.5) < 1e-6, f"curvatures {s.curvature1} {s.curvature2}")
+
+func knots_and_rows() -> unit!:
+    let data = scene()
+    let before = holding(data, "strip")
+    # G1 with one extra row: rows 0 to 2 move, rows 3 to 5 stay; the knots
+    # along the edge stay (Position Influence 0).
+    let made = CadSurfacing.aligned(data, "face strip 2.1 -0.1 2", "edge cylinder 2 0 2", 1, extra = 1)
+    let after = holding(made.geometry(), "strip")
+    let s0 = CadNurbs.surface_of_face(before, "strip")
+    let s1 = CadNurbs.surface_of_face(after, "strip")
+    assert(CadNurbs.knot_count(before, s0, 1) == CadNurbs.knot_count(after, s1, 1))
+    for k in 0..<CadNurbs.knot_count(after, s1, 1):
+        assert(CadNurbs.knot(before, s0, 1, k) == CadNurbs.knot(after, s1, 1, k))
+    assert(made.row_count() == 3 and made.row_size == 4, f"{made.row_count()} rows of {made.row_size}")
+    for u in 0..<6:
+        for v in 0..<4:
+            let moved = cv(after, "strip", u, v).subtract(cv(before, "strip", u, v)).length()
+            if u <= 2:
+                assert(moved > 1e-3, f"row {u} did not move")
+            else:
+                assert(moved < 1e-12, f"row {u} moved {moved}")
+    # Explicit Control on: G3 needs eight rows, the strip has six.
+    var refused = ""
+    _ = CadSurfacing.aligned(data, "face strip 2.1 -0.1 2", "edge cylinder 2 0 2", 3, explicit = true) catch failure:
+        refused = failure.message
+        recover made
+    assert(refused.contains("needs 8 rows across, has 6"), refused)
+    # Off: spans added across, eight rows or more.
+    let g3 = holding(CadSurfacing.aligned(data, "face strip 2.1 -0.1 2", "edge cylinder 2 0 2", 3).geometry(), "strip")
+    assert(CadNurbs.structure(g3, CadNurbs.surface_of_face(g3, "strip")).nu >= 8)
+
+func partial_range() -> unit!:
+    let data = scene()
+    let before = holding(data, "strip")
+    let s0 = CadNurbs.surface_of_face(before, "strip")
+    let made = CadSurfacing.aligned(data, "face strip 2.1 -0.1 2", "edge cylinder 2 0 2", 1, partial = true, start = 0.2, end = 0.8)
+    assert(made.met and made.angle_high < 0.1, f"partial angle {made.angle_high}")
+    let after = holding(made.geometry(), "strip")
+    let s1 = CadNurbs.surface_of_face(after, "strip")
+    # Outside the range and the span either side the edge stays; inside it
+    # lies on the cylinder's edge.
+    for k in 0..<21:
+        let f = float(k) / 20.0
+        let was = CadNurbs.point_at(before, s0, 0.0, f)
+        let now = CadNurbs.point_at(after, s1, 0.0, f)
+        if f < 0.13 or f > 0.87:
+            assert(now.subtract(was).length() < 1e-9, f"the edge moved at {f}: {was} to {now}")
+        elif f >= 0.2 and f <= 0.8:
+            assert(math.abs(now.x - 2.0) < 1e-9 and math.abs(now.y) < 1e-9, f"partial edge at {f}: {now}")
+
+## A roof: two flat strips meeting at a ridge x = 0, y = 1, each falling
+## to y = 0 at x = ∓3.
+func roof() -> GeometrySet!:
+    let left = strip(Vector3(0.0, 1.0, 0.0), Vector3(-3.0, 0.0, 0.0), 4.0, "left")
+    let right = strip(Vector3(0.0, 1.0, 0.0), Vector3(3.0, 0.0, 0.0), 4.0, "right")
+    return CadGeometry.of_model(left).merged(CadGeometry.of_model(right))
+
+func modify_both() -> unit!:
+    let made = CadSurfacing.aligned(roof(), "face left 0 1 2", "edge right 0 1 2", 1, both = true)
+    assert(made.met, f"both: angle {made.angle_high}")
+    let data = made.geometry()
+    let left = holding(data, "left")
+    let right = holding(data, "right")
+    # Mirror images of each other, the ridge where it was, the tangent rows
+    # level with it.
+    for u in 0..<6:
+        for v in 0..<4:
+            let a = cv(left, "left", u, v)
+            let b = cv(right, "right", u, v)
+            assert(math.abs(a.x + b.x) < 1e-9 and math.abs(a.y - b.y) < 1e-9 and math.abs(a.z - b.z) < 1e-9, f"cv {u} {v}: {a} and {b}")
+    for v in 0..<4:
+        assert(math.abs(cv(left, "left", 0, v).x) < 1e-9 and math.abs(cv(left, "left", 0, v).y - 1.0) < 1e-9)
+        assert(math.abs(cv(left, "left", 1, v).y - 1.0) < 1e-9, f"tangent row at y {cv(left, "left", 1, v).y}")
+    let (_, level) = shared_edge(data)
+    assert(level >= 1)
+
+func vector_type() -> unit!:
+    # Rows 1 slide along X only, onto the cylinder's tangent plane x = 2.
+    let data = scene()
+    let before = holding(data, "strip")
+    let made = CadSurfacing.aligned(data, "face strip 2.1 -0.1 2", "edge cylinder 2 0 2", 1, kind = 3, vector = Vector3(1.0, 0.0, 0.0))
+    let after = holding(made.geometry(), "strip")
+    for v in 0..<4:
+        let was = cv(before, "strip", 1, v)
+        let now = cv(after, "strip", 1, v)
+        assert(math.abs(now.x - 2.0) < 1e-9 and math.abs(now.y - was.y) < 1e-12 and math.abs(now.z - was.z) < 1e-12, f"vector row {now}")
+    let (_, level) = shared_edge(made.geometry())
+    assert(level >= 1)
+
+func two_masters() -> unit!:
+    # The strip between the cylinder and a flat sheet at its far side.
+    let sheet = strip(Vector3(3.2, -3.0, 0.0), Vector3(6.0, -3.0, 0.0), 4.0, "sheet")
+    let data = scene().merged(CadGeometry.of_model(sheet))
+    let made = CadSurfacing.aligned(data, "face strip 2.1 -0.1 2", "edge cylinder 2 0 2", 1, second = "edge sheet 3.2 -3 2", second_near = Vector3(3.0, -3.0, 2.0))
+    assert(made.met)
+    let sewn = CadSurfacing.stitched(made.geometry(), [], 0.0001)
+    assert(sewn.count == 2, f"{sewn.count} joined")
+    let check = CadMeasure.check(CadGeometry.model(sewn.geometry(), 0), "", 1, 12, 0.0001, 0.1, 0.5, 1.0, false, 8, false, 1.0, true)
+    assert(check.edge_count() == 2 and check.passed() == 2, f"{check.passed()} of {check.edge_count()} G1")
+
+func symmetry() -> unit!:
+    # A strip leaning toward the plane x = 0: G2 to its mirror.
+    let input = strip(Vector3(0.3, 0.0, 0.0), Vector3(3.0, 1.5, 0.0), 4.0, "half")
+    let made = CadSurfacing.aligned(CadGeometry.of_model(input), "face half 0.3 0 2", "plane 0 0 0 1 0 0", 2)
+    assert(made.met, f"symmetry: angle {made.angle_high}, curvature {made.curvature_high}")
+    let half = holding(made.geometry(), "half")
+    for v in 0..<4:
+        let p0 = cv(half, "half", 0, v)
+        let p1 = cv(half, "half", 1, v)
+        assert(math.abs(p0.x) < 1e-9, f"edge off the plane {p0}")
+        assert(math.abs(p1.y - p0.y) < 1e-9 and math.abs(p1.z - p0.z) < 1e-9 and p1.x > 0.01, f"tangent row not square to the plane: {p0} {p1}")
+        # Row 2 bends the strip in the plane z = const (its curvature has no
+        # x part at the edge): row 2's offset from row 1 keeps x - 2 row 1 + row 0 balance.
+    # The whole edge stays on the plane.
+    let s = CadNurbs.surface_of_face(half, "half")
+    for k in 0..<9:
+        assert(math.abs(CadNurbs.point_at(half, s, 0.0, float(k) / 8.0).x) < 1e-9)
+
+func refined() -> unit!:
+    # A strip above the cylinder's top arc, its edge cubic: G0 to the
+    # circle within 1e-6 needs spans along the edge.
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    for i in 0..<6:
+        for j in 0..<4:
+            let angle = math.pi * 0.5 * float(j) / 3.0
+            let r = 2.0 + 0.1 * float(i) / 5.0
+            points.append(Vector3(r * math.cos(angle), r * math.sin(angle), 4.05 + float(i) * 0.4))
+            weights.append(1.0)
+    let cap = CadSurfacing.patch(points, weights, 6, 4, 5, 3, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], "cap")
+    let data = CadGeometry.of_model(cap).merged(CadGeometry.of_model(quarter(2.0, 4.0)))
+    let plain = CadSurfacing.aligned(data, "face cap 1.42 1.42 4.05", "edge cylinder 1.41 1.41 4", 1, gap = 1e-6)
+    assert(not plain.met and plain.gap_high > 1e-6, f"a cubic met a quarter circle: {plain.gap_high}")
+    let better = CadSurfacing.aligned(data, "face cap 1.42 1.42 4.05", "edge cylinder 1.41 1.41 4", 1, gap = 1e-6, refine = true, most = 20)
+    assert(better.met and better.gap_high <= 1e-6, f"refined gap {better.gap_high}")
+
+func curve_ends() -> unit!:
+    # A line ending near a circle of radius 1: its end aligned G2 to it.
+    let line = CadCurveTools.by_points([Vector3(-3.0, -1.5, 0.0), Vector3(-1.0, -1.2, 0.0)], 1)
+    let w = math.sqrt(0.5)
+    let arc = CadSpline.make([Vector3(0.0, -1.0, 0.0), Vector3(1.0, -1.0, 0.0), Vector3(1.0, 0.0, 0.0)], [1.0, w, 1.0], 2, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+    let data = CadCurves.with_curve(CadCurves.with_curve(CadGeometry.of_model(quarter(2.0, 1.0)), "line", line), "arc", arc)
+    let made = CadSurfacing.aligned(data, "curve line -1 -1.2 0", "curve arc", 2, attach = 0.0)
+    let after = made.geometry()
+    let a = CadCurves.curve(after, CadCurves.find(after, "line"))
+    let b = CadCurves.curve(after, CadCurves.find(after, "arc"))
+    let join = CadMeasure.curve_join(a, a.high(), 1, b, b.low(), -1)
+    assert(join.level >= 2 and join.gap < 1e-12, f"curve join G{join.level}, gap {join.gap}, curvature {join.curvature}")
+
+func projected() -> unit!:
+    # A strip hanging over a flat sheet at y = -3: its edge cast down onto
+    # it (Project), G1, a curve left on the sheet.
+    let sheet = strip(Vector3(0.0, -3.0, -1.0), Vector3(6.0, -3.0, -1.0), 6.0, "floor")
+    let hanging = strip(Vector3(3.0, -2.0, 0.0), Vector3(3.5, 0.0, 0.0), 4.0, "hanging")
+    let data = CadGeometry.of_model(hanging).merged(CadGeometry.of_model(sheet))
+    let made = CadSurfacing.aligned(data, "face hanging 3 -2 2", "face floor", 1, kind = 1, vector = Vector3(0.0, -1.0, 0.0))
+    assert(made.met, f"project: gap {made.gap_high}, angle {made.angle_high}")
+    let after = made.geometry()
+    let curve = CadCurves.find(after, "Align1")
+    assert(curve >= 0 and CadCurves.face(after, curve) == "floor")
+    let hung = holding(after, "hanging")
+    let s = CadNurbs.surface_of_face(hung, "hanging")
+    for k in 0..<5:
+        assert(math.abs(CadNurbs.point_at(hung, s, 0.0, float(k) / 4.0).y + 3.0) < 1e-9)
+
+func sliders() -> unit!:
+    let data = scene()
+    let input = "face strip 2.1 -0.1 2"
+    let edge = "edge cylinder 2 0 2"
+    # Row 1 lies 0.56 behind the edge along the cylinder's tangent (+Y) as
+    # the strip had it; Tangent Scale 2 doubles it, 1 to 2 runs from one to
+    # the other.
+    let kept = holding(CadSurfacing.aligned(data, input, edge, 1).geometry(), "strip")
+    let doubled = holding(CadSurfacing.aligned(data, input, edge, 1, tangent = 2.0, tangent_end = 2.0).geometry(), "strip")
+    let ramped = holding(CadSurfacing.aligned(data, input, edge, 1, tangent = 1.0, tangent_end = 2.0).geometry(), "strip")
+    for v in 0..<4:
+        assert(math.abs(cv(kept, "strip", 1, v).y + 0.56) < 1e-9 and math.abs(cv(doubled, "strip", 1, v).y + 1.12) < 1e-9, f"tangent rows {cv(kept, "strip", 1, v)} {cv(doubled, "strip", 1, v)}")
+    assert(math.abs(cv(ramped, "strip", 1, 0).y + 0.56) < 1e-9 and math.abs(cv(ramped, "strip", 1, 3).y + 1.12) < 1e-9)
+    # AutoScale G2: row 2 twice as far behind row 1 too.
+    let plain2 = holding(CadSurfacing.aligned(data, input, edge, 2, tangent = 2.0, tangent_end = 2.0).geometry(), "strip")
+    let auto2 = holding(CadSurfacing.aligned(data, input, edge, 2, tangent = 2.0, tangent_end = 2.0, auto_g2 = true).geometry(), "strip")
+    let gap_plain = cv(plain2, "strip", 1, 1).y - cv(plain2, "strip", 2, 1).y
+    let gap_auto = cv(auto2, "strip", 1, 1).y - cv(auto2, "strip", 2, 1).y
+    assert(math.abs(gap_auto - 2.0 * gap_plain) < 1e-9, f"AutoScale G2: {gap_plain} then {gap_auto}")
+    # Tangent Balance: a strip whose rows spread along Z (its far edge from
+    # y -3 to -5) gets row 1 at one distance all along (the cylinder's
+    # speed is the same everywhere).
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    for i in 0..<6:
+        for j in 0..<4:
+            let z = 4.0 * float(j) / 3.0
+            let far = Vector3(3.0, -3.0 - z * 0.5, z)
+            let near = Vector3(2.15, -0.2, z)
+            points.append(near.add(far.subtract(near).multiply_scalar(float(i) / 5.0)))
+            weights.append(1.0)
+    let fan = CadSurfacing.patch(points, weights, 6, 4, 5, 3, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], "strip")
+    let fans = CadGeometry.of_model(fan).merged(CadGeometry.of_model(quarter(2.0, 4.0)))
+    let own = holding(CadSurfacing.aligned(fans, input, edge, 1).geometry(), "strip")
+    let even = holding(CadSurfacing.aligned(fans, input, edge, 1, balance = true).geometry(), "strip")
+    assert(math.abs(cv(own, "strip", 1, 0).y - cv(own, "strip", 1, 3).y) > 0.1)
+    assert(math.abs(cv(even, "strip", 1, 0).y - cv(even, "strip", 1, 3).y) < 1e-9, f"balanced {cv(even, "strip", 1, 0)} {cv(even, "strip", 1, 3)}")
+    # Skew: the strip leaves the edge 10 degrees off the cylinder's own
+    # direction across, still in its tangent plane (G1).
+    let skewed = CadSurfacing.aligned(data, input, edge, 1, skew = 10.0, skew_end = 10.0)
+    assert(math.abs(skewed.start_angle - 10.0) < 1e-6 and math.abs(skewed.end_angle - 10.0) < 1e-6 and skewed.angle_high < 1e-6, f"skew {skewed.start_angle} {skewed.end_angle}")
+    # Extra CV Rows 2, Blend Factor 0: rows 2 and 3 move 2/3 and 1/3 of
+    # row 1's change, row 4 not at all.
+    let before = holding(data, "strip")
+    let blended = holding(CadSurfacing.aligned(data, input, edge, 1, extra = 2).geometry(), "strip")
+    for v in 0..<4:
+        let change = cv(blended, "strip", 1, v).subtract(cv(before, "strip", 1, v))
+        assert(cv(blended, "strip", 2, v).subtract(cv(before, "strip", 2, v)).subtract(change.multiply_scalar(2.0 / 3.0)).length() < 1e-9)
+        assert(cv(blended, "strip", 3, v).subtract(cv(before, "strip", 3, v)).subtract(change.multiply_scalar(1.0 / 3.0)).length() < 1e-9)
+        assert(cv(blended, "strip", 4, v).subtract(cv(before, "strip", 4, v)).length() < 1e-12)
+    # An isoparm as the master: the cylinder's line at u = 0 is its edge.
+    let iso = CadSurfacing.aligned(data, input, "isoparm cylinder 0 0", 2)
+    assert(iso.met and iso.curvature_high < 0.5, f"isoparm master: curvature {iso.curvature_high}")
+    let (_, level) = shared_edge(iso.geometry())
+    assert(level == 2, f"isoparm G2 measured G{level}")
+    # U/V: a curve's end aligned to the cylinder's U direction (the circle
+    # round it) at its nearest point.
+    let line = CadCurveTools.by_points([Vector3(2.4, -3.0, 2.0), Vector3(2.1, -0.3, 2.0)], 1)
+    let curved = CadCurves.with_curve(data, "line", line)
+    let uv = CadSurfacing.aligned(curved, "curve line 2.1 -0.3 2", "face cylinder", 1, kind = 2)
+    assert(uv.met and uv.angle_high < 1e-6, f"U/V angle {uv.angle_high}")
+    let after = CadCurves.curve(uv.geometry(), CadCurves.find(uv.geometry(), "line"))
+    let end = after.at(after.high())
+    assert(math.abs(math.sqrt(end.x * end.x + end.y * end.y) - 2.0) < 1e-9, f"U/V end {end}")
+
+func box_tops() -> unit!:
+    # A box unstitched: its top (a plane) aligned G2 and G3 to its side
+    # becomes a whole B-spline face rolling over into the side, meshed.
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let apart = CadSurfacing.unstitched(CadGeometry.of_model(box), 0)
+    var top = ""
+    var side = ""
+    for k in 0..<6:
+        let m = CadGeometry.model(apart, k)
+        let frame = CadModeling.face_frame(m, m.face_name(0))
+        if frame.u.cross(frame.v).y > 0.999: top = m.face_name(0)
+        if frame.u.cross(frame.v).x > 0.999: side = m.face_name(0)
+    for order in [2, 3]:
+        let made = CadSurfacing.aligned(apart, f"face {top} 1 1 0", f"edge {side} 1 1 0", order)
+        let rolled = holding(made.geometry(), top)
+        assert(rolled.face_surface_kind(0) == 3 and rolled.edge_count() == 4)
+        assert(rolled.tessellate(16).face_count() > 0)
+        let (_, level) = shared_edge(CadGeometry.of_model(rolled).merged(CadGeometry.of_model(holding(made.geometry(), side))))
+        assert(level == order, f"box top G{order} measured G{level}")
