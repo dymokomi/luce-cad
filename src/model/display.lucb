@@ -217,9 +217,13 @@ extend CadModel:
         var colors = Growing[f64]()
         defer colors.close()
         var has_colors = false
+        # The B-rep's mesh, kept for its notes of faces left out.
+        var notes: interop.Reference[Mesh]? = none
+        defer:
+            if let held = notes: held.release()
         if let boundary = self.boundary:
             let part = try boundary.value().mesh(segments, edge_size, progress)
-            defer part.release()
+            notes = part
             for point in 0..<part.value().point_count():
                 _ = try output.point(self.placement.transform_point(try part.value().point(point)))
             let reversed = self.placement.determinant() < 0.0
@@ -275,8 +279,23 @@ extend CadModel:
             try colors.extend(output.nf * 3, 1.0)
             let colored = try tagged.value().with_attribute("Cd", 2, 3, colors.view())
             defer colored.release()
-            return try MeshNormals.generate(colored, output.face_parents[..<output.nf])
-        return try MeshNormals.generate(tagged, output.face_parents[..<output.nf])
+            return try with_notes_of(try MeshNormals.generate(colored, output.face_parents[..<output.nf]), notes)
+        return try with_notes_of(try MeshNormals.generate(tagged, output.face_parents[..<output.nf]), notes)
+
+## Takes `made`: with the B-rep mesh `part`'s notes of faces it left out
+## (.cad_dropped_faces, .cad_skipped_faces: brep_mesh's with_notes), which
+## a mesh rebuilt from its polygons would otherwise lose.
+func with_notes_of(made: interop.Reference[Mesh], part: interop.Reference[Mesh]?) -> interop.Reference[Mesh]!:
+    let source = part else return made
+    var current = made
+    errdefer current.release()
+    for name in [".cad_dropped_faces", ".cad_skipped_faces"]:
+        let index = source.value().find_attribute(name, (i64)(u8)Domain.detail)
+        if index < 0: continue
+        let next = try current.value().with_attribute_entry(try (try source.value().attribute_entry(index)).renamed(name))
+        current.release()
+        current = next
+    return current
 
 ## Curvature under a similarity placement: a uniform scale s divides it by s
 ## (a reflection keeps it, as corners reverse to keep normals outward), and

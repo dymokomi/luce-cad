@@ -1,0 +1,194 @@
+## Point location for lattice insertion (grid.lucb's insert_grid): which
+## lattice points lie inside the trim (even-odd along each lattice row,
+## against the triangulation's boundary, which insertion never splits),
+## which lie next to a boundary point (one bucket per lattice cell), and the
+## triangle holding a point (a walk across neighbors from the last one).
+## Each answer is what scanning every point or triangle would give, at the
+## cost of a few neighbors: a 64-division face's lattice has 65536 cells.
+
+## A triangle mesh's neighbors as it is split: `across[f * 3 + k]` is the
+## triangle across corner k's edge (k to k + 1) of triangle f, or -1 on the
+## boundary (and where more than two triangles meet).
+struct Neighbors:
+    var across: Growing[i64]
+
+    ## Neighbors of `mesh`'s triangles, from its corners.
+    static func of(mesh: const MeshBuilder*) -> Neighbors!:
+        var made = Neighbors(across = Growing[i64]())
+        errdefer made.close()
+        try made.across.fill(mesh.nf * 3, -1)
+        let keys = try new u64[mesh.nf * 3] --- in memory.heap
+        defer free(keys) in memory.heap
+        let order = try new i64[keys.length] --- in memory.heap
+        defer free(order) in memory.heap
+        for slot in 0..<keys.length: keys[slot] = edge_key(mesh, slot)
+        try sort.order(keys, order)
+        var at: usize = 0
+        while at < order.length:
+            var end = at + 1
+            while end < order.length and keys[(usize)order[end]] == keys[(usize)order[at]]: end += 1
+            let first = (usize)order[at]
+            if end == at + 2 and opposed(mesh, first, (usize)order[at + 1]):
+                made.across.items[first] = (i64)(order[at + 1] // 3)
+                made.across.items[(usize)order[at + 1]] = (i64)(first // 3)
+            at = end
+        return made
+
+    func close():
+        self.across.close()
+
+    ## Room for a triangle appended to the mesh (its neighbors set later).
+    func grow() -> !:
+        try self.across.push(-1)
+        try self.across.push(-1)
+        try self.across.push(-1)
+
+    func set(face: usize, values: const i64[]):
+        for k in 0..<(usize)3: self.across.items[face * 3 + k] = values[k]
+
+    ## Triangle `face`'s slot whose edge runs from `a` to `b` (3: none).
+    func slot(mesh: const MeshBuilder*, face: usize, a: i64, b: i64) -> usize:
+        for k in 0..<(usize)3:
+            if mesh.corners[face * 3 + k] == a and mesh.corners[face * 3 + (k + 1) % 3] == b: return k
+        return 3
+
+    ## Triangle `face` (if any) now has `value` across its edge from `a` to `b`.
+    func relink(mesh: const MeshBuilder*, face: i64, a: i64, b: i64, value: i64):
+        if face < 0: return
+        let k = self.slot(mesh, (usize)face, a, b)
+        if k < 3: self.across.items[(usize)face * 3 + k] = value
+
+## Corner slot `slot`'s edge, either way round.
+func edge_key(mesh: const MeshBuilder*, slot: usize) -> u64:
+    let a = (u64)mesh.corners[slot]
+    let b = (u64)mesh.corners[slot - slot % 3 + (slot % 3 + 1) % 3]
+    return (a << 32) | b if a < b else (b << 32) | a
+
+## Whether two slots of one edge run opposite ways (consistently wound).
+func opposed(mesh: const MeshBuilder*, first: usize, second: usize) -> bool:
+    return mesh.corners[first] != mesh.corners[second]
+
+## The lattice's cells, their boundary points, and the boundary's
+## crossings of the current lattice row.
+struct Lattice:
+    var origin: Vector3
+    var u: Vector3
+    var v: Vector3
+    var umin: f64
+    var vmin: f64
+    var spacing: f64
+    var vertical: f64
+    var columns: usize
+    var rows: usize
+    ## Each cell's first boundary point and each point's next in its cell.
+    var heads: i64[]
+    var next: i64[]
+    ## Boundary segments in lattice coordinates (u0, v0, u1, v1 each).
+    var segments: Growing[f64]
+    ## The current row's crossings, ascending, and how many lie before the
+    ## last column asked about.
+    var crossings: Growing[f64]
+    var passed: usize = 0
+
+    func close():
+        if self.heads.length > 0: free(self.heads) in memory.heap
+        if self.next.length > 0: free(self.next) in memory.heap
+        self.segments.close()
+        self.crossings.close()
+
+    ## Point `p`'s lattice coordinates.
+    func at(p: Vector3) -> Vector3:
+        let relative = p.subtract(self.origin)
+        return Vector3(relative.dot(self.u), relative.dot(self.v), 0.0)
+
+    ## Ready for row `row`: its boundary crossings sorted.
+    func start_row(row: usize) -> !:
+        let y = self.vmin + ((f64)row + 0.5) * self.vertical
+        self.crossings.clear()
+        self.passed = 0
+        var at: usize = 0
+        while at < self.segments.count:
+            let s = self.segments.items[at..<at + 4]
+            if (s[1] > y) != (s[3] > y): try self.crossings.push(s[0] + (y - s[1]) * (s[2] - s[0]) / (s[3] - s[1]))
+            at += 4
+        sort.sort(self.crossings.items[..<self.crossings.count])
+
+    ## Whether column `column` of the current row is inside the trim
+    ## (columns asked in ascending order).
+    func inside(column: usize) -> bool:
+        let x = self.umin + ((f64)column + 0.5) * self.spacing
+        while self.passed < self.crossings.count and self.crossings.items[self.passed] < x: self.passed += 1
+        return self.passed % 2 == 1
+
+    ## Whether a boundary point lies within a fifth of a cell of cell
+    ## (`column`, `row`)'s center (such a point lies in that cell).
+    func near(mesh: const MeshBuilder*, column: usize, row: usize, p: Vector3) -> bool:
+        var point = self.heads[row * self.columns + column]
+        while point >= 0:
+            let relative = mesh.points[(usize)point].subtract(p)
+            if math.abs(relative.dot(self.u)) < self.spacing * 0.2 and math.abs(relative.dot(self.v)) < self.vertical * 0.2: return true
+            point = self.next[(usize)point]
+        return false
+
+## The lattice over `mesh`'s points (all on its boundary: none inserted
+## yet), its boundary segments those of an odd number of triangles.
+func lattice(mesh: const MeshBuilder*, neighbors: const Neighbors*, origin: Vector3, u: Vector3, v: Vector3, umin: f64, vmin: f64, spacing: f64, vertical: f64, columns: usize, rows: usize) -> Lattice!:
+    var made = Lattice(origin = origin, u = u, v = v, umin = umin, vmin = vmin, spacing = spacing, vertical = vertical, columns = columns, rows = rows, heads = try new i64[columns * rows] --- in memory.heap, next = try new i64[mesh.np] --- in memory.heap, segments = Growing[f64](), crossings = Growing[f64]())
+    errdefer made.close()
+    for at in 0..<made.heads.length: made.heads[at] = -1
+    for point in 0..<mesh.np:
+        made.next[point] = -1
+        let p = made.at(mesh.points[point])
+        let column = math.floor((p.x - umin) / spacing)
+        let row = math.floor((p.y - vmin) / vertical)
+        if column < 0.0 or row < 0.0 or column >= (f64)columns or row >= (f64)rows: continue
+        let bucket = (usize)row * columns + (usize)column
+        made.next[point] = made.heads[bucket]
+        made.heads[bucket] = (i64)point
+    # A seam traced both ways meets itself: its slots link (neighbors), so
+    # only unlinked slots bound the trim. More than two triangles on an edge
+    # count by parity: each unlinked slot is a boundary segment, and a pair
+    # of them over one edge cancels in the even-odd count.
+    for slot in 0..<mesh.nf * 3:
+        if neighbors.across.items[slot] >= 0: continue
+        let a = made.at(mesh.points[(usize)mesh.corners[slot]])
+        let b = made.at(mesh.points[(usize)mesh.corners[slot - slot % 3 + (slot % 3 + 1) % 3]])
+        for value in [a.x, a.y, b.x, b.y]: try made.segments.push(value)
+    return made
+
+## The triangle strictly holding `p` (every side more than `epsilon` inside),
+## walked to across neighbors from `start`; -1 when `p` is on a side or the
+## walk meets the boundary (the caller then scans every triangle).
+func walk(mesh: const MeshBuilder*, neighbors: const Neighbors*, start: i64, p: Vector3, n: Vector3, epsilon: f64) -> i64:
+    var face = start
+    for step in 0..<most_steps:
+        let at = (usize)face * 3
+        let pa = mesh.points[(usize)mesh.corners[at]]
+        let pb = mesh.points[(usize)mesh.corners[at + 1]]
+        let pc = mesh.points[(usize)mesh.corners[at + 2]]
+        let sides = [pb.subtract(pa).cross(p.subtract(pa)).dot(n), pc.subtract(pb).cross(p.subtract(pb)).dot(n), pa.subtract(pc).cross(p.subtract(pc)).dot(n)]
+        var leave: usize = 3
+        var worst = -epsilon
+        for k in 0..<(usize)3:
+            if sides[k] < worst:
+                worst = sides[k]
+                leave = k
+        if leave == 3:
+            if sides[0] > epsilon and sides[1] > epsilon and sides[2] > epsilon: return face
+            return -1
+        face = neighbors.across.items[at + leave]
+        if face < 0: return -1
+    return -1
+
+## The first triangle (in order) holding `p` within `epsilon`, or -1.
+func scan_triangles(mesh: const MeshBuilder*, p: Vector3, n: Vector3, epsilon: f64) -> i64:
+    for face in 0..<mesh.nf:
+        let pa = mesh.points[(usize)mesh.corners[face * 3]]
+        let pb = mesh.points[(usize)mesh.corners[face * 3 + 1]]
+        let pc = mesh.points[(usize)mesh.corners[face * 3 + 2]]
+        if pb.subtract(pa).cross(p.subtract(pa)).dot(n) < -epsilon or pc.subtract(pb).cross(p.subtract(pb)).dot(n) < -epsilon or pa.subtract(pc).cross(p.subtract(pc)).dot(n) < -epsilon: continue
+        return (i64)face
+    return -1
+
+## A walk longer than this (round a concave trim's notch) gives way to a scan.
+let most_steps: usize = 4096

@@ -49,14 +49,12 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
             if loop == 0 and at == 0:
                 anchor = previous
         offset += (usize)sizes[loop]
-    # A single latitude loop bounds a spherical cap; UV has a singular pole.
-    if s.kind == surface_sphere and sizes.length == 1:
-        var latitude = true
-        for p in uv:
-            latitude = latitude and math.abs(p.y - uv[0].y) <= tolerance
-        if latitude:
-            try spherical_cap(mesh, ids, uv, s, sense, divisions)
-            return
+    # A single loop winding once round the axis bounds a spherical cap
+    # (a latitude circle, or a wavy loop such as a variable fillet's
+    # contact round a dome); UV has a singular pole.
+    if s.kind == surface_sphere and sizes.length == 1 and winds_once(uv, uscale):
+        try spherical_cap(mesh, ids, uv, s, sense, divisions)
+        return
     var spacing = uscale * math.pi / (2.0 * (f64)divisions)
     var vertical = vscale * math.pi / (2.0 * (f64)divisions) if s.kind == surface_sphere or s.kind == surface_torus else spacing
     if edge_size == 0.0:
@@ -104,10 +102,31 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
         for at in 0..<count:
             try mesh.corner(mapped[(usize)(try part.value().face_point(face, at if sense else count - 1 - at))])
 
+## Whether a loop's chart points (u unwrapped, scaled by `uscale`) go
+## round the axis once, every step turning the same way: rows from each
+## point straight to the pole then never cross.
+func winds_once(uv: const Vector3[], uscale: f64) -> bool:
+    let turn = 2.0 * math.pi * uscale
+    var total: f64 = 0.0
+    var sign: f64 = 0.0
+    for at in 0..<uv.length:
+        let next = uv[(at + 1) % uv.length].x
+        var step = next - uv[at].x
+        # The closing step comes back from the unwrapped end.
+        if at + 1 == uv.length: step = wrap(next / uscale, uv[at].x / uscale) * uscale - uv[at].x
+        if step == 0.0 or step * sign < 0.0: return false
+        sign = step
+        total += step
+    return math.abs(math.abs(total) - turn) <= turn * 1e-9
+
+## A spherical cap's mesh: rows from each boundary point along its
+## meridian to the pole the loop goes round (north when it turns
+## counterclockwise about the face's normal), `divisions` of them, closed
+## by a fan at the pole. Going east along the loop and north to the pole
+## faces out, so the corners' own order faces the face's way.
 func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s: Surface, sense: bool, divisions: i64) -> !:
-    let north = uv[uv.length - 1].x > uv[0].x
+    let north = (uv[uv.length - 1].x > uv[0].x) == sense
     let pole_v = math.pi * (0.5 if north else -0.5)
-    let start_v = uv[0].y / s.radius
     let previous = try new i64[ids.length] --- in memory.heap
     defer free(previous) in memory.heap
     let next = try new i64[ids.length] --- in memory.heap
@@ -115,20 +134,18 @@ func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s:
     for at in 0..<ids.length:
         previous[at] = ids[at]
     for row in 1..<divisions:
-        let v = start_v + (pole_v - start_v) * (f64)row / (f64)divisions
         for at in 0..<ids.length:
-            next[at] = try mesh.point(analytic_point(s, uv[at].x / s.radius, v))
+            let start_v = uv[at].y / s.radius
+            next[at] = try mesh.point(analytic_point(s, uv[at].x / s.radius, start_v + (pole_v - start_v) * (f64)row / (f64)divisions))
         for at in 0..<ids.length:
             let following = (at + 1) % ids.length
             let corners = [previous[at], previous[following], next[following], next[at]]
             try mesh.face(4)
-            for index in 0..<(usize)4:
-                try mesh.corner(corners[index if sense else 3 - index])
+            for index in 0..<(usize)4: try mesh.corner(corners[index])
         for at in 0..<ids.length:
             previous[at] = next[at]
     let pole = try mesh.point(analytic_point(s, 0.0, pole_v))
     for at in 0..<ids.length:
         let corners = [previous[at], previous[(at + 1) % ids.length], pole]
         try mesh.face(3)
-        for index in 0..<(usize)3:
-            try mesh.corner(corners[index if sense else 2 - index])
+        for index in 0..<(usize)3: try mesh.corner(corners[index])

@@ -21,22 +21,15 @@ pub func mapped_patch(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: con
     defer free(boundary) in memory.heap
     let ids = try new i64[offsets[4]] --- in memory.heap
     defer free(ids) in memory.heap
-    var previous = Vector3(0.5, 0.5, 0.0)
-    for side in 0..<(usize)4:
-        var index = offsets[side]
-        for segment in 0..<sides.lengths[side]:
-            let use = face.uses[(sides.starts[side] + segment) % face.uses.length]
-            let points = samples[edge_index(use)].ids
-            let length = points.length if segment + 1 == sides.lengths[side] else points.length - 1
-            for at in 0..<length:
-                ids[index] = points[at if use > 0 else points.length - 1 - at]
-                let p = mesh.points[(usize)ids[index]]
-                previous = try chart_parameter(s, p, previous, tolerance, index > 0)
-                boundary[index] = previous
-                index += 1
-        if side > 0 and ids[offsets[side] - 1] != ids[offsets[side]]:
-            error(invalid, "mapped patch sides do not meet")
-    if ids[0] != ids[ids.length - 1] or boundary[0].subtract(boundary[boundary.length - 1]).length() > 0.00001:
+    # A seam point lies on both copies of a closed surface's chart, and the
+    # first one's copy is a guess: a walk that comes back on the other copy
+    # (a closed B-spline strip started at v = 1, its rim wrapping to 0) is
+    # walked again from where it ended.
+    try walk(mesh, face, s, sides, offsets, samples, tolerance, Vector3(0.5, 0.5, 0.0), boundary, ids)
+    if ids[0] != ids[ids.length - 1]: error(invalid, "mapped patch has an open parameter boundary")
+    if boundary[0].subtract(boundary[boundary.length - 1]).length() > 0.00001:
+        try walk(mesh, face, s, sides, offsets, samples, tolerance, boundary[boundary.length - 1], boundary, ids)
+    if boundary[0].subtract(boundary[boundary.length - 1]).length() > 0.00001:
         error(invalid, "mapped patch has an open or singular parameter boundary")
     let grid = try new Vector3[(nx + 1) * (ny + 1)] --- in memory.heap
     defer free(grid) in memory.heap
@@ -105,3 +98,22 @@ pub func mapped_patch(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: con
                 try mesh.face(4)
                 for corner in 0..<(usize)4: try mesh.corner(corners[corner if forward else 3 - corner])
     if refine: try mapped_refine(mesh, grid, mapped, nx, ny, s, forward, tolerance, divisions)
+
+## The chart parameters of the patch's boundary samples (`ids`), side by
+## side, each continuing from the one before; the first from `seed`.
+func walk(mesh: const MeshBuilder*, face: BrepFace, s: Surface, sides: PatchSides, offsets: const usize[], samples: const Samples[], tolerance: f64, seed: Vector3, boundary: Vector3[], ids: i64[]) -> !:
+    var previous = seed
+    for side in 0..<(usize)4:
+        var index = offsets[side]
+        for segment in 0..<sides.lengths[side]:
+            let use = face.uses[(sides.starts[side] + segment) % face.uses.length]
+            let points = samples[edge_index(use)].ids
+            let length = points.length if segment + 1 == sides.lengths[side] else points.length - 1
+            for at in 0..<length:
+                ids[index] = points[at if use > 0 else points.length - 1 - at]
+                let p = mesh.points[(usize)ids[index]]
+                previous = try chart_parameter(s, p, previous, tolerance, index > 0)
+                boundary[index] = previous
+                index += 1
+        if side > 0 and ids[offsets[side] - 1] != ids[offsets[side]]:
+            error(invalid, "mapped patch sides do not meet")

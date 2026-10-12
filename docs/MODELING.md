@@ -853,9 +853,7 @@ edge it is one unit long. OpenCASCADE and Parasolid build a ball rolling along a
   degree and knots, else degree 5 over two spans). Spans that stray beyond the shape's tolerance are
   halved, and the rows are fitted again. The rows on the face and on the wall are those faces' new
   edges, so they are shared exactly; the wall's row lies on the wall because it runs along its
-  ruling. A fitted strip is parametrized with its normal into the material: the tessellator's
-  constrained fallback, which an unevenly sampled strip can reach, did not converge for the other
-  orientation.
+  ruling.
 
 The face's loop moves onto the contacts. Each wall's edge moves along the ruling to its contact. Each
 seam is shortened, and each joint gets one section edge, which both of its strips share. The result
@@ -881,8 +879,7 @@ arc, a hole's wall curving into the material), nothing trims the blend, so it st
 ends in the section's plane, and a flat end face (`<tag>/end[...]`) fills the corner between the
 section and the sharp edge, bounded by the section, the seam's upper part and a line on the face
 back to the corner. The seam is split at the wall's contact. The end face touches the face and the
-wall in cusps, which the tessellator samples finely (opposite sides' sample counts are equalized up
-to 1024). Concave chains' open ends stop flat too. **Checked against Fusion 2705** (probe of
+wall in cusps, which the tessellator samples finely. Concave chains' open ends stop flat too. **Checked against Fusion 2705** (probe of
 2026-10-12, `fusion_probe_tests`): a stadium plate's arc top edge filleted alone (r 3, Tangent chain
 off, G1 and G2) fails in Fusion ("ASM_BL_END_TOO_CMPLX ... at the ends of the selected edges"). The
 flat end here is a deliberate superset: it succeeds where Fusion fails, and the G1 half turn takes
@@ -1604,9 +1601,9 @@ Roughly in order of usefulness:
    steep piece beside a shallow one, and the law round a closed loop between its extremes (not
    decoded; Variable radius above). A G1 ball rolled along an open chain's run-out, and round a
    loop whose radius comes near the loop's own curvature (refused with that reason).
-5. **Meshing a closed loop's strip whose radius changes** at 48 divisions and finer fails on some
-   faces (too many grid cells; trims seen crossing), and those faces drop out of the mesh: a dome's
-   rim with radii changing round it meshes at 32 and 40.
+5. **A sphere face holding a pole whose boundary is not one loop round it**: a ball drilled through
+   at a slant leaves each half sphere a face bounded by its equator and a hole, which no chart
+   meshes (the face is skipped and named on the node).
 6. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
    analytic surfaces are recognized as coincident.
 7. **Sweep and loft.**

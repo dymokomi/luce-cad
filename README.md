@@ -179,6 +179,10 @@ Supported face meshing:
   contain multiple STEP edges. Opposite side counts agree before shared edge
   sampling; interior curvature can raise the counts even with straight borders.
   Folded, singular and degenerate grids fall back to constrained trim meshing.
+  A closed patch's seam point lies on both copies of its chart; a boundary walk
+  that comes back on the other copy (a closed B-spline strip round a loop) is
+  walked again from where it ended, so the strip maps (it was refused and
+  outgrew the clipped grid's budget at 48 divisions and more).
 - NURBS trim loops projected to UV, meshed and lifted to the surface. Repeated
   seams on verified closed supports retain separate periodic chart images but
   stitch through the original shared 3D identities. Projection must agree within
@@ -192,7 +196,14 @@ Supported face meshing:
   split IDs. Existing shared boundaries remain fixed. Eight passes and a per-patch
   face budget bound work; this is not a certified global chord-error guarantee.
 - Trimmed cylinders/cones/spheres/tori in unwrapped analytic UV coordinates;
-  latitude-bounded spherical caps receive a pole-aware mesh.
+  a spherical cap bounded by one loop winding once round the axis (a latitude,
+  or a wavy rim such as a variable fillet's contact round a dome) receives a
+  pole-aware mesh: rows from each boundary sample along its meridian to the
+  pole the loop goes round (by the loop's turn about the face's normal, so an
+  inside-out cap takes its own pole). The constrained fallback's interior
+  lattice finds each point's triangle by walking across neighbors and its
+  inside by even-odd along the lattice row (up to 131,072 cells, a 64-division
+  face's twice over; it scanned every triangle and stopped at 8,192).
   If rotating a spherical chart turns an authored seam into a retraced interior
   slit, matching canonical identities allow it as a fixed constraint. Every
   authored seam segment survives triangulation, grid insertion, diagonal flips,
@@ -293,8 +304,11 @@ Supported face meshing:
   committing. Unsupported layouts fall back without dropping shared seam IDs.
   A face no strategy meshes is left out of the tessellation, not the model:
   `CadGeometry.skipped_faces(mesh)` names each ("Skipped CAD face i: reason",
-  one line each, joined across a set's models). Only running out of memory,
-  or every face failing, fails a tessellation.
+  one line each, joined across a set's models and kept beside independent
+  faces). A strategy that makes no polygon fails too ("no mesher made a
+  polygon of it"), so no face is left out without its line; luced-3d shows
+  the lines as the node's warning. Only running out of memory, or every face
+  failing, fails a tessellation.
 - Support grids clip faces of any number of trim loops, coedges and boundary
   samples (a plate with 500 holes, a cap of 5,000 coedges): the chart, the
   cut grid and the constrained fallbacks size their scratch by the face, and
