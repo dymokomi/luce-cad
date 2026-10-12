@@ -289,7 +289,12 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
      radii agree along the axis.
 
    Coincident surfaces are reported as such, facing the same way or opposite: planes, cylinders,
-   spheres, cones and tori, each found twice.
+   spheres, cones and tori, each found twice. A B-spline surface lies on another surface when a
+   9 × 9 lattice of its points, projected onto the other, lands on it (within ten times the
+   tolerance, normals parallel) wherever it lands inside the other's domain, and enough points do
+   (`spline_coincidence.lucb`): a rounded box's strips on its copy's, moved along them, or a strip
+   on a cylinder it was rolled from. The first point off the other surface ends the test, so
+   crossing surfaces cost a projection or two.
 
    Planes within 1e-7 radians of parallel are treated as parallel: noise, not a crossing.
 
@@ -351,7 +356,8 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    - of coincident pieces, one or none is kept.
 8. **Merging and output.** Kept pieces of one face, or of flush faces, that share an edge nobody
    else uses and end up facing the same way are merged. That includes a subtracted solid's turned
-   face lying flush on the other's. A sphere zone gets a seam meridian, because the tessellator meshes a band
+   face lying flush on the other's. Flush pieces on B-spline faces stay separate faces sharing an
+   edge: neither surface need reach over the other's part. A sphere zone gets a seam meridian, because the tessellator meshes a band
    on a sphere only with a seam. The result is written as a new B-rep. If any edge isn't used
    exactly twice, the operation fails rather than producing a broken solid.
 
@@ -1763,9 +1769,7 @@ Roughly in order of usefulness:
    azimuthal disk with holes: a ball drilled through at a slant) nor an open hemisphere (a
    latitude-longitude chart about the trims' middle), such as a ball with holes spread all round it
    and no loop round a pole; such a face is skipped and named on the node.
-6. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
-   analytic surfaces are recognized as coincident.
-7. **Sweep and loft.**
-8. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
-9. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
+6. **Sweep and loft.**
+7. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
+8. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face (strips apart, inside corners).

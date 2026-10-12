@@ -786,7 +786,8 @@ numbers given there.
 
 ### Status
 
-What has landed since the study, item by item (the runs of §2 repeated with the same drivers):
+What has landed since the study, item by item (the runs of §2 repeated with the same drivers).
+"Limits n" in this study numbers MODELING.md's list as it was when the study was written.
 
 - **1, shared edges sized from the faces (done).** Each curved analytic face asks its edges for
   its interior target before the samples are frozen (`layout/face_targets.lucb`), the
@@ -803,6 +804,14 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   (now placed on great circles and sampled to their stretch) took F3 from 0.0019 to 4e-6 off
   exact with a third of the triangles (218,124 to 72,956). Triangles at 64: T2 93,540 (six faces
   missing) to 510,396; F7 152,894 (one missing) to 281,574.
+
+- **2, coincident B-spline faces (done).** A lattice of one surface's points projected onto the
+  other decides it (`modeling/spline_coincidence.lucb`); the existing imprint then runs, and flush
+  pieces on B-spline faces stay separate faces (no surface reaches over the other's part). B9:
+  union, common and difference closed, at 1.5, 0.5 and 0.5 of the rounded box to 1e-4 by mesh
+  volume (11495.2750, 3831.7581, 3831.7581 against 11495.2745 and 3831.7582), 61 ms each against
+  SMLib's 20. B8 unchanged (36 ms). Regression: `spline_boolean_tests`, with a box flush with the
+  rounded box's side.
 
 ## 12. What not to take
 

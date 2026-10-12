@@ -1,0 +1,77 @@
+## This file: whether two faces, one on a B-spline surface or both, lie on
+## one surface where they overlap (a rounded box and its copy moved along
+## its strips: each strip lies on the other's surface over their common
+## stretch). The booleans then imprint each face's boundary on the other,
+## as they do for coplanar faces, instead of tracing a curve that is
+## everywhere.
+##
+## A lattice of points over each B-spline surface is projected onto the
+## other surface. Points landing inside the other's domain (or anywhere on
+## an analytic surface, which has no edge) must lie on it with the normals
+## parallel; enough of them must, or the surfaces merely touch. Any one
+## point off the other surface ends the test: crossing surfaces fail at
+## once.
+
+## The points a side of the lattice has.
+let coincidence_lattice: usize = 9
+
+## meet_same or meet_opposite when the surfaces of faces `fa` and `fb` (one
+## a B-spline) lie on each other where they overlap, else meet_curves.
+func spline_coincidence(w: Shape*, fa: usize, fb: usize, tol: f64) -> i64!:
+    let sa = &w.surfaces.items[(usize)w.faces.items[fa].surface]
+    let sb = &w.surfaces.items[(usize)w.faces.items[fb].surface]
+    var facing: f64 = 0.0
+    var shared: usize = 0
+    for side in 0..<2:
+        let source = sa if side == 0 else sb
+        let onto = sb if side == 0 else sa
+        if source.kind != surface_spline: continue
+        let (lies, along, count) = try lies_on(source, onto, tol)
+        if not lies: return meet_curves
+        if facing == 0.0: facing = along
+        shared += count
+    # Points on both, in two dimensions (rows and columns of the lattice).
+    if shared < coincidence_lattice: return meet_curves
+    return meet_same if facing > 0.0 else meet_opposite
+
+## Whether every lattice point of B-spline surface `s` that lands inside
+## surface `t` lies on it with parallel normals; the sign of the normals'
+## agreement, and how many points landed inside it.
+func lies_on(s: const Surface*, t: const Surface*, tol: f64) -> (bool, f64, usize)!:
+    let n = coincidence_lattice
+    let reach = tol * 10.0
+    var facing: f64 = 0.0
+    var landed: usize = 0
+    var seed = Vector3(0.5, 0.5, 0.0)
+    # From the middle out, so a crossing is found at the first points.
+    for ring in 0..<(n + 1) // 2:
+        for i in 0..<n:
+            for j in 0..<n:
+                let middle = (n - 1) // 2
+                let ri = i - middle if i >= middle else middle - i
+                let rj = j - middle if j >= middle else middle - j
+                if (ri if ri > rj else rj) != ring: continue
+                let uv = Vector3((f64)i / (f64)(n - 1), (f64)j / (f64)(n - 1), 0.0)
+                let p = try evaluate(*s, uv)
+                var gap = 0.0
+                var normal = Vector3()
+                if t.kind == surface_spline:
+                    let found = try nearest_parameters(*t, p, seed, true)
+                    # On the other's edge: the nearest point is not a foot.
+                    let margin = 1e-6
+                    if found.x <= margin or found.y <= margin or found.x >= 1.0 - margin or found.y >= 1.0 - margin: continue
+                    seed = found
+                    gap = (try evaluate(*t, found)).subtract(p).length()
+                    if gap > reach: return (false, 0.0, 0)
+                    normal = try nurbs_normal(*t, found)
+                else:
+                    gap = surface_distance(t, p)
+                    if gap > reach: return (false, 0.0, 0)
+                    normal = try normal_at(t, p, reach)
+                let own = try nurbs_normal(*s, uv)
+                let agree = own.dot(normal)
+                if math.abs(agree) < 1.0 - 1e-6: return (false, 0.0, 0)
+                if facing == 0.0: facing = agree
+                elif facing * agree < 0.0: return (false, 0.0, 0)
+                landed += 1
+    return (landed > 0, facing, landed)
