@@ -1,13 +1,17 @@
 ## Fusion's Two distances and Distance and angle chamfers
 ## (CadModeling.chamfered_sides) on a 2-box: one edge, its prism's volume
 ## taken (½ × the two reaches × its length); the top's rim, the top taking
-## the first distance (its own loop), flipped the sides take it; an edge
-## between curved faces refused with why.
+## the first distance (its own loop), flipped the sides take it. On curved
+## faces (curved_sides): a cylinder's rim and a hole's rim by Pappus, both
+## ways round, and by distance and angle; a box's top loop round rounded
+## uprights; a drilled ball's rims (sphere and cylinder, the distance on the
+## sphere a chord); an inside edge (material added); too steep an angle
+## refused with why.
 from luce_cad.modeling import CadModeling
 from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
 from luce_geocore.geocore import Vector3, Mesh
-from checks import manifold, volume
+from checks import closed, manifold, volume
 from luce_std import math
 
 pub func chamfer_side_tests() -> unit!:
@@ -29,13 +33,111 @@ pub func chamfer_side_tests() -> unit!:
     let flipped = CadModeling.chamfered_sides(box, rim, 0.3, 0.1, 0.0, "c", true, true).tessellate(16)
     manifold(flipped)
     assert(reach(flipped, 1.0) > 0.9 - 1e-6 and reach(flipped, 1.0) < 0.9 + 1e-6)
-    # A cylinder's rim is not between flat faces: refused, saying so.
+    curved_sides()
+    print("PASS sided chamfers: a box edge by two distances and by distance and angle (the prism taken), the top's rim with the top taking the first distance and flipped; a cylinder's and a hole's rims both ways and by distance and angle, a box's top loop round rounded uprights, a drilled ball's rims, an inside edge, by their volumes; too steep an angle refused")
+
+## Sided chamfers on curved faces and inside edges, against their volumes.
+func curved_sides() -> unit!:
+    # A pin's top rim (radius 1): a triangle of legs a (in along the top)
+    # and b (down the side) turned round the axis, its centroid a / 3 in.
     let pin = CadModeling.tagged(CadSolids.cylinder(1.0, 2.0), "pin")
+    let rim = CadModeling.edge_references(pin, edges_where(pin, top_ring))
+    let before = volume(pin.tessellate(64))
+    let one = before - volume(CadModeling.chamfered_sides(pin, rim, 0.3, 0.1, 0.0, "c").tessellate(64))
+    let other = before - volume(CadModeling.chamfered_sides(pin, rim, 0.3, 0.1, 0.0, "c", true, true).tessellate(64))
+    let top_first = ring(1.0, 0.3, 0.1, -1.0)
+    let side_first = ring(1.0, 0.1, 0.3, -1.0)
+    assert(math.abs(one - other) > 0.003)
+    near(math.min(one, other), math.min(top_first, side_first), "rim")
+    near(math.max(one, other), math.max(top_first, side_first), "rim flipped")
+    # Distance and angle at a square corner: the other leg 0.2 tan 30°.
+    let angled = before - volume(CadModeling.chamfered_sides(pin, rim, 0.2, 0.0, math.pi / 6.0, "c").tessellate(64))
+    let leg = 0.2 * math.tan(math.pi / 6.0)
+    let either = math.abs(angled - ring(1.0, 0.2, leg, -1.0)) < math.abs(angled - ring(1.0, leg, 0.2, -1.0))
+    near(angled, ring(1.0, 0.2, leg, -1.0) if either else ring(1.0, leg, 0.2, -1.0), "rim by angle")
+    # A hole's rim (radius 0.5 through a plate): the centroid a / 3 out.
+    let plate = CadModeling.tagged(CadSolids.box(3.0, 1.0, 3.0), "plate")
+    let drilled = CadModeling.combined(plate, CadModeling.tagged(CadSolids.cylinder(0.5, 4.0), "hole"), 1)
+    let hole_rim = CadModeling.edge_references(drilled, edges_where(drilled, hole_top))
+    let plain = volume(drilled.tessellate(64))
+    let opened = plain - volume(CadModeling.chamfered_sides(drilled, hole_rim, 0.2, 0.1, 0.0, "c").tessellate(64))
+    let opened_flipped = plain - volume(CadModeling.chamfered_sides(drilled, hole_rim, 0.2, 0.1, 0.0, "c", true, true).tessellate(64))
+    near(math.min(opened, opened_flipped), math.min(ring(0.5, 0.2, 0.1, 1.0), ring(0.5, 0.1, 0.2, 1.0)), "hole rim")
+    near(math.max(opened, opened_flipped), math.max(ring(0.5, 0.2, 0.1, 1.0), ring(0.5, 0.1, 0.2, 1.0)), "hole rim flipped")
+    # A 2-box's top loop round uprights rounded 0.4: the top (holding the
+    # whole loop) takes 0.2, the sides 0.1. Along a closed convex loop of
+    # length P the triangle sweeps ½ a b (P - 2π a / 3).
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let rounded = CadModeling.filleted(box, CadModeling.edge_references(box, edges_where(box, upright)), 0.4, "f")
+    let loop = CadModeling.edge_references(rounded, [edges_where(rounded, top_ring)[0]])
+    let perimeter = 4.0 * 1.2 + 2.0 * math.pi * 0.4
+    let looped = CadModeling.chamfered_sides(rounded, loop, 0.2, 0.1, 0.0, "c")
+    near(volume(rounded.tessellate(64)) - volume(looped.tessellate(64)), 0.01 * (perimeter - 2.0 * math.pi * 0.2 / 3.0), "top loop")
+    # A unit ball drilled by a hole of radius 0.5: both rims between the
+    # hole (holding both: the first distance, 0.1 down it) and a half of
+    # the sphere (0.05 straight from the edge, a chord). The triangle and
+    # the sphere's sliver beyond the chord, by Pappus.
+    let ball = CadModeling.tagged(CadSolids.sphere(1.0), "ball")
+    let bored = CadModeling.combined(ball, CadModeling.tagged(CadSolids.cylinder(0.5, 4.0), "hole"), 1)
+    let rims = CadModeling.edge_references(bored, edges_where(bored, ball_rim))
+    let corner = Vector3(0.5, math.sqrt(0.75), 0.0)
+    let turn = 2.0 * math.asin(0.025)
+    let along = math.atan2(corner.y, corner.x) - turn
+    let (triangle, centroid) = pappus([corner, Vector3(0.5, corner.y - 0.1, 0.0), Vector3(math.cos(along), math.sin(along), 0.0)])
+    let sliver = 0.5 * (turn - math.sin(turn))
+    let expected = 2.0 * 2.0 * math.pi * (centroid * triangle + math.cos(along + turn * 0.5) * sliver)
+    let made = CadModeling.chamfered_sides(bored, rims, 0.1, 0.05, 0.0, "c")
+    let mesh = made.tessellate(64)
+    closed(mesh)
+    near(volume(bored.tessellate(64)) - volume(mesh), expected, "ball rims")
+    # An inside edge: a block standing on a plate, one edge of its foot,
+    # the prism ½ a b along its length added (its ends flush).
+    let base = CadModeling.tagged(CadSolids.box(4.0, 1.0, 4.0), "base")
+    let block = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "block").transformed(Vector3(0.0, 1.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let standing = CadModeling.combined(base, block, 0)
+    let foot = CadModeling.edge_references(standing, edges_where(standing, foot_front))
+    let filled = CadModeling.chamfered_sides(standing, foot, 0.3, 0.1, 0.0, "c", false)
+    near(volume(filled.tessellate(16)) - volume(standing.tessellate(16)), 0.5 * 0.3 * 0.1 * 2.0, "inside edge")
+    # Too steep an angle for the corner: said.
     var refused = false
-    _ = CadModeling.chamfered_sides(pin, CadModeling.edge_references(pin, edges_where(pin, top_ring)), 0.2, 0.1, 0.0, "c") catch failure:
-        refused = failure.message.contains("Equal distance")
+    _ = CadModeling.chamfered_sides(pin, rim, 0.2, 0.0, math.pi * 0.6, "c") catch failure:
+        refused = failure.message.contains("too steep")
     assert(refused)
-    print("PASS sided chamfers: a box edge by two distances and by distance and angle (the prism taken), the top's rim with the top taking the first distance and flipped, a rim between a plane and a cylinder refused with why")
+
+## The volume a triangle of legs `a` (along the flat face, into it) and
+## `b` (along the cylinder's axis) takes turned round a rim of `radius`:
+## `outward` -1 a pin's rim (the face inside the circle), 1 a hole's.
+func ring(radius: float, a: float, b: float, outward: float) -> float:
+    return 2.0 * math.pi * (radius + outward * a / 3.0) * a * b * 0.5
+
+func near(value: float, expected: float, what: str) -> unit!:
+    if math.abs(value - expected) > 0.0003: print(f"{what}: {value}, expected {expected}")
+    assert(math.abs(value - expected) <= 0.0003)
+
+## A region of the meridian plane (radius, height) as a closed polygon:
+## its area and its centroid's radius.
+func pappus(points: list[Vector3]) -> (float, float):
+    var area = 0.0
+    var moment = 0.0
+    for k in 0..<points.length:
+        let a = points[k]
+        let b = points[(k + 1) % points.length]
+        let cross = a.x * b.y - b.x * a.y
+        area += cross * 0.5
+        moment += (a.x + b.x) * cross / 6.0
+    return (math.abs(area), moment / area)
+
+func hole_top(a: Vector3, b: Vector3) -> bool:
+    return a.y > 0.499 and b.y > 0.499 and math.abs(math.hypot(a.x, a.z) - 0.5) < 1e-6
+
+func ball_rim(a: Vector3, b: Vector3) -> bool:
+    return math.abs(a.y) > 0.8 and math.abs(math.hypot(a.x, a.z) - 0.5) < 1e-6 and math.abs(a.y - b.y) < 1e-9
+
+func upright(a: Vector3, b: Vector3) -> bool:
+    return math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9
+
+func foot_front(a: Vector3, b: Vector3) -> bool:
+    return math.abs(a.y - 0.5) < 1e-9 and math.abs(b.y - 0.5) < 1e-9 and math.abs(a.z - 1.0) < 1e-9 and math.abs(b.z - 1.0) < 1e-9
 
 func solid(model: CadModel, expected: float, what: str) -> unit!:
     let mesh = model.tessellate(16)

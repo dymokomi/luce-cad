@@ -56,7 +56,8 @@ struct CapSide:
 ## The builder: the body `w`, the result `out` (begun as a copy of the
 ## body, so its points, edges and surfaces keep their numbers), the blend
 ## (`reach`: a fillet's radius, a chamfer's size; `weight`: a G1 section's
-## middle weight, the chain's corner's), and for each body edge its picked
+## middle weight, the chain's corner's; a chamfer's `chamfer` sides, and
+## whether the cap takes their first distance: `cap_first`), and for each body edge its picked
 ## side (-1), whether it is a seam, and its new seam (-1, a split seam's
 ## upper part in `uppers`), for
 ## each body vertex its contacts on the cap and wall, its section (-1),
@@ -70,6 +71,8 @@ struct Cap:
     var round: bool
     var continuity: i64
     var weight: f64
+    var chamfer: const ChamferSides*?
+    var cap_first: bool
     var sides: Growing[CapSide]
     var side_of: Growing[i64]
     var is_seam: Growing[bool]
@@ -124,13 +127,15 @@ struct Cap:
         return try self.out.add_edge(ShapeEdge(c, low if forward else high, high if forward else low, a, b))
 
 ## Edges `chosen` of `w` blended round their caps (see the file's header):
-## filleted to `size` (`continuity` 1 to 3) when `round`, else chamfered;
-## none when they are not all such loops (the booleans then try).
-pub func cap_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str) -> interop.Reference[CadModel]?!:
+## filleted to `size` (`continuity` 1 to 3) when `round`, else chamfered
+## (by `sides` when given: chamfers.lucb); none when they are not all such
+## loops (the booleans then try).
+pub func cap_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str, sides: const ChamferSides*? = none) -> interop.Reference[CadModel]?!:
     var made = try new_cap(w, size, round, continuity)
     defer made.close()
     let b = &made
     if not try cap_eligible(b, chosen): return none
+    try chamfer_first(b, sides)
     try chain_weight(b)
     try cap_room(b)
     try cap_contacts(b)
@@ -150,7 +155,7 @@ func new_cap(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cap!:
     for k in w.spline_knots.view(): try out.spline_knots.push(k)
     for s in w.surfaces.view():
         try out.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
-    var made = Cap(w, out, size, round, continuity, math.sqrt(0.5), Growing[CapSide](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](),
+    var made = Cap(w, out, size, round, continuity, math.sqrt(0.5), none, true, Growing[CapSide](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](),
                    Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[Runout](), Growing[i64](), Growing[u8]())
     errdefer made.close()
     try made.side_of.fill(w.edges.count, -1)
@@ -165,6 +170,18 @@ func new_cap(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cap!:
     try made.end_lines.fill(w.points.count, -1)
     try made.runout_of.fill(w.points.count, -1)
     return made
+
+## A chamfer's `sides` on the builder, and which face of the loops takes
+## their first distance: the same for every side (a section is shared at
+## each joint), or an error.
+func chamfer_first(b: Cap*, sides: const ChamferSides*?) -> !:
+    b.chamfer = sides
+    if b.round or sides == none: return
+    for k in 0..<b.sides.count:
+        let side = b.sides.items[k]
+        let on_cap = first_face(sides, side.edge, side.cap)
+        if k == 0: b.cap_first = on_cap
+        elif on_cap != b.cap_first: error(invalid, "this chamfer's first distance would change faces along its loop: flip it, or chamfer the loop's edges apart")
 
 ## The G1 section's middle weight, sin(θ/2) for the chain's corner of
 ## cosine λ (√½ square): the corner at the first side's start (a slanted
@@ -201,11 +218,11 @@ func cap_contacts(b: Cap*) -> !:
             if b.on_cap.items[(usize)v] >= 0: continue
             let t = edge.t0 if end == 0 else edge.t1
             let (u, _) = try into_cap(b, &side, t)
-            let (_, c) = try corner_at(b, &side, t)
+            let (lambda, c) = try corner_at(b, &side, t)
             let s = try ruling_at(b, &side, t)
             let p = w.points.items[(usize)v]
             b.on_cap.items[(usize)v] = try b.out.add_point(p.add(u.multiply_scalar(c)))
-            b.on_wall.items[(usize)v] = try b.out.add_point(p.add(s.multiply_scalar(c)))
+            b.on_wall.items[(usize)v] = try b.out.add_point(p.add(s.multiply_scalar(try wall_distance(b, lambda))))
     try cap_runouts(b)
     for v in 0..<w.points.count:
         if flat_end(b, v): b.end_lines.items[v] = try b.line(b.on_cap.items[v], (i64)v)
@@ -242,8 +259,8 @@ func cap_room(b: const Cap*) -> !:
         let edge = w.edges.items[side.edge]
         for k in 0..<(usize)5:
             let t = edge.t0 + (edge.t1 - edge.t0) * (f64)k / 4.0
-            let (_, c) = try corner_at(b, &side, t)
-            factor = math.max(factor, c / b.reach)
+            let (lambda, c) = try corner_at(b, &side, t)
+            factor = math.max(factor, math.max(c, try wall_distance(b, lambda)) / b.reach)
         most = math.min(most, try offset_room(b, &side))
     var ends = Growing[i64]()
     defer ends.close()
@@ -313,8 +330,9 @@ func cap_strip(b: Cap*, k: usize) -> !:
     let (u0, _) = try into_cap(b, &side, edge.t0)
     var empty_points: Vector3[]
     var empty_numbers: f64[]
-    # A corner of cosine λ: the contacts c from it, the wall's μ c along
-    # the normal; a fillet's center r off the cap.
+    # A corner of cosine λ: the cap's contact c from it, the wall's its leg
+    # along the ruling (μ of it along the normal); a fillet's center r off
+    # the cap.
     let (lambda, c) = try corner_at(b, &side, edge.t0)
     let mu = math.sqrt(1.0 - lambda * lambda)
     let regular = try regular_side(b, &side)
@@ -338,8 +356,9 @@ func cap_strip(b: Cap*, k: usize) -> !:
         let radius = carrier.a + c * outward
         let c_cap = try b.out.add_carrier(Carrier(1, carrier.origin, carrier.x, carrier.y, radius, radius, -1))
         b.sides.items[k].outer = try b.out.add_edge(ShapeEdge(c_cap, edge.t0, edge.t1, cap_start, cap_end))
-        let wall_radius = carrier.a + c * lambda * outward
-        let lowered = carrier.origin.add(side.into_wall.multiply_scalar(c * mu))
+        let down = try wall_distance(b, lambda)
+        let wall_radius = carrier.a + down * lambda * outward
+        let lowered = carrier.origin.add(side.into_wall.multiply_scalar(down * mu))
         let c_wall = try b.out.add_carrier(Carrier(1, lowered, carrier.x, carrier.y, wall_radius, wall_radius, -1))
         b.sides.items[k].inner = try b.out.add_edge(ShapeEdge(c_wall, edge.t0, edge.t1, wall_start, wall_end))
         if b.round and b.continuity == 1:
@@ -353,7 +372,7 @@ func cap_strip(b: Cap*, k: usize) -> !:
             let axis = side.into_wall if opening > 0.0 else side.into_wall.multiply_scalar(-1.0)
             let origin = carrier.origin if opening > 0.0 else lowered
             let start_radius = radius if opening > 0.0 else wall_radius
-            try b.out.surfaces.push(try Surface(2, origin, carrier.x, axis, start_radius, math.atan2(math.abs(opening), c * mu), empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+            try b.out.surfaces.push(try Surface(2, origin, carrier.x, axis, start_radius, math.atan2(math.abs(opening), down * mu), empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
             return try finish_strip(b, k)
     # The section swept along the edge: rows of control points, each exact
     # (a line's, an arc's) or fitted, sharing their knots.
@@ -422,9 +441,9 @@ func finish_strip(b: Cap*, k: usize) -> !:
     else:
         # The arc's middle, on the bisector from its center to the corner;
         # the chamfer's, between its contacts.
-        let (_, c) = try corner_at(b, &side, t)
+        let (lambda, c) = try corner_at(b, &side, t)
         let center = corner.add(u.multiply_scalar(c)).add(side.into_wall.multiply_scalar(b.reach))
-        let middle = center.add((try corner.subtract(center).normalized()).multiply_scalar(b.reach)) if b.round else corner.add(u.add(s).multiply_scalar(c * 0.5))
+        let middle = center.add((try corner.subtract(center).normalized()).multiply_scalar(b.reach)) if b.round else corner.add(u.multiply_scalar(c * 0.5)).add(s.multiply_scalar(try wall_distance(b, lambda) * 0.5))
         normal = try normal_at(surf, middle, b.w.tolerance * 100.0)
     b.sides.items[k].sense = normal.dot(outward) > 0.0
     # A fitted strip is parametrized with its normal into the material (its

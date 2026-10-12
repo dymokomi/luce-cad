@@ -1,23 +1,73 @@
 ## Fusion's Chamfer types beyond Equal distance: Two distances (one along
 ## each face) and Distance and angle (a distance along the first face, the
-## chamfer leaving it at an angle), made as blend.lucb's equal chamfers
-## are: a tool swept along each edge, taken away. Straight outside edges
-## between flat faces for now; any other edge is refused with why.
+## chamfer leaving it at an angle), made wherever equal chamfers are: round
+## a flat face's loops (cap_blend.lucb), between curved faces
+## (curved_blend.lucb), and by the booleans' tools (blend.lucb), each
+## taking its two legs from here.
+##
+## Distances are measured from the edge, in the plane square to it, to
+## where the chamfer meets each face: along a flat face that is the
+## distance along it; on a curved face the straight distance to that point
+## (Parasolid's apex range). Fusion's forum answers say only that the
+## values are measured from the original edge; on curved faces this has
+## not been checked against Fusion itself.
 ##
 ## Which face takes the first distance: of each chosen edge's two faces,
 ## the one more of the chosen edges lie on (a loop's own face: a box's top
 ## round its rim), a tie going to the name first in byte order; `flip`
-## turns every edge round.
+## turns every edge round. Distance and angle's second leg is
+## distance × sin(angle) / sin(corner + angle) for the angle between the
+## faces' ways from the edge (90°: distance × tan(angle)). Fusion's own
+## Distance and angle is known to misbehave where the faces are not square
+## (Autodesk's forum); this is the plane triangle's exact leg.
+
+## A chamfer's sides: Two distances (`second` along each edge's other
+## face) or Distance and angle (`second` 0: leaving the first face at
+## `angle`, radians), and each body edge's first face (`first_of`, -1 for
+## edges not chosen).
+struct ChamferSides:
+    var second: f64
+    var angle: f64
+    var first_of: Growing[i64]
+
+    func close():
+        self.first_of.close()
+
+## The reach along an edge's second face of a chamfer `distance` along its
+## first, the faces' ways from the edge `corner` (radians) apart: the
+## same with no sides (Equal distance), `second`, or Distance and angle's.
+func second_leg(sides: const ChamferSides*?, distance: f64, corner: f64) -> f64!:
+    let given = sides else return distance
+    if given.second > 0.0: return given.second
+    if corner + given.angle >= math.pi - 1e-9: error(invalid, "the chamfer's angle is too steep for this corner: it never meets the other face")
+    return distance * math.sin(given.angle) / math.sin(corner + given.angle)
+
+## Whether face `f` of edge `e` takes the first distance (always, with no
+## sides).
+func first_face(sides: const ChamferSides*?, e: usize, f: usize) -> bool:
+    let given = sides else return true
+    return given.first_of.items[e] == (i64)f
+
+## Edge `e`'s chamfer legs `size` along its faces (edge_faces' order):
+## (along fa, along fb), the faces' ways from the edge measured at its
+## middle (a straight edge's and a rim's corner is the same all along).
+func chamfer_legs(w: const Shape*, e: usize, size: f64, sides: const ChamferSides*?) -> (f64, f64)!:
+    if sides == none: return (size, size)
+    let (fa, fb) = try edge_faces(w, e)
+    let along = try along_edge(w, e)
+    let corner = math.acos(math.clamp((try into_face(w, fa, e, along)).dot(try into_face(w, fb, e, along)), -1.0, 1.0))
+    let other = try second_leg(sides, size, corner)
+    return (size, other) if first_face(sides, e, fa) else (other, size)
 
 ## `model` with the edges `references` names (with their tangent chains
 ## when `chain`) chamfered `distance` along the first face and, when
 ## `second` is positive, `second` along the other; else leaving the first
-## face at `angle` (radians), which reaches the other face that far:
-## distance × sin(angle) / sin(corner + angle) for the faces' corner angle.
-## The chamfers' faces are named for `tag` as blended's.
+## face at `angle` (radians). The chamfers' faces are named for `tag` as
+## blended's.
 func sided_chamfer(model: const CadModel*, references: str, distance: f64, second: f64, angle: f64, tag: str, chain: bool, flip: bool) -> interop.Reference[CadModel]!:
     if not math.is_finite(distance) or distance <= 0.0: error(invalid, "a chamfer needs a positive distance")
-    if second <= 0.0 and (not math.is_finite(angle) or angle <= 0.0 or angle >= math.pi): error(invalid, "a chamfer's angle is between 0° and 180°")
+    if not math.is_finite(second) or second < 0.0: error(invalid, "a chamfer's second distance is positive, or 0 for Distance and angle")
+    if second == 0.0 and (not math.is_finite(angle) or angle <= 0.0 or angle >= math.pi): error(invalid, "a chamfer's angle is between 0° and 180°")
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
@@ -31,49 +81,12 @@ func sided_chamfer(model: const CadModel*, references: str, distance: f64, secon
         let (fa, fb) = try edge_faces(&w, e)
         counts.items[fa] += 1
         counts.items[fb] += 1
-    # Each edge's sizes along its faces fa and fb, checked before any tool.
-    var sizes = Growing[f64]()
-    defer sizes.close()
+    var sides = ChamferSides(second, angle, Growing[i64]())
+    defer sides.close()
+    try sides.first_of.fill(w.edges.count, -1)
     for e in chosen.view():
         let (fa, fb) = try edge_faces(&w, e)
-        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line or not flat_pair(&w, fa, fb) or not (try convex(&w, e)):
-            error(invalid, "Two distances and Distance and angle chamfers work on straight outside edges between flat faces for now; chamfer this edge by Equal distance")
         var a_first = counts.items[fa] > counts.items[fb] or (counts.items[fa] == counts.items[fb] and text_before(w.face_name(fa), w.face_name(fb)))
         if flip: a_first = not a_first
-        let along = try along_edge(&w, e)
-        let corner = math.acos(math.clamp((try into_face(&w, fa, e, along)).dot(try into_face(&w, fb, e, along)), -1.0, 1.0))
-        var other = second
-        if second <= 0.0:
-            if corner + angle >= math.pi - 1e-9: error(invalid, "the chamfer's angle is too steep for this corner: it never meets the other face")
-            other = distance * math.sin(angle) / math.sin(corner + angle)
-        let size_a = distance if a_first else other
-        let size_b = other if a_first else distance
-        try check_fits(&w, e, math.max(size_a, size_b), false)
-        try sizes.push(size_a)
-        try sizes.push(size_b)
-    var body = try shape_rays(&w)
-    defer body.close()
-    var name = Growing[u8]()
-    defer name.close()
-    var result = try copy_model(model)
-    for at in 0..<chosen.count:
-        let e = chosen.items[at]
-        let low = w.edge_at(e, 0.0) catch failure:
-            result.release()
-            error(failure.code, failure.message)
-        let high = w.edge_at(e, 1.0) catch failure:
-            result.release()
-            error(failure.code, failure.message)
-        blend_name(&w, e, tag, &name) catch failure:
-            result.release()
-            error(failure.code, failure.message)
-        let tool = edge_tool(&w, e, sizes.items[at * 2], false, 1, low, high, false, false, &body, (str)name.view(), sizes.items[at * 2 + 1]) catch failure:
-            result.release()
-            error(failure.code, failure.message)
-        defer tool.release()
-        let next = combine(result.value(), tool.value(), op_subtract) catch failure:
-            result.release()
-            error(failure.code, failure.message)
-        result.release()
-        result = next
-    return result
+        sides.first_of.items[e] = (i64)(fa if a_first else fb)
+    return try blend_chosen(model, &w, chosen.view(), false, distance, false, tag, 1, true, none, &sides)

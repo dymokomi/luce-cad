@@ -42,7 +42,8 @@ struct CurvedSection:
     var weight: f64
 
 ## The builder: the body `w`, the result `out` (a copy of the body to
-## begin), the blend (`reach`: a fillet's radius, a chamfer's size), each
+## begin), the blend (`reach`: a fillet's radius, a chamfer's size; a
+## chamfer's `chamfer` sides: chamfers.lucb), each
 ## body edge's picked side (-1) and new edge when it is shortened at a
 ## loop's vertex (-1), each body vertex's contacts and section (-1), and
 ## a field per face (a B-spline's nearest point search starts where the
@@ -53,6 +54,7 @@ struct Curved:
     var reach: f64
     var round: bool
     var continuity: i64
+    var chamfer: const ChamferSides*?
     var sides: Growing[CurvedSide]
     var side_of: Growing[i64]
     var shortened: Growing[i64]
@@ -77,11 +79,13 @@ struct Curved:
 
 ## Edges `chosen` of `w` blended between their curved faces (see the
 ## file's header): filleted to `size` (`continuity` 1 to 3) when `round`,
-## else chamfered; none when they are not such loops.
-pub func curved_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str) -> interop.Reference[CadModel]?!:
+## else chamfered (by `sides` when given); none when they are not such
+## loops.
+pub func curved_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str, sides: const ChamferSides*? = none) -> interop.Reference[CadModel]?!:
     var made = try new_curved(w, size, round, continuity)
     defer made.close()
     let c = &made
+    c.chamfer = sides
     if not try curved_eligible(c, chosen): return none
     try curved_contacts(c)
     for k in 0..<c.sides.count: try curved_strip(c, k)
@@ -91,7 +95,7 @@ pub func curved_blend(w: const Shape*, chosen: const usize[], size: f64, round: 
 func new_curved(w: const Shape*, size: f64, round: bool, continuity: i64) -> Curved!:
     var out = try shape_copy(w)
     errdefer out.close()
-    var made = Curved(w, out, size, round, continuity, Growing[CurvedSide](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[Vector3](), Growing[Field](), Growing[u8]())
+    var made = Curved(w, out, size, round, continuity, none, Growing[CurvedSide](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[Vector3](), Growing[Field](), Growing[u8]())
     errdefer made.close()
     try made.side_of.fill(w.edges.count, -1)
     try made.shortened.fill(w.edges.count, -1)
@@ -254,10 +258,20 @@ func section_on(c: Curved*, side: const CurvedSide*, t: f64) -> CurvedSection!:
     let (db, _, on_b) = try face_distance(c, side.b, center)
     if math.abs(da - s * r) > w.tolerance or math.abs(db - s * r) > w.tolerance: try too_tight(c)
     if not c.round:
-        # A chamfer: the points its size along each face, square to the
-        # edge, found from the ball's contacts (which face the right way).
-        let qa = try chamfer_point(c, side.a, e, tangent, on_a, r)
-        let qb = try chamfer_point(c, side.b, e, tangent, on_b, r)
+        # A chamfer: the points its legs from the edge on each face, square
+        # to it, found from the ball's contacts (which face the right way).
+        # Distance and angle's second leg takes the faces' ways from the
+        # edge there.
+        let (_, normal_a, _) = try face_distance(c, side.a, e)
+        let (_, normal_b, _) = try face_distance(c, side.b, e)
+        let way_a = try tangent.cross(normal_a).normalized()
+        let way_b = try tangent.cross(normal_b).normalized()
+        let ua = way_a.multiply_scalar(1.0 if way_a.dot(on_a.subtract(e)) > 0.0 else -1.0)
+        let ub = way_b.multiply_scalar(1.0 if way_b.dot(on_b.subtract(e)) > 0.0 else -1.0)
+        let other = try second_leg(c.chamfer, r, math.acos(math.clamp(ua.dot(ub), -1.0, 1.0)))
+        let a_first = first_face(c.chamfer, side.edge, side.a)
+        let qa = try chamfer_point(c, side.a, e, tangent, on_a, r if a_first else other)
+        let qb = try chamfer_point(c, side.b, e, tangent, on_b, other if a_first else r)
         # Its "center" mirrors the corner across the chamfer's middle, so
         # that the strip faces away from it as a ball's does.
         return CurvedSection(qa, e, qb, qa.add(qb).subtract(e), 1.0)

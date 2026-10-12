@@ -8,9 +8,9 @@
 
 ## The section of edge `e`'s blend at `p` (its start), swept along `along`:
 ## the corner profile between two planes, or between a plane and a
-## cylinder along the edge (ruled_profile). A chamfer between two planes
-## reaches `other` along the edge's second face when it is positive
-## (chamfers.lucb's two-sided ones), else `size` like the first.
+## cylinder along the edge (ruled_profile). A chamfer reaches `other` along
+## the edge's second face when it is positive (chamfers.lucb's two-sided
+## ones), else `size` like the first.
 func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, round: bool, continuity: i64, other: f64 = -1.0) -> Profiles!:
     let (fa, fb) = try edge_faces(w, e)
     let ua = try into_face(w, fa, e, along)
@@ -19,20 +19,24 @@ func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size
     if cylinder < 0: return try corner_profile(p, along, ua, ub, size, round, continuity, other)
     if round and continuity > 1: error(invalid, "G2 and G3 fillets between a plane and a cylinder are not supported yet")
     let plane = fb if (usize)cylinder == fa else fa
-    return try ruled_profile(w, plane, (usize)cylinder, p, along, ua if plane == fa else ub, ub if plane == fa else ua, size, round, try convex(w, e))
+    let second = other if not round and other > 0.0 else size
+    let on_plane = size if plane == fa else second
+    let on_round = second if plane == fa else size
+    return try ruled_profile(w, plane, (usize)cylinder, p, along, ua if plane == fa else ub, ub if plane == fa else ua, on_plane, round, try convex(w, e), on_round)
 
 ## The section of a blend between plane face `plane` and cylinder face
 ## `cylinder` (its axis along the edge), at edge point `p`: the region
 ## between the edge, the contacts and the blend (a fillet's circle touching
 ## the plane and the cylinder, its center where the plane and the cylinder
-## moved by the radius meet; a chamfer's line `size` along each), closed
-## back along the cylinder's own circle. `into_plane` and `into_round` are
-## the directions into each face from the edge.
-func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool) -> Profiles!:
+## moved by the radius meet; a chamfer's line `size` along the plane and
+## `other` to the cylinder), closed back along the cylinder's own circle.
+## `into_plane` and `into_round` are the directions into each face from
+## the edge.
+func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool, other: f64) -> Profiles!:
     let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
     let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
     let radius = s.radius
-    let (ta, tb, center) = try ruled_contacts(w, plane, cylinder, p, into_plane, into_round, size, round, outward)
+    let (ta, tb, center) = try ruled_contacts(w, plane, cylinder, p, into_plane, into_round, size, round, outward, other)
     var profile = Profiles(p, along, into_plane, along.cross(into_plane), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
                            Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
     errdefer profile.close()
@@ -52,8 +56,10 @@ func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, a
     return profile
 
 ## A plane/cylinder blend's contacts at edge point `p`: on the plane, on
-## the cylinder, and a fillet's center (see ruled_profile).
-func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool) -> (Vector3, Vector3, Vector3)!:
+## the cylinder, and a fillet's center (see ruled_profile). A chamfer's
+## contact on the cylinder is `other` straight from the edge (its chord:
+## chamfers.lucb's measure).
+func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool, other: f64) -> (Vector3, Vector3, Vector3)!:
     let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
     let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
     let radius = s.radius
@@ -82,10 +88,12 @@ func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, 
         tb = axis_point.add(try center.subtract(axis_point).normalized().multiply_scalar(radius))
     else:
         ta = p.add(into_plane.multiply_scalar(size))
-        # `size` along the cylinder's circle, the way into its face.
+        # `other` straight from the edge, on the cylinder's circle the way
+        # into its face: a chord of 2 R sin(φ/2).
+        if other >= 2.0 * radius: error(invalid, "a chamfer this large reaches across the cylinder it meets")
         let r0 = p.subtract(axis_point)
         let turn = 1.0 if s.z.cross(r0).dot(into_round) > 0.0 else -1.0
-        tb = axis_point.add(turned_direction(r0, s.z, turn * size / radius))
+        tb = axis_point.add(turned_direction(r0, s.z, turn * 2.0 * math.asin(other / (2.0 * radius))))
     return (ta, tb, center)
 
 ## The tool that blends edge `e` from `start` to `end` (its chain's ends),
@@ -98,7 +106,7 @@ func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, 
 ## Its blend face is named `name`. A two-sided chamfer reaches `other`
 ## along the second face (section_profile).
 func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str, other: f64 = -1.0) -> interop.Reference[CadModel]!:
-    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_circle: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name)
+    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_circle: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name, other)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -188,7 +196,7 @@ func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, point
 ## the face at each end: exactly there when that face is square to the
 ## edge, else swept past and cut by the face's plane.
 ## An end marked exact (where a corner ball takes over) ends square there.
-func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, name: str) -> interop.Reference[CadModel]!:
+func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, name: str, other: f64 = -1.0) -> interop.Reference[CadModel]!:
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -198,7 +206,7 @@ func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity:
     let (n1, h1) = (along, along.dot(end)) if exact_end else try end_plane(w, end, fa, fb)
     let square = math.abs(n0.dot(along)) > 1.0 - 1e-9 and math.abs(n1.dot(along)) > 1.0 - 1e-9
     let margin = 0.0 if square else size * 4.0 + length * 0.1
-    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(margin)), along, size, round, continuity)
+    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(margin)), along, size, round, continuity, other)
     defer profile.close()
     let solid = try BrepModel.sized(length + margin * 2.0)
     defer solid.release()
@@ -250,7 +258,7 @@ func name_tool(b: BrepModel*, name: str) -> !:
 ## turns all the way; an arc's turns along it, reaching past an end where
 ## the corner beyond is empty and stopping at an exact one (a tangent
 ## joint with the next edge of a chain).
-func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str) -> interop.Reference[CadModel]!:
+func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str, other: f64 = -1.0) -> interop.Reference[CadModel]!:
     let edge = w.edges.items[e]
     let carrier = w.carriers.items[(usize)edge.carrier]
     let (fa, fb) = try edge_faces(w, e)
@@ -262,7 +270,7 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     let solid = try BrepModel.sized(carrier.a + size * 4.0)
     defer solid.release()
     if edge.start == edge.end:
-        var profile = try corner_profile(p, along, ua, ub, size, round, continuity)
+        var profile = try corner_profile(p, along, ua, ub, size, round, continuity, other)
         defer profile.close()
         try revolve_into(solid.value(), &profile, carrier.origin, normal, (carrier.a + size) * 1e-7, "")
         try name_tool(solid.value(), name)
@@ -281,7 +289,7 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     let after = 0.0 if exact_end or try body.inside(w, turned_point(last, carrier.origin, a, size * 0.5 / carrier.a).add(turned_direction(corner, a, sweep * 0.5)), extent) else margin
     # The profile where the tool starts: the middle's turned back.
     let back = -(sweep * 0.5 + before)
-    var profile = try corner_profile(turned_point(p, carrier.origin, a, back), turned_direction(along, a, back), turned_direction(ua, a, back), turned_direction(ub, a, back), size, round, continuity)
+    var profile = try corner_profile(turned_point(p, carrier.origin, a, back), turned_direction(along, a, back), turned_direction(ua, a, back), turned_direction(ub, a, back), size, round, continuity, other)
     defer profile.close()
     try revolve_into(solid.value(), &profile, carrier.origin, a, (carrier.a + size) * 1e-7, "", sweep + before + after)
     try name_tool(solid.value(), name)

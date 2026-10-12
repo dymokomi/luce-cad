@@ -36,7 +36,7 @@ does today.
 | `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
 | `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |
 | `rule_edges(model, rounds, fillets, faces, others)` | Fusion's Rule Fillet (`rules.lucb`): references to the blendable edges a rule takes, convex ones (rounds), concave ones (fillets) or both; with `faces` named, only edges on those faces, and with `others` too, only edges between the two sets. Made again on every cook, the edges follow the body. |
-| `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Straight outside edges between flat faces for now; others are refused with why. |
+| `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Every edge Equal distance takes (loops round a flat face, rims, curved faces, inside edges); each distance runs straight from the edge to the chamfer's contact in the plane square to the edge (`chamfers.lucb`). |
 | `edge_references(model, edges)` | References to edges, given by their B-rep numbers (what a viewport pick gives). |
 | `resolved_count(model, references)` | How many edges the references find, or an error when one is gone. |
 | `tagged(model, tag)` | Unnamed faces named `tag/f<i>`, for bodies made without names, such as primitives. |
@@ -304,11 +304,26 @@ stops flush.
 Corners where chamfers meet come out of the booleans as three chamfer planes meeting at a point.
 Fusion's setback triangle is not made.
 
+**Chamfer types and distances** (`chamfers.lucb`). Fusion's Chamfer has Equal distance, Two
+distances and Distance and angle. Each distance is measured from the original edge (what Autodesk's
+forum answers say), here in the plane square to the edge, straight to where the chamfer meets the
+face: along a flat face that is the distance along it, on a curved face a chord (Parasolid calls this
+an apex range). Fusion's documents do not say how it measures on curved faces, so that part is
+unverified. The first distance goes on the face more of the chosen edges lie on (a loop's own face),
+a tie by name, and Flip swaps. Distance and angle leaves the first face at the angle, so the second
+leg is d·sin θ / sin(φ + θ) for faces φ apart (d·tan θ when square); Autodesk staff have said
+Fusion's own Distance and angle misbehaves where the faces are not square, so this follows the
+geometry rather than that. All three take the same paths as Equal distance: loops round a flat face
+(`cap_blend.lucb`, its legs per corner, so a drafted wall's second leg follows the draft), loops
+between curved faces (`curved_blend.lucb`, the corner from the faces' tangent planes at each
+section), and the booleans' tools (straight edges, rims, a plane on a cylinder, inside edges).
+
 **A plane meeting a cylinder along its length** (a D-shaft's flat, a slot's side) is blended by a
 cylinder parallel to the axis. A fillet's center is where the plane moved by the radius meets the
 cylinder moved by it: a radius of R − r or R + r, by which sides the material and the corner are on.
 Its section closes back along the cylinder's own circle, not a chord, so it takes no material the
-fillet keeps. A chamfer runs `size` along the plane and `size` around the circle.
+fillet keeps. A chamfer runs `size` along the plane and reaches the circle `size` straight from the
+edge (a chord, as every chamfer's distance on a curved face: `chamfers.lucb`).
 
 **Inside corners** (concave edges, where faces meet at more than 180° through the solid) take
 material rather than losing it. The corner profile is the same shape, lying in the air between the
@@ -784,9 +799,8 @@ Roughly in order of usefulness:
 
 1. **Fillet corners beyond three edges,** and G1 setback corners (the same patch with one row:
    unequal radii, Fusion's other corner type).
-2. **Two distances and Distance and angle chamfers** beyond straight outside edges between flat
-   faces: rims, edges round a flat face whose walls are ruled away, loops between curved faces,
-   inside edges; and Fusion's chamfer corner types (Chamfer, Miter, Blend).
+2. **Fusion's chamfer corner types** (Chamfer, Miter, Blend) where chamfers of different sizes
+   meet at a sharp corner.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
    the loop turns a sharp corner rather than going on tangentially.
