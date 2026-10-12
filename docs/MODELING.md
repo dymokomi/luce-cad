@@ -443,40 +443,60 @@ changed. luced-3d's Fillet node keeps its plan on the compute worker, so draggin
 rebuilds. On every edge of a box, a radius costs 1 ms at G2 and 1.5 ms at G3, against 33 ms and 55
 ms afresh.
 
-### Loops round a flat face (`cap_blend.lucb`)
+### Loops round a flat face (`cap_blend.lucb`, `cap_rows.lucb`)
 
-A flat face's edges where it meets walls standing square to it are blended directly too, as a
-whole tangent loop. A wall may be a plane containing the face's normal, a cylinder about it, or a
-B-spline face swept straight along it, as an extrusion's sides and an earlier fillet's strips are.
+A flat face's edges where it meets walls ruled away from it are blended directly too, as a whole
+tangent loop or part of one. A wall may be:
+- a plane at any angle to the face (a box's side, a tapered extrusion's);
+- a cylinder or cone about the face's normal (a hole, a tapered extrusion's rounded corner);
+- a surface swept straight along one way out of the face's plane: an extrusion's B-spline side, an
+  earlier fillet's strip, a cylinder along a slanted upright (a tapered box's filleted corner).
+
 The top of a box whose uprights were filleted is such a loop: four lines and the uprights' G1 arcs
-or G2/G3 sections, tangent where they meet. So is a hole's rim. Every vertex of the loop must be a
-joint: two picked edges meeting tangentially, and one seam between two walls along the face's
-normal. Anything else is left to the booleans.
+or G2/G3 sections, tangent where they meet; so is a tapered box's, and a hole's rim. Every vertex of
+a picked edge is a joint (two picked edges meeting tangentially, and one seam between their walls
+along their ruling) or an open end (below). Anything else is left to the booleans.
 
-Every section across such an edge is the same square corner. The blend is that one 2D section (a
-quarter circle, the G2/G3 B-spline, or a chamfer's line) carried along the edge, in the frame of the
-face's normal and the edge's normal in the face. OpenCASCADE and Parasolid build a ball rolling
-along a curve the same way.
-- **Lines and arcs** stay exact. G1 and chamfers make a cylinder or plane along a line, and a torus
-  or cone about an arc. G2 and G3 sweep their section along the edge: straight, or as rational
-  arcs about an arc's axis.
-- **B-spline edges** are approximated. Each row of the section's control points follows an offset
-  of the edge. Its ends and end tangents are exact, and its interior is a least-squares fit on the
-  edge's own parameter, degree and knots. Spans that stray beyond the shape's tolerance are halved,
-  and the rows are fitted again. The rows on the face and on the wall are those faces' new edges,
-  so they are shared exactly. The rows along the wall are the edge moved, which the knots hold
-  exactly.
+The blend is a 2D section (a circle's arc, the G2/G3 B-spline, or a chamfer's line) carried along the
+edge in the frame of the way into the face, `u`, and the wall's ruling `S`, scaled so that across the
+edge it is one unit long. OpenCASCADE and Parasolid build a ball rolling along a curve the same way.
+- **The corner** has cosine λ = D · u (D the wall's way square to the edge): 0 for a square wall,
+  -sin(taper) at a tapered extrusion's top. Contacts are r cot(θ/2) = r (1 + λ)/μ from the corner (μ
+  = √(1 − λ²)), a chamfer's its size along each face. A G1 section is the rational arc with middle
+  weight sin(θ/2); the chain's corner sets it (a slanted sweep's corner changes along it, its
+  sections then near-circles meeting the faces tangentially).
+- **The ruling** is a plane's from one seam's way to the other's (the plane between two slanted
+  fillet strips), a cylinder's or cone's line through the point, or a sweep's way.
+- **Lines and arcs whose corner stays the same** are exact: rows are lines or concentric arcs;
+  square ones and drafted ones without skew make a cylinder or plane along a line, a torus or cone
+  about an arc.
+- **Everything else is fitted.** Each row of the section's control points follows the edge: its ends
+  and end tangents exact, its interior a least-squares fit on the edge's parameter (a B-spline's own
+  degree and knots, else degree 5 over two spans). Spans that stray beyond the shape's tolerance are
+  halved, and the rows are fitted again. The rows on the face and on the wall are those faces' new
+  edges, so they are shared exactly; the wall's row lies on the wall because it runs along its
+  ruling. A fitted strip is parametrized with its normal into the material: the tessellator's
+  constrained fallback, which an unevenly sampled strip can reach, did not converge for the other
+  orientation.
 
-The face's loop moves onto the contacts. Each wall's edge moves down to its contact: the wall's own
-section, moved. Each seam is shortened, and each joint gets one section edge, which both of its
-strips share. The result is closed by construction, and checked.
+The face's loop moves onto the contacts. Each wall's edge moves along the ruling to its contact. Each
+seam is shortened, and each joint gets one section edge, which both of its strips share. The result
+is closed by construction, and checked.
+
+**Open ends.** Without Tangent chain, a picked edge may stop where the loop goes on tangentially into
+an edge that is not picked (a fillet ending where a tangent loop goes on). The strip stops in the
+section's plane there, square to the edge. A flat end face (`<tag>/end[...]`, named by the edge going
+on) fills the corner between the section and the sharp edge, bounded by the section, the seam's upper
+part and a line on the face back to the corner. The seam is split at the wall's contact: the blended
+wall keeps the lower part, the wall going on keeps both. The removed volume is then exactly the
+section's area along the edge. The end face touches the face and the wall in cusps (the section is
+tangent to both), which the tessellator samples finely; it equalizes opposite sides' sample counts up
+to 1024 (was 512) so the strip beside it stays a mapped patch.
 
 **Too large** is said with the size that fits. A contact on the face must stay short of where the
 edge's offset folds (the edge's least radius of curvature toward the face: 0.341 for G3 uprights of
-0.4). Each seam must keep some length (half its length when both its ends are blended).
-
-**Without Tangent chain,** an edge whose loop continues into B-spline edges is refused: "turn
-Tangent chain on, or pick the whole loop". Booleans can't end a tool on a B-spline wall.
+0.4). Each seam must keep some length (half its length when both its ends are blended). A drafted
+corner's contacts are farther than the radius; the sizes said allow for it.
 
 ### Fillets meeting at corners (`corners.lucb`)
 
@@ -672,8 +692,8 @@ Roughly in order of usefulness:
 
 1. **Fillet corners beyond three edges,** and G1 setback corners (the same patch with one row:
    unequal radii, Fusion's other corner type).
-2. **Blends on other curved edges:** ellipses, and edges between two curved faces; open
-   chains along B-spline walls (a fillet ending where a tangent loop goes on).
+2. **Blends on other curved edges:** edges between two curved faces (beyond a flat face's loop);
+   open ends where the loop turns a sharp corner rather than going on tangentially.
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
    surfaces. Rays through them are exact (`spline_rays.lucb`).
 4. **Sweep and loft;** Extrude's Thin option and a start offset by a face.

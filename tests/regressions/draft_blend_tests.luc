@@ -1,0 +1,133 @@
+## Blends round a flat face whose walls are drafted (cap_blend.lucb): a
+## tapered rounded rectangle's top loop (planes and cones leaning in) and
+## a tapered box's after its uprights were filleted (the uprights' strips
+## swept along slanted edges), filleted G1, G2, G3 and chamfered. Each is
+## closed and faces out. Along the tapered rectangle's closed convex loop
+## (length P) the corner's section (area A, its centroid x̄ in from the
+## edge along the cap) sweeps A (P - 2π x̄), the loop's curvature
+## integrating to one turn: checked exactly for the chamfer's triangle and
+## the fillet's circle in the corner's true angle.
+from luce_cad.sketch import CadSketch
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_geocore.geocore import Vector3, Mesh
+from checks import closed, volume
+from luce_std import math
+
+## The edges of `model` lying wholly at height `y`.
+func loop_at(model: CadModel, y: float) -> str!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if math.abs(model.face_edge_point(face, use, 0.0).y - y) < 1e-9 and math.abs(model.face_edge_point(face, use, 0.5).y - y) < 1e-9 and not (id in found):
+                found.append(id)
+    return CadModeling.edge_references(model, found)
+
+## The edges of `model` rising more than 1 (uprights).
+func uprights(model: CadModel) -> str!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if math.abs(model.face_edge_point(face, use, 0.0).y - model.face_edge_point(face, use, 1.0).y) > 1.0 and not (id in found):
+                found.append(id)
+    return CadModeling.edge_references(model, found)
+
+## Every display triangle faces out, but for slivers of no area.
+func outward(mesh: Mesh) -> unit!:
+    for triangle in 0..<mesh.index_count() // 3:
+        let a = mesh.vertex(mesh.index(triangle * 3))
+        let b = mesh.vertex(mesh.index(triangle * 3 + 1))
+        let c = mesh.vertex(mesh.index(triangle * 3 + 2))
+        let n = b.position.subtract(a.position).cross(c.position.subtract(a.position))
+        assert(n.dot(a.normal) > 0.0 or n.length() <= 1e-6)
+
+## `model`'s loop `refs` blended to `r` (`continuity` 0: chamfered),
+## closed and outward; how much it took away.
+func removed(model: CadModel, refs: str, r: float, continuity: int, faces: int) -> float!:
+    let made = CadModeling.chamfered(model, refs, r, "#g") if continuity == 0 else CadModeling.filleted(model, refs, r, "#g", continuity)
+    if made.face_count() != faces: print(f"faces {made.face_count()}, expected {faces}")
+    assert(made.face_count() == faces)
+    let mesh = made.tessellate(64)
+    closed(mesh)
+    outward(mesh)
+    return volume(model.tessellate(64)) - volume(mesh)
+
+## A corner of cosine `lambda` (the wall's way across the edge against the
+## way into the cap): the section's area and its centroid's way in along
+## the cap, a chamfer's (continuity 0) or a circle's of radius `r`.
+func section(lambda: float, r: float, continuity: int) -> (float, float):
+    let mu = math.sqrt(1.0 - lambda * lambda)
+    if continuity == 0:
+        return (0.5 * r * r * mu, (r + r * lambda) / 3.0)
+    # The region between the cap, the wall and the arc: a polygon of the
+    # corner, the contacts and the arc's points, by the shoelace.
+    let c = r * (1.0 + lambda) / mu
+    let points: list[(float, float)] = [(0.0, 0.0), (c, 0.0)]
+    let start = -0.5 * math.pi
+    var stop = math.atan2(c * mu - r, c * lambda - c)
+    # Round the corner side: the angle falls from straight down.
+    if stop > start:
+        stop -= 2.0 * math.pi
+    for k in 1..<2000:
+        let angle = start + (stop - start) * float(k) / 2000.0
+        points.append((c + r * math.cos(angle), r + r * math.sin(angle)))
+    points.append((c * lambda, c * mu))
+    var area = 0.0
+    var moment = 0.0
+    for k in 0..<points.length:
+        let (x0, y0) = points[k]
+        let (x1, y1) = points[(k + 1) % points.length]
+        let cross = x0 * y1 - x1 * y0
+        area += cross * 0.5
+        moment += (x0 + x1) * cross / 6.0
+    return (math.abs(area), moment / area)
+
+pub func draft_blend_tests() -> unit!:
+    # A 4 x 2 rounded rectangle (corners 0.5) 2 high, leaning in 0.1.
+    let s = CadSketch.parse("")
+    let p = [s.add_point(-1.5, -1.0), s.add_point(1.5, -1.0), s.add_point(2.0, -0.5), s.add_point(2.0, 0.5), s.add_point(1.5, 1.0), s.add_point(-1.5, 1.0), s.add_point(-2.0, 0.5), s.add_point(-2.0, -0.5)]
+    _ = s.add_line(p[0], p[1])
+    _ = s.add_arc(s.add_point(1.5, -0.5), p[1], p[2])
+    _ = s.add_line(p[2], p[3])
+    _ = s.add_arc(s.add_point(1.5, 0.5), p[3], p[4])
+    _ = s.add_line(p[4], p[5])
+    _ = s.add_arc(s.add_point(-1.5, 0.5), p[5], p[6])
+    _ = s.add_line(p[6], p[7])
+    _ = s.add_arc(s.add_point(-1.5, -0.5), p[7], p[0])
+    let taper = 0.1
+    let body = CadModeling.extruded_sides(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0)), 2.0, 0.0, "e", taper = taper)
+    let top = loop_at(body, 2.0)
+    let perimeter = 8.0 + 2.0 * math.pi * (0.5 - 2.0 * math.tan(taper))
+    # The wall leans in: down it runs out, against the way into the cap.
+    let lambda = -math.sin(taper)
+    let r = 0.2
+    var previous = 1e300
+    for continuity in 0..<4:
+        let taken = removed(body, top, r, continuity, 18)
+        if continuity < 2:
+            let (area, centroid) = section(lambda, r, continuity)
+            let expected = area * (perimeter - 2.0 * math.pi * centroid)
+            if math.abs(taken - expected) > 0.0005:
+                print(f"tapered G{continuity}: removed {taken}, expected {expected}")
+            assert(math.abs(taken - expected) <= 0.0005)
+        # Smoother fillets take less.
+        assert(taken < previous)
+        previous = taken
+    # A tapered 2 x 2 box's slanted uprights filleted (cylinders and sweeps
+    # along them), then its top loop: lines between drafted planes and the
+    # uprights' sections, slanted walls.
+    let square = CadSketch.parse("")
+    let q = [square.add_point(-1.0, -1.0), square.add_point(1.0, -1.0), square.add_point(1.0, 1.0), square.add_point(-1.0, 1.0)]
+    for at in 0..<4:
+        _ = square.add_line(q[at], q[(at + 1) % 4])
+    let tapered = CadModeling.extruded_sides(square.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0)), 2.0, 0.0, "e", taper = taper)
+    for first in 1..<4:
+        let rounded = CadModeling.filleted(tapered, uprights(tapered), 0.3, "#u", first)
+        var before = 1e300
+        for continuity in 0..<4:
+            let taken = removed(rounded, loop_at(rounded, 2.0), 0.15, continuity, 18)
+            assert(taken > 0.0 and taken < before)
+            before = taken
+    print("PASS drafted blends: a tapered rounded rectangle's top loop (planes and cones leaning in) chamfered and filleted G1, G2, G3, the chamfer and circle by their swept sections in the corner's true angle; a tapered box's top loop after its slanted uprights were filleted G1, G2, G3 (walls swept along slanted edges); closed and outward")

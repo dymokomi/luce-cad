@@ -1,0 +1,131 @@
+## A cap loop's blend written out (cap_blend.lucb): the body's faces with
+## their loops on the contacts, the strips, and the open ends' flat faces.
+
+## The result: the body's faces, the cap's loops on its contacts (and an
+## open end's line to its corner), each wall's edge on its contact and its
+## seams shortened or split, then the strips and the open ends' faces;
+## turned to agree and checked closed (local_blend_result.lucb's orient).
+func cap_result(b: Cap*, tag: str) -> interop.Reference[CadModel]!:
+    let w = b.w
+    var uses = Growing[i64]()
+    defer uses.close()
+    var sizes = Growing[i64]()
+    defer sizes.close()
+    for f in 0..<w.faces.count:
+        uses.clear()
+        sizes.clear()
+        let face_uses = w.face_uses(f)
+        var at: usize = 0
+        for size in w.face_sizes(f):
+            let before = uses.count
+            for use in face_uses[at..<at + (usize)size]: try cap_use(b, f, use, &uses)
+            try sizes.push((i64)(uses.count - before))
+            at += (usize)size
+        let face = w.faces.items[f]
+        try b.out.add_face(face.surface, face.sense, uses.view(), sizes.view(), try b.out.add_name(w.face_name(f)))
+    let fixed = b.out.faces.count
+    for side in b.sides.view():
+        let edge = w.edges.items[side.edge]
+        # Against the cap's way along its contact, from that contact.
+        var loop: i64[4] = [side.outer + 1, b.sections.items[(usize)edge.end] + 1, -(side.inner + 1), -(b.sections.items[(usize)edge.start] + 1)]
+        if try cap_runs_forward(w, side.cap, side.edge):
+            loop = [-(side.outer + 1), b.sections.items[(usize)edge.start] + 1, side.inner + 1, -(b.sections.items[(usize)edge.end] + 1)]
+        let size: i64[1] = [4]
+        try blend_name(w, side.edge, tag, &b.name)
+        try b.out.add_face(side.surface, side.sense, loop[..<4], size[..<1], try b.out.add_name((str)b.name.view()))
+    # Each open end's flat face.
+    for v in 0..<w.points.count:
+        if b.open.items[v]: try end_face(b, v, tag)
+    try orient(&b.out, fixed)
+    let solid = try used_brep(&b.out)
+    defer solid.release()
+    return try CadModel.of_brep(solid)
+
+## Whether face `cap` of `w` uses edge `e` from its start to its end.
+func cap_runs_forward(w: const Shape*, cap: usize, e: usize) -> bool!:
+    for use in w.face_uses(cap):
+        if edge_index(use) == e: return use > 0
+    error(invalid, "a blended edge is not on its cap")
+
+## Body face `f`'s loop use `use` as the result has it, onto `out`: a
+## picked edge by its contact on that face (with an open end's line to
+## the corner on the cap), a seam shortened (with its upper part on the
+## wall going on past an open end), else the edge itself.
+func cap_use(b: Cap*, f: usize, use: i64, out: Growing[i64]*) -> !:
+    let w = b.w
+    let e = edge_index(use)
+    let forward = use > 0
+    let edge = w.edges.items[e]
+    let k = b.side_of.items[e]
+    if k >= 0:
+        let side = b.sides.items[(usize)k]
+        let id = side.outer if side.cap == f else side.inner
+        let head = (usize)(edge.start if forward else edge.end)
+        let tail = (usize)(edge.end if forward else edge.start)
+        # On the cap, an open end's line: from the corner to the contact
+        # before, from the contact to the corner after.
+        if side.cap == f and b.open.items[head]: try out.push(-(b.end_lines.items[head] + 1))
+        try out.push((id + 1) if forward else -(id + 1))
+        if side.cap == f and b.open.items[tail]: try out.push(b.end_lines.items[tail] + 1)
+        return
+    let seam = b.seams.items[e]
+    if seam < 0:
+        try out.push(use)
+        return
+    let top_part = b.uppers.items[e]
+    if top_part < 0:
+        try out.push((seam + 1) if forward else -(seam + 1))
+        return
+    # Split at an open end `v`: the blended edge's wall keeps the lower
+    # part; the wall going on keeps both, in the seam's own order (the
+    # upper part first when the seam starts at `v`).
+    let v = edge.start if b.open.items[(usize)edge.start] else edge.end
+    for side in b.sides.view():
+        let picked = w.edges.items[side.edge]
+        if side.wall == f and (picked.start == v or picked.end == v):
+            try out.push((seam + 1) if forward else -(seam + 1))
+            return
+    let upper_first = edge.start == v
+    let first = top_part if upper_first else seam
+    let second = seam if upper_first else top_part
+    if forward:
+        try out.push(first + 1)
+        try out.push(second + 1)
+    else:
+        try out.push(-(second + 1))
+        try out.push(-(first + 1))
+
+## Open end `v`'s flat face, in its section's plane: from its cap contact
+## along its section to its wall contact, up the seam's upper part to the
+## corner, back along the line on the cap. It faces the blend: away from
+## the corner going on (into the blend's air on a convex edge).
+func end_face(b: Cap*, v: usize, tag: str) -> !:
+    let w = b.w
+    var top_part: i64 = -1
+    for g in 0..<w.edges.count:
+        if b.uppers.items[g] < 0: continue
+        let seam = w.edges.items[g]
+        if seam.start == (i64)v or seam.end == (i64)v: top_part = b.uppers.items[g]
+    if top_part < 0: error(invalid, "an open end's seam was not split")
+    # From the wall contact up to the corner.
+    let upward = b.out.edges.items[(usize)top_part].end == (i64)v
+    let loop: i64[3] = [b.sections.items[v] + 1, (top_part + 1) if upward else -(top_part + 1), -(b.end_lines.items[v] + 1)]
+    let size: i64[1] = [3]
+    let head = b.at(b.on_cap.items[v])
+    let corner = w.points.items[v]
+    let tail = b.at(b.on_wall.items[v])
+    let normal = try head.subtract(corner).cross(tail.subtract(corner)).normalized()
+    # Outward: along the blended edge from the corner (convex), else back.
+    var outward = Vector3()
+    for side in b.sides.view():
+        let edge = w.edges.items[side.edge]
+        if edge.start == (i64)v or edge.end == (i64)v:
+            outward = (try w.leaving(side.edge, 0 if edge.start == (i64)v else 1)).multiply_scalar(1.0 if side.convex else -1.0)
+    var empty_points: Vector3[]
+    var empty_numbers: f64[]
+    try b.out.surfaces.push(try Surface(0, corner, try head.subtract(corner).normalized(), normal, 0.0, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+    # Named by the edge going on: `tag/end[A&B]`.
+    try role_name(&b.name, tag, "end[")
+    try edge_name(w, (usize)b.continues.items[v], &b.name)
+    try b.name.push(93)
+    try b.out.add_face((i64)b.out.surfaces.count - 1, normal.dot(outward) > 0.0, loop[..<3], size[..<1], try b.out.add_name((str)b.name.view()))

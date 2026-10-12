@@ -1,0 +1,206 @@
+## Which picked edges a cap loop's blend takes (cap_blend.lucb): edges
+## round a flat face whose walls are ruled away from it, each vertex a
+## joint or an open end, the cap of an edge between two flat faces told by
+## its neighbors or by the edge its loop goes on into.
+
+## How face `wall` runs away from the plane of normal `n`, when it is ruled
+## so a blend can follow it: a plane across it (ruling_between), a
+## cylinder or cone about `n` (ruling_cone), or a surface swept straight
+## along one way out of the plane: a cylinder along its axis, a B-spline
+## with two rows along that way (ruling_sweep, with its way). -1 when it is
+## none of these.
+func wall_ruling(w: const Shape*, wall: usize, n: Vector3) -> (i64, Vector3):
+    let s = w.surfaces.items[(usize)w.faces.items[wall].surface]
+    if s.kind == surface_plane:
+        if math.abs(s.z.dot(n)) > 1.0 - 1e-9: return (-1, Vector3())
+        return (ruling_between, Vector3())
+    if s.kind == surface_cylinder or s.kind == surface_cone:
+        if math.abs(s.z.dot(n)) > 1.0 - 1e-12: return (ruling_cone, Vector3())
+        if s.kind == surface_cylinder and math.abs(s.z.dot(n)) > 1e-6: return (ruling_sweep, s.z)
+        return (-1, Vector3())
+    if s.kind != surface_spline: return (-1, Vector3())
+    # The swept way is v (two rows per u) or u (two rows per v).
+    let along_v = s.nv == 2 and s.dv == 1
+    let along_u = s.nu == 2 and s.du == 1
+    if not along_v and not along_u: return (-1, Vector3())
+    let count = s.nu if along_v else s.nv
+    var step = Vector3()
+    for i in 0..<(usize)count:
+        let first = i * 2 if along_v else i
+        let second = i * 2 + 1 if along_v else (usize)s.nv + i
+        if math.abs(s.weights[first] - s.weights[second]) > 1e-12: return (-1, Vector3())
+        let d = s.points[second].subtract(s.points[first])
+        if i == 0:
+            step = d
+            if step.length() <= w.tolerance or math.abs(step.dot(n)) <= step.length() * 1e-6: return (-1, Vector3())
+        elif d.subtract(step).length() > w.tolerance: return (-1, Vector3())
+    let way = step.normalized() catch failure: return (-1, Vector3())
+    return (ruling_sweep, way)
+
+## Whether edge `e` lies where flat face `cap` meets a wall (`wall`) ruled
+## away from it: what this file blends.
+func cap_candidate(w: const Shape*, e: usize, cap: usize, wall: usize) -> bool:
+    if cap == wall: return false
+    let s = w.surfaces.items[(usize)w.faces.items[cap].surface]
+    if s.kind != surface_plane: return false
+    let kind = w.carriers.items[(usize)w.edges.items[e].carrier].kind
+    if kind != curve_line and kind != curve_circle and kind != curve_ellipse and kind != curve_spline: return false
+    let (ruling, _) = wall_ruling(w, wall, s.z)
+    return ruling >= 0
+
+## The picked edges' sides, when every one lies on a cap loop and every
+## vertex of theirs is a joint (two of them meeting tangentially on the
+## cap, and one seam along their walls' ruling) or an open end (the loop
+## going on tangentially into an edge not picked, and one seam); false
+## otherwise.
+func cap_eligible(b: Cap*, chosen: const usize[]) -> bool!:
+    let w = b.w
+    if chosen.length == 0: return false
+    # Each edge's possible caps (one of its faces, or both).
+    var caps = Growing[i64]()
+    defer caps.close()
+    for e in chosen:
+        if b.side_of.items[e] >= 0: return false
+        b.side_of.items[e] = 0
+        let (fa, fb) = try edge_faces(w, e)
+        let a = cap_candidate(w, e, fa, fb)
+        let z = cap_candidate(w, e, fb, fa)
+        if not a and not z: return false
+        try caps.push((i64)fa if a else -1)
+        try caps.push((i64)fb if z else -1)
+    for e in chosen: b.side_of.items[e] = -1
+    # Picked ends at each vertex: two (a joint, or a closed edge's both),
+    # or one (an open end).
+    var ends = Growing[i64]()
+    defer ends.close()
+    try ends.fill(w.points.count, 0)
+    for e in chosen:
+        ends.items[(usize)w.edges.items[e].start] += 1
+        ends.items[(usize)w.edges.items[e].end] += 1
+    for e in chosen:
+        for v in [w.edges.items[e].start, w.edges.items[e].end]:
+            let count = ends.items[(usize)v]
+            if count != 1 and count != 2: return false
+    # Edges meeting at a joint share their cap: keep only caps the
+    # neighbour allows, until nothing changes.
+    var changed = true
+    while changed:
+        changed = false
+        for i in 0..<chosen.length:
+            for j in 0..<chosen.length:
+                if i == j: continue
+                let ei = w.edges.items[chosen[i]]
+                let ej = w.edges.items[chosen[j]]
+                if ei.start != ej.start and ei.start != ej.end and ei.end != ej.start and ei.end != ej.end: continue
+                for k in 0..<(usize)2:
+                    let c = caps.items[i * 2 + k]
+                    if c < 0 or c == caps.items[j * 2] or c == caps.items[j * 2 + 1]: continue
+                    caps.items[i * 2 + k] = -1
+                    changed = true
+    # An edge still on two caps (a line between planes, alone): the cap
+    # is the face its loop goes on into, tangentially, past an open end.
+    for i in 0..<chosen.length:
+        if caps.items[i * 2] < 0 or caps.items[i * 2 + 1] < 0: continue
+        let on = try continued_face(w, chosen[i], chosen)
+        if on < 0: continue
+        for k in 0..<(usize)2:
+            if caps.items[i * 2 + k] != on: caps.items[i * 2 + k] = -1
+    for i in 0..<chosen.length:
+        let e = chosen[i]
+        let first = caps.items[i * 2]
+        let second = caps.items[i * 2 + 1]
+        if (first < 0) == (second < 0): return false
+        let cap = (usize)(first if first >= 0 else second)
+        let (fa, fb) = try edge_faces(w, e)
+        let wall = fb if fa == cap else fa
+        let n = w.surfaces.items[(usize)w.faces.items[cap].surface].z
+        let along = try along_edge(w, e)
+        let edge = w.edges.items[e]
+        let middle = (edge.t0 + edge.t1) * 0.5
+        let crosswise = try n.cross(try w.tangent(edge.carrier, middle)).normalized()
+        let cap_way = try into_face(w, cap, e, along)
+        let wall_way = try into_face(w, wall, e, along)
+        # The wall must leave the cap's plane, not lie along it.
+        if math.abs(wall_way.dot(n)) < 1e-6 or math.abs(wall_way.dot(cap_way)) > 1.0 - 1e-6: return false
+        let (ruling, sweep) = wall_ruling(w, wall, n)
+        let into_wall = n.multiply_scalar(1.0 if wall_way.dot(n) > 0.0 else -1.0)
+        try b.sides.push(CapSide(e, cap, wall, 1.0 if crosswise.dot(cap_way) > 0.0 else -1.0, into_wall, try convex(w, e), ruling, Vector3(), Vector3(),
+                                 sweep, -1, -1, -1, true))
+        b.side_of.items[e] = (i64)b.sides.count - 1
+    for k in 0..<b.sides.count:
+        if not try vertices_eligible(b, k, ends.view()): return false
+    return true
+
+## The face edge `e` shares with an edge not in `chosen` that goes on
+## from it tangentially at one of its vertices, or -1.
+func continued_face(w: const Shape*, e: usize, chosen: const usize[]) -> i64!:
+    let edge = w.edges.items[e]
+    let (fa, fb) = try edge_faces(w, e)
+    for end in 0..<(usize)2:
+        let v = edge.start if end == 0 else edge.end
+        let mine = try w.leaving(e, (i64)end)
+        for g in 0..<w.edges.count:
+            let other = w.edges.items[g]
+            if g == e or (other.start != v and other.end != v) or edge_in(chosen, g): continue
+            if (try w.leaving(g, 0 if other.start == v else 1)).dot(mine) > -1.0 + 1e-9: continue
+            let (ga, gb) = try edge_faces(w, g)
+            if ga == fa or gb == fa: return (i64)fa
+            if ga == fb or gb == fb: return (i64)fb
+    return -1
+
+## Whether side `k`'s two vertices are joints (its picked neighbor tangent,
+## on its cap, its wall on the same side) or open ends (the edge going on
+## tangentially on the cap, not picked), each with one seam: a line along
+## the walls' ruling there. A plane's rulings at its ends are its seams'.
+func vertices_eligible(b: Cap*, k: usize, ends: const i64[]) -> bool!:
+    let w = b.w
+    let side = b.sides.items[k]
+    let edge = w.edges.items[side.edge]
+    for end in 0..<(usize)2:
+        let v = edge.start if end == 0 else edge.end
+        let t = edge.t0 if end == 0 else edge.t1
+        var seam: i64 = -1
+        var goes_on: i64 = -1
+        var count: usize = 0
+        let mine = try w.leaving(side.edge, (i64)end)
+        for g in 0..<w.edges.count:
+            let other = w.edges.items[g]
+            if other.start != v and other.end != v: continue
+            count += 1
+            if g == side.edge: continue
+            let theirs = try w.leaving(g, 0 if other.start == v else 1)
+            let tangential = mine.dot(theirs) <= -1.0 + 1e-9
+            let j = b.side_of.items[g]
+            if j >= 0:
+                let next = b.sides.items[(usize)j]
+                if next.cap != side.cap or next.into_wall.dot(side.into_wall) < 0.0 or next.convex != side.convex or not tangential: return false
+                continue
+            if tangential:
+                let (ga, gb) = try edge_faces(w, g)
+                if ga != side.cap and gb != side.cap: return false
+                goes_on = (i64)g
+                continue
+            if w.carriers.items[(usize)other.carrier].kind != curve_line or seam >= 0: return false
+            seam = (i64)g
+        if seam < 0: return false
+        b.is_seam.items[(usize)seam] = true
+        if ends[(usize)v] == 1:
+            # An open end: three edges, the one going on tangentially.
+            if goes_on < 0 or count != 3: return false
+            b.open.items[(usize)v] = true
+            b.continues.items[(usize)v] = goes_on
+        elif goes_on >= 0:
+            return false
+        # The seam runs along the wall's ruling there, into the wall.
+        let line = w.edges.items[(usize)seam]
+        let from_v = w.points.items[(usize)(line.end if line.start == v else line.start)].subtract(w.points.items[(usize)v])
+        let tangent = try (try w.tangent(edge.carrier, t)).normalized()
+        let spread = from_v.subtract(tangent.multiply_scalar(from_v.dot(tangent))).length()
+        if spread <= w.tolerance or from_v.dot(side.into_wall) <= 0.0: return false
+        let scaled = from_v.multiply_scalar(1.0 / spread)
+        if end == 0: b.sides.items[k].s0 = scaled
+        else: b.sides.items[k].s1 = scaled
+        if side.ruling != ruling_between:
+            let ruled = try ruling_at(b, &b.sides.items[k], t)
+            if ruled.subtract(scaled).length() > 1e-6 * ruled.length(): return false
+    return true

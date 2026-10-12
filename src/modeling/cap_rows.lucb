@@ -1,0 +1,385 @@
+## The rows of a cap loop's blends (cap_blend.lucb): how each wall runs
+## away from its edge, the section across the edge there, and the strip's
+## rows of control points along the edge.
+##
+## A wall runs away from its edge along its rulings (its straight lines):
+## - a plane between two seams: from one seam's way to the other's, so its
+##   contact with the blend is the line between its seams' points;
+## - a cylinder or cone about the cap's normal: its line through the point;
+## - a surface swept straight along one way (a B-spline sweep, an earlier
+##   fillet's strip, a cylinder along a slanted upright): that way.
+## Square walls (a box's sides) run along the cap's normal. A drafted wall
+## (a tapered extrusion's) leans: the corner between the cap and the wall
+## is not square, the same along a plane or a cone about the normal, and
+## changing along a slanted sweep.
+##
+## The section lies on the cap's way `u` (into the cap, square to the edge)
+## and the ruling `S`, scaled so that across the edge it is one unit long
+## (S = D + g T: D the wall's way square to the edge, T the edge's way): a
+## section point `a` along u and `b` along S is a + b λ into the cap and b μ
+## along the normal (λ = D · u, the corner's cosine). A fillet's contacts are
+## r cot(θ/2) from the corner: (1 + λ) r / μ. Rows are e(t) + a_k u(t) +
+## b_k S(t): on the cap where b is 0, on the wall where a is 0 (its ruling),
+## exact lines along a line, exact arcs about an arc, fitted elsewhere.
+
+## How a side's wall runs away from its edge (CapSide.ruling).
+let ruling_between: i64 = 0
+let ruling_cone: i64 = 1
+let ruling_sweep: i64 = 2
+
+## Side `side`'s ruling at its carrier's parameter `t`: the way into its
+## wall, scaled to a unit across the edge.
+func ruling_at(b: const Cap*, side: const CapSide*, t: f64) -> Vector3!:
+    let w = b.w
+    let edge = w.edges.items[side.edge]
+    var s = Vector3()
+    if side.ruling == ruling_between:
+        let f = (t - edge.t0) / (edge.t1 - edge.t0)
+        return side.s0.add(side.s1.subtract(side.s0).multiply_scalar(f))
+    if side.ruling == ruling_cone:
+        let wall = &w.surfaces.items[(usize)w.faces.items[side.wall].surface]
+        let p = try w.at(edge.carrier, t)
+        let d = p.subtract(wall.origin)
+        let radial = try d.subtract(wall.z.multiply_scalar(d.dot(wall.z))).normalized()
+        s = wall.z.add(radial.multiply_scalar(math.tan(wall.angle) if wall.kind == surface_cone else 0.0))
+    else:
+        s = side.sweep
+    if s.dot(side.into_wall) < 0.0: s = s.multiply_scalar(-1.0)
+    let tangent = try (try w.tangent(edge.carrier, t)).normalized()
+    let spread = s.subtract(tangent.multiply_scalar(s.dot(tangent))).length()
+    if spread <= 1e-9: error(invalid, "a blend's wall runs along its edge")
+    return s.multiply_scalar(1.0 / spread)
+
+## The corner's cosine λ at `t` (the wall's way square to the edge, against
+## the way into the cap) and the contact distance there (a fillet's
+## r cot(θ/2), a chamfer's size).
+func corner_at(b: const Cap*, side: const CapSide*, t: f64) -> (f64, f64)!:
+    let edge = b.w.edges.items[side.edge]
+    let (u, _) = try into_cap(b, side, t)
+    let s = try ruling_at(b, side, t)
+    let tangent = try (try b.w.tangent(edge.carrier, t)).normalized()
+    let lambda = s.subtract(tangent.multiply_scalar(s.dot(tangent))).dot(u)
+    if math.abs(lambda) > 1.0 - 1e-6: error(invalid, "a blend's wall lies along its cap")
+    return (lambda, contact_distance(b, lambda))
+
+## How far a blend's contacts are from a corner of cosine `lambda`.
+func contact_distance(b: const Cap*, lambda: f64) -> f64:
+    if not b.round: return b.reach
+    return b.reach * (1.0 + lambda) / math.sqrt(1.0 - lambda * lambda)
+
+## The section of a corner of cosine `lambda`: its control points as steps
+## along u (`along_cap`) and S (`along_wall`) from the corner, from the cap's
+## contact to the wall's; its knots, weights and degree. A chamfer's line;
+## G1 a circle's arc (rational, its middle weight the chain's: b.weight);
+## G2, G3 the fillet's B-spline (fillet_section).
+func section_at(b: const Cap*, lambda: f64, along_cap: Growing[f64]*, along_wall: Growing[f64]*, knots: Growing[f64]*, weights: Growing[f64]*) -> i64!:
+    along_cap.clear()
+    along_wall.clear()
+    knots.clear()
+    weights.clear()
+    let c = contact_distance(b, lambda)
+    if not b.round:
+        let a: f64[2] = [c, 0.0]
+        let z: f64[2] = [0.0, c]
+        let k: f64[4] = [0.0, 0.0, 1.0, 1.0]
+        try along_cap.assign(a[..<2])
+        try along_wall.assign(z[..<2])
+        try knots.assign(k[..<4])
+        try weights.fill(2, 1.0)
+        return 1
+    if b.continuity == 1:
+        let a: f64[3] = [c, 0.0, 0.0]
+        let z: f64[3] = [0.0, 0.0, c]
+        let k: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+        let x: f64[3] = [1.0, b.weight, 1.0]
+        try along_cap.assign(a[..<3])
+        try along_wall.assign(z[..<3])
+        try knots.assign(k[..<6])
+        try weights.assign(x[..<3])
+        return 2
+    var points = Growing[Vector3]()
+    defer points.close()
+    try fillet_section(Vector3(c, 0.0, 0.0), Vector3(0.0, c, 0.0), Vector3(), b.continuity, &points, knots)
+    for p in points.view():
+        try along_cap.push(p.x)
+        try along_wall.push(p.y)
+    try weights.fill(points.count, 1.0)
+    return 5
+
+## Every row of side `side`'s section at parameter `t` (the section
+## there) onto `out`: e(t) + a_k u(t) + b_k S(t).
+func rows_at(b: const Cap*, side: const CapSide*, t: f64, out: Growing[Vector3]*) -> !:
+    let edge = b.w.edges.items[side.edge]
+    let (lambda, _) = try corner_at(b, side, t)
+    var a = Growing[f64]()
+    defer a.close()
+    var z = Growing[f64]()
+    defer z.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    _ = try section_at(b, lambda, &a, &z, &knots, &weights)
+    let (u, _) = try into_cap(b, side, t)
+    let s = try ruling_at(b, side, t)
+    let e = try b.w.at(edge.carrier, t)
+    out.clear()
+    for k in 0..<a.count: try out.push(e.add(u.multiply_scalar(a.items[k])).add(s.multiply_scalar(z.items[k])))
+
+## Every row's derivative by `t` at `t`, an end of the edge's interval
+## (a difference into the interval: the section changes with the corner
+## along a slanted wall, and a B-spline carrier ends there) onto `out`.
+func rows_turning(b: const Cap*, side: const CapSide*, t: f64, out: Growing[Vector3]*) -> !:
+    let edge = b.w.edges.items[side.edge]
+    let low = math.min(edge.t0, edge.t1)
+    let high = math.max(edge.t0, edge.t1)
+    let h = (high - low) * 1e-6
+    let a = t if t + h <= high else t - h
+    var ahead = Growing[Vector3]()
+    defer ahead.close()
+    try rows_at(b, side, a + h, &ahead)
+    try rows_at(b, side, a, out)
+    for k in 0..<out.count: out.items[k] = ahead.items[k].subtract(out.items[k]).multiply_scalar(1.0 / h)
+
+## Side `side`'s rows (`rows` of them) as curves sharing knots: the net
+## (row-major, a row per section point) onto `net`, the along knots and
+## weights onto `knots` and `weights`; the degree. Along a line with a
+## plane's ruling between its seams they are exact lines, along an arc
+## with a cone's or cylinder's ruling exact rational arcs (concentric) over
+## [0, 1]; else fitted.
+func along_rows(b: const Cap*, side: const CapSide*, rows: usize, net: Growing[Vector3]*, knots: Growing[f64]*, weights: Growing[f64]*) -> i64!:
+    let w = b.w
+    let edge = w.edges.items[side.edge]
+    let carrier = w.carriers.items[(usize)edge.carrier]
+    if carrier.kind == curve_line and side.ruling == ruling_between:
+        var first = Growing[Vector3]()
+        defer first.close()
+        var last = Growing[Vector3]()
+        defer last.close()
+        try rows_at(b, side, edge.t0, &first)
+        try rows_at(b, side, edge.t1, &last)
+        for k in 0..<rows:
+            try net.push(first.items[k])
+            try net.push(last.items[k])
+        let ends: f64[4] = [0.0, 0.0, 1.0, 1.0]
+        try knots.assign(ends[..<4])
+        try weights.fill(2, 1.0)
+        return 1
+    if carrier.kind != curve_circle or side.ruling != ruling_cone: return try fitted_rows(b, side, rows, net, knots, weights)
+    # An arc in spans of at most a quarter turn, each a rational quadratic:
+    # a section point a along u and b along S is a + b λ out (or in) and b μ
+    # down the axis.
+    let (lambda, _) = try corner_at(b, side, edge.t0)
+    let mu = math.sqrt(1.0 - lambda * lambda)
+    var a = Growing[f64]()
+    defer a.close()
+    var z = Growing[f64]()
+    defer z.close()
+    var section_knots = Growing[f64]()
+    defer section_knots.close()
+    var section_weights = Growing[f64]()
+    defer section_weights.close()
+    _ = try section_at(b, lambda, &a, &z, &section_knots, &section_weights)
+    let sweep = edge.t1 - edge.t0
+    let spans = (usize)math.max(1.0, math.ceil(math.abs(sweep) / (math.pi * 0.5) - 1e-9))
+    let half = sweep / (2.0 * (f64)spans)
+    let radial = w.points.items[(usize)edge.start].subtract(carrier.origin)
+    let (u0, _) = try into_cap(b, side, edge.t0)
+    let outward = 1.0 if u0.dot(radial) > 0.0 else -1.0
+    for i in 0..<rows:
+        let radius = carrier.a + (a.items[i] + z.items[i] * lambda) * outward
+        let center = carrier.origin.add(side.into_wall.multiply_scalar(z.items[i] * mu))
+        for j in 0..<spans * 2 + 1:
+            let angle = edge.t0 + half * (f64)j
+            let direction = carrier.x.multiply_scalar(math.cos(angle)).add(carrier.y.multiply_scalar(math.sin(angle)))
+            let scale = radius if j % 2 == 0 else radius / math.cos(half)
+            try net.push(center.add(direction.multiply_scalar(scale)))
+    for _ in 0..<(usize)3: try knots.push(0.0)
+    for j in 1..<spans:
+        try knots.push((f64)j / (f64)spans)
+        try knots.push((f64)j / (f64)spans)
+    for _ in 0..<(usize)3: try knots.push(1.0)
+    for j in 0..<spans * 2 + 1: try weights.push(1.0 if j % 2 == 0 else math.cos(half))
+    return 2
+
+## Side `side`'s rows fitted: least squares on the edge's parameter, a
+## B-spline edge's degree (at least 3) and knots, else degree 5 over two
+## spans; each row's ends and end tangents exact; spans whose rows stray
+## more than the tolerance are halved, and it is fitted again.
+func fitted_rows(b: const Cap*, side: const CapSide*, rows: usize, net: Growing[Vector3]*, knots: Growing[f64]*, weights: Growing[f64]*) -> i64!:
+    let w = b.w
+    let edge = w.edges.items[side.edge]
+    let carrier = w.carriers.items[(usize)edge.carrier]
+    let low = math.min(edge.t0, edge.t1)
+    let high = math.max(edge.t0, edge.t1)
+    knots.clear()
+    var p: usize = 5
+    if carrier.kind == curve_spline:
+        let (_, _, ck, cd) = w.spline_net(carrier.spline)
+        p = (usize)math.max((f64)cd, 3.0)
+        for _ in 0..<p + 1: try knots.push(low)
+        var at: usize = 0
+        while at < ck.length:
+            let value = ck[at]
+            var multiplicity: usize = 0
+            while at + multiplicity < ck.length and ck[at + multiplicity] == value: multiplicity += 1
+            at += multiplicity
+            if value <= low or value >= high: continue
+            for _ in 0..<(usize)math.min((f64)p, (f64)(multiplicity + p - (usize)cd)): try knots.push(value)
+        for _ in 0..<p + 1: try knots.push(high)
+    else:
+        for _ in 0..<p + 1: try knots.push(low)
+        try knots.push((low + high) * 0.5)
+        for _ in 0..<p + 1: try knots.push(high)
+    var marked = Growing[bool]()
+    defer marked.close()
+    for _ in 0..<12:
+        let m = knots.count - p - 1
+        marked.clear()
+        try marked.fill(knots.count, m < 6)
+        if m >= 6:
+            try fit_once(b, side, rows, p, knots.view(), net)
+            if not try mark_strays(b, side, rows, p, knots.view(), net.view(), &marked): break
+        # Each marked span halved.
+        var k = knots.count - 1
+        while k > 0:
+            k -= 1
+            if marked.items[k] and knots.items[k + 1] > knots.items[k]: try knots.insert(k + 1, (knots.items[k] + knots.items[k + 1]) * 0.5)
+        if knots.count > 4096: error(invalid, "a blend along this curved edge could not be fitted within the tolerance")
+    let m = knots.count - p - 1
+    if net.count != m * rows: error(invalid, "a blend along this curved edge could not be fitted within the tolerance")
+    try weights.fill(m, 1.0)
+    return (i64)p
+
+## Samples per knot span when fitting a row of degree `p`.
+func samples_per_span(p: usize) -> usize:
+    return 2 * p + 2
+
+## One least-squares fit of each row (as fitted_rows) on `knots`, onto
+## `net` (row-major): the normal equations factored once, solved per row.
+func fit_once(b: const Cap*, side: const CapSide*, rows: usize, p: usize, knots: const f64[], net: Growing[Vector3]*) -> !:
+    let m = knots.length - p - 1
+    let unknowns = m - 4
+    let low = knots[p]
+    let high = knots[m]
+    net.clear()
+    try net.fill(m * rows, Vector3())
+    # The fixed ends: each row's end points and the next ones in, along
+    # its end tangents.
+    var at_low = Growing[Vector3]()
+    defer at_low.close()
+    var at_high = Growing[Vector3]()
+    defer at_high.close()
+    var turning_low = Growing[Vector3]()
+    defer turning_low.close()
+    var turning_high = Growing[Vector3]()
+    defer turning_high.close()
+    try rows_at(b, side, low, &at_low)
+    try rows_at(b, side, high, &at_high)
+    try rows_turning(b, side, low, &turning_low)
+    try rows_turning(b, side, high, &turning_high)
+    for r in 0..<rows:
+        net.items[r * m] = at_low.items[r]
+        net.items[r * m + 1] = at_low.items[r].add(turning_low.items[r].multiply_scalar((knots[p + 1] - low) / (f64)p))
+        net.items[r * m + m - 1] = at_high.items[r]
+        net.items[r * m + m - 2] = at_high.items[r].subtract(turning_high.items[r].multiply_scalar((high - knots[m - 1]) / (f64)p))
+    var exact = Growing[Vector3]()
+    defer exact.close()
+    var matrix = Growing[f64]()
+    defer matrix.close()
+    try matrix.fill(unknowns * unknowns, 0.0)
+    var rhs = Growing[f64]()
+    defer rhs.close()
+    try rhs.fill(unknowns * rows * 3, 0.0)
+    var values: f64[9]
+    let per = samples_per_span(p)
+    for span in p..<m:
+        let k0 = knots[span]
+        let k1 = knots[span + 1]
+        if k1 <= k0: continue
+        for j in 0..<per:
+            let t = k0 + (k1 - k0) * ((f64)j + 0.5) / (f64)per
+            let first = nurbs_basis(knots, (i64)m, (i64)p, t, &values)
+            for i in 0..<p + 1:
+                let row = first + i
+                if row < 2 or row >= m - 2: continue
+                for k in 0..<p + 1:
+                    let column = first + k
+                    if column < 2 or column >= m - 2: continue
+                    matrix.items[(row - 2) * unknowns + column - 2] += values[i] * values[k]
+            try rows_at(b, side, t, &exact)
+            for r in 0..<rows:
+                var target = exact.items[r]
+                for k in 0..<p + 1:
+                    let column = first + k
+                    if column < 2 or column >= m - 2: target = target.subtract(net.items[r * m + column].multiply_scalar(values[k]))
+                for i in 0..<p + 1:
+                    let row = first + i
+                    if row < 2 or row >= m - 2: continue
+                    let at = (r * unknowns + row - 2) * 3
+                    rhs.items[at] += values[i] * target.x
+                    rhs.items[at + 1] += values[i] * target.y
+                    rhs.items[at + 2] += values[i] * target.z
+    try cholesky_factor(matrix.items[..<unknowns * unknowns], unknowns)
+    var column = Growing[f64]()
+    defer column.close()
+    try column.fill(unknowns, 0.0)
+    for r in 0..<rows:
+        for axis in 0..<(usize)3:
+            for i in 0..<unknowns: column.items[i] = rhs.items[(r * unknowns + i) * 3 + axis]
+            cholesky_apply(matrix.items[..<unknowns * unknowns], column.items[..<unknowns], unknowns)
+            for i in 0..<unknowns:
+                let q = net.items[r * m + i + 2]
+                net.items[r * m + i + 2] = Vector3(column.items[i] if axis == 0 else q.x, column.items[i] if axis == 1 else q.y, column.items[i] if axis == 2 else q.z)
+
+## Marks onto `marked` (by knot index) the spans where a fitted row
+## strays from its exact place by more than the tolerance; whether any.
+func mark_strays(b: const Cap*, side: const CapSide*, rows: usize, p: usize, knots: const f64[], net: const Vector3[], marked: Growing[bool]*) -> bool!:
+    let m = knots.length - p - 1
+    let per = samples_per_span(p)
+    var values: f64[9]
+    var any = false
+    var exact = Growing[Vector3]()
+    defer exact.close()
+    for span in p..<m:
+        let k0 = knots[span]
+        let k1 = knots[span + 1]
+        if k1 <= k0: continue
+        for j in 0..<per + 1:
+            let t = k0 + (k1 - k0) * (f64)j / (f64)per
+            let first = nurbs_basis(knots, (i64)m, (i64)p, math.min(t, knots[m] - (k1 - k0) * 1e-12), &values)
+            try rows_at(b, side, t, &exact)
+            for r in 0..<rows:
+                var fitted = Vector3()
+                for k in 0..<p + 1: fitted = fitted.add(net[r * m + first + k].multiply_scalar(values[k]))
+                if fitted.subtract(exact.items[r]).length() > b.w.tolerance:
+                    marked.items[span] = true
+                    any = true
+    return any
+
+## Symmetric positive definite `matrix` (n x n) factored in place, L Lᵀ
+## (L in the lower triangle).
+func cholesky_factor(matrix: f64[], n: usize) -> !:
+    for j in 0..<n:
+        var d = matrix[j * n + j]
+        for k in 0..<j: d -= matrix[j * n + k] * matrix[j * n + k]
+        if d <= 0.0: error(invalid, "a blend's fit along its edge is singular")
+        let diagonal = math.sqrt(d)
+        matrix[j * n + j] = diagonal
+        for i in j + 1..<n:
+            var s = matrix[i * n + j]
+            for k in 0..<j: s -= matrix[i * n + k] * matrix[j * n + k]
+            matrix[i * n + j] = s / diagonal
+
+## `rhs` solved in place against a factored `matrix` (cholesky_factor).
+func cholesky_apply(matrix: const f64[], rhs: f64[], n: usize):
+    for i in 0..<n:
+        var s = rhs[i]
+        for k in 0..<i: s -= matrix[i * n + k] * rhs[k]
+        rhs[i] = s / matrix[i * n + i]
+    var i = n
+    while i > 0:
+        i -= 1
+        var s = rhs[i]
+        for k in i + 1..<n: s -= matrix[k * n + i] * rhs[k]
+        rhs[i] = s / matrix[i * n + i]
