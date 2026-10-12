@@ -1,0 +1,74 @@
+## Tube (surfacing Stage 6: Alias's Tubular Offset; §4.1 and §6.7 of
+## luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md): a circular
+## tube of a radius along a curve: a free curve, an edge, an isoparm, or a
+## curve on a face.
+##
+## Its sections are exact circles (rational quadratic, nine control
+## points) square to the curve, about a center on it moved by Alias's
+## Normal offset (along the face's normal for a curve on a face, else the
+## curve's rotation-minimizing frame's up; Flip turns a bump into a
+## groove) and Tangent offset (across, in the face). The circles' rows are
+## fitted along the curve by its length (along.lucb): a straight curve
+## gives a cylinder exactly, a circle a torus within the tolerance.
+
+## What the sections need: the curve (on 0..1) and its master (its face),
+## its arc table and natural frames, the radius and offsets.
+struct TubeWork:
+    var master: Master
+    var curve: Spline
+    var arc: ArcTable
+    var frames: Frames
+    var radius: f64
+    var tangent_offset: f64
+    var normal_offset: f64
+
+    func close():
+        self.master.close()
+        self.curve.close()
+        self.arc.close()
+        self.frames.close()
+
+## The tube's circle at fraction `s` of the curve's length.
+func tube_section(context: void*, s: f64, out: Growing[Weighted]*) -> !:
+    let w = (TubeWork*)context
+    let t = try arc_param(&w.curve, &w.arc, s)
+    var (x, tangent, up) = try frame_at(&w.curve, &w.frames, sweep_natural, Vector3(), &w.master, &w.curve, &w.frames, t)
+    if w.master.has_face:
+        # On a face: up its normal (the face's facing), square to the curve.
+        let uv = try w.master.chart_of(x)
+        let j = try surface_jet(w.master.surface(), uv, false, false)
+        var n = j.su.cross(j.sv)
+        if not w.master.w.faces.items[w.master.f].sense: n = n.multiply_scalar(-1.0)
+        up = n.subtract(tangent.multiply_scalar(n.dot(tangent))).normalized() catch failure: error(invalid, "Tube: the face's normal runs along the curve")
+    let side = tangent.cross(up)
+    let center = x.add(up.multiply_scalar(w.normal_offset)).add(side.multiply_scalar(w.tangent_offset))
+    let half = math.sqrt(0.5)
+    let xs: f64[9] = [1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0, 1.0, 1.0]
+    let ys: f64[9] = [0.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0]
+    out.clear()
+    for k in 0..<(usize)9:
+        let p = center.add(up.multiply_scalar(w.radius * xs[k])).add(side.multiply_scalar(w.radius * ys[k]))
+        try out.push(weighted(p, 1.0) if k % 2 == 0 else Weighted(p.x * half, p.y * half, p.z * half, half))
+
+## Tube's net along the curve `words` (a master's words): radius `radius`,
+## Normal offset `normal_offset` (negated with `flip`), Tangent offset
+## `tangent_offset`.
+func tube_net(set: interop.Reference[GeometrySet], words: str, radius: f64, tangent_offset: f64, normal_offset: f64, flip: bool) -> Net!:
+    if not (radius > 0.0): error(invalid, "Tube: the radius must be more than zero")
+    var master = try master_of(set, words, -1, Vector3())
+    errdefer master.close()
+    if master.curve.points.count == 0: error(invalid, "Tube: pick a curve, an edge or an isoparm")
+    var curve = try master.curve.copy()
+    errdefer curve.close()
+    unit_domain(&curve)
+    var arc = try arc_table(&curve)
+    errdefer arc.close()
+    let frames = try make_frames(&curve, Vector3())
+    var w = TubeWork(master, curve, arc, frames, radius, tangent_offset, -normal_offset if flip else normal_offset)
+    defer w.close()
+    var across = Growing[f64]()
+    defer across.close()
+    for k in [0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0]: try across.push(k)
+    let tolerance = math.max(1e-12, (size_of(&w.curve) + radius) * 1e-8)
+    var source = SectionSource((void*)&w, tube_section, tolerance)
+    return try along_net(&source, across.view(), 2, 9, (usize)math.max(2.0, (f64)span_count(&w.curve)))

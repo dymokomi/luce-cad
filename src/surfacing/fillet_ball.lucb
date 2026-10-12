@@ -1,0 +1,178 @@
+## Surface Fillet's ball (surface_fillet.lucb): where a ball of a radius
+## touches the two face sets in a plane, by Newton on the two contacts'
+## chart points (the two sets moved by the radius along their normals
+## agree there, on the plane), a contact moved onto another face of its
+## set when it leaves its own; Chordal's radius found by its chord.
+
+## The point and the unit normal toward the ball side of face `k` of
+## `set` at chart point `uv`.
+func ball_side(set: FilletSet*, k: usize, uv: Vector3) -> (Vector3, Vector3)!:
+    let master = &set.faces.items[k]
+    let j = try surface_jet(master.surface(), uv, false, false)
+    var n = j.su.cross(j.sv)
+    if not master.w.faces.items[master.f].sense: n = n.multiply_scalar(-1.0)
+    let unit_normal = n.normalized() catch failure: error(invalid, "Surface Fillet: a face has no normal there (a pole); pick other faces")
+    return (j.p, unit_normal.multiply_scalar(set.sign))
+
+## The residual of the ball with radius `r` at contacts `x` (u1 v1 u2 v2)
+## against the plane through `o` square to `d`: the two moved points'
+## difference and the first's height off the plane.
+func ball_residual(w: FilletWork*, s: const BallStation*, x: f64[4], r: f64, o: Vector3, d: Vector3, out: f64[4]*) -> !:
+    let (p1, m1) = try ball_side(&w.one, s.f1, Vector3(x[0], x[1], 0.0))
+    let (p2, m2) = try ball_side(&w.two, s.f2, Vector3(x[2], x[3], 0.0))
+    let c1 = p1.add(m1.multiply_scalar(r))
+    let c2 = p2.add(m2.multiply_scalar(r))
+    (*out)[0] = c1.x - c2.x
+    (*out)[1] = c1.y - c2.y
+    (*out)[2] = c1.z - c2.z
+    (*out)[3] = c1.subtract(o).dot(d)
+
+## ball_residual, false where a contact cannot be evaluated (off a spline's
+## domain).
+func residual_at(w: FilletWork*, s: const BallStation*, x: f64[4], r: f64, o: Vector3, d: Vector3, out: f64[4]*) -> bool:
+    ball_residual(w, s, x, r, o, d, out) catch failure:
+        return false
+    return true
+
+## A 4 by 4 system `a` (row major) solved for `b` in place (partial
+## pivoting); false when it is singular.
+func solve4(a: f64[16]*, b: f64[4]*) -> bool:
+    for col in 0..<(usize)4:
+        var pivot = col
+        for r in col + 1..<(usize)4:
+            if math.abs((*a)[r * 4 + col]) > math.abs((*a)[pivot * 4 + col]): pivot = r
+        if not (math.abs((*a)[pivot * 4 + col]) > 1e-300): return false
+        if pivot != col:
+            for k in 0..<(usize)4:
+                let t = (*a)[col * 4 + k]
+                (*a)[col * 4 + k] = (*a)[pivot * 4 + k]
+                (*a)[pivot * 4 + k] = t
+            let t = (*b)[col]
+            (*b)[col] = (*b)[pivot]
+            (*b)[pivot] = t
+        for r in col + 1..<(usize)4:
+            let f = (*a)[r * 4 + col] / (*a)[col * 4 + col]
+            for k in col..<(usize)4: (*a)[r * 4 + k] -= f * (*a)[col * 4 + k]
+            (*b)[r] -= f * (*b)[col]
+    var i: usize = 4
+    while i > 0:
+        i -= 1
+        var sum = (*b)[i]
+        for k in i + 1..<(usize)4: sum -= (*a)[i * 4 + k] * (*b)[k]
+        (*b)[i] = sum / (*a)[i * 4 + i]
+    return true
+
+func norm4(f: f64[4]) -> f64:
+    return math.sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2] + f[3] * f[3])
+
+## Newton on the ball of radius `r` in the plane through `o` square to `d`
+## from `s`'s contacts; `s` holds the answer. Whether it converged.
+func ball_newton(w: FilletWork*, s: BallStation*, r: f64, o: Vector3, d: Vector3) -> bool!:
+    var x: f64[4] = [s.uv1.x, s.uv1.y, s.uv2.x, s.uv2.y]
+    var f: f64[4] = [0.0, 0.0, 0.0, 0.0]
+    try ball_residual(w, s, x, r, o, d, &f)
+    var size_now = norm4(f)
+    let goal = w.size * 1e-13
+    for _ in 0..<40:
+        if size_now <= goal: break
+        var a: f64[16]
+        for k in 0..<(usize)4:
+            let h = 1e-7 * (1.0 + math.abs(x[k]))
+            var moved = x
+            moved[k] += h
+            var g: f64[4] = [0.0, 0.0, 0.0, 0.0]
+            try ball_residual(w, s, moved, r, o, d, &g)
+            for row in 0..<(usize)4: a[row * 4 + k] = (g[row] - f[row]) / h
+        var step: f64[4] = [-f[0], -f[1], -f[2], -f[3]]
+        if not solve4(&a, &step): return false
+        # Halved while it does not help.
+        var scale = 1.0
+        var taken = false
+        for _ in 0..<12:
+            var next: f64[4] = [x[0] + scale * step[0], x[1] + scale * step[1], x[2] + scale * step[2], x[3] + scale * step[3]]
+            var g: f64[4] = [0.0, 0.0, 0.0, 0.0]
+            if residual_at(w, s, next, r, o, d, &g) and norm4(g) < size_now:
+                x = next
+                f = g
+                size_now = norm4(g)
+                taken = true
+                break
+            scale *= 0.5
+        if not taken: break
+    if size_now > w.size * 1e-9: return false
+    s.uv1 = Vector3(x[0], x[1], 0.0)
+    s.uv2 = Vector3(x[2], x[3], 0.0)
+    let (p1, m1) = try ball_side(&w.one, s.f1, s.uv1)
+    s.center = p1.add(m1.multiply_scalar(r))
+    s.radius = r
+    return true
+
+## The face of `set` holding `p` (nearest within a millionth of the model),
+## and its chart point there; -1 when none does.
+func holding_face(w: FilletWork*, set: FilletSet*, p: Vector3) -> (i64, Vector3)!:
+    for k in 0..<set.faces.count:
+        let master = &set.faces.items[k]
+        let uv = master.chart_of(p) catch failure: continue
+        if not master.holds(uv): continue
+        let q = surface_point(*master.surface(), uv) catch failure: continue
+        if q.subtract(p).length() <= w.size * 1e-6: return ((i64)k, uv)
+    return (-1, Vector3())
+
+## Ball outcomes.
+let ball_found: i64 = 0
+let ball_outside: i64 = 1
+let ball_failed: i64 = 2
+
+## The ball in the plane through `o` square to `d`, from `s`'s contacts
+## (`s` holds the answer): the radius the options ask (Chordal: the one
+## whose contacts lie the chord apart), each contact moved onto another
+## face of its set where it leaves its own. With `bounded`, outside when a
+## contact leaves its set.
+func ball_at(w: FilletWork*, s: BallStation*, o: Vector3, d: Vector3, bounded: bool) -> i64!:
+    var r = s.radius if s.radius > 0.0 else w.opts.size
+    for _ in 0..<4:
+        var tries = 0
+        while true:
+            if not try ball_newton(w, s, r, o, d): return ball_failed
+            # A contact past its face: onto the set's face holding it.
+            let (p1, _) = try ball_side(&w.one, s.f1, s.uv1)
+            let (p2, _) = try ball_side(&w.two, s.f2, s.uv2)
+            let in1 = w.one.faces.items[s.f1].holds(s.uv1)
+            let in2 = w.two.faces.items[s.f2].holds(s.uv2)
+            if in1 and in2: break
+            var moved = false
+            if not in1:
+                let (k, uv) = try holding_face(w, &w.one, p1)
+                if k >= 0 and (usize)k != s.f1:
+                    s.f1 = (usize)k
+                    s.uv1 = uv
+                    moved = true
+            if not in2:
+                let (k, uv) = try holding_face(w, &w.two, p2)
+                if k >= 0 and (usize)k != s.f2:
+                    s.f2 = (usize)k
+                    s.uv2 = uv
+                    moved = true
+            tries += 1
+            if not moved or tries > 3:
+                if bounded: return ball_outside
+                break
+        if not w.opts.chordal: return ball_found
+        # Chordal: the radius scaled by the chord asked over the chord had.
+        let (q1, _) = try ball_side(&w.one, s.f1, s.uv1)
+        let (q2, _) = try ball_side(&w.two, s.f2, s.uv2)
+        let chord = q1.subtract(q2).length()
+        if not (chord > 0.0): return ball_failed
+        let next = r * w.opts.size / chord
+        if math.abs(next - r) <= w.size * 1e-13:
+            return ball_found
+        r = next
+        for _ in 0..<12:
+            if not try ball_newton(w, s, r, o, d): return ball_failed
+            let (a1, _) = try ball_side(&w.one, s.f1, s.uv1)
+            let (a2, _) = try ball_side(&w.two, s.f2, s.uv2)
+            let had = a1.subtract(a2).length()
+            let again = r * w.opts.size / had
+            if math.abs(again - r) <= w.size * 1e-13: break
+            r = again
+    return ball_found

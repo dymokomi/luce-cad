@@ -1,0 +1,148 @@
+## The sweeps' frames and arc lengths (sweep.lucb has the plan; Blend
+## Surface and Tube share them): rotation-minimizing frames by double
+## reflection, the frame modes, and a curve's arc length by its parameter.
+
+## The rail's frames, sampled finely: points, tangents and reference
+## directions (square to the tangent), transported by the mode.
+struct Frames:
+    var params: Growing[f64]
+    var points: Growing[Vector3]
+    var tangents: Growing[Vector3]
+    var ups: Growing[Vector3]
+
+    func close():
+        self.params.close()
+        self.points.close()
+        self.tangents.close()
+        self.ups.close()
+
+## A direction square to `t`.
+func square_to(t: Vector3) -> Vector3!:
+    let seed = Vector3(1.0, 0.0, 0.0) if math.abs(t.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+    return try seed.subtract(t.multiply_scalar(seed.dot(t))).normalized()
+
+## The frame of `frames` at `t` (point, tangent, up), one double
+## reflection on from the sample before it (natural), or the mode's.
+func frame_at(rail: const Spline*, frames: const Frames*, mode: i64, vector: Vector3, normals: Master*, spine: const Spline*, spine_frames: const Frames*, t: f64) -> (Vector3, Vector3, Vector3)!:
+    let j = try curve_jet(rail, t, 1, t >= rail.high())
+    let x = j.d[0]
+    if mode == sweep_spine:
+        # The spine's frame where its square plane passes x: x's foot.
+        let at = spline_nearest(spine, x)
+        let (_, along, up) = try frame_at(spine, spine_frames, sweep_natural, vector, normals, spine, spine_frames, at)
+        return (x, along, up)
+    let tangent = j.d[1].normalized() catch failure: error(invalid, "Rail: the rail stops (its tangent vanishes)")
+    if mode == sweep_vector:
+        let up = vector.subtract(tangent.multiply_scalar(vector.dot(tangent))).normalized() catch failure: error(invalid, "Rail: the vector runs along the rail")
+        return (x, tangent, up)
+    if mode == sweep_normal:
+        let probe = Probe(x, tangent, try square_to(tangent), empty_jet())
+        let goal = try normals.target(normals.nearest(x), &probe, 0.0)
+        let up = goal.n.subtract(tangent.multiply_scalar(goal.n.dot(tangent))).normalized() catch failure: error(invalid, "Profile: the face's normal runs along the rail")
+        return (x, tangent, up)
+    # The sample at or before t, then one reflection pair on.
+    let count = frames.params.count
+    var k = (usize)math.clamp(math.floor(t * (f64)(count - 1)), 0.0, (f64)(count - 1))
+    while k > 0 and frames.params.items[k] > t: k -= 1
+    return (x, tangent, reflected(frames.points.items[k], frames.tangents.items[k], frames.ups.items[k], x, tangent))
+
+## Double reflection: the up `r` at `x` with tangent `t` carried to `x1`
+## with tangent `t1`.
+func reflected(x: Vector3, t: Vector3, r: Vector3, x1: Vector3, t1: Vector3) -> Vector3:
+    let v1 = x1.subtract(x)
+    let c1 = v1.dot(v1)
+    if not (c1 > 1e-300): return r
+    let rl = r.subtract(v1.multiply_scalar(2.0 * v1.dot(r) / c1))
+    let tl = t.subtract(v1.multiply_scalar(2.0 * v1.dot(t) / c1))
+    let v2 = t1.subtract(tl)
+    let c2 = v2.dot(v2)
+    if not (c2 > 1e-300): return rl
+    return rl.subtract(v2.multiply_scalar(2.0 * v2.dot(rl) / c2))
+
+## The rail's natural frames at 2048 steps (the up starting square to its
+## start, or `start_up` when given).
+func make_frames(rail: const Spline*, start_up: Vector3) -> Frames!:
+    var f = Frames(Growing[f64](), Growing[Vector3](), Growing[Vector3](), Growing[Vector3]())
+    errdefer f.close()
+    let steps: usize = 2048
+    var before = try curve_jet(rail, rail.low(), 1, false)
+    var t0 = try before.d[1].normalized()
+    var up = start_up.subtract(t0.multiply_scalar(start_up.dot(t0))).normalized() catch failure: recover try square_to(t0)
+    for k in 0..<steps + 1:
+        let t = rail.low() + (rail.high() - rail.low()) * (f64)k / (f64)steps
+        let j = try curve_jet(rail, t, 1, k == steps)
+        let tangent = j.d[1].normalized() catch failure: error(invalid, "Rail: the rail stops (its tangent vanishes)")
+        if k > 0: up = reflected(before.d[0], t0, up, j.d[0], tangent)
+        try f.params.push(t)
+        try f.points.push(j.d[0])
+        try f.tangents.push(tangent)
+        try f.ups.push(up)
+        before = j
+        t0 = tangent
+    return f
+
+## A curve's arc length by its parameter: the length at 1024 equal steps
+## of its domain, each step by five-point Gauss-Legendre.
+struct ArcTable:
+    var lengths: Growing[f64]
+
+    func close():
+        self.lengths.close()
+
+    func total() -> f64:
+        return self.lengths.items[self.lengths.count - 1]
+
+## |c'| integrated from `a` to `b` (one Gauss-Legendre rule).
+func arc_piece(c: const Spline*, a: f64, b: f64) -> f64!:
+    let nodes: f64[5] = [0.0, -0.5384693101056831, 0.5384693101056831, -0.9061798459386640, 0.9061798459386640]
+    let weights: f64[5] = [0.5688888888888889, 0.4786286704993665, 0.4786286704993665, 0.2369268850561891, 0.2369268850561891]
+    var sum = 0.0
+    for k in 0..<(usize)5:
+        let t = (a + b) * 0.5 + (b - a) * 0.5 * nodes[k]
+        let j = try curve_jet(c, t, 1, false)
+        sum += weights[k] * j.d[1].length()
+    return sum * (b - a) * 0.5
+
+func arc_table(c: const Spline*) -> ArcTable!:
+    var table = ArcTable(Growing[f64]())
+    errdefer table.close()
+    let steps: usize = 1024
+    var run = 0.0
+    try table.lengths.push(0.0)
+    for k in 0..<steps:
+        let a = c.low() + (c.high() - c.low()) * (f64)k / (f64)steps
+        let b = c.low() + (c.high() - c.low()) * (f64)(k + 1) / (f64)steps
+        run += try arc_piece(c, a, b)
+        try table.lengths.push(run)
+    if not (run > 0.0): error(invalid, "Rail: the rail has no length")
+    return table
+
+## The parameter of `c` at fraction `s` of its length: from the table's
+## step, Newton on the length (smooth in s, so the sweep's sections are).
+func arc_param(c: const Spline*, table: const ArcTable*, s: f64) -> f64!:
+    let want = math.clamp(s, 0.0, 1.0) * table.total()
+    let steps = table.lengths.count - 1
+    var k: usize = 0
+    var high = steps
+    while k + 1 < high:
+        let middle = (k + high) // 2
+        if table.lengths.items[middle] <= want: k = middle
+        else: high = middle
+    let a = c.low() + (c.high() - c.low()) * (f64)k / (f64)steps
+    let b = c.low() + (c.high() - c.low()) * (f64)(k + 1) / (f64)steps
+    var t = a + (b - a) * (want - table.lengths.items[k]) / math.max(1e-300, table.lengths.items[k + 1] - table.lengths.items[k])
+    for _ in 0..<6:
+        let have = table.lengths.items[k] + try arc_piece(c, a, t)
+        let j = try curve_jet(c, t, 1, false)
+        let speed = j.d[1].length()
+        if not (speed > 0.0): break
+        t = math.clamp(t - (have - want) / speed, a, b)
+    return t
+
+## The fraction of `c`'s length at parameter `t`.
+func arc_fraction(c: const Spline*, table: const ArcTable*, t: f64) -> f64!:
+    let steps = table.lengths.count - 1
+    let f = math.clamp((t - c.low()) / (c.high() - c.low()), 0.0, 1.0)
+    let k = (usize)math.min((f64)(steps - 1), math.floor(f * (f64)steps))
+    let a = c.low() + (c.high() - c.low()) * (f64)k / (f64)steps
+    return (table.lengths.items[k] + try arc_piece(c, a, t)) / table.total()

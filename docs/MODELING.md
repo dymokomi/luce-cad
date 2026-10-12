@@ -1630,7 +1630,7 @@ leaves Align1 on it.
 Not yet: Alias's Accept/Restore checkpoints (each Align is a step or node; undo and the history
 serve); the Vector type at G3 (Alias offers it at G1 and G2).
 
-## Surfaces from curves (`surfacing/builders.lucb`, `square`, `skin`, `sweep`, `sheets`, `extend`)
+## Surfaces from curves (`surfacing/builders.lucb`, `square`, `square_fields`, `skin`, `sweep`, `sweep_frames`, `sheets`, `extend`, `extend_chain`)
 
 Stage 5 of the surfacing plan (luced-3d `docs/research/SURFACING-ALIAS-PLASTICITY.md` §4.6, §6.6):
 Alias's Square, Skin, Rail, Profile, Set Planar, the sheet Extrude and Revolve of free curves, and
@@ -1778,6 +1778,76 @@ Not yet: Skin's Flow Control and Modify Range, Rail's Colinear Options and Rebui
 builders' Explicit Control on Skin, Rail and Profile; Alias's Multi-Surface Draft and N-sided (Stage 7's
 fill). Align's Vector type stays at G1 and G2, as Alias's (its 2015 reference offers Vector at those
 orders only; G3 asks the Edge type).
+
+## Blends between surfaces (`surfacing/along.lucb`, `blend_surface`, `surface_fillet`, `fillet_ball`, `fillet_trims`, `tube`)
+
+Stage 6 of the surfacing plan (luced-3d `docs/research/SURFACING-ALIAS-PLASTICITY.md` §4.1, §5.3,
+§6.7): Alias's Freeform and Profile Blend, Surface Fillet (Parasolid's face-face blend) and Tubular
+Offset, as `CadSurfaceBlend`'s static calls, each returning the set with a new sheet (Surface Fillet's
+trims change the faces it rolls on).
+
+**Sections along a run** (`along.lucb`). A source gives the section at any fraction of the run, each the
+same count of homogeneous control points on the same knots across; their rows are fitted along at
+degree 5, the first and last sections exactly, on uniform spans doubled until the sections between lie
+within the tolerance. Homogeneous rows keep rational sections exact wherever they vary as a polynomial
+of degree 5 or less along the run.
+
+**Blend Surface** (`blend_surface.lucb`; Alias's Freeform Blend and Profile Blend, Plasticity's Bridge
+Surface, Rhino's BlendSrf). Two sides, each a chain of Align's master words (edges, isoparms, curves on
+faces, free curves; a chain's apart by `+`, joined end to end), matched by the fraction of their length
+(Flow Control Connect ends; Free: each station on side 2 where the plane square to side 1 cuts it),
+within each side's range (Modify Range). At a station the section is a degree 5 B-spline across, as many
+control points as the two sides hold (six at least; eight, three spans, at G3 both sides), its end rows
+the curve continuing each side's surface across it by arc length (§6.1's rows: A' = vT, A'' = v²K,
+A''' = v³K', the cross curve's unit tangent, curvature vector and its rate; an edge's face continued
+past the edge, a curve on a face or an isoparm's face toward the other side), v the side's Shape times
+the chord; the loose middle and the orders a side does not ask follow the ends' cubic Hermite (a line
+between G0 sides) bowed by Proportional Crown along the normal of the chord and side 1. A profile
+curve (Profile Blend) is passed at its station: the section there fitted to it with the same end rows,
+the difference from the free section carried along by a cubic between profiles (constant past the
+ends), so the end rows stay exact; a section has two more control points when profiles shape it. A
+free curve's side is G0 only (refused above, as Alias's).
+
+**Surface Fillet** (`surface_fillet.lucb`). A rolling ball between two face sets (face masters), each
+rolling on its side toward the other set (summed over samples) or flipped. The ball at a station: the
+two contacts' chart points by Newton on the two sets moved by the radius along their normals agreeing,
+in the station's plane (four equations, four unknowns, a finite-difference Jacobian, halved steps);
+a contact leaving its face for another of its set carries on there. The seed is the best of the first
+set's samples moved onto the second; the spine is marched both ways along the normals' cross until a
+contact leaves its set, the end found by bisection to a hundred-billionth of the model; the centers are
+interpolated by a cubic by chord length, and sections are cut square to it. Sections: G0 Chamfer (the
+chord), G1 Circular (the ball's arc, rational quadratic), G2 and G3 Curvature (`fillet_section`, the edge
+fillets' quintic sections on the same contacts and corner, bent by each face's normal curvature toward
+it; G3's rate of curvature is matched on flat and round faces), their arms by the Form Factor (0.1 to
+2). Chordal: each station's radius scaled until the contacts lie the chord apart. Trim Automatic: each
+face's contacts as a cubic cast onto it along its normals (Trim's 3D Trimming, loose ends extended),
+the part off the far side of the other set's contact kept; Curves on surface: the contacts cast onto
+the faces as curves on them (Project along the normals); Off.
+
+`CadMeasure.check` takes `faces` (names apart by `;`) to measure only the edges of those faces: the
+builders' and blends' Continuity Check of a new sheet against its neighbors, without the neighbors' own
+edges.
+
+**Tube** (`tube.lucb`; Alias's Tubular Offset). Exact circles (nine rational control points) square to a
+curve, about a center moved by Normal offset (along the face's normal for a curve on a face or an
+edge's face, else the curve's rotation-minimizing frame's up; Flip negates it) and Tangent offset,
+fitted along the curve by its length.
+
+Tests (`tests/regressions/blend_build_tests.luc`), against closed forms and the Check tools: a G1 Surface
+Fillet between perpendicular 4 by 4 planes is the cylinder of radius 1 about x = z = 1 to 1e-12, from y = 0
+to 4 within 1e-9; trimmed (Automatic) each plane keeps 12 of 16 and the contacts measure G1, G2 and G3
+as the section asks; Chordal 1 puts the contacts 1 apart, 1/√2 from the edge; a ball between a floor
+and a cylinder 1.5 above it keeps every section point a radius off its center (to 1e-9) with its
+contacts on the floor and the cylinder; Curves on surface leaves two curves on faces. Blend Surface
+between two cylinders' edges measures exactly G0, G1, G2 and G3 at both edges as asked (G3: degree 5,
+eight rows across, three spans); Crown 0.1 lifts a G0 blend's middle 0.5, a tenth of its chord of 5; a
+profile curve lies on the Profile Blend within 1e-5. Tube along a line is the cylinder to
+1e-12, along a circle the torus within 1e-7; Normal offset moves the axis, Flip the other way.
+
+Not yet (Stage 8 and later): Alias's Bias and Lead sections, one-sided Curvature, variable radius and
+chord along the fillet, Flow Control Edge align, Interior Edge Align, Explicit Control on the blends;
+G3 Curvature's rate on faces whose curvature changes; Tube's variable radius and its trims; Round,
+Ball Corner, Corner Blend, Bridge Fillet; conic sections.
 
 ## Sketches (`sketch/`)
 

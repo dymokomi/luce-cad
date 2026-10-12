@@ -1,0 +1,408 @@
+## Surface Fillet (surfacing Stage 6: Alias's Surface Fillet between two
+## sets of surfaces, Parasolid's face-face blend, Rhino's FilletSrf; §4.1,
+## §5.3 and §6.7 of luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md):
+## a rolling ball between two face sets that need not touch.
+##
+## Each set rolls the ball on one side of its faces (the side toward the
+## other set, or flipped: Alias's arrows). The ball's center is where the
+## two sets moved by the radius along their normals meet, the spine; at a
+## station a plane cuts the spine, and the ball there touches each set at
+## a contact: four unknowns (each contact's chart point) and four
+## equations (the two moved points agree, and lie on the plane), solved by
+## Newton. The spine is marched from a seed (the best of a sampling of the
+## first set moved onto the second) both ways, a step at a time along the
+## two normals' cross, until a contact leaves its set (the end found by
+## bisection to a ten-billionth of the model); a contact leaving one face
+## of a set for another of it carries on there. The marched centers are
+## interpolated by a cubic (by chord length), and the sections cut square
+## to that spine anywhere along it.
+##
+## Sections (Alias's Section Type): G0 Chamfer (the chord between the
+## contacts), G1 Circular (the ball's own arc, rational quadratic: a
+## fillet between planes is exactly a cylinder), G2 and G3 Curvature
+## (fillet_section's degree 5 sections of the edge fillets on the same
+## contacts: G2 matching each face's normal curvature across, G3 also its
+## rate on flat and round faces), their arms by the Form Factor. Chordal
+## (Alias's Chord, Parasolid's constant width): the ball's radius at each
+## station is the one whose contacts lie the chord apart. The sections'
+## rows are fitted along the spine (along.lucb), exact where they vary as
+## a polynomial (between planes: linearly).
+##
+## Trim (Alias's Trim Type): Automatic trims each face the ball rolls on
+## back to its contact curve (the part under the fillet, toward the other
+## set, discarded: Trim's machinery, the contact curve cast onto the face
+## along its normals); Curves on surface leaves the contact curves on the
+## faces; Off leaves the faces as they are.
+
+pub let fillet_chamfer: i64 = 0
+pub let fillet_circular: i64 = 1
+pub let fillet_g2: i64 = 2
+pub let fillet_g3: i64 = 3
+
+pub let fillet_trim_automatic: i64 = 0
+pub let fillet_trim_curves: i64 = 1
+pub let fillet_trim_off: i64 = 2
+
+## Surface Fillet's options: the section type, the radius (or the chord
+## with `chordal`), each set flipped, the trim, and the Form Factor (0.1 to
+## 2, G2 and G3's arms).
+pub struct FilletOptions:
+    pub var section: i64
+    pub var size: f64
+    pub var chordal: bool
+    pub var flips: bool[2]
+    pub var trim: i64
+    pub var form: f64
+
+## A face set: each face as a face master (its shape, chart and loops) and
+## the side the ball rolls on (+1 along the faces' normals, -1 against).
+struct FilletSet:
+    var faces: Growing[Master]
+    var sign: f64
+
+    func close():
+        close_masters(&self.faces)
+
+## A station: where along the spine (a fraction, once the spine is made),
+## the ball's center and radius, and each contact's face and chart point.
+struct BallStation:
+    var tau: f64
+    var center: Vector3
+    var radius: f64
+    var f1: usize
+    var uv1: Vector3
+    var f2: usize
+    var uv2: Vector3
+
+## What a fillet's sections need.
+struct FilletWork:
+    var one: FilletSet
+    var two: FilletSet
+    var opts: FilletOptions
+    var size: f64
+    var stations: Growing[BallStation]
+    var spine: Spline
+
+    func close():
+        self.one.close()
+        self.two.close()
+        self.stations.close()
+        self.spine.close()
+
+## The direction the spine runs at station `s` (the two normals' cross,
+## turned along `before`).
+func spine_way(w: FilletWork*, s: const BallStation*, before: Vector3) -> Vector3!:
+    let (_, m1) = try ball_side(&w.one, s.f1, s.uv1)
+    let (_, m2) = try ball_side(&w.two, s.f2, s.uv2)
+    let t = m1.cross(m2).normalized() catch failure: error(invalid, "Surface Fillet: the two sets run parallel there; the ball touches them nowhere apart")
+    return t.multiply_scalar(-1.0) if t.dot(before) < 0.0 else t
+
+## Each face's chart box, sampled `count` by `count`: chart points the
+## face holds, onto `out` (with the face's index into `faces`).
+func face_samples(set: FilletSet*, count: usize, out: Growing[Vector3]*, faces: Growing[usize]*) -> !:
+    for k in 0..<set.faces.count:
+        let master = &set.faces.items[k]
+        var low = Vector3(1.0e300, 1.0e300, 0.0)
+        var high = Vector3(-1.0e300, -1.0e300, 0.0)
+        for q in master.chart.view():
+            low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), 0.0)
+            high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), 0.0)
+        for i in 0..<count:
+            for j in 0..<count:
+                let uv = Vector3(low.x + (high.x - low.x) * ((f64)i + 0.5) / (f64)count, low.y + (high.y - low.y) * ((f64)j + 0.5) / (f64)count, 0.0)
+                if not master.holds(uv): continue
+                try out.push(uv)
+                try faces.push(k)
+
+## The set's faces' points at their samples' middle (for the sides).
+func set_middle(set: FilletSet*) -> Vector3!:
+    var uvs = Growing[Vector3]()
+    defer uvs.close()
+    var faces = Growing[usize]()
+    defer faces.close()
+    try face_samples(set, 5, &uvs, &faces)
+    if uvs.count == 0: error(invalid, "Surface Fillet: a set's faces have no area")
+    var sum = Vector3()
+    for k in 0..<uvs.count: sum = sum.add(try surface_point(*set.faces.items[faces.items[k]].surface(), uvs.items[k]))
+    return sum.multiply_scalar(1.0 / (f64)uvs.count)
+
+## Each set's side: toward the other set's middle (summed over its own
+## samples), then flipped as asked.
+func choose_sides(w: FilletWork*) -> !:
+    for which in 0..<(usize)2:
+        let set = &w.one if which == 0 else &w.two
+        let other = try set_middle(&w.two if which == 0 else &w.one)
+        var uvs = Growing[Vector3]()
+        defer uvs.close()
+        var faces = Growing[usize]()
+        defer faces.close()
+        try face_samples(set, 5, &uvs, &faces)
+        set.sign = 1.0
+        var lean = 0.0
+        for k in 0..<uvs.count:
+            let (p, m) = try ball_side(set, faces.items[k], uvs.items[k])
+            lean += m.dot(other.subtract(p))
+        set.sign = -1.0 if lean < 0.0 else 1.0
+        if w.opts.flips[which]: set.sign = -set.sign
+
+## The seed: the first set's samples moved by the radius, each onto the
+## second set; the one landing a radius off it on its ball side, solved.
+func seed_station(w: FilletWork*) -> BallStation!:
+    var uvs = Growing[Vector3]()
+    defer uvs.close()
+    var faces = Growing[usize]()
+    defer faces.close()
+    try face_samples(&w.one, 12, &uvs, &faces)
+    let r = w.opts.size
+    var best = 1.0e300
+    var found = BallStation(0.0, Vector3(), 0.0, 0, Vector3(), 0, Vector3())
+    for k in 0..<uvs.count:
+        let (p1, m1) = try ball_side(&w.one, faces.items[k], uvs.items[k])
+        let c = p1.add(m1.multiply_scalar(r))
+        for l in 0..<w.two.faces.count:
+            let master = &w.two.faces.items[l]
+            let uv2 = master.chart_of(c) catch failure: continue
+            if not master.holds(uv2): continue
+            let (p2, m2) = try ball_side(&w.two, l, uv2)
+            let away = c.subtract(p2)
+            if away.dot(m2) <= 0.0: continue
+            let score = math.abs(away.length() - r)
+            if score < best:
+                best = score
+                found = BallStation(0.0, c, r, faces.items[k], uvs.items[k], l, uv2)
+    if not (best < 1.0e300): error(invalid, "Surface Fillet: the ball touches the two sets nowhere: pick sets that face each other, flip a side, or change the radius")
+    # Solved in the plane square to the spine there.
+    let way = try spine_way(w, &found, Vector3(1.0, 0.0, 0.0))
+    var solved = found
+    if try ball_at(w, &solved, found.center, way, true) != ball_found: error(invalid, "Surface Fillet: the ball could not be placed between the two sets: change the radius or flip a side")
+    return solved
+
+## The stations marched from `start` along `way` (+1 or -1 times the
+## spine's own direction there) onto `out`, up to where a contact leaves its
+## set.
+func march(w: FilletWork*, start: BallStation, way: f64, out: Growing[BallStation]*) -> !:
+    var current = start
+    var before = (try spine_way(w, &current, Vector3(1.0, 0.0, 0.0))).multiply_scalar(way)
+    let longest = math.max(w.opts.size * 0.5, w.size * 1e-4)
+    var h = longest
+    var count = 0
+    while count < 4000:
+        count += 1
+        let t = try spine_way(w, &current, before)
+        var trial = current
+        let result = try ball_at(w, &trial, current.center.add(t.multiply_scalar(h)), t, true)
+        if result == ball_found:
+            try out.push(trial)
+            current = trial
+            before = t
+            h = math.min(h * 1.5, longest)
+            continue
+        if result == ball_failed:
+            h *= 0.5
+            if h < w.size * 1e-9: return
+            continue
+        # A contact leaves its set within this step: the last station
+        # inside it found by bisection.
+        var low = 0.0
+        var high = h
+        var last = current
+        var have = false
+        while high - low > w.size * 1e-11:
+            let middle = (low + high) * 0.5
+            var probe = current
+            let r = try ball_at(w, &probe, current.center.add(t.multiply_scalar(middle)), t, true)
+            if r == ball_found:
+                low = middle
+                last = probe
+                have = true
+            else: high = middle
+        if have: try out.push(last)
+        return
+    error(invalid, "Surface Fillet: the spine runs on without end (the sets meet the ball all round?)")
+
+## The spine: a cubic through the stations' centers by chord length, each
+## station's fraction along it set.
+func make_spine(w: FilletWork*) -> !:
+    let n = w.stations.count
+    if n < 2: error(invalid, "Surface Fillet: the ball rolls nowhere along the sets")
+    var run = 0.0
+    var params = Growing[f64]()
+    defer params.close()
+    try params.push(0.0)
+    for k in 1..<n:
+        run += w.stations.items[k].center.subtract(w.stations.items[k - 1].center).length()
+        try params.push(run)
+    if not (run > 0.0): error(invalid, "Surface Fillet: the ball rolls nowhere along the sets")
+    for k in 0..<n:
+        params.items[k] = params.items[k] / run
+        w.stations.items[k].tau = params.items[k]
+    let degree = fewer(3, n - 1)
+    var knots = Growing[f64]()
+    defer knots.close()
+    var matrix = Growing[f64]()
+    defer matrix.close()
+    try collocation(params.view(), degree, &knots, &matrix)
+    var values = Growing[Weighted]()
+    defer values.close()
+    for s in w.stations.view(): try values.push(weighted(s.center, 1.0))
+    var points = Growing[Weighted]()
+    defer points.close()
+    try interpolate_points(matrix.view(), values.view(), &points)
+    var spine = empty_spline((i64)degree)
+    errdefer spine.close()
+    try spine.knots.assign(knots.view())
+    try spine.points.assign(points.view())
+    w.spine.close()
+    w.spine = spine
+
+## The ball at fraction `s` of the spine: in the plane square to it there,
+## from the nearest station's contacts.
+func ball_along(w: FilletWork*, s: f64) -> BallStation!:
+    let j = try curve_jet(&w.spine, s, 1, s >= 1.0)
+    var nearest: usize = 0
+    for k in 0..<w.stations.count:
+        if math.abs(w.stations.items[k].tau - s) < math.abs(w.stations.items[nearest].tau - s): nearest = k
+    var station = w.stations.items[nearest]
+    let d = j.d[1].normalized() catch failure: error(invalid, "Surface Fillet: the spine stops")
+    if try ball_at(w, &station, j.d[0], d, false) != ball_found: error(invalid, "Surface Fillet: the ball could not be placed along the spine; change the radius")
+    return station
+
+## The normal curvature times the normal of face `k` of `set` at `uv`
+## along unit direction `e` (G2 and G3 sections' bends).
+func bend_of(set: FilletSet*, k: usize, uv: Vector3, e: Vector3) -> Vector3!:
+    let master = &set.faces.items[k]
+    let j = try surface_jet(master.surface(), uv, false, false)
+    var n = j.su.cross(j.sv)
+    if not master.w.faces.items[master.f].sense: n = n.multiply_scalar(-1.0)
+    let unit_normal = n.normalized() catch failure: return Vector3()
+    let a = chart_direction(j.su, j.sv, e)
+    let second = j.suu.multiply_scalar(a.x * a.x).add(j.suv.multiply_scalar(2.0 * a.x * a.y)).add(j.svv.multiply_scalar(a.y * a.y))
+    return unit_normal.multiply_scalar(second.dot(unit_normal))
+
+## The section of the ball `b`: its control points (homogeneous) onto
+## `out`, by the section type.
+func fillet_cross(w: FilletWork*, b: const BallStation*, out: Growing[Weighted]*) -> !:
+    let (p1, _) = try ball_side(&w.one, b.f1, b.uv1)
+    let (p2, _) = try ball_side(&w.two, b.f2, b.uv2)
+    out.clear()
+    if w.opts.section == fillet_chamfer:
+        try out.push(weighted(p1, 1.0))
+        try out.push(weighted(p2, 1.0))
+        return
+    let c = b.center
+    let u1 = p1.subtract(c)
+    let u2 = p2.subtract(c)
+    let r = b.radius
+    let cosine = math.clamp(u1.dot(u2) / math.max(1e-300, u1.length() * u2.length()), -1.0, 1.0)
+    let theta = math.acos(cosine)
+    if not (theta < math.pi - 1e-9): error(invalid, "Surface Fillet: the ball wraps half round or more (the sets turn back on each other); flip a side")
+    let half = math.cos(theta * 0.5)
+    let bisector = u1.add(u2).normalized() catch failure: error(invalid, "Surface Fillet: the contacts are opposite each other on the ball")
+    let corner = c.add(bisector.multiply_scalar(r / half))
+    if w.opts.section == fillet_circular:
+        try out.push(weighted(p1, 1.0))
+        try out.push(Weighted(corner.x * half, corner.y * half, corner.z * half, half))
+        try out.push(weighted(p2, 1.0))
+        return
+    # G2 and G3: the edge fillets' sections on the same contacts and
+    # corner, bent by each face's normal curvature toward the corner.
+    let e1 = corner.subtract(p1).normalized() catch failure: error(invalid, "Surface Fillet: a contact is the corner")
+    let e2 = corner.subtract(p2).normalized() catch failure: error(invalid, "Surface Fillet: a contact is the corner")
+    let bend1 = try bend_of(&w.one, b.f1, b.uv1, e1)
+    let bend2 = try bend_of(&w.two, b.f2, b.uv2, e2)
+    var points = Growing[Vector3]()
+    defer points.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    try fillet_section(p1, p2, corner, w.opts.section, &points, &knots, w.opts.form, bend1, bend2)
+    for q in points.view(): try out.push(weighted(q, 1.0))
+
+## The section source's call: the section at fraction `s` of the spine.
+func fillet_section_at(context: void*, s: f64, out: Growing[Weighted]*) -> !:
+    let w = (FilletWork*)context
+    let b = try ball_along(w, s)
+    try fillet_cross(w, &b, out)
+
+## The knots across a section of the type: chamfer degree 1, circular
+## degree 2 (one Bezier each), G2 and G3 fillet_section's.
+func cross_knots(section: i64, out: Growing[f64]*) -> i64!:
+    out.clear()
+    if section == fillet_chamfer or section == fillet_circular:
+        let degree = (usize)section + 1
+        for _ in 0..<degree + 1: try out.push(0.0)
+        for _ in 0..<degree + 1: try out.push(1.0)
+        return (i64)degree
+    var points = Growing[Vector3]()
+    defer points.close()
+    try fillet_section(Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, 0.0), section, &points, out)
+    return 5
+
+## A face set from `words` (face names apart by `;`).
+func fillet_set(set: interop.Reference[GeometrySet], words: str) -> FilletSet!:
+    var faces = Growing[Master]()
+    errdefer close_masters(&faces)
+    let bytes = words.bytes
+    var start: usize = 0
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 59: continue
+        let name = (str)bytes[start..<at]
+        start = at + 1
+        if name.length == 0: continue
+        var buffer: u8[300]
+        try faces.push(try master_of(set, try strings.format(buffer, f"face {name}"), -1, Vector3()))
+    if faces.count == 0: error(invalid, "Surface Fillet: pick the faces of both sets")
+    return FilletSet(faces, 1.0)
+
+## What Surface Fillet made: the sheet's net and the contacts (each
+## station's points and faces) for the trims.
+struct FilletMade:
+    var net: Net
+    var contacts: Growing[BallStation]
+
+    func close():
+        self.net.close()
+        self.contacts.close()
+
+## Surface Fillet's net between face sets `first` and `second`.
+func fillet_net(set: interop.Reference[GeometrySet], first: str, second: str, opts: const FilletOptions*, sets: FilletSet[2]*) -> FilletMade!:
+    if not (opts.size > 0.0): error(invalid, "Surface Fillet: the radius (or chord) must be more than zero")
+    if opts.section < fillet_chamfer or opts.section > fillet_g3: error(invalid, "Surface Fillet: the section is G0 Chamfer, G1 Circular, G2 or G3 Curvature")
+    if not (opts.form >= 0.1 and opts.form <= 2.0): error(invalid, "Surface Fillet: the Form Factor is 0.1 to 2")
+    var one = try fillet_set(set, first)
+    var two = fillet_set(set, second) catch failure:
+        one.close()
+        error(failure.code, failure.message)
+    var w = FilletWork(one, two, *opts, 1.0, Growing[BallStation](), empty_spline(1))
+    defer w.close()
+    # The model's size from the sets' samples (the tolerances' scale).
+    let a = try set_middle(&w.one)
+    let b = try set_middle(&w.two)
+    w.size = math.max(a.subtract(b).length() + opts.size, opts.size)
+    try choose_sides(&w)
+    let seed = try seed_station(&w)
+    var behind = Growing[BallStation]()
+    defer behind.close()
+    try march(&w, seed, -1.0, &behind)
+    var k = behind.count
+    while k > 0:
+        k -= 1
+        try w.stations.push(behind.items[k])
+    try w.stations.push(seed)
+    try march(&w, seed, 1.0, &w.stations)
+    try make_spine(&w)
+    var across = Growing[f64]()
+    defer across.close()
+    let degree = try cross_knots(opts.section, &across)
+    let size = across.count - (usize)degree - 1
+    var source = SectionSource((void*)&w, fillet_section_at, w.size * 1e-8)
+    var net = try along_net(&source, across.view(), degree, size, 1)
+    errdefer net.close()
+    var contacts = Growing[BallStation]()
+    errdefer contacts.close()
+    try contacts.assign(w.stations.view())
+    # The sets live on for the trims.
+    (*sets)[0] = w.one
+    (*sets)[1] = w.two
+    w.one = FilletSet(Growing[Master](), 1.0)
+    w.two = FilletSet(Growing[Master](), 1.0)
+    return FilletMade(net, contacts)

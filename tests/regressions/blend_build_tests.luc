@@ -1,0 +1,268 @@
+## Blends between surfaces (surfacing Stage 6, luce_cad.surfacing's
+## CadSurfaceBlend) against closed forms, measured by the Check tools
+## (CadMeasure.check across the edges once stitched): a Surface Fillet
+## between two perpendicular planes is the edge fillet: G1 exactly the
+## cylinder of its radius, along the planes' whole length, the planes
+## trimmed back to its contacts (Automatic) and G1 there, G2 and G3
+## sections measuring G2 and G3; Chordal sets the chord between the
+## contacts; between a plane and a cylinder that do not touch the ball's
+## center keeps the radius off both; Curves on surface leaves the contacts
+## on the faces. Blend Surface between two cylinders' edges measures G0 to
+## G3 at both edges as asked (G3 three quintic spans across), Crown lifts
+## a G0 blend, a profile curve lies on a Profile Blend; Tube along a line
+## is a cylinder exactly and along a circle a torus.
+from luce_cad.surfacing import CadSurfacing, CadSurfaceBlend
+from luce_cad.cad_geometry import CadGeometry
+from luce_cad.cad_curves import CadCurves
+from luce_cad.curves import CadCurveTools
+from luce_cad.measure import CadMeasure
+from luce_cad.model import CadModel
+from luce_cad.nurbs import CadSpline, CadNurbs
+from luce_geocore.geocore import Vector3, GeometrySet
+from luce_std import math
+
+pub func blend_build_tests() -> unit!:
+    fillet_planes()
+    fillet_apart()
+    blend_cylinders()
+    blend_profiles()
+    tubes()
+    print("PASS blend build: Surface Fillet between perpendicular planes is the cylinder exactly, the planes trimmed to it and G1, G2 and G3 as asked, Chordal's chord, a ball between a plane and a cylinder apart, contacts as curves on the faces; Blend Surface between cylinders G0 to G3 at both edges (G3 three quintic spans), Crown, a profile on the blend; Tube a cylinder and a torus")
+
+# -- Shapes.
+
+## A flat patch (degree 1) through four corners, `a` to `b` along u and `a`
+## to `d` along v.
+func flat(a: Vector3, b: Vector3, d: Vector3, name: str) -> CadModel!:
+    let c = b.add(d).subtract(a)
+    return CadSurfacing.patch([a, d, b, c], [1.0, 1.0, 1.0, 1.0], 2, 2, 1, 1, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], name)
+
+## A quarter cylinder sheet of radius `r` about the line through `c` along
+## Z (4 long), from angle `a0` round a quarter.
+func quarter(c: Vector3, r: float, a0: float, name: str) -> GeometrySet!:
+    let w = math.sqrt(0.5)
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    let angles = [a0, a0 + math.pi / 4.0, a0 + math.pi / 2.0]
+    for k in 0..<3:
+        let reach = r if k != 1 else r / w
+        let p = c.add(Vector3(reach * math.cos(angles[k]), reach * math.sin(angles[k]), 0.0))
+        points.append(p)
+        points.append(p.add(Vector3(0.0, 0.0, 4.0)))
+        weights.append(1.0 if k != 1 else w)
+        weights.append(1.0 if k != 1 else w)
+    return CadGeometry.of_model(CadSurfacing.patch(points, weights, 3, 2, 2, 1, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], name))
+
+## A circle of radius `r` about `center` in the plane of unit `a` and `b`.
+func ring(center: Vector3, a: Vector3, b: Vector3, r: float) -> CadSpline!:
+    let w = math.sqrt(0.5)
+    let xs = [1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0, 1.0, 1.0]
+    let ys = [0.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0]
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    for k in 0..<9:
+        points.append(center.add(a.multiply_scalar(r * xs[k])).add(b.multiply_scalar(r * ys[k])))
+        weights.append(1.0 if k % 2 == 0 else w)
+    return CadSpline.make(points, weights, 2, [0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0])
+
+## The face named `name` among `data`'s bodies, and its surface.
+func sheet_named(data: GeometrySet, name: str) -> (CadModel, int)!:
+    for index in 0..<CadGeometry.model_count(data):
+        let model = CadGeometry.model(data, index)
+        for f in 0..<model.face_count():
+            if model.face_name(f) == name:
+                return (model, CadNurbs.surface_of_face(model, name))
+    trap(f"no face {name}")
+
+## The levels of the shared edges once `data`'s bodies are stitched.
+func levels(data: GeometrySet) -> list[int]!:
+    let sewn = CadSurfacing.stitched(data, [], 0.0001)
+    let model = CadGeometry.model(sewn.geometry(), 0)
+    let check = CadMeasure.check(model, "", 3, 16, 0.0001, 0.1, 0.5, 1.0, false, 8, false, 1.0, true)
+    let found: list[int] = []
+    for e in 0..<check.edge_count():
+        found.append(check.edge(e).level)
+    return found
+
+## The area of face `name` of `data` from its mesh.
+func area_of(data: GeometrySet, name: str) -> float!:
+    var total = 0.0
+    for index in 0..<CadGeometry.model_count(data):
+        let model = CadGeometry.model(data, index)
+        let mesh = model.tessellate(64)
+        let owners = mesh.find_attribute("cad_face", 2)
+        for face in 0..<mesh.face_count():
+            if model.face_name(int(mesh.attribute_value(owners, face))) != name:
+                continue
+            let a = mesh.point(mesh.face_point(face, 0))
+            for k in 1..<mesh.face_size(face) - 1:
+                let b = mesh.point(mesh.face_point(face, k))
+                let c = mesh.point(mesh.face_point(face, k + 1))
+                total += b.subtract(a).cross(c.subtract(a)).length() * 0.5
+    return total
+
+# -- Surface Fillet.
+
+func fillet_planes() -> unit!:
+    # A floor (z = 0) and a wall (x = 0), both 4 by 4, meeting along Y.
+    var data = CadGeometry.of_model(flat(Vector3(0.0, 0.0, 0.0), Vector3(4.0, 0.0, 0.0), Vector3(0.0, 4.0, 0.0), "floor"))
+    data = data.merged(CadGeometry.of_model(flat(Vector3(0.0, 0.0, 0.0), Vector3(0.0, 0.0, 4.0), Vector3(0.0, 4.0, 0.0), "wall")))
+    # G1, untrimmed: exactly the cylinder of radius 1 about x = z = 1, the
+    # quarter between the contacts, the planes' whole length.
+    let circular = CadSurfaceBlend.fillet(data, "floor", "wall", 1.0, trim = 2)
+    let (sheet, s) = sheet_named(circular.geometry(), "Fillet")
+    var off = 0.0
+    var low = 1.0e300
+    var high = -1.0e300
+    for i in 0..<11:
+        for j in 0..<11:
+            let p = CadNurbs.point_at(sheet, s, float(i) / 10.0, float(j) / 10.0)
+            off = math.max(off, math.abs(math.hypot(p.x - 1.0, p.z - 1.0) - 1.0))
+            assert(p.x <= 1.0 + 1e-12 and p.z <= 1.0 + 1e-12, f"the fillet leaves the quarter at {p}")
+            low = math.min(low, p.y)
+            high = math.max(high, p.y)
+    assert(off < 1e-12, f"the G1 fillet between perpendicular planes is {off} off the cylinder")
+    assert(math.abs(low) < 1e-9 and math.abs(high - 4.0) < 1e-9, f"the fillet runs {low} to {high}")
+    # Trimmed (Automatic): each plane loses the strip under the fillet (12
+    # left of 16), and every contact measures G1, G2, G3 as the section asks.
+    for section in 1..<4:
+        let made = CadSurfaceBlend.fillet(data, "floor", "wall", 1.0, section = section)
+        assert(math.abs(area_of(made.geometry(), "floor") - 12.0) < 1e-3, f"the trimmed floor's area {area_of(made.geometry(), "floor")}")
+        assert(math.abs(area_of(made.geometry(), "wall") - 12.0) < 1e-3, f"the trimmed wall's area {area_of(made.geometry(), "wall")}")
+        let found = levels(made.geometry())
+        var contacts = 0
+        for level in found:
+            if level >= section:
+                contacts += 1
+        assert(contacts >= 2, f"section {section} measures {found}")
+        # Checked with the fillet named, only its own two edges.
+        let sewn = CadSurfacing.stitched(made.geometry(), [], 0.0001)
+        let only = CadMeasure.check(CadGeometry.model(sewn.geometry(), 0), "", 3, 16, 0.0001, 0.1, 0.5, 1.0, false, 8, false, 1.0, true, faces = "Fillet")
+        assert(only.edge_count() == 2, f"{only.edge_count()} edges of the fillet checked")
+    # Chordal: chord 1 between the contacts, so they lie 1/√2 from the edge.
+    let chordal = CadSurfaceBlend.fillet(data, "floor", "wall", 1.0, chordal = true, trim = 2)
+    let (cs, ci) = sheet_named(chordal.geometry(), "Fillet")
+    let a = CadNurbs.point_at(cs, ci, 0.0, 0.5)
+    let b = CadNurbs.point_at(cs, ci, 1.0, 0.5)
+    assert(math.abs(a.subtract(b).length() - 1.0) < 1e-9, f"the chord {a.subtract(b).length()}")
+    assert(math.abs(math.max(a.x, b.x) - math.sqrt(0.5)) < 1e-9, f"a contact at {a} {b}")
+
+func fillet_apart() -> unit!:
+    # A floor and a cylinder of radius 1 above it (axis along Z at x = 3,
+    # y = 2.5... the cylinder's quarter facing down and left), 1.5 apart:
+    # the ball's center is 1 over the floor and 2 from the axis.
+    var data = CadGeometry.of_model(flat(Vector3(-2.0, -2.0, 0.0), Vector3(-2.0, 6.0, 0.0), Vector3(6.0, -2.0, 0.0), "floor"))
+    let axis = Vector3(3.0, 0.0, 2.5)
+    let w = math.sqrt(0.5)
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    let angles = [math.pi, math.pi * 1.25, math.pi * 1.5]
+    for k in 0..<3:
+        let reach = 1.0 if k != 1 else 1.0 / w
+        let p = axis.add(Vector3(reach * math.cos(angles[k]), 0.0, reach * math.sin(angles[k])))
+        points.append(p)
+        points.append(p.add(Vector3(0.0, 4.0, 0.0)))
+        weights.append(1.0 if k != 1 else w)
+        weights.append(1.0 if k != 1 else w)
+    data = data.merged(CadGeometry.of_model(CadSurfacing.patch(points, weights, 3, 2, 2, 1, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], "pipe")))
+    let made = CadSurfaceBlend.fillet(data, "floor", "pipe", 1.0, trim = 2)
+    let (sheet, s) = sheet_named(made.geometry(), "Fillet")
+    let cx = 3.0 - math.sqrt(4.0 - 1.5 * 1.5)
+    for i in 0..<9:
+        for j in 0..<9:
+            let p = CadNurbs.point_at(sheet, s, float(i) / 8.0, float(j) / 8.0)
+            assert(math.abs(math.hypot(p.x - cx, p.z - 1.0) - 1.0) < 1e-9, f"a section point {p} is not a radius off the ball's center")
+    # Its contacts lie on the floor and on the pipe.
+    for j in 0..<9:
+        let a = CadNurbs.point_at(sheet, s, 0.0, float(j) / 8.0)
+        let b = CadNurbs.point_at(sheet, s, 1.0, float(j) / 8.0)
+        let floor_side = a if math.abs(a.z) < math.abs(b.z) else b
+        let pipe_side = b if math.abs(a.z) < math.abs(b.z) else a
+        assert(math.abs(floor_side.z) < 1e-9, f"the floor's contact {floor_side}")
+        assert(math.abs(math.hypot(pipe_side.x - 3.0, pipe_side.z - 2.5) - 1.0) < 1e-9, f"the pipe's contact {pipe_side}")
+    # Curves on surface: each face carries its contact as a curve on it.
+    let curved = CadSurfaceBlend.fillet(data, "floor", "pipe", 1.0, trim = 1)
+    var on_faces = 0
+    for index in 0..<CadCurves.count(curved.geometry()):
+        if CadCurves.face(curved.geometry(), index) != "":
+            on_faces += 1
+    assert(on_faces == 2, f"{on_faces} contact curves on faces")
+
+# -- Blend Surface.
+
+func blend_cylinders() -> unit!:
+    # Two cylinders of radius 1 side by side, x = 0 and x = 5; the blend
+    # bridges their tops, where each runs on toward the other.
+    var data = quarter(Vector3(0.0, 0.0, 0.0), 1.0, math.pi / 2.0, "left")
+    data = data.merged(quarter(Vector3(5.0, 0.0, 0.0), 1.0, 0.0, "right"))
+    for order in 0..<4:
+        let made = CadSurfaceBlend.blend(data, "edge left 0 1 2", "edge right 5 1 2", continuity = [order, order])
+        let found = levels(made.geometry())
+        assert(found.length == 2, f"G{order}: {found.length} shared edges")
+        for level in found:
+            assert(level >= order, f"Blend Surface G{order} measures {found}")
+            if order > 0 and order < 3:
+                assert(level == order, f"Blend Surface G{order} measures G{level} by chance")
+        let (sheet, s) = sheet_named(made.geometry(), "Blend")
+        let shape = CadNurbs.structure(sheet, s)
+        if order == 3:
+            assert(shape.du == 5 and shape.nu == 8, f"G3 both sides is three quintic spans across: degree {shape.du}, {shape.nu} rows")
+    # G0 with Proportional Crown 0.1: the middle rises a tenth of the chord
+    # (5 between the tops) above the straight blend.
+    let flat_blend = CadSurfaceBlend.blend(data, "edge left 0 1 2", "edge right 5 1 2", continuity = [0, 0])
+    let crowned = CadSurfaceBlend.blend(data, "edge left 0 1 2", "edge right 5 1 2", continuity = [0, 0], crown = 0.1)
+    let (f0, s0) = sheet_named(flat_blend.geometry(), "Blend")
+    let (f1, s1) = sheet_named(crowned.geometry(), "Blend")
+    let rise = CadNurbs.point_at(f1, s1, 0.5, 0.5).subtract(CadNurbs.point_at(f0, s0, 0.5, 0.5)).length()
+    assert(math.abs(rise - 0.5) < 1e-6, f"Crown 0.1 lifts the middle {rise}")
+
+func blend_profiles() -> unit!:
+    # A G1 blend between the tops shaped by a profile curve across its
+    # middle: the blend passes the profile.
+    var data = quarter(Vector3(0.0, 0.0, 0.0), 1.0, math.pi / 2.0, "left")
+    data = data.merged(quarter(Vector3(5.0, 0.0, 0.0), 1.0, 0.0, "right"))
+    let profile = CadCurveTools.by_points([Vector3(0.0, 1.0, 2.0), Vector3(1.5, 1.6, 2.0), Vector3(3.5, 1.6, 2.0), Vector3(5.0, 1.0, 2.0)], 3)
+    let shaped = CadCurves.with_curve(data, "profile", profile)
+    let made = CadSurfaceBlend.blend(shaped, "edge left 0 1 2", "edge right 5 1 2", continuity = [0, 0], profiles = "curve profile")
+    let (sheet, s) = sheet_named(made.geometry(), "Blend")
+    for k in 0..<11:
+        let p = profile.at(profile.low() + (profile.high() - profile.low()) * float(k) / 10.0)
+        let uv = CadNurbs.parameters_at(sheet, s, p)
+        let q = CadNurbs.point_at(sheet, s, uv.x, uv.y)
+        assert(q.subtract(p).length() < 1e-5, f"the Profile Blend misses its profile by {q.subtract(p).length()} at {p}")
+    for level in levels(made.geometry()):
+        assert(level >= 0, "the Profile Blend leaves its sides")
+
+# -- Tube.
+
+func tubes() -> unit!:
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "line", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(0.0, 0.0, 3.0)], 1))
+    data = CadCurves.with_curve(data, "ring", ring(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), 3.0))
+    let straight = CadSurfaceBlend.tube(data, "curve line", 0.5)
+    let (pipe, ps) = sheet_named(straight.geometry(), "Tube")
+    for i in 0..<9:
+        for j in 0..<9:
+            let p = CadNurbs.point_at(pipe, ps, float(i) / 8.0, float(j) / 8.0)
+            assert(math.abs(math.hypot(p.x, p.y) - 0.5) < 1e-12, f"the Tube along a line leaves the cylinder at {p}")
+    let round = CadSurfaceBlend.tube(data, "curve ring", 0.5)
+    let (torus, ts) = sheet_named(round.geometry(), "Tube")
+    var off = 0.0
+    for i in 0..<41:
+        for j in 0..<41:
+            let p = CadNurbs.point_at(torus, ts, float(i) / 40.0, float(j) / 40.0)
+            off = math.max(off, math.abs(math.hypot(math.hypot(p.x, p.y) - 3.0, p.z) - 0.5))
+    assert(off < 1e-7, f"the Tube along a circle is {off} off the torus")
+    # Normal offset 0.25 moves the axis off the line, Flip the other way.
+    let lifted = CadSurfaceBlend.tube(data, "curve line", 0.5, normal_offset = 0.25)
+    let dropped = CadSurfaceBlend.tube(data, "curve line", 0.5, normal_offset = 0.25, flip = true)
+    let (l, li) = sheet_named(lifted.geometry(), "Tube")
+    let (d, di) = sheet_named(dropped.geometry(), "Tube")
+    var axis_l = Vector3()
+    var axis_d = Vector3()
+    for k in 0..<8:
+        axis_l = axis_l.add(CadNurbs.point_at(l, li, float(k) / 8.0, 0.5))
+        axis_d = axis_d.add(CadNurbs.point_at(d, di, float(k) / 8.0, 0.5))
+    let centre_l = axis_l.multiply_scalar(0.125)
+    let centre_d = axis_d.multiply_scalar(0.125)
+    assert(math.abs(math.hypot(centre_l.x, centre_l.y) - 0.25) < 1e-6 and math.hypot(centre_l.x + centre_d.x, centre_l.y + centre_d.y) < 1e-6, f"Normal offset moves the axis to {centre_l}, flipped to {centre_d}")

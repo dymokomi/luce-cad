@@ -1,0 +1,76 @@
+## Sections fitted along a run into a net (surfacing Stage 6: Blend
+## Surface, Surface Fillet and Tube; sweep.lucb's fit, made general). A
+## source gives the section at any fraction s of the run (0 to 1), each the
+## same count of homogeneous control points on the same knots across. The
+## rows of control points are fitted along s at degree 5, the first and
+## last sections exactly, on uniform spans doubled until the sections
+## between lie within the source's tolerance (or 256 spans). Homogeneous
+## rows keep rational sections (a fillet's circular arcs) exact wherever
+## they vary as a polynomial of degree 5 or less along the run (a fillet
+## between planes: linearly).
+
+## Where sections come from: the section at fraction s (`section_at` with
+## `context`) and how close the net must stay to them.
+struct SectionSource:
+    var context: void*
+    var section_at: func(void*, f64, Growing[Weighted]*) -> unit!
+    var tolerance: f64
+
+## The net of `source`'s sections: `size` control points across on knots
+## `across` (degree `across_degree`, u), fitted along s (v) from `start`
+## spans.
+func along_net(source: const SectionSource*, across: const f64[], across_degree: i64, size: usize, start: usize) -> Net!:
+    var spans = (usize)math.max(1.0, (f64)start)
+    var section = Growing[Weighted]()
+    defer section.close()
+    while true:
+        var knots = Growing[f64]()
+        defer knots.close()
+        try uniform_knots(5, spans, 0.0, 1.0, &knots)
+        var params = Growing[f64]()
+        defer params.close()
+        try fit_parameters(knots.view(), 5, 6, &params)
+        var fitter = try make_fitter(5, knots.view(), params.view(), 0)
+        defer fitter.close()
+        # The sections at the fit's parameters, one after another.
+        var grid = Growing[Weighted]()
+        defer grid.close()
+        for t in params.view():
+            try source.section_at(source.context, t, &section)
+            if section.count != size: error(invalid, "a section along the blend came out with another count of control points")
+            for q in section.view(): try grid.push(q)
+        var made = empty_net()
+        errdefer made.close()
+        made.du = across_degree
+        made.dv = 5
+        made.nu = size
+        made.nv = knots.count - 6
+        try made.ku.assign(across)
+        try made.kv.assign(knots.view())
+        try made.points.fill(made.nu * made.nv, Weighted(0.0, 0.0, 0.0, 0.0))
+        var values = Growing[Weighted]()
+        defer values.close()
+        var fitted = Growing[Weighted]()
+        defer fitted.close()
+        for i in 0..<size:
+            values.clear()
+            for at in 0..<params.count: try values.push(grid.items[at * size + i])
+            var starts: Weighted[4] = [values.items[0], Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+            var ends: Weighted[4] = [values.items[values.count - 1], Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+            try fitter.fit(values.view(), &starts, &ends, &fitted)
+            for k in 0..<made.nv: made.points.items[i * made.nv + k] = fitted.items[k]
+        # The sections between the fit's parameters against the rows.
+        var worst = 0.0
+        for k in 0..<4 * spans:
+            let t = ((f64)k + 0.37) / (f64)(4 * spans)
+            try source.section_at(source.context, t, &section)
+            for i in 0..<size:
+                var bv: f64[12]
+                let first = nurbs_basis(made.kv.view(), (i64)made.nv, 5, t, &bv)
+                var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+                for j in 0..<(usize)6: sum = sum.plus(made.points.items[i * made.nv + first + j].times(bv[j]))
+                worst = math.max(worst, sum.point().subtract(section.items[i].point()).length())
+        if worst <= source.tolerance or spans >= 256: return made
+        made.close()
+        spans *= 2
+    error(invalid, "unreachable")

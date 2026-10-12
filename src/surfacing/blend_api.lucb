@@ -1,0 +1,66 @@
+## Blends between surfaces (surfacing Stage 6; blend_surface.lucb,
+## surface_fillet.lucb and tube.lucb have the plans): what Luce calls,
+## CadSurfaceBlend. Each takes a geometry set and returns it with a new
+## sheet named `name` after its bodies (the Surface Fillet's trims change
+## the faces it rolls on), with its measures (CadSurfaceEdit's).
+pub struct CadSurfaceBlend:
+    let reserved: u8 = 0
+
+    ## Blend Surface (Alias's Freeform Blend; Profile Blend with
+    ## `profiles`): between the sides `first` and `second` (Align's master
+    ## words: edges, isoparms, curves on faces, free curves; a side's chain
+    ## apart by `+`), each `continuity` G0 to G3 with its `shape` (1 as
+    ## built; above it tighter toward the corner); Proportional Crown
+    ## `crown` (-0.25 to 0.25 of the chord); `flow` flow_connect (the
+    ## sides' ends connected) or flow_free (sections square to side 1);
+    ## each side's `range` (side 1 from and to, side 2 from and to,
+    ## fractions of its length); through the curves `profiles` (words apart
+    ## by `;`).
+    pub static func blend(set: interop.Reference[GeometrySet], first: str, second: str, continuity: const i64[] = [1, 1], shape: const f64[] = [1.0, 1.0], crown: f64 = 0.0,
+                          flow: i64 = 0, range: const f64[] = [0.0, 1.0, 0.0, 1.0], profiles: str = "", name: str = "Blend") -> interop.Reference[CadSurfaceEdit]!:
+        if continuity.length != 2 or shape.length != 2: error(invalid, "Blend Surface: a continuity and a shape for each side")
+        if range.length != 4: error(invalid, "Blend Surface: each side's range is two fractions")
+        if not (crown >= -0.25 and crown <= 0.25): error(invalid, "Blend Surface: Proportional Crown is -0.25 to 0.25")
+        if flow != flow_connect and flow != flow_free: error(invalid, "Blend Surface: Flow Control is Connect ends or Free")
+        let opts = BlendOptions([continuity[0], continuity[1]], [shape[0], shape[1]], crown, flow, [range[0], range[1], range[2], range[3]])
+        var net = try blend_net(set, first, second, &opts, profiles)
+        defer net.close()
+        return try added_sheet(set, &net, name)
+
+    ## Surface Fillet (Alias's; Parasolid's face-face blend): a rolling ball
+    ## between the face sets `first` and `second` (face names apart by `;`),
+    ## radius `size` (with `chordal`, the chord between the contacts), each
+    ## set's side flipped by `flips` (the default: toward the other set),
+    ## the section `section` (fillet_chamfer, fillet_circular, fillet_g2,
+    ## fillet_g3) with Form Factor `form`, and `trim` (fillet_trim_automatic,
+    ## fillet_trim_curves, fillet_trim_off).
+    pub static func fillet(set: interop.Reference[GeometrySet], first: str, second: str, size: f64, section: i64 = 1, chordal: bool = false, flips: const bool[] = [false, false],
+                           trim: i64 = 0, form: f64 = 1.0, name: str = "Fillet") -> interop.Reference[CadSurfaceEdit]!:
+        if flips.length != 2: error(invalid, "Surface Fillet: a flip for each set")
+        if trim < fillet_trim_automatic or trim > fillet_trim_off: error(invalid, "Surface Fillet: Trim is Automatic, Curves on surface or Off")
+        let opts = FilletOptions(section, size, chordal, [flips[0], flips[1]], trim, form)
+        var sets: FilletSet[2] = [FilletSet(Growing[Master](), 1.0), FilletSet(Growing[Master](), 1.0)]
+        defer sets[0].close()
+        defer sets[1].close()
+        var made = try fillet_net(set, first, second, &opts, &sets)
+        defer made.close()
+        let body = try net_body(&made.net, name, true)
+        defer body.release()
+        var result = try with_body_added(set, body)
+        if trim != fillet_trim_off:
+            let trimmed = try fillet_trims(result, &made, &sets, trim, name)
+            result.release()
+            result = trimmed
+        let edit = try edit_of(result)
+        edit.value().count = 1
+        return edit
+
+    ## Tube (Alias's Tubular Offset): a circular tube of radius `radius`
+    ## along the curve `curve` (Align's master words: a curve, a curve on a
+    ## face, an edge, an isoparm), its center moved `normal_offset` along
+    ## the face's normal (the curve's frame's up off a face; negated with
+    ## `flip`: a groove for a bump) and `tangent_offset` across.
+    pub static func tube(set: interop.Reference[GeometrySet], curve: str, radius: f64, tangent_offset: f64 = 0.0, normal_offset: f64 = 0.0, flip: bool = false, name: str = "Tube") -> interop.Reference[CadSurfaceEdit]!:
+        var net = try tube_net(set, curve, radius, tangent_offset, normal_offset, flip)
+        defer net.close()
+        return try added_sheet(set, &net, name)

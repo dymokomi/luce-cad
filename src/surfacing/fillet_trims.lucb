@@ -1,0 +1,103 @@
+## Surface Fillet's trims (surface_fillet.lucb): Automatic trims each face
+## the ball rolled on back to its contact curve, the part under the fillet
+## (toward the other set) discarded, by Trim's machinery with the contact
+## cast onto the face along its normals; Curves on surface casts the
+## contacts onto the faces as curves on them.
+
+## `set` with the faces the fillet `made` rolled on trimmed back to its
+## contacts (`trim` Automatic) or carrying them as curves (Curves on
+## surface), `name` naming the contact curves.
+func fillet_trims(set: interop.Reference[GeometrySet], made: const FilletMade*, sets: FilletSet[2]*, trim: i64, name: str) -> interop.Reference[GeometrySet]!:
+    var current = set.clone()
+    errdefer current.release()
+    for which in 0..<(usize)2:
+        let fs = &(*sets)[which]
+        for k in 0..<fs.faces.count:
+            # This face's contacts, in order along the spine, and the
+            # other contact of each (the side to take away).
+            var points = Growing[Vector3]()
+            defer points.close()
+            var others = Growing[Vector3]()
+            defer others.close()
+            for b in made.contacts.view():
+                let face = b.f1 if which == 0 else b.f2
+                if face != k: continue
+                let (p, _) = try ball_side(fs, k, b.uv1 if which == 0 else b.uv2)
+                let other = &(*sets)[1 - which]
+                let (q, _) = try ball_side(other, b.f2 if which == 0 else b.f1, b.uv2 if which == 0 else b.uv1)
+                try points.push(p)
+                try others.push(q)
+            if points.count < 2: continue
+            let next = try trimmed_by_contacts(current, &fs.faces.items[k], points.view(), others.view(), trim, name, which)
+            current.release()
+            current = next
+    return current
+
+## `set` with face `master`'s contact curve through `points` (as a free
+## curve cast onto it along its normals): the face trimmed by it, the part
+## toward `others` (the other set's contacts) taken away (`trim`
+## Automatic), or the curve kept on the face (Curves on surface).
+func trimmed_by_contacts(set: interop.Reference[GeometrySet], master: Master*, points: const Vector3[], others: const Vector3[], trim: i64, name: str, which: usize) -> interop.Reference[GeometrySet]!:
+    # The contact curve: a cubic through the contacts by chord length.
+    var params = Growing[f64]()
+    defer params.close()
+    var run = 0.0
+    try params.push(0.0)
+    for k in 1..<points.length:
+        run += points[k].subtract(points[k - 1]).length()
+        try params.push(run)
+    if not (run > 0.0): return set.clone()
+    for k in 0..<params.count: params.items[k] = params.items[k] / run
+    var knots = Growing[f64]()
+    defer knots.close()
+    var matrix = Growing[f64]()
+    defer matrix.close()
+    try collocation(params.view(), fewer(3, points.length - 1), &knots, &matrix)
+    var values = Growing[Weighted]()
+    defer values.close()
+    for p in points: try values.push(weighted(p, 1.0))
+    var solved = Growing[Weighted]()
+    defer solved.close()
+    try interpolate_points(matrix.view(), values.view(), &solved)
+    var curve = empty_spline((i64)fewer(3, points.length - 1))
+    defer curve.close()
+    try curve.knots.assign(knots.view())
+    try curve.points.assign(solved.view())
+    let face = master.w.face_name(master.f)
+    var buffer: u8[300]
+    let curve_name = try strings.format(buffer, f"{name}/contact{which + 1}[{face}]")
+    let held = try held_spline(try curve.copy())
+    defer held.release()
+    let with_curve = try CadCurves.with_curve(set, curve_name, held)
+    defer with_curve.release()
+    let body = try body_holding(with_curve, face)
+    if trim == fillet_trim_curves:
+        # The contact as a curve on the face: cast along its normals.
+        let cast = try CadSurfacing.projected(with_curve, body, face, curve_name, Vector3(), normal = true, both = true)
+        defer cast.release()
+        let geometry = try cast.value().geometry()
+        defer geometry.release()
+        return try CadCurves.without_curve(geometry, curve_name)
+    # The part to keep: off the middle contact, away from the other set.
+    let middle = points.length // 2
+    let p = points[middle]
+    let toward = others[middle].subtract(p)
+    var away = toward.multiply_scalar(-1.0)
+    let uv = try master.chart_of(p)
+    let j = try surface_jet(master.surface(), uv, false, false)
+    let n = j.su.cross(j.sv).normalized() catch failure: error(invalid, "Surface Fillet: a face has no normal at a contact")
+    away = away.subtract(n.multiply_scalar(away.dot(n))).normalized() catch failure: error(invalid, "Surface Fillet: the other set lies square over a contact")
+    let step = math.max(toward.length() * 0.05, 1e-6)
+    let keep: Vector3[1] = [p.add(away.multiply_scalar(step))]
+    let cut = try CadSurfacing.trimmed(with_curve, body, face, keep[..<1], 0, curve_name, "trim", cast = trim_cast_normal, extend = true)
+    defer cut.release()
+    return try CadCurves.without_curve(cut, curve_name)
+
+## The index of the body of `set` holding face `face`.
+func body_holding(set: interop.Reference[GeometrySet], face: str) -> i64!:
+    let models = set_models(try set.get())
+    for at in 0..<models.length:
+        let model = models[at].value()
+        for f in 0..<model.face_count():
+            if (try model.face_name(f)) == face: return (i64)at
+    error(invalid, "Surface Fillet: a face it rolls on is no longer in the model")

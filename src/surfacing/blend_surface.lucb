@@ -1,0 +1,381 @@
+## Blend Surface (surfacing Stage 6: Alias's Freeform Blend and Profile
+## Blend, Plasticity's Bridge Surface, Rhino's BlendSrf; §4.1 and §6.7 of
+## luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md): a surface
+## between two sides, each a chain of edges, isoparms, curves on faces or
+## free curves (Align's master words; a chain's apart by `+`), meeting
+## each G0 to G3, optionally through profile curves.
+##
+## The sides are matched by the fraction of their length (Flow Control
+## Connect ends: start to start, end to end; Free: each station on side 2
+## where the plane square to side 1 there cuts it), within each side's
+## range (Modify Range). At a station the section runs from side 1's point
+## to side 2's: a B-spline across of degree 5 on uniform spans, as many
+## control points as the two sides' continuity holds (six at least; eight,
+## three spans, for G3 both sides), whose first rows are the curve that
+## continues side 1's surface across it (§6.1's rows by arc length: A' =
+## vT, A'' = v²K, A''' = v³K', T the unit tangent, K the curvature vector
+## and K' its rate of the surface's curve leaving the side, v the speed)
+## and whose last rows are side 2's likewise. The speed v is the side's
+## Shape times the chord between the two points (above 1 tighter toward
+## the corner, below rounder); the loose middle control points, and the
+## orders a side does not ask, follow the cubic Hermite of the ends (a
+## straight line between G0 sides), bowed by Proportional Crown (a
+## fraction of the chord along the normal of the chord and side 1's run).
+## A profile curve (Profile Blend) is passed at its station: the section
+## there fitted to it with the same end rows, and the difference from the
+## free section carried along the blend by a cubic between profiles
+## (constant past the first and last), so the end rows stay exact. The
+## sections' rows are fitted along the blend (along.lucb).
+
+pub let flow_connect: i64 = 0
+pub let flow_free: i64 = 1
+
+## Blend Surface's options: each side's continuity (0 G0 to 3 G3) and
+## Shape, Proportional Crown, Flow Control, and each side's range (side
+## 1 from and to, side 2 from and to, fractions of its length).
+pub struct BlendOptions:
+    pub var continuity: i64[2]
+    pub var shape: f64[2]
+    pub var crown: f64
+    pub var flow: i64
+    pub var range: f64[4]
+
+## One side: its masters (the chain), the chain joined into one curve on
+## 0..1 within its range, that curve's arc table, its continuity and Shape.
+struct BlendSide:
+    var masters: Growing[Master]
+    var curve: Spline
+    var arc: ArcTable
+    var order: i64
+    var shape: f64
+
+    func close():
+        close_masters(&self.masters)
+        self.curve.close()
+        self.arc.close()
+
+## A profile's correction: its station (a fraction of side 1) and the
+## difference of each control point from the free section there.
+struct ProfileFix:
+    var place: f64
+    var delta: Growing[Weighted]
+
+## What the sections need.
+struct BlendWork:
+    var one: BlendSide
+    var two: BlendSide
+    var flow: i64
+    var crown: f64
+    ## The knots across, the control points a section has, the rows each
+    ## side holds (the fitter's keep), and the fitter across.
+    var knots: Growing[f64]
+    var size: usize
+    var keep: usize
+    var params: Growing[f64]
+    var fitter: Fitter
+    var fixes: Growing[ProfileFix]
+
+    func close():
+        self.one.close()
+        self.two.close()
+        self.knots.close()
+        self.params.close()
+        self.fitter.close()
+        for f in self.fixes.view():
+            var owned = f
+            owned.delta.close()
+        self.fixes.close()
+
+## The point of `side` at fraction `s` of its length and its tangent there.
+func run_point(side: BlendSide*, s: f64) -> (Vector3, Vector3)!:
+    let t = try arc_param(&side.curve, &side.arc, s)
+    let j = try curve_jet(&side.curve, t, 1, t >= side.curve.high())
+    return (j.d[0], j.d[1])
+
+## The curve leaving `side` into the blend at `p` (its run `along` there),
+## toward `toward`: the unit tangent, curvature vector and its rate by arc
+## length of the surface's curve across the side (an edge's face
+## continued past the edge; a curve on a face or an isoparm, the face on
+## toward the other side).
+func side_leaving(side: BlendSide*, p: Vector3, along: Vector3, toward: Vector3) -> (Vector3, Vector3, Vector3)!:
+    var best: usize = 0
+    var best_distance = 1.0e300
+    for k in 0..<side.masters.count:
+        let c = &side.masters.items[k].curve
+        let d = c.point_at(spline_nearest(c, p)).subtract(p).length()
+        if d < best_distance:
+            best_distance = d
+            best = k
+    let m = &side.masters.items[best]
+    if not m.has_face: error(invalid, "Blend Surface: G1 and above need the side on a surface (an edge, an isoparm or a curve on a face); a free curve's side is G0")
+    let c = &m.curve
+    let fraction = (spline_nearest(c, p) - c.low()) / math.max(1e-300, c.high() - c.low())
+    let probe = Probe(p, along, toward.subtract(p), empty_jet())
+    let goal = try m.target(fraction, &probe, 0.0)
+    if m.kind == master_edge: return (goal.t.multiply_scalar(-1.0), goal.k, goal.dk.multiply_scalar(-1.0))
+    return (goal.t, goal.k, goal.dk)
+
+## Side 2's fraction for side 1's point `p` with run `along` (Flow Control
+## Free): where the plane through `p` square to `along` cuts side 2,
+## nearest `near`; `near` when it does not.
+func free_match(w: BlendWork*, p: Vector3, along: Vector3, near: f64) -> f64!:
+    let d = along.normalized() catch failure: return near
+    var best = near
+    var best_gap = 1.0e300
+    var before = 0.0
+    var before_value = 0.0
+    for k in 0..<(usize)129:
+        let s = (f64)k / 128.0
+        let (q, _) = try run_point(&w.two, s)
+        let value = q.subtract(p).dot(d)
+        if k > 0 and (value == 0.0 or (value > 0.0) != (before_value > 0.0)):
+            # Bisect the crossing.
+            var a = before
+            var b = s
+            var fa = before_value
+            for _ in 0..<60:
+                let m = (a + b) * 0.5
+                let (qm, _) = try run_point(&w.two, m)
+                let fm = qm.subtract(p).dot(d)
+                if (fm > 0.0) == (fa > 0.0):
+                    a = m
+                    fa = fm
+                else: b = m
+            let at = (a + b) * 0.5
+            if math.abs(at - near) < best_gap:
+                best_gap = math.abs(at - near)
+                best = at
+        before = s
+        before_value = value
+    return best
+
+## The free section at fraction `s` of side 1 (no profile's correction)
+## onto `out`.
+func free_section(w: BlendWork*, s: f64, out: Growing[Weighted]*) -> !:
+    let (p0, a0) = try run_point(&w.one, s)
+    let s2 = try free_match(w, p0, a0, s) if w.flow == flow_free else s
+    let (p1, a1) = try run_point(&w.two, s2)
+    let chord = p1.subtract(p0)
+    let c = chord.length()
+    if not (c > 0.0): error(invalid, "Blend Surface: the two sides meet; a blend needs a gap between them")
+    # The surfaces' curves leaving each side (none for G0).
+    var t0 = Vector3()
+    var k0 = Vector3()
+    var r0 = Vector3()
+    var t1 = Vector3()
+    var k1 = Vector3()
+    var r1 = Vector3()
+    if w.one.order > 0:
+        let (a, b, d) = try side_leaving(&w.one, p0, a0, p1)
+        t0 = a
+        k0 = b
+        r0 = d
+    if w.two.order > 0:
+        let (a, b, d) = try side_leaving(&w.two, p1, a1, p0)
+        t1 = a
+        k1 = b
+        r1 = d
+    let v0 = w.one.shape * c
+    let v1 = w.two.shape * c
+    # The reference: the cubic Hermite of the ends (the chord's slope at a
+    # G0 side), bowed by the crown along the normal of the chord and side
+    # 1's run.
+    let m0 = t0.multiply_scalar(v0) if w.one.order > 0 else chord
+    let m1 = t1.multiply_scalar(-v1) if w.two.order > 0 else chord
+    var bow = Vector3()
+    if w.crown != 0.0:
+        let n = chord.cross(a0).normalized() catch failure: recover Vector3()
+        bow = n.multiply_scalar(4.0 * w.crown * c)
+    let third = p0.multiply_scalar(12.0).add(m0.multiply_scalar(6.0)).subtract(p1.multiply_scalar(12.0)).add(m1.multiply_scalar(6.0))
+    let reference_start: Vector3[4] = [p0, m0.add(bow), p0.multiply_scalar(-6.0).subtract(m0.multiply_scalar(4.0)).add(p1.multiply_scalar(6.0)).subtract(m1.multiply_scalar(2.0)).subtract(bow.multiply_scalar(2.0)), third]
+    let reference_end: Vector3[4] = [p1, m1.subtract(bow), p0.multiply_scalar(6.0).add(m0.multiply_scalar(2.0)).subtract(p1.multiply_scalar(6.0)).add(m1.multiply_scalar(4.0)).subtract(bow.multiply_scalar(2.0)), third]
+    # The rows each side asks, the reference's past its order.
+    let own_start: Vector3[4] = [p0, t0.multiply_scalar(v0), k0.multiply_scalar(v0 * v0), r0.multiply_scalar(v0 * v0 * v0)]
+    let own_end: Vector3[4] = [p1, t1.multiply_scalar(-v1), k1.multiply_scalar(v1 * v1), r1.multiply_scalar(-v1 * v1 * v1)]
+    var starts: Weighted[4] = [Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+    var ends: Weighted[4] = [Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+    for j in 0..<w.keep + 1:
+        let a = own_start[j] if (i64)j <= w.one.order else reference_start[j]
+        let b = own_end[j] if (i64)j <= w.two.order else reference_end[j]
+        starts[j] = Weighted(a.x, a.y, a.z, 1.0 if j == 0 else 0.0)
+        ends[j] = Weighted(b.x, b.y, b.z, 1.0 if j == 0 else 0.0)
+    var values = Growing[Weighted]()
+    defer values.close()
+    for t in w.params.view():
+        let h = cubic_hermite(p0, m0, p1, m1, t).add(bow.multiply_scalar(t * (1.0 - t)))
+        try values.push(weighted(h, 1.0))
+    try w.fitter.fit(values.view(), &starts, &ends, out)
+
+## The section at fraction `s` of side 1: the free one, corrected by the
+## profiles (a cubic between their stations, constant past the ends).
+func blend_section(context: void*, s: f64, out: Growing[Weighted]*) -> !:
+    let w = (BlendWork*)context
+    try free_section(w, s, out)
+    let n = w.fixes.count
+    if n == 0: return
+    var j: usize = 0
+    while j + 1 < n and w.fixes.items[j + 1].place <= s: j += 1
+    for i in 0..<w.size:
+        var fix = w.fixes.items[0].delta.items[i]
+        if n > 1 and s > w.fixes.items[0].place and s < w.fixes.items[n - 1].place:
+            # Catmull-Rom slopes (flat at the first and last profile).
+            let a = w.fixes.items[j].place
+            let b = w.fixes.items[j + 1].place
+            let f = (s - a) / (b - a)
+            let da = fix_slope(w, j, i).times(b - a)
+            let db = fix_slope(w, j + 1, i).times(b - a)
+            let pa = w.fixes.items[j].delta.items[i]
+            let pb = w.fixes.items[j + 1].delta.items[i]
+            let f2 = f * f
+            let f3 = f2 * f
+            fix = pa.times(2.0 * f3 - 3.0 * f2 + 1.0).plus(da.times(f3 - 2.0 * f2 + f)).plus(pb.times(-2.0 * f3 + 3.0 * f2)).plus(db.times(f3 - f2))
+        elif n > 1 and s >= w.fixes.items[n - 1].place:
+            fix = w.fixes.items[n - 1].delta.items[i]
+        out.items[i] = out.items[i].plus(fix)
+
+## Profile `k`'s correction's slope along the blend at control point `i`.
+func fix_slope(w: const BlendWork*, k: usize, i: usize) -> Weighted:
+    let n = w.fixes.count
+    if k == 0 or k + 1 >= n: return Weighted(0.0, 0.0, 0.0, 0.0)
+    let a = &w.fixes.items[k - 1]
+    let b = &w.fixes.items[k + 1]
+    return b.delta.items[i].minus(a.delta.items[i]).times(1.0 / (b.place - a.place))
+
+## A side from the chain `words` (a chain's masters apart by `+`), its
+## range `from` to `to`.
+func blend_side(set: interop.Reference[GeometrySet], words: str, order: i64, shape: f64, from_at: f64, to_at: f64) -> BlendSide!:
+    var masters = Growing[Master]()
+    errdefer close_masters(&masters)
+    let bytes = words.bytes
+    var start: usize = 0
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 43: continue
+        if at > start: try masters.push(try master_of(set, (str)bytes[start..<at], -1, Vector3()))
+        start = at + 1
+    if masters.count == 0: error(invalid, "Blend Surface: pick both sides (edges, isoparms or curves)")
+    var whole = try joined_set(masters.view())
+    defer whole.close()
+    if not (from_at >= 0.0 and to_at <= 1.0 and to_at - from_at > 1e-6): error(invalid, "Blend Surface: a side's range runs from 0 to 1 of it, start before end")
+    var curve = try segment_of(&whole, from_at, to_at)
+    errdefer curve.close()
+    let arc = try arc_table(&curve)
+    return BlendSide(masters, curve, arc, order, shape)
+
+## Blend Surface's net between sides `first` and `second` by `opts`,
+## through the profile curves `profiles` (Align's master words apart by
+## `;`; none for a Freeform Blend).
+func blend_net(set: interop.Reference[GeometrySet], first: str, second: str, opts: const BlendOptions*, profiles: str) -> Net!:
+    for k in 0..<(usize)2:
+        if opts.continuity[k] < 0 or opts.continuity[k] > 3: error(invalid, "Blend Surface: each side is G0 to G3")
+        if not (opts.shape[k] > 0.0): error(invalid, "Blend Surface: a side's Shape is more than 0")
+    var one = try blend_side(set, first, opts.continuity[0], opts.shape[0], opts.range[0], opts.range[1])
+    var two = blend_side(set, second, opts.continuity[1], opts.shape[1], opts.range[2], opts.range[3]) catch failure:
+        one.close()
+        error(failure.code, failure.message)
+    # Side 2 runs the way side 1 does (their starts nearer than crossed).
+    let a0 = one.curve.point_at(0.0)
+    let a1 = one.curve.point_at(1.0)
+    if a0.subtract(two.curve.point_at(1.0)).length() + a1.subtract(two.curve.point_at(0.0)).length() < a0.subtract(two.curve.point_at(0.0)).length() + a1.subtract(two.curve.point_at(1.0)).length():
+        let turned_round = reversed_spline(&two.curve) catch failure:
+            one.close()
+            two.close()
+            error(failure.code, failure.message)
+        two.curve.close()
+        two.curve = turned_round
+        two.arc.close()
+        two.arc = arc_table(&two.curve) catch failure:
+            one.close()
+            two.close()
+            error(failure.code, failure.message)
+    var profile_masters = Growing[Master]()
+    defer close_masters(&profile_masters)
+    if profiles.length > 0:
+        builder_masters(set, profiles, &profile_masters) catch failure:
+            one.close()
+            two.close()
+            error(failure.code, failure.message)
+    # The section's structure: the rows each side holds (both the higher
+    # order), six control points at least, more for a profile to shape.
+    let keep = (usize)math.max((f64)opts.continuity[0], (f64)opts.continuity[1])
+    var size = 2 * (keep + 1)
+    if size < 6: size = 6
+    if profile_masters.count > 0: size += 2
+    var knots = Growing[f64]()
+    var params = Growing[f64]()
+    var made_fitter = section_fitter(size, keep, &knots, &params) catch failure:
+        knots.close()
+        params.close()
+        one.close()
+        two.close()
+        error(failure.code, failure.message)
+    var w = BlendWork(one, two, opts.flow, opts.crown, knots, size, keep, params, made_fitter, Growing[ProfileFix]())
+    defer w.close()
+    # The sides' size sets the tolerance (shallow copies, only read).
+    let sides: Spline[2] = [w.one.curve, w.two.curve]
+    let tolerance = build_tolerance(sides[..<2])
+    # Each profile's station and its difference from the free section.
+    for m in profile_masters.view():
+        try add_profile(&w, &m.curve)
+    var source = SectionSource((void*)&w, blend_section, tolerance)
+    let spans = fewer(64, (usize)math.max(2.0, (f64)math.max((f64)span_count(&w.one.curve), (f64)span_count(&w.two.curve))))
+    return try along_net(&source, w.knots.view(), 5, size, spans)
+
+## The fitter across a section of `size` control points holding `keep` + 1
+## at each end: its knots (degree 5, uniform) onto `knots`, its parameters
+## onto `params`.
+func section_fitter(size: usize, keep: usize, knots: Growing[f64]*, params: Growing[f64]*) -> Fitter!:
+    try uniform_knots(5, size - 5, 0.0, 1.0, knots)
+    try fit_parameters(knots.view(), 5, 12, params)
+    return try make_fitter(5, knots.view(), params.view(), keep)
+
+## Profile curve `c` added to `w`'s corrections: its station is where its
+## end nearer side 1 lies on it; there the section is fitted to it with the
+## same end rows.
+func add_profile(w: BlendWork*, c: const Spline*) -> !:
+    var profile = try c.copy()
+    defer profile.close()
+    unit_domain(&profile)
+    let start = profile.point_at(0.0)
+    let finish = profile.point_at(1.0)
+    let near_start = w.one.curve.point_at(spline_nearest(&w.one.curve, start)).subtract(start).length()
+    let near_finish = w.one.curve.point_at(spline_nearest(&w.one.curve, finish)).subtract(finish).length()
+    if near_finish < near_start:
+        let turned_round = try reversed_spline(&profile)
+        profile.close()
+        profile = turned_round
+    let foot = spline_nearest(&w.one.curve, profile.point_at(0.0))
+    let place = try arc_fraction(&w.one.curve, &w.one.arc, foot)
+    for f in w.fixes.view():
+        if math.abs(f.place - place) < 1e-9: error(invalid, "Blend Surface: two profiles sit at one place")
+    var loose = Growing[Weighted]()
+    defer loose.close()
+    try free_section(w, place, &loose)
+    # The section through the profile: the free one's end rows, its
+    # middle fitted to the profile's points (by their fraction of it).
+    var values = Growing[Weighted]()
+    defer values.close()
+    var table = try arc_table(&profile)
+    defer table.close()
+    for t in w.params.view(): try values.push(weighted(profile.point_at(try arc_param(&profile, &table, t)), 1.0))
+    var starts: Weighted[4] = [Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+    var ends: Weighted[4] = [Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+    # The end rows as the free section has them: its derivatives at both
+    # ends to the order held.
+    var section = empty_spline(5)
+    defer section.close()
+    try section.knots.assign(w.knots.view())
+    try section.points.assign(loose.view())
+    var jet: Weighted[6]
+    try homogeneous_jet(&section, 0.0, w.keep, false, &jet)
+    for j in 0..<w.keep + 1: starts[j] = jet[j]
+    try homogeneous_jet(&section, 1.0, w.keep, true, &jet)
+    for j in 0..<w.keep + 1: ends[j] = jet[j]
+    var through = Growing[Weighted]()
+    defer through.close()
+    try w.fitter.fit(values.view(), &starts, &ends, &through)
+    var delta = Growing[Weighted]()
+    errdefer delta.close()
+    for i in 0..<w.size: try delta.push(through.items[i].minus(loose.items[i]))
+    var slot = w.fixes.count
+    while slot > 0 and w.fixes.items[slot - 1].place > place: slot -= 1
+    try w.fixes.insert(slot, ProfileFix(place, delta))
