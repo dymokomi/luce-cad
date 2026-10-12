@@ -72,6 +72,11 @@ func assemble(work: Work*, op: i64, others: Others*) -> interop.Reference[CadMod
     # Every edge used twice, but a face passing through one of them (before
     # the zones' seams, which the traced shape does not hold).
     if (try pieces_closed(work, &pieces, keep.view(), turn.view())) and (try touches_itself(work, &traced, &pieces, piece_face.view(), keep.view())): error(invalid, non_manifold)
+    # Faces touching along a section (from outside, joined; one inside the
+    # other at its face, subtracted) whose kept pieces both reach it: the
+    # merged faces no longer share the section's edge, and the result
+    # closes, but it is pinched to nothing along it.
+    if try pinched(work, &traced, &pieces, piece_face.view(), keep.view(), op): error(invalid, non_manifold)
     try seam_zones(work, &traced, &pieces, piece_face.view(), keep.view())
     # A result that does not close where the bodies touch along a curve
     # (from outside, joined; one inside the other at its face, subtracted)
@@ -264,8 +269,10 @@ func write_pieces(work: Work*, pieces: const Pieces*, piece_face: const usize[],
         let edge = work.finals.items[e]
         let a = (try w.at(edge.carrier, edge.t0)).subtract(work.vertices.items[(usize)edge.start]).length()
         let z = (try w.at(edge.carrier, edge.t1)).subtract(work.vertices.items[(usize)edge.end]).length()
-        slack.items[(usize)edge.start] = math.max(slack.items[(usize)edge.start], a * 1.01)
-        slack.items[(usize)edge.end] = math.max(slack.items[(usize)edge.end], z * 1.01)
+        # A vertex's zone holds its edges' (a tolerant edge's precision).
+        let own = edge_slack[e] if e < edge_slack.length else 0.0
+        slack.items[(usize)edge.start] = math.max(slack.items[(usize)edge.start], math.max(a * 1.01, own))
+        slack.items[(usize)edge.end] = math.max(slack.items[(usize)edge.end], math.max(z * 1.01, own))
     var edge_ids = Growing[i64]()
     defer edge_ids.close()
     for e in 0..<work.finals.count:
@@ -375,4 +382,33 @@ func touches_itself(work: Work*, traced: const Shape*, pieces: const Pieces*, pi
                     if edge_index(use) == e: bounds = true
             if bounds: continue
             if (try piece_holds(work, traced, f, pieces, q, middle)) and (try piece_holds(work, traced, f, pieces, q, quarter)) and (try piece_holds(work, traced, f, pieces, q, three)): return true
+    return false
+
+## Whether faces the tangencies note touch along a section where the
+## operation keeps material on neither side between them, and a kept piece
+## of each face reaches that section (bounded by it or holding it).
+func pinched(work: Work*, traced: const Shape*, pieces: const Pieces*, piece_face: const usize[], keep: const bool[], op: i64) -> bool!:
+    let w = &work.w
+    for touch in work.tangencies.view():
+        if not ((op == op_union and not touch.same) or (op == op_subtract and touch.same)): continue
+        for at in 0..<work.sections.count:
+            let section = work.sections.items[at]
+            let pair = (section.fa == (i64)touch.fa and section.fb == (i64)touch.fb) or (section.fa == (i64)touch.fb and section.fb == (i64)touch.fa)
+            if not pair: continue
+            let id = work.section_ids.items[at]
+            let e = edge_index(id)
+            let edge = work.finals.items[e]
+            let middle = try w.at(edge.carrier, (edge.t0 + edge.t1) * 0.5)
+            if (try kept_reaches(work, traced, pieces, piece_face, keep, touch.fa, e, middle)) and (try kept_reaches(work, traced, pieces, piece_face, keep, touch.fb, e, middle)): return true
+    return false
+
+## Whether a kept piece of face `f` has final edge `e` on its boundary or
+## holds `p` (on it).
+func kept_reaches(work: Work*, traced: const Shape*, pieces: const Pieces*, piece_face: const usize[], keep: const bool[], f: usize, e: usize, p: Vector3) -> bool!:
+    for q in 0..<pieces.piece_count():
+        if not keep[q] or piece_face[q] != f: continue
+        for c in pieces.piece_cycles(q):
+            for use in pieces.cycle(c):
+                if edge_index(use) == e: return true
+        if try piece_holds(work, traced, f, pieces, q, p): return true
     return false

@@ -1,0 +1,83 @@
+## Offsets of B-spline faces (the SMLib study's item 6, its S2 and S3). A
+## B-spline face's offset is fitted as a B-spline within the tolerance
+## (modeling/offset_surface.lucb), a profile swept straight staying one,
+## swept further so a neighbor moved past its end still meets it; a moved
+## face's B-spline neighbor follows it along their traced meeting curve.
+## A box whose uprights are rounded G2 (B-spline strips of 5): shelled 1
+## inside, closed and with its top opened (both refused before, blaming a
+## wall thinner than the shell); the closed shell and the body every face
+## of which is offset 1 in together make the box again; offset 1 out and
+## back in, the box again; offset 2 in, each strip's middle 2 inside its
+## old one along the old normal.
+from luce_cad.modeling import CadModeling, CadDirect
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return found
+
+## The volume of `model`, extrapolated from 32 and 64 divisions, its
+## meshes closed.
+func refined(model: CadModel) -> float!:
+    let coarse = model.tessellate(32)
+    closed(coarse)
+    let fine = model.tessellate(64)
+    closed(fine)
+    return volume(fine) + (volume(fine) - volume(coarse)) / 3.0
+
+func near(value: float, expected: float, within: float, what: str) -> unit!:
+    if math.abs(value - expected) > within: print(f"{what}: {value} against {expected}")
+    assert(math.abs(value - expected) <= within)
+
+## Every face name of `model`, `;` between.
+func all_faces(model: CadModel) -> str!:
+    var names = ""
+    for face in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, face)
+        names = name if names.length == 0 else names + ";" + name
+    return names
+
+pub func offset_spline_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "r")
+    let upright = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9 and math.abs(a.y - b.y) > 1e-6
+    let rounded = CadModeling.filleted(box, CadModeling.edge_references(box, edges_where(box, upright)), 5.0, "g", 2)
+    let whole = refined(rounded)
+    # Shelled 1 inside, closed: the void is the body offset 1 in.
+    let shell = CadModeling.shelled(rounded, "", 1.0, "w")
+    let inner = CadDirect.offset_faces(rounded, all_faces(rounded), -1.0, false)
+    near(refined(shell) + refined(inner), whole, 0.02, "closed shell and its void")
+    # Its top opened.
+    var top = ""
+    for face in 0..<rounded.face_count():
+        let name = CadModeling.face_name_of(rounded, face)
+        let at = CadModeling.face_point(rounded, name)
+        if at.found and at.normal.y > 0.999 and at.point.y > 9.0: top = name
+    let open = CadModeling.shelled(rounded, top, 1.0, "w")
+    assert(refined(open) > refined(shell) * 0.8 and refined(open) < refined(shell))
+    # Out and back.
+    let out = CadDirect.offset_faces(rounded, all_faces(rounded), 1.0, false)
+    let back = CadDirect.offset_faces(out, all_faces(out), -1.0, false)
+    near(refined(back), whole, 0.02, "offset out and back")
+    # Each strip offset 2 in: its point (face_point's, at its middle) lies 2
+    # inside the old one along the old normal there.
+    let deeper = CadDirect.offset_faces(rounded, all_faces(rounded), -2.0, false)
+    for face in 0..<rounded.face_count():
+        let name = CadModeling.face_name_of(rounded, face)
+        if not name.starts_with("g/"): continue
+        let before = CadModeling.face_point(rounded, name)
+        let after = CadModeling.face_point(deeper, name)
+        assert(before.found and after.found)
+        # The new face's point lies 2 in from the old surface along the old
+        # normal there: its distance from the old point's tangent plane.
+        near(before.point.subtract(after.point).dot(before.normal), 2.0, 1e-3, "a strip offset 2 in")
+    print("PASS B-spline offsets: a box rounded G2 shelled 1 closed (with its void, the body offset 1 in, it makes the box) and opened at its top; offset 1 out and back in, the box; strips offset 2 in lie 2 inside along their normals")

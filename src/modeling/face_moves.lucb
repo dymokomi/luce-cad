@@ -49,9 +49,9 @@ func moved_surface(w: const Shape*, f: usize, m: const FaceMove*, distance: f64)
     let face = w.faces.items[f]
     let s = &w.surfaces.items[(usize)face.surface]
     if m.kind == move_offset:
-        if s.kind == surface_spline: error(invalid, "Offset Face needs planes, cylinders, cones, spheres or tori: this face is a B-spline")
         # Outward is the surface's normal when the face runs with it.
         let d = distance if face.sense else -distance
+        if s.kind == surface_spline: return try offset_spline(s, d, w.tolerance)
         if s.kind == surface_plane:
             return try Surface(s.kind, s.origin.add(s.z.multiply_scalar(d)), s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv)
         if s.kind == surface_torus:
@@ -450,16 +450,26 @@ func seam_carrier(w: const Shape*, c: const Carrier*, start: Vector3, end: Vecto
 ## two planes the line through them; else the curve of their surfaces'
 ## meeting through both, nearest `hint` (where the edge ran: a closed
 ## edge's ends are one point).
-func meeting_carrier(w: const Shape*, fa: usize, fb: usize, start: Vector3, end: Vector3, hint: Vector3) -> Carrier!:
+func meeting_carrier(w: Shape*, fa: usize, fb: usize, start: Vector3, end: Vector3, hint: Vector3) -> Carrier!:
     let sa = &w.surfaces.items[(usize)w.faces.items[fa].surface]
     let sb = &w.surfaces.items[(usize)w.faces.items[fb].surface]
     if sa.kind == surface_plane and sb.kind == surface_plane:
         let d = end.subtract(start)
         if d.length() <= w.tolerance * 10.0: error(invalid, "an edge would shrink to nothing: the move changes the body's shape too much")
         return Carrier(curve_line, start, try d.normalized(), Vector3(), 0.0, 0.0, -1)
-    if sa.kind == surface_spline or sb.kind == surface_spline: error(invalid, "a B-spline face next to a moved face cannot follow it yet")
     var curves = Growing[Carrier]()
     defer curves.close()
+    if sa.kind == surface_spline or sb.kind == surface_spline:
+        # A B-spline face: where it meets the other, in closed form where
+        # the booleans have one (a plane across a profile swept straight),
+        # else traced round the edge.
+        if not try spline_meet(w, fa, fb, w.tolerance, &curves):
+            let (la, ha) = try face_box(w, fa)
+            let (lb, hb) = try face_box(w, fb)
+            let size = upper(ha, hb).subtract(lower(la, lb)).length()
+            let reach = Vector3(1.0, 1.0, 1.0).multiply_scalar(end.subtract(start).length() * 0.5 + size * 0.02)
+            try marched(w, fa, fb, lower(lower(start, end), hint).subtract(reach), upper(upper(start, end), hint).add(reach), size, w.tolerance, &curves)
+        return try nearest_spline_carrier(w, curves.view(), start, end, hint)
     let met = try meet(sa, sb, w.tolerance, &curves)
     if met != meet_curves: error(invalid, "a moved face no longer meets its neighbor along a curve this can follow")
     # The curve through both ends, nearest the hint.
@@ -475,6 +485,33 @@ func meeting_carrier(w: const Shape*, fa: usize, fb: usize, start: Vector3, end:
             best = (i64)at
     if best < 0: error(invalid, "a moved face no longer meets its neighbor where the edge runs")
     return curves.items[(usize)best]
+
+## Of `curves` (any kind, B-splines' nets in `w`), the one passing through
+## `start` and `end`, nearest `hint`.
+func nearest_spline_carrier(w: Shape*, curves: const Carrier[], start: Vector3, end: Vector3, hint: Vector3) -> Carrier!:
+    var best: i64 = -1
+    var best_distance = 1.0e300
+    for at in 0..<curves.length:
+        let c = curves[at]
+        let index = try w.add_carrier(c)
+        let low = 0.0
+        let high = 1.0 if c.kind == curve_spline else 2.0 * math.pi
+        if c.kind == curve_line:
+            if math.max(carrier_gap(&c, start), carrier_gap(&c, end)) > w.tolerance * 100.0: continue
+            let away = carrier_gap(&c, hint)
+            if away < best_distance:
+                best_distance = away
+                best = (i64)at
+            continue
+        let gap_start = (try w.at(index, try nearest_on(w, index, start, low, high))).subtract(start).length()
+        let gap_end = (try w.at(index, try nearest_on(w, index, end, low, high))).subtract(end).length()
+        if math.max(gap_start, gap_end) > w.tolerance * 100.0: continue
+        let away = (try w.at(index, try nearest_on(w, index, hint, low, high))).subtract(hint).length()
+        if away < best_distance:
+            best_distance = away
+            best = (i64)at
+    if best < 0: error(invalid, "a moved face no longer meets its B-spline neighbor where the edge runs")
+    return curves[(usize)best]
 
 ## How far `p` is from carrier `c` (a line, circle or ellipse).
 func carrier_gap(c: const Carrier*, p: Vector3) -> f64:

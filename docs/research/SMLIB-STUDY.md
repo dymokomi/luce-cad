@@ -858,8 +858,30 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   Tangent contact sections are noted, and the results that would be non-manifold are refused
   with a message naming it: B1, B2 and B6 (B2 meshed open before, silently), with a check that
   no kept face passes through an edge of the result. B3 and B5 are unchanged. Regression:
-  `touching_tests`. Still open: tangency classified from the surfaces' curvatures, gap repair,
-  zones as sums of tolerances.
+  `touching_tests`. Then: a section is a tangency when the faces' normals are parallel along it
+  (to a thousandth of a radian, as a traced B-spline's are) and stepping off it across one face, a
+  little and further, stays on one side of the other face's surface: the Dupin test of the faces'
+  relative curvature, measured (faces crossing at a shallow angle fall on either side). A result
+  whose kept faces both reach such a section where the operation keeps nothing between them is
+  refused as non-manifold even when it closes: a pipe grazing a box's top and bottom from inside,
+  taken from it, merged the faces either side of each line and meshed open before. Merged vertices
+  meet within the sum of their zones (five tolerances each, or a tolerant entity's precision; a
+  vertex's zone grows to the larger), and a written vertex's precision holds its edges'. Still
+  open: gap repair (a lone vertex squeezed onto its partner before refusing), section precision
+  from the traced deviation, and a B-spline tangency case built exactly (a G2 strip's tangent
+  plane needs the strip's own extreme).
+
+- **6, B-spline offsets (part).** A B-spline face's offset is fitted within the tolerance by
+  interpolation at the Greville points of the base's knots (each interior breakpoint once more,
+  spans halved until the fit holds at their middles; `modeling/offset_surface.lucb`); a profile
+  swept straight stays one, swept further at both ends so a neighbor moved past its old end still
+  meets it; a moved face and its B-spline neighbor meet along the booleans' curve (closed form for a
+  plane across a swept profile, else traced). S2 and S3 run, closed: 1699.144 and 2013.059 (SMLib
+  1717.846 and 2034.240, whose G2 strips are a different, faired quintic, as in B8); the closed
+  shell and the body offset 1 in make the rounded box again within 0.02, offset 1 out and back in
+  too. A shell's refusal now gives the inner wall's own reason. Still open: extending other
+  B-splines (end-span continuation), offsets of rational bases kept rational, and the surface
+  extension operator as a modeling tool of its own.
 
 - **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
   plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was

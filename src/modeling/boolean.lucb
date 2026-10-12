@@ -86,6 +86,9 @@ struct Work:
     var chosen: Growing[bool]
     ## Faces touching along sections (note_tangency).
     var tangencies: Growing[Tangency] = Growing[Tangency]()
+    ## Each merged vertex's zone: how far from it a point is still it
+    ## (the work's own tolerance, or a tolerant entity's precision).
+    var zones: Growing[f64] = Growing[f64]()
 
     func close():
         self.w.close()
@@ -96,6 +99,7 @@ struct Work:
         self.imprints.close()
         self.coincident.close()
         self.tangencies.close()
+        self.zones.close()
         self.finals.close()
         self.piece_ids.close()
         self.piece_starts.close()
@@ -108,11 +112,17 @@ struct Work:
 
     ## The merged vertex at `p`, merging within `slack` too (a tolerant
     ## edge's or vertex's precision: Parasolid's tolerant modeling).
+    ## Two points are one vertex when they are nearer than their zones
+    ## together (SMLib's rule): each zone five tolerances, or a tolerant
+    ## entity's precision; the vertex's zone grows to the larger.
     func vertex_within(p: Vector3, slack: f64) -> i64!:
-        let reach = math.max(self.tol * 10.0, slack)
+        let zone = math.max(self.tol * 5.0, slack)
         for at in 0..<self.vertices.count:
-            if self.vertices.items[at].subtract(p).length() <= reach: return (i64)at
+            if self.vertices.items[at].subtract(p).length() <= zone + self.zones.items[at]:
+                self.zones.items[at] = math.max(self.zones.items[at], zone)
+                return (i64)at
         try self.vertices.push(p)
+        try self.zones.push(zone)
         return (i64)self.vertices.count - 1
 
     ## The merged vertex for a new edge's end at `p` across faces `fa` and
@@ -534,18 +544,35 @@ func add_sections(work: Work*, lookup: Lookup*, c: i64, closed: bool, low: f64, 
         try work.sections.push(Section(ShapeEdge(c, t0, t1, start, end), (i64)fa, (i64)fb))
         try note_tangency(work, fa, fb, c, t0, t1)
 
-## The faces' normals parallel along section `c` (t0..t1, at a quarter,
-## half and three quarters): they touch there, not cross.
+## Whether faces `fa` and `fb` touch along section `c` (t0..t1) rather
+## than cross it, noted as a tangency. At a quarter, half and three quarters
+## along, their normals must be parallel (to a thousandth of a radian, as a
+## traced B-spline's are), and the faces must part to one side: stepping off
+## the section across face `fa` both ways, a little and further, its points
+## stay on one side of `fb`'s surface. That is the Dupin indicatrix test,
+## made by measuring: faces tangent along a curve have no relative curvature
+## along it and a definite one across it, while faces crossing at a shallow
+## angle (normals nearly parallel too) fall on either side.
 func note_tangency(work: Work*, fa: usize, fb: usize, c: i64, t0: f64, t1: f64) -> !:
     let w = &work.w
     var agree: f64 = 0.0
     for fraction in [0.25, 0.5, 0.75]:
-        let p = try w.at(c, t0 + (t1 - t0) * fraction)
+        let t = t0 + (t1 - t0) * fraction
+        let p = try w.at(c, t)
         let na = try w.face_normal(fa, p)
         let nb = try w.face_normal(fb, p)
         let dot = na.dot(nb)
-        if math.abs(dot) < 1.0 - 1e-9: return
+        if math.abs(dot) < 1.0 - 5e-7: return
         agree = dot
+        let along = w.tangent(c, t) catch failure: recover Vector3()
+        let sideways = na.cross(along).normalized() catch failure: recover Vector3()
+        if sideways.length() == 0.0: continue
+        for reach in [work.size * 1e-3, work.size * 1e-2]:
+            var sides: f64[2] = [0.0, 0.0]
+            for k in 0..<(usize)2:
+                let q = try nearest_on_surface(w, fa, p.add(sideways.multiply_scalar(reach if k == 0 else -reach)))
+                sides[k] = q.subtract(try nearest_on_surface(w, fb, q)).dot(nb)
+            if sides[0] * sides[1] < 0.0 and math.min(math.abs(sides[0]), math.abs(sides[1])) > work.tol * 10.0: return
     try work.tangencies.push(Tangency(fa, fb, agree > 0.0))
 
 ## A stretch of closed traced curve `c` (parameters low..high) from t0

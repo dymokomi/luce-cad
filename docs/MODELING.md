@@ -323,12 +323,16 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    Curves of one face pair crossing each other are cut where they cross, at one vertex: two equal
    pipes crossing meet in two ellipses that cross where the pipes touch.
 
-   A section along which the two faces are tangent (normals parallel at a quarter, half and three
-   quarters of it) is a touching contact. Joined where they touch from outside, or subtracted where
-   one lies inside the other touching its face, the bodies would leave an edge four faces meet at:
-   the operation refuses, naming the result non-manifold. So does a result whose edges are each
-   used twice but where a kept face passes through one of them (no thickness there), and one whose
-   only open edges are such four-face edges.
+   A section along which the two faces are tangent is a touching contact: at a quarter, half and
+   three quarters of it their normals are parallel (to a thousandth of a radian) and stepping off it
+   across one face, both ways, stays on one side of the other (the faces part, they do not cross).
+   Joined where they touch from outside, or subtracted where one lies inside the other touching its
+   face, the bodies would leave an edge four faces meet at: the operation refuses, naming the result
+   non-manifold. So does a result whose edges are each used twice but where a kept face passes
+   through one of them (no thickness there), one whose kept faces both reach such a contact (their
+   pieces either side merged, it closes but is pinched to nothing there), and one whose only open
+   edges are such four-face edges. Vertices merge within the sum of their zones: five tolerances
+   each, or a tolerant edge's or vertex's precision; a written vertex's precision holds its edges'.
    Coincident faces imprint each other's boundaries.
 4. **Shared edges.** Edges are cut at every crossing. Pieces with the same ends and middle are one
    edge, so the faces on both sides share it.
@@ -1035,8 +1039,14 @@ faces take new surfaces and the body keeps its topology. Built directly, without
   faces no longer meet in one point, a flat face whose loop would turn inside out: "the move changes
   the body's shape too much". A face tangent to a chosen one (a fillet's strip beside the face it
   rounds) would no longer meet it, so it must move too: Offset's tangent chain takes it along; a
-  Move without it is refused. B-spline faces next to a chosen one, and B-spline chosen faces for an
-  offset, are refused.
+  Move without it is refused.
+- **B-spline faces.** A chosen B-spline face's offset is a B-spline fitted within the model's
+  tolerance (`offset_surface.lucb`): the base's degree and breakpoints, each interior breakpoint once
+  more (the offset is one order less smooth), interpolated at the knots' Greville points, every span
+  halved until it holds at the spans' middles. A profile swept straight (a G2 or G3 blend's strip)
+  stays one and is swept four offsets further both ways, so a neighbor moved out past its old end
+  still meets it. A moved face and a B-spline neighbor meet along the booleans' curve: in closed form
+  where they have one (a plane across a swept profile), else traced round the edge.
 
 The result is checked closed. Not checked yet: a moved face passing through a far part of the
 body (a self-intersection), which needs the booleans' face pairs.
@@ -1116,9 +1126,9 @@ removed faces the inner body lies wholly inside: a closed void, a second shell.
 
 Faces offset as Offset Face's do, so a box's rounded uprights of 0.3 give a hollow rounded by 0.2
 for a wall of 0.1. A wall thicker than a rounded face's radius, or one that would change the body's
-topology, is refused: "the shell's thickness is too large for this body". The inner wall's faces are
-named `<tag>/` and the face's own name. B-spline faces are not offset yet (they would need a fitted
-degree 5 approximation).
+topology, is refused: "the shell's thickness is too large for this body", with the inner wall's own
+reason after it. The inner wall's faces are named `<tag>/` and the face's own name. B-spline faces are offset as
+Offset Face's are: a box rounded G2 shells closed or opened at its top.
 
 ### Every edge rounded whole (`rounded.lucb`)
 
@@ -2010,8 +2020,11 @@ Roughly in order of usefulness:
    solids, and Fusion's Sweep and Loft dialogs on sketches).
 7. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
 8. **Non-manifold results:** bodies touching along a line or a face (a box and a pipe lying on
-   it, joined; a pipe inside a box touching its wall, subtracted) are refused as non-manifold.
-9. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
+   it, joined; a pipe inside a box touching its wall, subtracted; a pipe grazing a box's top and
+   bottom, taken from it) are refused as non-manifold.
+9. **Offsets where faces vanish or reconnect** (a shell thicker than a fillet's radius), B-spline
+   offsets of other than profiles swept straight past their surfaces' ends (no extension yet), and
+   draft; Delete healing several faces at once beside curved faces
    beyond a band round one face (strips apart, inside corners).
 10. **Needles where shared samples crowd:** a grid line of one face crossing a shared edge a hair
    from one of its samples becomes a station beside it, and both faces keep a needle there (the

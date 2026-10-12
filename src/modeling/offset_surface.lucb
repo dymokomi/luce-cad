@@ -1,0 +1,201 @@
+## This file: a B-spline surface's offset (base + d · normal), fitted as a
+## B-spline to the model's tolerance, for Offset Face, Move and Shell on
+## B-spline faces (face_moves.lucb). The offset is as smooth as the base's
+## normal, one order less than the base: it keeps the base's degree and
+## breakpoints, each interior breakpoint once more (a G2 strip's C2 joins
+## become C1). The fit interpolates the exact offset at the Greville points
+## of those knots (a collocation, solved per row and per column), and
+## halves every span until it stays within the tolerance at the spans'
+## middles, at most seven times. A profile swept straight (an extruded
+## blend) stays one: its offset is the offset profile swept the same way,
+## and it is swept four offsets further both ways, so a neighbor moved out
+## past its old end (a shell's opened top) still meets it.
+
+## The offset of B-spline `s` by `d` along its normal (nurbs_normal's
+## side), within `tolerance`.
+func offset_spline(s: const Surface*, d: f64, tolerance: f64) -> Surface!:
+    var ku = Growing[f64]()
+    defer ku.close()
+    var kv = Growing[f64]()
+    defer kv.close()
+    # A profile swept straight offsets to one swept straight: its sweep
+    # needs no more spans.
+    let (swept, _) = extrusion_of(s)
+    for round in 0..<(usize)8:
+        try offset_knots(s.ku, s.du, (usize)s.nu, round, &ku)
+        try offset_knots(s.kv, s.dv, (usize)s.nv, 0 if swept else round, &kv)
+        let made = try offset_fit(s, d, ku.view(), kv.view())
+        if (try offset_error(s, d, &made)) <= tolerance:
+            if not swept: return made
+            defer made.close()
+            return try swept_further(&made, math.abs(d) * 4.0)
+        made.close()
+    error(invalid, "a B-spline face's offset does not fit within the tolerance (its curvature is too near the offset)")
+
+## Knots for the offset along one direction of a base with `knots` (of
+## `degree`, `count` control points): the same degree and breakpoints, each
+## interior breakpoint's multiplicity one more (up to the degree), every
+## span halved `round` times.
+func offset_knots(knots: const f64[], degree: i64, count: usize, round: usize, out: Growing[f64]*) -> !:
+    out.clear()
+    let p = (usize)degree
+    let low = knots[p]
+    let high = knots[count]
+    for _ in 0..<p + 1: try out.push(low)
+    var at = p + 1
+    var previous = low
+    while at < count:
+        let value = knots[at]
+        var times: usize = 0
+        while at < count and knots[at] == value:
+            times += 1
+            at += 1
+        try span_halves(previous, value, round, out)
+        for _ in 0..<(p if times + 1 > p else times + 1): try out.push(value)
+        previous = value
+    try span_halves(previous, high, round, out)
+    for _ in 0..<p + 1: try out.push(high)
+
+## The interior knots splitting [a, b] into 2^round equal spans.
+func span_halves(a: f64, b: f64, round: usize, out: Growing[f64]*) -> !:
+    let pieces = (usize)1 << round
+    for k in 1..<pieces: try out.push(a + (b - a) * (f64)k / (f64)pieces)
+
+## The point of the exact offset at knot values (u, v) of the base (whose
+## domain the fit shares).
+func offset_point(s: const Surface*, d: f64, u: f64, v: f64) -> Vector3!:
+    let uv = normalized(s, u, v)
+    let n = try nurbs_normal(*s, uv)
+    if n.length() < 0.5: error(invalid, "a B-spline face has a point with no normal (a pole or a fold): its offset is not made")
+    return (try evaluate(*s, uv)).add(n.multiply_scalar(d))
+
+## The B-spline on knots `ku` and `kv` (of the base's degrees) through the
+## exact offset at their Greville points.
+func offset_fit(s: const Surface*, d: f64, ku: const f64[], kv: const f64[]) -> Surface!:
+    let p = (usize)s.du
+    let q = (usize)s.dv
+    let nu = ku.length - p - 1
+    let nv = kv.length - q - 1
+    if nu * nv > 65536: error(invalid, "a B-spline face's offset needs more than 65,536 control points")
+    let gu = try new f64[nu] --- in memory.heap
+    defer free(gu) in memory.heap
+    let gv = try new f64[nv] --- in memory.heap
+    defer free(gv) in memory.heap
+    for i in 0..<nu: gu[i] = greville_of(ku, p, i)
+    for j in 0..<nv: gv[j] = greville_of(kv, q, j)
+    # The exact offset at every pair, then each row solved along u, then
+    # each column along v.
+    let values = try new Vector3[nu * nv] --- in memory.heap
+    defer free(values) in memory.heap
+    for i in 0..<nu:
+        for j in 0..<nv: values[i * nv + j] = try offset_point(s, d, gu[i], gv[j])
+    let along_u = try collocation(ku, p, gu)
+    defer free(along_u) in memory.heap
+    let along_v = try collocation(kv, q, gv)
+    defer free(along_v) in memory.heap
+    let column = try new Vector3[nu if nu > nv else nv] --- in memory.heap
+    defer free(column) in memory.heap
+    for j in 0..<nv:
+        for i in 0..<nu: column[i] = values[i * nv + j]
+        try solve_dense(along_u, nu, column[..<nu])
+        for i in 0..<nu: values[i * nv + j] = column[i]
+    for i in 0..<nu:
+        for j in 0..<nv: column[j] = values[i * nv + j]
+        try solve_dense(along_v, nv, column[..<nv])
+        for j in 0..<nv: values[i * nv + j] = column[j]
+    let weights = try new f64[nu * nv] --- in memory.heap
+    defer free(weights) in memory.heap
+    for at in 0..<weights.length: weights[at] = 1.0
+    return try Surface(surface_spline, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, values, weights, ku, kv, (i64)nu, (i64)nv, s.du, s.dv)
+
+## The Greville point of control point `i` on `knots` of `degree`.
+func greville_of(knots: const f64[], degree: usize, i: usize) -> f64:
+    var sum: f64 = 0.0
+    for k in 1..<degree + 1: sum += knots[i + k]
+    return sum / (f64)degree
+
+## The n × n collocation matrix of the bases on `knots` (of `degree`) at
+## `points`, row by row.
+func collocation(knots: const f64[], degree: usize, points: const f64[]) -> f64[]!:
+    let n = points.length
+    let matrix = try new f64[n * n] --- in memory.heap
+    for at in 0..<matrix.length: matrix[at] = 0.0
+    var values: f64[12]
+    for i in 0..<n:
+        let first = nurbs_basis(knots, (i64)n, (i64)degree, points[i], &values)
+        for k in 0..<degree + 1:
+            if first + k < n: matrix[i * n + first + k] = values[k]
+    return matrix
+
+## Solve `matrix` (n × n, row by row; left as it was) x = `rhs` in place,
+## by elimination with partial pivoting on a copy.
+func solve_dense(matrix: const f64[], n: usize, rhs: Vector3[]) -> !:
+    let a = try new f64[n * n] --- in memory.heap
+    defer free(a) in memory.heap
+    for at in 0..<a.length: a[at] = matrix[at]
+    for column in 0..<n:
+        var pivot = column
+        for row in column + 1..<n:
+            if math.abs(a[row * n + column]) > math.abs(a[pivot * n + column]): pivot = row
+        if math.abs(a[pivot * n + column]) < 1e-14: error(invalid, "a B-spline offset's collocation is singular")
+        if pivot != column:
+            for k in 0..<n:
+                let swap = a[column * n + k]
+                a[column * n + k] = a[pivot * n + k]
+                a[pivot * n + k] = swap
+            let swap = rhs[column]
+            rhs[column] = rhs[pivot]
+            rhs[pivot] = swap
+        for row in column + 1..<n:
+            let factor = a[row * n + column] / a[column * n + column]
+            if factor == 0.0: continue
+            for k in column..<n: a[row * n + k] -= factor * a[column * n + k]
+            rhs[row] = rhs[row].subtract(rhs[column].multiply_scalar(factor))
+    var row = n
+    while row > 0:
+        row -= 1
+        var sum = rhs[row]
+        for k in row + 1..<n: sum = sum.subtract(rhs[k].multiply_scalar(a[row * n + k]))
+        rhs[row] = sum.multiply_scalar(1.0 / a[row * n + row])
+
+## The fit's largest distance from the exact offset at the middles of its
+## spans (and between them).
+func offset_error(s: const Surface*, d: f64, made: const Surface*) -> f64!:
+    var worst: f64 = 0.0
+    let p = (usize)made.du
+    let q = (usize)made.dv
+    for i in p..<(usize)made.nu:
+        let a = made.ku[i]
+        let b = made.ku[i + 1]
+        if not (b > a): continue
+        for j in q..<(usize)made.nv:
+            let c = made.kv[j]
+            let e = made.kv[j + 1]
+            if not (e > c): continue
+            for (fu, fv) in [(0.5, 0.5), (0.25, 0.25), (0.75, 0.75), (0.25, 0.75), (0.75, 0.25)]:
+                let u = a + (b - a) * fu
+                let v = c + (e - c) * fv
+                let exact = try offset_point(s, d, u, v)
+                worst = math.max(worst, (try evaluate(*made, normalized(made, u, v))).subtract(exact).length())
+    return worst
+
+## Knot values (u, v) of `s` as its normalized parameters (evaluate's).
+func normalized(s: const Surface*, u: f64, v: f64) -> Vector3:
+    let u0 = s.ku[(usize)s.du]
+    let u1 = s.ku[(usize)s.nu]
+    let v0 = s.kv[(usize)s.dv]
+    let v1 = s.kv[(usize)s.nv]
+    return Vector3((u - u0) / (u1 - u0), (v - v0) / (v1 - v0), 0.0)
+
+## Profile surface `s` (two rows, the second the first moved along the
+## sweep) swept `reach` further at both ends.
+func swept_further(s: const Surface*, reach: f64) -> Surface!:
+    let points = try new Vector3[s.points.length] --- in memory.heap
+    defer free(points) in memory.heap
+    for u in 0..<(usize)s.nu:
+        let a = s.points[u * 2]
+        let b = s.points[u * 2 + 1]
+        let along = b.subtract(a).normalized() catch failure: recover Vector3()
+        points[u * 2] = a.subtract(along.multiply_scalar(reach))
+        points[u * 2 + 1] = b.add(along.multiply_scalar(reach))
+    return try Surface(surface_spline, s.origin, s.x, s.z, s.radius, s.angle, points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv)
