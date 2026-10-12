@@ -29,7 +29,7 @@ does today.
 | `profile_fills(set, keys)` | The regions of the profiles `keys` names (empty: every profile), triangulated flat on the plane by the trim mesher (`polygons/`), to shade them. A region whose loops touch is left out. |
 | `profile_anchor(set, keys)` | Where a feature's arrow stands on those profiles (empty: the closed shapes Extrude takes): a point inside them (the middle of their area when it lies on them, else of their largest triangle), the plane's normal, their area. |
 | `inside(model, point)` | Whether a point lies inside a closed solid, by rays through its exact faces (`rays.lucb`): what an automatic Join or Cut asks. |
-| `shelled(model, faces, thickness, tag, side)` | Shell: hollowed to a wall `thickness` thick, the faces named opened (none: a closed void), the wall inside (`0`), outside (`1`) or half each way (`2`). |
+| `shelled(model, faces, thickness, tag, side, chain, outside_thickness)` | Shell: hollowed to a wall `thickness` thick, the faces named opened (none: a closed void), the wall inside (`0`), outside (`1`) or both ways (`2`): half each way, or with `outside_thickness` 0 or more Fusion's Inside (`thickness`) and Outside thicknesses. With `chain` (Fusion's Tangent chain) the faces meeting opened ones tangentially open too. |
 | `combined(a, b, operation)` | Combine: `0` join, `1` cut (`a` without `b`), `2` intersect. Fusion's Keep Tools is the caller keeping `b`; several tools are combined one after another. |
 | `split_by_plane(model, origin, normal, tag)`, `split_by_face(model, tool, face, tag)` | Split Body: the piece on the plane's normal side (inside a curved face's surface) and the piece beyond, as two lumps of one model. |
 | `sliced(model, origin, normal, tag)` | Fusion's sketch Slice: what lies behind the plane (against its normal), the half-space in front taken away and the cut capped by faces named `<tag>/to/f<i>`; the model itself when nothing of it is in front; refused when all of it is. |
@@ -53,6 +53,9 @@ takes them, several apart by `;`:
 | `moved_faces(model, faces, by)`, `rotated_faces(model, faces, origin, axis, angle)` | Move Face: translated, or turned about a line. |
 | `replaced_faces(model, faces, target, target_face)` | Replace Face: the faces on another face's surface instead. |
 | `deleted_faces(model, faces)` | Delete with healing: holes and bosses whole, or one fillet, chamfer or corner face. |
+| `split_faces(model, faces, tool, tool_face, tag)`, `split_faces_by_plane(model, faces, origin, normal, tag)` | Fusion's Split Face: the faces split where a face's surface (extended) or a plane crosses them; one closed solid with the new edges. The pieces on the surface's outer side (a plane's normal side, the side a tool face faces; outside a curved surface) are named `<tag>/split[<name>]`, the others keep the face's name, so each can be picked apart. |
+| `tangent_chain(model, faces)` | Fusion's Tangent chain: the faces and every face meeting them tangentially, and so on, by name. |
+| `copied_faces(model, faces, prefix)` | Move/Copy of faces with Create copy: an open surface body of copies of the faces, their names with `prefix` before them. |
 | `face_names(model, faces)` | The names of B-rep face numbers (a pick's), apart by `;`. |
 
 Edit CAD (luced-3d's direct modeling) reaches these through the viewport's pick mesh, with
@@ -696,6 +699,12 @@ body (a self-intersection), which needs the booleans' face pairs.
 The edges running into the gap keep their carriers, lengthened to the new corners. Anything else is
 refused, saying what Delete heals. A box's top, say, has four parallel-sided neighbors that cannot
 close over it.
+
+**Split Face** (`face_split.lucb`) runs the booleans' first steps: the surface, as the faces of
+its solid lying on it (a plane's large square, a curved surface's long wall), meets only the chosen
+faces; each is split along the new edges, whose ends cut the edges of the faces beside it, and every
+piece is kept as it is, none merged back. A surface that crosses none of the faces, or lies on one of
+them, is refused.
 
 ### Shell (`shell.lucb`)
 

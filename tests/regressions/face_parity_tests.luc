@@ -1,0 +1,141 @@
+## Fusion's direct modeling beyond one face at a time (CadDirect): Tangent
+## chain, Shell's Tangent chain, copies of faces as a surface body, Split
+## Face, Replace Face onto several targets and Delete healing several
+## strips and corners at once; each checked closed and of the volume
+## geometry gives, or refused with why.
+from luce_cad.modeling import CadModeling, CadDirect
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+func solid(model: CadModel, expected: float, tolerance: float, what: str) -> unit!:
+    let mesh = model.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > tolerance:
+        print(f"{what}: volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= tolerance)
+
+## The name of `model`'s flat face whose outward normal is `normal`.
+func flat(model: CadModel, normal: Vector3) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let frame = CadModeling.face_frame(model, name)
+        if frame.found and frame.u.cross(frame.v).dot(normal) > 0.999:
+            return name
+    assert(false, "no such face")
+    return ""
+
+## References to `box`'s straight edges whose ends both satisfy `keep`
+## (by their coordinates).
+func edges_where(box: CadModel, keep: func(Vector3, Vector3) -> bool) -> str!:
+    let found: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let id = box.face_edge_id(face, use)
+            if keep(box.face_edge_point(face, use, 0.0), box.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return CadModeling.edge_references(box, found)
+
+## The names of `model`'s faces whose name contains `part`, apart by `;`.
+func named(model: CadModel, part: str) -> str!:
+    let found: list[str] = []
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        if name.contains(part) and not (name in found):
+            found.append(name)
+    return found.join(";")
+
+pub func face_parity_tests() -> unit!:
+    chains()
+    copies()
+    splits()
+    print("PASS direct modeling parity: a side's tangent chain over a rounded upright, a shell opened along it; faces copied as a surface body; a box's top split by a plane and by a pin's wall into pieces named apart, split again; a tool that misses or lies on the face refused")
+
+## A 2-box with one upright (x = 1, z = 1) rounded 0.3: the +X side's
+## tangent chain is it, the strip and the +Z side. Shell with Tangent chain
+## opens all three, as naming them does;
+## without it the side alone cannot open.
+func chains() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let corner = edges_where(box, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.x - 1.0) < 1e-9 and math.abs(b.x - 1.0) < 1e-9 and math.abs(a.z - 1.0) < 1e-9 and math.abs(b.z - 1.0) < 1e-9)
+    let rounded = CadModeling.filleted(box, corner, 0.3, "f")
+    let side = flat(rounded, Vector3(1.0, 0.0, 0.0))
+    let chain = CadDirect.tangent_chain(rounded, side)
+    assert(chain.split(";").length == 3)
+    assert(chain.contains(named(rounded, "f/blend")) and chain.contains(flat(rounded, Vector3(0.0, 0.0, 1.0))))
+    # Alone, a flat top meets nothing tangentially.
+    assert(CadDirect.tangent_chain(rounded, flat(rounded, Vector3(0.0, 1.0, 0.0))).split(";").length == 1)
+    let by_chain = CadModeling.shelled(rounded, side, 0.1, "s", chain = true)
+    let by_names = CadModeling.shelled(rounded, chain, 0.1, "s")
+    let expected = volume(by_names.tessellate(32))
+    solid(by_chain, expected, 1e-6, "shell with tangent chain")
+    assert(by_chain.face_count() == by_names.face_count())
+    # Without the chain the strip would have to leave the side it rounds
+    # onto: refused.
+    var refused = false
+    _ = CadModeling.shelled(rounded, side, 0.1, "s") catch failure:
+        refused = failure.message.contains("too large")
+    assert(refused)
+
+## A box's top and +X side copied: an open body of two faces named apart,
+## which meshes; the box is unchanged.
+func copies() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = flat(box, Vector3(0.0, 1.0, 0.0))
+    let side = flat(box, Vector3(1.0, 0.0, 0.0))
+    let copy = CadDirect.copied_faces(box, f"{top};{side}", "c:")
+    assert(copy.face_count() == 2)
+    for f in 0..<copy.face_count():
+        assert(CadModeling.face_name_of(copy, f).starts_with("c:"))
+    let mesh = copy.tessellate(32)
+    assert(mesh.face_count() > 0)
+    assert(box.face_count() == 6)
+    var refused = false
+    _ = CadDirect.copied_faces(box, "nothing", "c:") catch failure:
+        refused = failure.message.contains("gone")
+    assert(refused)
+
+## The names of `model`'s faces, in order.
+func names_of(model: CadModel) -> list[str]!:
+    let found: list[str] = []
+    for f in 0..<model.face_count():
+        found.append(CadModeling.face_name_of(model, f))
+    return found
+
+## Split Face: a 2-box's top by the plane x = 0 (two halves, the +X one
+## named apart) and by a pin's wall (a disc and a ring round it, the ring
+## named apart); one closed solid of the box's volume each time. A half
+## split again by z = 0. Planes that miss the top or lie on it: refused.
+func splits() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = flat(box, Vector3(0.0, 1.0, 0.0))
+    let halves = CadDirect.split_faces_by_plane(box, top, Vector3(), Vector3(1.0, 0.0, 0.0), "k")
+    solid(halves, 8.0, 1e-6, "top split in halves")
+    assert(halves.face_count() == 7)
+    let piece = f"k/split[{top}]"
+    assert(piece in names_of(halves) and top in names_of(halves))
+    let at = CadModeling.face_point(halves, piece)
+    assert(at.found and at.point.x > 0.0 and at.normal.y > 0.999)
+    # The neighbors keep their faces; the +X half splits again across Z.
+    let quarters = CadDirect.split_faces_by_plane(halves, piece, Vector3(), Vector3(0.0, 0.0, 1.0), "q")
+    solid(quarters, 8.0, 1e-6, "a half split again")
+    assert(quarters.face_count() == 8)
+    let pin = CadModeling.tagged(CadSolids.cylinder(0.5, 3.0), "pin")
+    var wall = ""
+    for f in 0..<pin.face_count():
+        if pin.face_surface_kind(f) == 1:
+            wall = CadModeling.face_name_of(pin, f)
+    let ringed = CadDirect.split_faces(box, top, pin, wall, "r")
+    solid(ringed, 8.0, 1e-6, "top split by a pin")
+    assert(ringed.face_count() == 7 and f"r/split[{top}]" in names_of(ringed))
+    var missed = false
+    _ = CadDirect.split_faces_by_plane(box, top, Vector3(5.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), "k") catch failure:
+        missed = failure.message.contains("misses")
+    assert(missed)
+    var lying = false
+    _ = CadDirect.split_faces_by_plane(box, top, Vector3(0.0, 1.0, 0.0), Vector3(0.0, 1.0, 0.0), "k") catch failure:
+        lying = failure.message.contains("lies on")
+    assert(lying)

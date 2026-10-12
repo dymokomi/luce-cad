@@ -1,0 +1,105 @@
+## Split Face (Fusion's): faces of a body split where a surface crosses
+## them (a plane, or a face's surface extended past the face). The body
+## keeps its shape and stays one closed solid; it gains the edges along the
+## cut, and the faces next to the split ones gain vertices where those
+## edges end.
+##
+## The booleans' first steps do the work (boolean.lucb steps 1 to 4): the
+## surface, as the faces of its solid lying on it, meets only the chosen
+## faces; each chosen face is split along the new edges; every piece of
+## the body is kept and none merged back (boolean_result.lucb's last steps
+## without the selection and merging).
+##
+## Each piece needs a name of its own to be picked and moved apart: the
+## pieces on the surface's outer side (a plane's normal side; outside a
+## cylinder, cone, sphere or torus) are named `<tag>/split[<name>]`, the
+## others keep the face's name. Refused when the surface crosses none of
+## the faces, or lies on one of them.
+
+## `model` with its faces `chosen` (marked) split where surface `s` crosses
+## them (see above).
+func split_faces_by(model: const CadModel*, chosen: const bool[], s: const Surface*, tag: str) -> interop.Reference[CadModel]!:
+    var first = try shape_of(model)
+    let faces_a = first.faces.count
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<faces_a:
+        let (l, h) = try face_box(&first, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    # The surface as faces: those of its solid lying on it, a plane's large
+    # square or a curved surface's long wall.
+    let span = high.subtract(low).length() * 4.0 + s.origin.subtract(low).length() * 2.0
+    let (_, tool) = try surface_side(s, s.origin, 1.0, s.z, 0.0, span, tag)
+    defer tool.release()
+    var t = try shape_of(tool.value())
+    defer t.close()
+    var on = Growing[i64]()
+    defer on.close()
+    for f in 0..<t.faces.count:
+        if t.surfaces.items[(usize)t.faces.items[f].surface].kind != s.kind: continue
+        # Its boundary on the surface (a plane's square, not the box's other
+        # sides; a wall, not its caps, by the kind).
+        var lies = true
+        for use in t.face_uses(f):
+            let (gap, _) = try signed_gap(s, try t.edge_at(edge_index(use), 0.5), t.tolerance)
+            if math.abs(gap) > span * 1e-9: lies = false
+        if lies: try on.push((i64)f)
+    if on.count == 0: error(invalid, "Split Face could not lay out the splitting surface")
+    let sheet = try tool.value().subset(on.view())
+    defer sheet.release()
+    var second = try shape_of(sheet.value())
+    defer second.close()
+    try append_shape(&first, &second)
+    var work = Work(first, faces_a, 1.0, 1e-9, Growing[Vector3](), Growing[i64](), Growing[Cut](), Growing[Section](), Growing[Imprint](),
+                    Growing[Coincident](), Growing[ShapeEdge](), Growing[i64](), Growing[usize](), Growing[i64](), Growing[bool]())
+    defer work.close()
+    for c in chosen: try work.chosen.push(c)
+    work.size = math.max(1e-6, high.subtract(low).length())
+    work.tol = math.max(work.size * 1e-7, 1e-10)
+    for p in work.w.points.view(): try work.point_vertex.push(try work.vertex(p))
+    try intersect_faces(&work)
+    if work.coincident.count > 0: error(invalid, "the splitting surface lies on a face it would split: pick another tool")
+    try vertex_cuts(&work)
+    try cut_edges(&work)
+    var traced = try final_shape(&work)
+    defer traced.close()
+    var pieces = try new_pieces()
+    defer pieces.close()
+    var piece_face = Growing[usize]()
+    defer piece_face.close()
+    var piece_name = Growing[i64]()
+    defer piece_name.close()
+    try face_pieces(&work, &traced, faces_a, &pieces, &piece_face, &piece_name)
+    # Every piece of the body kept as it is.
+    var keep = Growing[bool]()
+    defer keep.close()
+    var turn = Growing[bool]()
+    defer turn.close()
+    for _ in 0..<pieces.piece_count():
+        try keep.push(true)
+        try turn.push(false)
+    # The pieces of each split face on the surface's outer side, named
+    # apart.
+    var split_any = false
+    var name = Growing[u8]()
+    defer name.close()
+    for p in 0..<pieces.piece_count():
+        let f = piece_face.items[p]
+        if not chosen[f]: continue
+        var count = 0
+        for q in 0..<pieces.piece_count():
+            if piece_face.items[q] == f: count += 1
+        if count < 2: continue
+        split_any = true
+        let point = try piece_point(&work, &traced, f, &pieces, p)
+        let (gap, _) = try signed_gap(s, point, work.tol)
+        if gap <= 0.0: continue
+        name.clear()
+        try role_name(&name, tag, "split[")
+        for byte in work.w.face_name(f).bytes: try name.push(byte)
+        try name.push(93)
+        piece_name.items[p] = try work.w.add_name((str)name.view())
+    if not split_any: error(invalid, "the splitting tool misses the faces to split")
+    try seam_zones(&work, &traced, &pieces, piece_face.view(), keep.view())
+    return try write_result(&work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view())

@@ -7,10 +7,6 @@ func assemble(work: Work*, op: i64, others: Others*) -> interop.Reference[CadMod
     let w = &work.w
     var traced = try final_shape(work)
     defer traced.close()
-    var halves = Growing[HalfEdge]()
-    defer halves.close()
-    var kept = Growing[(usize, usize, bool)]()
-    defer kept.close()
     var pieces = try new_pieces()
     defer pieces.close()
     var piece_face = Growing[usize]()
@@ -18,37 +14,7 @@ func assemble(work: Work*, op: i64, others: Others*) -> interop.Reference[CadMod
     # Each piece's name: its face's, or merged faces' names together.
     var piece_name = Growing[i64]()
     defer piece_name.close()
-    for f in 0..<w.faces.count:
-        halves.clear()
-        # The boundary, piece by piece, the way the face uses each edge.
-        for use in w.face_uses(f):
-            let e = edge_index(use)
-            let first = work.piece_starts.items[e]
-            let last = work.piece_starts.items[e + 1]
-            for k in 0..<last - first:
-                let id = work.piece_ids.items[first + k if use > 0 else last - 1 - k]
-                let forward = (id > 0) == (use > 0)
-                try halves.push(HalfEdge((id if id > 0 else -id) - 1, forward))
-        let boundary = halves.count
-        # New edges across it, both ways, unless already on its boundary.
-        for at in 0..<work.sections.count:
-            let section = work.sections.items[at]
-            if section.fa != (i64)f and section.fb != (i64)f: continue
-            try add_both(&halves, boundary, work.section_ids.items[at])
-        for mark in work.imprints.view():
-            if mark.face != f: continue
-            let first = work.piece_starts.items[mark.edge]
-            let last = work.piece_starts.items[mark.edge + 1]
-            for k in first..<last:
-                let id = work.piece_ids.items[k]
-                let final = work.finals.items[edge_index(id)]
-                let middle = try w.at(final.carrier, (final.t0 + final.t1) * 0.5)
-                if try face_contains(w, f, middle, work.tol) == inside_face: try add_both(&halves, boundary, id)
-        let before = pieces.piece_count()
-        try split_face(&traced, f, halves.view(), try face_pole(w, f), &pieces)
-        for _ in before..<pieces.piece_count():
-            try piece_face.push(f)
-            try piece_name.push(w.faces.items[f].name)
+    try face_pieces(work, &traced, w.faces.count, &pieces, &piece_face, &piece_name)
     # Classify and select.
     try find_blocks(work, &traced, &pieces, piece_face.view(), others)
     var keep = Growing[bool]()
@@ -75,6 +41,44 @@ func assemble(work: Work*, op: i64, others: Others*) -> interop.Reference[CadMod
     try merge_pieces(work, &traced, &pieces, &piece_face, &piece_name, &keep, &turn)
     try seam_zones(work, &traced, &pieces, piece_face.view(), keep.view())
     return try write_result(work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view())
+
+## Step 4: the first `faces` faces of the work shape split along the new
+## edges into `pieces` on `traced`, each piece's face and name noted.
+func face_pieces(work: Work*, traced: const Shape*, faces: usize, pieces: Pieces*, piece_face: Growing[usize]*, piece_name: Growing[i64]*) -> !:
+    let w = &work.w
+    var halves = Growing[HalfEdge]()
+    defer halves.close()
+    for f in 0..<faces:
+        halves.clear()
+        # The boundary, piece by piece, the way the face uses each edge.
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            let first = work.piece_starts.items[e]
+            let last = work.piece_starts.items[e + 1]
+            for k in 0..<last - first:
+                let id = work.piece_ids.items[first + k if use > 0 else last - 1 - k]
+                let forward = (id > 0) == (use > 0)
+                try halves.push(HalfEdge((id if id > 0 else -id) - 1, forward))
+        let boundary = halves.count
+        # New edges across it, both ways, unless already on its boundary.
+        for at in 0..<work.sections.count:
+            let section = work.sections.items[at]
+            if section.fa != (i64)f and section.fb != (i64)f: continue
+            try add_both(&halves, boundary, work.section_ids.items[at])
+        for mark in work.imprints.view():
+            if mark.face != f: continue
+            let first = work.piece_starts.items[mark.edge]
+            let last = work.piece_starts.items[mark.edge + 1]
+            for k in first..<last:
+                let id = work.piece_ids.items[k]
+                let final = work.finals.items[edge_index(id)]
+                let middle = try w.at(final.carrier, (final.t0 + final.t1) * 0.5)
+                if try face_contains(w, f, middle, work.tol) == inside_face: try add_both(&halves, boundary, id)
+        let before = pieces.piece_count()
+        try split_face(traced, f, halves.view(), try face_pole(w, f), pieces)
+        for _ in before..<pieces.piece_count():
+            try piece_face.push(f)
+            try piece_name.push(w.faces.items[f].name)
 
 ## Add final edge `id` (signed) to `halves` both ways, unless one of the
 ## first `boundary` halves is it.

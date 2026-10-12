@@ -20,7 +20,7 @@ pub struct CadDirect:
         var picked = Growing[usize]()
         defer picked.close()
         try faces_named(&w, faces, &picked)
-        if chain: try tangent_chain(&w, &picked)
+        if chain: try grow_tangent(&w, &picked)
         let m = FaceMove(move_offset, Vector3(), Vector3(), Vector3(), 0.0, distance)
         var targets = Growing[Surface]()
         defer targets.close()
@@ -116,6 +116,76 @@ pub struct CadDirect:
         for f in picked.view(): deleted.items[f] = true
         return try healed(&w, deleted.view())
 
+    ## Fusion's Split Face: `model` with faces `faces` split where the
+    ## surface of `tool`'s face `tool_face` (a plane, cylinder, cone,
+    ## sphere or torus), extended past the face, crosses them; one closed
+    ## solid with the new edges. The pieces on the surface's outer side (a
+    ## plane's side the tool face faces; outside a curved surface) are
+    ## named `<tag>/split[<name>]`, the others keep their name
+    ## (face_split.lucb).
+    pub static func split_faces(model: interop.Reference[CadModel], faces: str, tool: interop.Reference[CadModel], tool_face: str, tag: str) -> interop.Reference[CadModel]!:
+        var t = try shape_of(tool.value())
+        defer t.close()
+        var found = Growing[usize]()
+        defer found.close()
+        try faces_named(&t, tool_face, &found)
+        let f = found.items[0]
+        let s = &t.surfaces.items[(usize)t.faces.items[f].surface]
+        if s.kind == surface_spline: error(invalid, "Split Face takes a plane, cylinder, cone, sphere or torus as its tool")
+        var chosen = try chosen_faces(model, faces)
+        defer chosen.close()
+        if s.kind == surface_plane and not t.faces.items[f].sense:
+            # The plane turned to face the way the face does.
+            var turned = try plane_surface(s.origin, s.x, s.z.multiply_scalar(-1.0))
+            defer turned.close()
+            return try split_faces_by(model.value(), chosen.view(), &turned, tag)
+        return try split_faces_by(model.value(), chosen.view(), s, tag)
+
+    ## Split Face by the plane through `origin` facing `normal`: the pieces
+    ## on the normal's side are named `<tag>/split[<name>]`.
+    pub static func split_faces_by_plane(model: interop.Reference[CadModel], faces: str, origin: Vector3, normal: Vector3, tag: str) -> interop.Reference[CadModel]!:
+        let n = normal.normalized() catch failure: error(invalid, "a split plane needs a normal")
+        let seed = Vector3(1.0, 0.0, 0.0) if math.abs(n.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+        let x = try seed.subtract(n.multiply_scalar(seed.dot(n))).normalized()
+        var plane = try plane_surface(origin, x, n)
+        defer plane.close()
+        var chosen = try chosen_faces(model, faces)
+        defer chosen.close()
+        return try split_faces_by(model.value(), chosen.view(), &plane, tag)
+
+    ## Fusion's Tangent chain: faces `faces` and every face meeting one of
+    ## them tangentially, and so on (a fillet's strips with the faces they
+    ## round onto), by name apart by `;`, the faces named first.
+    pub static func tangent_chain(model: interop.Reference[CadModel], faces: str) -> interop.Owned[str]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var picked = Growing[usize]()
+        defer picked.close()
+        try faces_named(&w, faces, &picked)
+        try grow_tangent(&w, &picked)
+        var out = Growing[u8]()
+        defer out.close()
+        for f in picked.view():
+            if out.count > 0: try out.push(59)
+            for byte in w.face_name(f).bytes: try out.push(byte)
+        return try interop.copy_text((str)out.view())
+
+    ## Move/Copy of faces with Create copy: an open surface body of copies
+    ## of `model`'s faces `faces`, their names (every alias) with `prefix`
+    ## before them so they are told from the originals.
+    pub static func copied_faces(model: interop.Reference[CadModel], faces: str, prefix: str) -> interop.Reference[CadModel]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var picked = Growing[usize]()
+        defer picked.close()
+        try faces_named(&w, faces, &picked)
+        var ids = Growing[i64]()
+        defer ids.close()
+        for f in picked.view(): try ids.push((i64)f)
+        let part = try model.value().subset(ids.view())
+        defer part.release()
+        return try CadModeling.prefixed(part, prefix)
+
     ## The names of `model`'s faces `faces` (B-rep face numbers, as a pick
     ## gives them), apart by `;`: what the operations here take.
     pub static func face_names(model: interop.Reference[CadModel], faces: const i64[]) -> interop.Owned[str]!:
@@ -150,7 +220,7 @@ func faces_named(w: const Shape*, text: str, out: Growing[usize]*) -> !:
     if out.count == 0: error(invalid, "pick the faces")
 
 ## `faces` with every face meeting one of them tangentially, and so on.
-func tangent_chain(w: const Shape*, faces: Growing[usize]*) -> !:
+func grow_tangent(w: const Shape*, faces: Growing[usize]*) -> !:
     var taken = Growing[bool]()
     defer taken.close()
     try taken.fill(w.faces.count, false)
@@ -173,3 +243,24 @@ pub func nearest_on_surface(w: const Shape*, f: usize, p: Vector3) -> Vector3!:
     let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
     let (gap, n) = try signed_gap(s, p, w.tolerance)
     return p.subtract(n.multiply_scalar(gap))
+
+## The faces of `model` that `faces` names, marked.
+func chosen_faces(model: interop.Reference[CadModel], faces: str) -> Growing[bool]!:
+    var w = try shape_of(model.value())
+    defer w.close()
+    var picked = Growing[usize]()
+    defer picked.close()
+    try faces_named(&w, faces, &picked)
+    var marked = Growing[bool]()
+    errdefer marked.close()
+    try marked.fill(w.faces.count, false)
+    for f in picked.view(): marked.items[f] = true
+    return marked
+
+## The plane through `origin` with unit axes `x` and normal `z`.
+func plane_surface(origin: Vector3, x: Vector3, z: Vector3) -> Surface!:
+    var no_points = Growing[Vector3]()
+    defer no_points.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    return try Surface(surface_plane, origin, x, z, 0.0, 0.0, no_points.view(), knots.view(), knots.view(), knots.view(), 0, 0, 0, 0)
