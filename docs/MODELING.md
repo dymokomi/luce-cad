@@ -475,7 +475,13 @@ volume), at G1, G2 and G3 (bulging: G1), each closed with the round one face.
 
 **Variable radius** (`variable_fillet.lucb`, `radius_law.lucb`): Fusion's radii at points along a
 tangent chain, positions 0 to 1 as fractions of the chain's length (Fusion's API: "the percentage
-along the curve"). The chain starts at an open end, the first named edge's chain followed back, or
+along the curve"). On an open chain round a flat face that length is **the balls' path's** (the
+sections' centers), not the edge's: Fusion's strips run on it (probe 8: a plate's line, arc and line
+of 10, 15.708 and 10 ran 10.0416, 11.024 and 10.0416 at 2 to 4, the law straight in it), so round a
+convex arc, where the path is shorter, the radius changes more slowly than along the edge; the law
+is tabled so (`cap_blend.lucb`'s `spine_law`, a few passes, the centers moving with the radius), and
+Fusion's volumes follow to 0.001 (`fusion_plate_tests`). A straight edge's path is straight, so its
+law is the edge's. The chain starts at an open end, the first named edge's chain followed back, or
 for a closed loop at the first named edge's start; a closed loop's start and end radii must agree.
 G1, G2 and G3, under a Tangency weight (each section the weight's at its radius: Tangency weight
 below). **The law between points** (`radius_law.lucb`) is Fusion's by default (luced-3d's Smooth
@@ -696,7 +702,8 @@ lines its end control points lie on, so the continuity at the faces stays. **Ver
   a square corner): `fusion_section_contract` matches its sections at 0.5 and 2, `fusion_probe_tests`
   its volumes at 0.5, 1, 2 on edges of 90°, 120° and 60°. A conic has no ball tangent to three of
   them, so a weighted G1 fillet takes the booleans' tools (straight edges and rims) with rational
-  spline sections and setback corners; loops between curved faces (a dome's rim) fit it directly.
+  spline sections and setback corners; loops round a flat face carry the conic directly (their strips
+  B-splines, not cylinders or tori), as do loops between curved faces (a dome's rim).
 - **G2:** Fusion's curve above, w scaling its speed at the contacts: sections at 0.1, 0.5, 1, 2 and
   volumes at 0.5, 1, 2 on 90°, 120°, 60° edges match Fusion's.
 - **G3** (not in Fusion): each leg's fraction f toward the corner becomes 1 − (1 − f)^w, its first
@@ -878,7 +885,18 @@ Where the wall going on does not turn away from the carried section (a flat side
 arc, a hole's wall curving into the material), nothing trims the blend, so it stops flat: the strip
 ends in the section's plane, and a flat end face (`<tag>/end[...]`) fills the corner between the
 section and the sharp edge, bounded by the section, the seam's upper part and a line on the face
-back to the corner. The seam is split at the wall's contact. The end face touches the face and the
+back to the corner.
+
+**Corner ends.** Where the loop turns a sharp outside corner instead (a plate's top edges ending at
+its sides), the chain ends there against an end wall: a plane square to the blended edge, the
+cap's edge going on straight along it. Fusion runs the strip flush into that wall: the section at the
+end lies in the wall's plane, the wall loses its corner beyond the section (its loop now the cap's
+edge cut at the contact, the section, and the seam shortened to the wall's contact), and no face is
+added. **Checked against Fusion 2705** (probe 8 of 2026-10-12, `fusion_plate_tests`): a plate's
+line, arc and line filleted with Tangent chain, ten faces, constant 3 at G1 (weights 1 and 0.5) and
+G2 within 0.001 of Fusion's volumes, 2 to 4 along the balls' path at G1 0.5 and G2 too; at G1 weight
+1 Fusion rolls a ball along the changing chain, ours scales the section (0.09 more). An end wall at
+another angle, or curved, is not a corner end yet (the booleans then try). The seam is split at the wall's contact. The end face touches the face and the
 wall in cusps, which the tessellator samples finely. Concave chains' open ends stop flat too. **Checked against Fusion 2705** (probe of
 2026-10-12, `fusion_probe_tests`): a stadium plate's arc top edge filleted alone (r 3, Tangent chain
 off, G1 and G2) fails in Fusion ("ASM_BL_END_TOO_CMPLX ... at the ends of the selected edges"). The
@@ -1595,15 +1613,20 @@ Roughly in order of usefulness:
    feature, and full rounds of curved ribs whose ends are not flat through the axis.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
-   the loop turns a sharp corner rather than going on tangentially (Fusion builds these); an arc of
-   a dome's rim alone filleted.
+   the loop turns a sharp corner into an end wall that is not a plane square to the edge (Fusion
+   builds these: its strip carried on and trimmed by the wall); an arc of a dome's rim alone
+   filleted.
 4. **Variable radius laws Fusion shapes its own way**: a piece from an open end into a flat run, a
    steep piece beside a shallow one, and the law round a closed loop between its extremes (not
-   decoded; Variable radius above). A G1 ball rolled along an open chain's run-out, and round a
-   loop whose radius comes near the loop's own curvature (refused with that reason).
-5. **A sphere face holding a pole whose boundary is not one loop round it**: a ball drilled through
-   at a slant leaves each half sphere a face bounded by its equator and a hole, which no chart
-   meshes (the face is skipped and named on the node).
+   decoded; Variable radius above). A G1 ball rolled along an open chain (at weight 1 ours scales
+   the section there: 0.09 off Fusion on the plate chain), and round a loop whose radius comes near
+   the loop's own curvature (refused with that reason). Whether Fusion measures a single edge's or a
+   closed loop's law along the balls' path too, as it does an open chain's, is not checked (the
+   laws read back on a box's edge fit its edge's length).
+5. **Sphere faces no one chart holds**: neither one loop round a pole (the cap's rows, or the
+   azimuthal disk with holes: a ball drilled through at a slant) nor an open hemisphere (a
+   latitude-longitude chart about the trims' middle), such as a ball with holes spread all round it
+   and no loop round a pole; such a face is skipped and named on the node.
 6. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
    analytic surfaces are recognized as coincident.
 7. **Sweep and loft.**

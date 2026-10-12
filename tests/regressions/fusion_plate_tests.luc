@@ -1,0 +1,63 @@
+## A plate's open chain ending at corners, checked against Fusion 2705
+## itself (probe 8 of 2026-10-12, luce_work/cad/fusion/out8): a 10 deep
+## plate (0,0), (20,0), (20,10), an arc about (10,10) to (10,20), (0,20);
+## its top edge on x = 20 filleted with Tangent chain, so the line, the arc
+## and the line on y = 20, ending where the loop turns sharply into the
+## plate's sides. Fusion runs the strips flush into those sides (their
+## corners beyond the section cut away, ten faces): constant 3 at G1 (1
+## and 0.5) and G2, and 2 to 4 along the chain, straight in the length of
+## the balls' path (spine_law), at G1 0.5 and G2. Each takes Fusion's
+## volume within 0.002. At G1 weight 1 Fusion rolls a ball along the
+## varying chain (its strip running a hair past the ends): ours scales the
+## section, 0.09 more (MODELING.md, Limits).
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.sketch import CadSketch
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 0.5)) and not (id in found):
+                found.append(id)
+    return found
+
+## The volume `model`'s meshes at 32 and 64 divisions extrapolate to.
+func refined(model: CadModel) -> float!:
+    let coarse = volume(model.tessellate(32))
+    let mesh = model.tessellate(64)
+    closed(mesh)
+    let fine = volume(mesh)
+    return fine + (fine - coarse) / 3.0
+
+pub func fusion_plate_tests() -> unit!:
+    let s = CadSketch.parse("")
+    let a = s.add_point(0.0, 0.0)
+    let b = s.add_point(20.0, 0.0)
+    let c = s.add_point(20.0, 10.0)
+    let d = s.add_point(10.0, 20.0)
+    let e = s.add_point(0.0, 20.0)
+    _ = s.add_line(a, b)
+    _ = s.add_line(b, c)
+    _ = s.add_arc(s.add_point(10.0, 10.0), c, d)
+    _ = s.add_line(d, e)
+    _ = s.add_line(e, a)
+    let plate = CadModeling.extruded_sides(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 10.0, 0.0, "p")
+    let side = func (p: Vector3, q: Vector3) -> bool:
+        return math.abs(p.x - 20.0) < 1e-9 and math.abs(q.x - 20.0) < 1e-9 and math.abs(p.z - 10.0) < 1e-9 and math.abs(q.z - 10.0) < 1e-9
+    let edge = CadModeling.edge_references(plate, edges_where(plate, side))
+    # Fusion's plate, exactly: 3785.398163397448.
+    let base = 3785.398163397448
+    let cases = [("constant G1", false, 1, 1.0, 3718.464215408911, 0.002), ("constant G1 weight 0.5", false, 1, 0.5, 3689.182380701, 0.002), ("constant G2", false, 2, 1.0, 3732.7454310502617, 0.002), ("2 to 4 G1 weight 0.5", true, 1, 0.5, 3685.811757673009, 0.002), ("2 to 4 G2", true, 2, 1.0, 3730.9079279856783, 0.002), ("2 to 4 G1", true, 1, 1.0, 3716.210264487569, 0.1)]
+    let plate_volume = refined(plate)
+    for (name, variable, continuity, weight, fusion, within) in cases:
+        let made = CadModeling.variable_filleted(plate, edge, [0.0, 1.0], [2.0, 4.0], "v", false, continuity, true, weight) if variable else CadModeling.filleted(plate, edge, 3.0, "f", continuity, true, false, weight)
+        assert(made.face_count() == 10)
+        let removed = plate_volume - refined(made)
+        if math.abs(removed - (base - fusion)) > within: print(f"plate chain {name}: took {removed}, Fusion {base - fusion}")
+        assert(math.abs(removed - (base - fusion)) <= within)
+    print("PASS Fusion's plate chain: a line, arc and line ending at the plate's corners filleted flush into its sides (Fusion's ten faces and volumes: constant G1 at weights 1 and 0.5, G2; 2 to 4 along the balls' path at G1 0.5 and G2)")

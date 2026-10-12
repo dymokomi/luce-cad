@@ -151,9 +151,12 @@ Tessellation is a cache, not a conversion:
   (shared edge samples stay, so the preview stays joined) in milliseconds;
   releasing the drag tessellates in full.
 
-`CadModel.overlay(mesh)` returns a `CadOverlay`: each edge's polyline once
-(64 chords when curved; made once per model and passed to copies with moved
-cvs), the hull (every control net, rows then columns, per distinct face
+`CadModel.overlay(mesh)` returns a `CadOverlay`: each B-rep edge as `mesh`
+(the model's tessellation) samples it, the mesh's own edges between faces on
+different surfaces, so a line runs exactly along the faces beside it (an
+edge's own 64-chord polyline, sampled apart from the mesh, crossed the
+faces' chords and showed dashed where it dipped behind them; it stays for a
+mesh without faces), independent faces' outlines, the hull (every control net, rows then columns, per distinct face
 placement) and a normal guide per face, as point pairs. `edges_key()` names
 what the edge lines depend on, so a viewport keeps them while cvs move.
 
@@ -200,7 +203,10 @@ Supported face meshing:
   or a wavy rim such as a variable fillet's contact round a dome) receives a
   pole-aware mesh: rows from each boundary sample along its meridian to the
   pole the loop goes round (by the loop's turn about the face's normal, so an
-  inside-out cap takes its own pole). The constrained fallback's interior
+  inside-out cap takes its own pole). Such a loop with holes inside (a ball
+  drilled through at a slant: each half sphere its equator and a hole) is
+  meshed in an azimuthal equidistant chart about that pole (`sphere_disk`),
+  where every loop is closed. The constrained fallback's interior
   lattice finds each point's triangle by walking across neighbors and its
   inside by even-odd along the lattice row (up to 131,072 cells, a 64-division
   face's twice over; it scanned every triangle and stopped at 8,192).

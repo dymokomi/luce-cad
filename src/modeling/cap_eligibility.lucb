@@ -149,9 +149,11 @@ func continued_face(w: const Shape*, e: usize, chosen: const usize[]) -> i64!:
     return -1
 
 ## Whether side `k`'s two vertices are joints (its picked neighbor tangent,
-## on its cap, its wall on the same side) or open ends (the edge going on
-## tangentially on the cap, not picked), each with one seam: a line along
-## the walls' ruling there. A plane's rulings at its ends are its seams'.
+## on its cap, its wall on the same side), open ends (the edge going on
+## tangentially on the cap, not picked) or corner ends (the cap's edge
+## turning there into an end wall: corner_end), each with one seam: a line
+## along the walls' ruling there. A plane's rulings at its ends are its
+## seams'.
 func vertices_eligible(b: Cap*, k: usize, ends: const i64[]) -> bool!:
     let w = b.w
     let side = b.sides.items[k]
@@ -161,6 +163,7 @@ func vertices_eligible(b: Cap*, k: usize, ends: const i64[]) -> bool!:
         let t = edge.t0 if end == 0 else edge.t1
         var seam: i64 = -1
         var goes_on: i64 = -1
+        var turns: i64 = -1
         var count: usize = 0
         let mine = try w.leaving(side.edge, (i64)end)
         for g in 0..<w.edges.count:
@@ -180,16 +183,27 @@ func vertices_eligible(b: Cap*, k: usize, ends: const i64[]) -> bool!:
                 if ga != side.cap and gb != side.cap: return false
                 goes_on = (i64)g
                 continue
+            if face_uses_edge(w, side.cap, g):
+                if turns >= 0: return false
+                turns = (i64)g
+                continue
             if w.carriers.items[(usize)other.carrier].kind != curve_line or seam >= 0: return false
             seam = (i64)g
         if seam < 0: return false
         b.is_seam.items[(usize)seam] = true
         if ends[(usize)v] == 1:
-            # An open end: three edges, the one going on tangentially.
-            if goes_on < 0 or count != 3: return false
-            b.open.items[(usize)v] = true
-            b.continues.items[(usize)v] = goes_on
-        elif goes_on >= 0:
+            # An open end: three edges, the one going on tangentially, or
+            # the cap's turning into an end wall.
+            if count != 3: return false
+            if goes_on >= 0 and turns < 0:
+                b.open.items[(usize)v] = true
+                b.continues.items[(usize)v] = goes_on
+            elif turns >= 0 and goes_on < 0 and (try corner_end(b, &side, end, (usize)turns, (usize)seam)):
+                b.open.items[(usize)v] = true
+                b.cornered.items[(usize)v] = true
+                b.continues.items[(usize)v] = turns
+            else: return false
+        elif goes_on >= 0 or turns >= 0:
             return false
         # The seam runs along the wall's ruling there, into the wall.
         let line = w.edges.items[(usize)seam]
@@ -204,3 +218,31 @@ func vertices_eligible(b: Cap*, k: usize, ends: const i64[]) -> bool!:
             let ruled = try ruling_at(b, &b.sides.items[k], t)
             if ruled.subtract(scaled).length() > 1e-6 * ruled.length(): return false
     return true
+
+## Whether side `side`'s end `end` (0 its start) is a corner end: the
+## cap's edge `turns` going on there is straight and its other face, the
+## end wall, a plane square to the blended edge, which the material lies
+## behind (an outside corner: the edge stops at the wall), between the
+## side's wall and it seam `seam`; the blend convex. The strip then ends
+## flush in the wall, the section there lying in its plane.
+func corner_end(b: const Cap*, side: const CapSide*, end: usize, turns: usize, seam: usize) -> bool!:
+    let w = b.w
+    if not side.convex: return false
+    if w.carriers.items[(usize)w.edges.items[turns].carrier].kind != curve_line: return false
+    # Each between two faces (an edge of one face only is no corner).
+    let (ga, gb) = edge_faces(w, turns) catch failure: return false
+    let wall = gb if ga == side.cap else ga
+    if w.surfaces.items[(usize)w.faces.items[wall].surface].kind != surface_plane: return false
+    let (sa, sb) = edge_faces(w, seam) catch failure: return false
+    if not ((sa == side.wall and sb == wall) or (sa == wall and sb == side.wall)): return false
+    let edge = w.edges.items[side.edge]
+    let v = edge.start if end == 0 else edge.end
+    let inward = try w.leaving(side.edge, (i64)end)
+    let outward = try w.face_normal(wall, w.points.items[(usize)v])
+    return outward.dot(inward) <= -1.0 + 1e-9
+
+## Whether face `f` of `w` uses edge `e`.
+func face_uses_edge(w: const Shape*, f: usize, e: usize) -> bool:
+    for use in w.face_uses(f):
+        if edge_index(use) == e: return true
+    return false

@@ -87,3 +87,39 @@ pub func face_guides(mesh: const Mesh*, out: Growing[Vector3]*) -> !:
         try out.push(center)
         try out.push(center.add((try mesh.face_normal(middle)).multiply_scalar(length)))
         first = end
+
+## The B-rep's edges as `mesh` (`model`'s tessellation) samples them, onto
+## `out` as point pairs: each mesh edge between polygons of two B-rep faces
+## on different surfaces (seams are not drawn), or on the mesh's open
+## border. Taken from the polygons' own points, an edge's line runs exactly
+## along the faces beside it; the B-rep's own polyline, sampled apart from
+## the mesh, crossed the faces' chords and showed dashed where it dipped
+## behind them. False (nothing added) when the mesh has no faces to read.
+pub func mesh_boundary_lines(mesh: const Mesh*, model: const CadModel*, out: Growing[Vector3]*) -> bool!:
+    let source = mesh.find_attribute("cad_face", 2)
+    if source < 0 or mesh.face_count() == 0: return false
+    let faces = try mesh.attribute_entry(source)
+    let ends = try mesh.edge_span()
+    let edges = ends.length // 2
+    let offsets = mesh.offset_span()
+    let corner_edges = try mesh.corner_edge_span()
+    # Each mesh edge's first two polygons' CAD faces (-1: none yet).
+    let sides = try new i64[edges * 2] --- in memory.heap
+    defer free(sides) in memory.heap
+    for at in 0..<sides.length: sides[at] = -1
+    for polygon in 0..<offsets.length - 1:
+        let face = (i64)faces.number(polygon, 0)
+        for corner in (usize)offsets[polygon]..<(usize)offsets[polygon + 1]:
+            let edge = (usize)corner_edges[corner]
+            if sides[edge * 2] < 0: sides[edge * 2] = face
+            elif sides[edge * 2 + 1] < 0: sides[edge * 2 + 1] = face
+    let first = (i64)model.count
+    for edge in 0..<edges:
+        let a = sides[edge * 2]
+        let b = sides[edge * 2 + 1]
+        # Independent faces draw their own outlines (CadModel.overlay).
+        if a < first: continue
+        if b >= 0 and (a == b or (try model.face_surface_id(a)) == (try model.face_surface_id(b))): continue
+        try out.push(try mesh.point((i64)ends[edge * 2]))
+        try out.push(try mesh.point((i64)ends[edge * 2 + 1]))
+    return true

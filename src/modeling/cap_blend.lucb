@@ -27,8 +27,11 @@
 ## trimmed by the faces it runs into; where the face going on does not turn
 ## away from it, the strip stops in the section's plane, a flat end face
 ## fills the corner between the section and the sharp edge going on, and
-## the seam is split at the wall's contact. Anything else is declined
-## (blend.lucb's booleans).
+## the seam is split at the wall's contact. Or the loop turns a sharp
+## outside corner there into a flat end wall square to the edge (a plate's
+## side): the strip ends flush in that wall, which loses the corner beyond
+## the section (Fusion's result, its edge on the cap cut at the contact).
+## Anything else is declined (blend.lucb's booleans).
 
 ## A picked edge of a cap loop: its cap and wall faces, the side of its
 ## cap normal its cap lies on (`sign`: the way into the cap is `sign`
@@ -63,12 +66,17 @@ struct CapSide:
 ## each body vertex its contacts on the cap and wall, its section (-1),
 ## whether it is an open end (the edge going on there: `continues`), its
 ## run-out (`runout_of`, into `runouts`; -1: a flat end) and a flat end's
-## line from its cap contact to it.
+## line from its cap contact to it; whether it is a corner end (`cornered`:
+## the loop turns into an end wall there), and each edge going on from a
+## corner end cut at the cap contact (`corner_cuts`, by body edge).
 struct Cap:
     var w: const Shape*
     var out: Shape
     var reach: f64
     var law: const RadiusLaw*?
+    ## The law as measured along the balls' path (spine_law), when one is
+    ## given: `law` then points here (else it stays empty).
+    var spine: RadiusLaw
     var round: bool
     var continuity: i64
     var weight: f64
@@ -93,10 +101,13 @@ struct Cap:
     var end_lines: Growing[i64]
     var runouts: Growing[Runout]
     var runout_of: Growing[i64]
+    var cornered: Growing[bool]
+    var corner_cuts: Growing[i64]
     var name: Growing[u8]
 
     func close():
         self.out.close()
+        self.spine.close()
         self.sides.close()
         self.side_of.close()
         self.is_seam.close()
@@ -110,6 +121,8 @@ struct Cap:
         self.end_lines.close()
         self.runouts.close()
         self.runout_of.close()
+        self.cornered.close()
+        self.corner_cuts.close()
         self.name.close()
         self.balls.close()
 
@@ -147,6 +160,7 @@ pub func cap_blend(w: const Shape*, chosen: const usize[], size: f64, round: boo
     b.law = law
     if not try cap_eligible(b, chosen): return none
     try chamfer_first(b, sides)
+    try spine_law(b)
     try chain_weight(b)
     b.rolled = rolled_cap(b)
     if b.rolled: try cap_balls(b)
@@ -168,8 +182,8 @@ func new_cap(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cap!:
     for k in w.spline_knots.view(): try out.spline_knots.push(k)
     for s in w.surfaces.view():
         try out.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
-    var made = Cap(w, out, size, none, round, continuity, math.sqrt(0.5), none, true, 1.0, false, SampledBalls(Growing[Vector3](), Growing[f64](), 1.0), Growing[CapSide](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](),
-                   Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[Runout](), Growing[i64](), Growing[u8]())
+    var made = Cap(w, out, size, none, empty_law(), round, continuity, math.sqrt(0.5), none, true, 1.0, false, SampledBalls(Growing[Vector3](), Growing[f64](), 1.0), Growing[CapSide](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](),
+                   Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[Runout](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[u8]())
     errdefer made.close()
     try made.side_of.fill(w.edges.count, -1)
     try made.is_seam.fill(w.edges.count, false)
@@ -182,7 +196,46 @@ func new_cap(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cap!:
     try made.continues.fill(w.points.count, -1)
     try made.end_lines.fill(w.points.count, -1)
     try made.runout_of.fill(w.points.count, -1)
+    try made.cornered.fill(w.points.count, false)
+    try made.corner_cuts.fill(w.edges.count, -1)
     return made
+
+## Fusion measures a variable radius along a chain by its balls' path (the
+## sections' centers), not the edge: a chain's strips run on that path's
+## length (probe 8 of 2026-10-12: a plate's line, arc and line ran 10.0416,
+## 11.024 and 10.0416 long, the law 2 to 4 straight in it), so round a
+## convex arc, where the path is shorter, the radius changes more slowly
+## than along the edge. The law is tabled again so: each chain edge's table
+## the length of its sections' centers under the law as it stands, a few
+## times over, the centers moving with the radius. On a straight edge the
+## path is straight and the law unchanged. A closed loop's law stays on its
+## edge: Fusion's loop laws were read back as radii along the edge
+## (fusion_roll_tests), which says nothing of its own measure there.
+func spine_law(b: Cap*) -> !:
+    let given = b.law else return
+    if not b.round or given.closed: return
+    b.spine = try given.copied()
+    b.law = &b.spine
+    var row = Growing[f64]()
+    defer row.close()
+    var rows = Growing[f64]()
+    defer rows.close()
+    for pass in 0..<6:
+        rows.clear()
+        for side in b.sides.view():
+            let edge = b.w.edges.items[side.edge]
+            var previous = Vector3()
+            var run = 0.0
+            for k in 0..<law_samples + 1:
+                let t = edge.t0 + (edge.t1 - edge.t0) * (f64)k / (f64)law_samples
+                let (u, _) = try into_cap(b, &side, t)
+                let (_, c) = try corner_at(b, &side, t)
+                let center = (try b.w.at(edge.carrier, t)).add(u.multiply_scalar(c)).add(side.into_wall.multiply_scalar(try reach_at(b, &side, t)))
+                if k > 0: run += center.subtract(previous).length()
+                previous = center
+                try rows.push(run)
+        for k in 0..<b.sides.count:
+            try b.spine.retable(b.sides.items[k].edge, rows.view()[k * (law_samples + 1)..<(k + 1) * (law_samples + 1)])
 
 ## A chamfer's `sides` on the builder, and which face of the loops takes
 ## their first distance: the same for every side (a section is shared at
@@ -250,6 +303,7 @@ func cap_contacts(b: Cap*) -> !:
             b.on_cap.items[(usize)v] = try b.out.add_point(p.add(u.multiply_scalar(c)))
             b.on_wall.items[(usize)v] = try b.out.add_point(p.add(s.multiply_scalar(try wall_distance(b, lambda, try reach_at(b, &side, t)))))
     try cap_runouts(b)
+    try corner_cuts(b)
     for v in 0..<w.points.count:
         if flat_end(b, v): b.end_lines.items[v] = try b.line(b.on_cap.items[v], (i64)v)
     for g in 0..<w.edges.count:
@@ -268,7 +322,40 @@ func cap_contacts(b: Cap*) -> !:
 
 ## Whether vertex `v` is an open end that stops flat (no run-out).
 func flat_end(b: const Cap*, v: usize) -> bool:
-    return b.open.items[v] and b.runout_of.items[v] < 0
+    return b.open.items[v] and b.runout_of.items[v] < 0 and not b.cornered.items[v]
+
+## Each edge going on from a corner end, on the cap and its end wall, cut
+## at the end's cap contact (which lies on it: the wall is square to the
+## blended edge), from both ends when both are corner ends.
+func corner_cuts(b: Cap*) -> !:
+    let w = b.w
+    for v in 0..<w.points.count:
+        if not b.cornered.items[v]: continue
+        let g = (usize)b.continues.items[v]
+        if b.corner_cuts.items[g] >= 0: continue
+        let edge = w.edges.items[g]
+        # Its corner ends' contacts must leave it some length.
+        let both = b.cornered.items[(usize)edge.start] and b.cornered.items[(usize)edge.end] and b.continues.items[(usize)edge.start] == (i64)g and b.continues.items[(usize)edge.end] == (i64)g
+        let length = w.points.items[(usize)edge.end].subtract(w.points.items[(usize)edge.start]).length()
+        let reach = b.at(b.on_cap.items[v]).subtract(w.points.items[v]).length()
+        if reach * (2.0 if both else 1.0) >= length - w.tolerance * 10.0: try too_large(b.round, b.reach, b.reach * length / (reach * (2.0 if both else 1.0)), "the edge its chain ends against")
+        var t0 = edge.t0
+        var t1 = edge.t1
+        var start = edge.start
+        var end = edge.end
+        for k in 0..<(usize)2:
+            let at = edge.start if k == 0 else edge.end
+            if not b.cornered.items[(usize)at] or b.continues.items[(usize)at] != (i64)g: continue
+            let touch = b.on_cap.items[(usize)at]
+            let t = try nearest_on(w, edge.carrier, b.at(touch), edge.t0, edge.t1)
+            if (try w.at(edge.carrier, t)).subtract(b.at(touch)).length() > w.tolerance * 10.0: error(invalid, "a blend's contact is off the edge its chain ends against")
+            if k == 0:
+                t0 = t
+                start = touch
+            else:
+                t1 = t
+                end = touch
+        b.corner_cuts.items[g] = try b.out.add_edge(ShapeEdge(edge.carrier, t0, t1, start, end))
 
 ## The largest blend the loops take, an error when the blend is not
 ## smaller: each contact on the cap must stay short of where the edge's
@@ -368,7 +455,7 @@ func cap_strip(b: Cap*, k: usize) -> !:
         b.sides.items[k].outer = try b.line(cap_start, cap_end)
         b.sides.items[k].inner = try b.line(wall_start, wall_end)
         let along = carrier.x.multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
-        if b.round and b.continuity == 1:
+        if b.round and b.continuity == 1 and b.tangency == 1.0:
             let axis = corner.add(u0.multiply_scalar(c)).add(side.into_wall.multiply_scalar(b.reach))
             try b.out.surfaces.push(try Surface(1, axis, try b.at(cap_start).subtract(axis).normalized(), along, b.reach, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
             return try finish_strip(b, k)
@@ -389,7 +476,7 @@ func cap_strip(b: Cap*, k: usize) -> !:
         let lowered = carrier.origin.add(side.into_wall.multiply_scalar(down * mu))
         let c_wall = try b.out.add_carrier(Carrier(1, lowered, carrier.x, carrier.y, wall_radius, wall_radius, -1))
         b.sides.items[k].inner = try b.out.add_edge(ShapeEdge(c_wall, edge.t0, edge.t1, wall_start, wall_end))
-        if b.round and b.continuity == 1:
+        if b.round and b.continuity == 1 and b.tangency == 1.0:
             # A torus about the arc's axis, its tube's center the ball's path.
             let center = carrier.origin.add(side.into_wall.multiply_scalar(b.reach))
             try b.out.surfaces.push(try Surface(5, center, carrier.x, carrier.x.cross(carrier.y), radius, b.reach, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))

@@ -1,0 +1,89 @@
+## A sphere face holding a pole with holes in it (a ball drilled through at
+## a slant leaves each half sphere such a face: its equator round the pole,
+## and a hole), which neither the cap's rows nor a latitude-longitude chart
+## take (the loop round the pole has no closed image in the second, and the
+## face does not fit an open hemisphere). It is meshed in an azimuthal
+## equidistant chart about that pole: each direction at angle θ from the
+## pole and azimuth φ about it is the point θ R (cos φ, sin φ), so the face
+## becomes a disk with holes, every loop closed, the chart's own lengths
+## the sphere's along meridians and never longer across them. The trims
+## are triangulated with a lattice there (TrimPolygon) and the new points
+## lifted onto the sphere; boundary ids stay the face's own.
+
+## The loop of `uv` (loops by `sizes`, a sphere's chart points scaled by
+## `uscale` in u) that goes round the axis once, -1 when none or more than
+## one does.
+func winding_loop(uv: const Vector3[], sizes: const i64[], uscale: f64) -> i64:
+    var found: i64 = -1
+    var offset: usize = 0
+    for loop in 0..<sizes.length:
+        let count = (usize)sizes[loop]
+        if winds_once(uv[offset..<offset + count], uscale):
+            if found >= 0: return -1
+            found = (i64)loop
+        offset += count
+    return found
+
+## Mesh the face of trim loops `ids` (by `sizes`; their sphere chart points
+## `uv`, u scaled by the radius) whose loop `outer` goes round the axis,
+## the rest holes, in the azimuthal chart about the pole `outer` goes round
+## (as spherical_cap picks it).
+func sphere_disk(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], uv: const Vector3[], outer: usize, s: Surface, sense: bool, divisions: i64) -> !:
+    var offset: usize = 0
+    for loop in 0..<outer: offset += (usize)sizes[loop]
+    let ring = uv[offset..<offset + (usize)sizes[outer]]
+    let north = (ring[ring.length - 1].x > ring[0].x) == sense
+    let pole = s.z.multiply_scalar(1.0 if north else -1.0)
+    let x = s.x
+    let y = pole.cross(x)
+    # The loops in chart order: the one round the pole first, then the holes.
+    let points = try new Vector3[ids.length] --- in memory.heap
+    defer free(points) in memory.heap
+    let order = try new i64[ids.length] --- in memory.heap
+    defer free(order) in memory.heap
+    let counts = try new i64[sizes.length] --- in memory.heap
+    defer free(counts) in memory.heap
+    var at: usize = 0
+    var low = Vector3(1e300, 1e300, 0.0)
+    var high = Vector3(-1e300, -1e300, 0.0)
+    for pass in 0..<(usize)2:
+        var start: usize = 0
+        for loop in 0..<sizes.length:
+            let count = (usize)sizes[loop]
+            if (loop == outer) == (pass == 0):
+                counts[(usize)(0 if pass == 0 else (loop + 1 if loop < outer else loop))] = (i64)count
+                for k in start..<start + count:
+                    let d = try mesh.points[(usize)ids[k]].subtract(s.origin).normalized()
+                    let theta = math.acos(math.clamp(d.dot(pole), -1.0, 1.0))
+                    if theta > math.pi * 0.95: error(invalid, "a sphere face reaches round to its pole's opposite")
+                    let phi = math.atan2(d.dot(y), d.dot(x))
+                    let p = Vector3(s.radius * theta * math.cos(phi), s.radius * theta * math.sin(phi), 0.0)
+                    points[at] = p
+                    order[at] = ids[k]
+                    low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), 0.0)
+                    high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), 0.0)
+                    at += 1
+            start += count
+    # A quarter turn in `divisions` steps, as the chart lattices space theirs,
+    # bounded by the disk's extent.
+    let extent = math.max(high.x - low.x, high.y - low.y)
+    let spacing = math.max(math.min(s.radius * math.pi / (2.0 * (f64)divisions), extent / (f64)divisions), extent / ((f64)divisions * 4.0))
+    let part = try TrimPolygon.quadrangulate_seams(points, counts, Vector3(0.0, 0.0, 1.0), order, spacing, spacing)
+    defer part.release()
+    let mapped = try new i64[(usize)part.value().point_count()] --- in memory.heap
+    defer free(mapped) in memory.heap
+    for k in 0..<mapped.length:
+        if k < order.length:
+            mapped[k] = order[k]
+            continue
+        let q = try part.value().point((i64)k)
+        let theta = math.hypot(q.x, q.y) / s.radius
+        let phi = math.atan2(q.y, q.x)
+        let way = pole.multiply_scalar(math.cos(theta)).add(x.multiply_scalar(math.sin(theta) * math.cos(phi))).add(y.multiply_scalar(math.sin(theta) * math.sin(phi)))
+        mapped[k] = try mesh.point(s.origin.add(way.multiply_scalar(s.radius)))
+    # The chart's +z is the sphere's outward normal (x cross y is the pole).
+    for face in 0..<part.value().face_count():
+        let count = try part.value().face_size(face)
+        try mesh.face(count)
+        for k in 0..<count:
+            try mesh.corner(mapped[(usize)(try part.value().face_point(face, k if sense else count - 1 - k))])
