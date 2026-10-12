@@ -1,0 +1,71 @@
+## A curved blend's strip (curved_blend.lucb) round a circle whose faces
+## are both turned about its axis (a dome's flat face and sphere, a hole's
+## rim through a ball): every section is the first one turned, so the
+## rows along the edge are exact rational arcs, the strip a surface of
+## revolution (a G1 fillet's at weight 1 the torus, as Fusion's) and its
+## contact edges exact circles.
+
+## Whether surface `s` is turned about the line through `origin` along
+## unit `axis`: a plane square to it, or a sphere, cylinder, cone or
+## torus about it.
+func turned_about(s: const Surface*, origin: Vector3, axis: Vector3, tolerance: f64) -> bool:
+    let offset = s.origin.subtract(origin)
+    let on_axis = offset.subtract(axis.multiply_scalar(offset.dot(axis))).length() <= tolerance
+    if s.kind == surface_plane: return math.abs(math.abs(s.z.dot(axis)) - 1.0) < 1e-9
+    if s.kind == surface_sphere: return on_axis
+    if s.kind == surface_cylinder or s.kind == surface_cone or s.kind == surface_torus: return on_axis and math.abs(math.abs(s.z.dot(axis)) - 1.0) < 1e-9
+    return false
+
+## Side `side`'s rows turned exactly when its edge is a circle (or an arc
+## of one) both its faces are turned about, its radius constant: onto
+## `points` (a row per section point, from the edge's start to its end),
+## `weights` and `knots` (degree 2, spans of at most a quarter turn); the
+## number of rows, 0 when the edge is not such a circle.
+func turned_rows(c: Curved*, side: const CurvedSide*, points: Growing[Vector3]*, weights: Growing[f64]*, knots: Growing[f64]*) -> usize!:
+    let w = c.w
+    if c.law != none: return 0
+    let edge = w.edges.items[side.edge]
+    let carrier = w.carriers.items[(usize)edge.carrier]
+    if carrier.kind != curve_circle: return 0
+    let axis = try carrier.x.cross(carrier.y).normalized()
+    let tolerance = carrier.a * 1e-9
+    if not turned_about(&w.surfaces.items[(usize)w.faces.items[side.a].surface], carrier.origin, axis, tolerance): return 0
+    if not turned_about(&w.surfaces.items[(usize)w.faces.items[side.b].surface], carrier.origin, axis, tolerance): return 0
+    # The section at the edge's start, its points and weights.
+    let s = try section_on(c, side, edge.t0)
+    var section = Growing[Vector3]()
+    defer section.close()
+    var section_weights = Growing[f64]()
+    defer section_weights.close()
+    if c.round and c.continuity == 1:
+        try section.push(s.on_a)
+        try section.push(s.corner)
+        try section.push(s.on_b)
+        try section_weights.push(1.0)
+        try section_weights.push(s.weight)
+        try section_weights.push(1.0)
+    else:
+        try curved_section_rows(c, s, &section)
+        try section_weights.fill(section.count, 1.0)
+    # Each point turned from the start to the end in equal spans, each a
+    # rational quadratic: its middle point out by 1 / cos and weighted cos
+    # of the half span.
+    let sweep = edge.t1 - edge.t0
+    let spans = (usize)math.max(1.0, math.ceil(math.abs(sweep) / (math.pi * 0.5) - 1e-9))
+    let half = sweep / (2.0 * (f64)spans)
+    for i in 0..<section.count:
+        let q = section.items[i]
+        let foot = carrier.origin.add(axis.multiply_scalar(q.subtract(carrier.origin).dot(axis)))
+        let out = q.subtract(foot)
+        let side_way = axis.cross(out)
+        for j in 0..<spans * 2 + 1:
+            let angle = half * (f64)j
+            let turned = out.multiply_scalar(math.cos(angle)).add(side_way.multiply_scalar(math.sin(angle)))
+            try points.push(foot.add(turned.multiply_scalar(1.0 if j % 2 == 0 else 1.0 / math.cos(half))))
+            try weights.push(section_weights.items[i] * (1.0 if j % 2 == 0 else math.cos(half)))
+    for _ in 0..<(usize)3: try knots.push(0.0)
+    for j in 1..<spans:
+        try knots.push((f64)j / (f64)spans)
+        try knots.push((f64)j / (f64)spans)
+    for _ in 0..<(usize)3: try knots.push(1.0)
+    return section.count

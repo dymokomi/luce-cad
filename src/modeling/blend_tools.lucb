@@ -17,13 +17,17 @@ func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size
     let ub = try into_face(w, fb, e, along)
     let cylinder = ruled_pair(w, e, fa, fb)
     if cylinder < 0: return try corner_profile(p, along, ua, ub, size, round, continuity, other, tangency)
-    if round and continuity != 1: error(invalid, "G2 and G3 fillets between a plane and a cylinder are not supported yet")
-    if round and tangency != 1.0: error(invalid, "a tangency weight between a plane and a cylinder is not supported yet")
+    # G2 (curvature matched to the cylinder at its contact) is cut cleanly;
+    # a G1 conic or G3 section touching the cylinder only tangentially
+    # leaves the booleans an intersection they cannot trace yet.
+    if round and continuity == 3: error(invalid, "G3 fillets between a plane and a cylinder along it are not built yet: use G1 or G2")
+    if round and continuity <= 1 and tangency != 1.0: error(invalid, "a Tangency weight on a G1 fillet between a plane and a cylinder along it is not built yet: use G2")
+    if round and continuity == g1_spline: error(invalid, "a G1 setback corner beside a fillet between a plane and a cylinder along it is not built yet")
     let plane = fb if (usize)cylinder == fa else fa
     let second = other if not round and other > 0.0 else size
     let on_plane = size if plane == fa else second
     let on_round = second if plane == fa else size
-    return try ruled_profile(w, plane, (usize)cylinder, p, along, ua if plane == fa else ub, ub if plane == fa else ua, on_plane, round, try convex(w, e), on_round)
+    return try ruled_profile(w, plane, (usize)cylinder, p, along, ua if plane == fa else ub, ub if plane == fa else ua, on_plane, round, try convex(w, e), on_round, continuity, tangency)
 
 ## The section of a blend between plane face `plane` and cylinder face
 ## `cylinder` (its axis along the edge), at edge point `p`: the region
@@ -32,8 +36,11 @@ func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size
 ## moved by the radius meet; a chamfer's line `size` along the plane and
 ## `other` to the cylinder), closed back along the cylinder's own circle.
 ## `into_plane` and `into_round` are the directions into each face from
-## the edge.
-func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool, other: f64) -> Profiles!:
+## the edge. A G2 fillet is a spline between the same contacts on the
+## corner where the plane meets the cylinder's tangent there
+## (fillet_section: Fusion's, following the cylinder's curvature at its
+## contact, under any Tangency weight).
+func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool, other: f64, continuity: i64 = 1, tangency: f64 = 1.0) -> Profiles!:
     let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
     let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
     let radius = s.radius
@@ -43,7 +50,16 @@ func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, a
     errdefer profile.close()
     try profile.loop_offsets.push(0)
     try profile.edges.push(line_edge(p, ta))
-    if round:
+    if round and continuity == 2:
+        let to_tb = tb.subtract(axis_point)
+        let corner = try lines_meet(ta, into_plane, tb, s.z.cross(to_tb))
+        let first = profile.spline_points.count
+        let knot_first = profile.spline_knots.count
+        try fillet_section(ta, tb, corner, 2, &profile.spline_points, &profile.spline_knots, tangency, Vector3(), to_tb.multiply_scalar(-1.0 / (radius * radius)))
+        while profile.spline_weights.count < profile.spline_points.count: try profile.spline_weights.push(1.0)
+        try profile.splines.push(ProfileSpline(first, profile.spline_points.count - first, knot_first, 5))
+        try profile.edges.push(ProfileEdge(2, ta, tb, Vector3(), 0.0, 0.0, (i64)profile.splines.count - 1))
+    elif round:
         let leaving = ta.subtract(center)
         let arriving = tb.subtract(center)
         try profile.edges.push(ProfileEdge(1, ta, tb, center, size, math.atan2(along.dot(leaving.cross(arriving)), leaving.dot(arriving)), -1))
@@ -179,31 +195,71 @@ func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: 
 ## A G2 or G3 fillet's section from contact `ta` to contact `tb`, whose
 ## legs run along the faces to the corner `p`: a degree 5 B-spline (the
 ## degree of every freeform element), its control points onto `points`
-## and its knots onto `knots`. The first three (G2) or four (G3) control
-## points lie along each leg, so the curvature (and for G3 its change) is
-## zero where it meets each face. G2 is one span (six points); G3 three
-## spans (eight points, knots at the thirds). At a square corner with
-## contacts a unit from it, both curves' curvature peaks at 1.17 times the
-## circle's, and their middles are 0.376 (G2) and 0.360 (G3) from the
-## corner, the circle's 0.414.
-## `tangency` is Fusion's Tangency weight (0.1 to 2): how far the
-## continuity reaches into the blend. Each leg's fraction f toward the
-## corner becomes 1 - (1 - f)^tangency: 1 leaves them, more draws the
-## points toward the corner (the curve hugs the faces longer and turns
-## tighter in the middle), less draws them back to the contacts (a flatter
-## blend). The contacts and the points' lines stay, so the continuity does.
-func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, points: Growing[Vector3]*, knots: Growing[f64]*, tangency: f64 = 1.0) -> !:
-    let g2: f64[3] = [0.0, 0.3, 0.6]
+## and its knots onto `knots`. `tangency` is Fusion's Tangency weight (0.1
+## to 2, 1 the default).
+## G2 is Fusion's own (Fusion 2705's blend faces read back as B-splines,
+## probe of 2026-10-12, matched to 1e-14 at seven corner angles and nine
+## weights): degree 4, two spans (knots 0, 1/2, 1), six points: each
+## contact, then two along its leg, a and b from it,
+##   a = r φ w / 8,   b = r sin φ / 4 + a (5 - 2 cos φ) / 3,
+## for the turn φ from one leg to the other (π less the faces' angle), the
+## radius r (each leg r tan(φ/2) long) and the weight w: w scales the speed
+## at the contacts, the circle's arc length r φ at 1. Raised here to degree
+## 5 exactly, the middle knot twice (still C3), so it is Fusion's curve.
+## On a curved face the inner point moves off its leg by 8 a² κ / 3 toward
+## the face's center of curvature in the section's plane, so the curvature
+## matches the face's at the contact (Fusion's does too): `bend_a` and
+## `bend_b` are κ times that unit direction at each contact (zero on a
+## flat face; curvature_toward gives them).
+## G3 (not in Fusion): three spans (knots at the thirds), eight points, the
+## first four along each leg (fractions 0, 0.1, 0.2 and 0.6 of the way to
+## the corner), so the curvature and its change are zero at each face. Its
+## weight draws each fraction f to 1 - (1 - f)^w: above 1 toward the corner
+## (hugging the faces longer, tighter in the middle), below toward the
+## contacts, its first points' speed nearly w times as Fusion's G2's, its
+## inner ones never past the corner.
+## At a square corner with contacts a unit from it, G2's middle is 0.366
+## from the corner and G3's 0.360, the circle's 0.414.
+func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, points: Growing[Vector3]*, knots: Growing[f64]*, tangency: f64 = 1.0, bend_a: Vector3 = Vector3(), bend_b: Vector3 = Vector3()) -> !:
+    if continuity == 2:
+        try fusion_g2(ta, tb, p, points, knots, tangency, bend_a, bend_b)
+        return
     let g3: f64[4] = [0.0, 0.1, 0.2, 0.6]
-    let half: usize = 3 if continuity == 2 else 4
-    for k in 0..<half: try points.push(ta.add(p.subtract(ta).multiply_scalar(weighted_fraction(g2[k] if half == 3 else g3[k], tangency))))
-    for k in 0..<half:
-        let f = g2[half - 1 - k] if half == 3 else g3[half - 1 - k]
-        try points.push(tb.add(p.subtract(tb).multiply_scalar(weighted_fraction(f, tangency))))
+    for k in 0..<(usize)4: try points.push(ta.add(p.subtract(ta).multiply_scalar(weighted_fraction(g3[k], tangency))))
+    for k in 0..<(usize)4: try points.push(tb.add(p.subtract(tb).multiply_scalar(weighted_fraction(g3[3 - k], tangency))))
     for _ in 0..<(usize)6: try knots.push(0.0)
-    if half == 4:
-        try knots.push(1.0 / 3.0)
-        try knots.push(2.0 / 3.0)
+    try knots.push(1.0 / 3.0)
+    try knots.push(2.0 / 3.0)
+    for _ in 0..<(usize)6: try knots.push(1.0)
+
+## Fusion's G2 section (fillet_section): its six degree 4 points, then
+## raised to degree 5 (eight points, knots 0 six times, 1/2 twice, 1 six
+## times).
+func fusion_g2(ta: Vector3, tb: Vector3, p: Vector3, points: Growing[Vector3]*, knots: Growing[f64]*, tangency: f64, bend_a: Vector3, bend_b: Vector3) -> !:
+    let la = p.subtract(ta)
+    let lb = p.subtract(tb)
+    let ea = try la.normalized()
+    let eb = try lb.normalized()
+    # The turn between the legs, and the radius their length gives.
+    let phi = math.pi - math.acos(math.clamp(ea.dot(eb), -1.0, 1.0))
+    let leg = (la.length() + lb.length()) * 0.5
+    let r = leg / math.tan(phi * 0.5)
+    let a = r * phi * tangency / 8.0
+    let b = r * math.sin(phi) / 4.0 + a * (5.0 - 2.0 * math.cos(phi)) / 3.0
+    let off = 8.0 * a * a / 3.0
+    let q: Vector3[6] = [ta, ta.add(ea.multiply_scalar(a)), ta.add(ea.multiply_scalar(b)).add(bend_a.multiply_scalar(off)),
+                         tb.add(eb.multiply_scalar(b)).add(bend_b.multiply_scalar(off)), tb.add(eb.multiply_scalar(a)), tb]
+    try points.push(q[0])
+    try points.push(q[0].add(q[1].multiply_scalar(4.0)).multiply_scalar(0.2))
+    try points.push(q[1].multiply_scalar(0.7).add(q[2].multiply_scalar(0.3)))
+    try points.push(q[1].add(q[2].multiply_scalar(7.0)).add(q[3].multiply_scalar(2.0)).multiply_scalar(0.1))
+    try points.push(q[2].multiply_scalar(2.0).add(q[3].multiply_scalar(7.0)).add(q[4]).multiply_scalar(0.1))
+    try points.push(q[3].multiply_scalar(0.3).add(q[4].multiply_scalar(0.7)))
+    try points.push(q[4].multiply_scalar(4.0).add(q[5]).multiply_scalar(0.2))
+    try points.push(q[5])
+    for _ in 0..<(usize)6: try knots.push(0.0)
+    try knots.push(0.5)
+    try knots.push(0.5)
     for _ in 0..<(usize)6: try knots.push(1.0)
 
 ## A section control point's fraction `f` toward the corner under tangency
@@ -295,7 +351,7 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     let normal = carrier.x.cross(carrier.y)
     let ball = sphere_rim(w, e, fa, fb)
     if ball >= 0 and not try convex(w, e): error(invalid, "an inside rim on a sphere (a dimple's) is not blended yet")
-    if ball >= 0 and round: error(invalid, "a fillet of a rim between a flat face and a sphere is not built yet: chamfer it")
+    if ball >= 0 and round: error(invalid, "a rim between a flat face and a sphere is filleted only along its whole loop (curved_blend)")
     let solid = try BrepModel.sized(carrier.a + size * 4.0)
     defer solid.release()
     if edge.start == edge.end:

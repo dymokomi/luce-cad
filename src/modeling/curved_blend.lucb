@@ -1,12 +1,14 @@
 ## Blends of edges between two curved faces (a boss on a pipe, a hole's rim
-## through a ball, two fillets' strips meeting), built directly as
-## cap_blend.lucb's are: a ball of the radius rolling between the two
-## surfaces, in the plane square to the edge at each point. Its center
+## through a ball, two fillets' strips meeting) or fillets between a flat
+## face and a sphere about it (a dome's rim: Fusion's torus there), built
+## directly as cap_blend.lucb's are: a ball of the radius rolling between
+## the two surfaces, in the plane square to the edge at each point. Its center
 ## (the spine) is where both surfaces offset by the radius meet in that
 ## plane (Newton on their signed distances, the plane's equation the
 ## third), its contacts the nearest points on each, and the section the
-## arc between them (a G1 circle, rational; the G2/G3 B-spline on the
-## same contacts and their tangents' corner) or, chamfered, the line
+## arc between them (a G1 circle, rational, a conic under a Tangency
+## weight; the G2/G3 B-spline on the same contacts and their tangents'
+## corner, G2's following each face's curvature) or, chamfered, the line
 ## between the points the chamfer's size along each face. The strip's rows
 ## of control points are fitted along the edge (row_fit.lucb), a G1
 ## section's middle weight fitted with them (its rows homogeneous).
@@ -33,13 +35,16 @@ struct CurvedSide:
 
 ## One section across a picked edge: the contacts on its faces, the
 ## corner where their tangents in the section's plane meet, the ball's
-## center and (G1) the arc's middle weight.
+## center, (G1) the arc's middle weight and (G2) each face's curvature
+## along the section at its contact (curvature_toward).
 struct CurvedSection:
     var on_a: Vector3
     var corner: Vector3
     var on_b: Vector3
     var center: Vector3
     var weight: f64
+    var bend_a: Vector3
+    var bend_b: Vector3
 
 ## The builder: the body `w`, the result `out` (a copy of the body to
 ## begin), the blend (`reach`: a fillet's radius, a chamfer's size; a
@@ -112,15 +117,19 @@ func new_curved(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cur
     for f in 0..<w.faces.count: try made.fields.push(field_of(&w.surfaces.items[(usize)w.faces.items[f].surface]))
     return made
 
-## Whether the picked edges are such loops: each between two faces at
-## least one of them curved and neither flat, its vertices joints, the
+## Whether the picked edges are such loops: each between two curved faces
+## (or, filleted, a flat face and a sphere about it), its vertices joints, the
 ## faces' other edges there running on in the section's plane.
 func curved_eligible(c: Curved*, chosen: const usize[]) -> bool!:
     let w = c.w
     if chosen.length == 0: return false
     for e in chosen:
         let (fa, fb) = try edge_faces(w, e)
-        if w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_plane or w.surfaces.items[(usize)w.faces.items[fb].surface].kind == surface_plane: return false
+        # Two curved faces, or a fillet of a flat face and a sphere about
+        # the rim (a dome's; its chamfer is a cone, sphere_rims.lucb, and
+        # cap_blend.lucb takes walls ruled away from a flat face).
+        let flat = w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_plane or w.surfaces.items[(usize)w.faces.items[fb].surface].kind == surface_plane
+        if flat and (not c.round or sphere_rim(w, e, fa, fb) < 0): return false
         if c.side_of.items[e] >= 0: return false
         try c.sides.push(CurvedSide(e, fa, fb, try convex(w, e), -1, -1, -1, true))
         c.side_of.items[e] = (i64)c.sides.count - 1
@@ -281,7 +290,7 @@ func section_on(c: Curved*, side: const CurvedSide*, t: f64) -> CurvedSection!:
         let qb = try chamfer_point(c, side.b, e, tangent, on_b, other if a_first else r)
         # Its "center" mirrors the corner across the chamfer's middle, so
         # that the strip faces away from it as a ball's does.
-        return CurvedSection(qa, e, qb, qa.add(qb).subtract(e), 1.0)
+        return CurvedSection(qa, e, qb, qa.add(qb).subtract(e), 1.0, Vector3(), Vector3())
     # The corner: where the contacts' tangents across the edge meet.
     let (_, normal_a, _) = try face_distance(c, side.a, on_a)
     let (_, normal_b, _) = try face_distance(c, side.b, on_b)
@@ -289,7 +298,25 @@ func section_on(c: Curved*, side: const CurvedSide*, t: f64) -> CurvedSection!:
     let way_b = tangent.cross(normal_b).multiply_scalar(1.0 if tangent.cross(normal_b).dot(e.subtract(on_b)) > 0.0 else -1.0)
     let corner = try lines_meet(on_a, way_a, on_b, way_b)
     let angle = math.acos(math.clamp((try on_a.subtract(corner).normalized()).dot(try on_b.subtract(corner).normalized()), -1.0, 1.0))
-    return CurvedSection(on_a, corner, on_b, center, math.sin(angle * 0.5))
+    # G1's middle weight (times Fusion's Tangency weight: a conic); G2's
+    # inner points follow the faces' curvature.
+    var bend_a = Vector3()
+    var bend_b = Vector3()
+    if c.continuity == 2:
+        bend_a = try curvature_toward(c, side.a, on_a, try way_a.normalized())
+        bend_b = try curvature_toward(c, side.b, on_b, try way_b.normalized())
+    return CurvedSection(on_a, corner, on_b, center, math.sin(angle * 0.5) * c.tangency, bend_a, bend_b)
+
+## Face `f`'s curvature at its point `q` along its tangent `way`: the
+## curvature times the unit direction toward its center of curvature (the
+## normal section's), from how its normal turns along `way` (face_distance's
+## normals a hair either side). Zero on a plane.
+func curvature_toward(c: Curved*, f: usize, q: Vector3, way: Vector3) -> Vector3!:
+    let h = c.reach * 1e-4
+    let (_, n, _) = try face_distance(c, f, q)
+    let (_, ahead, _) = try face_distance(c, f, q.add(way.multiply_scalar(h)))
+    let (_, behind, _) = try face_distance(c, f, q.subtract(way.multiply_scalar(h)))
+    return n.multiply_scalar(-ahead.subtract(behind).dot(way) / (2.0 * h))
 
 ## The point face `f` reaches `size` from edge point `e` in the plane square
 ## to `tangent`, heading toward `toward` (the ball's contact there): Newton
@@ -357,7 +384,7 @@ func curved_section_rows(c: const Curved*, s: CurvedSection, out: Growing[Vector
         return
     var knots = Growing[f64]()
     defer knots.close()
-    try fillet_section(s.on_a, s.on_b, s.corner, c.continuity, out, &knots, c.tangency)
+    try fillet_section(s.on_a, s.on_b, s.corner, c.continuity, out, &knots, c.tangency, s.bend_a, s.bend_b)
 
 ## A side's rows as a row source.
 struct CurvedRows:
@@ -453,6 +480,53 @@ func curved_strip(c: Curved*, k: usize) -> !:
     let w = c.w
     let side = c.sides.items[k]
     let edge = w.edges.items[side.edge]
+    # The surface's rows (a row per section point, along the edge) and
+    # their weights, its knots along and degree.
+    var points = Growing[Vector3]()
+    defer points.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var p: usize = 2
+    var forward = true
+    var surface_rows = try turned_rows(c, &c.sides.items[k], &points, &weights, &knots)
+    if surface_rows == 0:
+        p = try fitted_curved_rows(c, k, &points, &weights, &knots)
+        surface_rows = points.count // (knots.count - p - 1)
+        forward = edge.t1 > edge.t0
+    let nv = knots.count - p - 1
+    var ku = Growing[f64]()
+    defer ku.close()
+    let du = try curved_section_knots(c, &ku)
+    let start_a = c.on_a.items[(usize)edge.start]
+    let end_a = c.on_a.items[(usize)edge.end]
+    let start_b = c.on_b.items[(usize)edge.start]
+    let end_b = c.on_b.items[(usize)edge.end]
+    # The contact edges: the first row and the last.
+    c.sides.items[k].outer = try curved_spline_edge(&c.out, start_a, end_a, points.view()[..<nv], weights.view()[..<nv], knots.view(), (i64)p, forward)
+    let last = surface_rows - 1
+    c.sides.items[k].inner = try curved_spline_edge(&c.out, start_b, end_b, points.view()[last * nv..<(last + 1) * nv], weights.view()[last * nv..<(last + 1) * nv], knots.view(), (i64)p, forward)
+    try c.out.surfaces.push(try Surface(surface_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, points.view(), weights.view(), ku.view(), knots.view(), (i64)surface_rows, (i64)nv, du, (i64)p))
+    let surface = (i64)c.out.surfaces.count - 1
+    c.sides.items[k].surface = surface
+    # Outward at the middle: away from the ball's center on a convex edge.
+    let middle = try section_on(c, &c.sides.items[k], (edge.t0 + edge.t1) * 0.5)
+    let surf = &c.out.surfaces.items[(usize)surface]
+    let u_mid = (surf.ku[(usize)surf.du] + surf.ku[(usize)surf.nu]) * 0.5
+    let v_mid = (surf.kv[(usize)surf.dv] + surf.kv[(usize)surf.nv]) * 0.5
+    let normal = try surface_normal_checked(surf.points, surf.weights, surf.nu, surf.nv, surf.du, surf.dv, surf.ku, surf.kv, u_mid, v_mid)
+    let at = middle.on_a.add(middle.on_b).multiply_scalar(0.5)
+    let outward = at.subtract(middle.center) if side.convex else middle.center.subtract(at)
+    c.sides.items[k].sense = normal.dot(outward) > 0.0
+
+## Side `k`'s rows fitted along its edge (row_fit.lucb) from its lower
+## parameter to its higher: onto `points` (a row per section point, a G1
+## corner row divided by its weight), `weights` and `knots`; the degree
+## along: a B-spline edge's (at least 3) on its knots, else 5 in four spans.
+func fitted_curved_rows(c: Curved*, k: usize, points: Growing[Vector3]*, weights: Growing[f64]*, knots: Growing[f64]*) -> usize!:
+    let w = c.w
+    let edge = w.edges.items[c.sides.items[k].edge]
     let carrier = w.carriers.items[(usize)edge.carrier]
     let low = math.min(edge.t0, edge.t1)
     let high = math.max(edge.t0, edge.t1)
@@ -460,8 +534,6 @@ func curved_strip(c: Curved*, k: usize) -> !:
     defer probe.close()
     try curved_section_rows(c, try section_on(c, &c.sides.items[k], low), &probe)
     let rows = probe.count
-    var knots = Growing[f64]()
-    defer knots.close()
     var p: usize = 5
     if carrier.kind == curve_spline:
         let (_, _, ck, cd) = w.spline_net(carrier.spline)
@@ -484,13 +556,9 @@ func curved_strip(c: Curved*, k: usize) -> !:
     var source = RowSource((void*)&context, curved_rows_at, low, high, w.tolerance)
     var net = Growing[Vector3]()
     defer net.close()
-    try fit_rows(&source, rows, p, &knots, &net)
+    try fit_rows(&source, rows, p, knots, &net)
     let nv = knots.count - p - 1
-    # The surface's rows and weights; a G1 corner row is homogeneous.
-    var points = Growing[Vector3]()
-    defer points.close()
-    var weights = Growing[f64]()
-    defer weights.close()
+    # A G1 corner row is homogeneous, its weights the row after the last.
     let surface_rows = rows - 1 if c.round and c.continuity == 1 else rows
     for i in 0..<surface_rows:
         for j in 0..<nv:
@@ -501,32 +569,7 @@ func curved_strip(c: Curved*, k: usize) -> !:
                 point = point.multiply_scalar(1.0 / weight)
             try points.push(point)
             try weights.push(weight)
-    var ku = Growing[f64]()
-    defer ku.close()
-    let du = try curved_section_knots(c, &ku)
-    let forward = edge.t1 > edge.t0
-    let start_a = c.on_a.items[(usize)edge.start]
-    let end_a = c.on_a.items[(usize)edge.end]
-    let start_b = c.on_b.items[(usize)edge.start]
-    let end_b = c.on_b.items[(usize)edge.end]
-    var ones = Growing[f64]()
-    defer ones.close()
-    try ones.fill(nv, 1.0)
-    c.sides.items[k].outer = try curved_spline_edge(&c.out, start_a, end_a, net.view()[..<nv], ones.view(), knots.view(), (i64)p, forward)
-    let last = surface_rows - 1
-    c.sides.items[k].inner = try curved_spline_edge(&c.out, start_b, end_b, net.view()[last * nv..<(last + 1) * nv], ones.view(), knots.view(), (i64)p, forward)
-    try c.out.surfaces.push(try Surface(surface_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, points.view(), weights.view(), ku.view(), knots.view(), (i64)surface_rows, (i64)nv, du, (i64)p))
-    let surface = (i64)c.out.surfaces.count - 1
-    c.sides.items[k].surface = surface
-    # Outward at the middle: away from the ball's center on a convex edge.
-    let middle = try section_on(c, &c.sides.items[k], (low + high) * 0.5)
-    let surf = &c.out.surfaces.items[(usize)surface]
-    let u_mid = (surf.ku[(usize)surf.du] + surf.ku[(usize)surf.nu]) * 0.5
-    let v_mid = (surf.kv[(usize)surf.dv] + surf.kv[(usize)surf.nv]) * 0.5
-    let normal = try surface_normal_checked(surf.points, surf.weights, surf.nu, surf.nv, surf.du, surf.dv, surf.ku, surf.kv, u_mid, v_mid)
-    let at = middle.on_a.add(middle.on_b).multiply_scalar(0.5)
-    let outward = at.subtract(middle.center) if side.convex else middle.center.subtract(at)
-    c.sides.items[k].sense = normal.dot(outward) > 0.0
+    return p
 
 ## A B-spline edge of `s` over its whole domain from point `a` to `b`:
 ## from its first control point to its last (`forward`), or back.

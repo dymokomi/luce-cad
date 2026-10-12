@@ -3,8 +3,23 @@
 ##   cut at its middle) chamfered 3 at its rim has its sphere-side circle
 ##   r 9.55 at 2.96606 above the rim's plane (3 straight from the rim, as
 ##   Fusion's) and its plane-side circle r 7. Fusion's volume, 1833.0211,
-##   is what the chord gives (Pappus); the arc's would differ. A fillet
-##   there is refused (not built yet).
+##   is what the chord gives (Pappus); the arc's would differ.
+## - The same dome's rim filleted 2 (Fusion succeeds: a torus between the
+##   plane's circle of √60 and the sphere's of √93.75 at 2.5): at G1 and G2,
+##   Tangency weights 0.5, 1 and 2, the volumes Fusion gave (probe of
+##   2026-10-12); G3 closes too.
+## - Fusion's Tangency weight on a straight edge filleted 4 (its sections
+##   fusion_section_contract checks): a 20 box's edge and prisms whose edge
+##   is 120° and 60°, G1 and G2 at weights 0.5, 1 and 2, Fusion's volumes.
+## - A D-shaft (a circle of 10 cut flat at 5, 20 long), the flat meeting
+##   the cylinder along it filleted 2 at G2 (its section matching the
+##   cylinder's curvature, as Fusion's) at weights 0.5, 1 and 2: Fusion's
+##   volumes; a weighted G1 and G3 there are refused (not built yet).
+## - A variable radius (2 to 6, straight) along a 20 box's edge: G2 at
+##   weights 0.5, 1 and 2 and G1 at 0.5 and 2 take Fusion's volumes (each
+##   section the weight's at its radius). G1 at weight 1 differs: Fusion
+##   rolls a ball there (a cone, 7926.5667), ours scales the circle in
+##   planes square to the edge (8000 - (1 - π/4) 1040/3).
 ## - A fillet's open end where the face going on does not turn away (a
 ##   stadium plate, one arc's top edge alone, r 3): Fusion fails there
 ##   (ASM_BL_END_TOO_CMPLX) at G1 and G2; here it ends flat (a deliberate
@@ -20,8 +35,113 @@ from luce_std import math
 
 pub func fusion_probe_tests() -> unit!:
     dome_chord()
+    dome_fillet()
+    weighted_edges()
+    flat_shaft()
+    variable_weights()
     open_end()
-    print("PASS Fusion probe cases: a dome's rim chamfered 3 (Fusion's circles r 9.55 at 2.96606 and r 7, its volume 1833.0211 by the chord), a fillet there refused; a stadium arc's top edge filleted alone at G1 and G2, ending flat where Fusion fails")
+    print("PASS Fusion probe cases: a dome's rim chamfered 3 (Fusion's circles r 9.55 at 2.96606 and r 7, its volume 1833.0211 by the chord) and filleted 2 (Fusion's torus circles and volumes at G1 and G2, weights 0.5, 1, 2; G3 closed); Tangency weights on a box's edge and 120° and 60° prisms' (Fusion's volumes); a D-shaft's flat edge at G2 and weights (Fusion's volumes), weighted G1 and G3 there refused; variable radius under weights (Fusion's volumes); a stadium arc's top edge filleted alone at G1 and G2, ending flat where Fusion fails")
+
+## The volume of `model`'s mesh at 32 and 64 divisions, extrapolated (its
+## error falls as the square of the division).
+func refined(model: CadModel) -> float!:
+    let coarse = volume(model.tessellate(32))
+    let mesh = model.tessellate(64)
+    closed(mesh)
+    let fine = volume(mesh)
+    return fine + (fine - coarse) / 3.0
+
+## Fusion's volumes taken away from a dome of 10 by its rim filleted 2,
+## G1 then G2 at weights 0.5, 1 and 2 (the dome 2000 π / 3).
+func dome_fillet() -> unit!:
+    let ball = CadModeling.tagged(CadSolids.sphere(10.0), "ball")
+    let below = CadModeling.tagged(CadSolids.box(30.0, 30.0, 30.0), "cut").transformed(Vector3(0.0, -15.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let dome = CadModeling.combined(ball, below, 1)
+    let rim_edges = CadModeling.edge_references(dome, edges_where(dome, rim))
+    let whole = refined(dome)
+    let fusion = [1986.038249, 2020.562509, 2056.411298, 2000.042229, 2032.746816, 2079.880153]
+    var at = 0
+    for continuity in [1, 2]:
+        for weight in [0.5, 1.0, 2.0]:
+            let made = CadModeling.filleted(dome, rim_edges, 2.0, "f", continuity, tangency = weight)
+            assert(made.face_count() == 3)
+            # The contacts: the plane's circle of √60, the sphere's of
+            # √93.75 at 2.5 (10/8 of the ball's center at √60, 2).
+            assert(has_circle(made, math.sqrt(60.0), 0.0) and has_circle(made, math.sqrt(93.75), 2.5))
+            let taken = whole - refined(made)
+            let expected = 2000.0 * math.pi / 3.0 - fusion[at]
+            if math.abs(taken - expected) > 0.01: print(f"dome G{continuity} weight {weight}: taken {taken}, Fusion {expected}")
+            assert(math.abs(taken - expected) <= 0.01)
+            at += 1
+    closed(CadModeling.filleted(dome, rim_edges, 2.0, "f", 3).tessellate(32))
+
+## A prism 20 deep whose top edge at (20, 20) is `angle` degrees between
+## its top and its side.
+func prism(angle: float) -> CadModel!:
+    let t = angle * math.pi / 180.0
+    let s = CadSketch.parse("")
+    let corners = [Vector3(0.0, 0.0, 0.0), Vector3(20.0, 0.0, 0.0), Vector3(20.0, 20.0, 0.0), Vector3(0.0, 20.0, 0.0)] if angle == 90.0 else [Vector3(-20.0, 0.0, 0.0), Vector3(20.0 - math.cos(t) * 20.0 / math.sin(t), 0.0, 0.0), Vector3(20.0, 20.0, 0.0), Vector3(-20.0, 20.0, 0.0)]
+    let ids: list[int] = []
+    for p in corners:
+        ids.append(s.add_point(p.x, p.y))
+    for k in 0..<4:
+        _ = s.add_line(ids[k], ids[(k + 1) % 4])
+    return CadModeling.extruded_sides(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 20.0, 0.0, "p")
+
+## The reference of `model`'s edge along z through (x, y).
+func edge_along(model: CadModel, x: float, y: float) -> str!:
+    let along = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - x) < 1e-6 and math.abs(a.y - y) < 1e-6 and math.abs(b.x - x) < 1e-6 and math.abs(b.y - y) < 1e-6
+    let found = edges_where(model, along)
+    assert(found.length == 1)
+    return CadModeling.edge_references(model, found)
+
+## Fusion's volumes for the edge at (20, 20) filleted 4 at G1 and G2,
+## weights 0.5, 1 and 2, the edge 90°, 120° and 60°.
+func weighted_edges() -> unit!:
+    let fusion = [7900.730747, 7931.327412, 7960.567923, 7917.722074, 7946.16264, 7986.770673,
+                  18283.220536, 18292.200599, 18300.075207, 18290.408837, 18297.650774, 18307.482233,
+                  13398.10065, 13471.445881, 13552.034859, 13418.569641, 13492.711559, 13608.637652]
+    var at = 0
+    for angle in [90.0, 120.0, 60.0]:
+        let p = prism(angle)
+        let edge = edge_along(p, 20.0, 20.0)
+        for continuity in [1, 2]:
+            for weight in [0.5, 1.0, 2.0]:
+                let v = refined(CadModeling.filleted(p, edge, 4.0, "f", continuity, false, tangency = weight))
+                if math.abs(v - fusion[at]) > 0.002: print(f"{angle}° G{continuity} weight {weight}: {v}, Fusion {fusion[at]}")
+                assert(math.abs(v - fusion[at]) <= 0.002)
+                at += 1
+
+## A circle of 10 cut flat at y = 5, 20 long: the flat meets the cylinder
+## along (±√75, 5).
+func flat_shaft() -> unit!:
+    let s = CadSketch.parse("")
+    let x = math.sqrt(75.0)
+    let a = s.add_point(-x, 5.0)
+    let b = s.add_point(x, 5.0)
+    _ = s.add_line(a, b)
+    _ = s.add_arc(s.add_point(0.0, 0.0), a, b)
+    let shaft = CadModeling.extruded_sides(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 20.0, 0.0, "s")
+    let edge = edge_along(shaft, x, 5.0)
+    let whole = refined(shaft)
+    let exact = 2000.0 * (math.pi - (2.0 * math.pi / 3.0 - math.sqrt(0.75)) * 0.5)
+    let fusion = [5048.28947, 5050.892648, 5054.231887]
+    var at = 0
+    for weight in [0.5, 1.0, 2.0]:
+        let taken = whole - refined(CadModeling.filleted(shaft, edge, 2.0, "f", 2, false, tangency = weight))
+        let expected = exact - fusion[at]
+        if math.abs(taken - expected) > 0.003: print(f"D-shaft G2 weight {weight}: taken {taken}, Fusion {expected}")
+        assert(math.abs(taken - expected) <= 0.003)
+        at += 1
+    # Fusion's G1 there is the circle (5049.190782 at weight 1).
+    let g1 = whole - refined(CadModeling.filleted(shaft, edge, 2.0, "f", 1, false))
+    assert(math.abs(g1 - (exact - 5049.190782)) <= 0.003)
+    for continuity in [1, 3]:
+        var said = ""
+        _ = CadModeling.filleted(shaft, edge, 2.0, "f", continuity, false, tangency = 0.5) catch failure:
+            said = failure.message
+        assert(said.contains("not built yet"), said)
 
 ## The ids of `model`'s edges whose start and middle `keep` takes.
 func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
@@ -75,11 +195,18 @@ func dome_chord() -> unit!:
     let got = volume(dome.tessellate(64)) - volume(mesh)
     if math.abs(got - taken) > taken * 0.002: print(f"dome: taken {got}, expected {taken}")
     assert(math.abs(got - taken) <= taken * 0.002)
-    # Fillets there are not built yet: said.
-    var said = ""
-    _ = CadModeling.filleted(dome, CadModeling.edge_references(dome, edges), 2.0, "f") catch failure:
-        said = failure.message
-    assert(said.contains("sphere"), said)
+
+## A 20 box's edge at (20, 20) filleted 2 to 6 straight along it, G2 at
+## weights 0.5, 1, 2 and G1 at 0.5, 2: Fusion's volumes; G1 at 1 the
+## circles scaled (∫ r² = 1040 / 3).
+func variable_weights() -> unit!:
+    let p = prism(90.0)
+    let edge = edge_along(p, 20.0, 20.0)
+    let cases = [(2, 0.5, 7910.865581), (2, 1.0, 7941.676193), (2, 2.0, 7985.66823), (1, 0.5, 7892.458309), (1, 2.0, 7957.281917), (1, 1.0, 8000.0 - (1.0 - math.pi / 4.0) * 1040.0 / 3.0)]
+    for (continuity, weight, expected) in cases:
+        let v = refined(CadModeling.variable_filleted(p, edge, [0.0, 1.0], [2.0, 6.0], "v", false, continuity, false, weight))
+        if math.abs(v - expected) > 0.002: print(f"variable G{continuity} weight {weight}: {v}, expected {expected}")
+        assert(math.abs(v - expected) <= 0.002)
 
 ## A stadium plate 10 high: lines (0, ±10) to (30, ±10), half circles of
 ## 10 about (0, 0) and (30, 0); y up.

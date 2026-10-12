@@ -1,0 +1,97 @@
+## Fillet sections against Fusion 2705's own (its blend faces read back as
+## B-splines by the probe of 2026-10-12): a 20 box's top front edge
+## filleted 4, the section where the blend meets the box's side.
+## - G2 at Tangency weights 0.1, 0.5, 1 and 2: Fusion's curve is degree 4,
+##   two spans (knots 0, 1/2, 1), its six points the contacts and two along
+##   each leg, a and b from the contact (below, as Fusion wrote them). Ours
+##   is the same curve raised to degree 5: equal at every parameter.
+## - G1 at weights 0.5 and 2: Fusion's rational cubic (the conic raised
+##   from its quadratic, middle weight cos 45° times the weight), equal to
+##   ours, a rational quintic, at every parameter.
+import interop
+from luce_std import math
+from luce_geocore.geocore import Vector3, invalid
+from luce_geocore.core.growing import Growing
+from geometry import NurbsCurve
+from model import CadModel
+from solids import CadSolids
+from modeling import CadModeling, blended, shape_of
+
+pub func fusion_section_contracts() -> !:
+    let box = try CadModeling.tagged(try CadSolids.box(20.0, 20.0, 20.0), "#b")
+    defer box.release()
+    # Fusion's G2 legs: (weight, a, b).
+    let g2: f64[12] = [0.1, 0.078539816, 1.130899694, 0.5, 0.392699082, 1.654498469, 1.0, 0.785398163, 2.308996939, 2.0, 1.570796327, 3.617993878]
+    for k in 0..<(usize)4:
+        let a = g2[k * 3 + 1]
+        let b = g2[k * 3 + 2]
+        # In the box's frame: the corner (10, 10) in (y, z), the contacts 4
+        # down the side and 4 back along the top.
+        let fusion: Vector3[6] = [Vector3(0.0, 6.0, 10.0), Vector3(0.0, 6.0 + a, 10.0), Vector3(0.0, 6.0 + b, 10.0), Vector3(0.0, 10.0, 6.0 + b), Vector3(0.0, 10.0, 6.0 + a), Vector3(0.0, 10.0, 6.0)]
+        let ones: f64[6] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        let knots: f64[11] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0]
+        try compare(box, 2, g2[k * 3], fusion[..<6], ones[..<6], 4, knots[..<11])
+    # Fusion's G1 conics: (weight, the inner points' offset, their weight).
+    let g1: f64[6] = [0.5, 1.656854249, 0.5690355937288492, 2.0, 2.9551845, 1.2761423749153968]
+    for k in 0..<(usize)2:
+        let off = g1[k * 3 + 1]
+        let inner = g1[k * 3 + 2]
+        let fusion: Vector3[4] = [Vector3(0.0, 6.0, 10.0), Vector3(0.0, 6.0 + off, 10.0), Vector3(0.0, 10.0, 6.0 + off), Vector3(0.0, 10.0, 6.0)]
+        let weights: f64[4] = [1.0, inner, inner, 1.0]
+        let knots: f64[8] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+        try compare(box, 1, g1[k * 3], fusion[..<4], weights[..<4], 3, knots[..<8])
+
+## The box's top front edge filleted 4 at `continuity` and `weight`: its
+## blend face's section (where x is least) against Fusion's curve, both
+## ways round, at 41 parameters.
+func compare(box: interop.Reference[CadModel], continuity: i64, weight: f64, fusion: const Vector3[], fusion_weights: const f64[], degree: i64, fusion_knots: const f64[]) -> !:
+    var w = try shape_of(box.value())
+    defer w.close()
+    var edges = Growing[i64]()
+    defer edges.close()
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        let a = w.points.items[(usize)edge.start]
+        let b = w.points.items[(usize)edge.end]
+        if a.y > 9.99 and b.y > 9.99 and a.z > 9.99 and b.z > 9.99: try edges.push((i64)e)
+    if edges.count != 1: error(invalid, "the box's top front edge was not found")
+    let references = try CadModeling.edge_references(box, edges.view())
+    defer references.release()
+    let made = try blended(box.value(), references.value, 4.0, true, "#f", continuity, true, true, 1, false, weight)
+    defer made.release()
+    var found = false
+    for face in 0..<made.value().face_count():
+        var support = try made.value().face_support(face)
+        defer support.close()
+        if support.kind != 3: continue
+        found = true
+        # The section runs the way of degree 5; its first row, at the
+        # box's side (x = -10 or past it: the strip may reach beyond).
+        let across_u = support.du == 5
+        let count = support.nu if across_u else support.nv
+        let rows = support.nv if across_u else support.nu
+        var section = Growing[Vector3]()
+        defer section.close()
+        var weights = Growing[f64]()
+        defer weights.close()
+        for i in 0..<(usize)count:
+            let at = i * (usize)rows if across_u else i
+            try section.push(support.placement.transform_point(support.points.items[at]))
+            try weights.push(support.weights.items[at])
+        let knots = support.knots_u.view() if across_u else support.knots_v.view()
+        let low = knots[5]
+        let high = knots[knots.length - 6]
+        var forward = 0.0
+        var backward = 0.0
+        for k in 0..<(usize)41:
+            let t = (f64)k / 40.0
+            var ours = try NurbsCurve.at(section.view(), weights.view(), 5, knots, low + (high - low) * t)
+            ours = Vector3(0.0, ours.y, ours.z)
+            let there = try NurbsCurve.at(fusion, fusion_weights, degree, fusion_knots, t)
+            let back = try NurbsCurve.at(fusion, fusion_weights, degree, fusion_knots, 1.0 - t)
+            forward = math.max(forward, ours.subtract(there).length())
+            backward = math.max(backward, ours.subtract(back).length())
+        if math.min(forward, backward) > 2e-6:
+            print(f"G{continuity} weight {weight}: off Fusion's section by {math.min(forward, backward)}")
+            error(invalid, "a fillet's section is not Fusion's")
+    if not found: error(invalid, "the fillet has no B-spline face")

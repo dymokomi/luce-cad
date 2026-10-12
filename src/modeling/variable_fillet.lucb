@@ -1,6 +1,7 @@
 ## Fusion's Variable radius fillet: radii at points along a tangent chain
 ## of edges (positions 0 to 1 along it: radius_law.lucb), blending between
-## them smoothly or straight, G1, G2 or G3.
+## them smoothly or straight, G1, G2 or G3, under Fusion's Tangency weight
+## (fillet_section, arc_section) as a constant fillet's.
 ##
 ## The chain is built as a constant fillet's would be, the radius asked of
 ## the law at each section: loops round a flat face and their open ends'
@@ -14,8 +15,9 @@
 ## edge every control point is the edge's point plus r(s) times a fixed
 ## vector (G1: the rational quadratic arc from contact to contact whose
 ## middle control point is the edge's own point, weighted sin(θ/2) for
-## faces θ apart, the contacts r cot(θ/2) along each face; G2 and G3: the
-## fillet's B-spline on those contacts), so with r(s) a piecewise cubic the
+## faces θ apart, times the Tangency weight (a conic), the contacts
+## r cot(θ/2) along each face; G2 and G3: the fillet's B-spline on those
+## contacts), so with r(s) a piecewise cubic the
 ## face is exactly a B-spline, cubic along (a knot thrice at each point:
 ## each piece a Bezier). The tool is the region between the edge and that
 ## face, taken away (an inside edge: added) by the booleans. Its net keeps
@@ -33,9 +35,10 @@
 ## `chain`) filleted with `radii` at `positions` along the chain (0 its
 ## start, 1 its end; the ends are added from the nearest radius when
 ## missing), smoothly or straight between them, of `continuity`, the blend
-## named for feature `tag`.
-func variable_filleted_edge(model: const CadModel*, reference: str, positions: const f64[], radii: const f64[], smooth: bool, tag: str, continuity: i64 = 1, chain: bool = true) -> interop.Reference[CadModel]!:
+## named for feature `tag`, under Tangency weight `tangency`.
+func variable_filleted_edge(model: const CadModel*, reference: str, positions: const f64[], radii: const f64[], smooth: bool, tag: str, continuity: i64 = 1, chain: bool = true, tangency: f64 = 1.0) -> interop.Reference[CadModel]!:
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
+    try check_tangency(tangency)
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
@@ -50,17 +53,17 @@ func variable_filleted_edge(model: const CadModel*, reference: str, positions: c
     defer law.close()
     let largest = law.largest()
     for e in chosen.view(): try check_fits(&w, e, largest, true)
-    if let made = try cap_blend(&w, chosen.view(), largest, true, continuity, tag, none, &law): return made
-    if let made = try curved_blend(&w, chosen.view(), largest, true, continuity, tag, none, &law): return made
+    if let made = try cap_blend(&w, chosen.view(), largest, true, continuity, tag, none, &law, tangency): return made
+    if let made = try curved_blend(&w, chosen.view(), largest, true, continuity, tag, none, &law, tangency): return made
     let e = chosen.items[0]
     let (fa, fb) = try edge_faces(&w, e)
     if chosen.count != 1 or w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line or not flat_pair(&w, fa, fb):
         error(invalid, "a variable radius fillet takes one straight edge between flat faces, a tangent chain round a flat face, or a loop between two curved faces")
-    return try variable_straight(model, &w, e, &law, continuity, tag)
+    return try variable_straight(model, &w, e, &law, continuity, tag, tangency)
 
 ## One straight edge `e` between flat faces filleted by `law`, of
 ## `continuity` (see the header).
-func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: const RadiusLaw*, continuity: i64, tag: str) -> interop.Reference[CadModel]!:
+func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: const RadiusLaw*, continuity: i64, tag: str, tangency: f64) -> interop.Reference[CadModel]!:
     let edge = w.edges.items[e]
     let (fa, fb) = try edge_faces(w, e)
     let start = try w.edge_at(e, 0.0)
@@ -113,7 +116,7 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
     var name = Growing[u8]()
     defer name.close()
     try blend_name(w, e, tag, &name)
-    let tool = try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), law.smooth, (str)name.view(), convex_edge, continuity, &ends)
+    let tool = try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), law.smooth, (str)name.view(), convex_edge, continuity, &ends, tangency)
     defer tool.release()
     return try combine(model, tool.value(), op_subtract if convex_edge else op_union)
 
@@ -173,7 +176,7 @@ func ends_square(w: const Shape*, v: i64, fa: usize, fb: usize, along: Vector3) 
 ## `ends` says an end is slanted, each row of the net stops in that end's
 ## plane: its first (last) piece runs from there, the same polynomial, so
 ## every row keeps the knots and the end's section lies in the plane.
-func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, reach: f64, weight: f64, positions: const f64[], radii: const f64[], smooth: bool, name: str, convex_edge: bool, continuity: i64, ends: const EndPlanes*) -> interop.Reference[CadModel]!:
+func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, reach: f64, weight: f64, positions: const f64[], radii: const f64[], smooth: bool, name: str, convex_edge: bool, continuity: i64, ends: const EndPlanes*, tangency: f64) -> interop.Reference[CadModel]!:
     let pieces = positions.length - 1
     let count = 3 * pieces + 1
     # Along: a cubic Bezier per piece, knots thrice at each point.
@@ -198,10 +201,10 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
         try unit_section.push(ub.multiply_scalar(reach))
         let k6: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
         try section_knots.assign(k6[..<6])
-        let x3: f64[3] = [1.0, weight, 1.0]
+        let x3: f64[3] = [1.0, weight * tangency, 1.0]
         try section_weights.assign(x3[..<3])
     else:
-        try fillet_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), continuity, &unit_section, &section_knots)
+        try fillet_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), continuity, &unit_section, &section_knots, tangency)
         try section_weights.fill(unit_section.count, 1.0)
         degree = 5
     let rows = unit_section.count

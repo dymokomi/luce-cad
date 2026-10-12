@@ -62,14 +62,45 @@ func half_direction(w: const Shape*, h: HalfEdge, at_start: bool, fraction: f64 
     if chord.length() > 1e-300: return chord
     return try w.leaving(e, 0 if own_start else 1)
 
+## The chord from where half-edge `h` starts to its point `distance` from
+## there (its far end when it never gets that far): curves leaving one
+## vertex are compared at equal distances, not at equal fractions of
+## edges whose lengths may differ a thousandfold (a fillet's section
+## against the long arc of the face it touches).
+func half_chord(w: const Shape*, h: HalfEdge, distance: f64) -> Vector3!:
+    let e = (usize)h.edge
+    let here = try w.edge_at(e, 0.0 if h.forward else 1.0)
+    # The fraction reaching `distance`: doubled from a small one, then
+    # halved between.
+    var low = 0.0
+    var high = 1e-6
+    while high < 1.0 and (try w.edge_at(e, high if h.forward else 1.0 - high)).subtract(here).length() < distance:
+        low = high
+        high = math.min(1.0, high * 2.0)
+    for _ in 0..<60:
+        let middle = (low + high) * 0.5
+        if (try w.edge_at(e, middle if h.forward else 1.0 - middle)).subtract(here).length() < distance: low = middle
+        else: high = middle
+    let chord = (try w.edge_at(e, high if h.forward else 1.0 - high)).subtract(here)
+    if chord.length() > 1e-300: return chord
+    return try w.leaving(e, 0 if h.forward else 1)
+
+## How far half-edge `h` reaches from where it starts (to its middle or
+## its far end, whichever is further: a closed edge comes back).
+func half_reach(w: const Shape*, h: HalfEdge) -> f64!:
+    let e = (usize)h.edge
+    let here = try w.edge_at(e, 0.0 if h.forward else 1.0)
+    return math.max((try w.edge_at(e, 0.5)).subtract(here).length(), (try w.edge_at(e, 1.0 if h.forward else 0.0)).subtract(here).length())
+
 ## Whether half-edge `a` turns clockwise from `back` before `b` does, both
-## leaving along one tangent: compared on chords further along each until
-## they part.
+## leaving along one tangent: compared on chords of equal length further
+## along each until they part.
 func first_clockwise(w: const Shape*, back: Vector3, a: HalfEdge, b: HalfEdge, n: Vector3) -> bool!:
     let fractions: f64[4] = [0.01, 0.05, 0.2, 0.5]
+    let reach = math.min(try half_reach(w, a), try half_reach(w, b))
     for f in fractions:
-        let ta = clockwise(back, try half_direction(w, a, true, f), n)
-        let tb = clockwise(back, try half_direction(w, b, true, f), n)
+        let ta = clockwise(back, try half_chord(w, a, reach * f), n)
+        let tb = clockwise(back, try half_chord(w, b, reach * f), n)
         if math.abs(ta - tb) > 1e-9: return ta < tb
     return false
 
@@ -118,12 +149,18 @@ pub func split_face(w: const Shape*, f: usize, halves: const HalfEdge[], pole: f
             let point = w.points.items[(usize)vertex]
             let n = try w.face_normal(f, point)
             let back = try half_direction(w, h, false)
+            # Each way on is measured a thousandth of the shortest one's
+            # reach from the vertex.
+            var near = 1.0e300
+            for k in 0..<halves.length:
+                if start_of(w, halves[k]) == vertex: near = math.min(near, try half_reach(w, halves[k]))
+            near *= 1e-3
             var best: i64 = -1
             var best_turn = 1.0e300
             for k in 0..<halves.length:
                 if start_of(w, halves[k]) != vertex: continue
                 # Its own reverse comes last.
-                var turn = clockwise(back, try half_direction(w, halves[k], true), n)
+                var turn = clockwise(back, try half_chord(w, halves[k], near), n)
                 if halves[k].edge == h.edge and halves[k].forward != h.forward: turn = 2.0 * math.pi + 1.0
                 if best >= 0 and math.abs(turn - best_turn) < 1e-6:
                     # Leaving along one tangent (a curve touching a line, as
