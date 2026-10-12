@@ -69,14 +69,34 @@ func facing(model: CadModel, normal: Vector3) -> str!:
             return name
     return ""
 
-## Whether a flat face of `model` faces up.
+## Whether a flat face of `model` faces up (every face's point found,
+## B-spline faces' too).
 func flat_top(model: CadModel) -> bool!:
+    var up = false
     for f in 0..<model.face_count():
-        if model.face_surface_kind(f) != 0:
-            continue
-        if CadModeling.face_point(model, CadModeling.face_name_of(model, f)).normal.y > 0.999:
-            return true
-    return false
+        let at = CadModeling.face_point(model, CadModeling.face_name_of(model, f))
+        assert(at.found)
+        up = up or (model.face_surface_kind(f) == 0 and at.normal.y > 0.999)
+    return up
+
+## A G2 and a G3 full round's strips: each one's point lies inside it,
+## halfway along the rib (z = 0, not on an end's section where a fallback
+## would put it), on the strip's circle-like section between top and side,
+## its normal turned 45° between them (regression: a point off a B-spline
+## surface was refused as "NURBS boundary projection exceeds CAD tolerance").
+func strip_points(rib: CadModel, top: str) -> unit!:
+    for continuity in [2, 3]:
+        let round = CadModeling.full_round(rib, top, "r", continuity = continuity)
+        var strips = 0
+        for f in 0..<round.face_count():
+            if round.face_surface_kind(f) == 0:
+                continue
+            let at = CadModeling.face_point(round, CadModeling.face_name_of(round, f))
+            assert(at.found and math.abs(at.point.z) < 1e-6, f"{at.point.z}")
+            assert(math.abs(math.abs(at.normal.x) - math.sqrt(0.5)) < 1e-6 and math.abs(at.normal.y - math.sqrt(0.5)) < 1e-6)
+            assert(at.point.y > 3.0 and at.point.y < 5.0)
+            strips += 1
+        assert(strips == 2)
 
 ## A 4 x 10 x 20 rib: its top rounded whole, radius 2: two quarter
 ## cylinders' worth taken, the top face gone. A tapered rib (6 wide at the
@@ -91,6 +111,7 @@ func full_round() -> unit!:
         if continuity == 1:
             assert(math.abs(volume(mesh) - (800.0 - 40.0 * 4.0 * (1.0 - math.pi * 0.25))) < 0.1)
         assert(not flat_top(round) and math.abs(mesh.bounds().maximum.y - 5.0) < 1e-3)
+    strip_points(rib, top)
     let s = CadSketch.parse("")
     let p = [s.add_point(-3.0, 0.0), s.add_point(3.0, 0.0), s.add_point(2.0, 10.0), s.add_point(-2.0, 10.0)]
     for at in 0..<4:
