@@ -7,16 +7,22 @@
 ## its reference as a projection made from the body is.
 ##
 ## The body's faces come too, for Project's whole face and body outline
-## (shadow_faces.lucb): each face's name and its edges.
+## (shadow_faces.lucb): each face's name and its edges; and after the
+## edges, the curved faces' silhouettes (silhouettes.lucb), shadows like
+## the edges' with their own references. Each shadow says whether it bounds
+## the body's outline, told where the body is.
 ##
-## The text: a line per edge, `e <reference> <height> <x> <y> …`, the
-## reference escaped as a sketch text's words, its mean height off the plane
-## and `projection_per_edge` x, y pairs; then a line per face,
-## `f <name> <edge> …`, the name escaped alike.
+## The text: a line per edge, then per silhouette,
+## `e <reference> <height> <bounds> <x> <y> …`, the reference escaped as a
+## sketch text's words, its mean height off the plane, 1 when it bounds the
+## outline (else 0) and `projection_per_edge` x, y pairs; then a line per
+## face, `f <name> <edge> …`, the name escaped alike.
 
 pub struct CadShadows:
     var samples: Growing[f64]
     var heights: Growing[f64]
+    ## Whether each shadow bounds the body's outline.
+    var bounds: Growing[bool]
     ## Each edge's reference, a run of `names`.
     var starts: Growing[usize]
     var names: Growing[u8]
@@ -30,6 +36,7 @@ pub struct CadShadows:
     pub func close():
         self.samples.close()
         self.heights.close()
+        self.bounds.close()
         self.starts.close()
         self.names.close()
         self.face_starts.close()
@@ -43,7 +50,7 @@ pub struct CadShadows:
 
     ## The shadows `text` describes (empty: none).
     pub static func parse(text: str) -> interop.Reference[CadShadows]!:
-        var made = CadShadows(Growing[f64](), Growing[f64](), Growing[usize](), Growing[u8](), Growing[usize](), Growing[u8](), Growing[usize](), Growing[i64]())
+        var made = CadShadows(Growing[f64](), Growing[f64](), Growing[bool](), Growing[usize](), Growing[u8](), Growing[usize](), Growing[u8](), Growing[usize](), Growing[i64]())
         errdefer made.close()
         let per = projection_per_edge()
         var fields: str[72] = ---
@@ -60,16 +67,17 @@ pub struct CadShadows:
                 continue
             let count = split(line, fields[0..])
             if count == 0: continue
-            if fields[0] != "e" or count != 3 + 2 * per or made.face_starts.count > 0: error(invalid, "a shadows text has a line it does not know")
+            if fields[0] != "e" or count != 4 + 2 * per or made.face_starts.count > 0: error(invalid, "a shadows text has a line it does not know")
             try made.starts.push(made.names.count)
             try unescape(fields[1], &made.names)
             try made.heights.push(try strings.parse_f64(fields[2]))
+            try made.bounds.push(fields[3] == "1")
             for at in 0..<2 * per:
-                try made.samples.push(try strings.parse_f64(fields[3 + at]))
+                try made.samples.push(try strings.parse_f64(fields[4 + at]))
         try made.starts.push(made.names.count)
         try made.face_starts.push(made.face_chars.count)
         try made.edge_starts.push(made.face_edges.count)
-        return try interop.Reference[CadShadows].adopt(new CadShadows(made.samples, made.heights, made.starts, made.names, made.face_starts, made.face_chars, made.edge_starts, made.face_edges) in memory.heap, cad_shadows_type, memory.heap)
+        return try interop.Reference[CadShadows].adopt(new CadShadows(made.samples, made.heights, made.bounds, made.starts, made.names, made.face_starts, made.face_chars, made.edge_starts, made.face_edges) in memory.heap, cad_shadows_type, memory.heap)
 
     ## A face's line, `f <name> <edge> …`, read (after the edges).
     func read_face(line: str) -> !:
@@ -139,25 +147,79 @@ pub struct CadShadows:
         return best
 
     ## `projection`'s shadows as text, every edge's reference with its
-    ## height and samples, then every face's name and edges (made where the
+    ## height, whether it bounds the outline and its samples, then every
+    ## silhouette's alike, then every face's name and edges (made where the
     ## body is).
     pub static func text_of(projection: interop.Reference[CadProjection]) -> interop.Owned[str]!:
         let p = try projection.get()
         let per = projection_per_edge()
-        let samples = projection_samples(p)
-        var w = try shape_of(p.model.value())
+        let model = p.model.value()
+        var w = try shape_of(model)
         defer w.close()
-        var out = Growing[u8]()
-        defer out.close()
+        let normal = p.u.cross(p.v)
+        let mesh = try model.tessellate(silhouette_divisions)
+        defer mesh.release()
+        # The silhouettes after the edges: samples, heights, references and
+        # their outer sides.
+        var samples = Growing[f64]()
+        defer samples.close()
+        try samples.assign(projection_samples(p))
+        let edges = samples.count // (2 * per)
+        var heights = Growing[f64]()
+        defer heights.close()
+        try heights.assign(p.heights.view())
+        var faces = Growing[i64]()
+        defer faces.close()
+        var points = Growing[Vector3]()
+        defer points.close()
+        try silhouettes_of(&w, mesh.value(), normal, per, &faces, &points)
+        var outward = Growing[f64]()
+        defer outward.close()
+        var names = Growing[u8]()
+        defer names.close()
+        var name_starts = Growing[usize]()
+        defer name_starts.close()
         var reference = Growing[u8]()
         defer reference.close()
-        for e in 0..<samples.length // (2 * per):
-            reference.clear()
-            try references_of(&w, [(i64)e], &reference)
+        for s in 0..<faces.count:
+            let run = points.view()[s * per..<(s + 1) * per]
+            var height = 0.0
+            for q in run:
+                let d = q.subtract(p.origin)
+                try samples.push(d.dot(p.u))
+                try samples.push(d.dot(p.v))
+                height += d.dot(normal)
+            try heights.push(height / (f64)per)
+            let n = try w.face_normal((usize)faces.items[s], run[per // 2])
+            try outward.push(n.dot(p.u))
+            try outward.push(n.dot(p.v))
+            try silhouette_reference(&w, (usize)faces.items[s], run, &reference)
+            try name_starts.push(names.count)
+            for byte in reference.view(): try names.push(byte)
+        try name_starts.push(names.count)
+        var bounds = Growing[bool]()
+        defer bounds.close()
+        try outline_flags(mesh.value(), samples.view(), per, edges, outward.view(), p.origin, p.u, p.v, &bounds)
+        var out = Growing[u8]()
+        defer out.close()
+        for e in 0..<samples.count // (2 * per):
+            # A seam (a face meeting itself) is no edge to Fusion: no
+            # reference, no part of the outline.
+            let seam = e < edges and (w.sides.items[e * 2] < 0 or w.sides.items[e * 2 + 1] < 0)
+            if seam:
+                reference.clear()
+                try reference.push(45)
+                bounds.items[e] = false
+            elif e < edges:
+                try references_of(&w, [(i64)e], &reference)
+            else:
+                reference.clear()
+                for byte in names.view()[name_starts.items[e - edges]..<name_starts.items[e - edges + 1]]: try reference.push(byte)
             try put_text(&out, "e ")
             try put_escaped(&out, (str)reference.view())
-            try put_number(&out, p.heights.items[e])
-            for value in samples[e * 2 * per..<(e + 1) * 2 * per]:
+            try put_number(&out, heights.items[e])
+            try put_text(&out, " 1" if bounds.items[e] else " 0")
+            for value in samples.view()[e * 2 * per..<(e + 1) * 2 * per]:
                 try put_number(&out, value)
             try out.push(10)
         for f in 0..<w.faces.count:

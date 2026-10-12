@@ -12,11 +12,15 @@ let per_edge: usize = 33
 
 ## A body's edges on a sketch plane: `per_edge` x, y samples each, in the
 ## body's edge order, each edge's mean height off the plane (along its
-## normal, u × v), and the body (for the edges' references and faces).
+## normal, u × v), the body (for the edges' references, faces and
+## silhouettes) and the plane (`origin`, `u`, `v`).
 pub struct CadProjection:
     var samples: Growing[f64]
     var heights: Growing[f64]
     var model: interop.Reference[CadModel]
+    var origin: Vector3
+    var u: Vector3
+    var v: Vector3
 
     pub func close():
         self.samples.close()
@@ -43,7 +47,7 @@ pub struct CadProjection:
             for k in 0..<per_edge:
                 height += (try w.edge_at(e, (f64)k / (f64)(per_edge - 1))).subtract(origin).dot(n)
             try heights.push(height / (f64)per_edge)
-        return try interop.Reference[CadProjection].adopt(new CadProjection(samples, heights, model.clone()) in memory.heap, cad_projection_type, memory.heap)
+        return try interop.Reference[CadProjection].adopt(new CadProjection(samples, heights, model.clone(), origin, u, v) in memory.heap, cad_projection_type, memory.heap)
 
     pub func edge_count() -> i64:
         return (i64)(self.samples.count // (2 * per_edge))
@@ -81,13 +85,78 @@ pub func projection_samples(p: const CadProjection*) -> const f64[]:
 pub func projection_per_edge() -> usize:
     return per_edge
 
-## Edge `e` of `w` sampled and cast onto the plane, onto `out`.
+## Edge `e` of `w` sampled and cast onto the plane, onto `out` (unfolded).
 func cast_edge(w: const Shape*, e: usize, origin: Vector3, u: Vector3, v: Vector3, out: Growing[f64]*) -> !:
+    let at = out.count
     for k in 0..<per_edge:
         let p = try w.edge_at(e, (f64)k / (f64)(per_edge - 1))
         let d = p.subtract(origin)
         try out.push(d.dot(u))
         try out.push(d.dot(v))
+    unfold(out.items[at..<out.count])
+
+## The silhouette `reference` names on `model` (its shape `w`) cast onto
+## the plane through `origin` (axes `u`, `v`), onto `out`.
+func cast_silhouette(w: const Shape*, model: const CadModel*, reference: str, origin: Vector3, u: Vector3, v: Vector3, out: Growing[f64]*) -> !:
+    let mesh = try model.tessellate(silhouette_divisions)
+    defer mesh.release()
+    var points = Growing[Vector3]()
+    defer points.close()
+    try resolve_silhouette(w, mesh.value(), reference, u.cross(v), per_edge, &points)
+    for q in points.view():
+        let d = q.subtract(origin)
+        try out.push(d.dot(u))
+        try out.push(d.dot(v))
+
+## A run whose samples all lie on one line but turn back along it (a
+## circle or an arc past half a turn seen edge-on) made the segment it
+## covers: its samples evenly from the extreme nearer its start to the
+## other, so it casts a line (Fusion's: a rim seen from the side is a
+## line).
+func unfold(run: f64[]):
+    let n = run.length // 2
+    # The two samples farthest apart.
+    var a: usize = 0
+    var b: usize = 0
+    var most = 0.0
+    for i in 0..<n:
+        let d = math.hypot(run[2 * i] - run[0], run[2 * i + 1] - run[1])
+        if d > most:
+            most = d
+            a = i
+    most = 0.0
+    for i in 0..<n:
+        let d = math.hypot(run[2 * i] - run[2 * a], run[2 * i + 1] - run[2 * a + 1])
+        if d > most:
+            most = d
+            b = i
+    if most <= 0.0: return
+    let tolerance = most * 1e-9
+    let dx = (run[2 * b] - run[2 * a]) / most
+    let dy = (run[2 * b + 1] - run[2 * a + 1]) / most
+    var previous = -1.0
+    var monotone = true
+    var sense = 0.0
+    for i in 0..<n:
+        let x = run[2 * i] - run[2 * a]
+        let y = run[2 * i + 1] - run[2 * a + 1]
+        if math.abs(x * dy - y * dx) > tolerance: return
+        let along = x * dx + y * dy
+        if i > 0:
+            let step = along - previous
+            if math.abs(step) > tolerance:
+                if sense == 0.0: sense = step
+                elif step * sense < 0.0: monotone = false
+        previous = along
+    if monotone: return
+    # From the extreme nearer the run's start.
+    let first = a if math.hypot(run[2 * a] - run[0], run[2 * a + 1] - run[1]) <= math.hypot(run[2 * b] - run[0], run[2 * b + 1] - run[1]) else b
+    let last = b if first == a else a
+    let (sx, sy, ex, ey) = (run[2 * first], run[2 * first + 1], run[2 * last], run[2 * last + 1])
+    for i in 0..<n:
+        let f = (f64)i / (f64)(n - 1)
+        run[2 * i] = sx + (ex - sx) * f
+        run[2 * i + 1] = sy + (ey - sy) * f
 
 ## Add the shadow of the edge whose samples are `run` to `sketch`, fixed
 ## and linked to `reference`; the curve made.
@@ -201,6 +270,22 @@ pub func relink_sketch(sketch: Sketch*, model: const CadModel*, origin: Vector3,
     let tolerance = 1e-6 * math.max(1.0, size_of(sketch))
     var lost: i64 = 0
     for l in sketch.links.view():
+        # A silhouette: its face's again, nearest where it was.
+        if is_silhouette(sketch.link_reference(l)):
+            let at = runs.count
+            cast_silhouette(&w, model, sketch.link_reference(l), origin, u, v, &runs) catch failure:
+                lost += 1
+                if let out = lost_out: try out.push(l.entity)
+                runs.count = at
+                continue
+            let run = runs.view()[at..<runs.count]
+            if end_on(run, tolerance) or shadow_kind(run, tolerance) != sketch.entity(l.entity).kind:
+                lost += 1
+                if let out = lost_out: try out.push(l.entity)
+                runs.count = at
+                continue
+            try plan.push((l.entity, at))
+            continue
         resolve_edges(&w, sketch.link_reference(l), &edges) catch failure:
             lost += 1
             if let out = lost_out: try out.push(l.entity)

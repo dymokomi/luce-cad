@@ -1,0 +1,313 @@
+## Silhouettes for Fusion's Project: where a curved face turns away from
+## the sketch's plane along its normal (its normal square to the plane's),
+## the line its outline follows though no edge is there: a cylinder seen
+## from its side, a ball's rim. Found on the body's display mesh, face by
+## face: the mesh's points carry the face's exact normal, and where n·N
+## changes sign along a triangle's side the silhouette crosses it; the
+## crossed chain into curves, which are sampled evenly and each sample
+## moved onto the exact silhouette (along the surface, across it, until
+## n·N is zero). A curve crossing_pair where it leaves its face.
+##
+## A silhouette is referred to by its face's name and a point of it,
+## `<face>~x,y,z` (silhouette_reference): relinking finds that face's
+## silhouette nearest the point again.
+##
+## Which shadows bound the body's outline is told on the same mesh
+## (outline_flags): an edge's shadow bounds it when one side of it is inside
+## the shadow of a display triangle and the other inside none; a
+## silhouette's inner side is its own face, so only its outer side (the way
+## its face's normal points there) is probed.
+
+let silhouette_separator: u8 = 126
+
+## The display mesh's divisions silhouettes are found on.
+let silhouette_divisions: i64 = 64
+
+## A crossing of a face's silhouette with a mesh side between points `a`
+## and `b` (a < b): where.
+struct MeshCrossing:
+    var a: i64
+    var b: i64
+    var p: Vector3
+
+## Every silhouette of `w`'s faces seen along `normal` (the plane's), from
+## `mesh` (the body's display mesh, its faces tagged cad_face): each one's
+## face onto `faces` and its `per` samples (3D points, evenly along it)
+## onto `points`.
+func silhouettes_of(w: const Shape*, mesh: const Mesh*, normal: Vector3, per: usize, faces: Growing[i64]*, points: Growing[Vector3]*) -> !:
+    faces.clear()
+    points.clear()
+    let tag = mesh.find_attribute("cad_face", 2)
+    if tag < 0: error(invalid, "a display mesh without its faces' numbers has no silhouettes")
+    # Each mesh face's B-rep face.
+    var owner = Growing[i64]()
+    defer owner.close()
+    for f in 0..<mesh.face_count(): try owner.push((i64)(try mesh.attribute_value(tag, f)))
+    # n·N at each mesh point, for the face being looked at (a point on a
+    # seam between faces has a normal for each).
+    var g = Growing[f64]()
+    defer g.close()
+    var seen = Growing[i64]()
+    defer seen.close()
+    try g.fill((usize)mesh.point_count(), 0.0)
+    try seen.fill((usize)mesh.point_count(), -1)
+    var crossed = Growing[MeshCrossing]()
+    defer crossed.close()
+    var segments = Growing[(usize, usize)]()
+    defer segments.close()
+    var chain = Growing[Vector3]()
+    defer chain.close()
+    for face in 0..<w.faces.count:
+        let kind = w.surfaces.items[(usize)w.faces.items[face].surface].kind
+        if kind == surface_plane: continue
+        crossed.clear()
+        segments.clear()
+        for f in 0..<mesh.face_count():
+            if owner.items[(usize)f] != (i64)face: continue
+            let size = try mesh.face_size(f)
+            # Each triangle of the face's fan.
+            for k in 1..<size - 1:
+                let corners: i64[3] = [try mesh.face_point(f, 0), try mesh.face_point(f, k), try mesh.face_point(f, k + 1)]
+                var values: f64[3]
+                for c in 0..<(usize)3:
+                    let p = corners[c]
+                    if seen.items[(usize)p] != (i64)face:
+                        seen.items[(usize)p] = (i64)face
+                        g.items[(usize)p] = (try w.face_normal(face, try mesh.point(p))).dot(normal)
+                    values[c] = g.items[(usize)p]
+                var crossing_pair: usize[2]
+                var found: usize = 0
+                for c in 0..<(usize)3:
+                    let d = (c + 1) % 3
+                    # A sign change (a zero counts as positive).
+                    if (values[c] >= 0.0) == (values[d] >= 0.0): continue
+                    if found < 2: crossing_pair[found] = try meet_at(&crossed, mesh, corners[c], corners[d], values[c], values[d])
+                    found += 1
+                if found == 2: try segments.push((crossing_pair[0], crossing_pair[1]))
+        if segments.count == 0: continue
+        try chain_segments(w, face, crossed.view(), segments.view(), normal, per, &chain, faces, points)
+
+## The crossing between mesh points `a` and `b` (n·N `ga` and `gb`, of
+## opposite signs): its index in `crossed`, added when new.
+func meet_at(crossed: Growing[MeshCrossing]*, mesh: const Mesh*, a: i64, b: i64, ga: f64, gb: f64) -> usize!:
+    let low = a if a < b else b
+    let high = b if a < b else a
+    for at in 0..<crossed.count:
+        let c = crossed.items[at]
+        if c.a == low and c.b == high: return at
+    let pa = try mesh.point(a)
+    let pb = try mesh.point(b)
+    let t = ga / (ga - gb)
+    try crossed.push(MeshCrossing(low, high, pa.add(pb.subtract(pa).multiply_scalar(t))))
+    return crossed.count - 1
+
+## Face `face`'s crossed joined by `segments` into chains (open ones
+## from their crossing_pair first, then loops), each sampled and moved onto the
+## exact silhouette: its face onto `faces`, its `per` points onto
+## `points`.
+func chain_segments(w: const Shape*, face: usize, crossed: const MeshCrossing[], segments: const (usize, usize)[], normal: Vector3, per: usize, chain: Growing[Vector3]*, faces: Growing[i64]*, points: Growing[Vector3]*) -> !:
+    var used = Growing[bool]()
+    defer used.close()
+    try used.fill(segments.length, false)
+    var degree = Growing[i64]()
+    defer degree.close()
+    try degree.fill(crossed.length, 0)
+    for (a, b) in segments:
+        degree.items[a] += 1
+        degree.items[b] += 1
+    for pass in 0..<2:
+        for start in 0..<crossed.length:
+            # Open chains start at an end (one segment); loops anywhere.
+            if pass == 0 and degree.items[start] != 1: continue
+            var at = start
+            chain.clear()
+            try chain.push(crossed[start].p)
+            while true:
+                var next: i64 = -1
+                for s in 0..<segments.length:
+                    if used.items[s]: continue
+                    let (a, b) = segments[s]
+                    if a == at or b == at:
+                        used.items[s] = true
+                        next = (i64)(b if a == at else a)
+                        break
+                if next < 0: break
+                at = (usize)next
+                try chain.push(crossed[at].p)
+                if at == start: break
+            if chain.count < 2: continue
+            try sample_chain(w, face, chain.view(), normal, per, faces, points)
+
+## A chain of crossed sampled `per` times evenly along it, each sample
+## moved onto face `face`'s exact silhouette; dropped when it is no longer
+## than the body's tolerance.
+func sample_chain(w: const Shape*, face: usize, chain: const Vector3[], normal: Vector3, per: usize, faces: Growing[i64]*, points: Growing[Vector3]*) -> !:
+    var total = 0.0
+    for k in 1..<chain.length: total += chain[k].subtract(chain[k - 1]).length()
+    if total <= w.tolerance * 10.0: return
+    try faces.push((i64)face)
+    var leg: usize = 1
+    var run = 0.0
+    for k in 0..<per:
+        let target = total * (f64)k / (f64)(per - 1)
+        while leg < chain.length - 1 and run + chain[leg].subtract(chain[leg - 1]).length() < target:
+            run += chain[leg].subtract(chain[leg - 1]).length()
+            leg += 1
+        let span = chain[leg].subtract(chain[leg - 1])
+        let length = span.length()
+        let f = math.clamp((target - run) / length, 0.0, 1.0) if length > 0.0 else 0.0
+        try points.push(try onto_silhouette(w, face, chain[leg - 1].add(span.multiply_scalar(f)), normal, total))
+
+## Point `q` (near face `face`'s silhouette) moved onto it: onto the
+## surface, then along the surface across the silhouette (the plane's
+## normal laid onto the surface's tangent plane) by secant steps until the
+## face's normal is square to `normal`. `scale` sizes the secant's step.
+func onto_silhouette(w: const Shape*, face: usize, q: Vector3, normal: Vector3, scale: f64) -> Vector3!:
+    var p = try nearest_on_surface(w, face, q)
+    let h = math.max(scale, 1.0) * 1e-5
+    for _ in 0..<12:
+        let n = try w.face_normal(face, p)
+        let value = n.dot(normal)
+        if math.abs(value) <= 1e-13: return p
+        let across = normal.subtract(n.multiply_scalar(value))
+        if across.length() <= 1e-12: return p
+        let way = try across.normalized()
+        let ahead = try nearest_on_surface(w, face, p.add(way.multiply_scalar(h)))
+        let slope = ((try w.face_normal(face, ahead)).dot(normal) - value) / h
+        if math.abs(slope) <= 1e-12: return p
+        # No step longer than the secant's reach allows (a sphere's pole).
+        let step = math.clamp(-value / slope, -scale * 0.05, scale * 0.05)
+        p = try nearest_on_surface(w, face, p.add(way.multiply_scalar(step)))
+    return p
+
+## Silhouette `points` (one of face `face`'s) referred to: the face's name
+## and its middle, `<face>~x,y,z`, onto `out` (cleared).
+func silhouette_reference(w: const Shape*, face: usize, points: const Vector3[], out: Growing[u8]*) -> !:
+    out.clear()
+    let name = w.face_name(face)
+    if name == "": error(invalid, "a silhouette of an unnamed face cannot be referred to")
+    for byte in name.bytes: try out.push(byte)
+    try out.push(silhouette_separator)
+    let middle = points[points.length // 2]
+    try push_coordinate(out, middle.x)
+    try out.push(44)
+    try push_coordinate(out, middle.y)
+    try out.push(44)
+    try push_coordinate(out, middle.z)
+
+## Whether `reference` is a silhouette's.
+func is_silhouette(reference: str) -> bool:
+    for byte in reference.bytes:
+        if byte == silhouette_separator: return true
+    return false
+
+## The silhouette `reference` refers to on `w` seen along `normal` (from
+## `mesh`): the one of its face's name whose middle is nearest the recorded
+## one, its `per` points onto `out`; an error when the face has none now.
+func resolve_silhouette(w: const Shape*, mesh: const Mesh*, reference: str, normal: Vector3, per: usize, out: Growing[Vector3]*) -> !:
+    out.clear()
+    let bytes = reference.bytes
+    var at: usize = 0
+    while at < bytes.length and bytes[at] != silhouette_separator: at += 1
+    let name = (str)bytes[..<at]
+    var numbers: f64[3]
+    var field: usize = 0
+    var start = at + 1
+    for k in at + 1..<bytes.length + 1:
+        if k < bytes.length and bytes[k] != 44: continue
+        if field >= 3: error(invalid, "a silhouette's reference has more than a point")
+        numbers[field] = strings.parse_f64((str)bytes[start..<k]) else error(invalid, "a silhouette's reference has a point that is not numbers")
+        field += 1
+        start = k + 1
+    if field != 3: error(invalid, "a silhouette's reference has no point")
+    let recorded = Vector3(numbers[0], numbers[1], numbers[2])
+    var faces = Growing[i64]()
+    defer faces.close()
+    var points = Growing[Vector3]()
+    defer points.close()
+    try silhouettes_of(w, mesh, normal, per, &faces, &points)
+    var best: i64 = -1
+    var best_distance = 0.0
+    for s in 0..<faces.count:
+        if not (try names_meet(w.face_name((usize)faces.items[s]), name)): continue
+        let d = points.items[s * per + per // 2].subtract(recorded).length()
+        if best < 0 or d < best_distance:
+            best = (i64)s
+            best_distance = d
+    if best < 0: error(invalid, "the face no longer turns away from the sketch's plane: its silhouette is gone")
+    for k in 0..<per: try out.push(points.items[(usize)best * per + k])
+
+## For each shadow run (`count` of them, `per` x, y pairs each in
+## `samples`), whether it bounds the body's outline, from `mesh` cast on
+## the plane through `origin` along `u` and `v`; runs from `first_silhouette`
+## on are silhouettes, their outer side `outward` (x, y on the plane, one
+## pair each). Onto `out`.
+func outline_flags(mesh: const Mesh*, samples: const f64[], per: usize, first_silhouette: usize, outward: const f64[], origin: Vector3, u: Vector3, v: Vector3, out: Growing[bool]*) -> !:
+    out.clear()
+    let count = samples.length // (2 * per)
+    # The display triangles' shadows, x, y triples.
+    var triangles = Growing[f64]()
+    defer triangles.close()
+    var low_x = 1.0e300
+    var high_x = -1.0e300
+    var low_y = 1.0e300
+    var high_y = -1.0e300
+    for f in 0..<mesh.face_count():
+        let size = try mesh.face_size(f)
+        for k in 1..<size - 1:
+            for c in [0, k, k + 1]:
+                let d = (try mesh.point(try mesh.face_point(f, c))).subtract(origin)
+                let x = d.dot(u)
+                let y = d.dot(v)
+                low_x = math.min(low_x, x)
+                high_x = math.max(high_x, x)
+                low_y = math.min(low_y, y)
+                high_y = math.max(high_y, y)
+                try triangles.push(x)
+                try triangles.push(y)
+    let probe = 1e-4 * math.max(1.0, math.max(high_x - low_x, high_y - low_y))
+    let tolerance = probe * 1e-2
+    let k = per // 2
+    for e in 0..<count:
+        let run = samples[e * 2 * per..<(e + 1) * 2 * per]
+        if end_on(run, tolerance):
+            try out.push(false)
+            continue
+        let x = run[2 * k]
+        let y = run[2 * k + 1]
+        if e >= first_silhouette:
+            let s = e - first_silhouette
+            let ox = outward[2 * s]
+            let oy = outward[2 * s + 1]
+            let length = math.hypot(ox, oy)
+            if length <= 0.0:
+                try out.push(false)
+                continue
+            try out.push(not shadowed(triangles.view(), x + ox / length * probe, y + oy / length * probe))
+            continue
+        let tx = run[2 * k + 2] - run[2 * k - 2]
+        let ty = run[2 * k + 3] - run[2 * k - 1]
+        let length = math.hypot(tx, ty)
+        if length <= 0.0:
+            try out.push(false)
+            continue
+        let nx = -ty / length * probe
+        let ny = tx / length * probe
+        try out.push(shadowed(triangles.view(), x + nx, y + ny) != shadowed(triangles.view(), x - nx, y - ny))
+
+## Whether a triangle of `triangles` (x, y triples) holds (`x`, `y`).
+func shadowed(triangles: const f64[], x: f64, y: f64) -> bool:
+    for t in 0..<triangles.length // 6:
+        let ax = triangles[6 * t]
+        let ay = triangles[6 * t + 1]
+        let bx = triangles[6 * t + 2]
+        let by = triangles[6 * t + 3]
+        let cx = triangles[6 * t + 4]
+        let cy = triangles[6 * t + 5]
+        let d1 = (bx - ax) * (y - ay) - (by - ay) * (x - ax)
+        let d2 = (cx - bx) * (y - by) - (cy - by) * (x - bx)
+        let d3 = (ax - cx) * (y - cy) - (ay - cy) * (x - cx)
+        let negative = d1 < 0.0 or d2 < 0.0 or d3 < 0.0
+        let positive = d1 > 0.0 or d2 > 0.0 or d3 > 0.0
+        if not (negative and positive): return true
+    return false

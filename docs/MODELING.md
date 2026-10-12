@@ -781,8 +781,16 @@ the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
   edge of its loops, neighbors sharing points by place, the face remembered by name so relinking
   adds edges it gains; `project_shadow_outline(shadows, toward)` brings the body's outline: the
   edges whose shadow bounds the union of the faces' shadows, one of each pair casting the same
-  shadow (the higher). A silhouette that is no edge (a cylinder seen from its side) is not
-  brought. An edge already projected is not brought twice.
+  shadow (the higher). Silhouettes are brought too, as Fusion's Project brings them
+  (`silhouettes.lucb`): where a curved face turns away along the plane's normal (a cylinder
+  seen from its side, a ball's rim), found on the body's display mesh (n·N changing sign across
+  a triangle's side, the crossings chained) and each sample moved onto the exact silhouette.
+  Which shadows bound the outline is told where the body is, on that mesh (one side of an edge
+  in a triangle's shadow, the other in none; a silhouette's outer side clear), and carried in
+  the text. A silhouette is linked to `<face>~x,y,z`, its face and a point of it; relinking
+  takes that face's silhouette nearest the point. A rim seen edge-on (its shadow turning back
+  along a line) casts the line it covers; a seam (a face meeting itself) is no edge to Fusion
+  and never bounds the outline. An edge already projected is not brought twice.
 - **Dimensions drawn** (`dimensions.lucb`), as drawings draw them. `lay_out(at, pixel)` gives a
   dimension's lines, arrowheads and label place on the plane, with screen sizes (gaps,
   overshoots, the default offset) in multiples of `pixel`, a screen point's length there:
