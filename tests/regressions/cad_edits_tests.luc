@@ -38,8 +38,9 @@ pub func cad_edits_tests() -> unit!:
     let two = CadEdits.with_model(box, CadSolids.sphere(1.0))
     assert(CadGeometry.model_count(two) == 2 and CadEdits.pick_mesh(two).face_count() > 6)
     edge_references()
+    face_moves()
     open_patches()
-    print("PASS CAD edits: tagged pick mesh, whole-model moves (parts refused), face and model deletes, added models, per-model edge references, replaced models")
+    print("PASS CAD edits: tagged pick mesh, whole-model moves (parts refused), face and model deletes, added models, per-model edge references, replaced models; picked faces by name, a model's share, faces moved and turned (Move Face), whole models placed, faces not scaled; unnamed models named")
 
 func edge_references() -> unit!:
     let first = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#a")
@@ -60,6 +61,39 @@ func edge_references() -> unit!:
     _ = CadEdits.replaced(models, 3, first) catch failure:
         refused = true
     assert(refused)
+
+## A tagged 2-box's +X face picked: its name, the model's share of the
+## group; moved 1 along x (the box grows to 2 × 2 × 3), turned 10° about
+## its middle (the volume kept); the whole model placed; faces never scaled.
+func face_moves() -> unit!:
+    let box = CadGeometry.of_model(CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#a"))
+    let pick = CadEdits.pick_mesh(box)
+    let faces = pick.find_attribute("cad_face", 2)
+    var side = -1
+    for polygon in 0..<pick.face_count():
+        if side < 0 and pick.face_center(polygon).x > 0.999: side = int(pick.attribute_value(faces, polygon))
+    let group = f"@cad_model=0 &@cad_face={side}"
+    let name = CadEdits.model_faces(pick, group, 0)
+    assert(name.starts_with("#a/") and not name.contains(";"))
+    assert(CadEdits.model_faces(pick, group, 1) == "")
+    assert(CadEdits.model_share(pick, group, 0) == 1 and CadEdits.model_share(pick, "*", 0) == 2 and CadEdits.model_share(pick, "!*", 0) == 0)
+    let longer = CadGeometry.model(CadEdits.transformed_faces(box, pick, group, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]), 0).tessellate(8)
+    near(longer.bounds().maximum.x, 2.0)
+    near(longer.bounds().minimum.x, -1.0)
+    let turned = CadGeometry.model(CadEdits.transformed_faces(box, pick, group, [0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]), 0).tessellate(8)
+    assert(turned.bounds().maximum.x > 1.1 and turned.bounds().maximum.x < 1.2)
+    let whole = CadGeometry.model(CadEdits.transformed_faces(box, pick, "*", [0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]), 0).tessellate(8)
+    near(whole.bounds().minimum.y, 4.0)
+    var refused = false
+    _ = CadEdits.transformed_faces(box, pick, group, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]) catch failure:
+        refused = failure.message.contains("do not scale")
+    assert(refused)
+    # Unnamed faces named for direct modeling; named ones kept.
+    let plain = CadEdits.with_model(box, CadSolids.box(1.0, 1.0, 1.0))
+    let named = CadEdits.named_models(plain, "#m")
+    assert(CadModeling.face_name_of(CadGeometry.model(named, 1), 0) == "#m1/f0")
+    assert(CadModeling.face_name_of(CadGeometry.model(named, 0), 0) == CadModeling.face_name_of(CadGeometry.model(box, 0), 0))
+    assert(CadEdits.model_faces(CadEdits.pick_mesh(named), "@cad_model=1", 1).split(";").length == 6)
 
 ## Two trimmed regions share a plane. One rim contains two collinear
 ## edges: whole edges differ, but their tangent chain is shared.

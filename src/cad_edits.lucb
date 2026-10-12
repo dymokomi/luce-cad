@@ -14,7 +14,8 @@ from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import ComponentTransform, MeshPart, concatenated, group_bits_of, Domain, TableBuilder, text_attribute, append_text
 from model import CadModel
 from cad_geometry import set_models, with_models
-from modeling import reference_lines, shape_of
+from modeling import reference_lines, shape_of, CadDirect, CadModeling
+from geometry import push_decimal
 from luce_std import sort
 
 ## Luce's CAD editing operations (Edit CAD).
@@ -176,6 +177,136 @@ pub struct CadEdits:
             if joined.count > 0: try append_text(&joined, ";")
             try append_text(&joined, reference)
         return try interop.copy_text((str)joined.view())
+
+    ## The names of the B-rep faces of model `model` that face group `group`
+    ## of `pick` names, each once, apart by `;` ("" when it names none of
+    ## that model's): what direct modeling's face operations take.
+    pub static func model_faces(pick: interop.Reference[Mesh], group: str, model: i64) -> interop.Owned[str]!:
+        let mesh = try pick.get()
+        let owner = mesh.find_attribute("cad_model", 2)
+        let source = mesh.find_attribute("cad_face", 2)
+        let texts = mesh.find_attribute("cad_face_name", 2)
+        if owner < 0 or source < 0: error(invalid, "the pick mesh lost its CAD tags")
+        var bits = try group_bits_of(mesh, group, Domain.face)
+        defer bits.bits.release()
+        let words = bits.bits.view()
+        var joined = Growing[u8]()
+        defer joined.close()
+        var seen = Growing[i64]()
+        defer seen.close()
+        for face in 0..<mesh.face_count():
+            if (words[(usize)face >> 6] >> (u64)((usize)face & 63)) & 1 == 0: continue
+            if (i64)(try mesh.attribute_value(owner, face)) != model: continue
+            let brep = (i64)(try mesh.attribute_value(source, face))
+            var known = false
+            for other in seen.view(): known = known or other == brep
+            if known: continue
+            try seen.push(brep)
+            let name = (try mesh.attribute_text(texts, face)) if texts >= 0 else ""
+            if name == "": error(invalid, "a face without a name cannot be referred to: the model's faces have no names")
+            if joined.count > 0: try append_text(&joined, ";")
+            try append_text(&joined, name)
+        return try interop.copy_text((str)joined.view())
+
+    ## How much of model `model` face group `group` of `pick` names: 0
+    ## nothing, 1 some of its faces, 2 all of them (the whole model).
+    pub static func model_share(pick: interop.Reference[Mesh], group: str, model: i64) -> i64!:
+        let mesh = try pick.get()
+        let owner = mesh.find_attribute("cad_model", 2)
+        if owner < 0: error(invalid, "the pick mesh lost its CAD tags")
+        var bits = try group_bits_of(mesh, group, Domain.face)
+        defer bits.bits.release()
+        let words = bits.bits.view()
+        var chosen: i64 = 0
+        var total: i64 = 0
+        for face in 0..<mesh.face_count():
+            if (i64)(try mesh.attribute_value(owner, face)) != model: continue
+            total += 1
+            if (words[(usize)face >> 6] >> (u64)((usize)face & 63)) & 1 != 0: chosen += 1
+        if chosen == 0: return 0
+        return 2 if chosen == total else 1
+
+    ## `set` with what face group `group` of `pick` names moved by Transform
+    ## Components' numbers (as transformed_parts takes them): a model named
+    ## whole is placed, as transformed_parts places it; faces of a model
+    ## named in part are turned about the pivot and moved, the faces around
+    ## following (CadDirect's Move Face). Faces do not scale: only whole
+    ## models do.
+    pub static func transformed_faces(set: interop.Reference[GeometrySet], pick: interop.Reference[Mesh], group: str, numbers: const f64[]) -> interop.Reference[GeometrySet]!:
+        let source = try set.get()
+        let models = set_models(source)
+        var chosen = try Chosen.of(try pick.get(), group, models)
+        defer chosen.close()
+        let transform = try ComponentTransform.of(numbers, chosen.centroid)
+        let matrix = transform.matrix(transform.translation)
+        let scaled = numbers[6] != 1.0 or numbers[7] != 1.0 or numbers[8] != 1.0
+        let (axis, angle) = rotation_of(transform.linear)
+        var result = Growing[interop.Reference[CadModel]]()
+        defer:
+            for model in result.view(): model.release()
+            result.close()
+        for index in 0..<models.length:
+            if chosen.faces.items[index] == 0:
+                try result.push(models[index].clone())
+                continue
+            if chosen.faces.items[index] == chosen.totals.items[index]:
+                let placed = try models[index].value().placed(matrix)
+                result.push(placed) catch failure:
+                    placed.release()
+                    error(failure.code, failure.message)
+                continue
+            if scaled: error(invalid, "faces move and turn, they do not scale: scale whole models at the Object level")
+            let names = try CadEdits.model_faces(pick, group, (i64)index)
+            defer names.release()
+            var moved = models[index].clone()
+            if angle > 1e-12:
+                let turned = CadDirect.rotated_faces(moved, names.value, transform.pivot, axis, angle) catch failure:
+                    moved.release()
+                    error(failure.code, failure.message)
+                moved.release()
+                moved = turned
+            if transform.translation.length() > 0.0:
+                let shifted = CadDirect.moved_faces(moved, names.value, transform.translation) catch failure:
+                    moved.release()
+                    error(failure.code, failure.message)
+                moved.release()
+                moved = shifted
+            result.push(moved) catch failure:
+                moved.release()
+                error(failure.code, failure.message)
+        return try with_models(source, result.view())
+
+    ## `set` with every model that has unnamed faces named (CadModeling's
+    ## `tagged`, model i's faces `<prefix><i>/f<n>`), so direct modeling
+    ## can refer to them; the same set when every face has a name.
+    pub static func named_models(set: interop.Reference[GeometrySet], prefix: str) -> interop.Reference[GeometrySet]!:
+        let source = try set.get()
+        let models = set_models(source)
+        var unnamed = false
+        for model in models:
+            for face in 0..<model.value().face_count():
+                if (try model.value().face_name(face)) == "": unnamed = true
+        if not unnamed: return set.clone()
+        var result = Growing[interop.Reference[CadModel]]()
+        defer:
+            for model in result.view(): model.release()
+            result.close()
+        var tag = Growing[u8]()
+        defer tag.close()
+        for index in 0..<models.length:
+            var named = true
+            for face in 0..<models[index].value().face_count():
+                if (try models[index].value().face_name(face)) == "": named = false
+            if named:
+                try result.push(models[index].clone())
+                continue
+            try tag.assign(prefix.bytes)
+            try push_decimal(&tag, (i64)index)
+            let made = try CadModeling.tagged(models[index], (str)tag.view())
+            result.push(made) catch failure:
+                made.release()
+                error(failure.code, failure.message)
+        return try with_models(source, result.view())
 
     ## `set` with model `index` replaced by `model`.
     pub static func replaced(set: interop.Reference[GeometrySet], index: i64, model: interop.Reference[CadModel]) -> interop.Reference[GeometrySet]!:
@@ -500,3 +631,23 @@ func tangent_ids(model: const CadModel*, ids: Growing[i64]*) -> !:
             let keep = a if a < b else b
             for at in 0..<ids.count:
                 if ids.items[at] == a or ids.items[at] == b: ids.items[at] = keep
+
+## The axis and angle (radians, 0..π) of rotation matrix `linear`'s turn.
+func rotation_of(linear: Matrix4) -> (Vector3, f64):
+    let x = linear.x
+    let y = linear.y
+    let z = linear.z
+    let cosine = math.max(-1.0, math.min(1.0, (x.x + y.y + z.z - 1.0) * 0.5))
+    let angle = math.acos(cosine)
+    if angle < 1e-12: return (Vector3(0.0, 0.0, 1.0), 0.0)
+    let skew = Vector3(y.z - z.y, z.x - x.z, x.y - y.x)
+    if skew.length() > 1e-9: return (skew.multiply_scalar(1.0 / skew.length()), angle)
+    # A half turn: the axis from the diagonal, R = 2aaᵀ - I.
+    var axis = Vector3(math.sqrt(math.max(0.0, (x.x + 1.0) * 0.5)), math.sqrt(math.max(0.0, (y.y + 1.0) * 0.5)), math.sqrt(math.max(0.0, (z.z + 1.0) * 0.5)))
+    if axis.x >= axis.y and axis.x >= axis.z:
+        axis = Vector3(axis.x, x.y / (2.0 * axis.x), x.z / (2.0 * axis.x))
+    elif axis.y >= axis.z:
+        axis = Vector3(y.x / (2.0 * axis.y), axis.y, y.z / (2.0 * axis.y))
+    else:
+        axis = Vector3(z.x / (2.0 * axis.z), z.y / (2.0 * axis.z), axis.z)
+    return (axis.multiply_scalar(1.0 / axis.length()), angle)

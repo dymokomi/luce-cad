@@ -1,0 +1,309 @@
+## Sketches as objects of a geometry set: Fusion's sketches in direct
+## modeling ("Do not capture design history"), which stay in the design as
+## objects beside its bodies. A set's sketch component holds named sketches,
+## each its CadSketch text, its plane (an origin and the sketch's x and y
+## directions) and whether it shows. luced-3d's Edit CAD makes and edits
+## them as recipe steps; Extrude and Revolve steps read a sketch's curves
+## from them. The component places with the set (planes move, sketches keep
+## their own coordinates), joins, filters by name as an object path, and is
+## saved in geometry files (element `cad_sketches`, one child per sketch).
+import interop
+import memory
+from luce_geocore.geocore import Vector3, Matrix4, Bounds, invalid, GeometrySet
+from luce_geocore.core.growing import Growing
+import ownership
+from luce_geocore.kernel import ComponentType, Placement, IdSet, TableBuilder, PathFilter
+from luce_geocore.kernel import adopt_set, dispose_set, empty_set, append_text, append_number
+from luce_geocore.kernel import register_codec, GeometryWriter, GeometryReader
+from geometry import push_decimal
+
+## One sketch: its name (unique in the set), CadSketch text and plane.
+struct SketchEntry:
+    var name: Growing[u8]
+    var text: Growing[u8]
+    var origin: Vector3
+    var u: Vector3
+    var v: Vector3
+    var visible: bool
+
+    func close():
+        self.name.close()
+        self.text.close()
+
+## A set's sketches: immutable once published; each owner has its own copy
+## (the texts are small).
+pub struct SketchList:
+    var entries: Growing[SketchEntry]
+
+    func add(name: str, text: str, origin: Vector3, u: Vector3, v: Vector3, visible: bool) -> !:
+        var entry = SketchEntry(Growing[u8](), Growing[u8](), origin, u, v, visible)
+        entry.name.assign(name.bytes) catch failure:
+            entry.close()
+            error(failure.code, failure.message)
+        entry.text.assign(text.bytes) catch failure:
+            entry.close()
+            error(failure.code, failure.message)
+        self.entries.push(entry) catch failure:
+            entry.close()
+            error(failure.code, failure.message)
+
+    func add_entry(entry: const SketchEntry*) -> !:
+        try self.add((str)entry.name.view(), (str)entry.text.view(), entry.origin, entry.u, entry.v, entry.visible)
+
+    ## The index of sketch `name`, or none.
+    func find(name: str) -> usize?:
+        for at in 0..<self.entries.count:
+            if (str)self.entries.items[at].name.view() == name: return at
+        return none
+
+func new_list() -> SketchList*!:
+    let storage = try new SketchList[1] --- in memory.heap
+    storage[0].entries = Growing[SketchEntry]()
+    return storage.data
+
+pub let sketch_component: ComponentType = ComponentType("cad_sketches", share_list, close_list, list_size, list_bytes, list_bounds, place_list, join_lists, list_paths, filter_list, describe_list,
+                                                        "", trace_nothing)
+
+## Sketches hold no Luce objects.
+func trace_nothing(data: const void*, visit: func(ownership.Object*, void*) -> unit, context: void*):
+    _ = data
+    _ = visit
+    _ = context
+
+func share_list(data: const void*) -> void*!:
+    let copy = try new_list()
+    errdefer close_list((void*)copy)
+    for entry in ((const SketchList*)data).entries.view(): try copy.add_entry(&entry)
+    return (void*)copy
+
+func close_list(data: void*):
+    let list = (SketchList*)data
+    for at in 0..<list.entries.count: list.entries.items[at].close()
+    list.entries.close()
+    free(SketchList[](list, 1)) in memory.heap
+
+func list_size(data: const void*) -> usize:
+    return ((const SketchList*)data).entries.count
+
+func list_bytes(data: const void*, ids: IdSet*) -> usize!:
+    _ = ids
+    var total: usize = 64
+    for entry in ((const SketchList*)data).entries.view(): total += entry.name.count + entry.text.count + 80
+    return total
+
+## A sketch has no surface to frame; the viewport frames the bodies.
+func list_bounds(data: const void*, matrix: Matrix4, out: Bounds*) -> bool!:
+    _ = data
+    _ = matrix
+    _ = out
+    return false
+
+## Each plane placed: its origin moved, its axes turned (and kept unit
+## length, so the sketch keeps its own sizes).
+func place_list(data: const void*, placement: const Placement*) -> void*!:
+    let placed = try new_list()
+    errdefer close_list((void*)placed)
+    for entry in ((const SketchList*)data).entries.view():
+        let origin = placement.matrix.transform_point(entry.origin)
+        let u = (try placement.matrix.transform_direction(entry.u).normalized())
+        let v = (try placement.matrix.transform_direction(entry.v).normalized())
+        try placed.add((str)entry.name.view(), (str)entry.text.view(), origin, u, v, entry.visible)
+    return (void*)placed
+
+func join_lists(first: const void*, second: const void*) -> void*!:
+    let joined = try new_list()
+    errdefer close_list((void*)joined)
+    for entry in ((const SketchList*)first).entries.view(): try joined.add_entry(&entry)
+    for entry in ((const SketchList*)second).entries.view(): try joined.add_entry(&entry)
+    return (void*)joined
+
+## Sketch names are their object paths.
+func list_paths(data: const void*, out: TableBuilder*) -> !:
+    for entry in ((const SketchList*)data).entries.view():
+        if entry.name.count > 0: _ = try out.intern((str)entry.name.view())
+
+func filter_list(data: const void*, filter: const PathFilter*, keep: bool) -> void*!:
+    let filtered = try new_list()
+    errdefer close_list((void*)filtered)
+    for entry in ((const SketchList*)data).entries.view():
+        let selected = filter.is_empty() or filter.matches((str)entry.name.view())
+        if selected == keep: try filtered.add_entry(&entry)
+    return (void*)filtered
+
+func describe_list(data: const void*, out: Growing[u8]*) -> !:
+    let count = ((const SketchList*)data).entries.count
+    try append_number(out, count)
+    try append_text(out, " sketch" if count == 1 else " sketches")
+
+## Geometry files: element `cad_sketches` with a child `s<i>` per sketch
+## holding its name, text, plane and visibility.
+func encode_list(data: const void*, writer: GeometryWriter*, path: str) -> !:
+    let list = (const SketchList*)data
+    try writer.crate.element(path, "cad_sketches")
+    try writer.crate.integer("count", (i64)list.entries.count)
+    var base = Growing[u8]()
+    defer base.close()
+    try base.assign(path.bytes)
+    var name = Growing[u8]()
+    defer name.close()
+    for index in 0..<list.entries.count:
+        let entry = &list.entries.items[index]
+        try name.assign("s".bytes)
+        try push_decimal(&name, (i64)index)
+        try writer.crate.element(try writer.child((str)base.view(), (str)name.view()), "cad_sketch")
+        try writer.crate.text("name", (str)entry.name.view())
+        try writer.crate.text("text", (str)entry.text.view())
+        try writer.crate.triple("origin", entry.origin.x, entry.origin.y, entry.origin.z)
+        try writer.crate.triple("u", entry.u.x, entry.u.y, entry.u.z)
+        try writer.crate.triple("v", entry.v.x, entry.v.y, entry.v.z)
+        try writer.crate.integer("visible", 1 if entry.visible else 0)
+
+func decode_list(reader: GeometryReader*, path: str) -> void*!:
+    let list = try new_list()
+    errdefer close_list((void*)list)
+    var base = Growing[u8]()
+    defer base.close()
+    try base.assign(path.bytes)
+    while let header = try reader.next_property(): _ = header
+    var name = Growing[u8]()
+    defer name.close()
+    var text = Growing[u8]()
+    defer text.close()
+    while let child = try reader.next_child((str)base.view()):
+        _ = child
+        name.clear()
+        text.clear()
+        var origin = Vector3()
+        var u = Vector3(1.0, 0.0, 0.0)
+        var v = Vector3(0.0, 1.0, 0.0)
+        var visible = true
+        while let header = try reader.next_property():
+            if header.name == "name": try reader.text(header, &name)
+            elif header.name == "text": try reader.text(header, &text)
+            elif header.name == "origin": origin = try reader.triple(header)
+            elif header.name == "u": u = try reader.triple(header)
+            elif header.name == "v": v = try reader.triple(header)
+            elif header.name == "visible": visible = (try reader.integer(header)) != 0
+        try list.add((str)name.view(), (str)text.view(), origin, u, v, visible)
+    return (void*)list
+
+## The set's sketch list; none without sketches.
+func list_of(set: const GeometrySet*) -> const SketchList*?:
+    let data = set.find(&sketch_component) else return none
+    return (const SketchList*)data
+
+## The sketch at `index` of `set`, or an error.
+func entry_at(set: interop.Reference[GeometrySet], index: i64) -> const SketchEntry*!:
+    let list = list_of(try set.get()) else error(invalid, "the geometry has no sketches")
+    if index < 0 or (usize)index >= list.entries.count: error(invalid, "sketch index out of range")
+    return &list.entries.items[(usize)index]
+
+## `set` with `list` as its sketches (none when it is empty, which is
+## closed); every other component shared.
+func with_list(set: const GeometrySet*, list: SketchList*) -> interop.Reference[GeometrySet]!:
+    let result = set.storage() catch failure:
+        close_list((void*)list)
+        error(failure.code, failure.message)
+    result.remove(&sketch_component)
+    if list.entries.count == 0:
+        close_list((void*)list)
+    else:
+        result.put(&sketch_component, (void*)list) catch failure:
+            close_list((void*)list)
+            dispose_set(result)
+            error(failure.code, failure.message)
+    return try adopt_set(result)
+
+## Luce's view of a set's sketches.
+pub struct CadSketches:
+    let reserved: u8 = 0
+
+    ## Register the sketches' codec with geocore's geometry files (once, at
+    ## startup; CadGeometry.register_codec does it with the models').
+    pub static func register_codec() -> i64!:
+        try register_codec(&sketch_component, encode_list, decode_list)
+        return 0
+
+    ## How many sketches `set` holds.
+    pub static func count(set: interop.Reference[GeometrySet]) -> i64!:
+        let list = list_of(try set.get()) else return 0
+        return (i64)list.entries.count
+
+    ## The index of the sketch named `name`, or -1.
+    pub static func find(set: interop.Reference[GeometrySet], name: str) -> i64!:
+        let list = list_of(try set.get()) else return -1
+        let at = list.find(name) else return -1
+        return (i64)at
+
+    pub static func name(set: interop.Reference[GeometrySet], index: i64) -> interop.Owned[str]!:
+        return try interop.copy_text((str)(try entry_at(set, index)).name.view())
+
+    ## Its CadSketch text.
+    pub static func text(set: interop.Reference[GeometrySet], index: i64) -> interop.Owned[str]!:
+        return try interop.copy_text((str)(try entry_at(set, index)).text.view())
+
+    ## Its plane: the origin, and the sketch's x and y directions.
+    pub static func origin(set: interop.Reference[GeometrySet], index: i64) -> Vector3!:
+        return (try entry_at(set, index)).origin
+
+    pub static func u(set: interop.Reference[GeometrySet], index: i64) -> Vector3!:
+        return (try entry_at(set, index)).u
+
+    pub static func v(set: interop.Reference[GeometrySet], index: i64) -> Vector3!:
+        return (try entry_at(set, index)).v
+
+    pub static func visible(set: interop.Reference[GeometrySet], index: i64) -> bool!:
+        return (try entry_at(set, index)).visible
+
+    ## `set` with sketch `name` holding `text` on the plane through
+    ## `origin` along `u` and `v`: the one of that name replaced in place,
+    ## else a new one after the others.
+    pub static func with_sketch(set: interop.Reference[GeometrySet], name: str, text: str, origin: Vector3, u: Vector3, v: Vector3, visible: bool = true) -> interop.Reference[GeometrySet]!:
+        if name == "": error(invalid, "a sketch needs a name")
+        if not origin.is_finite() or not u.is_finite() or not v.is_finite(): error(invalid, "a sketch's plane must be finite")
+        let source = try set.get()
+        let list = try new_list()
+        var replaced = false
+        if let existing = list_of(source):
+            for entry in existing.entries.view():
+                if (str)entry.name.view() == name:
+                    list.add(name, text, origin, u, v, visible) catch failure:
+                        close_list((void*)list)
+                        error(failure.code, failure.message)
+                    replaced = true
+                    continue
+                list.add_entry(&entry) catch failure:
+                    close_list((void*)list)
+                    error(failure.code, failure.message)
+        if not replaced:
+            list.add(name, text, origin, u, v, visible) catch failure:
+                close_list((void*)list)
+                error(failure.code, failure.message)
+        return try with_list(source, list)
+
+    ## `set` with sketch `name` shown or hidden (an error when it has none).
+    pub static func with_visible(set: interop.Reference[GeometrySet], name: str, visible: bool) -> interop.Reference[GeometrySet]!:
+        let index = try CadSketches.find(set, name)
+        if index < 0: error(invalid, "the sketch is not in the model")
+        let entry = try entry_at(set, index)
+        return try CadSketches.with_sketch(set, name, (str)entry.text.view(), entry.origin, entry.u, entry.v, visible)
+
+    ## `set` without sketch `name` (the same set when it has none).
+    pub static func without_sketch(set: interop.Reference[GeometrySet], name: str) -> interop.Reference[GeometrySet]!:
+        let source = try set.get()
+        let existing = list_of(source) else return set.clone()
+        let list = try new_list()
+        for entry in existing.entries.view():
+            if (str)entry.name.view() == name: continue
+            list.add_entry(&entry) catch failure:
+                close_list((void*)list)
+                error(failure.code, failure.message)
+        return try with_list(source, list)
+
+    ## `set` without any sketches.
+    pub static func without_sketches(set: interop.Reference[GeometrySet]) -> interop.Reference[GeometrySet]!:
+        let source = try set.get()
+        if list_of(source) == none: return set.clone()
+        let result = try source.storage()
+        result.remove(&sketch_component)
+        return try adopt_set(result)
