@@ -1,15 +1,37 @@
-## Where two analytic surfaces meet when no closed form does (cylinders at
-## an angle, cones at an angle, tori): marching, after OpenCASCADE's IntWalk
-## and SolveSpace's surfinter. Each surface is an implicit function f = 0;
-## a curve on both runs along the cross product of their gradients. Start
-## points are where one face's boundary or a grid over it crosses the other
-## surface; each is traced both ways (a step along the curve, then Newton
-## back onto both surfaces) until it leaves the faces' box or closes. Each
-## traced curve becomes a cubic B-spline through its points (all on both
-## surfaces), a carrier like any other.
+## Where two surfaces meet when no closed form does (cylinders at an
+## angle, cones at an angle, tori, B-spline surfaces): marching, after
+## OpenCASCADE's IntWalk and SolveSpace's surfinter. Each surface is a
+## field f = 0: an analytic surface's implicit function, a B-spline's
+## signed distance to its nearest point (along its normal there, found by
+## Newton from the last one); a curve on both runs along the cross product
+## of their gradients. Start points are where one face's boundary or a grid
+## over it crosses the other surface; each is traced both ways (a step
+## along the curve, then Newton back onto both surfaces) until it leaves
+## the faces' box or closes. Each traced curve becomes a cubic B-spline
+## through its points (all on both surfaces), a carrier like any other.
 
-## Surface `s`'s implicit value at `p` (zero on it) and its gradient.
-func implicit(s: const Surface*, p: Vector3) -> (f64, Vector3)!:
+## A surface as marching reads it, and for a B-spline the parameters of the
+## nearest point found last (the next search starts there), once found.
+struct Field:
+    var s: const Surface*
+    var seed: Vector3
+    var seeded: bool
+
+func field_of(s: const Surface*) -> Field:
+    return Field(s, Vector3(0.5, 0.5, 0.0), false)
+
+## The field's value at `p` (zero on the surface) and its gradient.
+func implicit(field: Field*, p: Vector3) -> (f64, Vector3)!:
+    let s = field.s
+    if s.kind == surface_spline:
+        # The signed distance to the nearest point, from the last one (a
+        # lattice of starts the first time).
+        let uv = try nearest_parameters(*s, p, field.seed, not field.seeded)
+        field.seed = uv
+        field.seeded = true
+        let q = try evaluate(*s, uv)
+        let n = try (try nurbs_normal(*s, uv)).normalized()
+        return (p.subtract(q).dot(n), n)
     let d = p.subtract(s.origin)
     if s.kind == surface_plane: return (d.dot(s.z), s.z)
     if s.kind == surface_sphere: return (d.dot(d) - s.radius * s.radius, d.multiply_scalar(2.0))
@@ -20,14 +42,17 @@ func implicit(s: const Surface*, p: Vector3) -> (f64, Vector3)!:
     if s.kind == surface_cone:
         let slope = math.tan(s.angle)
         return (length - (s.radius + h * slope), q.multiply_scalar(1.0 / length).subtract(s.z.multiply_scalar(slope)))
-    if s.kind == surface_torus:
-        let ring = s.origin.add(q.multiply_scalar(s.radius / length))
-        let offset = p.subtract(ring)
-        return (offset.dot(offset) - s.angle * s.angle, offset.multiply_scalar(2.0))
-    error(invalid, "marching on B-spline surfaces is not supported yet")
+    let ring = s.origin.add(q.multiply_scalar(s.radius / length))
+    let offset = p.subtract(ring)
+    return (offset.dot(offset) - s.angle * s.angle, offset.multiply_scalar(2.0))
+
+## A B-spline field's search from a lattice again (a seed far from where
+## the last one was found).
+func unseed(field: Field*):
+    field.seeded = false
 
 ## `p` moved onto both surfaces (Gauss-Newton, the least move), or none.
-func onto_both(s1: const Surface*, s2: const Surface*, start: Vector3, tol: f64) -> Vector3?!:
+func onto_both(s1: Field*, s2: Field*, start: Vector3, tol: f64) -> Vector3?!:
     var p = start
     for _ in 0..<50:
         let (f1, g1) = try implicit(s1, p)
@@ -49,7 +74,7 @@ func onto_both(s1: const Surface*, s2: const Surface*, start: Vector3, tol: f64)
     return none
 
 ## The curve's direction at `p`: across both gradients.
-func curve_direction(s1: const Surface*, s2: const Surface*, p: Vector3) -> Vector3?!:
+func curve_direction(s1: Field*, s2: Field*, p: Vector3) -> Vector3?!:
     let (_, g1) = try implicit(s1, p)
     let (_, g2) = try implicit(s2, p)
     let t = g1.cross(g2)
@@ -63,7 +88,7 @@ func in_box(p: Vector3, low: Vector3, high: Vector3) -> bool:
 
 ## Trace from `seed` along `heading` (or against it) onto `out`: false when
 ## it came back to its start (a closed curve).
-func trace(s1: const Surface*, s2: const Surface*, seed: Vector3, heading: Vector3, step: f64, low: Vector3, high: Vector3, tol: f64, out: Growing[Vector3]*) -> bool!:
+func trace(s1: Field*, s2: Field*, seed: Vector3, heading: Vector3, step: f64, low: Vector3, high: Vector3, tol: f64, out: Growing[Vector3]*) -> bool!:
     var p = seed
     var t = heading
     for count in 0..<20000:
@@ -80,8 +105,10 @@ func trace(s1: const Surface*, s2: const Surface*, seed: Vector3, heading: Vecto
 ## The curves where faces fa and fb of `w` meet, traced, as spline
 ## carriers onto `out`; `low`..`high` bounds where both faces are.
 pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, size: f64, tol: f64, out: Growing[Carrier]*) -> !:
-    let s1 = &w.surfaces.items[(usize)w.faces.items[fa].surface]
-    let s2 = &w.surfaces.items[(usize)w.faces.items[fb].surface]
+    var f1 = field_of(&w.surfaces.items[(usize)w.faces.items[fa].surface])
+    var f2 = field_of(&w.surfaces.items[(usize)w.faces.items[fb].surface])
+    let s1 = &f1
+    let s2 = &f2
     let step = size * 0.004
     # Start points: sign changes of each surface's function along the
     # other face's boundary and across a grid over it.
@@ -107,33 +134,65 @@ pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, s
     for seed in seeds.view():
         # A seed on a curve already traced adds nothing.
         if traced.near(seed): continue
+        # Each trace searches B-splines afresh from its seed.
+        unseed(s1)
+        unseed(s2)
         let heading = (try curve_direction(s1, s2, seed)) else continue
-        line.clear()
-        back.clear()
-        try line.push(seed)
-        let open = try trace(s1, s2, seed, heading, step, low, high, tol, &line)
-        if open:
-            _ = try trace(s1, s2, seed, heading.multiply_scalar(-1.0), step, low, high, tol, &back)
-            # The backward run reversed, then the forward one.
-            var joined = Growing[Vector3]()
-            defer joined.close()
-            var at = back.count
-            while at > 0:
-                at -= 1
-                try joined.push(back.items[at])
-            for p in line.view(): try joined.push(p)
-            line.clear()
-            for p in joined.view(): try line.push(p)
-        else:
-            # Closed: end on the start exactly.
-            try line.push(seed)
+        # Traced finer until the cubic through the points stays on both
+        # surfaces between them (a B-spline's curvature asks for more).
+        var spacing = step
+        for attempt in 0..<5:
+            try traced_line(s1, s2, seed, heading, spacing, low, high, tol, &line, &back)
+            if line.count < 4: break
+            try interpolate_cubic(line.view(), &net, &knots)
+            weights.clear()
+            for _ in net.view(): try weights.push(1.0)
+            if attempt == 4 or (try stays_on(s1, s2, net.view(), weights.view(), knots.view(), line.count * 4, tol)): break
+            spacing *= 0.5
         if line.count < 4: continue
         for p in line.view(): try traced.add(p)
-        try interpolate_cubic(line.view(), &net, &knots)
-        weights.clear()
-        for _ in net.view(): try weights.push(1.0)
         let spline = try w.store_spline(net.view(), weights.view(), knots.view(), 3, Matrix4())
         try out.push(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline))
+
+## The curve through `seed` on both fields, traced both ways (or round
+## once, closed) `step` apart, onto `line` (`back` is scratch).
+func traced_line(s1: Field*, s2: Field*, seed: Vector3, heading: Vector3, step: f64, low: Vector3, high: Vector3, tol: f64, line: Growing[Vector3]*, back: Growing[Vector3]*) -> !:
+    line.clear()
+    back.clear()
+    unseed(s1)
+    unseed(s2)
+    try line.push(seed)
+    let open = try trace(s1, s2, seed, heading, step, low, high, tol, line)
+    if not open:
+        # Closed: end on the start exactly.
+        try line.push(seed)
+        return
+    unseed(s1)
+    unseed(s2)
+    _ = try trace(s1, s2, seed, heading.multiply_scalar(-1.0), step, low, high, tol, back)
+    # The backward run reversed, then the forward one.
+    var joined = Growing[Vector3]()
+    defer joined.close()
+    var at = back.count
+    while at > 0:
+        at -= 1
+        try joined.push(back.items[at])
+    for p in line.view(): try joined.push(p)
+    try line.assign(joined.view())
+
+## Whether the cubic `net` stays within half the tolerance of both fields
+## at `samples` points along it.
+func stays_on(s1: Field*, s2: Field*, net: const Vector3[], weights: const f64[], knots: const f64[], samples: usize, tol: f64) -> bool!:
+    let low = knots[3]
+    let high = knots[net.length]
+    unseed(s1)
+    unseed(s2)
+    for k in 0..<samples + 1:
+        let p = try NurbsCurve.at(net, weights, 3, knots, low + (high - low) * (f64)k / (f64)samples)
+        for field in [s1, s2]:
+            let (value, gradient) = try implicit(field, p)
+            if math.abs(value) / math.max(gradient.length(), 1e-300) > tol * 0.5: return false
+    return true
 
 ## Points binned in cubes of side `reach`, the cubes hashed into a fixed
 ## number of buckets (chained through `next`): whether a point lies within
@@ -187,7 +246,7 @@ func new_point_cells(reach: f64) -> PointCells!:
 
 ## Where `other`'s function changes sign along face `f`'s boundary (which
 ## lies on `own`), refined onto both, onto `seeds`.
-func boundary_seeds(w: const Shape*, f: usize, other: const Surface*, own: const Surface*, tol: f64, seeds: Growing[Vector3]*) -> !:
+func boundary_seeds(w: const Shape*, f: usize, other: Field*, own: Field*, tol: f64, seeds: Growing[Vector3]*) -> !:
     for use in w.face_uses(f):
         let e = edge_index(use)
         let count = 128
@@ -207,7 +266,7 @@ func boundary_seeds(w: const Shape*, f: usize, other: const Surface*, own: const
 
 ## Where `other`'s function changes sign between neighbors of a grid over
 ## face `f`'s chart (closed curves inside it), onto `seeds`.
-func grid_seeds(w: const Shape*, f: usize, other: const Surface*, own: const Surface*, tol: f64, seeds: Growing[Vector3]*) -> !:
+func grid_seeds(w: const Shape*, f: usize, other: Field*, own: Field*, tol: f64, seeds: Growing[Vector3]*) -> !:
     var chart = Growing[Vector3]()
     defer chart.close()
     var starts = Growing[usize]()
@@ -220,11 +279,13 @@ func grid_seeds(w: const Shape*, f: usize, other: const Surface*, own: const Sur
         high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), 0.0)
     let n = 32
     for i in 0..<n + 1:
+        # Each column searches a B-spline afresh.
+        unseed(other)
         var previous = 0.0
         for j in 0..<n + 1:
             let u = low.x + (high.x - low.x) * (f64)i / (f64)n
             let v = low.y + (high.y - low.y) * (f64)j / (f64)n
-            let p = try surface_point(*own, Vector3(u, v, 0.0))
+            let p = try surface_point(*own.s, Vector3(u, v, 0.0))
             let value = (try implicit(other, p)).0
             if j > 0 and (previous <= 0.0) != (value <= 0.0):
                 if let q = try onto_both(own, other, p, tol): try seeds.push(q)

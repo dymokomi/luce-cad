@@ -211,13 +211,20 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
 
    Planes within 1e-7 radians of parallel are treated as parallel: noise, not a crossing.
 
-   Analytic pairs the table doesn't cover are traced (`march.lucb`). This covers cylinders at an
-   angle, cones at an angle and tori. Each surface is an implicit function, and a curve on both runs
-   along the cross product of their gradients. Start points are where one face's boundary, or a grid
-   over the face, crosses the other surface. Each start is traced both ways: a step along the curve,
-   then Newton back onto both surfaces. A trace ends where the surfaces touch (their gradients
-   parallel). Each traced curve becomes an interpolating cubic B-spline
-   through points exactly on both surfaces.
+   Pairs the table doesn't cover are traced (`march.lucb`). This covers cylinders at an angle,
+   cones at an angle, tori, and B-spline surfaces against anything (a fillet's strip cut by a tilted
+   plane or pin, two rounded bodies' strips crossing). Each surface is a field: an analytic
+   surface's implicit function, a B-spline's signed distance to its nearest point (along its normal
+   there, Newton from the nearest point found last, a lattice of starts for each new trace). A curve
+   on both runs along the cross product of their gradients. Start points are where one face's
+   boundary, or a grid over the face, crosses the other surface. Each start is traced both ways: a
+   step along the curve, then Newton back onto both surfaces. A trace ends where the surfaces touch
+   (their gradients parallel). Each traced curve becomes an interpolating cubic B-spline through
+   points exactly on both surfaces; it is traced again at half the step until the cubic stays within
+   half the tolerance of both surfaces between its points.
+
+   B-spline pairs with a closed form keep it: a plane against a profile swept straight, two sweeps
+   meeting in a miter, a turned profile against a plane or a cylinder or cone about its axis.
 3. **Clipping to faces.** Each curve is clipped to both faces (`clip.lucb`). Its crossings with
    either face's boundary are found on samples, then refined by Newton steps on the exact curves.
    Those crossings cut the curve, and they cut a boundary edge only where the other face is: a
@@ -694,8 +701,8 @@ Roughly in order of usefulness:
    unequal radii, Fusion's other corner type).
 2. **Blends on other curved edges:** edges between two curved faces (beyond a flat face's loop);
    open ends where the loop turns a sharp corner rather than going on tangentially.
-3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
-   surfaces. Rays through them are exact (`spline_rays.lucb`).
+3. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
+   analytic surfaces are recognized as coincident.
 4. **Sweep and loft;** Extrude's Thin option and a start offset by a face.
 5. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
 6. **Shell of B-spline faces** and draft; Delete healing more than one strip or corner at a time (a chain of
