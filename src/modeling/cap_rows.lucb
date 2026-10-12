@@ -97,6 +97,15 @@ func section_at(b: const Cap*, lambda: f64, r: f64, along_cap: Growing[f64]*, al
     along_wall.clear()
     knots.clear()
     weights.clear()
+    if b.rolled:
+        # Rolled (cap_rolled.lucb): a degree 5 Bezier, its points made
+        # there; six placeholder steps.
+        try along_cap.fill(6, 0.0)
+        try along_wall.fill(6, 0.0)
+        for _ in 0..<(usize)6: try knots.push(0.0)
+        for _ in 0..<(usize)6: try knots.push(1.0)
+        try weights.fill(6, 1.0)
+        return 5
     let c = try contact_distance(b, lambda, r)
     if not b.round:
         let a: f64[2] = [c, 0.0]
@@ -130,6 +139,7 @@ func section_at(b: const Cap*, lambda: f64, r: f64, along_cap: Growing[f64]*, al
 ## Every row of side `side`'s section at parameter `t` (the section
 ## there) onto `out`: e(t) + a_k u(t) + b_k S(t).
 func rows_at(b: const Cap*, side: const CapSide*, t: f64, out: Growing[Vector3]*) -> !:
+    if b.rolled: return try cap_rolled_section(b, side, t, out)
     let edge = b.w.edges.items[side.edge]
     let (lambda, _) = try corner_at(b, side, t)
     var a = Growing[f64]()
@@ -239,9 +249,17 @@ func fitted_rows(b: const Cap*, side: const CapSide*, rows: usize, net: Growing[
         for _ in 0..<p + 1: try knots.push(low)
         try knots.push((low + high) * 0.5)
         for _ in 0..<p + 1: try knots.push(high)
+    if let law = b.law: try law_knots(law, w, side.edge, low, high, p, knots)
     var context = CapRows(b, side)
-    var source = RowSource((void*)&context, cap_rows_at, low, high, w.tolerance)
-    try fit_rows(&source, rows, p, knots, net)
+    # Rolled sections are fitted themselves (within 1e-5): their rows
+    # within a millionth of the loop.
+    var tolerance = w.tolerance
+    if b.rolled:
+        if let law = b.law: tolerance = math.max(tolerance, law.total * 1e-6)
+    var source = RowSource((void*)&context, cap_rows_at, low, high, tolerance)
+    fit_rows(&source, rows, p, knots, net) catch failure:
+        if not b.rolled or failure.code != invalid: error(failure.code, failure.message)
+        error(invalid, "a G1 variable fillet (Tangency weight 1) rolling its ball round this loop could not be fitted: its radius comes near the loop's own curvature; give it a smaller radius there or another weight")
     try weights.fill(knots.count - p - 1, 1.0)
     return (i64)p
 

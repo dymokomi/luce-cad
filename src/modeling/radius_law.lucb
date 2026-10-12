@@ -194,6 +194,61 @@ struct RadiusLaw:
         let into = run if self.forward.items[e] else own - run
         return math.clamp((self.before.items[e] + into) / self.total, 0.0, 1.0)
 
+    ## Edge `e`'s carrier parameters (between `low` and `high`) where the
+    ## law's points fall, onto `out`, rising: where its cubics meet, only
+    ## their slopes alike (bisection on the chain's fraction).
+    func points_on(w: const Shape*, e: usize, low: f64, high: f64, out: Growing[f64]*) -> !:
+        out.clear()
+        if self.place.items[e] < 0: return
+        let f_low = try self.fraction(w, e, low)
+        let f_high = try self.fraction(w, e, high)
+        let lo = math.min(f_low, f_high)
+        let hi = math.max(f_low, f_high)
+        for k in 0..<self.positions.count:
+            let f = self.positions.items[k]
+            if f <= lo + 1e-9 or f >= hi - 1e-9: continue
+            var a = low
+            var b = high
+            for _ in 0..<80:
+                let m = (a + b) * 0.5
+                if ((try self.fraction(w, e, m)) < f) == (f_low < f_high): a = m
+                else: b = m
+            try out.push((a + b) * 0.5)
+        # Rising in the parameter.
+        if out.count > 1 and out.items[0] > out.items[out.count - 1]:
+            var i: usize = 0
+            var j = out.count - 1
+            while i < j:
+                let keep = out.items[i]
+                out.items[i] = out.items[j]
+                out.items[j] = keep
+                i += 1
+                j -= 1
+
+    ## The chain's edge and carrier parameter `s` along it (its length from
+    ## the chain's start; a closed loop's wraps round): the arc length table
+    ## read backward (linear between its samples, as `fraction` reads it).
+    ## (-1, 0) off the chain.
+    func at_length(w: const Shape*, s: f64) -> (i64, f64):
+        var at = s
+        if self.closed: at = s - math.floor(s / self.total) * self.total
+        for e in 0..<self.place.count:
+            if self.place.items[e] < 0: continue
+            let edge = w.edges.items[e]
+            let row = e * (law_samples + 1)
+            let own = self.lengths.items[row + law_samples]
+            let before = self.before.items[e]
+            if at < before or at > before + own: continue
+            let into = at - before
+            let run = into if self.forward.items[e] else own - into
+            var j: usize = 0
+            while j + 1 < law_samples and self.lengths.items[row + j + 1] < run: j += 1
+            let a = self.lengths.items[row + j]
+            let gap = self.lengths.items[row + j + 1] - a
+            let f = ((f64)j + ((run - a) / gap if gap > 0.0 else 0.0)) / (f64)law_samples
+            return ((i64)e, edge.t0 + (edge.t1 - edge.t0) * f)
+        return (-1, 0.0)
+
     ## The radius at edge `e`'s carrier parameter `t`.
     func at_edge(w: const Shape*, e: usize, t: f64) -> f64!:
         return self.at_fraction(try self.fraction(w, e, t))

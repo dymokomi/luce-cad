@@ -32,6 +32,11 @@ struct Rolled:
     var positions: const f64[]
     var radii: const f64[]
     var slopes: const f64[]
+    ## The planes the strip ends in (normals along the edge's way): square
+    ## to it, or a slanted end face's; the sections between turn from one to
+    ## the other (rolled_section).
+    var n0: Vector3
+    var n1: Vector3
 
 ## The radius at `z` along the edge, the law's end pieces carried on past
 ## its ends.
@@ -49,63 +54,18 @@ func rolled_ball_at(r: const Rolled*, s: f64) -> (Vector3, f64, Vector3, f64):
     let center = r.start.add(r.along.multiply_scalar(s)).add(r.k.multiply_scalar(radius))
     return (center, radius, r.along.add(r.k.multiply_scalar(rate)), rate)
 
-## The envelope's point in the section at `z` along the ray from the edge
-## `tau` of the way from `ua` to `ub`: where the ray first enters the balls,
-## the least of its distances to each ball (ray_meets) over their places
-## along the edge (sampled about `z`, then golden section: at the least
-## the ball touches the envelope there, its characteristic).
-func rolled_point(r: const Rolled*, z: f64, tau: f64) -> Vector3!:
-    let e = r.start.add(r.along.multiply_scalar(z))
-    # The contacts: each ball touches a face at the foot of its center.
-    let foot = rolled_radius(r, z) / math.tan(r.theta * 0.5)
-    if tau == 0.0: return e.add(r.ua.multiply_scalar(foot))
-    if tau == 1.0: return e.add(r.ub.multiply_scalar(foot))
-    let way = r.ua.multiply_scalar(math.sin((1.0 - tau) * r.theta)).add(r.ub.multiply_scalar(math.sin(tau * r.theta))).multiply_scalar(1.0 / math.sin(r.theta))
-    let reach = 2.0 * rolled_radius(r, z)
-    # The local least nearest `z` (the characteristic of the balls about
-    # it: where steep radii swallow a valley's small balls, the strip runs
-    # on through them as Fusion's does, not over the outer balls' crease).
-    let steps: usize = 64
-    var values: f64[65]
-    for k in 0..<steps + 1: values[k] = ray_meets(r, e, way, z - reach + 2.0 * reach * (f64)k / (f64)steps)
-    var at = z
-    var nearest = 1.0e300
-    for k in 0..<steps + 1:
-        let s = z - reach + 2.0 * reach * (f64)k / (f64)steps
-        let left = values[k - 1] if k > 0 else 1.0e300
-        let right = values[k + 1] if k < steps else 1.0e300
-        if values[k] < 1.0e299 and values[k] <= left and values[k] <= right and math.abs(s - z) < nearest:
-            nearest = math.abs(s - z)
-            at = s
-    var low = at - 2.0 * reach / (f64)steps
-    var high = at + 2.0 * reach / (f64)steps
-    let golden = (math.sqrt(5.0) - 1.0) * 0.5
-    var x1 = high - golden * (high - low)
-    var x2 = low + golden * (high - low)
-    var f1 = ray_meets(r, e, way, x1)
-    var f2 = ray_meets(r, e, way, x2)
-    for _ in 0..<100:
-        if f1 < f2:
-            high = x2
-            x2 = x1
-            f2 = f1
-            x1 = high - golden * (high - low)
-            f1 = ray_meets(r, e, way, x1)
-        else:
-            low = x1
-            x1 = x2
-            f1 = f2
-            x2 = low + golden * (high - low)
-            f2 = ray_meets(r, e, way, x2)
-        if high - low <= r.length * 1e-14: break
-    let d = math.min(f1, f2)
-    if d >= 1.0e299: error(invalid, "a rolled fillet's section could not be found: no ball reaches the ray")
-    return e.add(way.multiply_scalar(d))
+## Balls along a chain: the center and radius of the ball `s` along it
+## (its length from the chain's start), as a callback on `context`, and
+## the model's size (where searches stop).
+struct Balls:
+    var context: void*
+    var at: func(void*, f64) -> (Vector3, f64)
+    var size: f64
 
-## Where the ray from `e` along `way` first meets the ball at `s` (very far
-## when it passes it).
-func ray_meets(r: const Rolled*, e: Vector3, way: Vector3, s: f64) -> f64:
-    let (center, radius, _, _) = rolled_ball_at(r, s)
+## Where the ray from `e` along `way` first meets ball `s` of `balls` (very
+## far when it passes it, or the ball has no radius).
+func ray_meets(balls: const Balls*, e: Vector3, way: Vector3, s: f64) -> f64:
+    let (center, radius) = balls.at(balls.context, s)
     if radius <= 0.0: return 1.0e300
     let q = e.subtract(center)
     let b = q.dot(way)
@@ -113,19 +73,76 @@ func ray_meets(r: const Rolled*, e: Vector3, way: Vector3, s: f64) -> f64:
     if disc < 0.0: return 1.0e300
     return -b - math.sqrt(disc)
 
+## The envelope's point on the ray from `e` along `way`: where the ray
+## first enters the balls about `s0` (within `reach` either way), the
+## least of its distances to each ball (ray_meets) over their places: the
+## local least nearest `s0` (sampled, then golden section), the ball there
+## touching the envelope (its characteristic). Taking the local least,
+## where steep radii swallow a valley's small balls the strip runs on
+## through them, not over the outer balls' crease.
+func envelope_point(balls: const Balls*, s0: f64, e: Vector3, way: Vector3, reach: f64) -> Vector3!:
+    let steps: usize = 24
+    var values: f64[25]
+    for k in 0..<steps + 1: values[k] = ray_meets(balls, e, way, s0 - reach + 2.0 * reach * (f64)k / (f64)steps)
+    var at = s0
+    var nearest = 1.0e300
+    for k in 0..<steps + 1:
+        let s = s0 - reach + 2.0 * reach * (f64)k / (f64)steps
+        let left = values[k - 1] if k > 0 else 1.0e300
+        let right = values[k + 1] if k < steps else 1.0e300
+        if values[k] < 1.0e299 and values[k] <= left and values[k] <= right and math.abs(s - s0) < nearest:
+            nearest = math.abs(s - s0)
+            at = s
+    var low = at - 2.0 * reach / (f64)steps
+    var high = at + 2.0 * reach / (f64)steps
+    let golden = (math.sqrt(5.0) - 1.0) * 0.5
+    var x1 = high - golden * (high - low)
+    var x2 = low + golden * (high - low)
+    var f1 = ray_meets(balls, e, way, x1)
+    var f2 = ray_meets(balls, e, way, x2)
+    for _ in 0..<100:
+        if f1 < f2:
+            high = x2
+            x2 = x1
+            f2 = f1
+            x1 = high - golden * (high - low)
+            f1 = ray_meets(balls, e, way, x1)
+        else:
+            low = x1
+            x1 = x2
+            f1 = f2
+            x2 = low + golden * (high - low)
+            f2 = ray_meets(balls, e, way, x2)
+        # (The distance is flat at its least: a place within 1e-8 of the
+        # size leaves it within 1e-16.)
+        if high - low <= balls.size * 1e-8: break
+    let d = math.min(f1, f2)
+    if d >= 1.0e299: error(invalid, "a rolled fillet's section could not be found: no ball reaches the ray")
+    return e.add(way.multiply_scalar(d))
+
 ## Bernstein weights of degree 5 at `t`.
 func bernstein5(t: f64) -> f64[6]:
     let u = 1.0 - t
     return [u * u * u * u * u, 5.0 * t * u * u * u * u, 10.0 * t * t * u * u * u, 10.0 * t * t * t * u * u, 5.0 * t * t * t * t * u, t * t * t * t * t]
 
-## The section at `z`: its six control points onto `out` (see the header).
-func rolled_section(r: const Rolled*, z: f64, out: Growing[Vector3]*) -> !:
+## The envelope's section of `balls` about `s0` in the plane through the
+## corner `e` along the ways `ua` and `ub` (unit: the rays' fan), from
+## contact `a` to `b`: its six control points onto `out` (see the header):
+## samples along rays between the ways, a degree 5 Bezier fitted, its
+## second and fifth points on the faces' tangents at the contacts (`toward_a`,
+## `toward_b`: unit, from each contact toward the corner).
+func envelope_section(balls: const Balls*, s0: f64, e: Vector3, ua: Vector3, ub: Vector3, toward_a: Vector3, toward_b: Vector3, a: Vector3, b: Vector3, out: Growing[Vector3]*) -> !:
     let samples: usize = 40
+    let theta = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    let reach = 2.0 * math.max(a.subtract(e).length(), b.subtract(e).length())
     var points = Growing[Vector3]()
     defer points.close()
-    for k in 0..<samples + 1: try points.push(try rolled_point(r, z, (f64)k / (f64)samples))
-    let a = points.items[0]
-    let b = points.items[samples]
+    try points.push(a)
+    for k in 1..<samples:
+        let tau = (f64)k / (f64)samples
+        let way = ua.multiply_scalar(math.sin((1.0 - tau) * theta)).add(ub.multiply_scalar(math.sin(tau * theta))).multiply_scalar(1.0 / math.sin(theta))
+        try points.push(try envelope_point(balls, s0, e, way, reach))
+    try points.push(b)
     # The samples' parameters: chord lengths first.
     var params = Growing[f64]()
     defer params.close()
@@ -134,8 +151,7 @@ func rolled_section(r: const Rolled*, z: f64, out: Growing[Vector3]*) -> !:
     let total = params.items[samples]
     for k in 0..<samples + 1: params.items[k] /= total
     # The plane's frame: x along ua, y across in the section.
-    let y = try r.ub.subtract(r.ua.multiply_scalar(r.ub.dot(r.ua))).normalized()
-    let e = r.start.add(r.along.multiply_scalar(z))
+    let y = try ub.subtract(ua.multiply_scalar(ub.dot(ua))).normalized()
     var control: Vector3[6] = [a, a, a, b, b, b]
     for _ in 0..<16:
         # Least squares for α, β (the legs) and the inner points' x, y.
@@ -146,14 +162,14 @@ func rolled_section(r: const Rolled*, z: f64, out: Growing[Vector3]*) -> !:
             let fixed = a.multiply_scalar(w[0] + w[1]).add(b.multiply_scalar(w[4] + w[5])).add(e.multiply_scalar(w[2] + w[3]))
             let residual = points.items[k].subtract(fixed)
             for axis in 0..<(usize)2:
-                let dir = r.ua if axis == 0 else y
-                let row: f64[6] = [-w[1] * r.ua.dot(dir), -w[4] * r.ub.dot(dir), w[2] if axis == 0 else 0.0, w[2] if axis == 1 else 0.0, w[3] if axis == 0 else 0.0, w[3] if axis == 1 else 0.0]
+                let dir = ua if axis == 0 else y
+                let row: f64[6] = [w[1] * toward_a.dot(dir), w[4] * toward_b.dot(dir), w[2] if axis == 0 else 0.0, w[2] if axis == 1 else 0.0, w[3] if axis == 0 else 0.0, w[3] if axis == 1 else 0.0]
                 let value = residual.dot(dir)
                 for i in 0..<(usize)6:
                     rhs[i] += row[i] * value
                     for j in 0..<(usize)6: normal[i * 6 + j] += row[i] * row[j]
         if not solve_small(normal[..<36], rhs[..<6], 6): error(invalid, "a rolled fillet's section could not be fitted")
-        control = [a, a.subtract(r.ua.multiply_scalar(rhs[0])), e.add(r.ua.multiply_scalar(rhs[2])).add(y.multiply_scalar(rhs[3])), e.add(r.ua.multiply_scalar(rhs[4])).add(y.multiply_scalar(rhs[5])), b.subtract(r.ub.multiply_scalar(rhs[1])), b]
+        control = [a, a.add(toward_a.multiply_scalar(rhs[0])), e.add(ua.multiply_scalar(rhs[2])).add(y.multiply_scalar(rhs[3])), e.add(ua.multiply_scalar(rhs[4])).add(y.multiply_scalar(rhs[5])), b.add(toward_b.multiply_scalar(rhs[1])), b]
         # Each inner sample's parameter moved to its foot (Newton).
         for k in 1..<samples:
             for _ in 0..<3:
@@ -167,6 +183,96 @@ func rolled_section(r: const Rolled*, z: f64, out: Growing[Vector3]*) -> !:
                 if speed > 0.0: params.items[k] = math.clamp(t - at.subtract(points.items[k]).dot(slope) / speed, 0.0, 1.0)
     out.clear()
     for p in control: try out.push(p)
+
+## Balls sampled evenly round a closed loop (its length `total`): centers
+## and radii, read between by Catmull-Rom cubics (sampled_ball).
+struct SampledBalls:
+    var centers: Growing[Vector3]
+    var radii: Growing[f64]
+    var total: f64
+
+    func close():
+        self.centers.close()
+        self.radii.close()
+
+## Balls round a loop sampled (each loop builds its own: cap_rolled.lucb,
+## curved_rolled.lucb).
+let ball_samples: usize = 1024
+
+## The ball `s` round the loop (Balls' callback on a SampledBalls).
+func sampled_ball(context: void*, s: f64) -> (Vector3, f64):
+    let b = (SampledBalls*)context
+    let n = b.centers.count
+    let x = s / b.total * (f64)n
+    let base = math.floor(x)
+    let f = x - base
+    var index: i64[4] = [0, 0, 0, 0]
+    for k in 0..<(usize)4:
+        let i = ((i64)base - 1 + (i64)k) % (i64)n
+        index[k] = i + (i64)n if i < 0 else i
+    let f2 = f * f
+    let f3 = f2 * f
+    let w: f64[4] = [(-f3 + 2.0 * f2 - f) * 0.5, (3.0 * f3 - 5.0 * f2 + 2.0) * 0.5, (-3.0 * f3 + 4.0 * f2 + f) * 0.5, (f3 - f2) * 0.5]
+    var center = Vector3()
+    var radius = 0.0
+    for k in 0..<(usize)4:
+        center = center.add(b.centers.items[(usize)index[k]].multiply_scalar(w[k]))
+        radius += b.radii.items[(usize)index[k]] * w[k]
+    return (center, radius)
+
+## The straight edge's balls (Balls' callback on a Rolled).
+func rolled_balls_at(context: void*, s: f64) -> (Vector3, f64):
+    let (center, radius, _, _) = rolled_ball_at((Rolled*)context, s)
+    return (center, radius)
+
+## The straight edge's section at `z`: its six control points onto `out`,
+## from the contacts (each ball touches a face at the foot of its center).
+## Where the ends are slanted the section at `z` lies in the plane through
+## the edge's point there whose normal turns from the start's plane's to
+## the end's (`n0`, `n1`), so the first and last sections lie in the end
+## faces' planes, as Fusion's face is trimmed by them: the ways into the
+## faces are their traces in that plane, and each contact the face's
+## contact line (the balls' feet) where it crosses the plane.
+func rolled_section(r: const Rolled*, z: f64, out: Growing[Vector3]*) -> !:
+    var balls = Balls((void*)r, rolled_balls_at, r.length)
+    let e = r.start.add(r.along.multiply_scalar(z))
+    let v = z / r.length
+    let n = try r.n0.multiply_scalar(1.0 - v).add(r.n1.multiply_scalar(v)).normalized()
+    if n.dot(r.along) >= 1.0 - 1e-15:
+        let foot = rolled_radius(r, z) / math.tan(r.theta * 0.5)
+        try envelope_section(&balls, z, e, r.ua, r.ub, r.ua.multiply_scalar(-1.0), r.ub.multiply_scalar(-1.0), e.add(r.ua.multiply_scalar(foot)), e.add(r.ub.multiply_scalar(foot)), out)
+        return
+    let ua = try face_trace(r.ua, r.along, n)
+    let ub = try face_trace(r.ub, r.along, n)
+    let a = try contact_in(r, r.ua, e, n, z)
+    let b = try contact_in(r, r.ub, e, n, z)
+    try envelope_section(&balls, z, e, ua, ub, ua.multiply_scalar(-1.0), ub.multiply_scalar(-1.0), a, b, out)
+
+## The way into a face (`into`, square to the edge `along`) traced in the
+## plane of normal `n` through the edge: the face's plane holds `into` and
+## `along`; its line in that plane.
+func face_trace(into: Vector3, along: Vector3, n: Vector3) -> Vector3!:
+    let face_normal = into.cross(along)
+    let way = try n.cross(face_normal).normalized()
+    return way.multiply_scalar(1.0 if way.dot(into) > 0.0 else -1.0)
+
+## Where the contact line on the face along `into` (the balls' feet, r cot
+## (θ/2) out from the edge) crosses the plane of normal `n` through `e`:
+## Newton on the place along the edge, from `z`.
+func contact_in(r: const Rolled*, into: Vector3, e: Vector3, n: Vector3, z: f64) -> Vector3!:
+    let reach = 1.0 / math.tan(r.theta * 0.5)
+    var s = z
+    let h = r.length * 1e-7
+    for _ in 0..<60:
+        let p = r.start.add(r.along.multiply_scalar(s)).add(into.multiply_scalar(rolled_radius(r, s) * reach))
+        let q = r.start.add(r.along.multiply_scalar(s + h)).add(into.multiply_scalar(rolled_radius(r, s + h) * reach))
+        let f = n.dot(p.subtract(e))
+        let rate = (n.dot(q.subtract(e)) - f) / h
+        if math.abs(rate) < 1e-300: error(invalid, "a rolled fillet's contact runs along its slanted end")
+        let step = f / rate
+        s -= step
+        if math.abs(step) <= r.length * 1e-15: break
+    return r.start.add(r.along.multiply_scalar(s)).add(into.multiply_scalar(rolled_radius(r, s) * reach))
 
 ## Bernstein weight `i` of degree 4 at `t`.
 func bernstein4(t: f64, i: usize) -> f64:
@@ -194,3 +300,41 @@ func rolled_net(r: Rolled*, tolerance: f64, net: Growing[Vector3]*, weights: Gro
     try fit_rows(&source, 6, p, knots, net)
     try weights.fill(net.count, 1.0)
     return (i64)p
+
+## Whether the balls' envelope folds along the edge: across the fillet (on
+## each characteristic circle, the arc from one face's contact to the
+## other's) each point must move on along the edge as the ball rolls;
+## where one turns back, the circles cross and the envelope folds. Fusion
+## 2705 then scales the circle's section along the edge instead of rolling
+## (probes 7 and 8: radii 2, x at the middle, 2 along a 20 edge roll up to
+## x = 10 and scale from 12; L11 scales), as variable_straight does too.
+func rolled_folds(r: const Rolled*) -> bool:
+    let samples: usize = 400
+    let h = r.length * 1e-5
+    for k in 0..<samples + 1:
+        let s = r.length * (f64)k / (f64)samples
+        for a in 0..<(usize)33:
+            let x0 = characteristic(r, s, (f64)a / 32.0)
+            let x1 = characteristic(r, s + h, (f64)a / 32.0)
+            if x1.subtract(x0).dot(r.along) <= 0.0: return true
+    return false
+
+## The point `f` of the way along the characteristic circle of the ball at
+## `s` (where it touches the envelope) from its contact with face a to its
+## contact with face b, the short way.
+func characteristic(r: const Rolled*, s: f64, f: f64) -> Vector3:
+    let (center, radius, moving, rate) = rolled_ball_at(r, s)
+    let speed = moving.dot(moving)
+    let t = moving.multiply_scalar(1.0 / math.sqrt(speed))
+    # The circle's center and the contacts (each ball's feet on the faces).
+    let middle = center.add(moving.multiply_scalar(-rate * radius / speed))
+    let e = r.start.add(r.along.multiply_scalar(s))
+    let foot = radius / math.tan(r.theta * 0.5)
+    let to_a = e.add(r.ua.multiply_scalar(foot)).subtract(middle)
+    let to_b = e.add(r.ub.multiply_scalar(foot)).subtract(middle)
+    let size = to_a.length()
+    let x = to_a.multiply_scalar(1.0 / size)
+    let y = t.cross(x)
+    let sweep = math.atan2(to_b.dot(y), to_b.dot(x))
+    let angle = sweep * f
+    return middle.add(x.multiply_scalar(size * math.cos(angle))).add(y.multiply_scalar(size * math.sin(angle)))

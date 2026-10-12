@@ -1,0 +1,177 @@
+## A variable fillet along one straight edge that ends at a slanted face,
+## its section scaled with the radius (any weight but G1's 1, G2, G3), as
+## Fusion 2705 makes it (probes 8 and 10 of 2026-10-12): the section swept
+## along the edge, square to it, the law carried on past the edge's end
+## (straight on, its end piece's polynomial), and the sweep trimmed by the
+## end face's plane. A tensor net cannot stop each row at the plane and
+## stay that sweep (its rows would meet the plane at different places
+## along the edge, and a section mixes them), so here the sections lie in
+## planes that turn from the slanted end's to the other end's, through the
+## edge's point at each place: each the sweep's own curve in that plane
+## (sampled: for each point of the unit section, the place along the edge
+## where the scaled point lies in the plane, by Newton), fitted with the
+## section's own degree and knots, its points next to the contacts held on
+## the faces' traces in the plane (G1, G2, G3 at the contacts as the
+## section is), the samples' parameters moved to their feet. The sections'
+## points are fitted along the edge as rows (row_fit.lucb).
+
+## The sweep and its turning section planes: the edge from `start` along
+## `along`, `length` long, the law, the unit section (`section` points from
+## the edge's point at unit radius, `weights`, `degree`, `knots`), how many
+## points beyond each contact lie on its leg (`legs`: the continuity), the
+## ways into the faces and the end planes' normals (along the edge's way).
+struct Tilted:
+    var start: Vector3
+    var along: Vector3
+    var length: f64
+    var positions: const f64[]
+    var radii: const f64[]
+    var slopes: const f64[]
+    var section: const Vector3[]
+    var weights: const f64[]
+    var degree: i64
+    var knots: const f64[]
+    var legs: usize
+    var ua: Vector3
+    var ub: Vector3
+    var n0: Vector3
+    var n1: Vector3
+
+## The radius `s` along the edge, the law carried on past its ends.
+func tilted_radius(t: const Tilted*, s: f64) -> f64:
+    let f = s / t.length
+    var k: usize = 0
+    while k + 2 < t.positions.length and f > t.positions[k + 1]: k += 1
+    return hermite(t.positions, t.radii, t.slopes, k, f)
+
+## The section at `z` along the edge (in its turning plane): its points
+## onto `out` (the section's count of them).
+func tilted_section(t: const Tilted*, z: f64, out: Growing[Vector3]*) -> !:
+    let v = z / t.length
+    let n = try t.n0.multiply_scalar(1.0 - v).add(t.n1.multiply_scalar(v)).normalized()
+    let e = t.start.add(t.along.multiply_scalar(z))
+    let count = t.section.length
+    let low = t.knots[(usize)t.degree]
+    let high = t.knots[count]
+    let samples: usize = 40
+    var points = Growing[Vector3]()
+    defer points.close()
+    var params = Growing[f64]()
+    defer params.close()
+    let h = t.length * 1e-7
+    for k in 0..<samples + 1:
+        let u = low + (high - low) * (f64)k / (f64)samples
+        let q = try NurbsCurve.at(t.section, t.weights, t.degree, t.knots, u)
+        var s = z
+        for _ in 0..<60:
+            let f = n.dot(t.start.add(t.along.multiply_scalar(s)).add(q.multiply_scalar(tilted_radius(t, s))).subtract(e))
+            let g = n.dot(t.start.add(t.along.multiply_scalar(s + h)).add(q.multiply_scalar(tilted_radius(t, s + h))).subtract(e))
+            let rate = (g - f) / h
+            if math.abs(rate) < 1e-300: error(invalid, "a variable fillet's section runs along its slanted end")
+            let step = f / rate
+            s -= step
+            if math.abs(step) <= t.length * 1e-15: break
+        try points.push(t.start.add(t.along.multiply_scalar(s)).add(q.multiply_scalar(tilted_radius(t, s))))
+        try params.push(u)
+    let a = points.items[0]
+    let b = points.items[samples]
+    let ua = try face_trace(t.ua, t.along, n)
+    let ub = try face_trace(t.ub, t.along, n)
+    let y = try ub.subtract(ua.multiply_scalar(ub.dot(ua))).normalized()
+    # Unknowns: each leg's points' distances back from their contact, then
+    # the free points' x, y in the plane.
+    let legs = t.legs
+    let loose = count - 2 - 2 * legs
+    let unknowns = 2 * legs + 2 * loose
+    var control = Growing[Vector3]()
+    defer control.close()
+    try control.fill(count, a)
+    var normal = Growing[f64]()
+    defer normal.close()
+    var rhs = Growing[f64]()
+    defer rhs.close()
+    var row = Growing[f64]()
+    defer row.close()
+    for _ in 0..<12:
+        normal.clear()
+        rhs.clear()
+        try normal.fill(unknowns * unknowns, 0.0)
+        try rhs.fill(unknowns, 0.0)
+        for k in 0..<samples + 1:
+            var ders: f64[36]
+            let first = basis_derivatives(t.knots, (i64)count, t.degree, params.items[k], &ders)
+            # The fixed part (the contacts, the edge's point under the free
+            # points' plane coordinates) and each unknown's coefficient.
+            var fixed = Vector3()
+            row.clear()
+            try row.fill(unknowns * 2, 0.0)
+            for j in 0..<(usize)t.degree + 1:
+                let i = first + j
+                let w = ders[j]
+                if i < legs + 1:
+                    fixed = fixed.add(a.multiply_scalar(w))
+                    if i > 0:
+                        row.items[(i - 1) * 2] -= w * ua.dot(ua)
+                        row.items[(i - 1) * 2 + 1] -= w * ua.dot(y)
+                elif i >= count - 1 - legs:
+                    fixed = fixed.add(b.multiply_scalar(w))
+                    if i < count - 1:
+                        let leg = count - 1 - i
+                        row.items[(legs + leg - 1) * 2] -= w * ub.dot(ua)
+                        row.items[(legs + leg - 1) * 2 + 1] -= w * ub.dot(y)
+                else:
+                    fixed = fixed.add(e.multiply_scalar(w))
+                    let f = 2 * legs + 2 * (i - legs - 1)
+                    row.items[f * 2] += w
+                    row.items[(f + 1) * 2 + 1] += w
+            let residual = points.items[k].subtract(fixed)
+            for axis in 0..<(usize)2:
+                let value = residual.dot(ua if axis == 0 else y)
+                for i in 0..<unknowns:
+                    let ci = row.items[i * 2 + axis]
+                    if ci == 0.0: continue
+                    rhs.items[i] += ci * value
+                    for j in 0..<unknowns: normal.items[i * unknowns + j] += ci * row.items[j * 2 + axis]
+        if not solve_small(normal.items[0..<normal.count], rhs.items[0..<rhs.count], unknowns): error(invalid, "a variable fillet's slanted section could not be fitted")
+        control.items[0] = a
+        control.items[count - 1] = b
+        for leg in 1..<legs + 1:
+            control.items[leg] = a.subtract(ua.multiply_scalar(rhs.items[leg - 1]))
+            control.items[count - 1 - leg] = b.subtract(ub.multiply_scalar(rhs.items[legs + leg - 1]))
+        for i in legs + 1..<count - 1 - legs:
+            let f = 2 * legs + 2 * (i - legs - 1)
+            control.items[i] = e.add(ua.multiply_scalar(rhs.items[f])).add(y.multiply_scalar(rhs.items[f + 1]))
+        # Each inner sample's parameter moved to its foot (Newton).
+        for k in 1..<samples:
+            for _ in 0..<3:
+                var ders: f64[36]
+                let first = basis_derivatives(t.knots, (i64)count, t.degree, params.items[k], &ders)
+                var at = Vector3()
+                var slope = Vector3()
+                for j in 0..<(usize)t.degree + 1:
+                    at = at.add(control.items[first + j].multiply_scalar(ders[j]))
+                    slope = slope.add(control.items[first + j].multiply_scalar(ders[12 + j]))
+                let speed = slope.dot(slope)
+                if speed > 0.0: params.items[k] = math.clamp(params.items[k] - at.subtract(points.items[k]).dot(slope) / speed, low, high)
+    out.clear()
+    for p in control.view(): try out.push(p)
+
+func tilted_rows_at(context: void*, z: f64, out: Growing[Vector3]*) -> !:
+    try tilted_section((Tilted*)context, z, out)
+
+## The tilted strip's net (the section's count of rows, fitted along the
+## edge from 0 to its length: knots four times at the law's points, where
+## its cubics meet C1), onto `net`, `weights` (1) and `knots`; the degree
+## along.
+func tilted_net(t: Tilted*, tolerance: f64, net: Growing[Vector3]*, weights: Growing[f64]*, knots: Growing[f64]*) -> i64!:
+    let p: usize = 5
+    for _ in 0..<p + 1: try knots.push(0.0)
+    for k in 0..<t.positions.length - 1:
+        if k > 0:
+            for _ in 0..<(usize)4: try knots.push(t.length * t.positions[k])
+        try knots.push(t.length * (t.positions[k] + t.positions[k + 1]) * 0.5)
+    for _ in 0..<p + 1: try knots.push(t.length)
+    var source = RowSource((void*)t, tilted_rows_at, 0.0, t.length, tolerance)
+    try fit_rows(&source, t.section.length, p, knots, net)
+    try weights.fill(net.count, 1.0)
+    return (i64)p

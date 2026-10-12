@@ -127,10 +127,12 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
     var cone = -1.0
     if continuity == 1 and tangency == 1.0 and straight:
         cone = rolling_weight(theta, (kept_sizes.items[1] - kept_sizes.items[0]) / (length * (kept_at.items[1] - kept_at.items[0])))
-    if continuity == 1 and tangency == 1.0 and not straight:
-        # Any other law: the balls' envelope (rolled_ball.lucb).
-        if ends.slanted0 or ends.slanted1: error(invalid, "a G1 variable fillet (Tangency weight 1) along a law with points between, ending at a slanted face, is not built yet: give it another weight, or end it square")
-        var rolled = Rolled(start, along, length, ua, ub, theta, try ua.add(ub).normalized().multiply_scalar(1.0 / math.sin(theta * 0.5)), kept_at.view(), kept_sizes.view(), kept_slopes.view())
+    let n0 = ends.n0.multiply_scalar(1.0 if ends.n0.dot(along) > 0.0 else -1.0) if ends.slanted0 else along
+    let n1 = ends.n1.multiply_scalar(1.0 if ends.n1.dot(along) > 0.0 else -1.0) if ends.slanted1 else along
+    var rolled = Rolled(start, along, length, ua, ub, theta, try ua.add(ub).normalized().multiply_scalar(1.0 / math.sin(theta * 0.5)), kept_at.view(), kept_sizes.view(), kept_slopes.view(), n0, n1)
+    # Any other law: the balls' envelope (rolled_ball.lucb), unless it
+    # folds, where Fusion scales the section instead.
+    if continuity == 1 and tangency == 1.0 and not straight and not rolled_folds(&rolled):
         var net = Growing[Vector3]()
         defer net.close()
         var weights = Growing[f64]()
@@ -149,6 +151,33 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
         let rolled_tool = try strip_solid(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), net.view(), weights.view(), 6, count, 5, along_degree, section_knots.view(), knots.view(), length + reach * law.largest() * 4.0, (str)name.view(), convex_edge, &ends)
         defer rolled_tool.release()
         return try combine(model, rolled_tool.value(), op_subtract if convex_edge else op_union)
+    if (ends.slanted0 or ends.slanted1) and cone < 0.0:
+        # A slanted end: the sweep trimmed by it (tilted_sweep.lucb).
+        var section = Growing[Vector3]()
+        defer section.close()
+        var section_weights = Growing[f64]()
+        defer section_weights.close()
+        var section_knots = Growing[f64]()
+        defer section_knots.close()
+        if continuity == 1: try arc_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), &section, &section_weights, &section_knots, tangency)
+        else:
+            try fillet_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), continuity, &section, &section_knots, tangency)
+            try section_weights.fill(section.count, 1.0)
+        var tilted = Tilted(start, along, length, kept_at.view(), kept_sizes.view(), kept_slopes.view(), section.view(), section_weights.view(), 5, section_knots.view(), (usize)continuity, ua, ub, n0, n1)
+        var net = Growing[Vector3]()
+        defer net.close()
+        var weights = Growing[f64]()
+        defer weights.close()
+        var knots = Growing[f64]()
+        defer knots.close()
+        let along_degree = try tilted_net(&tilted, math.max(w.tolerance, length * 1e-6), &net, &weights, &knots)
+        var fitted_knots = Growing[f64]()
+        defer fitted_knots.close()
+        try fitted_knots.assign(section_knots.view())
+        let count = net.count // section.count
+        let tilted_tool = try strip_solid(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), net.view(), weights.view(), section.count, count, 5, along_degree, fitted_knots.view(), knots.view(), length + reach * law.largest() * 4.0, (str)name.view(), convex_edge, &ends)
+        defer tilted_tool.release()
+        return try combine(model, tilted_tool.value(), op_subtract if convex_edge else op_union)
     let tool = try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), kept_slopes.view(), (str)name.view(), convex_edge, continuity, &ends, tangency, cone)
     defer tool.release()
     return try combine(model, tool.value(), op_subtract if convex_edge else op_union)

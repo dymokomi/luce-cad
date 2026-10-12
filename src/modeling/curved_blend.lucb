@@ -66,6 +66,10 @@ struct Curved:
     var chamfer: const ChamferSides*?
     ## Fusion's Tangency weight of a G2 or G3 section (fillet_section).
     var tangency: f64
+    ## A G1 variable fillet at weight 1: the ball rolled (curved_rolled.lucb),
+    ## the balls' centers and radii sampled evenly round the loop.
+    var rolled: bool
+    var balls: SampledBalls
     var sides: Growing[CurvedSide]
     var side_of: Growing[i64]
     var shortened: Growing[i64]
@@ -87,6 +91,7 @@ struct Curved:
         self.tangents.close()
         self.fields.close()
         self.name.close()
+        self.balls.close()
 
 ## Edges `chosen` of `w` blended between their curved faces (see the
 ## file's header): filleted to `size` (`continuity` 1 to 3) when `round`,
@@ -101,6 +106,7 @@ pub func curved_blend(w: const Shape*, chosen: const usize[], size: f64, round: 
     c.chamfer = sides
     c.law = law
     if not try curved_eligible(c, chosen): return none
+    try curved_rolls(c)
     try curved_contacts(c)
     for k in 0..<c.sides.count: try curved_strip(c, k)
     try curved_sections(c)
@@ -109,7 +115,7 @@ pub func curved_blend(w: const Shape*, chosen: const usize[], size: f64, round: 
 func new_curved(w: const Shape*, size: f64, round: bool, continuity: i64) -> Curved!:
     var out = try shape_copy(w)
     errdefer out.close()
-    var made = Curved(w, out, size, none, round, continuity, none, 1.0, Growing[CurvedSide](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[Vector3](), Growing[Field](), Growing[u8]())
+    var made = Curved(w, out, size, none, round, continuity, none, 1.0, false, SampledBalls(Growing[Vector3](), Growing[f64](), 1.0), Growing[CurvedSide](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[Vector3](), Growing[Field](), Growing[u8]())
     errdefer made.close()
     try made.side_of.fill(w.edges.count, -1)
     try made.shortened.fill(w.edges.count, -1)
@@ -445,6 +451,7 @@ struct CurvedRows:
 
 func curved_rows_at(context: void*, t: f64, out: Growing[Vector3]*) -> !:
     let rows = (CurvedRows*)context
+    if rows.c.rolled: return try curved_rolled_section(rows.c, rows.side, t, out)
     try curved_section_rows(rows.c, try section_on(rows.c, rows.side, t), out)
 
 ## The section's knots, weights (a G1 corner's left 1: its own row holds
@@ -455,6 +462,10 @@ func curved_section_knots(c: const Curved*, knots: Growing[f64]*) -> i64!:
         let k: f64[4] = [0.0, 0.0, 1.0, 1.0]
         try knots.assign(k[..<4])
         return 1
+    if c.rolled:
+        for _ in 0..<(usize)6: try knots.push(0.0)
+        for _ in 0..<(usize)6: try knots.push(1.0)
+        return 5
     if c.continuity == 1:
         let k: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
         try knots.assign(k[..<6])
@@ -584,7 +595,8 @@ func fitted_curved_rows(c: Curved*, k: usize, points: Growing[Vector3]*, weights
     let high = math.max(edge.t0, edge.t1)
     var probe = Growing[Vector3]()
     defer probe.close()
-    try curved_section_rows(c, try section_on(c, &c.sides.items[k], low), &probe)
+    if c.rolled: try curved_rolled_section(c, &c.sides.items[k], low, &probe)
+    else: try curved_section_rows(c, try section_on(c, &c.sides.items[k], low), &probe)
     let rows = probe.count
     var p: usize = 5
     if carrier.kind == curve_spline:
@@ -604,19 +616,28 @@ func fitted_curved_rows(c: Curved*, k: usize, points: Growing[Vector3]*, weights
         for _ in 0..<p + 1: try knots.push(low)
         for q in 1..<4: try knots.push(low + (high - low) * (f64)q / 4.0)
         for _ in 0..<p + 1: try knots.push(high)
+    if let law = c.law: try law_knots(law, w, c.sides.items[k].edge, low, high, p, knots)
     var context = CurvedRows(c, &c.sides.items[k])
-    var source = RowSource((void*)&context, curved_rows_at, low, high, w.tolerance)
+    # Rolled sections are fitted themselves (within 1e-5): their rows
+    # within a millionth of the loop.
+    var tolerance = w.tolerance
+    if c.rolled:
+        if let law = c.law: tolerance = math.max(tolerance, law.total * 1e-6)
+    var source = RowSource((void*)&context, curved_rows_at, low, high, tolerance)
     var net = Growing[Vector3]()
     defer net.close()
-    try fit_rows(&source, rows, p, knots, &net)
+    fit_rows(&source, rows, p, knots, &net) catch failure:
+        if not c.rolled or failure.code != invalid: error(failure.code, failure.message)
+        error(invalid, "a G1 variable fillet (Tangency weight 1) rolling its ball round this loop could not be fitted: its radius comes near the loop's own curvature; give it a smaller radius there or another weight")
     let nv = knots.count - p - 1
     # A G1 corner row is homogeneous, its weights the row after the last.
-    let surface_rows = rows - 1 if c.round and c.continuity == 1 else rows
+    let homogeneous = c.round and c.continuity == 1 and not c.rolled
+    let surface_rows = rows - 1 if homogeneous else rows
     for i in 0..<surface_rows:
         for j in 0..<nv:
             var point = net.items[i * nv + j]
             var weight = 1.0
-            if c.round and c.continuity == 1 and i == 1:
+            if homogeneous and i == 1:
                 weight = net.items[3 * nv + j].x
                 point = point.multiply_scalar(1.0 / weight)
             try points.push(point)
@@ -647,11 +668,12 @@ func curved_sections(c: Curved*) -> !:
             let v = (usize)(edge.start if end == 0 else edge.end)
             if c.sections.items[v] >= 0: continue
             let s = try section_on(c, &c.sides.items[k], edge.t0 if end == 0 else edge.t1)
-            try curved_section_rows(c, s, &rows)
+            if c.rolled: try curved_rolled_section(c, &c.sides.items[k], edge.t0 if end == 0 else edge.t1, &rows)
+            else: try curved_section_rows(c, s, &rows)
             let degree = try curved_section_knots(c, &knots)
             var weights = Growing[f64]()
             defer weights.close()
-            if c.round and c.continuity == 1:
+            if c.round and c.continuity == 1 and not c.rolled:
                 # The corner back from homogeneous, its weight its own.
                 rows.items[1] = s.corner
                 rows.count = 3

@@ -504,8 +504,16 @@ cylinders and tori; `fusion_law_tests`).
 1.001 scale the section), along any law; every other weight and G2 scale the section. Along one
 straight edge between flat faces the ball rolls here too: a straight law makes the cone Fusion makes
 (below), any other law the balls' envelope (`rolled_ball.lucb`, below), within 0.12 of Fusion's
-volumes where the law is Fusion's. Along chains (loops round a flat face, between curved faces) G1
-at weight 1 still scales the section: not built yet.
+volumes where the law is Fusion's. Round closed loops it rolls too (`cap_rolled.lucb` round a flat
+face, `curved_rolled.lucb` between curved faces or a flat face and a sphere): each section the balls'
+envelope there, the balls searched round the whole loop (between curved faces sampled once and read
+by Catmull-Rom cubics), fitted as a straight edge's are. Checked against Fusion with Fusion's own
+law read back from its G2 faces (a rounded box's top loop, a dome's rim), so only the rolling is
+compared: within 0.03 (`fusion_roll_tests`). Open chains' run-outs still scale the section (Fusion
+fails at those ends). **Where the envelope folds** (steep radii: probe 7's L11; radii 2, x, 2 along a
+20 edge from x = 12) Fusion scales the section along the whole edge instead (its face ends flush,
+its knots inside the edge), and so does ours (`rolled_folds`: across the fillet each characteristic
+circle's arc must move on along the edge), switching where Fusion does (x = 10 rolls, 12 scales).
 - **Chains** are built as a constant fillet's are, the radius asked of the law at each section:
   loops round a flat face and their run-outs (`cap_blend.lucb`: a box's top past rounded uprights,
   an edge ending where an earlier fillet's edge goes on), loops between two curved faces
@@ -537,17 +545,25 @@ at weight 1 still scales the section: not built yet.
   fifth points along the faces (G1), the inner points fitted by least squares with each sample's
   parameter moved to its foot: within 1e-5 of the envelope at radii of a few millimeters. The
   sections' points are fitted along the edge (`row_fit.lucb`, knots four times at the law's points,
-  where its cubics meet C1). The law is carried on past the edge's ends. A slanted end, and a law
-  steep enough that the balls' envelope folds, are refused, saying so (Fusion builds the folded one;
-  probe 7's L11). Its tool is the region between the edge and that face,
+  where its cubics meet C1). The law is carried on past the edge's ends. At a slanted end the
+  sections lie in planes turning from the end face's to the other end's (`rolled_section`): the
+  first is the envelope's trace in the end face, as Fusion's face trimmed by it. Its tool is the region between the edge and that face,
   taken away (added for an inside edge); its net keeps to one side of each face's plane. Ends:
   - square to the edge: flush;
   - any other flat end face, leaning either way (a slanted end, a wall a convex edge runs into, an
-    inside edge's end): each row of the net stops where it meets the end face's plane, its first
-    or last piece the same polynomial from there, so the rows keep their knots, the end section lies
-    in the plane, and no boolean crosses the strip there (an exact cylinder when the radius holds).
-    Reaching past and letting the end face trim the strip was tried first: a G2 strip's marched
-    crossing with a slanted face, tangent to the cap's edge at the contact, could not be split.
+    inside edge's end): Fusion 2705 sweeps the section on past the end (the law carried on straight
+    from its end piece) and the end face trims it (probes 8 and 10). Where the radius holds (a
+    cylinder) or runs straight (the rolled ball's cone) each row of the net stops where it meets the
+    end face's plane, exact (rows of a cylinder or a cone stopped anywhere stay on it). Any other law
+    (`tilted_sweep.lucb`): the sections lie in planes turning from the end face's to the other end's,
+    each the sweep's own curve there (for each point of the unit section, the place along the edge
+    where the scaled point lies in the plane), fitted with the section's degree and knots and its
+    points next to the contacts held on the faces' traces (G1 to G3 kept), and fitted along: the
+    trimmed sweep within the tolerance. (Stopping each row in the plane would mix rows from different
+    places along the edge in one section, off the sweep.) Fusion's faces sampled from its NURBS lie
+    within 2e-3 of ours (`fusion_roll_tests`); the mesh volumes of such sheared strips converge too
+    slowly to compare. Reaching past and letting the end face trim the strip with the booleans was
+    tried first: a G2 strip's marched crossing with a slanted face could not be split.
 
 `fillet_option_tests` checks the volume taken along a box's edge against the cone's corner area × ∫ r² ds
 (straight) and (1 − π/4) × ∫ r² ds (smooth);
@@ -1580,15 +1596,18 @@ Roughly in order of usefulness:
    feature, and full rounds of curved ribs whose ends are not flat through the axis.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
-   the loop turns a sharp corner rather than going on tangentially. A plane meeting a cylinder along
-   it at G3 or under a weighted G1 (the booleans' crossing where a section only touches the
-   cylinder); an arc of a dome's rim alone; G3 sections on curved faces still run straight off them
-   (G2's match the face's curvature).
-4. **Variable radius G1 at weight 1 as Fusion's rolling ball** (its face a cone for a straight law;
-   ours scales the circle in planes square to the edge, 1.3% more taken on a 2 to 6 edge).
-5. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
+   the loop turns a sharp corner rather than going on tangentially (Fusion builds these); an arc of
+   a dome's rim alone filleted.
+4. **Variable radius laws Fusion shapes its own way**: a piece from an open end into a flat run, a
+   steep piece beside a shallow one, and the law round a closed loop between its extremes (not
+   decoded; Variable radius above). A G1 ball rolled along an open chain's run-out, and round a
+   loop whose radius comes near the loop's own curvature (refused with that reason).
+5. **Meshing a closed loop's strip whose radius changes** at 48 divisions and finer fails on some
+   faces (too many grid cells; trims seen crossing), and those faces drop out of the mesh: a dome's
+   rim with radii changing round it meshes at 32 and 40.
+6. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
    analytic surfaces are recognized as coincident.
-6. **Sweep and loft.**
-7. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
-8. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
+7. **Sweep and loft.**
+8. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
+9. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face (strips apart, inside corners).
