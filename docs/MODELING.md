@@ -299,7 +299,10 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    Charts that wrap (cylinders, cones, spheres) are tested per loop, with the point moved by whole
    turns into the loop's range. A sphere's loops close over one pole per face.
 6. **Classification.** Each piece is classified at a point well inside it: on a coincident face,
-   facing the same way or opposite; otherwise inside or outside the other solid. Inside/outside is
+   facing the same way or opposite; otherwise inside or outside the other solid. The point is the
+   candidate farthest from the piece's boundary on a grid over its chart, refined; a piece thinner
+   than the grid's cells (a thin shell's ring round a hole) takes candidates stepped in beside the
+   middle of each boundary segment instead. Inside/outside is
    decided by three rays, majority wins (`rays.lucb`).
 
    Rays meet the other solid's exact faces: closed form for planes, cylinders, cones and spheres,
@@ -724,7 +727,10 @@ faces take new surfaces and the body keeps its topology. Built directly, without
   line through its new ends between two planes, else `intersect.lucb`'s curve through both ends. A
   seam follows its face (a line through its ends, a meridian's circle grown with it). An edge
   between two unchosen faces keeps its carrier with a new interval, so neighbors extend or shrink.
-  An arc runs round its circle the way it did, judged from its old tangent.
+  An arc runs round its circle the way it did, judged from its old tangent. Two faces meeting
+  tangentially and offset alike (a fillet's rim on a corner torus, in a shell) touch rather than
+  cross, so no intersection finds their edge: it is the old edge moved along their shared normal,
+  a line through its new ends or the circle through them and its moved middle.
 - **Refusals.** An edge that would vanish or turn round, an arc that would turn over, a corner whose
   faces no longer meet in one point, a flat face whose loop would turn inside out: "the move changes
   the body's shape too much". A face tangent to a chosen one (a fillet's strip beside the face it

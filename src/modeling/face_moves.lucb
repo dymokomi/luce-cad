@@ -327,7 +327,14 @@ func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, ol
             # circle about its center, grown with the face.
             carrier = try w.add_carrier(try seam_carrier(w, &old, start, end, m))
         else:
-            carrier = try w.add_carrier(try meeting_carrier(w, (usize)fa, (usize)fb, start, end, try w.edge_at(e, 0.5)))
+            let middle = try w.edge_at(e, 0.5)
+            let met = meeting_carrier(w, (usize)fa, (usize)fb, start, end, middle) catch failure:
+                # Faces meeting tangentially (a fillet's rim on a torus
+                # corner) offset alike stay tangent, so they touch rather
+                # than cross: the edge is the old one moved along their
+                # shared normal.
+                recover try tangent_carrier(w, (usize)fa, (usize)fb, &old, start, end, middle, failure.message)
+            carrier = try w.add_carrier(met)
     let c = w.carriers.items[(usize)carrier]
     var t0 = 0.0
     var t1 = 0.0
@@ -362,6 +369,42 @@ func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, ol
         if (try w.at(carrier, t0)).subtract(start).length() > w.tolerance * 100.0 or (try w.at(carrier, t1)).subtract(end).length() > w.tolerance * 100.0:
             error(invalid, "a B-spline edge cannot reach its moved corner: the move changes the body's shape too much")
     w.edges.items[e] = ShapeEdge(carrier, t0, t1, edge.start, edge.end)
+
+## The carrier of a tangent edge between faces `fa` and `fb` of `w`, both
+## offset alike: the old carrier `old` moved onto them, a line through the
+## new ends or the circle through them and the old middle `middle` moved
+## onto the new surface along its normal. Anything else, or faces not
+## meeting tangentially, fails with `reason`.
+func tangent_carrier(w: const Shape*, fa: usize, fb: usize, old: const Carrier*, start: Vector3, end: Vector3, middle: Vector3, reason: str) -> Carrier!:
+    let na = try w.face_normal(fa, start)
+    let nb = try w.face_normal(fb, start)
+    if na.dot(nb) < 1.0 - 1e-6: error(invalid, reason)
+    let (gap, n) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[fa].surface], middle, w.tolerance)
+    let moved = middle.subtract(n.multiply_scalar(gap))
+    if old.kind == curve_line:
+        let d = end.subtract(start)
+        if d.length() <= w.tolerance * 10.0: error(invalid, reason)
+        return Carrier(curve_line, start, try d.normalized(), Vector3(), 0.0, 0.0, -1)
+    if old.kind != curve_circle: error(invalid, reason)
+    # The circle through start, the moved middle and end.
+    let a = start.subtract(moved)
+    let b = end.subtract(moved)
+    let axis = a.cross(b)
+    if axis.length() <= w.tolerance * w.tolerance:
+        # A closed circle (start and end one point): about the old axis.
+        let z = old.x.cross(old.y)
+        let h = moved.subtract(old.origin).dot(z)
+        let center = old.origin.add(z.multiply_scalar(h))
+        let radius = moved.subtract(center).length()
+        if radius <= w.tolerance: error(invalid, reason)
+        return Carrier(curve_circle, center, old.x, old.y, radius, radius, -1)
+    let center = moved.add(b.cross(axis).multiply_scalar(a.dot(a)).add(axis.cross(a).multiply_scalar(b.dot(b))).multiply_scalar(0.5 / axis.dot(axis)))
+    let radius = start.subtract(center).length()
+    # The old frame turned to the new plane, keeping the turning sense.
+    var z = try axis.normalized()
+    if z.dot(old.x.cross(old.y)) < 0.0: z = z.multiply_scalar(-1.0)
+    let x = try start.subtract(center).normalized()
+    return Carrier(curve_circle, center, x, z.cross(x), radius, radius, -1)
 
 ## Circle or ellipse `c`'s parameter at `p` (on it).
 func angle_on(c: const Carrier*, p: Vector3) -> f64:
