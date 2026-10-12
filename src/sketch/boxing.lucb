@@ -1,17 +1,21 @@
 ## Box selection in a sketch: what a screen box seen on the sketch plane
 ## holds. The view casts the box's corners onto the plane, a convex
-## quadrilateral there (any convex polygon does). What lies entirely inside
-## it is held, Fusion's window rule in either drag direction: its points
-## inside it, and its curves and texts with every sample inside it.
+## quadrilateral there (any convex polygon does). As Fusion's box, which
+## way it was dragged decides what it holds: a window (left to right) holds
+## what lies entirely inside it, its points inside it and its curves and
+## texts with every sample inside it; a crossing (right to left) holds what
+## lies inside it or crosses it, a curve with a sample inside or a piece
+## between two samples crossing one of its sides.
 
 ## How many samples a circle, arc or free-form curve is met by.
 let box_samples: usize = 64
 
 ## The entities of `sketch` that the convex polygon `corners` (x, y pairs
 ## on the plane, in order round it either way) holds, ascending onto `out`
-## (replacing it): points inside it, curves wholly inside it; `only` 1
-## points alone, 2 curves alone, 0 both.
-func boxed_entities(sketch: const Sketch*, corners: const f64[], only: i64, out: Growing[i64]*) -> !:
+## (replacing it): points inside it, curves wholly inside it (with
+## `crossing`, inside it or crossing it); `only` 1 points alone, 2 curves
+## alone, 0 both.
+func boxed_entities(sketch: const Sketch*, corners: const f64[], only: i64, crossing: bool, out: Growing[i64]*) -> !:
     out.clear()
     if corners.length < 6 or corners.length % 2 != 0: error(invalid, "a sketch box is a polygon of three corners or more, as x, y pairs")
     for value in corners:
@@ -26,7 +30,8 @@ func boxed_entities(sketch: const Sketch*, corners: const f64[], only: i64, out:
             if polygon_holds(corners, sketch.x((i64)at), sketch.y((i64)at)): try out.push((i64)at)
             continue
         try sample_curve(sketch, e, box_samples, &samples)
-        if polygon_contains(corners, samples.view()): try out.push((i64)at)
+        let held = polygon_touches(corners, samples.view()) if crossing else polygon_contains(corners, samples.view())
+        if held: try out.push((i64)at)
 
 ## Whether (`x`, `y`) is inside the convex polygon `corners` or on its
 ## edge.
@@ -54,6 +59,32 @@ func polygon_contains(corners: const f64[], samples: const f64[]) -> bool:
         if not polygon_holds(corners, x, y): return false
         any = true
     return any
+
+## Whether a sample of `samples` (x, y pairs; NaN pairs break the line) is
+## inside the convex polygon `corners`, or a piece between two samples
+## crosses one of its sides: a crossing box's rule.
+func polygon_touches(corners: const f64[], samples: const f64[]) -> bool:
+    let count = corners.length // 2
+    for k in 0..<samples.length // 2:
+        let x = samples[2 * k]
+        let y = samples[2 * k + 1]
+        if math.is_nan(x): continue
+        if polygon_holds(corners, x, y): return true
+        if k == 0 or math.is_nan(samples[2 * k - 2]): continue
+        let before_x = samples[2 * k - 2]
+        let before_y = samples[2 * k - 1]
+        for c in 0..<count:
+            let next = (c + 1) % count
+            if segments_cross(before_x, before_y, x, y, corners[2 * c], corners[2 * c + 1], corners[2 * next], corners[2 * next + 1]): return true
+    return false
+
+## Whether segments c-d and a-b cross or touch.
+func segments_cross(cx: f64, cy: f64, dx: f64, dy: f64, ax: f64, ay: f64, bx: f64, by: f64) -> bool:
+    let d1 = side_of(ax, ay, bx, by, cx, cy)
+    let d2 = side_of(ax, ay, bx, by, dx, dy)
+    let d3 = side_of(cx, cy, dx, dy, ax, ay)
+    let d4 = side_of(cx, cy, dx, dy, bx, by)
+    return ((d1 <= 0.0 and d2 >= 0.0) or (d1 >= 0.0 and d2 <= 0.0)) and ((d3 <= 0.0 and d4 >= 0.0) or (d3 >= 0.0 and d4 <= 0.0))
 
 ## Which side of a-b (`x`, `y`) is: the cross product of a→b and a→it.
 func side_of(ax: f64, ay: f64, bx: f64, by: f64, x: f64, y: f64) -> f64:
