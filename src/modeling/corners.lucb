@@ -74,7 +74,16 @@ func fillet_corners(w: const Shape*, chosen: const usize[], radius: f64, continu
                 # Inside, the ball's planes move out into the air.
                 try balls.push(Ball(vertex, try ball_center(w, vertex, -radius if concave_count > 0 else radius), concave_count > 0))
                 continue
-            error(invalid, "fillets meeting at a corner are supported where two or three edges meet; fillet edges that do not meet, or chamfer them")
+            # Four or more, all of the corner's edges, G1: a ball when one
+            # touches every face there (a regular pyramid's apex).
+            if directions.count >= 4 and (i64)directions.count == degree and continuity == 1 and not setback:
+                let center = ball_center(w, vertex, -radius if concave_count > 0 else radius) catch failure:
+                    if failure.code != invalid: error(failure.code, failure.message)
+                    var buffer: u8[256]
+                    error(invalid, try strings.format(buffer, f"{directions.count} fillets meeting at a corner are rounded only where one ball touches all their faces (a regular pyramid's apex): fillet them in turns"))
+                try balls.push(Ball(vertex, center, concave_count > 0))
+                continue
+            error(invalid, "fillets meeting at a corner are supported where two or three edges meet, or four or more where one ball touches all their faces; fillet edges that do not meet, or chamfer them")
 
 ## A ball's corner tool: the corner beyond the planes through the ball's
 ## center square to each edge (where the edges' tools stop), reaching past
@@ -83,42 +92,35 @@ func fillet_corners(w: const Shape*, chosen: const usize[], radius: f64, continu
 func corner_tool(w: const Shape*, ball: const Ball*, radius: f64, name: str) -> interop.Reference[CadModel]!:
     let c = ball.center
     let corner = w.points.items[(usize)ball.vertex]
-    # Each edge here: its way from the center toward the corner, and the
-    # face at the corner it does not lie on.
-    var normals: Vector3[6] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
-    var offsets: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # Beyond the plane through the center square to each edge here (its way
+    # from the center toward the corner), and past each face at the corner:
+    # into the air outside, or (an inside corner, whose tool is added) into
+    # the material.
+    var normals = Growing[Vector3]()
+    defer normals.close()
+    var offsets = Growing[f64]()
+    defer offsets.close()
     var diagonal = Vector3()
-    var at: usize = 0
     for e in 0..<w.edges.count:
         let edge = w.edges.items[e]
         if edge.start != ball.vertex and edge.end != ball.vertex: continue
-        if at == 3: error(invalid, "a rounded corner has more than three edges")
         var d = try along_edge(w, e)
         if corner.subtract(c).dot(d) < 0.0: d = d.multiply_scalar(-1.0)
         diagonal = diagonal.add(d)
-        # Beyond the plane through the center: outward is back along it.
-        normals[at] = d.multiply_scalar(-1.0)
-        offsets[at] = -d.dot(c)
-        var far: i64 = -1
-        for f in 0..<w.faces.count:
-            var at_corner = false
-            var on_edge = false
-            for use in w.face_uses(f):
-                let k = edge_index(use)
-                if k == e: on_edge = true
-                let other = w.edges.items[k]
-                if other.start == ball.vertex or other.end == ball.vertex: at_corner = true
-            if at_corner and not on_edge: far = (i64)f
-        if far < 0: error(invalid, "a rounded corner lost one of its faces")
-        # Past the face: into the air outside, or (an inside corner, whose
-        # tool is added) into the material.
-        let n = face_outward(w, (usize)far)
-        let h = n.dot(w.surfaces.items[(usize)w.faces.items[(usize)far].surface].origin)
-        normals[at + 3] = n.multiply_scalar(-1.0) if ball.inside else n
-        offsets[at + 3] = (-h if ball.inside else h) + radius
-        at += 1
-    if at != 3: error(invalid, "a rounded corner needs three edges")
-    let cell = try hexahedron(normals[..<6], offsets[..<6], radius)
+        try normals.push(d.multiply_scalar(-1.0))
+        try offsets.push(-d.dot(c))
+    for f in 0..<w.faces.count:
+        var at_corner = false
+        for use in w.face_uses(f):
+            let other = w.edges.items[edge_index(use)]
+            if other.start == ball.vertex or other.end == ball.vertex: at_corner = true
+        if not at_corner: continue
+        let n = face_outward(w, f)
+        let h = n.dot(w.surfaces.items[(usize)w.faces.items[f].surface].origin)
+        try normals.push(n.multiply_scalar(-1.0) if ball.inside else n)
+        try offsets.push((-h if ball.inside else h) + radius)
+    if normals.count < 6: error(invalid, "a rounded corner needs three edges")
+    let cell = try convex_cell(normals.view(), offsets.view(), radius)
     defer cell.release()
     let ball_solid = try ball_at(c, try diagonal.normalized(), radius)
     defer ball_solid.release()
@@ -231,8 +233,13 @@ func ball_center(w: const Shape*, v: i64, radius: f64) -> Vector3!:
         let n = face_outward(w, f)
         try normals.push(n)
         try offsets.push(n.dot(s.origin) - radius)
-    if normals.count != 3: error(invalid, "fillets meeting at a corner need three faces there")
-    return try least_squares_point(normals.view(), offsets.view())
+    if normals.count < 3: error(invalid, "fillets meeting at a corner need three faces there")
+    let center = try least_squares_point(normals.view(), offsets.view())
+    # More than three planes moved in meet in one point only at a
+    # symmetric corner.
+    for at in 0..<normals.count:
+        if math.abs(normals.items[at].dot(center) - offsets.items[at]) > w.tolerance * 100.0: error(invalid, "no ball touches every face at this corner")
+    return center
 
 ## The name of the corner at vertex `v`, `tag/corner[A&B&C]` (its faces'
 ## names, sorted), into `out`.
@@ -259,3 +266,86 @@ func corner_name(w: const Shape*, v: usize, tag: str, out: Growing[u8]*) -> !:
         if at > 0: try out.push(face_separator)
         try push_text(out, names.items[at])
     try out.push(93)
+
+## The convex solid of half-spaces n . p <= offset (outward `normals`):
+## its corners where three planes meet inside the rest, each plane holding
+## three or more of them a face, its corners round it. `size` scales its
+## tolerance.
+func convex_cell(normals: const Vector3[], offsets: const f64[], size: f64) -> interop.Reference[CadModel]!:
+    let eps = size * 1e-9
+    var corners = Growing[Vector3]()
+    defer corners.close()
+    for i in 0..<normals.length:
+        for j in i + 1..<normals.length:
+            for k in j + 1..<normals.length:
+                let three: Vector3[3] = [normals[i], normals[j], normals[k]]
+                if math.abs(three[0].dot(three[1].cross(three[2]))) < 1e-9: continue
+                let at: f64[3] = [offsets[i], offsets[j], offsets[k]]
+                let p = try least_squares_point(three[..<3], at[..<3])
+                var within = true
+                for m in 0..<normals.length:
+                    if normals[m].dot(p) > offsets[m] + eps: within = false
+                if not within: continue
+                var known = false
+                for q in corners.view():
+                    if q.subtract(p).length() <= eps * 10.0: known = true
+                if not known: try corners.push(p)
+    let solid = try BrepModel.sized(size * 8.0)
+    defer solid.release()
+    let b = solid.value()
+    for p in corners.view(): _ = try b.add_vertex(p)
+    var keys = Growing[i64]()
+    defer keys.close()
+    var ids = Growing[i64]()
+    defer ids.close()
+    var ring = Growing[usize]()
+    defer ring.close()
+    var angles = Growing[f64]()
+    defer angles.close()
+    let n_corners = (i64)corners.count
+    for plane in 0..<normals.length:
+        let n = normals[plane]
+        ring.clear()
+        angles.clear()
+        var middle = Vector3()
+        for at in 0..<corners.count:
+            if math.abs(n.dot(corners.items[at]) - offsets[plane]) > eps * 10.0: continue
+            try ring.push(at)
+            middle = middle.add(corners.items[at])
+        if ring.count < 3: continue
+        middle = middle.multiply_scalar(1.0 / (f64)ring.count)
+        # Counterclockwise about the outward normal.
+        let x = try corners.items[ring.items[0]].subtract(middle).normalized()
+        let y = n.cross(x)
+        for at in ring.view():
+            let d = corners.items[at].subtract(middle)
+            try angles.push(math.atan2(d.dot(y), d.dot(x)))
+        for a in 1..<ring.count:
+            var k = a
+            while k > 0 and angles.items[k] < angles.items[k - 1]:
+                let ta = angles.items[k]
+                angles.items[k] = angles.items[k - 1]
+                angles.items[k - 1] = ta
+                let tr = ring.items[k]
+                ring.items[k] = ring.items[k - 1]
+                ring.items[k - 1] = tr
+                k -= 1
+        var uses = Growing[i64]()
+        defer uses.close()
+        for q in 0..<ring.count:
+            let head = (i64)ring.items[q]
+            let tail = (i64)ring.items[(q + 1) % ring.count]
+            let low = head if head < tail else tail
+            let high = tail if head < tail else head
+            var id: i64 = -1
+            for at in 0..<keys.count:
+                if keys.items[at] == low * n_corners + high: id = ids.items[at]
+            if id < 0:
+                id = try b.add_line(low, high)
+                try keys.push(low * n_corners + high)
+                try ids.push(id)
+            try uses.push((id + 1) if head == low else -(id + 1))
+        let surface = try b.add_surface(0, corners.items[ring.items[0]], n, x)
+        let sizes: i64[1] = [(i64)ring.count]
+        _ = try b.add_face(surface, uses.view(), sizes[..<1])
+    return try CadModel.of_brep(solid)

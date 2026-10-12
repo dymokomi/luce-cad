@@ -883,6 +883,23 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   B-splines (end-span continuation), offsets of rational bases kept rational, and the surface
   extension operator as a modeling tool of its own.
 
+- **7, fillet corners of N edges (part).** F8 (a square pyramid, every edge 1) was already built
+  whole by `rounded.lucb` (the solid shrunk and grown back by a ball): 1933.19 extrapolated against
+  the Steiner formula's 1933.19692 (SMLib 1933.1271, its corner a G1 approximation). But for an
+  irregular apex that construction took the shrunk corner by least squares and built a broken body
+  (a rectangular pyramid: volume 198, faces off their planes); it now declines. Four or more G1
+  fillets meeting at a vertex are rounded by a ball where one touches every face there (the
+  pyramid's four apex edges alone: closed, 1991.926), with the corner tool a convex cell of the
+  edges' and faces' half-spaces; elsewhere refused by name. Regression: `apex_tests`. Still open:
+  the 2N-sided patch for apexes no ball fits, unequal radii, mixed convexity at N edges.
+
+- **8, overflow by rail classification (part).** The same-convexity case: a fillet on a straight
+  edge between planes that runs off one face over a parallel convex edge into a flat face is trimmed
+  by that face, its tool reaching past the body for the booleans to cut. F6 (a plate 4 thick, its
+  top edge 5) now runs: 6 faces, closed, 1493.36981 against the section integral's 1493.36981 (and
+  4.5: 1513.17902); SMLib fails it. A cliff (a concave edge beyond) is still refused. Regression:
+  `overflow_tests`. Still open: rolling onto a tangent next face, the cliff's cover, curved faces.
+
 - **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
   plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was
   finding a point well inside a piece (`piece_point`), asked even of the plate's face with all its
@@ -895,7 +912,7 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   tracing (`whole_piece`: the other holes' walls), the face pairs' containment questions are
   answered from a lookup that traces a face's loops once, and on a plane only the loops whose box
   holds the point (`face_lookup.lucb`), and boundary edges whose box is far from a curve are not
-  sampled against it. P1: 790 to about 350 ms. What remains: the plate's top and bottom are still
+  sampled against it. P1: 790 to 310 ms in the comparison run (SMLib 290). What remains: the plate's top and bottom are still
   traced whole for each hole (`group_cycles` charts every loop) and classified from a chart of
   every loop (`inside_faces`); a chart cache shared by the boolean's steps would take most of it.
 

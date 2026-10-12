@@ -107,7 +107,14 @@ func check_fits(w: const Shape*, e: usize, size: f64, round: bool) -> !:
     if curved_pair(w, fa, fb): return
     let room_a = reach_a * 2.0 if curved_wall(w, e, fa, fb) else try room(w, e, fa, reach_a * 1.01 + w.tolerance * 100.0, around == (i64)fa)
     let room_b = reach_b * 2.0 if curved_wall(w, e, fb, fa) else try room(w, e, fb, reach_b * 1.01 + w.tolerance * 100.0, around == (i64)fb)
-    if room_a > reach_a + w.tolerance * 10.0 and room_b > reach_b + w.tolerance * 10.0: return
+    let fits_a = room_a > reach_a + w.tolerance * 10.0
+    let fits_b = room_b > reach_b + w.tolerance * 10.0
+    if fits_a and fits_b: return
+    # Running off one face over a convex edge into the next face, which
+    # trims it (the study's rail classification, its same-convexity case:
+    # a plate thinner than the radius): the edge's tool reaches past that
+    # face, outside the body, and the booleans cut it at the next face.
+    if round and (fits_a or (try overflows(w, e, fa, room_a))) and (fits_b or (try overflows(w, e, fb, room_b))) and (fits_a or fits_b): return
     let most = size * math.min(room_a / reach_a, room_b / reach_b)
     var buffer: u8[256]
     let text = try strings.format(buffer, f"a fillet radius of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}") if round else try strings.format(buffer, f"a chamfer of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}")
@@ -126,3 +133,37 @@ func rounded_text(value: f64) -> f64:
     if value == 0.0 or not math.is_finite(value): return value
     let scale = math.pow(10.0, 3.0 - math.floor(math.log10(math.abs(value))))
     return math.round(value * scale) / scale
+
+## Whether a fillet on straight edge `e` between flat faces may run off flat
+## face `f` (which goes `depth` in from the edge): it ends there in a
+## straight convex edge parallel to `e` whose other face is flat and turns
+## the same way, so that face trims the fillet's surface across it.
+func overflows(w: const Shape*, e: usize, f: usize, depth: f64) -> bool!:
+    let edge = w.edges.items[e]
+    if w.carriers.items[(usize)edge.carrier].kind != curve_line: return false
+    if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: return false
+    if not try convex(w, e): return false
+    let along = try along_edge(w, e)
+    let p = try w.edge_at(e, 0.5)
+    let side = try into_face(w, f, e, along)
+    let q = p.add(side.multiply_scalar(depth))
+    # The edge of `f` where the step leaves it.
+    var nearest: i64 = -1
+    var gap = 1.0e300
+    for use in w.face_uses(f):
+        let k = edge_index(use)
+        if k == e: continue
+        let other = w.edges.items[k]
+        let t = try nearest_on(w, other.carrier, q, other.t0, other.t1)
+        let d = (try w.at(other.carrier, t)).subtract(q).length()
+        if d < gap:
+            gap = d
+            nearest = (i64)k
+    if nearest < 0 or gap > w.tolerance * 1000.0 + depth * 1e-6: return false
+    let far = (usize)nearest
+    if w.carriers.items[(usize)w.edges.items[far].carrier].kind != curve_line: return false
+    if math.abs((try along_edge(w, far)).dot(along)) < 1.0 - 1e-9: return false
+    if not try convex(w, far): return false
+    let (ga, gb) = try edge_faces(w, far)
+    let next = gb if ga == f else ga
+    return w.surfaces.items[(usize)w.faces.items[next].surface].kind == surface_plane

@@ -782,8 +782,13 @@ edge: a hair in, the chords of a large arc said the face was on the other side):
 - **The whole-body rounding:** must leave each shrunk edge some length.
 
 Otherwise the error gives the size the blend must stay under, for example "a fillet radius of 1.5
-is too large for this edge's faces: it must be less than 1.0". Rolling on onto the next face, as
-Parasolid's overflow does, is not done.
+is too large for this edge's faces: it must be less than 1.0". One case runs over instead: a fillet
+on a straight edge between flat faces that runs off one face over a straight convex edge parallel to
+it, into a flat face that turns the same way (a plate thinner than the radius). That face trims the
+fillet (the study's rail classification, its same-convexity case): the edge's tool reaches past the
+face, outside the body, and the booleans cut it there, so the face it runs off goes and the round
+meets the next face at an angle. Rolling on onto a tangent next face (Parasolid's overflow) and
+covering a cliff (a concave edge beyond) are not done: refused as above.
 
 **Tangent chains.** Like Fusion's Tangent Chain, a referenced edge brings the edges that continue
 it tangentially with the same convexity, such as a rounded slot's rim or the edges around an
@@ -991,6 +996,13 @@ within 0.01 (`fusion_probe_tests`); G3 closes too.
   edge's tool stops at the plane through that center square to the edge, where its cylinder touches
   the ball in a great circle. A corner tool then takes what is left: the region beyond those three
   planes, reaching past the faces, minus the ball. That leaves the sphere patch.
+- **Four or more fillets** meeting at a corner of as many flat faces, all its edges, G1: a ball too,
+  where one touches every face there (its planes moved in by the radius meet in one point: a regular
+  pyramid's apex). The corner tool is the convex cell beyond each edge's plane and past each face
+  (`convex_cell`), minus the ball. Where no ball touches them all (a rectangular pyramid's apex) the
+  fillets are refused, naming it; every edge of a convex polyhedron rounded at once (`rounded.lucb`,
+  the solid shrunk and grown back by a ball) asks the same of each vertex, and so is refused there
+  too rather than built with its shrunk corner guessed.
 - **Inside corners** work the same way, mirrored: the ball rolls in the air, on the faces' planes
   moved out by the radius, and the corner tool adds material around it. A pocket's floor edges meet
   in miters; with its walls' edges too, its corners are balls.
@@ -1002,7 +1014,7 @@ within 0.01 (`fusion_probe_tests`); G3 closes too.
     edge first. The outside edges then run around it.
 
   The second pass finds its edges by reference on the first pass's result.
-- **Anything else** is refused: more than three edges at a corner, fillets meeting where the faces
+- **Anything else** is refused: four or more edges at a corner no ball fits, fillets meeting where the faces
   aren't flat, inside and outside fillets meeting where only two edges are picked, or orders that
   conflict along one edge.
 
@@ -1997,7 +2009,8 @@ Not yet: ellipses, splines, slots and text; curvature (G2) constraints; Blend Cu
 
 Roughly in order of usefulness:
 
-1. **Fillet corners beyond three edges.**
+1. **Fillet corners beyond three edges** where no one ball touches every face (an irregular apex;
+   Setback and G2/G3 corners of four or more), and three unequal radii at a corner.
 2. **Variable radius fillets meeting other fillets at a corner** of three edges within one
    feature, and full rounds of curved ribs whose ends are not flat through the axis.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from

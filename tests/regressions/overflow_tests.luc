@@ -1,0 +1,51 @@
+## A fillet larger than a face it runs onto (the SMLib study's item 8, its
+## F6): a plate 4 thick, its top edge rounded 5 and 4.5. The fillet runs off
+## the side face over its convex bottom edge into the bottom, which trims it
+## (the study's rail classification, its same-convexity case): the side
+## face goes, the round meets the bottom at an angle. Refused before ("it
+## must be less than 4"); SMLib fails it too. The volumes are the plate's
+## less 20 times the section taken away: the corner rectangle r by 4 less
+## the disk of r about (10 - r, 2 - r) inside it, integrated: 1493.36981 and
+## 1513.17902. A side face ending in a concave edge (a ledge below it) would
+## leave the fillet hanging past the ledge: still refused.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return found
+
+func near(value: float, expected: float, within: float, what: str) -> unit!:
+    if math.abs(value - expected) > within: print(f"{what}: {value} against {expected}")
+    assert(math.abs(value - expected) <= within)
+
+pub func overflow_tests() -> unit!:
+    let plate = CadModeling.tagged(CadSolids.box(20.0, 4.0, 20.0), "p")
+    let top_edge = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - 10.0) < 1e-9 and math.abs(b.x - 10.0) < 1e-9 and math.abs(a.y - 2.0) < 1e-9 and math.abs(b.y - 2.0) < 1e-9
+    let edge = CadModeling.edge_references(plate, edges_where(plate, top_edge))
+    for (radius, expected) in [(5.0, 1493.36981), (4.5, 1513.17902)]:
+        let made = CadModeling.filleted(plate, edge, radius, "f", 1)
+        assert(made.face_count() == 6)
+        let coarse = volume(made.tessellate(32))
+        let mesh = made.tessellate(64)
+        closed(mesh)
+        near(volume(mesh) + (volume(mesh) - coarse) / 3.0, expected, 1e-3, f"plate rounded {radius}")
+    # A ledge below the side face: its edge there is concave.
+    let ledge = CadModeling.combined(plate, CadModeling.tagged(CadSolids.box(10.0, 4.0, 20.0), "l").transformed(Vector3(10.0, -4.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), 0)
+    var refused = ""
+    _ = CadModeling.filleted(ledge, CadModeling.edge_references(ledge, edges_where(ledge, top_edge)), 5.0, "f", 1) catch failure:
+        refused = failure.message
+        recover ledge
+    if not refused.contains("too large"): print(f"ledge: {refused}")
+    assert(refused.contains("too large"))
+    print("PASS fillet overflow: a plate 4 thick, its top edge rounded 5 and 4.5, trimmed by its bottom (the side face gone; the volumes to 1e-3); onto a ledge's concave edge refused")
