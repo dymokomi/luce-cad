@@ -467,7 +467,7 @@ A sketch is points, lines, circles and arcs on a plane, and the constraints betw
 Fusion 360. `CadSketch` holds one for the editor: it reads and writes the sketch's text (what a
 Sketch node keeps), adds and removes entities and constraints, edits dimensions, solves, drags a
 point, picks what is near a point or held by a box (`select_box`: a screen box cast onto the plane,
-any convex polygon there; the points inside it and the curves meeting it, `boxing.lucb`), and gives
+any convex polygon there; what lies entirely inside it, points and whole curves, `boxing.lucb`), and gives
 the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
 `docs/research/SKETCH-SOLVER-STUDY.md` has the design, after SolveSpace's and FreeCAD's solvers.
 
