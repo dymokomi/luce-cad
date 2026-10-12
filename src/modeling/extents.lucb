@@ -71,7 +71,7 @@ pub func extrude_levels(b: BrepModel*, p: const Profiles*, levels: const Level[]
                 for i in 0..<n:
                     try curves.push(try level_curve(b, p, &edges[i], &moved.items[l * n + i], levels[l].height, vertices.items[l * n + i], vertices.items[l * n + (i + 1) % n]))
             for s in 0..<last:
-                for i in 0..<n: try uprights.push(try b.add_line(vertices.items[s * n + i], vertices.items[(s + 1) * n + i]))
+                for i in 0..<n: try uprights.push(try upright(b, p, edges, i, levels[s], levels[s + 1], vertices.items[s * n + i], vertices.items[(s + 1) * n + i]))
             # The sides, segment by segment.
             for s in 0..<last:
                 for i in 0..<n:
@@ -104,6 +104,42 @@ pub func extrude_levels(b: BrepModel*, p: const Profiles*, levels: const Level[]
         let high = try b.add_face(roof, top.view(), top_sizes.view())
         try cap_name(&name, tag, "end", outer)
         try b.set_face_name(high, (str)name.view())
+
+## The edge where the sides of `edges[i - 1]` and `edges[i]` meet, from
+## level `low` (vertex `start`) to level `high` (vertex `end`): a line
+## where both sides are planes, where they run on tangentially (a plane
+## along a cone's line) or where the levels lean alike (no taper between
+## them). Else (a plane meeting a cone at an angle: a conic; two cones: a
+## quartic) the joint traced level by level, the moved edges' crossing at
+## each height, as a cubic through it: a line between its ends lies on
+## neither side, and the booleans cannot part it from the true meeting.
+func upright(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[], i: usize, low: Level, high: Level, start: i64, end: i64) -> i64!:
+    let n = edges.length
+    let before = &edges[(i + n - 1) % n]
+    let e = &edges[i]
+    if low.grow == high.grow or (before.kind == profile_line and e.kind == profile_line): return try b.add_line(start, end)
+    let ta = try end_tangent(p, before, false)
+    let tb = try end_tangent(p, e, true)
+    # Tangent within a profile's drawing (a rounded rectangle's arcs): the
+    # plane along the cone's line, or two cones touching along one.
+    if ta.cross(tb).length() <= 1e-6 and ta.dot(tb) > 0.0: return try b.add_line(start, end)
+    var points = Growing[Vector3]()
+    defer points.close()
+    let steps = 32
+    for k in 0..<steps + 1:
+        let f = (f64)k / (f64)steps
+        let grow = low.grow + (high.grow - low.grow) * f
+        let height = low.height + (high.height - low.height) * f
+        try points.push((try joint(p, before, e, grow)).add(p.normal.multiply_scalar(height)))
+    var net = Growing[Vector3]()
+    defer net.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    try interpolate_cubic(points.view(), &net, &knots)
+    var weights = Growing[f64]()
+    defer weights.close()
+    for _ in net.view(): try weights.push(1.0)
+    return try b.add_spline_edge(start, end, net.view(), weights.view(), 3, knots.view(), true)
 
 ## The loop `edges` moved to `level`, onto `out`: each edge's ends where
 ## its moved neighbors meet it, and an arc's moved radius.

@@ -1,9 +1,11 @@
 ## Full round beyond flat sides along straight edges (full_round.lucb): a
 ## curved rib (its top an annular sector, its sides cylinders about the
-## top's normal) by Pappus; the same rib tapered (its sides cones); a rib
-## whose sides bulge (cylinders along it), the round tangent to them where
-## the section's circle is; each at G1 and G2, closed, the top face gone and
-## the rib no higher.
+## top's normal) by Pappus; the same rib tapered (its sides cones); a curved
+## rib extruded with draft (its ends leaning planes, the round trimmed by
+## them); a rib whose sides bulge (cylinders along it), the round tangent to
+## them where the section's circle is; a straight rib. Each at G1, G2 and
+## G3: closed, the top face gone, the rib no higher, and the round one face
+## (G2 and G3's halves joined, strip_join.lucb), as Fusion's is.
 from luce_cad.modeling import CadModeling
 from luce_cad.model import CadModel
 from luce_cad.sketch import CadSketch
@@ -20,17 +22,27 @@ func facing(model: CadModel, normal: Vector3) -> str!:
             return name
     return ""
 
-## `model`'s top (facing `up`) rounded fully at G1 and G2: closed, no flat
-## face facing up left, no higher than `height`; G1's volume.
-func rounded(model: CadModel, up: Vector3, height: float) -> float!:
+## How many faces of `model` the round (feature "r") made.
+func round_faces(model: CadModel) -> int!:
+    var count = 0
+    for f in 0..<model.face_count():
+        if model.face_name(f).starts_with("r/"):
+            count += 1
+    return count
+
+## `model`'s top (facing `up`) rounded fully at each of `continuities`
+## (G1 first): closed, no flat face facing up left, no higher than
+## `height`, the round one face; G1's volume.
+func rounded(model: CadModel, up: Vector3, height: float, continuities: list[int]) -> float!:
     let top = facing(model, up)
     assert(top != "")
     var g1 = 0.0
-    for continuity in [1, 2]:
+    for continuity in continuities:
         let round = CadModeling.full_round(model, top, "r", continuity = continuity)
         let mesh = round.tessellate(48)
         closed(mesh)
         assert(facing(round, up) == "")
+        assert(round_faces(round) == 1)
         assert(math.abs(mesh.bounds().maximum.z - height) < 1e-3)
         if continuity == 1:
             g1 = volume(mesh)
@@ -50,7 +62,7 @@ pub func full_round_tests() -> unit!:
     let outline = s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0))
     let ring = CadModeling.extruded(outline, 10.0, 0.0, "q")
     let before = math.pi * 0.25 * (196.0 - 100.0) * 10.0
-    let g1 = rounded(ring, Vector3(0.0, 0.0, 1.0), 10.0)
+    let g1 = rounded(ring, Vector3(0.0, 0.0, 1.0), 10.0, [1, 2, 3])
     let expected = before - (8.0 - 2.0 * math.pi) * 12.0 * math.pi * 0.5
     if math.abs(g1 - expected) > 0.1: print(f"curved rib: {g1}, expected {expected}")
     assert(math.abs(g1 - expected) < 0.1)
@@ -62,14 +74,11 @@ pub func full_round_tests() -> unit!:
     for at in 0..<4:
         _ = t.add_line(r[at], r[(at + 1) % 4])
     let tapered = CadModeling.revolved_about(t.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0)), Vector3(), Vector3(0.0, 0.0, 1.0), "t", angle = math.pi * 0.5)
-    _ = rounded(tapered, Vector3(0.0, 0.0, 1.0), 10.0)
-    # Ends that are not flat through the axis (an extrusion's, tapered):
-    # said.
-    var said = ""
+    _ = rounded(tapered, Vector3(0.0, 0.0, 1.0), 10.0, [1, 2, 3])
+    # Extruded with a draft of 5°: its ends lean (planes not through the
+    # axis), its sides are cones; the round's tools trimmed by the ends.
     let drafted = CadModeling.extruded_sides(outline, 10.0, 0.0, "d", taper = 5.0 * math.pi / 180.0)
-    _ = CadModeling.full_round(drafted, facing(drafted, Vector3(0.0, 0.0, 1.0)), "r") catch failure:
-        said = failure.message
-    assert(said.contains("through its axis"), said)
+    _ = rounded(drafted, Vector3(0.0, 0.0, 1.0), 10.0, [1, 2, 3])
     # A rib 6 wide at its foot and top, 10 high, its sides arcs bulging out
     # (circles about (∓5, 5) through its corners, radius √89), 20 long:
     # the circle tangent to the top and both sides has
@@ -86,10 +95,16 @@ pub func full_round_tests() -> unit!:
     let root = math.sqrt(89.0)
     let radius = (50.0 - 89.0) / (10.0 - 2.0 * root)
     assert(math.abs(math.sqrt(25.0 + (5.0 - radius) * (5.0 - radius)) - (root - radius)) < 1e-9)
-    let top = facing(bulging, Vector3(0.0, 0.0, 1.0))
-    let round = CadModeling.full_round(bulging, top, "r")
-    let mesh = round.tessellate(48)
-    closed(mesh)
-    assert(facing(round, Vector3(0.0, 0.0, 1.0)) == "")
-    assert(math.abs(mesh.bounds().maximum.z - 10.0) < 1e-3)
-    print("PASS full rounds: a curved rib (its round by Pappus), tapered (cones; an extrusion's drafted ends refused), a rib with bulging sides (the circle tangent to the top and both arcs), G1 and G2, closed, the top gone, no higher")
+    # G1 only: G2 and G3 blends of a plane and a cylinder are not built.
+    _ = rounded(bulging, Vector3(0.0, 0.0, 1.0), 10.0, [1])
+    # A straight rib 6 wide, 10 high, 20 long: the round a half cylinder of
+    # radius 3 (G1), its section losing 6 x 3 - 4.5π.
+    let w = CadSketch.parse("")
+    let corners = [w.add_point(-3.0, 0.0), w.add_point(3.0, 0.0), w.add_point(3.0, 10.0), w.add_point(-3.0, 10.0)]
+    for at in 0..<4:
+        _ = w.add_line(corners[at], corners[(at + 1) % 4])
+    let straight = CadModeling.extruded(w.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0)), 20.0, 0.0, "s")
+    let flat = rounded(straight, Vector3(0.0, 0.0, 1.0), 10.0, [1, 2, 3])
+    if math.abs(flat - (1200.0 - (18.0 - 4.5 * math.pi) * 20.0)) > 0.05: print(f"straight rib: {flat}, expected {1200.0 - (18.0 - 4.5 * math.pi) * 20.0}")
+    assert(math.abs(flat - (1200.0 - (18.0 - 4.5 * math.pi) * 20.0)) < 0.05)
+    print("PASS full rounds: a curved rib (its round by Pappus), tapered (cones), drafted (its leaning ends trimming the round), a rib with bulging sides (the circle tangent to the top and both arcs; G1), a straight rib; G1, G2 and G3 closed, the top gone, no higher, the round one face")

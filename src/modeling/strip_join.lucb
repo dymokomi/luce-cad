@@ -1,0 +1,202 @@
+## Two B-spline faces meeting along one edge where both surfaces end (a
+## boundary row of each control net, the same row in both), joined into
+## one face on one surface: the nets set end to end across the seam, the
+## knot between them repeated to the degree, so the surface is exactly the
+## two it was. A full round's G2 and G3 halves, which meet where the center
+## face was, become the one face Fusion makes, with no edge drawn along the
+## round's top.
+
+## A B-spline net read across a seam: rows across (count `na`, knots `ka`,
+## degree `da`), each row a curve along (count `nb`, knots `kb`, degree
+## `db`); point (row i, column j) at `i * nb + j`.
+struct SeamNet:
+    var points: Growing[Vector3]
+    var weights: Growing[f64]
+    var ka: Growing[f64]
+    var kb: Growing[f64]
+    var na: usize
+    var nb: usize
+    var da: i64
+    var db: i64
+
+    func close():
+        self.points.close()
+        self.weights.close()
+        self.ka.close()
+        self.kb.close()
+
+## Spline surface `s` read as a SeamNet: across its u (`across_u`) or its v,
+## either way reversed by `flip_across` and `flip_along`.
+func seam_net(s: const Surface*, across_u: bool, flip_across: bool, flip_along: bool) -> SeamNet!:
+    let nu = (usize)s.nu
+    let nv = (usize)s.nv
+    let na = nu if across_u else nv
+    let nb = nv if across_u else nu
+    var net = SeamNet(Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[f64](), na, nb, s.du if across_u else s.dv, s.dv if across_u else s.du)
+    errdefer net.close()
+    for i in 0..<na:
+        let a = (na - 1 - i) if flip_across else i
+        for j in 0..<nb:
+            let b = (nb - 1 - j) if flip_along else j
+            let at = (a * nv + b) if across_u else (b * nv + a)
+            try net.points.push(s.points[at])
+            try net.weights.push(s.weights[at])
+    try reversed_knots(s.ku if across_u else s.kv, flip_across, &net.ka)
+    try reversed_knots(s.kv if across_u else s.ku, flip_along, &net.kb)
+    return net
+
+## `knots` (reversed when `flip`) into `out`, from 0 to 1.
+func reversed_knots(knots: const f64[], flip: bool, out: Growing[f64]*) -> !:
+    let low = knots[0]
+    let high = knots[knots.length - 1]
+    let span = math.max(high - low, 1e-300)
+    for k in 0..<knots.length:
+        let value = (high - knots[knots.length - 1 - k]) if flip else (knots[k] - low)
+        try out.push(value / span)
+
+## Whether row `i` of `a` and row `k` of `b` are the same curve: the same
+## points within `tolerance`, their weights in one ratio (returned; 0 when
+## the rows differ).
+func same_row(a: const SeamNet*, i: usize, b: const SeamNet*, k: usize, tolerance: f64) -> f64:
+    if a.nb != b.nb or a.db != b.db: return 0.0
+    for j in 0..<a.kb.count:
+        if math.abs(a.kb.items[j] - b.kb.items[j]) > 1e-9: return 0.0
+    let ratio = a.weights.items[i * a.nb] / b.weights.items[k * b.nb]
+    for j in 0..<a.nb:
+        if a.points.items[i * a.nb + j].subtract(b.points.items[k * b.nb + j]).length() > tolerance: return 0.0
+        if math.abs(a.weights.items[i * a.nb + j] - ratio * b.weights.items[k * b.nb + j]) > 1e-9 * math.abs(a.weights.items[i * a.nb + j]): return 0.0
+    return ratio
+
+## The mean length of `net`'s control polygons across.
+func across_length(net: const SeamNet*) -> f64:
+    var total = 0.0
+    for j in 0..<net.nb:
+        for i in 1..<net.na:
+            total += net.points.items[i * net.nb + j].subtract(net.points.items[(i - 1) * net.nb + j]).length()
+    return total / (f64)net.nb
+
+## The surface of `first` and `second` set end to end (`first`'s last row
+## is `second`'s first, `ratio` scaling `second`'s weights to `first`'s),
+## its knots across in proportion to the nets' lengths across.
+func seam_surface(first: const SeamNet*, second: const SeamNet*, ratio: f64, like: const Surface*) -> Surface!:
+    let la = math.max(across_length(first), 1e-12)
+    let lb = math.max(across_length(second), 1e-12) / la
+    var points = Growing[Vector3]()
+    defer points.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    for k in 0..<first.points.count:
+        try points.push(first.points.items[k])
+        try weights.push(first.weights.items[k])
+    for k in second.nb..<second.points.count:
+        try points.push(second.points.items[k])
+        try weights.push(second.weights.items[k] * ratio)
+    # Across: first's knots but its last, then second's past its clamped
+    # start (the seam's knot left `da` times).
+    var ka = Growing[f64]()
+    defer ka.close()
+    for k in 0..<first.ka.count - 1: try ka.push(first.ka.items[k])
+    for k in (usize)second.da + 1..<second.ka.count: try ka.push(1.0 + second.ka.items[k] * lb)
+    let na = first.na + second.na - 1
+    return try Surface(surface_spline, like.origin, like.x, like.z, 0.0, 0.0, points.view(), weights.view(), ka.view(), first.kb.view(), (i64)na, (i64)first.nb, first.da, first.db)
+
+## Shape `w` with faces `fa` and `fb` (B-spline faces meeting along one
+## edge, one loop each) made one face on their joined surface, named
+## `name`; false (`w` unchanged) when their surfaces do not end on the
+## same row there or their sides disagree.
+func joined_seam(w: Shape*, fa: usize, fb: usize, name: str) -> bool!:
+    let a = w.faces.items[fa]
+    let b = w.faces.items[fb]
+    if a.loops != 1 or b.loops != 1: return false
+    let sa = &w.surfaces.items[(usize)a.surface]
+    let sb = &w.surfaces.items[(usize)b.surface]
+    if sa.kind != surface_spline or sb.kind != surface_spline: return false
+    # The one edge between them, and where it is in each loop.
+    var seam: i64 = -1
+    var at_a: usize = 0
+    let uses_a = w.face_uses(fa)
+    let uses_b = w.face_uses(fb)
+    for k in 0..<uses_a.length:
+        for use in uses_b:
+            if edge_index(use) != edge_index(uses_a[k]): continue
+            if seam >= 0: return false
+            seam = (i64)edge_index(use)
+            at_a = k
+    if seam < 0: return false
+    var at_b: usize = 0
+    for k in 0..<uses_b.length:
+        if edge_index(uses_b[k]) == (usize)seam: at_b = k
+    # Each net turned so the seam is a's last row and b's first.
+    let tolerance = w.tolerance * 10.0
+    for option_a in 0..<4:
+        var na = try seam_net(sa, option_a < 2, option_a % 2 == 1, false)
+        defer na.close()
+        for option_b in 0..<8:
+            var nb = try seam_net(sb, option_b < 4, (option_b // 2) % 2 == 1, option_b % 2 == 1)
+            defer nb.close()
+            if na.da != nb.da: continue
+            let ratio = same_row(&na, na.na - 1, &nb, 0, tolerance)
+            if ratio == 0.0: continue
+            # Each net's turn flips its normal: transposed, and each reversal.
+            let flips_a = (0 if option_a < 2 else 1) + option_a % 2
+            let flips_b = (0 if option_b < 4 else 1) + (option_b // 2) % 2 + option_b % 2
+            let sense = a.sense == (flips_a % 2 == 0)
+            if sense != (b.sense == (flips_b % 2 == 0)): return false
+            let surface = try seam_surface(&na, &nb, ratio, sa)
+            try w.surfaces.push(surface)
+            try replace_seamed(w, fa, fb, at_a, at_b, (i64)w.surfaces.count - 1, sense, name)
+            return true
+    return false
+
+## Faces `fa` and `fb` of `w` replaced by one face on surface `surface`:
+## a's loop with its seam use (at `at_a`) replaced by b's loop round from
+## the use after its own (`at_b`).
+func replace_seamed(w: Shape*, fa: usize, fb: usize, at_a: usize, at_b: usize, surface: i64, sense: bool, name: str) -> !:
+    var faces = Growing[ShapeFace]()
+    errdefer faces.close()
+    var uses = Growing[i64]()
+    errdefer uses.close()
+    var sizes = Growing[i64]()
+    errdefer sizes.close()
+    for f in 0..<w.faces.count:
+        if f == fb: continue
+        let face = w.faces.items[f]
+        let start_uses = uses.count
+        let start_sizes = sizes.count
+        if f == fa:
+            let own = w.face_uses(fa)
+            let other = w.face_uses(fb)
+            for k in 0..<own.length:
+                if k != at_a:
+                    try uses.push(own[k])
+                    continue
+                for step in 1..<other.length: try uses.push(other[(at_b + step) % other.length])
+            try sizes.push((i64)(uses.count - start_uses))
+            try faces.push(ShapeFace(surface, sense, start_uses, uses.count - start_uses, start_sizes, 1, try w.add_name(name)))
+            continue
+        for use in w.face_uses(f): try uses.push(use)
+        for size in w.face_sizes(f): try sizes.push(size)
+        try faces.push(ShapeFace(face.surface, face.sense, start_uses, uses.count - start_uses, start_sizes, sizes.count - start_sizes, face.name))
+    w.faces.close()
+    w.uses.close()
+    w.sizes.close()
+    w.faces = faces
+    w.uses = uses
+    w.sizes = sizes
+    # Moved into the shape: the locals start again empty.
+    faces = Growing[ShapeFace]()
+    uses = Growing[i64]()
+    sizes = Growing[i64]()
+    try w.index_sides()
+
+## `model` with its faces named `first` and `second` joined across their
+## seam (see the header) and named `name`; none when they cannot be.
+func seam_joined(model: const CadModel*, first: str, second: str, name: str) -> interop.Reference[CadModel]?!:
+    var w = try shape_of(model)
+    defer w.close()
+    let fa = try named_face(&w, first)
+    let fb = try named_face(&w, second)
+    if fa == fb or not try joined_seam(&w, fa, fb, name): return none
+    let solid = try used_brep(&w)
+    defer solid.release()
+    return try CadModel.of_brep(solid)

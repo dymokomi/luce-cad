@@ -174,6 +174,11 @@ outward in the plane by the level's growth, `-height × tan(taper)`.
 - Between two levels each edge sweeps a face: a plane for a line (slanted by the taper), a cylinder
   or a cone for an arc, a B-spline swept straight for a spline. A spline takes no taper (refused
   with a message).
+- The edge where two sides meet between levels (`upright`) is a line where both are planes, where
+  they run on tangentially, or where the levels lean alike. A tapered plane meeting a cone at an
+  angle meets it in a conic (two cones: a quartic): that edge is traced, the moved edges' crossing
+  at 33 heights, as a cubic through them. A line between its ends lay on neither side (0.009 off on
+  a 12 high drafted ring), and booleans on the body failed or misjudged it.
 - One side is two levels; two sides are three (the profile in the middle), or two when neither
   side tapers. Where two sides of different taper meet at the profile, each side face breaks
   there: the lower part is named `back<c>.<k>`.
@@ -382,21 +387,33 @@ edges with the sides must run alike, so every section is the same:
 - **Parallel lines** (a rib's top): the sides flat, tapered, or curved along the rib (cylinders
   whose axes run with the edges, a bulging side). Both edges are filleted to the circle's radius:
   the two strips touch the center face at the same line, so it goes and the strips are one cylinder
-  (G2 and G3: two strips meeting with zero curvature).
+  (G2 and G3: two strips meeting with zero curvature, joined into one face, below).
 - **Concentric arcs** (a curved rib): the sides cylinders or cones about the center face's normal,
-  the ends flat faces through the axis (a revolved rib's; an extrusion's drafted ends are refused).
-  Two fillets' part-torus tools would touch each other along the round's top, which the booleans
-  cannot part, so the round is made in two steps: the slab over the chord between the side contacts
-  is taken away, then the cap between that chord and the round is added back, both turned about the
-  axis along the arcs and flush with the ends. The round is one torus at G1, two strips of revolution
-  meeting where the center face was at G2 and G3.
+  the ends flat. Two fillets' part-torus tools would touch each other along the round's top, which
+  the booleans cannot part, so the round is made in two steps: the slab over the chord between the
+  side contacts is taken away, then the cap between that chord and the round is added back, both
+  turned about the axis along the arcs. The slab's chord runs on past the contacts out of the body
+  and its walls stand off the sides, along the axis (cylinders): a slab face on a side's surface, or
+  a slab edge along one, left the booleans coincident pieces to part. An end through the axis (a
+  revolved rib's) ends both tools flush. Past a leaning end (an extrusion's drafted ends; any flat
+  end) the tools turn on until every slab corner has crossed its plane, plus a margin, and a box on
+  the plane's outer side, no larger than the tools' end, trims each back to the plane
+  (`rib_ends`, `ends_trimmed`); an end that is not flat is refused. The round is one torus at G1,
+  two strips of revolution meeting where the center face was at G2 and G3, joined.
+- **One face** (`strip_join.lucb`), as Fusion's full round is: G2 and G3's two halves meet where
+  the center face was, each surface ending on the same row of its net there. The nets are set end to
+  end across that row (the knot between them repeated to the degree, the second net's weights
+  scaled to the first's on the row, its knot span in proportion to its length across), the seam
+  edge dropped and the two loops joined: the surface is exactly the two it was, with no edge drawn
+  along the round's top. Named for both edges' blends, as G1's one face is.
 
 The circle comes from the faces' tangent planes where the section meets them (Cramer's rule on
 n·X + r = h for each), refined by Newton on each face's signed distance (exact for flat sides and
 for a curved rib's, whose sides are straight in the section); it is converged to the last digits,
 since strips a hair apart leave a sliver of the center face the booleans cannot take.
-`full_round_tests` checks a curved rib by Pappus, a revolved rib with unlike tapers (cones), and a
-rib with bulging sides.
+`full_round_tests` checks a curved rib by Pappus, a revolved rib with unlike tapers (cones), a
+curved rib extruded with draft (leaning ends), a rib with bulging sides and a straight rib (its
+volume), at G1, G2 and G3 (bulging: G1), each closed with the round one face.
 
 **Variable radius** (`variable_fillet.lucb`, `radius_law.lucb`): Fusion's radii at points along a
 tangent chain, positions 0 to 1 as fractions of the chain's length (Fusion's API: "the percentage

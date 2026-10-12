@@ -16,7 +16,9 @@
 ## (Cramer's rule on n·X + r = h for each), which is the answer when they
 ## are flat.
 ## The sides, when not named, are the center face's neighbors across its
-## longest pair of such edges.
+## longest pair of such edges. G2 and G3 rounds are two halves meeting
+## where the center face was, joined into one face (strip_join.lucb), as
+## Fusion's full round is one face.
 
 ## `model` with face `center` rounded fully between faces `side1` and
 ## `side2` (empty: found as above), of `continuity` (1 G1, 2 G2, 3 G3), the
@@ -46,36 +48,89 @@ func full_rounded(model: const CadModel*, center: str, side1: str, side2: str, t
         try edges.push((i64)e)
     if edges.count < 2: error(invalid, "the center face does not meet both sides")
     let (radius, center_point) = try inscribed_circle(&w, c, sides, (usize)first)
-    # Arcs (a curved rib): the slab over the round's chord taken away and
-    # the cap under the round added back (round_part).
-    if w.carriers.items[(usize)w.edges.items[(usize)first].carrier].kind == curve_circle:
-        let other = (usize)edges.items[1] if edges.items[0] == first else (usize)edges.items[0]
-        try radial_ends(&w, c, sides, (usize)first)
-        let slab = try round_part(&w, c, (usize)first, other, radius, center_point, continuity, tag, 0)
-        defer slab.release()
-        let cut = try combine(model, slab.value(), op_subtract)
-        defer cut.release()
-        let cap = try round_part(&w, c, (usize)first, other, radius, center_point, continuity, tag, 1)
-        defer cap.release()
-        return try combine(cut.value(), cap.value(), op_union)
-    var text = Growing[u8]()
-    defer text.close()
-    try references_of(&w, edges.view(), &text)
-    return try blended(model, (str)text.view(), radius, true, tag, continuity, false)
+    let second = (usize)edges.items[1] if edges.items[0] == first else (usize)edges.items[0]
+    let rounded = try round_body(model, &w, c, sides, edges.view(), (usize)first, second, radius, center_point, continuity, tag)
+    if continuity == 1: return rounded
+    # G2 and G3: two halves meeting where the center face was, made one
+    # face (strip_join.lucb), as Fusion's full round is.
+    defer rounded.release()
+    var name_a = Growing[u8]()
+    defer name_a.close()
+    var name_b = Growing[u8]()
+    defer name_b.close()
+    try blend_name(&w, (usize)first, tag, &name_a)
+    try blend_name(&w, second, tag, &name_b)
+    var both = Growing[u8]()
+    defer both.close()
+    try round_name(name_b.view(), name_a.view(), &both)
+    let joined = try seam_joined(rounded.value(), (str)name_a.view(), (str)name_b.view(), (str)both.view())
+    if let one = joined: return one
+    error(invalid, "a full round's halves did not join into one face")
 
-## A full round of a curved rib (radius `radius`, center `center` in the
-## section through edge `ea`'s middle) over center face `c` between its
-## arcs `ea` and `eb` (concentric, the sides cylinders or cones about their
-## axis), turned about the axis along the arcs, flush with the rib's ends:
-## `part` 0 the slab over the chord between the side contacts (the sides
-## above them and a line above the center face), taken away; 1 the cap
-## between the chord and the round, added back. The round touches the
-## center face's plane along a circle, so one tool of the region over it
-## would touch the body there, which the booleans cannot part; the slab and
-## the cap meet the body only on their own faces. The round is a torus (G1;
-## one face, named for both edges' blends) or, G2 and G3, two strips of
-## revolution meeting where the center face was.
-func round_part(w: const Shape*, c: usize, ea: usize, eb: usize, radius: f64, center: Vector3, continuity: i64, tag: str, part: i64) -> interop.Reference[CadModel]!:
+## The full round of `model` (`w` its shape) over face `c` between
+## `sides`, their edges with it `edges` (`first` and `other` one each side),
+## of radius `radius` about `center`: G2 and G3 as two halves.
+func round_body(model: const CadModel*, w: const Shape*, c: usize, sides: const usize[2], edges: const i64[], first: usize, other: usize, radius: f64, center: Vector3, continuity: i64, tag: str) -> interop.Reference[CadModel]!:
+    if w.carriers.items[(usize)w.edges.items[first].carrier].kind != curve_circle:
+        var text = Growing[u8]()
+        defer text.close()
+        try references_of(w, edges, &text)
+        return try blended(model, (str)text.view(), radius, true, tag, continuity, false)
+    # Arcs (a curved rib): the slab over the round's chord taken away and
+    # the cap under the round added back (round_part), each turned past the
+    # rib's ends and trimmed by them.
+    var section = try rib_section(w, c, first, other, radius, center)
+    var trims = Growing[usize]()
+    defer trims.close()
+    try rib_ends(w, c, sides, &section, &trims)
+    let slab = try round_part(w, first, other, radius, &section, continuity, tag, 0)
+    defer slab.release()
+    let slab_trimmed = try ends_trimmed(slab.value(), w, trims.view(), &section)
+    defer slab_trimmed.release()
+    let cut = try combine(model, slab_trimmed.value(), op_subtract)
+    defer cut.release()
+    let cap = try round_part(w, first, other, radius, &section, continuity, tag, 1)
+    defer cap.release()
+    let cap_trimmed = try ends_trimmed(cap.value(), w, trims.view(), &section)
+    defer cap_trimmed.release()
+    return try combine(cut.value(), cap_trimmed.value(), op_union)
+
+## A curved rib's full round in the section through its arc's middle `p`
+## (along the arc `along`, the center face's normal `up`, across to the
+## other arc `width`): the sides' outward normals, the round's center, top
+## and side contacts, the slab's corners above the center face; the arcs'
+## axis (`origin`, `axis` turning the way along), and the turn from `low`
+## to `high` about it that the round's tools sweep (rib_ends sets it past
+## the rib's ends).
+struct RibSection:
+    var p: Vector3
+    var along: Vector3
+    var up: Vector3
+    var width: Vector3
+    var na: Vector3
+    var nb: Vector3
+    var center: Vector3
+    var mid: Vector3
+    var contact_a: Vector3
+    var contact_b: Vector3
+    var out_a: Vector3
+    var out_b: Vector3
+    var above_a: Vector3
+    var above_b: Vector3
+    var origin: Vector3
+    var axis: Vector3
+    var low: f64
+    var high: f64
+
+    ## The slab's corners: the chord's end past side a's contact, up beside
+    ## side a, across above, down beside side b, the chord's other end.
+    func corners() -> Vector3[4]:
+        return [self.out_a, self.above_a, self.above_b, self.out_b]
+
+## The section of a full round of radius `radius` about `center` over
+## center face `c` between its arcs `ea` and `eb` (see RibSection), turned
+## over the arc's own span.
+func rib_section(w: const Shape*, c: usize, ea: usize, eb: usize, radius: f64, center: Vector3) -> RibSection!:
     let edge = w.edges.items[ea]
     let carrier = w.carriers.items[(usize)edge.carrier]
     let p = try w.edge_at(ea, 0.5)
@@ -84,30 +139,179 @@ func round_part(w: const Shape*, c: usize, ea: usize, eb: usize, radius: f64, ce
     let side_b = try other_side(w, c, eb)
     let q = try section_foot(w, c, side_b, p, along)
     let up = try w.face_normal(c, p)
-    let width = try q.subtract(p).normalized()
     # Each side's outward normal at its contact (the same along its line in
-    # the section: a cylinder's or cone's about the axis) and its way up.
+    # the section: a cylinder's or cone's about the axis).
     let na = try w.face_normal(side_a, p)
     let nb = try w.face_normal(side_b, q)
-    let mid = center.add(up.multiply_scalar(radius))
+    # The chord on past each contact by the radius, out of the body, then
+    # straight up (along the axis: walls of cylinders about it) to the
+    # radius above the center face. The slab crosses the sides along the
+    # contacts and lies on none of them (a slab face on a side's surface,
+    # or its edge along one, leaves the booleans coincident pieces to
+    # part), and leaning ends meet its walls in ellipses, not in curves to
+    # trace.
     let contact_a = center.add(na.multiply_scalar(radius))
     let contact_b = center.add(nb.multiply_scalar(radius))
-    let rise_a = try rising(along.cross(na), up)
-    let rise_b = try rising(along.cross(nb), up)
-    # Up each side to the radius above the center face.
-    let lift = radius
-    let above_a = p.add(rise_a.multiply_scalar(lift / math.max(0.2, rise_a.dot(up))))
-    let above_b = q.add(rise_b.multiply_scalar(lift / math.max(0.2, rise_b.dot(up))))
-    # Turned along the arcs, past an open end (nothing beyond) by a margin:
-    # the profile built where the tool starts.
-    var a = carrier.x.cross(carrier.y)
-    if a.cross(p.subtract(carrier.origin)).dot(along) < 0.0: a = a.multiply_scalar(-1.0)
+    let chord = try contact_a.subtract(contact_b).normalized()
+    let out_a = contact_a.add(chord.multiply_scalar(radius))
+    let out_b = contact_b.subtract(chord.multiply_scalar(radius))
+    let above_a = out_a.add(up.multiply_scalar(p.subtract(out_a).dot(up) + radius))
+    let above_b = out_b.add(up.multiply_scalar(p.subtract(out_b).dot(up) + radius))
+    var axis = carrier.x.cross(carrier.y)
+    if axis.cross(p.subtract(carrier.origin)).dot(along) < 0.0: axis = axis.multiply_scalar(-1.0)
     let sweep = math.abs(edge.t1 - edge.t0)
-    let back = -sweep * 0.5
-    let o = carrier.origin
+    return RibSection(p, along, up, try q.subtract(p).normalized(), na, nb, center, center.add(up.multiply_scalar(radius)),
+                      contact_a, contact_b, out_a, out_b, above_a, above_b,
+                      carrier.origin, axis, -sweep * 0.5, sweep * 0.5)
+
+## A curved rib's ends, the faces at the center face's other edges: each
+## must be flat. An end through the arcs' axis (square to the rib) ends the
+## round's tools flush, at the arcs' own end. Past another (leaning, as an
+## extrusion's drafted ends do) the section's turn reaches at every slab
+## corner, by a margin, and the end goes into `trims`: the tools are
+## trimmed by its plane (ends_trimmed).
+func rib_ends(w: const Shape*, c: usize, sides: const usize[2], section: RibSection*, trims: Growing[usize]*) -> !:
+    var low = section.low
+    var high = section.high
+    var leaning_low = false
+    var leaning_high = false
+    for use in w.face_uses(c):
+        let g = edge_index(use)
+        let (fa, fb) = try edge_faces(w, g)
+        let f = fb if fa == c else fa
+        if f == sides[0] or f == sides[1]: continue
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind != surface_plane: error(invalid, "a curved rib's full round needs its ends flat")
+        let through = math.abs(s.z.dot(section.axis)) < 1e-9 and math.abs(section.origin.subtract(s.origin).dot(s.z)) <= w.tolerance * 10.0
+        if through: continue
+        try trims.push(f)
+        # The end's side (the turn to its edge), then each corner's turn to
+        # its plane on that side.
+        let toward = turn_about(section, try w.edge_at(g, 0.5))
+        let n = try w.face_normal(f, s.origin)
+        if toward < 0.0 and not leaning_low:
+            low = 0.0
+            leaning_low = true
+        if toward >= 0.0 and not leaning_high:
+            high = 0.0
+            leaning_high = true
+        for corner in section.corners():
+            let turn = try plane_turn(section, corner, s.origin, n, toward)
+            if toward < 0.0:
+                low = math.min(low, turn)
+            else:
+                high = math.max(high, turn)
+    if trims.count == 0: return
+    if low >= 0.0 or high <= 0.0: error(invalid, "a curved rib's full round needs an end on each side of the round")
+    let span = high - low
+    let margin = math.min(0.05 * span + 0.01, (2.0 * math.pi - span) * 0.25)
+    if not (margin > 0.0): error(invalid, "a curved rib's ends overlap round its axis: no full round fits")
+    section.low = (low - margin) if leaning_low else low
+    section.high = (high + margin) if leaning_high else high
+
+## The turn about the section's axis from its middle `p` to point `x`.
+func turn_about(section: const RibSection*, x: Vector3) -> f64:
+    let a = section.axis
+    let from_p = section.p.subtract(section.origin)
+    let from_x = x.subtract(section.origin)
+    let u = from_p.subtract(a.multiply_scalar(from_p.dot(a)))
+    let v = from_x.subtract(a.multiply_scalar(from_x.dot(a)))
+    return math.atan2(a.dot(u.cross(v)), u.dot(v))
+
+## The turn about the section's axis that takes point `x` onto the plane
+## through `o` facing `n`, the one nearest turn `toward`: a cos t + b sin t
+## = c on the circle `x` runs round.
+func plane_turn(section: const RibSection*, x: Vector3, o: Vector3, n: Vector3, toward: f64) -> f64!:
+    let a = section.axis
+    let rel = x.subtract(section.origin)
+    let level = a.multiply_scalar(rel.dot(a))
+    let radial = rel.subtract(level)
+    let cos_part = n.dot(radial)
+    let sin_part = n.dot(a.cross(radial))
+    let c = n.dot(o.subtract(section.origin.add(level)))
+    let amplitude = math.sqrt(cos_part * cos_part + sin_part * sin_part)
+    if amplitude <= 1e-12 or math.abs(c) > amplitude: error(invalid, "a curved rib's end does not cross its round: no full round fits")
+    let phase = math.atan2(sin_part, cos_part)
+    let spread = math.acos(c / amplitude)
+    var best = 0.0
+    var nearest = 1.0e300
+    for t in [phase + spread, phase - spread]:
+        # The same turn within a half turn of `toward`.
+        var turn = t
+        while turn - toward > math.pi: turn -= 2.0 * math.pi
+        while toward - turn > math.pi: turn += 2.0 * math.pi
+        if math.abs(turn - toward) < nearest:
+            nearest = math.abs(turn - toward)
+            best = turn
+    return best
+
+## `tool` (a round's slab or cap, turned past the rib's ends `ends`) with
+## what lies past each end plane taken away: a box on the plane's outer side
+## over the tool's end, no larger than it, so a rib turned more than half
+## round keeps the tool's far part.
+func ends_trimmed(tool: const CadModel*, w: const Shape*, ends: const usize[], section: const RibSection*) -> interop.Reference[CadModel]!:
+    if ends.length == 0: return try copy_model(tool)
+    var current = try copy_model(tool)
+    errdefer current.release()
+    let corners = section.corners()
+    var diameter = 0.0
+    for x in corners:
+        for y in corners: diameter = math.max(diameter, x.subtract(y).length())
+    for f in ends:
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        let n = try w.face_normal(f, s.origin)
+        # The tool's end past this plane: its corners at the turn there.
+        let toward = section.low if (try plane_turn(section, section.p, s.origin, n, 0.0)) < 0.0 else section.high
+        var depth = 0.0
+        var middle = Vector3()
+        for x in corners:
+            let tip = turned_point(x, section.origin, section.axis, toward)
+            depth = math.max(depth, n.dot(tip.subtract(s.origin)))
+            middle = middle.add(tip.multiply_scalar(0.25))
+        if not (depth > 0.0): error(invalid, "a curved rib's full round did not reach its end")
+        let side = diameter * 2.0 + depth * 4.0
+        let foot = middle.subtract(n.multiply_scalar(n.dot(middle.subtract(s.origin))))
+        let x = try across(n)
+        let box = try CadSolids.box(side, side, side)
+        defer box.release()
+        let placed = try box.value().placed(Matrix4(x, n.cross(x), n, foot.add(n.multiply_scalar(side * 0.5))))
+        defer placed.release()
+        let less = try combine(current.value(), placed.value(), op_subtract)
+        current.release()
+        current = less
+    return current
+
+## A full round of a curved rib (radius `radius`; its section `section`)
+## between its arcs `ea` and `eb` (concentric, the sides cylinders or cones
+## about their axis), turned about the axis along the arcs over the
+## section's turn: `part` 0 the slab over the chord between the side
+## contacts (the chord on past them, walls beside the sides and a line
+## above the center face), taken away; 1 the cap between the chord and the
+## round, added back; both trimmed by the rib's ends after (ends_trimmed).
+## The round touches the center face's plane along a circle, so one tool of
+## the region over it would touch the body there, which the booleans cannot
+## part; the slab and the cap meet the body only on their own faces. The
+## round is a torus (G1; one face, named for both edges' blends) or, G2 and
+## G3, two strips of revolution meeting where the center face was (joined
+## after).
+func round_part(w: const Shape*, ea: usize, eb: usize, radius: f64, section: const RibSection*, continuity: i64, tag: str, part: i64) -> interop.Reference[CadModel]!:
+    let carrier = w.carriers.items[(usize)w.edges.items[ea].carrier]
+    let a = section.axis
+    let o = section.origin
+    let back = section.low
+    let sweep = section.high - section.low
+    let along = section.along
+    let width = section.width
+    let center = section.center
+    let mid = section.mid
+    let contact_a = section.contact_a
+    let contact_b = section.contact_b
+    let na = section.na
+    let nb = section.nb
+    # The profile built where the tool starts.
     let way = turned_direction(along, a, back)
     let flat = turned_direction(width, a, back)
-    var profile = Profiles(turned_point(p, o, a, back), way, flat, way.cross(flat), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+    var profile = Profiles(turned_point(section.p, o, a, back), way, flat, way.cross(flat), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
                            Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
     defer profile.close()
     try profile.loop_offsets.push(0)
@@ -116,9 +320,10 @@ func round_part(w: const Shape*, c: usize, ea: usize, eb: usize, radius: f64, ce
     let tm = turned_point(mid, o, a, back)
     let tc = turned_point(center, o, a, back)
     if part == 0:
-        # The slab: up side a, across above, down side b, the chord back.
-        let corners: Vector3[4] = [above_a, above_b, contact_b, contact_a]
-        var previous = ta
+        # The slab: up beside side a, across above, down beside side b,
+        # the chord (on past both contacts) back.
+        let corners: Vector3[4] = [section.above_a, section.above_b, section.out_b, section.out_a]
+        var previous = turned_point(section.out_a, o, a, back)
         for point in corners:
             let next = turned_point(point, o, a, back)
             try profile.edges.push(line_edge(previous, next))
@@ -179,19 +384,19 @@ func round_part(w: const Shape*, c: usize, ea: usize, eb: usize, radius: f64, ce
     if continuity == 1:
         var both = Growing[u8]()
         defer both.close()
-        for byte in name_b.view(): try both.push(byte)
-        try both.push(124)
-        for byte in name_a.view(): try both.push(byte)
+        try round_name(name_b.view(), name_a.view(), &both)
         try b.set_face_name(0, (str)both.view())
     else:
         try b.set_face_name(0, (str)name_b.view())
         try b.set_face_name(1, (str)name_a.view())
     return try CadModel.of_brep(solid)
 
-## `d` made unit and turned to point the way `up` does.
-func rising(d: Vector3, up: Vector3) -> Vector3!:
-    let way = try d.normalized()
-    return way if way.dot(up) >= 0.0 else way.multiply_scalar(-1.0)
+## The name of a full round's one face, named for both edges' blends
+## (`a`, then `b`, as aliases), into `out`.
+func round_name(a: const u8[], b: const u8[], out: Growing[u8]*) -> !:
+    for byte in a: try out.push(byte)
+    try out.push(124)
+    for byte in b: try out.push(byte)
 
 ## The side of center face `c` across edge `e`.
 func other_side(w: const Shape*, c: usize, e: usize) -> usize!:
@@ -359,17 +564,3 @@ func edge_length(w: const Shape*, e: usize) -> f64!:
         total += here.subtract(previous).length()
         previous = here
     return total
-
-## A curved rib's ends, where the center face's other edges are: flat faces
-## through the arcs' axis (the round's slab and cap end flush with them).
-func radial_ends(w: const Shape*, c: usize, sides: const usize[2], e: usize) -> !:
-    let carrier = w.carriers.items[(usize)w.edges.items[e].carrier]
-    let axis = carrier.x.cross(carrier.y)
-    for use in w.face_uses(c):
-        let g = edge_index(use)
-        let (fa, fb) = try edge_faces(w, g)
-        let other = fb if fa == c else fa
-        if other == sides[0] or other == sides[1]: continue
-        let s = &w.surfaces.items[(usize)w.faces.items[other].surface]
-        let through = s.kind == surface_plane and math.abs(s.z.dot(axis)) < 1e-9 and math.abs(carrier.origin.subtract(s.origin).dot(s.z)) <= w.tolerance * 10.0
-        if not through: error(invalid, "a curved rib's full round needs its ends flat and square to it (through its axis)")
