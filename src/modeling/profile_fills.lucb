@@ -1,0 +1,120 @@
+## Profile fills: a sketch's profile regions triangulated flat on its plane
+## (the planar trim mesher, polygons/), to shade them as Fusion shades its
+## profiles, and the anchor a feature's arrow stands on: a point inside the
+## regions, their normal and area. A region whose loops touch, which the
+## mesher refuses, is left unshaded; its profile is still picked and
+## extruded.
+from polygons import TrimPolygon
+from luce_geocore.geocore import MeshBuilder, Mesh
+
+## Where a feature's arrow stands on profiles: a point inside them (the
+## middle of their area when that lies inside, else the middle of their
+## largest triangle), the sketch plane's normal and their area. `found`
+## false when the sketch has no closed profile.
+pub struct ProfileAnchor:
+    pub var found: bool
+    pub var point: Vector3
+    pub var normal: Vector3
+    pub var area: f64
+
+## The triangles of `p`'s regions, in plane coordinates (x, y; three points
+## each) onto `out`.
+func region_triangles(p: Profiles*, out: Growing[Vector3]*) -> !:
+    var outline = Growing[Vector3]()
+    defer outline.close()
+    var points = Growing[Vector3]()
+    defer points.close()
+    var sizes = Growing[i64]()
+    defer sizes.close()
+    for region in 0..<p.region_count():
+        points.clear()
+        sizes.clear()
+        for loop in p.region(region):
+            try p.outline(loop, &outline)
+            for at in outline.view(): try points.push(at)
+            try sizes.push((i64)outline.count)
+        let mesh = TrimPolygon.triangulate(points.view(), sizes.view(), Vector3(0.0, 0.0, 1.0)) catch failure:
+            continue
+        defer mesh.release()
+        let m = mesh.value()
+        for face in 0..<m.face_count():
+            if (try m.face_size(face)) != 3: continue
+            for corner in 0..<3: try out.push(points.items[(usize)(try m.face_point(face, (i64)corner))])
+
+## The profiles `keys` names of the sketch in `set` (empty: its every
+## profile), or none when it has no closed profile.
+func chosen_profiles(set: const GeometrySet*, keys: str, every: bool) -> Profiles?!:
+    let curves = set_curves(set) else return none
+    if curves.curve_count() == 0: return none
+    let tolerance = try sketch_size(set) * 0.0001
+    var named = Growing[u8]()
+    defer named.close()
+    try named.assign(keys.bytes)
+    if every and keys == "":
+        try face_keys(set, tolerance, false, Vector3(), &named)
+        if named.count == 0: return none
+    let found = profiles_of(set, tolerance, (str)named.view()) catch failure:
+        return none
+    return found
+
+## The shading of profiles `keys` (every profile when empty) of the sketch
+## in `set`: their regions' triangles on its plane, as a mesh (empty when
+## there are none).
+func profile_fill_mesh(set: const GeometrySet*, keys: str) -> interop.Reference[Mesh]!:
+    var out = try MeshBuilder()
+    defer out.close()
+    if let found = try chosen_profiles(set, keys, true):
+        var p = found
+        defer p.close()
+        var triangles = Growing[Vector3]()
+        defer triangles.close()
+        try region_triangles(&p, &triangles)
+        for corner in triangles.view():
+            _ = try out.point(p.origin.add(p.u.multiply_scalar(corner.x)).add(p.v.multiply_scalar(corner.y)))
+        for face in 0..<triangles.count // 3:
+            try out.face(3)
+            for corner in 0..<3: try out.corner((i64)(face * 3) + corner)
+    return try out.finish()
+
+## Where an arrow on profiles `keys` stands (empty: the closed shapes an
+## Extrude takes by default).
+func anchor_of(set: const GeometrySet*, keys: str) -> ProfileAnchor!:
+    let none_found = ProfileAnchor(false, Vector3(), Vector3(0.0, 1.0, 0.0), 0.0)
+    let found = try chosen_profiles(set, keys, false) else return none_found
+    var p = found
+    defer p.close()
+    var triangles = Growing[Vector3]()
+    defer triangles.close()
+    try region_triangles(&p, &triangles)
+    var total = 0.0
+    var middle = Vector3()
+    var largest = 0.0
+    var best = Vector3()
+    for face in 0..<triangles.count // 3:
+        let a = triangles.items[face * 3]
+        let b = triangles.items[face * 3 + 1]
+        let c = triangles.items[face * 3 + 2]
+        let area = math.abs((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)) * 0.5
+        let center = a.add(b).add(c).multiply_scalar(1.0 / 3.0)
+        total += area
+        middle = middle.add(center.multiply_scalar(area))
+        if area > largest:
+            largest = area
+            best = center
+    if total <= 0.0: return none_found
+    middle = middle.multiply_scalar(1.0 / total)
+    # The middle of the area, when it lies on the profiles (not in a hole).
+    var place = best
+    for face in 0..<triangles.count // 3:
+        if planar_triangle_holds(triangles.items[face * 3], triangles.items[face * 3 + 1], triangles.items[face * 3 + 2], middle):
+            place = middle
+            break
+    return ProfileAnchor(true, p.origin.add(p.u.multiply_scalar(place.x)).add(p.v.multiply_scalar(place.y)), p.normal, total)
+
+## Whether plane point `q` is inside triangle a, b, c (either winding) or
+## on its edge.
+func planar_triangle_holds(a: Vector3, b: Vector3, c: Vector3, q: Vector3) -> bool:
+    let d1 = (b.x - a.x) * (q.y - a.y) - (b.y - a.y) * (q.x - a.x)
+    let d2 = (c.x - b.x) * (q.y - b.y) - (c.y - b.y) * (q.x - b.x)
+    let d3 = (a.x - c.x) * (q.y - c.y) - (a.y - c.y) * (q.x - c.x)
+    return not ((d1 < 0.0 or d2 < 0.0 or d3 < 0.0) and (d1 > 0.0 or d2 > 0.0 or d3 > 0.0))

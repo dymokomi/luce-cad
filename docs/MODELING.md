@@ -22,6 +22,9 @@ does today.
 | `edge_axis(model, reference)` | A line edge's line, or a circular edge's axis, for Revolve. |
 | `profile_count(set)` | How many regions the sketch has. |
 | `profile_keys(set)`, `profile_at(set, point)` | The keys of the sketch's faces; the key of the face under a point (a click). `extruded` and `revolved` take keys to choose faces. |
+| `profile_fills(set, keys)` | The regions of the profiles `keys` names (empty: every profile), triangulated flat on the plane by the trim mesher (`polygons/`), to shade them. A region whose loops touch is left out. |
+| `profile_anchor(set, keys)` | Where a feature's arrow stands on those profiles (empty: the closed shapes Extrude takes): a point inside them (the middle of their area when it lies on them, else of their largest triangle), the plane's normal, their area. |
+| `inside(model, point)` | Whether a point lies inside a closed solid, by rays through its exact faces (`rays.lucb`): what an automatic Join or Cut asks. |
 | `combined(a, b, operation)` | `0` union, `1` `a` without `b`, `2` intersection. |
 | `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
 | `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |

@@ -40,6 +40,7 @@ func crossed(a: list[float], b: list[float]) -> GeometrySet!:
 
 pub func profile_tests() -> unit!:
     spline_profiles()
+    fills_and_anchors()
     let h = 5.0
     # Two circles of 10 overlapping by 8: a lens and two crescents.
     let s = CadSketch.parse("")
@@ -118,3 +119,45 @@ func spline_profiles() -> unit!:
     _ = r.add_spline([c, r.add_point(1.0, 2.5), d], false, 2)
     _ = r.add_line(d, c)
     solid(CadModeling.revolved(curves(r), 0, "r"), 4, 2.0 * math.pi * 0.9 * 4.0 / 3.0)
+
+## A 40 x 20 plate with a hole of radius 5 at (10, 10): two profiles, the
+## ring and the disc. Their fills cover their areas; the plate's anchor
+## stands on the ring (not in the hole), the default islands' too; inside
+## tells a point in a box from one outside it.
+func fills_and_anchors() -> unit!:
+    let s = CadSketch.parse("")
+    let corners = [s.add_point(0.0, 0.0), s.add_point(40.0, 0.0), s.add_point(40.0, 20.0), s.add_point(0.0, 20.0)]
+    for at in 0..<4:
+        _ = s.add_line(corners[at], corners[(at + 1) % 4])
+    _ = s.add_circle(s.add_point(10.0, 10.0), 5.0)
+    let plate = curves(s)
+    let keys = CadModeling.profile_keys(plate).split(";")
+    assert(keys.length == 2)
+    let disc = CadModeling.profile_at(plate, Vector3(10.0, 10.0, 0.0))
+    let ring = CadModeling.profile_at(plate, Vector3(30.0, 10.0, 0.0))
+    assert(disc != "" and ring != "" and disc != ring)
+    let hole = math.pi * 25.0
+    for (key, expected) in [(ring, 800.0 - hole), (disc, hole), ("", 800.0)]:
+        let a = CadModeling.profile_anchor(plate, key)
+        let fill = CadModeling.profile_fills(plate, key)
+        assert(fill.face_count() > 0)
+        var area = 0.0
+        for face in 0..<fill.face_count():
+            let p = fill.point(fill.face_point(face, 0))
+            let q = fill.point(fill.face_point(face, 1))
+            let r = fill.point(fill.face_point(face, 2))
+            area += q.subtract(p).cross(r.subtract(p)).length() * 0.5
+            assert(math.abs(p.z) < 1e-9)
+        # The outline follows arcs every 10 degrees: within 1%.
+        assert(math.abs(area - expected) < expected * 0.01, f"fill {area}, expected {expected}")
+        if key != "":
+            assert(a.found and math.abs(a.area - expected) < expected * 0.01 and a.normal.z > 0.99)
+            assert(CadModeling.profile_at(plate, a.point) == key, f"anchor {a.point.x}, {a.point.y}")
+    let islands = CadModeling.profile_anchor(plate, "")
+    assert(islands.found and CadModeling.profile_at(plate, islands.point) == ring)
+    # A sketch without a closed profile: no fill, no anchor.
+    let open = CadSketch.parse("")
+    _ = open.add_line(open.add_point(0.0, 0.0), open.add_point(10.0, 0.0))
+    assert(CadModeling.profile_fills(curves(open)).face_count() == 0 and not CadModeling.profile_anchor(curves(open)).found)
+    let box = CadSolids.box(2.0, 2.0, 2.0)
+    assert(CadModeling.inside(box, Vector3(0.3, 0.2, -0.4)) and not CadModeling.inside(box, Vector3(1.5, 0.0, 0.0)))
