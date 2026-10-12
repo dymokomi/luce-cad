@@ -15,8 +15,10 @@ pub struct Aligned:
     pub var set: interop.Reference[GeometrySet]
     pub var report: AlignReport
     pub var rows: Growing[Vector3]
-    ## The same rows before the align (Alias's proxy display).
+    ## The input's whole hull before the align (Alias's proxy display):
+    ## rows of proxy_size control points, row 0 on the edge.
     pub var proxy: Growing[Vector3]
+    pub var proxy_size: usize
     pub var row_size: usize
     pub var side: i64
     pub var order: i64
@@ -141,7 +143,7 @@ pub func aligned_refined(set: interop.Reference[GeometrySet], input: str, master
     let across: i64 = -1
     var m = try master_of(set, master, across if opts.kind != align_uv else uv_direction(opts), opts.vector)
     defer m.close()
-    if what.curve: return try align_curve(set, &what, &m, opts)
+    if what.curve: return try align_curve(set, &what, &m, master, opts)
     var w = empty_shape(0.0)
     defer w.close()
     let (body, f) = try face_place(set, what.name, &w)
@@ -195,16 +197,12 @@ pub func aligned_refined(set: interop.Reference[GeometrySet], input: str, master
     let count = fewer(turned_now.nu, order + 1 + (usize)math.max(0.0, (f64)opts.extra))
     for i in 0..<count:
         for j in 0..<turned_now.nv: try rows.push(turned_now.points.items[i * turned_now.nv + j].point())
-    # The hull as it was (Alias's proxy display): each aligned CV's place
-    # on the surface before the align, at its Greville parameters.
+    # The hull as it was (Alias's proxy display): the input's own control
+    # points before the align, row by row from the edge.
     var turned_before = try turned(&before, side, false)
     defer turned_before.close()
-    for i in 0..<count:
-        let gu = (greville(turned_now.ku.view(), i, turned_now.du) - turned_now.u_low()) / (turned_now.u_high() - turned_now.u_low())
-        for j in 0..<turned_now.nv:
-            let gv = (greville(turned_now.kv.view(), j, turned_now.dv) - turned_now.v_low()) / (turned_now.v_high() - turned_now.v_low())
-            try proxy.push(turned_before.point_at(turned_before.u_low() + (turned_before.u_high() - turned_before.u_low()) * gu, turned_before.v_low() + (turned_before.v_high() - turned_before.v_low()) * gv))
-    return Aligned(result, report, rows, proxy, turned_now.nv, side, (i64)order)
+    for q in turned_before.points.view(): try proxy.push(q.point())
+    return Aligned(result, report, rows, proxy, turned_before.nv, turned_now.nv, side, (i64)order)
 
 ## The U/V type's direction (Alias's: the master's U, else V), from the
 ## vector's x: 0 U, 1 V.
@@ -297,7 +295,7 @@ func project_cos(set: interop.Reference[GeometrySet], m: const Master*, net: con
 ## A curve's end aligned: its CVs from that end are the rows, one each
 ## (align.lucb's rows at a single station); the curve replaced in the set.
 ## Modify Both on a free master curve moves its end to the middle too.
-func align_curve(set: interop.Reference[GeometrySet], what: const Input*, m: Master*, opts: const AlignOptions*) -> Aligned!:
+func align_curve(set: interop.Reference[GeometrySet], what: const Input*, m: Master*, master: str, opts: const AlignOptions*) -> Aligned!:
     let index = try CadCurves.find(set, what.name)
     if index < 0: error(invalid, "Align: the curve is no longer in the model: pick it again")
     let on = try CadCurves.face(set, index)
@@ -321,8 +319,12 @@ func align_curve(set: interop.Reference[GeometrySet], what: const Input*, m: Mas
     var report = empty_report()
     var result = set.clone()
     errdefer result.release()
-    if opts.both:
-        if m.kind != master_curve or m.has_face: error(invalid, "Align (Modify Both) on a curve needs a free master curve")
+    if opts.both and not (m.kind == master_curve and not m.has_face):
+        # A surface master: both to the middle (align_both.lucb).
+        let moved = try curve_both_surface(result, m, master, &c, opts, order, extra, &report)
+        result.release()
+        result = moved
+    elif opts.both:
         let other_index = try master_curve_index(set, m)
         let other_held = try CadCurves.curve(set, other_index)
         defer other_held.release()
@@ -368,9 +370,8 @@ func align_curve(set: interop.Reference[GeometrySet], what: const Input*, m: Mas
     errdefer rows.close()
     var proxy = Growing[Vector3]()
     errdefer proxy.close()
-    for i in 0..<fewer(c.points.count, order + 1 + extra):
-        try rows.push(c.points.items[i].point())
-        try proxy.push(start_cvs.items[fewer(i, start_cvs.count - 1)])
+    for i in 0..<fewer(c.points.count, order + 1 + extra): try rows.push(c.points.items[i].point())
+    for p in start_cvs.view(): try proxy.push(p)
     if at_end:
         let restored = try reversed_spline(&c)
         c.close()
@@ -380,7 +381,7 @@ func align_curve(set: interop.Reference[GeometrySet], what: const Input*, m: Mas
     let next = try CadCurves.with_curve(result, what.name, aligned_curve)
     result.release()
     result = next
-    return Aligned(result, report, rows, proxy, 1, 1 if at_end else 0, (i64)order)
+    return Aligned(result, report, rows, proxy, 1, 1, 1 if at_end else 0, (i64)order)
 
 ## The set's index of a free master curve.
 func master_curve_index(set: interop.Reference[GeometrySet], m: const Master*) -> i64!:

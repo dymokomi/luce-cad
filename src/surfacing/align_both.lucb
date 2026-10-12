@@ -1,0 +1,107 @@
+## Modify Both for a curve whose master is a surface (Align's Both, Rhino's
+## Average, for a curve end against an edge, an isoparm, a curve on a face
+## or the face): the two meet in the middle. The surface is bent locally so
+## the point the curve met moves halfway to the curve's end: its control
+## points moved by a smooth bump in its chart, (1 - d²/r²)³ of their
+## Greville places' distance d within r (a quarter of the chart), scaled so
+## the point lands exactly; the curves lying on that face are lifted onto
+## it again from their chart curves; then the curve's end is aligned to the
+## surface as it now is, G0 to G3. (Two free curves average their jets
+## instead, align_apply.lucb.)
+
+## The bump's reach in the master face's chart (0 to 1 each way).
+let both_reach: f64 = 0.25
+
+## `set` with the master's face bent to the middle and the curve `c` (its
+## start at the joint, ready) aligned to it; returns the set.
+func curve_both_surface(set: interop.Reference[GeometrySet], m: Master*, master: str, c: Spline*, opts: const AlignOptions*, order: usize, extra: usize, report: AlignReport*) -> interop.Reference[GeometrySet]!:
+    if not m.has_face: error(invalid, "Align (Modify Both): the master has no surface to move")
+    let p0 = c.point_at(c.low())
+    let own = try curve_arc(c)
+    var mm = 0.0
+    if m.kind == master_edge or m.kind == master_isoparm or m.kind == master_curve:
+        mm = opts.attach if opts.attach >= 0.0 else m.nearest(p0)
+    let probe = Probe(p0, Vector3(), own.d[1], own)
+    let goal = try m.target(mm, &probe, 0.0)
+    let delta = p0.add(goal.p).multiply_scalar(0.5).subtract(goal.p)
+    let face = m.w.face_name(m.f)
+    var w = empty_shape(0.0)
+    defer w.close()
+    let (body, f) = try face_place(set, face, &w)
+    let tolerance = align_tolerance(&w)
+    var net = try plain_net(&w, f, tolerance)
+    defer net.close()
+    var before = try net.copy()
+    defer before.close()
+    var s = try surface_of(&net)
+    defer s.close()
+    let uv = try nearest_parameters(s, goal.p, Vector3(0.5, 0.5, 0.0), true)
+    # The bump's weight at each control point, and its sum at the point.
+    var weights = Growing[f64]()
+    defer weights.close()
+    for i in 0..<net.nu:
+        let gu = (greville(net.ku.view(), i, net.du) - net.u_low()) / (net.u_high() - net.u_low())
+        for j in 0..<net.nv:
+            let gv = (greville(net.kv.view(), j, net.dv) - net.v_low()) / (net.v_high() - net.v_low())
+            let d = math.hypot(gu - uv.x, gv - uv.y) / both_reach
+            let b = 1.0 - d * d
+            try weights.push(b * b * b if d < 1.0 else 0.0)
+    var bu: f64[12]
+    var bv: f64[12]
+    let fu = nurbs_basis(net.ku.view(), (i64)net.nu, net.du, net.u_low() + (net.u_high() - net.u_low()) * uv.x, &bu)
+    let fv = nurbs_basis(net.kv.view(), (i64)net.nv, net.dv, net.v_low() + (net.v_high() - net.v_low()) * uv.y, &bv)
+    var total = 0.0
+    for i in 0..<(usize)net.du + 1:
+        for j in 0..<(usize)net.dv + 1: total += bu[i] * bv[j] * weights.items[(fu + i) * net.nv + fv + j]
+    if not (total > 1e-6): error(invalid, "Align (Modify Both): the surface has too few control points near the joint to move it")
+    for at in 0..<net.points.count:
+        net.points.items[at] = weighted(net.points.items[at].point().add(delta.multiply_scalar(weights.items[at] / total)), 1.0)
+    let models = set_models(try set.get())
+    # The bent face is built to the align's tolerance (its net was made
+    # polynomial within it), not the body's own finer one.
+    w.tolerance = math.max(w.tolerance, tolerance)
+    let made = try with_net(models[body].value(), &w, f, &net, &before)
+    defer made.release()
+    let one: interop.Reference[CadModel][1] = [made]
+    let written = try with_body(set, (i64)body, one[..<1])
+    defer written.release()
+    let lifted = try relifted(written, face, tolerance)
+    errdefer lifted.release()
+    # The curve's end to the surface as it now is.
+    var again = try master_of(lifted, master, m.across, m.vector)
+    defer again.close()
+    var mm_again = 0.0
+    if again.kind == master_edge or again.kind == master_isoparm or again.kind == master_curve:
+        mm_again = opts.attach if opts.attach >= 0.0 else again.nearest(p0.add(delta))
+    let target = try again.target(mm_again, &probe, opts.skew[0] * math.pi / 180.0)
+    try align_curve_end(c, target, opts, order, extra, report)
+    return lifted
+
+## `set` with the curves lying on face `face` lifted onto its surface
+## again from their chart curves (after the face moved), within
+## `tolerance`.
+func relifted(set: interop.Reference[GeometrySet], face: str, tolerance: f64) -> interop.Reference[GeometrySet]!:
+    var result = set.clone()
+    errdefer result.release()
+    let count = try CadCurves.count(set)
+    for index in 0..<count:
+        let on = try CadCurves.face(set, index)
+        defer on.release()
+        if on.value != face: continue
+        var w = empty_shape(0.0)
+        defer w.close()
+        let (held_body, f) = try face_place(result, face, &w)
+        _ = held_body
+        let chart = try CadCurves.chart_curve(set, index)
+        defer chart.release()
+        var deviation = 0.0
+        let curve = try held_spline(try face_curve(&w.surfaces.items[(usize)w.faces.items[f].surface], spline_in(chart.value()), tolerance, &deviation))
+        defer curve.release()
+        let name = try CadCurves.name(set, index)
+        defer name.release()
+        let source = try CadCurves.source(set, index)
+        defer source.release()
+        let next = try CadCurves.with_curve(result, name.value, curve, try CadCurves.visible(set, index), source.value, face, chart)
+        result.release()
+        result = next
+    return result

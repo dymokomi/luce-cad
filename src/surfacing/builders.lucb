@@ -1,0 +1,381 @@
+## Surfacing Stage 5 (luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md
+## §4.6, §6.6): surfaces built from curves. Square (four boundaries, each
+## Free, G0, G1, G2, Implied or at a Tangent Angle), Skin (a loft through
+## sections), Rail and Profile (sections swept along rails), Set Planar
+## (a planar fill of closed curves), the sheet Extrude and Revolve of a
+## free curve, and Extend (a surface's edge carried on Linear, Natural,
+## Soft or Reflective). Each makes a new body of one sheet (Extend changes
+## its face) and is what CadSurfaceBuild calls (build_api.lucb).
+##
+## This file: what the builders share. Their curves are named as Align's
+## masters are ("curve <name>", "edge <face> x y z", "isoparm <face> <0 or
+## 1> <fraction>"; align_master.lucb), so a builder can ask the face a
+## boundary lies on for its cross derivatives; curves made compatible (one
+## degree, one knot vector, on 0..1); Bezier rows from end derivatives (a
+## Hermite interpolation of curves, exact); nets made alike and added.
+
+## The curves `text` names (words apart by `;`) as masters, onto `out`.
+func builder_masters(set: interop.Reference[GeometrySet], text: str, out: Growing[Master]*) -> !:
+    let bytes = text.bytes
+    var start: usize = 0
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 59: continue
+        let words = (str)bytes[start..<at]
+        start = at + 1
+        if words.length == 0: continue
+        try out.push(try master_of(set, words, -1, Vector3()))
+
+func close_masters(list: Growing[Master]*):
+    for m in list.view():
+        var owned = m
+        owned.close()
+    list.close()
+
+func close_splines_of(list: Growing[Spline]*):
+    for s in list.view():
+        var owned = s
+        owned.close()
+    list.close()
+
+## Whether `c`'s weights all agree (a polynomial curve).
+func plain_weights(c: const Spline*) -> bool:
+    let w0 = c.points.items[0].w
+    for q in c.points.view():
+        if math.abs(q.w - w0) > 1e-12 * math.abs(w0): return false
+    return true
+
+## The domain's distinct spans of `c`.
+func span_count(c: const Spline*) -> usize:
+    var spans: usize = 0
+    for k in (usize)c.degree..<c.points.count:
+        if c.knots.items[k + 1] > c.knots.items[k]: spans += 1
+    return spans
+
+## `c` as a polynomial curve (weights 1): its own points when its weights
+## agree, else refitted at degree 5 (or its own, if higher) on equal
+## spans, doubled until within `tolerance` (a circle's arc takes a few
+## quintic spans to a ten-millionth). Its ends keep their curvature.
+func plain_curve(c: const Spline*, tolerance: f64) -> Spline!:
+    if plain_weights(c):
+        var made = try c.copy()
+        for at in 0..<made.points.count: made.points.items[at] = weighted(made.points.items[at].point(), 1.0)
+        return made
+    let degree = (i64)math.max(5.0, (f64)c.degree)
+    var spans = (usize)math.max(1.0, (f64)span_count(c))
+    while true:
+        var knots = Growing[f64]()
+        defer knots.close()
+        try uniform_knots(degree, spans, c.low(), c.high(), &knots)
+        let count = spans + (usize)degree
+        let keep: usize = 2 if count >= 6 else 0
+        var made = try refit_curve(c, degree, knots.view(), keep, false)
+        let off = curve_deviation(c, &made, 64 * spans)
+        if off <= tolerance or spans >= 256: return made
+        made.close()
+        spans *= 2
+    error(invalid, "unreachable")
+
+## The size of `curves` together: their hulls' box diagonal.
+func curves_size(curves: const Spline[]) -> f64:
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for c in curves:
+        for q in c.points.view():
+            let p = q.point()
+            low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+            high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    return high.subtract(low).length()
+
+## The tolerance builders fit to: a ten-millionth of what they span.
+func build_tolerance(curves: const Spline[]) -> f64:
+    return math.max(1e-12, curves_size(curves) * 1e-7)
+
+## `curves` made compatible: on 0..1, one degree (the highest of theirs,
+## at least `least`) and one knot vector (each one's inner knots inserted
+## into the others to the most any has). The same curves.
+func make_compatible(curves: Growing[Spline]*, least: i64) -> !:
+    var degree = least
+    for c in curves.view(): degree = (i64)math.max((f64)degree, (f64)c.degree)
+    for at in 0..<curves.count:
+        unit_domain(&curves.items[at])
+        let c = &curves.items[at]
+        if c.degree < degree: try elevate(c, (usize)(degree - c.degree))
+    # Every distinct inner knot with the most multiplicity any curve gives
+    # it (knots a billionth apart are one).
+    var values = Growing[f64]()
+    defer values.close()
+    var counts = Growing[usize]()
+    defer counts.close()
+    for c in curves.view():
+        var inner = Growing[f64]()
+        defer inner.close()
+        try distinct_inner(&c, 1e-9, &inner)
+        for u in inner.view():
+            let m = multiplicity(c.knots.view(), u, 1e-9)
+            var found = false
+            for k in 0..<values.count:
+                if math.abs(values.items[k] - u) <= 1e-9:
+                    counts.items[k] = fewer(counts.items[k] if counts.items[k] > m else m, (usize)degree)
+                    found = true
+            if not found:
+                try values.push(u)
+                try counts.push(fewer(m, (usize)degree))
+    for at in 0..<curves.count:
+        let c = &curves.items[at]
+        for k in 0..<values.count:
+            var u = values.items[k]
+            for q in c.knots.view():
+                if math.abs(q - u) <= 1e-9: u = q
+            let have = multiplicity(c.knots.view(), u, 0.0)
+            if counts.items[k] > have: _ = try insert_knot(c, u, counts.items[k] - have)
+    # One knot vector: the first's (the others' differ by rounding).
+    for at in 1..<curves.count:
+        if curves.items[at].knots.count != curves.items[0].knots.count: error(invalid, "the curves could not be made compatible")
+        try curves.items[at].knots.assign(curves.items[0].knots.view())
+
+## The falling factorial n (n - 1) ... (n - k + 1).
+func falling(n: usize, k: usize) -> f64:
+    var f = 1.0
+    for i in 0..<k: f *= (f64)(n - i)
+    return f
+
+## Bezier rows of degree n = `first` + `last` - 1 (u from 0 to 1), each
+## `size` homogeneous points, from derivatives: `starts` holds the k-th
+## derivative at u = 0 for k < `first` (row k at [k size ..< (k + 1)
+## size]), `ends` at u = 1 for k < `last`. The rows onto `out`. A Bezier's
+## k-th derivative at its start comes from its first k + 1 points,
+## n!/(n - k)! Σ (-1)^(k-i) C(k, i) P_i, so each row is solved in turn;
+## at its end likewise from its last ones.
+func hermite_rows(starts: const Weighted[], first: usize, ends: const Weighted[], last: usize, size: usize, out: Growing[Weighted]*) -> !:
+    let n = first + last - 1
+    out.clear()
+    try out.fill((n + 1) * size, Weighted(0.0, 0.0, 0.0, 0.0))
+    for j in 0..<first:
+        for at in 0..<size:
+            var sum = starts[j * size + at].times(1.0 / falling(n, j))
+            for i in 0..<j:
+                let sign = -1.0 if (j - i) % 2 == 1 else 1.0
+                sum = sum.minus(out.items[i * size + at].times(sign * choose(j, i)))
+            out.items[j * size + at] = sum
+    for j in 0..<last:
+        for at in 0..<size:
+            var sum = ends[j * size + at].times(1.0 / falling(n, j))
+            for i in 1..<j + 1:
+                let sign = -1.0 if (j - i) % 2 == 1 else 1.0
+                sum = sum.minus(out.items[(n - j + i) * size + at].times(sign * choose(j, i)))
+            out.items[(n - j) * size + at] = sum.times(-1.0 if j % 2 == 1 else 1.0)
+
+## Bezier knots of degree `n` on 0..1.
+func bezier_knots(n: usize, out: Growing[f64]*) -> !:
+    out.clear()
+    for _ in 0..<n + 1: try out.push(0.0)
+    for _ in 0..<n + 1: try out.push(1.0)
+
+## A net from rows: `rows` holds `count` rows of `size` points (row i at
+## [i size ..< (i + 1) size]); with `across_u` the rows run along v at
+## successive u (u-major as the net), else along u at successive v.
+## `row_knots` (degree `row_degree`) are the knots along each row, and the
+## other direction is a Bezier of degree count - 1.
+func rows_net(rows: const Weighted[], count: usize, size: usize, row_knots: const f64[], row_degree: i64, across_u: bool) -> Net!:
+    var made = empty_net()
+    errdefer made.close()
+    var bezier = Growing[f64]()
+    defer bezier.close()
+    try bezier_knots(count - 1, &bezier)
+    if across_u:
+        made.du = (i64)count - 1
+        made.dv = row_degree
+        made.nu = count
+        made.nv = size
+        try made.ku.assign(bezier.view())
+        try made.kv.assign(row_knots)
+        try made.points.assign(rows)
+        return made
+    made.du = row_degree
+    made.dv = (i64)count - 1
+    made.nu = size
+    made.nv = count
+    try made.ku.assign(row_knots)
+    try made.kv.assign(bezier.view())
+    try made.points.fill(size * count, Weighted(0.0, 0.0, 0.0, 0.0))
+    for j in 0..<count:
+        for i in 0..<size: made.points.items[i * count + j] = rows[j * size + i]
+    return made
+
+## `a` and `b` made alike along `direction` (0 u, 1 v; both on 0..1): one
+## degree and one knot vector. The same surfaces.
+func match_direction(a: Net*, b: Net*, direction: i64) -> !:
+    let da = a.du if direction == 0 else a.dv
+    let db = b.du if direction == 0 else b.dv
+    if da < db: try net_elevate(a, direction, (usize)(db - da))
+    if db < da: try net_elevate(b, direction, (usize)(da - db))
+    for pass in 0..<2:
+        let from_net = b if pass == 0 else a
+        let into = a if pass == 0 else b
+        var inner = Growing[f64]()
+        defer inner.close()
+        var counts = Growing[usize]()
+        defer counts.close()
+        let knots = from_net.ku.view() if direction == 0 else from_net.kv.view()
+        let low = knots[(usize)(from_net.du if direction == 0 else from_net.dv)]
+        let high = knots[from_net.nu if direction == 0 else from_net.nv]
+        for k in knots:
+            if k <= low + 1e-9 or k >= high - 1e-9: continue
+            if inner.count > 0 and math.abs(inner.items[inner.count - 1] - k) <= 1e-9: continue
+            try inner.push(k)
+            try counts.push(multiplicity(knots, k, 1e-9))
+        for at in 0..<inner.count:
+            let target = into.ku.view() if direction == 0 else into.kv.view()
+            let have = multiplicity(target, inner.items[at], 1e-9)
+            if counts.items[at] > have: _ = try net_insert(into, direction, inner.items[at], counts.items[at] - have)
+    # One knot vector (they differ by rounding at most).
+    let ka = a.ku.view() if direction == 0 else a.kv.view()
+    let kb = b.ku.view() if direction == 0 else b.kv.view()
+    if ka.length != kb.length: error(invalid, "two nets could not be made alike")
+    if direction == 0: try b.ku.assign(a.ku.view())
+    else: try b.kv.assign(a.kv.view())
+
+## `a` + `scale` `b`, point by point (alike nets), into `a`.
+func add_net(a: Net*, b: const Net*, scale: f64) -> !:
+    if a.points.count != b.points.count: error(invalid, "nets to add are not alike")
+    for at in 0..<a.points.count: a.points.items[at] = a.points.items[at].plus(b.points.items[at].times(scale))
+
+## A body of one face on `net`, named `name`, facing along Su x Sv with
+## `sense` (the builders' sheets).
+func net_body(net: const Net*, name: str, sense: bool) -> interop.Reference[CadModel]!:
+    return try net_body_within(net, name, sense, 0.0)
+
+## net_body with the body's tolerance at least `tolerance` (a billionth of
+## the net's size otherwise).
+func net_body_within(net: const Net*, name: str, sense: bool, tolerance: f64) -> interop.Reference[CadModel]!:
+    var points = Growing[Vector3]()
+    defer points.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for q in net.points.view():
+        let p = q.point()
+        if not p.is_finite(): error(invalid, "the surface came out with points at infinity")
+        try points.push(p)
+        try weights.push(q.w)
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    return try spline_face(points.view(), weights.view(), (i64)net.nu, (i64)net.nv, net.du, net.dv, net.ku.view(), net.kv.view(), sense, name, math.max(tolerance, high.subtract(low).length() * 1e-9))
+
+## `set` with `model` added as a body after its others.
+func with_body_added(set: interop.Reference[GeometrySet], model: interop.Reference[CadModel]) -> interop.Reference[GeometrySet]!:
+    let source = try set.get()
+    var list = Growing[interop.Reference[CadModel]]()
+    defer list.close()
+    for m in set_models(source): try list.push(m)
+    try list.push(model)
+    return try with_models(source, list.view())
+
+## The homogeneous derivatives of `c` at `t` to `order` (from below with
+## `left`): for a polynomial curve (weights 1, or 0 for a field of
+## vectors) these are its own.
+func field_jet(c: const Spline*, t: f64, order: usize, left: bool) -> Jet!:
+    var a: Weighted[6]
+    try homogeneous_jet(c, t, order, left, &a)
+    var j = empty_jet()
+    for k in 0..<order + 1: j.d[k] = Vector3(a[k].x, a[k].y, a[k].z)
+    return j
+
+## The cubic Hermite at `t` of values `a`, `b` and slopes `da`, `db`.
+func cubic_hermite(a: Vector3, da: Vector3, b: Vector3, db: Vector3, t: f64) -> Vector3:
+    let t2 = t * t
+    let t3 = t2 * t
+    return a.multiply_scalar(2.0 * t3 - 3.0 * t2 + 1.0).add(da.multiply_scalar(t3 - 2.0 * t2 + t)).add(b.multiply_scalar(-2.0 * t3 + 3.0 * t2)).add(db.multiply_scalar(t3 - t2))
+
+## The normal of the plane a curve lies in (Implied continuity): from the
+## chord and the control point furthest off it; zero when it is straight
+## or not planar within `tolerance`.
+func curve_plane(c: const Spline*, tolerance: f64) -> Vector3:
+    let a = c.points.items[0].point()
+    let b = c.points.items[c.points.count - 1].point()
+    var chord = b.subtract(a)
+    if chord.length() <= tolerance:
+        chord = c.points.items[c.points.count // 2].point().subtract(a)
+    var far = Vector3()
+    var most = 0.0
+    for q in c.points.view():
+        let d = q.point().subtract(a)
+        let off = d.cross(chord).length() / math.max(1e-300, chord.length())
+        if off > most:
+            most = off
+            far = d
+    if most <= tolerance: return Vector3()
+    let n = chord.cross(far).normalized() catch failure: return Vector3()
+    for q in c.points.view():
+        if math.abs(q.point().subtract(a).dot(n)) > tolerance * 10.0: return Vector3()
+    return n
+
+## `net` as a polynomial net (weights 1): its own points when its weights
+## agree, else refitted at degree 5 at least within `tolerance` (Align
+## moves rows of plain control points).
+func polynomial_net(net: const Net*, tolerance: f64) -> Net!:
+    if not net.rational():
+        var made = try net.copy()
+        for at in 0..<made.points.count: made.points.items[at] = weighted(made.points.items[at].point(), 1.0)
+        return made
+    var deviation = 0.0
+    let su = (usize)math.max(1.0, (f64)(net.nu - (usize)net.du))
+    let sv = (usize)math.max(1.0, (f64)(net.nv - (usize)net.dv))
+    return try refit_within(net, (i64)math.max(5.0, (f64)net.du), (i64)math.max(5.0, (f64)net.dv), su, sv, 64, 2, 2, false, tolerance, &deviation)
+
+## Side `side` of `net` (0 u = 0, 1 u = 1, 2 v = 0, 3 v = 1) matched
+## G`order` (1 to 3) to `master` (the face its boundary lies on) by Align's
+## rows (align.lucb): the input's own hull, Explicit Control off (quintic
+## across, spans added for the rows), Refine to Alias's limits. A builder's
+## continuity at a boundary picked as an edge or a curve on a face.
+func match_side(net: Net*, side: i64, master: Master*, order: i64, tolerance: f64) -> !:
+    if not master.has_face: error(invalid, "G1 and above need the boundary on a surface: pick an edge, or a curve on a face")
+    var plain = try polynomial_net(net, tolerance)
+    errdefer plain.close()
+    let opts = AlignOptions(order, align_edge, Vector3(), 0.0, false, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0], false, false, 0, 0.0, false, 0.0, 1.0, false, false, 0, 0, 0, 0,
+                            true, 16, [tolerance * 10.0, 0.01, 0.1, 0.1], [0.0, 0.0], -1.0, false, false)
+    var report = empty_report()
+    try align_side(&plain, side, master, &opts, &report)
+    net.close()
+    *net = plain
+
+## The interpolation across `count` sections at `params` (increasing, 0 to
+## 1) by a B-spline of `degree` (at most count - 1) on averaged knots onto
+## `knots`; the collocation matrix (count by count, row major) onto
+## `matrix` (The NURBS Book A9.1).
+func collocation(params: const f64[], degree: usize, knots: Growing[f64]*, matrix: Growing[f64]*) -> !:
+    let n = params.length
+    knots.clear()
+    for _ in 0..<degree + 1: try knots.push(0.0)
+    for j in 1..<n - degree:
+        var sum = 0.0
+        for i in j..<j + degree: sum += params[i]
+        try knots.push(sum / (f64)degree)
+    for _ in 0..<degree + 1: try knots.push(1.0)
+    matrix.clear()
+    try matrix.fill(n * n, 0.0)
+    for r in 0..<n:
+        var values: f64[12]
+        let first = bases_at(knots.view(), n, degree, params[r], false, &values)
+        for j in 0..<degree + 1: matrix.items[r * n + first + j] = values[j]
+
+## The homogeneous points `values` (one per parameter) interpolated by the
+## collocation `matrix` (n by n): the control points onto `out`.
+func interpolate_points(matrix: const f64[], values: const Weighted[], out: Growing[Weighted]*) -> !:
+    let n = values.length
+    var a = Growing[f64]()
+    defer a.close()
+    var xyz = Growing[Vector3]()
+    defer xyz.close()
+    var w = Growing[Vector3]()
+    defer w.close()
+    for q in values:
+        try xyz.push(Vector3(q.x, q.y, q.z))
+        try w.push(Vector3(q.w, 0.0, 0.0))
+    try a.assign(matrix)
+    try solve_dense(&a, n, &xyz)
+    try a.assign(matrix)
+    try solve_dense(&a, n, &w)
+    out.clear()
+    for k in 0..<n: try out.push(Weighted(xyz.items[k].x, xyz.items[k].y, xyz.items[k].z, w.items[k].x))

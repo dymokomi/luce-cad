@@ -1,0 +1,556 @@
+## Rail and Profile (surfacing Stage 5: Alias's Rail Surface and Profile,
+## Rhino's Sweep1 and Sweep2, Plasticity's Sweep; §4.6 and §6.6 of
+## luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md): sections swept
+## along a rail, or between two.
+##
+## Each generation curve (a profile) is placed where it comes nearest the
+## rail and kept in the rail's frame there, its control points as offsets
+## along the frame's axes. Along the rail a section is those offsets
+## blended between the curves on either side (Rail's Gen Blend: linearly,
+## by a bias; Profile's Transition: Linear, Local, Global or Limited) and
+## put back in the frame at that place:
+##   Natural (and Alias's Proportional with one generation curve): a
+##     rotation-minimizing frame, transported by double reflection (Wang,
+##     Jüttler, Zheng and Liu 2008), so a circle swept round a circle
+##     turns with it and makes a torus;
+##   Parallel: no turning, the offsets only carried along;
+##   Vector (Alias's View): the frame keeps a fixed direction up;
+##   Surface normal (Profile on a curve on a face): the face's normal up.
+## With two rails each section reaches from the first rail to the second:
+## its offsets along the chord between them, scaled to it uniformly
+## (Scale), along it only (Non-proportional) or not at all (Rotate).
+## The surface is the sections' control points fitted along the rail at
+## degree 5, the first and last exactly, spans doubled until the sections
+## between lie within a ten-millionth. A rail or the first or last
+## generation curve on a surface matches that side G1 to G3 (Align's
+## rows).
+
+pub let sweep_natural: i64 = 0
+pub let sweep_parallel: i64 = 1
+pub let sweep_vector: i64 = 2
+pub let sweep_normal: i64 = 3
+
+pub let two_rail_scale: i64 = 0
+pub let two_rail_stretch: i64 = 1
+pub let two_rail_rotate: i64 = 2
+
+pub let transition_linear: i64 = 0
+pub let transition_local: i64 = 1
+pub let transition_global: i64 = 2
+pub let transition_limited: i64 = 3
+
+## A sweep's options: the frame mode, its vector, two rails' transform,
+## the blend between sections (a transition, Rail's bias), each side's
+## continuity (the first rail, the second, the first section, the last).
+pub struct SweepOptions:
+    pub var mode: i64
+    pub var vector: Vector3
+    pub var transform: i64
+    pub var transition: i64
+    pub var bias: f64
+    pub var continuity: i64[4]
+
+## The rail's frames, sampled finely: points, tangents and reference
+## directions (square to the tangent), transported by the mode.
+struct Frames:
+    var params: Growing[f64]
+    var points: Growing[Vector3]
+    var tangents: Growing[Vector3]
+    var ups: Growing[Vector3]
+
+    func close():
+        self.params.close()
+        self.points.close()
+        self.tangents.close()
+        self.ups.close()
+
+## A direction square to `t`.
+func square_to(t: Vector3) -> Vector3!:
+    let seed = Vector3(1.0, 0.0, 0.0) if math.abs(t.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+    return try seed.subtract(t.multiply_scalar(seed.dot(t))).normalized()
+
+## The frame of `frames` at `t` (point, tangent, up), one double
+## reflection on from the sample before it (natural), or the mode's.
+func frame_at(rail: const Spline*, frames: const Frames*, mode: i64, vector: Vector3, normals: Master*, t: f64) -> (Vector3, Vector3, Vector3)!:
+    let j = try curve_jet(rail, t, 1, t >= rail.high())
+    let x = j.d[0]
+    let tangent = j.d[1].normalized() catch failure: error(invalid, "Rail: the rail stops (its tangent vanishes)")
+    if mode == sweep_vector:
+        let up = vector.subtract(tangent.multiply_scalar(vector.dot(tangent))).normalized() catch failure: error(invalid, "Rail: the vector runs along the rail")
+        return (x, tangent, up)
+    if mode == sweep_normal:
+        let probe = Probe(x, tangent, try square_to(tangent), empty_jet())
+        let goal = try normals.target(normals.nearest(x), &probe, 0.0)
+        let up = goal.n.subtract(tangent.multiply_scalar(goal.n.dot(tangent))).normalized() catch failure: error(invalid, "Profile: the face's normal runs along the rail")
+        return (x, tangent, up)
+    # The sample at or before t, then one reflection pair on.
+    let count = frames.params.count
+    var k = (usize)math.clamp(math.floor(t * (f64)(count - 1)), 0.0, (f64)(count - 1))
+    while k > 0 and frames.params.items[k] > t: k -= 1
+    return (x, tangent, reflected(frames.points.items[k], frames.tangents.items[k], frames.ups.items[k], x, tangent))
+
+## Double reflection: the up `r` at `x` with tangent `t` carried to `x1`
+## with tangent `t1`.
+func reflected(x: Vector3, t: Vector3, r: Vector3, x1: Vector3, t1: Vector3) -> Vector3:
+    let v1 = x1.subtract(x)
+    let c1 = v1.dot(v1)
+    if not (c1 > 1e-300): return r
+    let rl = r.subtract(v1.multiply_scalar(2.0 * v1.dot(r) / c1))
+    let tl = t.subtract(v1.multiply_scalar(2.0 * v1.dot(t) / c1))
+    let v2 = t1.subtract(tl)
+    let c2 = v2.dot(v2)
+    if not (c2 > 1e-300): return rl
+    return rl.subtract(v2.multiply_scalar(2.0 * v2.dot(rl) / c2))
+
+## The rail's natural frames at 2048 steps (the up starting square to its
+## start, or `start_up` when given).
+func make_frames(rail: const Spline*, start_up: Vector3) -> Frames!:
+    var f = Frames(Growing[f64](), Growing[Vector3](), Growing[Vector3](), Growing[Vector3]())
+    errdefer f.close()
+    let steps: usize = 2048
+    var before = try curve_jet(rail, rail.low(), 1, false)
+    var t0 = try before.d[1].normalized()
+    var up = start_up.subtract(t0.multiply_scalar(start_up.dot(t0))).normalized() catch failure: recover try square_to(t0)
+    for k in 0..<steps + 1:
+        let t = rail.low() + (rail.high() - rail.low()) * (f64)k / (f64)steps
+        let j = try curve_jet(rail, t, 1, k == steps)
+        let tangent = j.d[1].normalized() catch failure: error(invalid, "Rail: the rail stops (its tangent vanishes)")
+        if k > 0: up = reflected(before.d[0], t0, up, j.d[0], tangent)
+        try f.params.push(t)
+        try f.points.push(j.d[0])
+        try f.tangents.push(tangent)
+        try f.ups.push(up)
+        before = j
+        t0 = tangent
+    return f
+
+## A curve's arc length by its parameter: the length at 1024 equal steps
+## of its domain, each step by five-point Gauss-Legendre.
+struct ArcTable:
+    var lengths: Growing[f64]
+
+    func close():
+        self.lengths.close()
+
+    func total() -> f64:
+        return self.lengths.items[self.lengths.count - 1]
+
+## |c'| integrated from `a` to `b` (one Gauss-Legendre rule).
+func arc_piece(c: const Spline*, a: f64, b: f64) -> f64!:
+    let nodes: f64[5] = [0.0, -0.5384693101056831, 0.5384693101056831, -0.9061798459386640, 0.9061798459386640]
+    let weights: f64[5] = [0.5688888888888889, 0.4786286704993665, 0.4786286704993665, 0.2369268850561891, 0.2369268850561891]
+    var sum = 0.0
+    for k in 0..<(usize)5:
+        let t = (a + b) * 0.5 + (b - a) * 0.5 * nodes[k]
+        let j = try curve_jet(c, t, 1, false)
+        sum += weights[k] * j.d[1].length()
+    return sum * (b - a) * 0.5
+
+func arc_table(c: const Spline*) -> ArcTable!:
+    var table = ArcTable(Growing[f64]())
+    errdefer table.close()
+    let steps: usize = 1024
+    var run = 0.0
+    try table.lengths.push(0.0)
+    for k in 0..<steps:
+        let a = c.low() + (c.high() - c.low()) * (f64)k / (f64)steps
+        let b = c.low() + (c.high() - c.low()) * (f64)(k + 1) / (f64)steps
+        run += try arc_piece(c, a, b)
+        try table.lengths.push(run)
+    if not (run > 0.0): error(invalid, "Rail: the rail has no length")
+    return table
+
+## The parameter of `c` at fraction `s` of its length: from the table's
+## step, Newton on the length (smooth in s, so the sweep's sections are).
+func arc_param(c: const Spline*, table: const ArcTable*, s: f64) -> f64!:
+    let want = math.clamp(s, 0.0, 1.0) * table.total()
+    let steps = table.lengths.count - 1
+    var k: usize = 0
+    var high = steps
+    while k + 1 < high:
+        let middle = (k + high) // 2
+        if table.lengths.items[middle] <= want: k = middle
+        else: high = middle
+    let a = c.low() + (c.high() - c.low()) * (f64)k / (f64)steps
+    let b = c.low() + (c.high() - c.low()) * (f64)(k + 1) / (f64)steps
+    var t = a + (b - a) * (want - table.lengths.items[k]) / math.max(1e-300, table.lengths.items[k + 1] - table.lengths.items[k])
+    for _ in 0..<6:
+        let have = table.lengths.items[k] + try arc_piece(c, a, t)
+        let j = try curve_jet(c, t, 1, false)
+        let speed = j.d[1].length()
+        if not (speed > 0.0): break
+        t = math.clamp(t - (have - want) / speed, a, b)
+    return t
+
+## The fraction of `c`'s length at parameter `t`.
+func arc_fraction(c: const Spline*, table: const ArcTable*, t: f64) -> f64!:
+    let steps = table.lengths.count - 1
+    let f = math.clamp((t - c.low()) / (c.high() - c.low()), 0.0, 1.0)
+    let k = (usize)math.min((f64)(steps - 1), math.floor(f * (f64)steps))
+    let a = c.low() + (c.high() - c.low()) * (f64)k / (f64)steps
+    return (table.lengths.items[k] + try arc_piece(c, a, t)) / table.total()
+
+## What a sweep needs to make a section anywhere along the rail.
+struct Sweeper:
+    var rail: Spline
+    var other: Spline
+    var two: bool
+    var frames: Frames
+    ## The rails' arc lengths: sections are placed and swept by the
+    ## fraction of the rail's length (the rail's own parameter may be only
+    ## C1, a circle's at its quarters; the length is as smooth as the rail).
+    var rail_arc: ArcTable
+    var other_arc: ArcTable
+    ## Each section's control points as offsets (x along the tangent or the
+    ## chord, y up, z the third; homogeneous with its weight), and its
+    ## place along the rail (a fraction of its length).
+    var locals: Growing[Spline]
+    var places: Growing[f64]
+    var mode: i64
+    var vector: Vector3
+    var transform: i64
+    var transition: i64
+    var bias: f64
+
+    func close():
+        self.rail.close()
+        self.other.close()
+        self.frames.close()
+        self.rail_arc.close()
+        self.other_arc.close()
+        for c in self.locals.view():
+            var owned = c
+            owned.close()
+        self.locals.close()
+        self.places.close()
+
+## The frame axes at fraction `s` of the rail's length: origin, then axes x, y, z, and the
+## scale for offsets along x and across (two rails); one rail: the rail's
+## point, tangent, up and their cross, unit scales.
+func axes_at(w: Sweeper*, normals: Master*, s: f64) -> (Vector3, Vector3, Vector3, Vector3, f64, f64)!:
+    let t = try arc_param(&w.rail, &w.rail_arc, s)
+    let (x, tangent, up) = try frame_at(&w.rail, &w.frames, w.mode, w.vector, normals, t)
+    if not w.two: return (x, tangent, up, tangent.cross(up), 1.0, 1.0)
+    let p2 = w.other.point_at(try arc_param(&w.other, &w.other_arc, s))
+    let chord = p2.subtract(x)
+    let length = chord.length()
+    let along = chord.normalized() catch failure: error(invalid, "Rail: the two rails meet")
+    let lift = up.subtract(along.multiply_scalar(up.dot(along))).normalized() catch failure: recover try square_to(along)
+    var across = 1.0
+    if w.transform == two_rail_scale: across = length
+    let stretch = length if w.transform != two_rail_rotate else 1.0
+    return (x, along, lift, along.cross(lift), stretch, across)
+
+## The blend of section offsets at fraction `t` of the rail's length
+## (homogeneous, alike sections).
+func blended(w: const Sweeper*, t: f64, out: Growing[Weighted]*) -> !:
+    let m = w.locals.count
+    let size = w.locals.items[0].points.count
+    out.clear()
+    try out.fill(size, Weighted(0.0, 0.0, 0.0, 0.0))
+    if m == 1 or t <= w.places.items[0]:
+        try out.assign(w.locals.items[0].points.view())
+        return
+    if t >= w.places.items[m - 1]:
+        try out.assign(w.locals.items[m - 1].points.view())
+        return
+    var j: usize = 0
+    while j + 2 < m and t > w.places.items[j + 1]: j += 1
+    let a = w.places.items[j]
+    let b = w.places.items[j + 1]
+    let s = (t - a) / (b - a)
+    if w.transition == transition_global or w.transition == transition_limited:
+        # Each offset coordinate a cubic through all sections: Global the
+        # natural spline's slopes, Limited's kept monotone (no overshoot).
+        for i in 0..<size:
+            var lanes: f64[4] = [0.0, 0.0, 0.0, 0.0]
+            for c in 0..<(usize)4: lanes[c] = try lane_at(w, i, c, j, s, w.transition == transition_limited)
+            out.items[i] = Weighted(lanes[0], lanes[1], lanes[2], lanes[3])
+        return
+    var f = s
+    if w.transition == transition_local: f = s * s * (3.0 - 2.0 * s)
+    elif w.bias > 0.0 and w.bias != 1.0: f = math.pow(s, w.bias)
+    for i in 0..<size: out.items[i] = w.locals.items[j].points.items[i].times(1.0 - f).plus(w.locals.items[j + 1].points.items[i].times(f))
+
+## Coordinate `c` (0 x w, 1 y w, 2 z w, 3 w) of offset `i` between
+## sections `j` and `j` + 1 at `s`: a cubic Hermite whose slopes are the
+## natural spline's through every section (Global), or Fritsch and
+## Carlson's monotone ones (Limited).
+func lane_at(w: const Sweeper*, i: usize, c: usize, j: usize, s: f64, limited: bool) -> f64!:
+    let m = w.locals.count
+    var values = Growing[f64]()
+    defer values.close()
+    for k in 0..<m:
+        let q = w.locals.items[k].points.items[i]
+        try values.push(q.x if c == 0 else (q.y if c == 1 else (q.z if c == 2 else q.w)))
+    var slopes = Growing[f64]()
+    defer slopes.close()
+    try slopes.fill(m, 0.0)
+    let t = w.places.view()
+    if limited:
+        for k in 0..<m:
+            let left = (values.items[k] - values.items[k - 1]) / (t[k] - t[k - 1]) if k > 0 else 0.0
+            let right = (values.items[k + 1] - values.items[k]) / (t[k + 1] - t[k]) if k + 1 < m else 0.0
+            if k == 0: slopes.items[k] = right
+            elif k + 1 == m: slopes.items[k] = left
+            elif left * right <= 0.0: slopes.items[k] = 0.0
+            else: slopes.items[k] = 2.0 / (1.0 / left + 1.0 / right)
+    else:
+        # The natural cubic spline's slopes: a tridiagonal system.
+        var diagonal = Growing[f64]()
+        defer diagonal.close()
+        var upper = Growing[f64]()
+        defer upper.close()
+        var rhs = Growing[f64]()
+        defer rhs.close()
+        for k in 0..<m:
+            let h0 = t[k] - t[k - 1] if k > 0 else 0.0
+            let h1 = t[k + 1] - t[k] if k + 1 < m else 0.0
+            let d0 = (values.items[k] - values.items[k - 1]) / h0 if k > 0 else 0.0
+            let d1 = (values.items[k + 1] - values.items[k]) / h1 if k + 1 < m else 0.0
+            if k == 0:
+                try diagonal.push(2.0 / h1)
+                try upper.push(1.0 / h1)
+                try rhs.push(3.0 * d1 / h1)
+            elif k + 1 == m:
+                try diagonal.push(2.0 / h0)
+                try upper.push(0.0)
+                try rhs.push(3.0 * d0 / h0)
+            else:
+                try diagonal.push(2.0 / h0 + 2.0 / h1)
+                try upper.push(1.0 / h1)
+                try rhs.push(3.0 * (d0 / h0 + d1 / h1))
+        # Thomas: the lower diagonal mirrors the upper (1 / h0).
+        for k in 1..<m:
+            let lower = 1.0 / (t[k] - t[k - 1])
+            let factor = lower / diagonal.items[k - 1]
+            diagonal.items[k] -= factor * upper.items[k - 1]
+            rhs.items[k] -= factor * rhs.items[k - 1]
+        var k = m
+        while k > 0:
+            k -= 1
+            let after = slopes.items[k + 1] if k + 1 < m else 0.0
+            slopes.items[k] = (rhs.items[k] - upper.items[k] * after) / diagonal.items[k]
+    let h = t[j + 1] - t[j]
+    let s2 = s * s
+    let s3 = s2 * s
+    return values.items[j] * (2.0 * s3 - 3.0 * s2 + 1.0) + slopes.items[j] * h * (s3 - 2.0 * s2 + s) + values.items[j + 1] * (-2.0 * s3 + 3.0 * s2) + slopes.items[j + 1] * h * (s3 - s2)
+
+## The section at fraction `t` of the rail's length: the blended offsets
+## in the frame there.
+func section_at(w: Sweeper*, normals: Master*, t: f64, out: Growing[Weighted]*) -> !:
+    var offsets = Growing[Weighted]()
+    defer offsets.close()
+    try blended(w, t, &offsets)
+    let (o, x, y, z, stretch, across) = try axes_at(w, normals, t)
+    out.clear()
+    for q in offsets.view():
+        let p = q.point()
+        if w.mode == sweep_parallel and not w.two:
+            try out.push(weighted(o.add(p), q.w))
+            continue
+        try out.push(weighted(o.add(x.multiply_scalar(p.x * stretch)).add(y.multiply_scalar(p.y * across)).add(z.multiply_scalar(p.z * across)), q.w))
+
+## Section `c` placed on the sweep: where it comes nearest the rail, and
+## its control points as offsets in the frame there.
+func place_section(w: Sweeper*, normals: Master*, c: const Spline*) -> !:
+    # The nearest pair of points (section, rail), by sampling then Newton.
+    var best = 1.0e300
+    var at = 0.0
+    for k in 0..<(usize)65:
+        let p = c.point_at(c.low() + (c.high() - c.low()) * (f64)k / 64.0)
+        let t = spline_nearest(&w.rail, p)
+        let d = w.rail.point_at(t).subtract(p).length()
+        if d < best:
+            best = d
+            at = t
+    let place = try arc_fraction(&w.rail, &w.rail_arc, at)
+    let (o, x, y, z, stretch, across) = try axes_at(w, normals, place)
+    var local = try c.copy()
+    errdefer local.close()
+    for k in 0..<local.points.count:
+        let q = c.points.items[k]
+        let d = q.point().subtract(o)
+        let p = d if w.mode == sweep_parallel and not w.two else Vector3(d.dot(x) / stretch, d.dot(y) / across, d.dot(z) / across)
+        local.points.items[k] = weighted(p, q.w)
+    # In order along the rail.
+    var slot = w.places.count
+    while slot > 0 and w.places.items[slot - 1] > place: slot -= 1
+    if slot < w.places.count and math.abs(w.places.items[slot] - place) < 1e-9: error(invalid, "Rail: two generation curves sit at one place on the rail")
+    try w.places.insert(slot, place)
+    try w.locals.insert(slot, local)
+
+## The knots sections are fitted on: `spans` about evenly, and a knot at
+## every section's place inside the rail as often as the blend's kink
+## there asks (Linear's, Rail's: a corner, five; Local's and Limited's:
+## C1, four; Global's: C2, three), so each piece between is fitted whole.
+func sweep_knots(w: const Sweeper*, spans: usize, out: Growing[f64]*) -> !:
+    out.clear()
+    var times: usize = 5
+    if w.transition == transition_local or w.transition == transition_limited: times = 4
+    if w.transition == transition_global: times = 3
+    var breaks = Growing[f64]()
+    defer breaks.close()
+    try breaks.push(0.0)
+    for place in w.places.view():
+        if place > 1e-6 and place < 1.0 - 1e-6 and w.places.count > 1: try breaks.push(place)
+    try breaks.push(1.0)
+    for _ in 0..<(usize)6: try out.push(0.0)
+    for b in 0..<breaks.count - 1:
+        let a = breaks.items[b]
+        let c = breaks.items[b + 1]
+        let pieces = (usize)math.max(1.0, math.ceil((c - a) * (f64)spans))
+        for k in 1..<pieces: try out.push(a + (c - a) * (f64)k / (f64)pieces)
+        if b + 2 < breaks.count:
+            for _ in 0..<times: try out.push(c)
+    for _ in 0..<(usize)6: try out.push(1.0)
+
+## The sweep's net: sections fitted along the rail (see the file's header).
+func sweep_fit(w: Sweeper*, normals: Master*, tolerance: f64) -> Net!:
+    var spans = (usize)math.max(2.0, (f64)span_count(&w.rail))
+    let size = w.locals.items[0].points.count
+    var section = Growing[Weighted]()
+    defer section.close()
+    while true:
+        var knots = Growing[f64]()
+        defer knots.close()
+        try sweep_knots(w, spans, &knots)
+        var params = Growing[f64]()
+        defer params.close()
+        try fit_parameters(knots.view(), 5, 6, &params)
+        var fitter = try make_fitter(5, knots.view(), params.view(), 0)
+        defer fitter.close()
+        # The sections at the fit's parameters, column by column.
+        var grid = Growing[Weighted]()
+        defer grid.close()
+        for t in params.view():
+            try section_at(w, normals, t, &section)
+            for q in section.view(): try grid.push(q)
+        var made = empty_net()
+        errdefer made.close()
+        made.du = w.locals.items[0].degree
+        made.dv = 5
+        made.nu = size
+        made.nv = knots.count - 6
+        try made.ku.assign(w.locals.items[0].knots.view())
+        try made.kv.assign(knots.view())
+        try made.points.fill(made.nu * made.nv, Weighted(0.0, 0.0, 0.0, 0.0))
+        var values = Growing[Weighted]()
+        defer values.close()
+        var fitted = Growing[Weighted]()
+        defer fitted.close()
+        for i in 0..<size:
+            values.clear()
+            for at in 0..<params.count: try values.push(grid.items[at * size + i])
+            var starts: Weighted[4]
+            var ends: Weighted[4]
+            starts[0] = values.items[0]
+            ends[0] = values.items[values.count - 1]
+            try fitter.fit(values.view(), &starts, &ends, &fitted)
+            for k in 0..<made.nv: made.points.items[i * made.nv + k] = fitted.items[k]
+        # The sections between the fit's, against the fitted columns.
+        var worst = 0.0
+        for k in 0..<4 * spans:
+            let t = ((f64)k + 0.37) / (f64)(4 * spans)
+            try section_at(w, normals, t, &section)
+            for i in 0..<size:
+                var bv: f64[12]
+                let first = nurbs_basis(made.kv.view(), (i64)made.nv, 5, t, &bv)
+                var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+                for j in 0..<(usize)6: sum = sum.plus(made.points.items[i * made.nv + first + j].times(bv[j]))
+                worst = math.max(worst, sum.point().subtract(section.items[i].point()).length())
+        if worst <= tolerance or spans >= 256: return made
+        made.close()
+        spans *= 2
+    error(invalid, "unreachable")
+
+## Which end of the sections (0 u = 0, 1 u = 1) lies on the rail `rail`
+## all along; -1 neither.
+func rail_side(net: const Net*, rail: const Spline*, tolerance: f64) -> i64:
+    for side in 0..<(i64)2:
+        var on = true
+        for k in 0..<(usize)9:
+            let v = net.v_low() + (net.v_high() - net.v_low()) * (f64)k / 8.0
+            let p = net.point_at(net.u_low() if side == 0 else net.u_high(), v)
+            if rail.point_at(spline_nearest(rail, p)).subtract(p).length() > tolerance * 100.0: on = false
+        if on: return side
+    return -1
+
+## A sweep of the sections `sections` along the rails `rails` (one or
+## two; Align's master words apart by `;`) by `opts`; `profile` places
+## them as Profile does (one rail, the transition between them).
+func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, opts: const SweepOptions*) -> Net!:
+    var rail_masters = Growing[Master]()
+    defer close_masters(&rail_masters)
+    try builder_masters(set, rails, &rail_masters)
+    if rail_masters.count < 1 or rail_masters.count > 2: error(invalid, "Rail takes one rail or two")
+    var section_masters = Growing[Master]()
+    defer close_masters(&section_masters)
+    try builder_masters(set, sections, &section_masters)
+    if section_masters.count < 1: error(invalid, "Rail: pick the generation curves (the sections) too")
+    let two = rail_masters.count == 2
+    var rail = try rail_masters.items[0].curve.copy()
+    unit_domain(&rail)
+    var other = empty_spline(1)
+    if two:
+        other.close()
+        other = try rail_masters.items[1].curve.copy()
+        unit_domain(&other)
+        # The second rail runs the way the first does.
+        if rail.point_at(0.0).subtract(other.point_at(1.0)).length() < rail.point_at(0.0).subtract(other.point_at(0.0)).length():
+            let turned_round = try reversed_spline(&other)
+            other.close()
+            other = turned_round
+    var curves = Growing[Spline]()
+    defer close_splines_of(&curves)
+    for m in section_masters.view():
+        var c = try m.curve.copy()
+        unit_domain(&c)
+        if curves.count > 0 and runs_against(&c, &curves.items[0]):
+            let turned_round = try reversed_spline(&c)
+            c.close()
+            c = turned_round
+        try curves.push(c)
+    try make_compatible(&curves, 1)
+    var everything = Growing[Spline]()
+    defer everything.close()
+    for c in curves.view(): try everything.push(c)
+    try everything.push(rail)
+    let tolerance = build_tolerance(everything.view())
+    # The frames start with the first section's lean off the rail.
+    var start_up = Vector3()
+    let first_point = curves.items[0].point_at(0.5)
+    let near = rail.point_at(spline_nearest(&rail, first_point))
+    start_up = first_point.subtract(near)
+    var w = Sweeper(rail, other, two, try make_frames(&rail, start_up), try arc_table(&rail), try arc_table(&other) if two else ArcTable(Growing[f64]()),
+                    Growing[Spline](), Growing[f64](), opts.mode, opts.vector, opts.transform, opts.transition, opts.bias)
+    defer w.close()
+    # The face a curve-on-face rail lies on, for Surface normal.
+    var normals = &rail_masters.items[0]
+    if opts.mode == sweep_normal and not normals.has_face: error(invalid, "Profile: Surface normal needs the rail on a face (a curve on a face, or an edge)")
+    for c in curves.view(): try place_section(&w, normals, &c)
+    var net = try sweep_fit(&w, normals, tolerance)
+    errdefer net.close()
+    # Continuity: the rails' sides, then the first and last sections'.
+    for r in 0..<rail_masters.count:
+        let order = opts.continuity[r]
+        if order <= 0: continue
+        let side = rail_side(&net, &rail_masters.items[r].curve, tolerance)
+        if side < 0: error(invalid, "Rail: a rail's continuity needs the sections to end on it")
+        try match_side(&net, side, &rail_masters.items[r], order, tolerance)
+    for k in 0..<(usize)2:
+        let order = opts.continuity[2 + k]
+        if order <= 0: continue
+        let at = w.places.items[0 if k == 0 else w.places.count - 1]
+        if math.abs(at - (0.0 if k == 0 else 1.0)) > 1e-6: error(invalid, "Rail: a section's continuity needs it at the rail's end")
+        # The section curve picked first or last along the rail.
+        var index: usize = 0
+        var best = 1.0e300
+        for m in 0..<section_masters.count:
+            let p = section_masters.items[m].curve.point_at(0.5)
+            let d = net.point_at(net.u_low() + (net.u_high() - net.u_low()) * 0.5, net.v_low() if k == 0 else net.v_high()).subtract(p).length()
+            if d < best:
+                best = d
+                index = m
+        try match_side(&net, 2 + (i64)k, &section_masters.items[index], order, tolerance)
+    return net

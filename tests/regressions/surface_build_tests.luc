@@ -1,0 +1,455 @@
+## Surfaces from curves (surfacing Stage 5, luce_cad.surfacing's
+## CadSurfaceBuild) against closed forms, measured by the Check tools
+## (CadMeasure.check across the edges once stitched): Square of four lines
+## is the bilinear patch; Square of a hole in a smooth surface meets its
+## four neighbors G0, G1 and G2 as asked on every edge (and Blend Cubic,
+## Implied Tangent and Tangent Angle do what they say); Skin of two
+## circles is a cone and of three a surface of revolution, exactly; a
+## closed Skin closes smoothly, and Start continuity matches an edge;
+## Rail along a circle is a torus, with two rails each section reaches
+## both; Profile's transitions pass through every profile, Limited
+## without overshoot; Set Planar of a circle with a hole has the ring's
+## area; Extrude and Revolve are exact; Extend Natural is the same
+## polynomial, Linear meets G1 and not G2, Soft and Reflective G2; Detach
+## periodic splits a closed B-spline sheet; Align's proxy is the input's
+## own hull; a curve's Modify Both against an edge moves both to the
+## middle; Project takes a temporary isoparm.
+from luce_cad.surfacing import CadSurfacing, CadSurfaceBuild
+from luce_cad.cad_geometry import CadGeometry
+from luce_cad.cad_curves import CadCurves
+from luce_cad.curves import CadCurveTools
+from luce_cad.measure import CadMeasure
+from luce_cad.model import CadModel
+from luce_cad.nurbs import CadSpline, CadNurbs
+from luce_geocore.geocore import Vector3, GeometrySet
+from luce_std import math
+
+pub func surface_build_tests() -> unit!:
+    square_lines()
+    square_hole()
+    square_options()
+    skins()
+    rails()
+    profiles()
+    sheets()
+    extends()
+    detach_closed()
+    align_followups()
+    print("PASS surface build: Square is bilinear on four lines and meets a hole's neighbors G0, G1 and G2 on every edge (Cubic, Implied Tangent, Tangent Angle too); Skin of circles is a cone and a surface of revolution exactly, closed smoothly, G1 to an edge at its start; Rail round a circle is a torus and reaches both of two rails; Profile passes its profiles, Limited without overshoot; Set Planar, Extrude and Revolve are exact; Extend Natural keeps the polynomial, Linear is G1 only, Soft and Reflective G2; Detach periodic splits a closed sheet; Align's proxy is the old hull; a curve's Modify Both meets an edge halfway; Project takes an isoparm")
+
+# -- Shapes.
+
+## A circle of radius `r` about `center` in the plane of unit `a` and `b`.
+func ring(center: Vector3, a: Vector3, b: Vector3, r: float) -> CadSpline!:
+    let w = math.sqrt(0.5)
+    let xs = [1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0, 1.0, 1.0]
+    let ys = [0.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0]
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    for k in 0..<9:
+        points.append(center.add(a.multiply_scalar(r * xs[k])).add(b.multiply_scalar(r * ys[k])))
+        weights.append(1.0 if k % 2 == 0 else w)
+    return CadSpline.make(points, weights, 2, [0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0])
+
+func flat_circle(r: float, z: float) -> CadSpline!:
+    return ring(Vector3(0.0, 0.0, z), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), r)
+
+## A smooth biquadratic height field (its x² y² term keeps a Coons patch of
+## its boundaries off it).
+func height(x: float, y: float) -> float:
+    return 0.2 * x * x + 0.1 * x * y - 0.15 * y * y + 0.3 * x * x * y * y - 0.1 * x * y * y
+
+## The biquadratic Bezier patch of `height` over [x0, x1] x [y0, y1]: its
+## control points from the values on a 3 x 3 grid (b1 = 2 f(1/2) - (f0 +
+## f1) / 2 each way).
+func piece(x0: float, x1: float, y0: float, y1: float, name: str) -> CadModel!:
+    let xs = [x0, (x0 + x1) * 0.5, x1]
+    let ys = [y0, (y0 + y1) * 0.5, y1]
+    let z: list[float] = []
+    for i in 0..<3:
+        let row = [height(xs[i], ys[0]), height(xs[i], ys[1]), height(xs[i], ys[2])]
+        z.extend([row[0], 2.0 * row[1] - 0.5 * (row[0] + row[2]), row[2]])
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    for i in 0..<3:
+        for j in 0..<3:
+            let b = 2.0 * z[3 + j] - 0.5 * (z[j] + z[6 + j]) if i == 1 else z[i * 3 + j]
+            points.append(Vector3(x0 + (x1 - x0) * float(i) / 2.0, y0 + (y1 - y0) * float(j) / 2.0, b))
+            weights.append(1.0)
+    return CadSurfacing.patch(points, weights, 3, 3, 2, 2, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], name)
+
+## A flat patch (degree 1) through four corners, `a` to `b` along u and `a`
+## to `d` along v.
+func flat(a: Vector3, b: Vector3, d: Vector3, name: str) -> CadModel!:
+    let c = b.add(d).subtract(a)
+    return CadSurfacing.patch([a, d, b, c], [1.0, 1.0, 1.0, 1.0], 2, 2, 1, 1, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], name)
+
+## The first face's surface of model `index` of `data`.
+func sheet_of(data: GeometrySet, index: int) -> (CadModel, int)!:
+    let model = CadGeometry.model(data, index)
+    return (model, CadNurbs.surface_of_face(model, model.face_name(0)))
+
+## The levels of the shared edges once `data`'s bodies are stitched.
+func levels(data: GeometrySet) -> list[int]!:
+    let sewn = CadSurfacing.stitched(data, [], 0.0001)
+    let model = CadGeometry.model(sewn.geometry(), 0)
+    let check = CadMeasure.check(model, "", 3, 16, 0.0001, 0.1, 0.5, 1.0, false, 8, false, 1.0, true)
+    let found: list[int] = []
+    for e in 0..<check.edge_count():
+        found.append(check.edge(e).level)
+    return found
+
+## The area of `model` from its mesh.
+func area(model: CadModel) -> float!:
+    let mesh = model.tessellate(64)
+    var total = 0.0
+    for face in 0..<mesh.face_count():
+        let a = mesh.point(mesh.face_point(face, 0))
+        for k in 1..<mesh.face_size(face) - 1:
+            let b = mesh.point(mesh.face_point(face, k))
+            let c = mesh.point(mesh.face_point(face, k + 1))
+            total += b.subtract(a).cross(c.subtract(a)).length() * 0.5
+    return total
+
+## The unit normal of `surface` of `model` at (u, v), by its partials.
+func normal_at(model: CadModel, surface: int, u: float, v: float) -> Vector3!:
+    let h = 1e-5
+    let su = CadNurbs.point_at(model, surface, math.min(1.0, u + h), v).subtract(CadNurbs.point_at(model, surface, math.max(0.0, u - h), v))
+    let sv = CadNurbs.point_at(model, surface, u, math.min(1.0, v + h)).subtract(CadNurbs.point_at(model, surface, u, math.max(0.0, v - h)))
+    return su.cross(sv).normalized()
+
+# -- Square.
+
+func square_lines() -> unit!:
+    var data = GeometrySet()
+    let corners = [Vector3(0.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0), Vector3(2.0, 3.0, 1.0), Vector3(0.0, 3.0, 0.0)]
+    for k in 0..<4:
+        data = CadCurves.with_curve(data, f"c{k}", CadCurveTools.by_points([corners[k], corners[(k + 1) % 4]], 1))
+    # Picked in any order, either way round.
+    let made = CadSurfaceBuild.square(data, "curve c2;curve c0;curve c3;curve c1", [1, 1, 1, 1], [0.0, 0.0, 0.0, 0.0])
+    let (model, s) = sheet_of(made.geometry(), 0)
+    # The bilinear patch: each point the blend of the corners.
+    var off = 0.0
+    for i in 0..<11:
+        for j in 0..<11:
+            let p = CadNurbs.point_at(model, s, float(i) / 10.0, float(j) / 10.0)
+            # Its (x, y) fix the bilinear parameters on this patch: x = 2 a, y = 3 b.
+            let a = p.x / 2.0
+            let b = p.y / 3.0
+            off = math.max(off, math.abs(p.z - a * b))
+    assert(off < 1e-12, f"Square of four lines is {off} off the bilinear patch")
+    let sides = [made.side(0), made.side(1), made.side(2), made.side(3)]
+    for k in 0..<4:
+        assert(k in sides, f"sides {sides}")
+
+func square_hole() -> unit!:
+    var data = CadGeometry.of_model(piece(0.0, 1.0, 1.0, 2.0, "left"))
+    data = data.merged(CadGeometry.of_model(piece(2.0, 3.0, 1.0, 2.0, "right")))
+    data = data.merged(CadGeometry.of_model(piece(1.0, 2.0, 0.0, 1.0, "bottom")))
+    data = data.merged(CadGeometry.of_model(piece(1.0, 2.0, 2.0, 3.0, "top")))
+    let words = f"edge left 1 1.5 {height(1.0, 1.5)};edge bottom 1.5 1 {height(1.5, 1.0)};edge right 2 1.5 {height(2.0, 1.5)};edge top 1.5 2 {height(1.5, 2.0)}"
+    for order in 0..<3:
+        let code = order + 1
+        let made = CadSurfaceBuild.square(data, words, [code, code, code, code], [0.0, 0.0, 0.0, 0.0])
+        let found = levels(made.geometry())
+        assert(found.length == 4, f"G{order}: {found.length} shared edges")
+        for level in found:
+            assert(level >= order, f"Square G{order} measured G{level} on an edge: {found}")
+        if order == 0:
+            # A Coons patch of the boundaries is not the surface: not G1.
+            assert(0 in found, f"G0 Square meets its neighbors smoothly by chance: {found}")
+        # The multi-span quintic: degree 5 across the continuity sides.
+        if order > 0:
+            let (model, s) = sheet_of(made.geometry(), 4)
+            let shape = CadNurbs.structure(model, s)
+            assert(shape.du >= 5 and shape.dv >= 5, f"degrees {shape.du} {shape.dv}")
+    # G1 on two sides only, the others G0: those two G1, the rest G0.
+    let mixed = CadSurfaceBuild.square(data, words, [2, 1, 2, 1], [0.0, 0.0, 0.0, 0.0])
+    var smooth = 0
+    for level in levels(mixed.geometry()):
+        if level >= 1:
+            smooth += 1
+    assert(smooth >= 2, f"{smooth} smooth edges")
+
+func square_options() -> unit!:
+    # Blend Cubic on four lines of a plane is still the plane.
+    var lines = GeometrySet()
+    let corners = [Vector3(0.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0), Vector3(2.0, 1.0, 0.0), Vector3(0.0, 1.0, 0.0)]
+    for k in 0..<4:
+        lines = CadCurves.with_curve(lines, f"c{k}", CadCurveTools.by_points([corners[k], corners[(k + 1) % 4]], 1))
+    let cubic = CadSurfaceBuild.square(lines, "curve c0;curve c1;curve c2;curve c3", [1, 1, 1, 1], [0.0, 0.0, 0.0, 0.0], cubic = true)
+    let (plane, ps) = sheet_of(cubic.geometry(), 0)
+    for i in 0..<5:
+        for j in 0..<5:
+            assert(math.abs(CadNurbs.point_at(plane, ps, float(i) / 4.0, float(j) / 4.0).z) < 1e-12)
+    # Implied Tangent: a bowed boundary in the plane y = 0 (the symmetry
+    # plane), the square leaving it at a right angle.
+    var bowed = GeometrySet()
+    bowed = CadCurves.with_curve(bowed, "mirror", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.6), Vector3(2.0, 0.0, 0.0)], 2))
+    bowed = CadCurves.with_curve(bowed, "far", CadCurveTools.by_points([Vector3(0.0, 2.0, 0.0), Vector3(2.0, 2.0, 0.0)], 1))
+    bowed = CadCurves.with_curve(bowed, "left", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(0.0, 2.0, 0.0)], 1))
+    bowed = CadCurves.with_curve(bowed, "right", CadCurveTools.by_points([Vector3(2.0, 0.0, 0.0), Vector3(2.0, 2.0, 0.0)], 1))
+    let implied = CadSurfaceBuild.square(bowed, "curve mirror;curve right;curve far;curve left", [4, 1, 1, 1], [0.0, 0.0, 0.0, 0.0])
+    let (model, s) = sheet_of(implied.geometry(), 0)
+    let side = implied.side(0)
+    for k in 1..<10:
+        let t = float(k) / 10.0
+        let u = 0.0 if side == 0 else (1.0 if side == 1 else t)
+        let v = t if side < 2 else (0.0 if side == 2 else 1.0)
+        let n = normal_at(model, s, u, v)
+        assert(math.abs(n.y) < 1e-4, f"Implied Tangent leaves the plane at {n} (normal along it)")
+    # Tangent Angle 30° from a floor: a plane rising at 30° (its corners'
+    # boundaries rise so too).
+    let rise = math.tan(math.pi / 6.0)
+    var data = CadGeometry.of_model(flat(Vector3(-1.0, 0.0, 0.0), Vector3(0.0, 0.0, 0.0), Vector3(-1.0, 1.0, 0.0), "floor"))
+    data = CadCurves.with_curve(data, "c", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, rise)], 1))
+    data = CadCurves.with_curve(data, "d", CadCurveTools.by_points([Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, rise)], 1))
+    data = CadCurves.with_curve(data, "b", CadCurveTools.by_points([Vector3(1.0, 0.0, rise), Vector3(1.0, 1.0, rise)], 1))
+    let tilted = CadSurfaceBuild.square(data, "edge floor 0 0.5 0;curve c;curve b;curve d", [6, 1, 1, 1], [30.0, 0.0, 0.0, 0.0])
+    let (slope, ss) = sheet_of(tilted.geometry(), 1)
+    let n = normal_at(slope, ss, 0.5, 0.5)
+    let angle = math.acos(math.min(1.0, math.abs(n.z))) * 180.0 / math.pi
+    assert(math.abs(angle - 30.0) < 1e-6, f"Tangent Angle 30 leans {angle}")
+
+# -- Skin.
+
+## The largest |radius(z) - want(z)| over sheet `index` of `data`.
+func worst_radius(data: GeometrySet, index: int, want: func(float) -> float) -> float!:
+    let (model, s) = sheet_of(data, index)
+    var worst = 0.0
+    for i in 0..<21:
+        for j in 0..<21:
+            let p = CadNurbs.point_at(model, s, float(i) / 20.0, float(j) / 20.0)
+            worst = math.max(worst, math.abs(math.hypot(p.x, p.y) - want(p.z)))
+    return worst
+
+func cone(z: float) -> float:
+    return 1.0 + z * 0.5
+
+func unit_radius(z: float) -> float:
+    _ = z
+    return 1.0
+
+func bulge(z: float) -> float:
+    return 1.0 + z * (2.0 - z) * 0.5
+
+func skins() -> unit!:
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "a", flat_circle(1.0, 0.0))
+    data = CadCurves.with_curve(data, "b", flat_circle(1.5, 1.0))
+    data = CadCurves.with_curve(data, "c", flat_circle(1.0, 2.0))
+    data = CadCurves.with_curve(data, "e", flat_circle(1.0, 1.0))
+    let cone_sheet = CadSurfaceBuild.skin(data, "curve a;curve b")
+    assert(worst_radius(cone_sheet.geometry(), 0, cone) < 1e-12, "Skin of two circles is not the cone")
+    let cylinder = CadSurfaceBuild.skin(data, "curve a;curve e")
+    assert(worst_radius(cylinder.geometry(), 0, unit_radius) < 1e-12, "Skin of two equal circles is not the cylinder")
+    let three = CadSurfaceBuild.skin(data, "curve a;curve b;curve c")
+    assert(worst_radius(three.geometry(), 0, bulge) < 1e-12, "Skin of three circles is not their surface of revolution")
+    # Closed: four circles round a loop; the seam's two sides meet smoothly.
+    var loop = GeometrySet()
+    let z = Vector3(0.0, 0.0, 1.0)
+    for k in 0..<4:
+        let angle = math.pi * 0.5 * float(k)
+        let out = Vector3(math.cos(angle), math.sin(angle), 0.0)
+        loop = CadCurves.with_curve(loop, f"r{k}", ring(out.multiply_scalar(3.0), out, z, 0.5 + 0.2 * float(k % 2)))
+    let closed = CadSurfaceBuild.skin(loop, "curve r0;curve r1;curve r2;curve r3", closed = true)
+    let (model, s) = sheet_of(closed.geometry(), 0)
+    let shape = CadNurbs.structure(model, s)
+    for k in 0..<9:
+        let u = float(k) / 8.0
+        let a = CadNurbs.point_at(model, s, u, 0.0)
+        let b = CadNurbs.point_at(model, s, u, 1.0)
+        assert(a.subtract(b).length() < 1e-12, "a closed Skin's seam does not close")
+        # Its slope across the seam from either side, by one-sided steps.
+        let before = b.subtract(CadNurbs.point_at(model, s, u, 1.0 - 1e-5))
+        let after = CadNurbs.point_at(model, s, u, 1e-5).subtract(a)
+        let turn = math.acos(math.min(1.0, before.normalized().dot(after.normalized()))) * 180.0 / math.pi
+        assert(turn < 0.05, f"a closed Skin turns {turn}° at its seam ({shape.nv} rows)")
+    # Start G1 to a floor's edge: the skin leaves the floor's edge tangent.
+    var floor = CadGeometry.of_model(flat(Vector3(0.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), "floor"))
+    floor = CadCurves.with_curve(floor, "top", CadCurveTools.by_points([Vector3(0.0, 2.5, 1.0), Vector3(2.0, 2.5, 1.0)], 1))
+    let skinned = CadSurfaceBuild.skin(floor, "edge floor 1 1 0;curve top", start = 1)
+    let found = levels(skinned.geometry())
+    assert(found.length == 1 and found[0] >= 1, f"Skin Start G1 measured {found}")
+
+# -- Rail and Profile.
+
+func rails() -> unit!:
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "rail", flat_circle(3.0, 0.0))
+    data = CadCurves.with_curve(data, "gen", ring(Vector3(3.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 1.0))
+    let torus = CadSurfaceBuild.rail(data, "curve gen", "curve rail")
+    let (model, s) = sheet_of(torus.geometry(), 0)
+    var worst = 0.0
+    for i in 0..<41:
+        for j in 0..<41:
+            let p = CadNurbs.point_at(model, s, float(i) / 40.0, float(j) / 40.0)
+            worst = math.max(worst, math.abs(math.hypot(math.hypot(p.x, p.y) - 3.0, p.z) - 1.0))
+    assert(worst < 1.2e-6, f"Rail round a circle is {worst} off the torus")
+    # Two rails: a line swept between two curves reaches both all along.
+    var two = GeometrySet()
+    two = CadCurves.with_curve(two, "r1", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.5), Vector3(2.0, 0.0, 0.0), Vector3(3.0, 0.0, 0.2)], 3))
+    two = CadCurves.with_curve(two, "r2", CadCurveTools.by_points([Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.6, 0.0), Vector3(2.0, 2.0, 0.3), Vector3(3.0, 1.5, 0.0)], 3))
+    two = CadCurves.with_curve(two, "g", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(0.0, 0.5, 0.4), Vector3(0.0, 1.0, 0.0)], 2))
+    for transform in [0, 1]:
+        let swept = CadSurfaceBuild.rail(two, "curve g", "curve r1;curve r2", transform = transform)
+        let (sheet, ss) = sheet_of(swept.geometry(), 0)
+        let r1 = CadCurves.curve(two, CadCurves.find(two, "r1"))
+        let r2 = CadCurves.curve(two, CadCurves.find(two, "r2"))
+        for k in 0..<11:
+            let v = float(k) / 10.0
+            let a = CadNurbs.point_at(sheet, ss, 0.0, v)
+            let b = CadNurbs.point_at(sheet, ss, 1.0, v)
+            let da = r1.at(CadCurveTools.nearest(r1, a)).subtract(a).length()
+            let db = r2.at(CadCurveTools.nearest(r2, b)).subtract(b).length()
+            assert(da < 1e-5 and db < 1e-5, f"two rails ({transform}): a section misses them by {da} and {db}")
+
+func profiles() -> unit!:
+    # Three circles of radii 1, 2, 1 on a straight rail up Z: Global passes
+    # each at its height; Linear is a pair of cones; Limited does not swell
+    # past 2.
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "rail", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(0.0, 0.0, 2.0)], 1))
+    data = CadCurves.with_curve(data, "p0", flat_circle(1.0, 0.0))
+    data = CadCurves.with_curve(data, "p1", flat_circle(2.0, 1.0))
+    data = CadCurves.with_curve(data, "p2", flat_circle(1.0, 2.0))
+    for transition in 0..<4:
+        let made = CadSurfaceBuild.profile(data, "curve p0;curve p1;curve p2", "curve rail", 0, transition)
+        let (model, s) = sheet_of(made.geometry(), 0)
+        var widest = 0.0
+        for i in 0..<41:
+            for j in 0..<41:
+                let p = CadNurbs.point_at(model, s, float(i) / 40.0, float(j) / 40.0)
+                widest = math.max(widest, math.hypot(p.x, p.y))
+                if transition == 0:
+                    assert(math.abs(math.hypot(p.x, p.y) - (1.0 + (1.0 - math.abs(p.z - 1.0)))) < 1e-6, f"Linear at z {p.z}")
+        # Each profile is passed at its height.
+        for k in 0..<41:
+            let p = CadNurbs.point_at(model, s, float(k) / 40.0, 0.5)
+            assert(math.abs(p.z - 1.0) < 1e-6 and math.abs(math.hypot(p.x, p.y) - 2.0) < 1e-6, f"transition {transition} misses the middle profile at {p}")
+        if transition == 3:
+            assert(widest < 2.0 + 1e-6, f"Limited swells to {widest}")
+
+# -- Set Planar, Extrude, Revolve.
+
+func sheets() -> unit!:
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "outer", flat_circle(3.0, 0.0))
+    data = CadCurves.with_curve(data, "hole", ring(Vector3(0.5, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), 1.0))
+    let planar = CadSurfaceBuild.set_planar(data, "curve outer;curve hole")
+    let ring_area = area(CadGeometry.model(planar.geometry(), 0))
+    assert(math.abs(ring_area - 8.0 * math.pi) < 1e-3 * 8.0 * math.pi, f"Set Planar's ring has area {ring_area}")
+    let extruded = CadSurfaceBuild.extruded(data, "curve outer", Vector3(0.0, 0.0, 1.0), 2.0)
+    let (wall, ws) = sheet_of(extruded.geometry(), 0)
+    for i in 0..<9:
+        for j in 0..<3:
+            let p = CadNurbs.point_at(wall, ws, float(i) / 8.0, float(j) / 2.0)
+            assert(math.abs(math.hypot(p.x, p.y) - 3.0) < 1e-12 and math.abs(p.z - float(j)) < 1e-12, f"Extrude at {p}")
+    let revolved = CadSurfaceBuild.revolved(data, "curve hole", Vector3(0.0, 2.0, 0.0), Vector3(1.0, 0.0, 0.0), 0.0, 360.0)
+    let (torus, ts) = sheet_of(revolved.geometry(), 0)
+    for i in 0..<9:
+        for j in 0..<9:
+            let p = CadNurbs.point_at(torus, ts, float(i) / 8.0, float(j) / 8.0)
+            # About the line y = 2 along X: the hole circle (centre 0.5, 0, 0)
+            # turns round it, a torus of radius 2 and tube 1 about x = 0.5.
+            let r = math.hypot(p.y - 2.0, p.z)
+            assert(math.abs(math.hypot(p.x - 0.5, r - 2.0) - 1.0) < 1e-12, f"Revolve at {p}")
+
+# -- Extend.
+
+## A curved cubic-by-quadratic sheet.
+func bump() -> CadModel!:
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    for i in 0..<4:
+        for j in 0..<3:
+            let x = 2.0 * float(i) / 3.0
+            let y = float(j) / 2.0
+            points.append(Vector3(x, y, 0.3 * math.sin(x + y * 0.5) * float(i * j + 1) * 0.3))
+            weights.append(1.0)
+    return CadSurfacing.patch(points, weights, 4, 3, 3, 2, [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], "bump")
+
+func extends() -> unit!:
+    let data = CadGeometry.of_model(bump())
+    let before = CadGeometry.model(data, 0)
+    let s0 = CadNurbs.surface_of_face(before, "bump")
+    # Natural: the old surface lies in the new one; the new edge 0.5 on.
+    let natural = CadSurfaceBuild.extended(data, "face bump 2 0.5 0", 1, 0.5)
+    let after = CadGeometry.model(natural.geometry(), 0)
+    let s1 = CadNurbs.surface_of_face(after, "bump")
+    var off = 0.0
+    for i in 0..<11:
+        for j in 0..<11:
+            let p = CadNurbs.point_at(before, s0, float(i) / 10.0, float(j) / 10.0)
+            let uv = CadNurbs.parameters_at(after, s1, p)
+            off = math.max(off, CadNurbs.point_at(after, s1, uv.x, uv.y).subtract(p).length())
+    assert(off < 1e-9, f"Extend Natural moves the surface {off}")
+    let edge = CadNurbs.point_at(before, s0, 1.0, 0.5)
+    let far = CadNurbs.point_at(after, s1, 1.0, 0.5)
+    assert(math.abs(far.subtract(edge).length() - 0.5) < 1e-6, f"Extend Natural reaches {far.subtract(edge).length()}")
+    # Unmerged, each kind's extension meets the sheet as it says.
+    let want = [1, 3, 2, 2]
+    for kind in 0..<4:
+        let made = CadSurfaceBuild.extended(data, "face bump 2 0.5 0", kind, 0.5, merge = false)
+        let found = levels(made.geometry())
+        assert(found.length == 1, f"kind {kind}: {found.length} shared edges")
+        assert(found[0] == want[kind] or (kind == 1 and found[0] >= 3), f"Extend kind {kind} measured G{found[0]}, wants G{want[kind]}")
+    # A percentage of the sheet's length across, and a curve's end.
+    let pct = CadSurfaceBuild.extended(data, "face bump 2 0.5 0", 0, 25.0, percent = true)
+    let longer = CadGeometry.model(pct.geometry(), 0)
+    assert(CadNurbs.point_at(longer, CadNurbs.surface_of_face(longer, "bump"), 1.0, 0.5).x > 2.4)
+    var curves = GeometrySet()
+    curves = CadCurves.with_curve(curves, "arc", ring(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), 1.0).piece(0.0, 0.25))
+    let grown = CadSurfaceBuild.extended(curves, "curve arc 0 1 0", 1, 0.5)
+    let arc = CadCurves.curve(grown.geometry(), CadCurves.find(grown.geometry(), "arc"))
+    for k in 0..<11:
+        let p = arc.at(arc.low() + (arc.high() - arc.low()) * float(k) / 10.0)
+        assert(math.abs(p.length() - 1.0) < 1e-6, f"a circle's arc extended Natural leaves the circle at {p}")
+
+# -- Stage 4 and 3 follow-ups.
+
+func detach_closed() -> unit!:
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "a", flat_circle(1.0, 0.0))
+    data = CadCurves.with_curve(data, "b", flat_circle(1.5, 1.0))
+    let tube = CadSurfaceBuild.skin(data, "curve a;curve b")
+    let split = CadSurfacing.stitched(tube.geometry(), [], 0.0001, detach_periodic = true)
+    assert(split.periodic == 1, f"{split.periodic} periodic faces split")
+    let model = CadGeometry.model(split.geometry(), 0)
+    assert(model.face_count() == 2, f"{model.face_count()} faces")
+    assert(math.abs(area(model) - area(CadGeometry.model(tube.geometry(), 0))) < 1e-3, "the split sheet's area changed")
+
+func align_followups() -> unit!:
+    # Align's proxy is the input's own hull before the align.
+    let strip_points: list[Vector3] = []
+    let weights: list[float] = []
+    for i in 0..<6:
+        for j in 0..<4:
+            strip_points.append(Vector3(2.15 + 0.17 * float(i), -0.2 - 0.56 * float(i), 4.0 * float(j) / 3.0))
+            weights.append(1.0)
+    let strip = CadSurfacing.patch(strip_points, weights, 6, 4, 5, 3, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], "strip")
+    let w = math.sqrt(0.5)
+    let quarter = CadSurfacing.patch([Vector3(2.0, 0.0, 0.0), Vector3(2.0, 0.0, 4.0), Vector3(2.0, 2.0, 0.0), Vector3(2.0, 2.0, 4.0), Vector3(0.0, 2.0, 0.0), Vector3(0.0, 2.0, 4.0)],
+                                     [1.0, 1.0, w, w, 1.0, 1.0], 3, 2, 2, 1, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], "cylinder")
+    let scene = CadGeometry.of_model(strip).merged(CadGeometry.of_model(quarter))
+    let aligned = CadSurfacing.aligned(scene, "face strip 2.1 -0.1 2", "edge cylinder 2 0 2", 2)
+    assert(aligned.proxy_size == 4 and aligned.proxy_row_count() == 6, f"proxy {aligned.proxy_row_count()} rows of {aligned.proxy_size}")
+    for i in 0..<6:
+        for j in 0..<4:
+            assert(aligned.proxy_point(i, j).subtract(strip_points[i * 4 + j]).length() < 1e-12)
+    # A curve's Modify Both against the cylinder's edge: the curve's end and
+    # the edge's point both move, to the middle, and meet there.
+    var curved = CadCurves.with_curve(CadGeometry.of_model(quarter), "c", CadCurveTools.by_points([Vector3(2.3, -0.3, 2.0), Vector3(3.0, -1.0, 2.0), Vector3(4.0, -2.0, 2.0)], 2))
+    let both = CadSurfacing.aligned(curved, "curve c 2.3 -0.3 2", "edge cylinder 2 0 2", 1, both = true)
+    let moved = both.geometry()
+    let c = CadCurves.curve(moved, CadCurves.find(moved, "c"))
+    let start = c.at(c.low())
+    assert(math.abs(start.x - 2.15) < 0.02 and math.abs(start.y + 0.15) < 0.02, f"Modify Both's meeting point {start}")
+    let cyl = CadGeometry.model(moved, 0)
+    let cs = CadNurbs.surface_of_face(cyl, "cylinder")
+    let on = CadNurbs.point_at(cyl, cs, CadNurbs.parameters_at(cyl, cs, start).x, CadNurbs.parameters_at(cyl, cs, start).y)
+    assert(on.subtract(start).length() < 1e-6, f"Modify Both: the surface misses the curve's end by {on.subtract(start).length()}")
+    # Project takes a temporary isoparm.
+    let box = CadGeometry.of_model(flat(Vector3(-2.0, -2.0, 0.0), Vector3(2.0, -2.0, 0.0), Vector3(-2.0, 2.0, 0.0), "floor")).merged(CadGeometry.of_model(quarter))
+    let cast = CadSurfacing.projected(box, 0, "floor", "isoparm cylinder 1 0.5", Vector3(0.0, 0.0, -1.0))
+    assert(cast.count >= 1, "Project of an isoparm made nothing")

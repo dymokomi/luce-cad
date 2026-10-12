@@ -1,0 +1,140 @@
+## Skin (surfacing Stage 5: Alias's Skin, Plasticity's and Rhino's Loft;
+## §4.6 and §6.6 of luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md):
+## a surface through sections, in the order picked.
+##
+## The sections are turned to run alike (each the way nearer the one
+## before), made compatible (one degree, one knot vector), and their
+## control points interpolated across by a B-spline of the degree asked
+## (quintic, or one less than the sections), at parameters by the mean
+## chord between neighbors. The interpolation is of homogeneous points,
+## so sections alike up to a scale and a shift along an axis (circles
+## about one axis) give exactly their surface of revolution: two circles a
+## cylinder or a cone. Closed, the sections wrap round: interpolated with
+## three loops more on either side (periodic in effect) and cut back
+## to the loop, so the seam is smooth. With the first or last section on
+## a surface (an edge, a curve on a face), Start and End continuity match
+## that side G1 to G3 by Align's rows (align.lucb).
+
+## Skin's options: the degree across, a closed loop, the start and end
+## continuity (0 G0 to 3 G3).
+pub struct SkinOptions:
+    pub var degree: i64
+    pub var closed: bool
+    pub var start: i64
+    pub var end: i64
+
+## The mean distance between the control points of `a` and `b` (alike).
+func mean_gap(a: const Spline*, b: const Spline*) -> f64:
+    var sum = 0.0
+    for k in 0..<a.points.count: sum += a.points.items[k].point().subtract(b.points.items[k].point()).length()
+    return sum / (f64)a.points.count
+
+## Whether `c` runs nearer `before` turned round (sampled along both).
+func runs_against(c: const Spline*, before: const Spline*) -> bool:
+    var same = 0.0
+    var other = 0.0
+    for k in 0..<(usize)11:
+        let f = (f64)k / 10.0
+        let p = before.point_at(before.low() + (before.high() - before.low()) * f)
+        same += c.point_at(c.low() + (c.high() - c.low()) * f).subtract(p).length()
+        other += c.point_at(c.high() - (c.high() - c.low()) * f).subtract(p).length()
+    return other < same
+
+## How many sections a closed Skin wraps on either side of its loop.
+func wrap_of(q: usize, n: usize) -> usize:
+    return q + 3 * n
+
+## Skin's net through the sections `words` (Align's master words apart by
+## `;`), in their order, by `opts`.
+func skin_net(set: interop.Reference[GeometrySet], words: str, opts: const SkinOptions*) -> Net!:
+    var masters = Growing[Master]()
+    defer close_masters(&masters)
+    try builder_masters(set, words, &masters)
+    let n = masters.count
+    if n < 2: error(invalid, "Skin needs two sections or more")
+    if opts.degree < 1 or opts.degree > most_degree: error(invalid, "Skin's degree across is 1 to 11")
+    var sections = Growing[Spline]()
+    defer close_splines_of(&sections)
+    for at in 0..<n:
+        var c = try masters.items[at].curve.copy()
+        unit_domain(&c)
+        if at > 0 and runs_against(&c, &sections.items[at - 1]):
+            let turned_round = try reversed_spline(&c)
+            c.close()
+            c = turned_round
+        try sections.push(c)
+    try make_compatible(&sections, 1)
+    let tolerance = build_tolerance(sections.view())
+    # The sequence interpolated: closed, the loop with the degree's
+    # sections either side; open, the sections.
+    let q = fewer((usize)opts.degree, n if opts.closed else n - 1)
+    var order = Growing[usize]()
+    defer order.close()
+    if opts.closed:
+        if n < 3: error(invalid, "a closed Skin needs three sections or more")
+        # Three loops either side: the interpolation's end effects die
+        # away (geometrically) long before the loop kept.
+        let wrap = wrap_of(q, n)
+        for k in 0..<wrap: try order.push((n * wrap - wrap + k) % n)
+        for k in 0..<n + 1: try order.push(k % n)
+        for k in 0..<wrap: try order.push((k + 1) % n)
+    else:
+        for k in 0..<n: try order.push(k)
+    let count = order.count
+    var params = Growing[f64]()
+    defer params.close()
+    var run = 0.0
+    try params.push(0.0)
+    for k in 1..<count:
+        let gap = mean_gap(&sections.items[order.items[k]], &sections.items[order.items[k - 1]])
+        if not (gap > tolerance): error(invalid, "Skin: two sections in a row lie on each other")
+        run += gap
+        try params.push(run)
+    for k in 0..<count: params.items[k] = params.items[k] / run
+    var knots = Growing[f64]()
+    defer knots.close()
+    var matrix = Growing[f64]()
+    defer matrix.close()
+    try collocation(params.view(), q, &knots, &matrix)
+    # Each control point of the sections interpolated across: the columns.
+    let first = &sections.items[0]
+    let nu = first.points.count
+    var made = empty_net()
+    errdefer made.close()
+    made.du = first.degree
+    made.dv = (i64)q
+    made.nu = nu
+    made.nv = count
+    try made.ku.assign(first.knots.view())
+    try made.kv.assign(knots.view())
+    try made.points.fill(nu * count, Weighted(0.0, 0.0, 0.0, 0.0))
+    var values = Growing[Weighted]()
+    defer values.close()
+    var solved = Growing[Weighted]()
+    defer solved.close()
+    for i in 0..<nu:
+        values.clear()
+        for k in 0..<count: try values.push(sections.items[order.items[k]].points.items[i])
+        try interpolate_points(matrix.view(), values.view(), &solved)
+        for k in 0..<count: made.points.items[i * count + k] = solved.items[k]
+    if opts.closed:
+        # Cut back to the loop: from the first section to its return.
+        var columns = Growing[Spline]()
+        defer close_splines_of(&columns)
+        try curves_along(&made, 1, &columns)
+        var cut = Growing[Spline]()
+        defer close_splines_of(&cut)
+        for c in columns.view():
+            var piece = try extract(&c, params.items[wrap_of(q, n)], params.items[wrap_of(q, n) + n])
+            unit_domain(&piece)
+            try cut.push(piece)
+        let loop = try net_from(cut.view(), 1, &made)
+        made.close()
+        made = loop
+    else:
+        for k in [(i64)0, (i64)1]:
+            let order_asked = opts.start if k == 0 else opts.end
+            if order_asked <= 0: continue
+            let at = 0 if k == 0 else n - 1
+            try match_side(&made, 2 + k, &masters.items[at], order_asked, tolerance)
+    return made

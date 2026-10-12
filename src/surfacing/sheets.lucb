@@ -1,0 +1,191 @@
+## Set Planar, and the sheet Extrude and Revolve of free curves (surfacing
+## Stage 5: Alias's Set Planar, Extrude and Revolve; Rhino's PlanarSrf,
+## ExtrudeCrv and Revolve; §4.6 and §6.6 of luced-3d's
+## docs/research/SURFACING-ALIAS-PLASTICITY.md).
+##
+## Set Planar fills closed curves lying in one plane: a plane face wide
+## enough is trimmed by the curves (trim.lucb, as Trim does), keeping the
+## regions inside an odd number of them, so a curve inside another is a
+## hole. Extrude carries a curve along a direction (degree 1 that way: the
+## curve's own control points moved), and Revolve turns it about an axis
+## (each control point round its own circle, rational quadratic arcs): both
+## exact, a sheet per curve, joined where they meet.
+
+## A plane face square to `normal` through `center`, `x` one of its sides'
+## directions, `half` x `half_y` either way: a body of one face named
+## `name`.
+func plane_rectangle(center: Vector3, normal: Vector3, x: Vector3, half: f64, half_y: f64, name: str, tolerance: f64) -> interop.Reference[CadModel]!:
+    let y = normal.cross(x)
+    let output = try BrepModel.held(math.max(tolerance, least_tolerance))
+    defer output.release()
+    let b = output.value()
+    var corners: i64[4] = [0, 0, 0, 0]
+    let xs: f64[4] = [-half, half, half, -half]
+    let ys: f64[4] = [-half_y, -half_y, half_y, half_y]
+    for k in 0..<(usize)4: corners[k] = try b.add_vertex(center.add(x.multiply_scalar(xs[k])).add(y.multiply_scalar(ys[k])))
+    var loop: i64[4] = [0, 0, 0, 0]
+    for k in 0..<(usize)4: loop[k] = (try b.add_line(corners[k], corners[(k + 1) % 4])) + 1
+    let plane = try b.add_surface(surface_plane, center, normal, x)
+    let sizes: i64[1] = [4]
+    let made = try b.add_face(plane, loop[..<4], sizes[..<1])
+    try b.set_face_name(made, name)
+    return try CadModel.of_brep(output)
+
+## Whether (x, y) lies inside the closed polygon `xs`, `ys` (even-odd).
+func inside_polygon(xs: const f64[], ys: const f64[], x: f64, y: f64) -> bool:
+    var inside = false
+    var j = xs.length - 1
+    for i in 0..<xs.length:
+        if (ys[i] > y) != (ys[j] > y):
+            let cross = xs[j] + (y - ys[j]) * (xs[i] - xs[j]) / (ys[i] - ys[j])
+            if x < cross: inside = not inside
+        j = i
+    return inside
+
+## Set Planar of the curves `words` (Align's master words apart by `;`):
+## a body of one trimmed plane face named `name`.
+func set_planar(set: interop.Reference[GeometrySet], words: str, name: str) -> interop.Reference[CadModel]!:
+    var masters = Growing[Master]()
+    defer close_masters(&masters)
+    try builder_masters(set, words, &masters)
+    if masters.count == 0: error(invalid, "Set Planar: pick the closed curves to fill")
+    var curves = Growing[Spline]()
+    defer close_splines_of(&curves)
+    for m in masters.view(): try curves.push(try m.curve.copy())
+    let size = curves_size(curves.view())
+    # The plane: Newell's normal of the curves' samples, through their middle.
+    let samples: usize = 128
+    var points = Growing[Vector3]()
+    defer points.close()
+    var normal = Vector3()
+    var center = Vector3()
+    for c in curves.view():
+        let first = points.count
+        for k in 0..<samples:
+            try points.push(c.point_at(c.low() + (c.high() - c.low()) * (f64)k / (f64)samples))
+        for k in 0..<samples:
+            let a = points.items[first + k]
+            let b = points.items[first + (k + 1) % samples]
+            normal = normal.add(Vector3((a.y - b.y) * (a.z + b.z), (a.z - b.z) * (a.x + b.x), (a.x - b.x) * (a.y + b.y)))
+    for p in points.view(): center = center.add(p)
+    center = center.multiply_scalar(1.0 / (f64)points.count)
+    let n = normal.normalized() catch failure: error(invalid, "Set Planar: the curves enclose no area (pick closed curves)")
+    var off = 0.0
+    for p in points.view(): off = math.max(off, math.abs(p.subtract(center).dot(n)))
+    let precision = math.max(size * 1e-7, off)
+    if off > size * 1e-4:
+        var buffer: u8[160]
+        error(invalid, try strings.format(buffer, f"Set Planar: the curves do not lie in one plane (one lies {off:.6f} off it)"))
+    let x = try square_to(n)
+    let y = n.cross(x)
+    var reach_x = 0.0
+    var reach_y = 0.0
+    for p in points.view():
+        reach_x = math.max(reach_x, math.abs(p.subtract(center).dot(x)))
+        reach_y = math.max(reach_y, math.abs(p.subtract(center).dot(y)))
+    let sheet = try plane_rectangle(center, n, x, reach_x * 1.2 + size * 0.05, reach_y * 1.2 + size * 0.05, name, size * 1e-9)
+    defer sheet.release()
+    # The curves, cast onto the plane, cut it.
+    var w = try shape_of(sheet.value())
+    defer w.close()
+    var cuts = empty_shape(w.tolerance)
+    defer cuts.close()
+    for c in curves.view():
+        var flat = Growing[Vector3]()
+        defer flat.close()
+        var weights = Growing[f64]()
+        defer weights.close()
+        for q in c.points.view():
+            let p = q.point()
+            try flat.push(p.subtract(n.multiply_scalar(p.subtract(center).dot(n))))
+            try weights.push(q.w)
+        let stored = try cuts.add_spline(flat.view(), weights.view(), c.knots.view(), c.degree)
+        _ = try cuts.add_carrier(Carrier(curve_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, stored))
+    var regions = try trim_regions(sheet.value(), name, &cuts)
+    defer regions.close()
+    if regions.loose.count > 0: error(invalid, "Set Planar: a curve does not close (its ends meet nothing); pick closed curves")
+    # Inside an odd number of the curves: kept.
+    var picks = Growing[Vector3]()
+    defer picks.close()
+    for marker in regions.markers.view():
+        var count = 0
+        var at: usize = 0
+        for _ in curves.view():
+            var xs = Growing[f64]()
+            defer xs.close()
+            var ys = Growing[f64]()
+            defer ys.close()
+            for k in 0..<samples:
+                let d = points.items[at + k].subtract(center)
+                try xs.push(d.dot(x))
+                try ys.push(d.dot(y))
+            let m = marker.subtract(center)
+            if inside_polygon(xs.view(), ys.view(), m.dot(x), m.dot(y)): count += 1
+            at += samples
+        if count % 2 == 1: try picks.push(marker)
+    if picks.count == 0: error(invalid, "Set Planar: the curves enclose nothing (pick closed curves)")
+    return try trim_face(sheet.value(), name, &cuts, picks.view(), 0, name, precision)
+
+## The sheets the curves `words` sweep (Extrude along `direction` by
+## `distance`, from `-distance` with `both`; or Revolve about the axis
+## through `origin` along `axis` from `start` to `end` degrees), joined
+## where they meet: a body named `name` (its faces `name`, `name`2, ...).
+func swept_sheets(set: interop.Reference[GeometrySet], words: str, revolve: bool, direction: Vector3, distance: f64, both: bool, origin: Vector3, axis: Vector3,
+                  start: f64, end: f64, name: str) -> interop.Reference[CadModel]!:
+    var masters = Growing[Master]()
+    defer close_masters(&masters)
+    try builder_masters(set, words, &masters)
+    if masters.count == 0: error(invalid, "pick the curves to sweep")
+    var bodies = Growing[interop.Reference[CadModel]]()
+    defer:
+        for m in bodies.view(): m.release()
+        bodies.close()
+    var size = 0.0
+    for at in 0..<masters.count:
+        let c = &masters.items[at].curve
+        var net = empty_net()
+        defer net.close()
+        net.du = c.degree
+        net.nu = c.points.count
+        try net.ku.assign(c.knots.view())
+        if revolve:
+            let a = axis.normalized() catch failure: error(invalid, "Revolve: the axis needs a direction")
+            if not (end > start): error(invalid, "Revolve: the end angle must pass the start")
+            if end - start > 360.0 + 1e-9: error(invalid, "Revolve turns a whole turn at most")
+            var arc = Growing[Vector3]()
+            defer arc.close()
+            var arc_weights = Growing[f64]()
+            defer arc_weights.close()
+            var arc_knots = Growing[f64]()
+            defer arc_knots.close()
+            try arc_spline(start * math.pi / 180.0, end * math.pi / 180.0, &arc, &arc_weights, &arc_knots)
+            net.dv = 2
+            net.nv = arc.count
+            for k in 0..<arc_knots.count: try net.kv.push((arc_knots.items[k] - arc_knots.items[0]) / (arc_knots.items[arc_knots.count - 1] - arc_knots.items[0]))
+            for q in c.points.view():
+                let p = q.point()
+                let foot = origin.add(a.multiply_scalar(p.subtract(origin).dot(a)))
+                let radial = p.subtract(foot)
+                let side = a.cross(radial)
+                for k in 0..<arc.count:
+                    let r = arc.items[k]
+                    try net.points.push(weighted(foot.add(radial.multiply_scalar(r.x)).add(side.multiply_scalar(r.y)), q.w * arc_weights.items[k]))
+        else:
+            let d = direction.normalized() catch failure: error(invalid, "Extrude: the direction needs a length")
+            if not (distance > 0.0): error(invalid, "Extrude: the distance must be more than zero")
+            let low = -distance if both else 0.0
+            net.dv = 1
+            net.nv = 2
+            let linear: f64[4] = [0.0, 0.0, 1.0, 1.0]
+            try net.kv.assign(linear[..<4])
+            for q in c.points.view():
+                let p = q.point()
+                try net.points.push(weighted(p.add(d.multiply_scalar(low)), q.w))
+                try net.points.push(weighted(p.add(d.multiply_scalar(distance)), q.w))
+        size = math.max(size, size_of(c))
+        var buffer: u8[128]
+        let face_name = name if at == 0 else try strings.format(buffer, f"{name}{at + 1}")
+        try bodies.push(try net_body(&net, face_name, true))
+    if bodies.count == 1: return bodies.items[0].clone()
+    let joined = try stitch_models(bodies.view(), size * 1e-7)
+    return joined.model

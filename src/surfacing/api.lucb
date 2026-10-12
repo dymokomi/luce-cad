@@ -17,6 +17,9 @@ pub struct CadSurfaceEdit:
     ## split in two.
     pub var periodic: i64
     pub var single: i64
+    ## Square: the side of the patch each picked boundary became (0 u = 0,
+    ## 1 u = 1, 2 v = 0, 3 v = 1).
+    var sides: Growing[i64]
 
     pub func init():
         self.made = none
@@ -27,14 +30,21 @@ pub struct CadSurfaceEdit:
         self.closed = false
         self.periodic = 0
         self.single = 0
+        self.sides = Growing[i64]()
 
     pub func geometry() -> interop.Reference[GeometrySet]!:
         let made = self.made else error(invalid, "a surfacing edit has no geometry")
         return made.clone()
 
+    ## Square: picked boundary `index`'s side (-1 none).
+    pub func side(index: i64) -> i64:
+        if index < 0 or (usize)index >= self.sides.count: return -1
+        return self.sides.items[(usize)index]
+
     pub func close():
         if let made = self.made: made.release()
         self.made = none
+        self.sides.close()
 
 pub let cad_surface_edit_type: interop.Type[CadSurfaceEdit] = interop.Type[CadSurfaceEdit]("CadSurfaceEdit", CadSurfaceEdit.close, closeable = true)
 
@@ -50,9 +60,22 @@ func edit_of(set: interop.Reference[GeometrySet]) -> interop.Reference[CadSurfac
 ## each other, and the loose ends that cut nothing.
 pub struct CadTrimRegions:
     var cut: TrimCut
+    ## The curves cutting the face as the trim takes them (3D Trimming's
+    ## cast curves among them), each sampled at cut_samples points.
+    var cuts: Growing[Vector3]
 
     pub func init():
         self.cut = TrimCut(Growing[Vector3](), Growing[Vector3](), Growing[Vector3]())
+        self.cuts = Growing[Vector3]()
+
+    ## How many curves cut the face.
+    pub func cut_count() -> i64:
+        return (i64)self.cuts.count // cut_samples
+
+    ## Point `index` (0 to cut_samples - 1) along cutting curve `cut`.
+    pub func cut_point(cut: i64, index: i64) -> Vector3!:
+        if cut < 0 or index < 0 or index >= cut_samples or cut >= self.cut_count(): error(invalid, "cutting curve point out of range")
+        return self.cuts.items[(usize)(cut * cut_samples + index)]
 
     pub func marker_count() -> i64:
         return (i64)self.cut.markers.count
@@ -77,6 +100,10 @@ pub struct CadTrimRegions:
 
     pub func close():
         self.cut.close()
+        self.cuts.close()
+
+## The points a cutting curve is drawn by (CadTrimRegions.cut_point).
+pub let cut_samples: i64 = 65
 
 pub let cad_trim_regions_type: interop.Type[CadTrimRegions] = interop.Type[CadTrimRegions]("CadTrimRegions", CadTrimRegions.close, closeable = true)
 
@@ -105,6 +132,8 @@ pub struct CadAlignEdit:
     pub var row_size: i64
     var rows: Growing[Vector3]
     var proxy: Growing[Vector3]
+    ## The input's hull before the align: rows of proxy_size.
+    pub var proxy_size: i64
 
     pub func init():
         self.made = none
@@ -124,6 +153,7 @@ pub struct CadAlignEdit:
         self.row_size = 0
         self.rows = Growing[Vector3]()
         self.proxy = Growing[Vector3]()
+        self.proxy_size = 0
 
     pub func geometry() -> interop.Reference[GeometrySet]!:
         let made = self.made else error(invalid, "an align has no geometry")
@@ -139,10 +169,16 @@ pub struct CadAlignEdit:
         if row < 0 or index < 0 or index >= self.row_size or row >= self.row_count(): error(invalid, "align row point out of range")
         return self.rows.items[(usize)(row * self.row_size + index)]
 
-    ## The same control point before the align (Alias's proxy display).
+    ## How many rows the hull before the align has (Alias's proxy display).
+    pub func proxy_row_count() -> i64:
+        if self.proxy_size == 0: return 0
+        return (i64)self.proxy.count // self.proxy_size
+
+    ## Control point `index` of the hull's row `row` before the align, row
+    ## 0 on the edge.
     pub func proxy_point(row: i64, index: i64) -> Vector3!:
-        if row < 0 or index < 0 or index >= self.row_size or row >= self.row_count(): error(invalid, "align row point out of range")
-        return self.proxy.items[(usize)(row * self.row_size + index)]
+        if row < 0 or index < 0 or index >= self.proxy_size or row >= self.proxy_row_count(): error(invalid, "align proxy point out of range")
+        return self.proxy.items[(usize)(row * self.proxy_size + index)]
 
     pub func close():
         if let made = self.made: made.release()
@@ -183,6 +219,35 @@ func fit_tolerance(model: const CadModel*) -> f64!:
         high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
     return math.max(w.tolerance, high.subtract(low).length() * 1e-7)
 
+## The curves Project casts: the set's curves `names` names (apart by `;`;
+## empty: every curve), and among them temporary isoparms ("isoparm <face>
+## <0 or 1> <fraction>", Alias's temporary pick objects), onto `out`.
+func projection_curves(set: interop.Reference[GeometrySet], names: str, out: Growing[Spline]*) -> !:
+    var plain = Growing[u8]()
+    defer plain.close()
+    let bytes = names.bytes
+    var start: usize = 0
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 59: continue
+        let item = (str)bytes[start..<at]
+        start = at + 1
+        if item.length > 8 and (str)item.bytes[0..<8] == "isoparm ":
+            var m = try master_of(set, item, -1, Vector3())
+            defer m.close()
+            try out.push(try m.curve.copy())
+            continue
+        if item.length == 0: continue
+        if plain.count > 0: try plain.push(59)
+        for b in item.bytes: try plain.push(b)
+    if out.count > 0 and plain.count == 0: return
+    var chosen = Growing[i64]()
+    defer chosen.close()
+    try chosen_curves(set, (str)plain.view(), "", &chosen)
+    for index in chosen.view():
+        let curve = try CadCurves.curve(set, index)
+        defer curve.release()
+        try out.push(try spline_in(curve.value()).copy())
+
 ## The set's curves `names` (apart by `;`; empty: every curve, or with
 ## `face` every curve on that face) by index.
 func chosen_curves(set: interop.Reference[GeometrySet], names: str, face: str, out: Growing[i64]*) -> !:
@@ -221,22 +286,20 @@ pub struct CadSurfacing:
                               original: bool = false, tolerance: f64 = 0.0, stem: str = "Projected") -> interop.Reference[CadSurfaceEdit]!:
         let model = try body_of(set, body)
         let fit = tolerance if tolerance > 0.0 else try fit_tolerance(model)
-        var chosen = Growing[i64]()
-        defer chosen.close()
-        try chosen_curves(set, curves, "", &chosen)
-        if chosen.count == 0: error(invalid, "Project: pick the curves to project")
+        var picked = Growing[Spline]()
+        defer close_splines(&picked)
+        try projection_curves(set, curves, &picked)
+        if picked.count == 0: error(invalid, "Project: pick the curves to project")
         var result = set.clone()
         var made: i64 = 0
         var worst = 0.0
-        for index in chosen.view():
-            let curve = try CadCurves.curve(set, index)
-            defer curve.release()
+        for c in picked.view():
             var charts = Growing[Spline]()
             defer close_splines(&charts)
             var lifted = Growing[Spline]()
             defer close_splines(&lifted)
             let cast = Casting(direction, normal, both)
-            worst = math.max(worst, try project_curve(model, face, spline_in(curve.value()), cast, fit, original, &charts, &lifted))
+            worst = math.max(worst, try project_curve(model, face, &c, cast, fit, original, &charts, &lifted))
             for k in 0..<charts.count:
                 let next = try add_on_face(result, stem, face, &lifted.items[k], &charts.items[k], "project")
                 result.release()
@@ -293,6 +356,13 @@ pub struct CadSurfacing:
             error(failure.code, failure.message)
         result.value().cut.close()
         result.value().cut = cut
+        # The cutting curves, for the viewport to draw while it waits.
+        for carrier in cuts.carriers.view():
+            if carrier.kind != curve_spline: continue
+            let (points, weights, knots, degree) = cuts.spline_net(carrier.spline)
+            var c = try spline_of(points, weights, degree, knots)
+            defer c.close()
+            for k in 0..<(usize)cut_samples: try result.value().cuts.push(c.point_at(c.low() + (c.high() - c.low()) * (f64)k / (f64)(cut_samples - 1)))
         return result
 
     ## Trim: face `face` of body `body` cut by its curves (as trim_regions),
@@ -405,9 +475,16 @@ pub struct CadSurfacing:
         for at in 0..<existing.length:
             if marked.items[at]: try chosen.push(existing[at])
         if chosen.count < 1: error(invalid, "Stitch: pick the surfaces to join")
-        let joined = try stitch_models(chosen.view(), gap)
+        # One body with only Detach asked: nothing to join, the body as is.
+        let alone = chosen.count == 1 and (detach_periodic or detach_single)
+        let joined = Stitched(chosen.items[0].clone(), 0, 0.0, try CadSurfacing.is_closed(chosen.items[0])) if alone else try stitch_models(chosen.view(), gap)
         defer joined.model.release()
-        let ready = try detached(joined.model, detach_periodic, detach_single)
+        # Closed B-spline faces split here (detach.lucb), the analytic ones
+        # by the stitcher's detached.
+        var spline_splits: i64 = 0
+        let opened = try split_closed_splines(joined.model, &spline_splits) if detach_periodic else joined.model.clone()
+        defer opened.release()
+        let ready = try detached(opened, detach_periodic, detach_single)
         defer ready.model.release()
         var list = Growing[interop.Reference[CadModel]]()
         defer list.close()
@@ -420,7 +497,7 @@ pub struct CadSurfacing:
                 try list.push(ready.model)
                 placed = true
         let edit = try edit_of(try with_models(source, list.view()))
-        edit.value().periodic = ready.periodic
+        edit.value().periodic = ready.periodic + spline_splits
         edit.value().single = ready.single
         edit.value().count = joined.joined
         edit.value().widest = joined.widest
@@ -492,6 +569,7 @@ pub struct CadSurfacing:
         edit.row_size = (i64)made.row_size
         try edit.rows.assign(made.rows.view())
         try edit.proxy.assign(made.proxy.view())
+        edit.proxy_size = (i64)made.proxy_size
         made.close()
         return result
 

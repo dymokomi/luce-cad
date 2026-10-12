@@ -1,0 +1,281 @@
+## Extend (surfacing Stage 5: Alias's Object Edit › Extend, Parasolid's
+## PK_BODY_extend, Rhino's ExtendSrf; §4.3 of luced-3d's
+## docs/research/SURFACING-ALIAS-PLASTICITY.md): a surface's natural edge
+## or a curve's end carried on by a distance or a percentage.
+##
+## A surface is extended column by column: each curve of its net running
+## across the edge is extended alike (one parameter length for all), so
+## the columns stay one net. At the end a column has its derivatives D1,
+## D2, D3 by its parameter; the extension over parameter length h is a
+## polynomial in s (0 to 1), as a Bezier joined at the end with full
+## multiplicity, the knot then removed as far as the curve stays (to the
+## continuity it was built with):
+##   Linear (Alias's; Parasolid's default): E + h s D1, straight on: G1,
+##     a curvature break;
+##   Natural (Alias's Extrapolate): the last span's own polynomial carried
+##     past the end (de Casteljau beyond 1, in homogeneous form, so an arc
+##     stays on its circle and a cylinder's side on the cylinder): the same
+##     surface, as smooth as it is;
+##   Soft (Parasolid's): C2 at the edge, the second derivative dying away
+##     to straight: E + h s D1 + h² D2 g(s) / 2, g'' = 2 (1 - s)²;
+##   Reflective (Parasolid's): C2, the curvature's change mirrored about
+##     the edge: E + h s D1 + (h s)² D2 / 2 - (h s)³ D3 / 6.
+## The distance is along the middle isoparm across the edge (its chord for
+## Natural), or a percentage of its length. Merged, the face is the extended net; not
+## merged, the extension is a face of its own beside it.
+
+pub let extend_linear: i64 = 0
+pub let extend_natural: i64 = 1
+pub let extend_soft: i64 = 2
+pub let extend_reflective: i64 = 3
+
+## The degree `kind`'s extension of a degree `p` curve needs: Soft's is
+## quartic, Reflective's cubic.
+func kind_degree(kind: i64, p: i64) -> i64:
+    if kind == extend_soft: return (i64)math.max((f64)p, 4.0)
+    if kind == extend_reflective: return (i64)math.max((f64)p, 3.0)
+    return p
+
+## The Bezier of degree `d` with s^k coefficients `a` (power basis), its
+## points onto `out`: b_i = Σ_{k ≤ i} C(i, k) / C(d, k) a_k.
+func power_to_bezier(a: const Weighted[], d: usize, out: Growing[Weighted]*) -> !:
+    out.clear()
+    for i in 0..<d + 1:
+        var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+        for k in 0..<i + 1: sum = sum.plus(a[k].times(choose(i, k) / choose(d, k)))
+        try out.push(sum)
+
+## The extension of `c` (a polynomial curve) past its high end by
+## parameter length `h` the way `kind` says, as a Bezier over high..high
+## + h, raised to `c`'s degree.
+func extension_piece(c: const Spline*, kind: i64, h: f64) -> Spline!:
+    let p = (usize)c.degree
+    let high = c.high()
+    var piece = empty_spline(c.degree)
+    errdefer piece.close()
+    if kind == extend_natural:
+        # The last span's Bezier, carried on by de Casteljau past its end.
+        var span_start = c.low()
+        for k in c.knots.view():
+            if k < high and k > span_start: span_start = k
+        var last = try extract(c, span_start, high)
+        defer last.close()
+        let s = (high + h - span_start) / (high - span_start)
+        var work = Growing[Weighted]()
+        defer work.close()
+        try work.assign(last.points.view())
+        var left = Growing[Weighted]()
+        defer left.close()
+        try left.push(work.items[0])
+        for level in 1..<p + 1:
+            for i in 0..<p + 1 - level: work.items[i] = work.items[i].times(1.0 - s).plus(work.items[i + 1].times(s))
+            try left.push(work.items[0])
+        for q in left.view():
+            if not (q.w > 0.0): error(invalid, "Extend Natural: this rational edge cannot be carried that far (its weights would vanish); extend less, or Linear")
+        # left is the Bezier over span_start..high + h; its part past high.
+        var whole = empty_spline(c.degree)
+        defer whole.close()
+        try whole.points.assign(left.view())
+        for _ in 0..<p + 1: try whole.knots.push(span_start)
+        for _ in 0..<p + 1: try whole.knots.push(high + h)
+        piece.close()
+        piece = try extract(&whole, high, high + h)
+        return piece
+    let j = try field_jet(c, high, 3, true)
+    var a: Weighted[5]
+    for k in 0..<(usize)5: a[k] = Weighted(0.0, 0.0, 0.0, 0.0)
+    var d: usize = 1
+    a[0] = Weighted(j.d[0].x, j.d[0].y, j.d[0].z, 1.0)
+    let d1 = j.d[1].multiply_scalar(h)
+    a[1] = Weighted(d1.x, d1.y, d1.z, 0.0)
+    if kind == extend_soft:
+        # g(s) = (1 - s)⁴ / 6 + 2 s / 3 - 1 / 6 = s² - 2 s³ / 3 + s⁴ / 6.
+        let d2 = j.d[2].multiply_scalar(h * h * 0.5)
+        a[2] = Weighted(d2.x, d2.y, d2.z, 0.0)
+        a[3] = Weighted(d2.x, d2.y, d2.z, 0.0).times(-2.0 / 3.0)
+        a[4] = Weighted(d2.x, d2.y, d2.z, 0.0).times(1.0 / 6.0)
+        d = 4
+    elif kind == extend_reflective:
+        let d2 = j.d[2].multiply_scalar(h * h * 0.5)
+        let d3 = j.d[3].multiply_scalar(-h * h * h / 6.0)
+        a[2] = Weighted(d2.x, d2.y, d2.z, 0.0)
+        a[3] = Weighted(d3.x, d3.y, d3.z, 0.0)
+        d = 3
+    var points = Growing[Weighted]()
+    defer points.close()
+    try power_to_bezier(a[..<d + 1], d, &points)
+    try piece.points.assign(points.view())
+    piece.degree = (i64)d
+    for _ in 0..<d + 1: try piece.knots.push(high)
+    for _ in 0..<d + 1: try piece.knots.push(high + h)
+    if (usize)d < p: try elevate(&piece, p - d)
+    return piece
+
+## `c` with `piece` (from its high end on, of its degree) joined: the
+## joint's knot at full multiplicity, then removed as far as the curve
+## stays within a billionth of its size (back to the continuity built).
+func joined_piece(c: const Spline*, piece: const Spline*) -> Spline!:
+    let p = (usize)c.degree
+    var made = empty_spline(c.degree)
+    errdefer made.close()
+    try made.points.assign(c.points.view())
+    for k in 1..<piece.points.count: try made.points.push(piece.points.items[k])
+    for k in 0..<c.knots.count - p - 1: try made.knots.push(c.knots.items[k])
+    for _ in 0..<p: try made.knots.push(c.high())
+    for _ in 0..<p + 1: try made.knots.push(piece.high())
+    _ = try remove_knot(&made, c.high(), p, size_of(c) * 1e-9 + 1e-15)
+    return made
+
+## The parameter length that carries `c` on by `distance` the way `kind`
+## does: along its end tangent; Natural, by its chord past the end.
+func extension_length(c: const Spline*, kind: i64, distance: f64) -> f64!:
+    let j = try field_jet(c, c.high(), 1, true)
+    let speed = j.d[1].length()
+    if not (speed > 0.0): error(invalid, "Extend: the edge stops there (its tangent vanishes)")
+    var h = distance / speed
+    if kind != extend_natural: return h
+    for _ in 0..<8:
+        var piece = try extension_piece(c, kind, h)
+        defer piece.close()
+        let reach = piece.point_at(piece.high()).subtract(c.point_at(c.high())).length()
+        if not (reach > 0.0): break
+        h *= distance / reach
+    return h
+
+## The length of `c` (64 chords a span).
+func chord_length(c: const Spline*) -> f64:
+    let count = 64 * (span_count(c) + 1)
+    var run = 0.0
+    var before = c.point_at(c.low())
+    for k in 1..<count + 1:
+        let p = c.point_at(c.low() + (c.high() - c.low()) * (f64)k / (f64)count)
+        run += p.subtract(before).length()
+        before = p
+    return run
+
+## `set` with the face or curve `input` ("face <name> x y z": the face's
+## side nearest the point; "curve <name> x y z": the end nearest it)
+## extended by `kind`, `distance` (or that percentage of its length with
+## `percent`); `merge` false keeps a surface's extension a face of its own
+## (a body after the others, named `<face>/extend`).
+func extended_set(set: interop.Reference[GeometrySet], input: str, kind: i64, distance: f64, percent: bool, merge: bool) -> interop.Reference[GeometrySet]!:
+    if kind < extend_linear or kind > extend_reflective: error(invalid, "Extend is Linear, Natural, Soft or Reflective")
+    if not (distance > 0.0): error(invalid, "Extend: the distance must be more than zero")
+    let what = try input_of(input)
+    if what.curve:
+        let index = try CadCurves.find(set, what.name)
+        if index < 0: error(invalid, "Extend: the curve is no longer in the model: pick it again")
+        let on = try CadCurves.face(set, index)
+        defer on.release()
+        if on.value.length > 0: error(invalid, "Extend carries a curve off its face: duplicate it as a free curve first")
+        let held = try CadCurves.curve(set, index)
+        defer held.release()
+        # Natural carries the curve's own (rational) form on: an arc of a
+        # circle stays on the circle; the others work on its polynomial.
+        let own = spline_in(held.value())
+        var c = try own.copy() if kind == extend_natural else try plain_curve(own, size_of(own) * 1e-9)
+        defer c.close()
+        let at_start = c.point_at(c.low()).subtract(what.near).length() < c.point_at(c.high()).subtract(what.near).length()
+        if at_start:
+            let turned_round = try reversed_spline(&c)
+            c.close()
+            c = turned_round
+        if kind_degree(kind, c.degree) > c.degree: try elevate(&c, (usize)(kind_degree(kind, c.degree) - c.degree))
+        let reach = distance * chord_length(&c) / 100.0 if percent else distance
+        let h = try extension_length(&c, kind, reach)
+        var piece = try extension_piece(&c, kind, h)
+        defer piece.close()
+        var longer = try joined_piece(&c, &piece)
+        defer longer.close()
+        if at_start:
+            let restored = try reversed_spline(&longer)
+            longer.close()
+            longer = restored
+        let made = try held_spline(try longer.copy())
+        defer made.release()
+        return try CadCurves.with_curve(set, what.name, made)
+    var w = empty_shape(0.0)
+    defer w.close()
+    let (body, f) = try face_place(set, what.name, &w)
+    let tolerance = align_tolerance(&w)
+    var net = try surface_net(&w, (usize)w.faces.items[f].surface) if kind == extend_natural else try plain_net(&w, f, tolerance)
+    defer net.close()
+    if not try natural(&w, f, &net): error(invalid, "Extend carries a natural edge on; this face is trimmed (Untrim it, or Trim Convert it first)")
+    let side = nearest_side(&net, what.near)
+    # Turned so the edge is the net's u = high end.
+    var low_side = try turned(&net, side, false)
+    defer low_side.close()
+    var work = try u_reversed(&low_side)
+    defer work.close()
+    if kind_degree(kind, work.du) > work.du: try net_elevate(&work, 0, (usize)(kind_degree(kind, work.du) - work.du))
+    var columns = Growing[Spline]()
+    defer close_splines_of(&columns)
+    try curves_along(&work, 0, &columns)
+    # The distance along the surface's middle isoparm across the edge (on
+    # 0..1: its parameter length back on the net's).
+    var middle = try isoparm_spline(&work, 1, 0.5)
+    defer middle.close()
+    let reach = distance * chord_length(&middle) / 100.0 if percent else distance
+    let h = (try extension_length(&middle, kind, reach)) * (work.u_high() - work.u_low())
+    var longer = Growing[Spline]()
+    defer close_splines_of(&longer)
+    var pieces = Growing[Spline]()
+    defer close_splines_of(&pieces)
+    for c in columns.view():
+        var piece = try extension_piece(&c, kind, h)
+        errdefer piece.close()
+        if merge: try longer.push(try joined_piece(&c, &piece))
+        try pieces.push(piece)
+    # The columns' knots after the removal may differ by a knot one could
+    # lose and another not: kept at the fewest any took out.
+    if merge: try unify_columns(&longer, &columns, &pieces)
+    var extended = try net_from(longer.view() if merge else pieces.view(), 0, &work)
+    defer extended.close()
+    var back_low = try u_reversed(&extended)
+    defer back_low.close()
+    var back = try turned(&back_low, side, true)
+    defer back.close()
+    let models = set_models(try set.get())
+    if merge:
+        let made = try with_net(models[body].value(), &w, f, &back, &net)
+        defer made.release()
+        let one: interop.Reference[CadModel][1] = [made]
+        return try with_body(set, (i64)body, one[..<1])
+    var buffer: u8[256]
+    let piece_name = try strings.format(buffer, f"{what.name}/extend")
+    let sheet = try net_body(&back, piece_name, w.faces.items[f].sense)
+    defer sheet.release()
+    return try with_body_added(set, sheet)
+
+## Merged columns alike: when the joint's knot came out at different
+## multiplicities (one column's shape let more go than another's), every
+## column joined again keeping the most any kept.
+func unify_columns(longer: Growing[Spline]*, columns: Growing[Spline]*, pieces: Growing[Spline]*) -> !:
+    var most: usize = 0
+    for c in longer.view(): most = c.knots.count if c.knots.count > most else most
+    var alike = true
+    for c in longer.view():
+        if c.knots.count != most: alike = false
+    if alike:
+        for at in 1..<longer.count: try longer.items[at].knots.assign(longer.items[0].knots.view())
+        return
+    # Rejoin each keeping the joint at the multiplicity the longest has.
+    var keep_at: usize = 0
+    for at in 0..<longer.count:
+        if longer.items[at].knots.count == most: keep_at = at
+    let joint = columns.items[0].high()
+    let want = multiplicity(longer.items[keep_at].knots.view(), joint, 1e-12)
+    for at in 0..<longer.count:
+        if longer.items[at].knots.count == most: continue
+        var again = empty_spline(columns.items[at].degree)
+        let p = (usize)columns.items[at].degree
+        let c = &columns.items[at]
+        try again.points.assign(c.points.view())
+        for k in 1..<pieces.items[at].points.count: try again.points.push(pieces.items[at].points.items[k])
+        for k in 0..<c.knots.count - p - 1: try again.knots.push(c.knots.items[k])
+        for _ in 0..<p: try again.knots.push(c.high())
+        for _ in 0..<p + 1: try again.knots.push(pieces.items[at].high())
+        _ = try remove_knot(&again, c.high(), p - want, 1.0e300)
+        longer.items[at].close()
+        longer.items[at] = again
+    for at in 1..<longer.count: try longer.items[at].knots.assign(longer.items[0].knots.view())

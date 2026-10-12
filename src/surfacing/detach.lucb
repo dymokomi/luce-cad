@@ -1,0 +1,84 @@
+## Stitch's Detach periodic surfaces for B-spline faces (Alias's Stitch
+## option, for CAD export; stitch.lucb's detached splits the analytic
+## faces): a natural B-spline face closed on itself, its seam edge used
+## both ways (a closed Skin, a whole Revolve), split at the middle of the
+## direction it closes in into two faces, each meeting the seam once: the
+## same surface, its two halves' nets cut from its own (exactly). The
+## first half keeps the face's name, the second is `<name>/detach`.
+
+## The edge face `f` of `w` uses both ways in one loop (its seam), or -1.
+func spline_seam(w: const Shape*, f: usize) -> i64:
+    let uses = w.face_uses(f)
+    for a in 0..<uses.length:
+        for b in a + 1..<uses.length:
+            if uses[a] == -uses[b]: return (i64)edge_index(uses[a])
+    return -1
+
+## `model` with every closed natural B-spline face split in two; how many
+## onto `count`. A trimmed closed B-spline face is refused (untrim it).
+func split_closed_splines(model: interop.Reference[CadModel], count: i64*) -> interop.Reference[CadModel]!:
+    var current = model.clone()
+    errdefer current.release()
+    for _ in 0..<64:
+        var w = try shape_of(current.value())
+        defer w.close()
+        var found: i64 = -1
+        var seam: i64 = -1
+        for f in 0..<w.faces.count:
+            if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_spline: continue
+            seam = spline_seam(&w, f)
+            if seam >= 0:
+                found = (i64)f
+                break
+        if found < 0: return current
+        let f = (usize)found
+        var net = try net_of(&w.surfaces.items[(usize)w.faces.items[f].surface])
+        defer net.close()
+        # The seam runs along an isoparm at u's ends (closed in u) or v's.
+        var s = try surface_of(&net)
+        defer s.close()
+        if not try on_domain_edge(&w, f, &s): error(invalid, "Detach periodic surfaces: a trimmed closed B-spline face is not split; untrim it first")
+        var along_u = true
+        for k in 0..<5:
+            let p = try w.edge_at((usize)seam, (f64)k / 4.0)
+            let uv = try nearest_parameters(s, p, Vector3(0.5, 0.5, 0.0), true)
+            if math.min(uv.x, 1.0 - uv.x) > 1e-6: along_u = false
+        let direction: i64 = 0 if along_u else 1
+        var lines = Growing[Spline]()
+        defer close_splines_of(&lines)
+        try curves_along(&net, direction, &lines)
+        let low = net.u_low() if along_u else net.v_low()
+        let high = net.u_high() if along_u else net.v_high()
+        let middle = (low + high) * 0.5
+        var halves = Growing[interop.Reference[CadModel]]()
+        defer:
+            for m in halves.view(): m.release()
+            halves.close()
+        let name = w.face_name(f)
+        for half in 0..<(usize)2:
+            var cut = Growing[Spline]()
+            defer close_splines_of(&cut)
+            for c in lines.view(): try cut.push(try extract(&c, low if half == 0 else middle, middle if half == 0 else high))
+            var piece = try net_from(cut.view(), direction, &net)
+            defer piece.close()
+            var buffer: u8[256]
+            let piece_name = name if half == 0 else try strings.format(buffer, f"{name}/detach")
+            try halves.push(try net_body_within(&piece, piece_name, w.faces.items[f].sense, w.tolerance * 100.0))
+        let joined = try stitch_models(halves.view(), w.tolerance * 10.0)
+        defer joined.model.release()
+        let made = try replaced_face(current.value(), name, joined.model.value())
+        current.release()
+        current = made
+        *count += 1
+    return current
+
+## Whether every edge of face `f` runs along the boundary of `s`'s domain
+## (a natural face; its loops however many).
+func on_domain_edge(w: const Shape*, f: usize, s: const Surface*) -> bool!:
+    for use in w.face_uses(f):
+        for k in 0..<9:
+            let p = try w.edge_at(edge_index(use), (f64)k / 8.0)
+            let q = try nearest_parameters(*s, p, Vector3(0.5, 0.5, 0.0), true)
+            if (try evaluate(*s, q)).subtract(p).length() > w.tolerance * 100.0: return false
+            if math.min(math.min(math.abs(q.x), math.abs(1.0 - q.x)), math.min(math.abs(q.y), math.abs(1.0 - q.y))) > 1e-6: return false
+    return true

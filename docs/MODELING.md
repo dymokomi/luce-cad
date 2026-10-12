@@ -1296,8 +1296,9 @@ Tests (`tests/regressions/nurbs_toolkit_tests.luc`), against closed forms:
 - **Frames.** On a G2 fillet's quintic net every CV's cloud frame is `cv_frame`'s to 1e-6, and on
   it the normal differs from the hull's; a net sent as text reads back the same surface.
 
-Not yet: knot vectors made compatible across a set of curves, reparameterization by chord
-length, extension (Stage 5). Untrim is Stage 3's (Projection, trims and stitching, below).
+Not yet as public calls: knot vectors made compatible across a set of curves (Stage 5's builders
+do it inside, `make_compatible`), reparameterization by chord length. Extension is Stage 5's
+(Extend, below); Untrim is Stage 3's (Projection, trims and stitching, below).
 
 ## Curves (`curves/`, `cad_curves.lucb`)
 
@@ -1588,13 +1589,19 @@ widest first.
   own kept in the plane, K' = −|K|² T: what a curve and its mirror image run back need to meet G3.
 - **Curves**: the CVs from the end are the rows, one each; a free master curve gives Q itself (at its
   nearest point or Attach Point), a face the U/V direction or the way the curve leaves; Modify Both on
-  two free curves moves both ends to the middle.
+  two free curves moves both ends to the middle. Against a surface master (an edge, an isoparm, a
+  curve on a face or the face; `align_both.lucb`) Modify Both bends the surface locally: its CVs move
+  by a bump in its chart ((1 − d²/r²)³ of their Greville places' distance within a quarter of the
+  chart, scaled so the met point lands exactly halfway to the curve's end), the curves on that face
+  are lifted onto it again from their chart curves, and the curve's end then aligns to the surface as
+  it now is.
 
 The result writes a natural face as a new face of the same name, facing as before, stitched to its body
 where its edges still meet; a trimmed one on the moved surface, its trims taking their nearest
-parameters (`with_face_surface` with `edited`). It reports the aligned rows and the same rows before
-(Alias's proxy display), the side and the order (luced-3d re-runs an Align when a CV of those rows is
-dragged later).
+parameters (`with_face_surface` with `edited`). It reports the aligned rows, the input's whole hull
+before the align (Alias's proxy display: `proxy_point(row, index)` over `proxy_row_count()` rows of
+`proxy_size`), the side and the order (luced-3d re-runs an Align when a CV of those rows is dragged
+later).
 
 Tests (`tests/regressions/align_tests.luc`), measured by the Check tools across the stitched edge: a
 flat quintic strip aligned to a quarter cylinder of radius 2 measures exactly G1, G2 and G3 as asked
@@ -1612,7 +1619,107 @@ a line's end aligns G2 to a circle (curve_join); Project casts a hanging strip's
 leaves Align1 on it.
 
 Not yet: Alias's Accept/Restore checkpoints (each Align is a step or node; undo and the history
-serve); the middle arrow that slides a whole row (the end arrows and the sliders do it).
+serve); the Vector type at G3 (Alias offers it at G1 and G2).
+
+## Surfaces from curves (`surfacing/builders.lucb`, `square`, `skin`, `sweep`, `sheets`, `extend`)
+
+Stage 5 of the surfacing plan (luced-3d `docs/research/SURFACING-ALIAS-PLASTICITY.md` §4.6, §6.6):
+Alias's Square, Skin, Rail, Profile, Set Planar, the sheet Extrude and Revolve of free curves, and
+Extend, as `CadSurfaceBuild`'s static calls. Each takes a geometry set and the words of its curves,
+Align's master words apart by `;` ("curve <name>", "edge <face> x y z", "isoparm <face> <0 or 1>
+<fraction>"), so a boundary on a surface can be asked for its cross derivatives (`align_master.lucb`),
+and returns the set with a new body of one sheet named `name` (Extend changes its face; a
+`CadSurfaceEdit`).
+
+**Square** (`square.lucb`; Alias's, Plasticity's and xNURBS's Square, Rhino's EdgeSrf). Four boundaries
+in any order and either way round are walked end to end (within a ten-thousandth of their size) and
+made the patch's sides: A (u = 0) and B (u = 1) along v, C (v = 0) and D (v = 1) along u; each pair
+made compatible (`make_compatible`: one degree, quintic when any side asks continuity, one knot
+vector). The surface is a Gordon-Coons patch with Hermite blending, S = P1 + P2 − P12, built as nets
+and so exact: P1 the Hermite in u between A's and B's fields (the boundary and its cross derivatives
+∂S/∂u, ∂²S/∂u² along it, each a B-spline curve on the pair's knots: the Bezier rows from the end
+derivatives, `hermite_rows`), P2 likewise in v, P12 the tensor Hermite of the corners' mixed
+derivatives; the three made alike and added. Per picked boundary its continuity: Free and G0 (no
+field, the bilinear Coons patch from four lines; Blend Cubic gives them the G0 patch's own slope), G1
+(∂S/∂u = L − (L·n)n, n the neighbor's normal, L the cubic Hermite of the corners' tangents and the G0
+patch's twists), G2 (also ∂²S/∂u² = M − (M·n)n + II(∂S/∂u, ∂S/∂u)n, II the neighbor's second
+fundamental form, so the normal curvature across matches; along the edge the shared curve gives the
+rest), Implied Tangent and Curvature (a planar boundary's plane as the mirror: ∂S/∂u square to it,
+∂²S/∂u² in it) and Tangent Angle (the neighbor's tangent plane turned about the edge; positive lifts the
+surface toward its normal side). The corners' mixed derivatives are one set every field holds
+(`corner_set`: the boundaries' own along them, the mean of the two sides' targets where both have a
+field, measured by fourth-order differences a thousandth apart), each field fitted on its pair's knots
+holding them to the second derivative at both ends; spans are added where a field misses its target
+by more than a millionth until it does. When neighbors meet consistently at a corner (one smooth
+surface, a vault's walls and arcs rising square from them) every edge meets its continuity; where they
+cannot (a corner whose boundary leaves the neighbor's tangent plane) the patch takes the mean there.
+Explicit Control refits to the degrees and spans asked, its sides held.
+
+**Skin** (`skin.lucb`; Alias's Skin, Loft). The sections turned to run alike (each the way nearer the
+one before), made compatible (rational ones kept rational), and their control points interpolated
+across at the mean chord between neighbors by a B-spline of the degree asked (quintic, at most one
+less than the sections), homogeneous, so two coaxial circles give exactly a cylinder or a cone and
+three a surface of revolution. Closed: interpolated with three loops more either side and cut back to
+the loop, the seam smooth. Start and End continuity match the first and last section's side G1 to
+G3 to the surface it lies on by Align's rows (`match_side`: Explicit Control off, Refine).
+
+**Rail and Profile** (`sweep.lucb`; Alias's Rail Surface and Profile, Rhino's Sweep1 and Sweep2). Each
+generation curve (profile) is placed where it comes nearest the rail and kept as offsets in the rail's
+frame there; a section anywhere is the offsets blended between the curves on either side and put back
+in the frame. Frames: Natural (rotation-minimizing, by double reflection along 2048 steps), Parallel,
+Vector (a fixed direction up), Surface normal (Profile on a curve on a face). Two rails: each section
+reaches from the first to the second, its offsets along the chord scaled to it (Scale), along the chord
+only (Non-proportional scale) or not at all (Rotate). Blends: Rail's linear with a bias; Profile's
+Linear, Local (eased), Global (the natural cubic spline through all) and Limited (Fritsch and Carlson's
+monotone cubic: no overshoot). Everything runs by the fraction of the rail's length (a Gauss-Legendre
+arc table, Newton within a step), not its parameter: a circle's quarters are only C1 in parameter, the
+length as smooth as the rail. The surface is the sections' control points fitted along the rail at
+degree 5, the first and last exactly, knots at each section's place as often as the blend's kink asks,
+spans doubled until the sections between lie within a ten-millionth. A rail or the end generation curve
+on a surface matches that side G1 to G3 (Align's rows).
+
+**Set Planar, Extrude, Revolve** (`sheets.lucb`). Set Planar: the curves' plane (Newell's normal of their
+samples; refused beyond a ten-thousandth off it), a plane face wide enough, trimmed by the curves cast
+onto it (`trim_face`, Trim's machinery), the regions inside an odd number of curves kept (a curve inside
+another a hole); a curve that does not close is refused. Extrude carries each curve's control points
+along a direction (degree 1 that way); Revolve turns each round its circle about the axis (rational
+quadratic arcs, `arc_spline`): both exact, the sheets joined where they meet.
+
+**Extend** (`extend.lucb`; Alias's Extend, Parasolid's PK_BODY_extend, Rhino's ExtendSrf). A face's
+natural edge (or a curve's end), by a distance along the middle isoparm across the edge or a percentage
+of its length, column by column of the net (one parameter length for all), each extension a Bezier
+joined with full multiplicity and its knot removed as far as the curve stays: Linear (E + hsD1: G1),
+Natural (the last span's own polynomial carried past the end by de Casteljau beyond 1, homogeneous, so
+an arc stays on its circle: the same surface), Soft (C2, the second derivative dying to straight:
+E + hsD1 + h²D2 g(s)/2, g'' = 2(1 − s)²) and Reflective (C2, the curvature's change mirrored:
+E + hsD1 + (hs)²D2/2 − (hs)³D3/6). Merge off keeps the extension a sheet of its own. A trimmed face is
+refused (Untrim or Trim Convert it first).
+
+**Stage 3 and 4 follow-ups that came with it.** Stitch's Detach periodic splits closed B-spline faces too
+(`detach.lucb`: a natural face whose seam edge it uses both ways, cut at the middle of the direction it
+closes in, exactly; a lone body may be stitched for Detach alone). `CadTrimRegions` hands the cutting
+curves as the trim takes them (`cut_count`, `cut_point`: 3D Trimming's cast curves for the viewport).
+Project takes temporary isoparms ("isoparm <face> <0 or 1> <fraction>" among its curves).
+
+Tests (`tests/regressions/surface_build_tests.luc`), against closed forms and measured by the Check
+tools: Square of four lines picked in any order is the bilinear patch to 1e-12; Square of a hole in a
+biquadratic height field meets its four neighbors G0 (and a Coons patch not G1), G1 and G2 on every edge,
+quintic; Blend Cubic of a plane's four lines is the plane; Implied Tangent leaves the symmetry plane
+square; Tangent Angle 30° from a floor leans 30°; Skin of two circles is a cone and a cylinder and of
+three their surface of revolution to 1e-12; a closed Skin's seam closes and turns less than 0.05°;
+Skin Start G1 to a floor's edge measures G1; Rail of a circle round a circle is a torus to 1.2e-6 (a
+ten-millionth of its size); two rails: each section reaches both within 1e-5 (Scale and
+Non-proportional); Profile's transitions pass every profile, Linear is a pair of cones, Limited never
+swells past the widest; Set Planar of a circle with a hole has the ring's area; Extrude and Revolve are
+exact to 1e-12; Extend Natural keeps the old surface inside the new to 1e-9 and reaches 0.5, Linear
+meets G1 (not G2), Natural G3, Soft and Reflective G2; a quarter circle extended Natural stays on its
+circle; Detach periodic splits a closed Skin into two faces of the same area; Align's proxy is the
+input's own hull; a curve's Modify Both against a cylinder's edge meets the surface halfway; Project
+casts an isoparm.
+
+Not yet: Square's Rebuild per edge, Boundary Blend and Influence, Colinear Options; Rail's Spine mode,
+Sweep Pivot and Curve Segments; Skin's Multiple surfaces (one per pair) and Proportional Crown;
+Alias's Multi-Surface Draft and N-sided (Stage 7's fill).
 
 ## Sketches (`sketch/`)
 
@@ -1771,7 +1878,8 @@ Roughly in order of usefulness:
    face whose loops do not make one band about any direction): skipped and named on the node.
    Every other sphere face meshes: holes all round a ball and through its poles, half a ball
    whose rim runs round them (`meshing/sphere_axis.lucb`).
-6. **Sweep and loft.**
+6. **Sweep and loft as solid features** (their sheets are Stage 5's Rail and Skin; capped into
+   solids, and Fusion's Sweep and Loft dialogs on sketches).
 7. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
 8. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face (strips apart, inside corners).
