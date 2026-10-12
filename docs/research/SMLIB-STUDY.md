@@ -784,6 +784,26 @@ numbers given there.
 | 14 | **UsdSolid write and read** (§10) | B-rep round trip through USD | 1–1.5 weeks | The round trips listed in §10.2 |
 | 15 | **Non-manifold bodies** (§1.2): regions and shells in `BrepModel`, an edge with 2k uses | B1, B6 and two boxes sharing a face as results, not refusals | Large (a month or more); only once 4 is done | B1, B2, B6 results with SMLib's volumes; UsdSolid's non-manifold cubes read |
 
+### Status
+
+What has landed since the study, item by item (the runs of §2 repeated with the same drivers):
+
+- **1, shared edges sized from the faces (done).** Each curved analytic face asks its edges for
+  its interior target before the samples are frozen (`layout/face_targets.lucb`), the
+  refinement's target beside a frozen side is that side's own sag, and it stops when a pass stops
+  helping or at the face budget, keeping the mesh it has (`meshing/adaptive_uv.lucb`). Tracing
+  the dropped faces found a second cause the reading had missed: the Lawson flips after grid
+  insertion ran at most 128 sweeps, which left fans of slivers 17 units long across the pipe of
+  F7, and the refinement could not split them away within its budget. The flips now run from a
+  queue (`polygons/improve.lucb`). T2 and F7 are closed at every division from 4 to 64 with no
+  face skipped (`division_range_tests`): T2 3597.155 (SMLib 3597.120), F7 3432.78 and the T
+  before its fillet 3430.63 (exact 3431.022; at 64 divisions the long pipe's face takes the
+  trimmed chart, whose target is relative to the face's length). Side effects in the table: T1
+  went from 0.50 to 0.006 under the exact volume, and the rounded corners' barycentric grids
+  (now placed on great circles and sampled to their stretch) took F3 from 0.0019 to 4e-6 off
+  exact with a third of the triangles (218,124 to 72,956). Triangles at 64: T2 93,540 (six faces
+  missing) to 510,396; F7 152,894 (one missing) to 281,574.
+
 ## 12. What not to take
 
 - **Its surfaces.** Cubic approximations of circles by default, G1-within-an-angle corners, Coons

@@ -1,19 +1,13 @@
 ## A sphere patch bounded by three great-circle arcs (a rounded corner,
-## where three fillets meet) meshed on a barycentric grid: point (a, b) is
-## the sphere point toward the corners' directions weighted n - a - b, a
-## and b, its border the arcs' own shared samples. Every triangle is near
-## equilateral; there is no pole and no seam (a latitude-longitude chart
-## crowds or folds triangles about its pole). Arcs sampled unequally are
-## left to the general meshers.
-
-## Whether `face` is a sphere triangle: one loop of three great-circle arcs.
-pub func sphere_triangle(face: BrepFace, surface: Surface, edges: const Curve[], tolerance: f64) -> bool:
-    if surface.kind != surface_sphere or face.sizes.length != 1 or face.uses.length != 3: return false
-    for use in face.uses:
-        let edge = edges[edge_index(use)]
-        if edge.kind != curve_circle or edge.origin.subtract(surface.origin).length() > tolerance * 10.0: return false
-        if math.abs(edge.radius - surface.radius) > tolerance * 10.0: return false
-    return true
+## where three fillets meet) meshed on a barycentric grid, its border the
+## arcs' own shared samples. Interior point (a, b) lies on three great
+## circles between border samples, one per family of grid lines (a fixed,
+## b fixed, a + b fixed), at its fraction along each; it is their mean.
+## Every triangle is near equilateral and about as large as the arcs'
+## steps (weighting the corners' directions instead stretches the middle
+## of an octant by the square root of three); there is no pole and no seam
+## (a latitude-longitude chart crowds or folds triangles about its pole).
+## Arcs sampled unequally are left to the general meshers.
 
 pub func barycentric_sphere(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], tolerance: f64, divisions: i64) -> !:
     # Each side's samples the way the loop runs, one after another.
@@ -32,22 +26,19 @@ pub func barycentric_sphere(mesh: MeshBuilder*, face: BrepFace, surface: Surface
     for at in 0..<(usize)3:
         if ids.items[starts[at] + n] != ids.items[starts[(at + 1) % 3]]: error(invalid, "a sphere triangle's sides do not chain")
     let sides = ids.view()
-    # Its triangles are as fine as the arcs' samples: those must keep the
-    # deviation the general meshers keep (analytic_trim's, for a whole
-    # sphere), or they mesh it.
+    # Its triangles are about as fine as the arcs' samples: those must keep
+    # the target the general meshers keep (analytic_trim's, for a whole
+    # sphere), with room for the grid's stretch, or they mesh it.
     let c = surface.origin
-    let deviation = math.max(tolerance, surface.radius * 3.4641016151377544 / ((f64)divisions * (f64)divisions * 16.0))
+    let deviation = analytic_target(surface, 0.0, divisions, tolerance) / grid_stretch
     for at in 0..<(usize)3:
         for k in 0..<n:
             let p = mesh.points[(usize)ids.items[starts[at] + k]].subtract(c)
             let q = mesh.points[(usize)ids.items[starts[at] + k + 1]].subtract(c)
             let half = 0.5 * math.acos(math.clamp(p.dot(q) / (p.length() * q.length()), -1.0, 1.0))
             if surface.radius * (1.0 - math.cos(half)) > deviation: error(invalid, "a sphere triangle's arcs are sampled too coarsely for a grid")
-    let da = try mesh.points[(usize)sides[starts[0]]].subtract(c).normalized()
-    let db = try mesh.points[(usize)sides[starts[1]]].subtract(c).normalized()
-    let dc = try mesh.points[(usize)sides[starts[2]]].subtract(c).normalized()
-    # Point (a, b): toward corner B by a, corner C by b; side 0 is b = 0
-    # (A to B), side 1 is a + b = n (B to C), side 2 is a = 0 (C to A).
+    # Point (a, b): side 0 is b = 0 (A to B), side 1 is a + b = n (B to
+    # C), side 2 is a = 0 (C to A).
     let width = n + 1
     let grid = try new i64[width * width] --- in memory.heap
     defer free(grid) in memory.heap
@@ -57,10 +48,16 @@ pub func barycentric_sphere(mesh: MeshBuilder*, face: BrepFace, surface: Surface
             if b == 0: id = sides[starts[0] + a]
             elif a + b == n: id = sides[starts[1] + b]
             elif a == 0: id = sides[starts[2] + n - b]
-            else:
-                let w = da.multiply_scalar((f64)(n - a - b)).add(db.multiply_scalar((f64)a)).add(dc.multiply_scalar((f64)b))
-                id = try mesh.point(c.add((try w.normalized()).multiply_scalar(surface.radius)))
             grid[a * width + b] = id
+    for a in 1..<n:
+        for b in 1..<n - a:
+            let rest = n - a - b
+            # Along a fixed a, b fixed, and a + b fixed.
+            let first = try arc_point(mesh.points[(usize)grid[a * width]], mesh.points[(usize)grid[a * width + n - a]], c, (f64)b / (f64)(n - a))
+            let second = try arc_point(mesh.points[(usize)grid[b]], mesh.points[(usize)grid[(n - b) * width + b]], c, (f64)a / (f64)(n - b))
+            let third = try arc_point(mesh.points[(usize)grid[(n - rest) * width]], mesh.points[(usize)grid[n - rest]], c, (f64)b / (f64)(n - rest))
+            let mean = try first.add(second).add(third).normalized()
+            grid[a * width + b] = try mesh.point(c.add(mean.multiply_scalar(surface.radius)))
     # Wind the triangles so their normals leave the sphere as the face's do.
     let p0 = mesh.points[(usize)grid[0]]
     let p1 = mesh.points[(usize)grid[width]]
@@ -79,3 +76,13 @@ func push_triangle(mesh: MeshBuilder*, corners: i64[3], forward: bool) -> !:
     try mesh.face(3)
     for at in 0..<(usize)3:
         try mesh.corner(corners[at if forward else 2 - at])
+
+## The unit direction from `center` a `fraction` of the way along the
+## great circle from `start` to `end`.
+func arc_point(start: Vector3, end: Vector3, center: Vector3, fraction: f64) -> Vector3!:
+    let p = try start.subtract(center).normalized()
+    let q = try end.subtract(center).normalized()
+    let angle = math.acos(math.clamp(p.dot(q), -1.0, 1.0))
+    if angle < 1e-12: return p
+    let sine = math.sin(angle)
+    return p.multiply_scalar(math.sin((1.0 - fraction) * angle) / sine).add(q.multiply_scalar(math.sin(fraction * angle) / sine))

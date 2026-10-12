@@ -77,22 +77,25 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
     if edge_size > 0.0:
         spacing = math.min(spacing, edge_size)
         vertical = math.min(vertical, edge_size)
-    let initial = try TrimPolygon.quadrangulate_seams(uv, sizes, Vector3(0.0, 0.0, 1.0), ids, spacing, vertical)
-    defer initial.release()
     var low = mesh.points[(usize)ids[0]]
     var high = low
     for id in ids:
         let p = mesh.points[(usize)id]
         low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
         high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
-    # Relative to the face's extent, or its whole surface's when that is
-    # larger (a sphere's, a torus's, a cylinder's section), so a small
-    # patch is meshed as densely as its surface would be, not more.
-    var extent = high.subtract(low).length()
-    if s.kind == surface_sphere: extent = math.max(extent, s.radius * 3.4641016151377544)
-    elif s.kind == surface_torus: extent = math.max(extent, (s.radius + s.angle) * 2.0)
-    elif s.kind == surface_cylinder or s.kind == surface_cone: extent = math.max(extent, s.radius * 2.0)
-    let deviation = math.max(tolerance, extent / ((f64)divisions * (f64)divisions * 16.0))
+    let deviation = analytic_target(s, high.subtract(low).length(), divisions, tolerance)
+    # The lattice no coarser than the target: rows round the axis sag at
+    # most `deviation` at the surface's widest circle (and a sphere's or a
+    # torus's rows along its meridians at theirs), so the refinement does
+    # not have to split every cell once.
+    if s.kind == surface_cylinder or s.kind == surface_sphere:
+        spacing = math.min(spacing, uscale * sag_step(s.radius, deviation))
+    elif s.kind == surface_torus:
+        spacing = math.min(spacing, uscale * sag_step(s.radius + s.angle, deviation))
+        vertical = math.min(vertical, vscale * sag_step(s.angle, deviation))
+    if s.kind == surface_sphere: vertical = math.min(vertical, vscale * sag_step(s.radius, deviation))
+    let initial = try TrimPolygon.quadrangulate_seams(uv, sizes, Vector3(0.0, 0.0, 1.0), ids, spacing, vertical)
+    defer initial.release()
     let constraints = try TrimConstraints.build(uv, ids, sizes)
     defer constraints.close()
     let part = try refine_uv(initial, s, uscale, vscale, deviation, constraints)

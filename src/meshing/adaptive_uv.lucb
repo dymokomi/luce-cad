@@ -1,5 +1,14 @@
 ## Curvature-driven interior refinement. Boundary IDs never change; both faces
 ## incident to a split UV edge consume its one shared midpoint. No T-junctions.
+##
+## A face's target is `tolerance`, or, beside a frozen side (the boundary's
+## or a trim constraint's, which no pass splits), that side's own sag: a
+## triangle on a frozen side keeps it however often it is split, so a
+## tighter target there is never met. (The tessellator samples shared
+## edges to their faces' targets first, so this matters only for small
+## differences.) Refinement also stops when its worst excess stops falling,
+## and at the face budget it keeps the mesh it has: a coarser face, never
+## a missing one.
 
 func chart_sample(s: Surface, p: Vector3, uscale: f64, vscale: f64) -> Vector3!:
     if s.kind != surface_spline: return analytic_point(s, p.x / uscale, p.y / vscale)
@@ -10,17 +19,28 @@ func chart_sample(s: Surface, p: Vector3, uscale: f64, vscale: f64) -> Vector3!:
 pub func refine_uv(source: interop.Reference[Mesh], surface: Surface, uscale: f64, vscale: f64, tolerance: f64, constraints: TrimConstraints = TrimConstraints()) -> interop.Reference[Mesh]!:
     var current = source.clone()
     errdefer current.release()
+    var previous: f64 = 1e300
     for pass in 0..<8:
-        let next = try refine_pass(current, surface, uscale, vscale, tolerance, constraints)
+        if current.value().face_count() > face_budget: break
+        var excess: f64 = 0.0
+        let next = try refine_pass(current, surface, uscale, vscale, tolerance, constraints, &excess)
         let finished = next.value().point_count() == current.value().point_count()
         current.release()
         current = next
-        if finished: break
+        # A pass whose worst triangle is hardly better than the last one's
+        # is splitting what splitting cannot fix.
+        if finished or excess > previous * 0.81: break
+        previous = excess
     return current
 
-func refine_pass(source: interop.Reference[Mesh], surface: Surface, uscale: f64, vscale: f64, tolerance: f64, constraints: TrimConstraints) -> interop.Reference[Mesh]!:
+## The most triangles a face's refinement grows to.
+let face_budget: i64 = 131072
+
+## One pass: split the sides whose midpoint, and the faces whose center,
+## lie further from the surface than their target. `excess` receives the
+## worst squared deviation over its target (1 when nothing is split).
+func refine_pass(source: interop.Reference[Mesh], surface: Surface, uscale: f64, vscale: f64, tolerance: f64, constraints: TrimConstraints, excess: f64*) -> interop.Reference[Mesh]!:
     let input = source.value()
-    if input.face_count() > 131072: error(invalid, "adaptive patch exceeds face budget")
     let worlds = try new Vector3[(usize)input.point_count()] --- in memory.heap
     defer free(worlds) in memory.heap
     for at in 0..<worlds.length: worlds[at] = try chart_sample(surface, try input.point((i64)at), uscale, vscale)
@@ -38,6 +58,22 @@ func refine_pass(source: interop.Reference[Mesh], surface: Surface, uscale: f64,
             let edge = (usize)(try input.face_edge(face, at))
             if uses[edge] < 2: adjacent[edge * 2 + uses[edge]] = face
             uses[edge] += 1
+    # Each face's squared target: the tolerance, or its frozen sides' sag
+    # (with a margin, as the sag is sampled at one point).
+    let targets = try new f64[(usize)input.face_count()] --- in memory.heap
+    defer free(targets) in memory.heap
+    for at in 0..<targets.length: targets[at] = tolerance * tolerance
+    for edge in 0..<(try input.edge_count()):
+        let a = try input.edge_point(edge, 0)
+        let b = try input.edge_point(edge, 1)
+        if uses[(usize)edge] == 2 and not constraints.contains(a, b): continue
+        let midpoint = (try input.point(a)).add(try input.point(b)).multiply_scalar(0.5)
+        let chord = worlds[(usize)a].add(worlds[(usize)b]).multiply_scalar(0.5)
+        let sag = (try chart_sample(surface, midpoint, uscale, vscale)).subtract(chord).length() * 1.25
+        for side in 0..<(uses[(usize)edge] if uses[(usize)edge] < 2 else (usize)2):
+            let face = (usize)adjacent[(usize)edge * 2 + side]
+            targets[face] = math.max(targets[face], sag * sag)
+    var worst: f64 = 0.0
     var output = try MeshBuilder(precise = true)
     defer output.close()
     try output.copy_points(input)
@@ -50,25 +86,33 @@ func refine_pass(source: interop.Reference[Mesh], surface: Surface, uscale: f64,
         let p = try chart_sample(surface, midpoint, uscale, vscale)
         # Measure geometric deflection, not parameterization speed. Comparing
         # positions at equal parameters over-refines even a flat skewed patch.
-        let squared = math.min(try face_deviation(input, worlds, adjacent[(usize)edge * 2], p), try face_deviation(input, worlds, adjacent[(usize)edge * 2 + 1], p))
-        if squared > tolerance * tolerance:
+        let first = adjacent[(usize)edge * 2]
+        let second = adjacent[(usize)edge * 2 + 1]
+        let squared = math.min(try face_deviation(input, worlds, first, p), try face_deviation(input, worlds, second, p))
+        let target = math.max(targets[(usize)first], targets[(usize)second])
+        if squared > target:
             splits[(usize)edge] = try output.point(midpoint)
+            worst = math.max(worst, squared / target)
     for face in 0..<input.face_count():
         let count = try input.face_size(face)
         let center = try input.face_center(face)
         let world = try chart_sample(surface, center, uscale, vscale)
+        let target = targets[(usize)face]
         var split = false
         var all = true
         for at in 0..<count:
             let exists = splits[(usize)(try input.face_edge(face, at))] >= 0
             split = split or exists
             all = all and exists
-        split = split or (try face_deviation(input, worlds, face, world)) > tolerance * tolerance
+        var deviation = try face_deviation(input, worlds, face, world)
         if count == 4:
             let a = try input.face_point(face, 0)
             let b = try input.face_point(face, 2)
             let uv = (try input.point(a)).add(try input.point(b)).multiply_scalar(0.5)
-            split = split or (try face_deviation(input, worlds, face, try chart_sample(surface, uv, uscale, vscale))) > tolerance * tolerance
+            deviation = math.max(deviation, try face_deviation(input, worlds, face, try chart_sample(surface, uv, uscale, vscale)))
+        if deviation > target:
+            split = true
+            worst = math.max(worst, deviation / target)
         if not split:
             try output.copy_face(input, face)
             continue
@@ -97,6 +141,7 @@ func refine_pass(source: interop.Reference[Mesh], surface: Surface, uscale: f64,
                 try add_triangle(&output, cut, b, middle)
             else:
                 try add_triangle(&output, a, b, middle)
+    *excess = worst if worst > 0.0 else 1.0
     if output.np == (usize)input.point_count(): return source.clone()
     return try output.finish()
 

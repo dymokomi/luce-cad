@@ -1,0 +1,122 @@
+## This file: a curved face's interior target, how far its mesh may stray
+## from the surface. The meshers refine a face's interior to it
+## (analytic_trim, surface_trim), and before any edge's samples are frozen
+## and shared, each face asks its edges to be sampled at least that finely
+## (edge_demands; the finest demand wins). So the boundary a face is given
+## never sags more than its interior may, and refining the interior can
+## always reach its target.
+
+## The target of a face on a plane, cylinder, cone, sphere or torus whose
+## loops span `extent`: relative to the face's extent, or to its whole
+## surface's when that is larger (a sphere's, a torus's, a cylinder's
+## section), so a small patch is meshed as densely as its surface would
+## be, not more.
+pub func analytic_target(s: Surface, extent: f64, divisions: i64, tolerance: f64) -> f64:
+    var size = extent
+    if s.kind == surface_sphere: size = math.max(size, s.radius * 3.4641016151377544)
+    elif s.kind == surface_torus: size = math.max(size, (s.radius + s.angle) * 2.0)
+    elif s.kind == surface_cylinder or s.kind == surface_cone: size = math.max(size, s.radius * 2.0)
+    return math.max(tolerance, size / ((f64)divisions * (f64)divisions * 16.0))
+
+## A B-spline surface's lengths along u and v (x and y): polylines of 16
+## spans along its middle isoparms.
+pub func spline_lengths(s: Surface) -> Vector3!:
+    var lengths = Vector3()
+    for at in 0..<16:
+        let a = (f64)at / 16.0
+        let b = (f64)(at + 1) / 16.0
+        lengths.x += (try evaluate(s, Vector3(b, 0.5, 0.0))).subtract(try evaluate(s, Vector3(a, 0.5, 0.0))).length()
+        lengths.y += (try evaluate(s, Vector3(0.5, b, 0.0))).subtract(try evaluate(s, Vector3(0.5, a, 0.0))).length()
+    return lengths
+
+## The target of a trimmed B-spline face with those lengths.
+pub func spline_target(lengths: Vector3, divisions: i64, tolerance: f64) -> f64:
+    return math.max(tolerance * 4.0, math.min(lengths.x, lengths.y) / ((f64)divisions * (f64)divisions * 4.0))
+
+## The angle a circle of `radius` may turn between samples so that its
+## chords sag at most `target`.
+pub func sag_step(radius: f64, target: f64) -> f64:
+    if target >= radius: return math.pi
+    return 2.0 * math.acos(1.0 - target / radius)
+
+## Whether `face` is a sphere triangle: one loop of three great-circle arcs.
+pub func sphere_triangle(face: BrepFace, surface: Surface, edges: const Curve[], tolerance: f64) -> bool:
+    if surface.kind != surface_sphere or face.sizes.length != 1 or face.uses.length != 3: return false
+    for use in face.uses:
+        let edge = edges[edge_index(use)]
+        if edge.kind != curve_circle or edge.origin.subtract(surface.origin).length() > tolerance * 10.0: return false
+        if math.abs(edge.radius - surface.radius) > tolerance * 10.0: return false
+    return true
+
+## How much more an interior triangle of a sphere triangle's barycentric
+## grid sags than the arcs' steps beside it: an octant's grid triangles
+## are about 1.2 times as long as its arcs' steps.
+pub let grid_stretch: f64 = 1.5
+
+## Raise each edge's interval count to what its curved faces demand.
+pub func edge_demands(edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], metrics: ArcMetric[], counts: usize[], divisions: i64, tolerance: f64) -> !:
+    for face in faces:
+        let s = surfaces[(usize)face.surface]
+        # A B-spline face's interior target is the trimmed fallback's
+        # (surface_trim): its mapped strips refine no interior, and the
+        # fallback relaxes beside a coarser boundary (refine_uv).
+        if s.kind == surface_plane or s.kind == surface_spline: continue
+        # A sphere triangle's grid is as fine as its arcs (spherical_triangle);
+        # another sphere face with a loop round its axis is meshed in rows
+        # from that loop (spherical_cap, sphere_disk), with no interior target.
+        let corner = sphere_triangle(face, s, edges, tolerance)
+        if s.kind == surface_sphere and not corner and (try circles_axis(face, s, edges)): continue
+        var box_low = try edges[edge_index(face.uses[0])].at(0.0)
+        var box_high = box_low
+        for use in face.uses:
+            let edge = edges[edge_index(use)]
+            for step in 0..<9:
+                let p = try edge.at((f64)step / 8.0)
+                box_low = Vector3(math.min(box_low.x, p.x), math.min(box_low.y, p.y), math.min(box_low.z, p.z))
+                box_high = Vector3(math.max(box_high.x, p.x), math.max(box_high.y, p.y), math.max(box_high.z, p.z))
+        var target = analytic_target(s, box_high.subtract(box_low).length(), divisions, tolerance)
+        if corner: target = target / grid_stretch
+        for use in face.uses:
+            let index = edge_index(use)
+            counts[index] = try demanded_intervals(edges[index], &metrics[index], counts[index], target, tolerance)
+
+## Whether one of a sphere face's loops goes once round the sphere's axis.
+func circles_axis(face: BrepFace, s: Surface, edges: const Curve[]) -> bool!:
+    var offset: usize = 0
+    for size in face.sizes:
+        var total: f64 = 0.0
+        var previous: f64 = 0.0
+        var first = true
+        for at in offset..<offset + (usize)size:
+            let use = face.uses[at]
+            let edge = edges[edge_index(use)]
+            for step in 0..<17:
+                let p = (try edge.at((f64)step / 16.0 if use > 0 else 1.0 - (f64)step / 16.0)).subtract(s.origin)
+                let angle = math.atan2(p.dot(s.y), p.dot(s.x))
+                if not first: total += wrap(angle, previous) - previous
+                previous = angle
+                first = false
+        offset += (usize)size
+        if math.abs(math.abs(total) - 2.0 * math.pi) < 0.5: return true
+    return false
+
+## The fewest intervals, at least `count` and at most 1024, whose chords
+## stay within `target` of the edge.
+func demanded_intervals(edge: Curve, metric: ArcMetric*, count: usize, target: f64, tolerance: f64) -> usize!:
+    if edge.kind == curve_line or count >= 1024: return count
+    if edge.kind == curve_circle or edge.kind == curve_ellipse:
+        let radius = math.max(edge.radius, edge.weights[0]) if edge.kind == curve_ellipse else edge.radius
+        let needed = math.ceil(math.abs(edge.sweep) / sag_step(radius, target) - 1e-9)
+        return (usize)math.min(1024.0, math.max((f64)count, needed))
+    if (try measure_error(edge, metric, count, tolerance)).x <= target: return count
+    var lower = count
+    var upper = count
+    while upper < 1024:
+        lower = upper
+        upper = (usize)math.min(1024.0, (f64)(upper * 2))
+        if (try measure_error(edge, metric, upper, tolerance)).x <= target: break
+    while upper > lower + 1:
+        let middle = (lower + upper) // 2
+        if (try measure_error(edge, metric, middle, tolerance)).x <= target: upper = middle
+        else: lower = middle
+    return upper

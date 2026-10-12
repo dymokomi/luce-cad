@@ -1,4 +1,13 @@
-## Bounded Lawson-style interior edge flips; trim boundaries remain constrained.
+## Lawson edge flips towards a Delaunay triangulation; trim boundaries remain
+## constrained.
+##
+## The flips run from a queue of sides to check: each flip queues the four
+## sides of its quad, so a change travels as far as it has to in one run.
+## (Sweeps over every side, each flipping disjoint pairs, need a sweep per
+## step of travel: a fan of long slivers from one boundary point across a
+## row of grid points unwinds one triangle per sweep, and a bounded number
+## of sweeps left such fans for the refinement to split until it ran out of
+## budget.)
 
 pub func improve(source: interop.Reference[Mesh], normal: Vector3, boundary_ids: const i64[], constraints: TrimConstraints = TrimConstraints()) -> interop.Reference[Mesh]!:
     let mesh = source.value()
@@ -12,78 +21,128 @@ pub func improve(source: interop.Reference[Mesh], normal: Vector3, boundary_ids:
             error(invalid, "planar improvement requires triangles")
         for at in 0..<3:
             corners[face * 3 + (usize)at] = try mesh.face_point((i64)face, at)
-    let slots = try new i64[count * 6 + 1] --- in memory.heap
-    defer free(slots) in memory.heap
-    let dirty = try new bool[count] --- in memory.heap
-    defer free(dirty) in memory.heap
+    let points = try new Vector3[(usize)mesh.point_count()] --- in memory.heap
+    defer free(points) in memory.heap
+    for at in 0..<points.length: points[at] = try mesh.point((i64)at)
+    # twin[k]: the corner whose side runs back along corner k's side (from
+    # corners[k] to the next corner), or -1 on the boundary, on a constraint
+    # and on a side more than two triangles share.
+    let twin = try twins(corners, constraints)
+    defer free(twin) in memory.heap
     let n = try normal.normalized()
-    # Rebuild adjacency per sweep; only disjoint pairs change in each sweep.
-    # This keeps queued/stale edges from modifying a triangle twice.
-    for pass in 0..<128:
-        for index in 0..<slots.length:
-            slots[index] = -1
-        for face in 0..<count:
-            dirty[face] = false
-        var changes: usize = 0
-        for corner in 0..<corners.length:
-            let face = corner // 3
-            if dirty[face]:
-                continue
-            let at = corner % 3
-            let a = corners[corner]
-            let b = corners[face * 3 + (at + 1) % 3]
-            if constraints.contains(a, b): continue
-            let lo = a if a < b else b
-            let hi = b if a < b else a
-            var slot = (usize)(lo * 8388609 + hi) % slots.length
-            while slots[slot] >= 0:
-                let previous = (usize)slots[slot]
-                let pa = corners[previous]
-                let pb = corners[previous // 3 * 3 + (previous % 3 + 1) % 3]
-                if (pa == a and pb == b) or (pa == b and pb == a):
-                    break
-                slot = (slot + 1) % slots.length
-            if slots[slot] < 0:
-                slots[slot] = (i64)corner
-                continue
-            let previous = (usize)slots[slot]
-            let other = previous // 3
-            if dirty[other] or other == face:
-                continue
-            let c = corners[face * 3 + (at + 2) % 3]
-            let d = corners[other * 3 + (previous % 3 + 2) % 3]
-            if a == d or b == d or c == d:
-                continue
-            # Distinct UV seam vertices may identify the same CAD vertex.
-            # A new diagonal must not collapse when lifted into the solid.
-            if (usize)c < boundary_ids.length and (usize)d < boundary_ids.length and boundary_ids[(usize)c] == boundary_ids[(usize)d]:
-                continue
-            let pa = try mesh.point(a)
-            let pb = try mesh.point(b)
-            let pc = try mesh.point(c)
-            let pd = try mesh.point(d)
-            if not should_flip(pa, pb, pc, pd, n):
-                continue
-            corners[face * 3] = c
-            corners[face * 3 + 1] = a
-            corners[face * 3 + 2] = d
-            corners[other * 3] = c
-            corners[other * 3 + 1] = d
-            corners[other * 3 + 2] = b
-            dirty[face] = true
-            dirty[other] = true
-            changes += 1
-        if changes == 0:
-            break
+    var queue = Growing[i64]()
+    defer queue.close()
+    for corner in 0..<corners.length:
+        if twin[corner] > (i64)corner: try queue.push((i64)corner)
+    # Delaunay flips end on their own; the bound only guards rounding.
+    var budget = corners.length * 16
+    while queue.count > 0 and budget > 0:
+        queue.count -= 1
+        let corner = (usize)queue.items[queue.count]
+        let other = twin[corner]
+        if other < 0: continue
+        let a = corners[corner]
+        let b = corners[after_corner(corner)]
+        let c = corners[before_corner(corner)]
+        let d = corners[before_corner((usize)other)]
+        if a == d or b == d or c == d:
+            continue
+        # Distinct UV seam vertices may identify the same CAD vertex.
+        # A new diagonal must not collapse when lifted into the solid.
+        if (usize)c < boundary_ids.length and (usize)d < boundary_ids.length and boundary_ids[(usize)c] == boundary_ids[(usize)d]:
+            continue
+        if not should_flip(points[(usize)a], points[(usize)b], points[(usize)c], points[(usize)d], n):
+            continue
+        budget -= 1
+        flip(corners, twin, corner, (usize)other)
+        let face = corner // 3
+        let o = (usize)other // 3
+        for k in [face * 3, face * 3 + 1, o * 3 + 1, o * 3 + 2]:
+            if twin[k] >= 0: try queue.push((i64)k)
     var output = try MeshBuilder(precise = true)
     defer output.close()
-    for point in 0..<mesh.point_count():
-        _ = try output.point(try mesh.point(point))
+    for point in points:
+        _ = try output.point(point)
     for face in 0..<count:
         try output.face(3)
         for at in 0..<3:
             try output.corner(corners[face * 3 + (usize)at])
     return try output.finish()
+
+func after_corner(corner: usize) -> usize:
+    return corner - corner % 3 + (corner % 3 + 1) % 3
+
+func before_corner(corner: usize) -> usize:
+    return corner - corner % 3 + (corner % 3 + 2) % 3
+
+## Each corner's twin (see improve), found through a table of sides keyed
+## by their lower and higher point.
+func twins(corners: const i64[], constraints: TrimConstraints) -> i64[]!:
+    let twin = try new i64[corners.length] --- in memory.heap
+    errdefer free(twin) in memory.heap
+    let slots = try new i64[corners.length * 2 + 1] --- in memory.heap
+    defer free(slots) in memory.heap
+    for index in 0..<slots.length: slots[index] = -1
+    for corner in 0..<corners.length: twin[corner] = -1
+    # -2 marks a side met a third time, or twice the same way: no twin.
+    for corner in 0..<corners.length:
+        let a = corners[corner]
+        let b = corners[after_corner(corner)]
+        if constraints.contains(a, b): continue
+        let lo = a if a < b else b
+        let hi = b if a < b else a
+        var slot = (usize)(lo * 8388609 + hi) % slots.length
+        while slots[slot] >= 0:
+            let seen = (usize)slots[slot]
+            let sa = corners[seen]
+            let sb = corners[after_corner(seen)]
+            if (sa == lo and sb == hi) or (sa == hi and sb == lo): break
+            slot = (slot + 1) % slots.length
+        if slots[slot] < 0:
+            slots[slot] = (i64)corner
+            continue
+        let seen = (usize)slots[slot]
+        if twin[seen] == -1 and corners[seen] == b and corners[after_corner(seen)] == a:
+            twin[seen] = (i64)corner
+            twin[corner] = (i64)seen
+        else:
+            if twin[seen] >= 0: twin[(usize)twin[seen]] = -2
+            twin[seen] = -2
+            twin[corner] = -2
+    for corner in 0..<corners.length:
+        if twin[corner] < 0: twin[corner] = -1
+    return twin
+
+## Flip the side at `corner` (face a b c) and its twin `other` (face b a d)
+## to the diagonal c d: the faces become c a d and c d b, and the four outer
+## sides' twins follow them.
+func flip(corners: i64[], twin: i64[], corner: usize, other: usize):
+    let face = corner // 3
+    let o = other // 3
+    let a = corners[corner]
+    let b = corners[after_corner(corner)]
+    let c = corners[before_corner(corner)]
+    let d = corners[before_corner(other)]
+    let bc = twin[after_corner(corner)]
+    let ca = twin[before_corner(corner)]
+    let ad = twin[after_corner(other)]
+    let db = twin[before_corner(other)]
+    corners[face * 3] = c
+    corners[face * 3 + 1] = a
+    corners[face * 3 + 2] = d
+    corners[o * 3] = c
+    corners[o * 3 + 1] = d
+    corners[o * 3 + 2] = b
+    link(twin, face * 3, ca)
+    link(twin, face * 3 + 1, ad)
+    twin[face * 3 + 2] = (i64)(o * 3)
+    twin[o * 3] = (i64)(face * 3 + 2)
+    link(twin, o * 3 + 1, db)
+    link(twin, o * 3 + 2, bc)
+
+func link(twin: i64[], corner: usize, other: i64):
+    twin[corner] = other
+    if other >= 0: twin[(usize)other] = (i64)corner
 
 func should_flip(a: Vector3, b: Vector3, c: Vector3, d: Vector3, normal: Vector3) -> bool:
     let ad = a.subtract(d)
