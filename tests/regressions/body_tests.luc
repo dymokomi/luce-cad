@@ -1,0 +1,62 @@
+## Bodies as Fusion's Modify menu takes them: Split Body by a plane and by
+## a cylinder's face (two lumps, each closed, their volumes adding up),
+## Move/Copy turned and moved, and Combine of a body with its copy.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+func solid(model: CadModel, expected: float, tolerance: float, what: str) -> unit!:
+    let mesh = model.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > tolerance:
+        print(f"{what}: volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= tolerance)
+
+pub func body_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    assert(CadModeling.lump_count(box) == 1)
+    # By the plane y = 0.3: 2 x 2 x 0.7 above, 2 x 2 x 1.3 below.
+    let halves = CadModeling.split_by_plane(box, Vector3(0.0, 0.3, 0.0), Vector3(0.0, 1.0, 0.0), "s")
+    assert(CadModeling.lump_count(halves) == 2)
+    solid(CadModeling.lump(halves, 0), 2.8, 1e-5, "above")
+    solid(CadModeling.lump(halves, 1), 5.2, 1e-5, "below")
+    solid(halves, 8.0, 1e-5, "both halves")
+    # By a pin's side (radius 0.5 along Y): the core and the rest.
+    let pin = CadModeling.tagged(CadSolids.cylinder(0.5, 1.0), "pin")
+    var side = ""
+    for f in 0..<pin.face_count():
+        if pin.face_surface_kind(f) == 1:
+            side = CadModeling.face_name_of(pin, f)
+    let cored = CadModeling.split_by_face(box, pin, side, "s")
+    assert(CadModeling.lump_count(cored) == 2)
+    solid(CadModeling.lump(cored, 0), math.pi * 0.25 * 2.0, 0.01, "core")
+    solid(CadModeling.lump(cored, 1), 8.0 - math.pi * 0.25 * 2.0, 0.01, "rest")
+    # A plane past the body splits nothing.
+    var refused = false
+    _ = CadModeling.split_by_plane(box, Vector3(0.0, 5.0, 0.0), Vector3(0.0, 1.0, 0.0), "s") catch failure:
+        refused = failure.message.contains("misses")
+    assert(refused)
+    # Move: a 4 x 2 x 2 bar turned a quarter about Y, then 5 along X: it
+    # runs along Z now, about x = 5.
+    let bar = CadModeling.tagged(CadSolids.box(4.0, 2.0, 2.0), "bar")
+    let moved = CadModeling.moved_body(bar, Vector3(5.0, 0.0, 0.0), angle = math.pi * 0.5)
+    let bounds = moved.tessellate(16).bounds()
+    assert(math.abs(bounds.minimum.x - 4.0) < 1e-6 and math.abs(bounds.maximum.x - 6.0) < 1e-6)
+    assert(math.abs(bounds.minimum.z + 2.0) < 1e-6 and math.abs(bounds.maximum.z - 2.0) < 1e-6)
+    solid(moved, 16.0, 1e-5, "moved")
+    # Copy: turned a quarter about the vertical line x = 1 and named apart:
+    # it covers x 0..2, z -1..3, overlapping the bar by 2 x 2 x 2.
+    let copy = CadModeling.moved_body(bar, Vector3(), origin = Vector3(1.0, 0.0, 0.0), angle = math.pi * 0.5, prefix = "copy:")
+    var prefixed = true
+    for f in 0..<copy.face_count():
+        if not CadModeling.face_name_of(copy, f).starts_with("copy:"):
+            prefixed = false
+    assert(prefixed)
+    solid(CadModeling.combined(bar, copy, 0), 24.0, 1e-5, "joined copy")
+    solid(CadModeling.combined(bar, copy, 1), 8.0, 1e-5, "cut by its copy")
+    solid(CadModeling.combined(bar, copy, 2), 8.0, 1e-5, "common with its copy")
+    print("PASS bodies: split by a plane and by a cylinder's face into two closed lumps; a plane missing the body refused; a bar turned and moved; its copy named apart, joined, cut and intersected")

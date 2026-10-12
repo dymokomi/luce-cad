@@ -236,6 +236,81 @@ pub struct CadModeling:
             for f in picked.view(): removed.items[f] = true
         return try shell_of(model, removed.view(), thickness, side, tag)
 
+    # -- Bodies: split, lumps, move and copy.
+
+    ## Split Body by the plane through `origin` facing `normal`: the piece
+    ## on the normal's side and the piece behind it, as two lumps of one
+    ## model (lump_count, lump). The cut faces are `<tag>/to/f<i>`.
+    pub static func split_by_plane(model: interop.Reference[CadModel], origin: Vector3, normal: Vector3, tag: str) -> interop.Reference[CadModel]!:
+        let n = normal.normalized() catch failure: error(invalid, "a split plane needs a normal")
+        let seed = Vector3(1.0, 0.0, 0.0) if math.abs(n.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+        let x = try seed.subtract(n.multiply_scalar(seed.dot(n))).normalized()
+        var no_points = Growing[Vector3]()
+        defer no_points.close()
+        var knots = Growing[f64]()
+        defer knots.close()
+        var plane = try Surface(surface_plane, origin, x, n, 0.0, 0.0, no_points.view(), knots.view(), knots.view(), knots.view(), 0, 0, 0, 0)
+        defer plane.close()
+        return try split_by_surface(model.value(), &plane, tag)
+
+    ## Split Body by the surface of `tool`'s face `face` (a plane, cylinder,
+    ## cone, sphere or torus), extended past the face: the piece inside it
+    ## (a plane: on its outward side) and the piece outside, as two lumps.
+    pub static func split_by_face(model: interop.Reference[CadModel], tool: interop.Reference[CadModel], face: str, tag: str) -> interop.Reference[CadModel]!:
+        var t = try shape_of(tool.value())
+        defer t.close()
+        var found = Growing[usize]()
+        defer found.close()
+        try faces_named(&t, face, &found)
+        let f = found.items[0]
+        let s = &t.surfaces.items[(usize)t.faces.items[f].surface]
+        if s.kind == surface_spline: error(invalid, "Split Body takes a plane, cylinder, cone, sphere or torus face")
+        if s.kind == surface_plane and not t.faces.items[f].sense:
+            # The plane turned to face the way the face does.
+            var no_points = Growing[Vector3]()
+            defer no_points.close()
+            var knots = Growing[f64]()
+            defer knots.close()
+            var turned = try Surface(surface_plane, s.origin, s.x, s.z.multiply_scalar(-1.0), 0.0, 0.0, no_points.view(), knots.view(), knots.view(), knots.view(), 0, 0, 0, 0)
+            defer turned.close()
+            return try split_by_surface(model.value(), &turned, tag)
+        return try split_by_surface(model.value(), s, tag)
+
+    ## How many lumps (separate pieces) `model` has.
+    pub static func lump_count(model: interop.Reference[CadModel]) -> i64!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var lumps = Growing[usize]()
+        defer lumps.close()
+        return (i64)(try lumps_of(&w, &lumps))
+
+    ## Lump `at` of `model` as a body of its own.
+    pub static func lump(model: interop.Reference[CadModel], at: i64) -> interop.Reference[CadModel]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var lumps = Growing[usize]()
+        defer lumps.close()
+        let count = try lumps_of(&w, &lumps)
+        if at < 0 or (usize)at >= count: error(invalid, "the body has no such lump")
+        return try lump_model(&w, lumps.view(), (usize)at)
+
+    ## Move/Copy of a body: `model` turned `angle` radians about the line
+    ## through `origin` along `axis`, then moved by `by`. A copy (the
+    ## original kept) takes `prefix` before its faces' names, so features
+    ## tell it from the original; empty for a move.
+    pub static func moved_body(model: interop.Reference[CadModel], by: Vector3, origin: Vector3 = Vector3(), axis: Vector3 = Vector3(0.0, 1.0, 0.0), angle: f64 = 0.0, prefix: str = "") -> interop.Reference[CadModel]!:
+        if not by.is_finite() or not origin.is_finite() or not math.is_finite(angle): error(invalid, "a move needs finite distances and angles")
+        let a = axis.normalized() catch failure: error(invalid, "a rotation needs an axis")
+        let x = Vector3(1.0, 0.0, 0.0).rotated_about(a, angle)
+        let y = Vector3(0.0, 1.0, 0.0).rotated_about(a, angle)
+        let z = Vector3(0.0, 0.0, 1.0).rotated_about(a, angle)
+        let turned = origin.rotated_about(a, angle)
+        let matrix = Matrix4(x, y, z, origin.subtract(turned).add(by))
+        let placed = try model.value().placed(matrix)
+        if prefix == "": return placed
+        defer placed.release()
+        return try CadModeling.prefixed(placed, prefix)
+
     # -- Extrude's extents (extents.lucb, extent_targets.lucb).
 
     ## The sketch's profiles in `set` (as extruded's) extruded on two sides

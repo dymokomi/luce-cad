@@ -26,7 +26,10 @@ does today.
 | `profile_anchor(set, keys)` | Where a feature's arrow stands on those profiles (empty: the closed shapes Extrude takes): a point inside them (the middle of their area when it lies on them, else of their largest triangle), the plane's normal, their area. |
 | `inside(model, point)` | Whether a point lies inside a closed solid, by rays through its exact faces (`rays.lucb`): what an automatic Join or Cut asks. |
 | `shelled(model, faces, thickness, tag, side)` | Shell: hollowed to a wall `thickness` thick, the faces named opened (none: a closed void), the wall inside (`0`), outside (`1`) or half each way (`2`). |
-| `combined(a, b, operation)` | `0` union, `1` `a` without `b`, `2` intersection. |
+| `combined(a, b, operation)` | Combine: `0` join, `1` cut (`a` without `b`), `2` intersect. Fusion's Keep Tools is the caller keeping `b`; several tools are combined one after another. |
+| `split_by_plane(model, origin, normal, tag)`, `split_by_face(model, tool, face, tag)` | Split Body: the piece on the plane's normal side (inside a curved face's surface) and the piece beyond, as two lumps of one model. |
+| `lump_count(model)`, `lump(model, at)` | A model's separate pieces, each as a body of its own. |
+| `moved_body(model, by, origin, axis, angle, prefix)` | Move/Copy: turned about a line, then moved; a copy's faces take `prefix` so features tell it from the original. |
 | `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
 | `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |
 | `edge_references(model, edges)` | References to edges, given by their B-rep numbers (what a viewport pick gives). |
@@ -262,6 +265,12 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
 
 The tolerance comes from the model's size (1e-7 of it). Results are inputs again, so it must not
 grow from one operation to the next.
+
+**Split Body** (`split_body.lucb`) uses the same booleans: the body with the cutting surface's
+solid and without it. A plane's solid is a large box on its normal side; a cylinder's, cone's,
+sphere's or torus's is the primitive of that surface, made long enough. The two results go side by
+side into one model, two lumps (`lumps.lucb` finds a model's pieces by the edges its faces share). A
+surface that misses the body is refused.
 
 ### Chamfer and fillet (`blend.lucb`)
 

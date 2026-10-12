@@ -1,0 +1,30 @@
+## Split Body (Fusion's): a body cut in two by a plane, or by a face's
+## surface extended past the face (a plane, cylinder, cone, sphere or
+## torus), both pieces kept as lumps of one model (CadModeling.lump reads
+## each). The booleans do the cutting: the body with the surface's solid
+## (the half-space on a plane's normal side, a curved surface's inside)
+## and without it. The cut faces are named `<tag>/to/f<i>`.
+
+## `model` split by surface `s` (its solid named for `tag`): the piece in
+## it and the piece out of it, as one model's lumps. An error when the
+## surface misses the body.
+func split_by_surface(model: const CadModel*, s: const Surface*, tag: str) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model)
+    defer w.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(&w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    let span = high.subtract(low).length() * 4.0 + s.origin.subtract(low).length() * 2.0
+    let (_, tool) = try surface_side(s, s.origin, 1.0, s.z, 0.0, span, tag)
+    defer tool.release()
+    let within = combine(model, tool.value(), op_intersect) catch failure:
+        error(invalid, "the split surface misses the body")
+    defer within.release()
+    let beyond = combine(model, tool.value(), op_subtract) catch failure:
+        error(invalid, "the split surface misses the body")
+    defer beyond.release()
+    if within.value().face_count() == 0 or beyond.value().face_count() == 0: error(invalid, "the split surface misses the body: it lies wholly on one side")
+    return try side_by_side(within.value(), beyond.value())
