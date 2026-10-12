@@ -4,6 +4,12 @@
 ## each). The booleans do the cutting: the body with the surface's solid
 ## (the half-space on a plane's normal side, a curved surface's inside)
 ## and without it. The cut faces are named `<tag>/to/f<i>`.
+##
+## With Fusion's Extend splitting tool off, a face cuts only where it
+## reaches: the face swept along its normal past the body (face_quilt.lucb)
+## is the tool. A piece cut off by the face alone is a piece; one the sweep's
+## walls or far end cut too lay beside the face, not behind it, and joins
+## the body again. Nothing cut off by the face alone is refused.
 
 ## `model` split by surface `s` (its solid named for `tag`): the piece in
 ## it and the piece out of it, as one model's lumps. An error when the
@@ -58,3 +64,71 @@ func behind_surface(model: const CadModel*, s: const Surface*, tag: str) -> inte
     let (_, tool) = try surface_side(s, s.origin, 1.0, s.z, 0.0, span, tag)
     defer tool.release()
     return try combine(model, tool.value(), op_subtract)
+
+## `model` split by face `f` of `t` where the face itself reaches (Extend
+## splitting tool off; see above): the pieces it cuts off and the rest, as
+## one model's lumps.
+func split_by_face_only(model: const CadModel*, t: const Shape*, f: usize, tag: str) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model)
+    defer w.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for g in 0..<w.faces.count:
+        let (l, h) = try face_box(&w, g)
+        low = lower(low, l)
+        high = upper(high, h)
+    let (fl, fh) = try face_box(t, f)
+    low = lower(low, fl)
+    high = upper(high, fh)
+    let d = try t.face_normal(f, try point_on_face(t, f))
+    var name = Growing[u8]()
+    defer name.close()
+    try role_name(&name, tag, "to/f0")
+    var one = Growing[usize]()
+    defer one.close()
+    try one.push(f)
+    let tool = closed_quilt(t, one.view(), d, high.subtract(low).length() * 4.0, (str)name.view()) catch failure:
+        _ = failure
+        error(invalid, "the splitting face cannot be swept past the body: turn Extend splitting tool on")
+    defer tool.release()
+    let within = combine(model, tool.value(), op_intersect) catch failure:
+        _ = failure
+        error(invalid, "the splitting face misses the body")
+    defer within.release()
+    var rest = combine(model, tool.value(), op_subtract) catch failure:
+        _ = failure
+        error(invalid, "the splitting face misses the body")
+    defer rest.release()
+    var c = try shape_of(within.value())
+    defer c.close()
+    var lumps = Growing[usize]()
+    defer lumps.close()
+    let count = try lumps_of(&c, &lumps)
+    var pieces = Growing[interop.Reference[CadModel]]()
+    defer:
+        for piece in pieces.view(): piece.release()
+        pieces.close()
+    for lump in 0..<count:
+        let piece = try lump_model(&c, lumps.view(), lump)
+        var beside = false
+        for g in 0..<c.faces.count:
+            if lumps.items[g] == lump and alias_starts(c.face_name(g), quilt_tag): beside = true
+        if not beside:
+            try pieces.push(piece)
+            continue
+        # Cut by the sweep's walls too: it stays with the body.
+        defer piece.release()
+        let joined = combine(rest.value(), piece.value(), op_union) catch failure:
+            _ = failure
+            error(invalid, "Split Body could not join back what lies beside the splitting face")
+        rest.release()
+        rest = joined
+    if pieces.count == 0: error(invalid, "the splitting face does not reach across the body: turn Extend splitting tool on to split by its surface")
+    if rest.value().face_count() == 0: error(invalid, "the splitting face misses the body: it lies wholly on one side")
+    var result = rest.clone()
+    defer result.release()
+    for piece in pieces.view():
+        let both = try side_by_side(result.value(), piece.value())
+        result.release()
+        result = both
+    return result.clone()

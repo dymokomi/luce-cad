@@ -1,0 +1,337 @@
+## Delete of a band of faces between one face and a ring of faces round it,
+## healed by extending them until they meet (Fusion's Delete of a rounded
+## or chamfered top chain, its rounded uprights curved, G1 cylinders or
+## G2/G3 B-spline strips): what face_heal.lucb's caps do not take, since
+## they need flat faces round the gap.
+##
+## The deleted faces must leave one face (A, the top) with a whole loop on
+## the gap, and every other face round the gap (the ring: sides, rounded
+## uprights) with one run of gap edges in a loop. Then:
+## - each ring face meets A along a new edge where their surfaces cross (a
+##   line between planes, an analytic curve, else a traced cubic through
+##   both ends, march.lucb);
+## - each edge between two ring faces running into the gap keeps its
+##   carrier, lengthened until it reaches A's surface: there the two ring
+##   edges and A meet;
+## - A's loop on the gap becomes the new edges, the other way round.
+## The result is checked closed. Anything else is refused with why.
+
+## One ring face's run of gap edges: face `face`, uses at..<at + count of
+## its uses (a run that may wrap round its loop, from `loop_at` with
+## `loop_size` uses), from vertex `head` to vertex `tail`.
+struct BandRun:
+    var face: usize
+    var loop_at: usize
+    var loop_size: usize
+    var start: usize
+    var count: usize
+    var head: i64
+    var tail: i64
+
+## The vertex use `use` ends at.
+func use_end(w: const Shape*, use: i64) -> i64:
+    let edge = w.edges.items[edge_index(use)]
+    return edge.end if use > 0 else edge.start
+
+## `w` without faces `deleted`, the band between one face and a ring of
+## faces healed (see above), as a model.
+func healed_band(w: Shape*, deleted: const bool[]) -> interop.Reference[CadModel]!:
+    var gap = Growing[bool]()
+    defer gap.close()
+    try gap.fill(w.edges.count, false)
+    for e in 0..<w.edges.count:
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0: continue
+        if deleted[(usize)fa] != deleted[(usize)fb]: gap.items[e] = true
+    # A: the kept face with a whole loop on the gap; the ring: one run of
+    # gap edges in some loop of each other face round the gap.
+    var a: i64 = -1
+    var a_loop_at: usize = 0
+    var a_loop_size: usize = 0
+    var runs = Growing[BandRun]()
+    defer runs.close()
+    for f in 0..<w.faces.count:
+        if deleted[f]: continue
+        let face = w.faces.items[f]
+        let uses = w.face_uses(f)
+        var at: usize = 0
+        for loop in 0..<face.loops:
+            let size = (usize)w.sizes.items[face.loop_first + loop]
+            var on_gap: usize = 0
+            for use in uses[at..<at + size]:
+                if gap.items[edge_index(use)]: on_gap += 1
+            if on_gap == size:
+                if a >= 0: error(invalid, "Delete cannot heal these faces: two faces round them lose a whole outline")
+                a = (i64)f
+                a_loop_at = face.first + at
+                a_loop_size = size
+            elif on_gap > 0:
+                # The run starts after a use off the gap.
+                var first = size
+                for k in 0..<size:
+                    if gap.items[edge_index(uses[at + k])] and not gap.items[edge_index(uses[at + (k + size - 1) % size])]:
+                        if first < size: error(invalid, "Delete cannot heal these faces: a face round them meets them in more than one place")
+                        first = k
+                let start_use = w.uses.items[face.first + at + first]
+                let end_use = w.uses.items[face.first + at + (first + on_gap - 1) % size]
+                for k in 0..<on_gap:
+                    if not gap.items[edge_index(uses[at + (first + k) % size])]: error(invalid, "Delete cannot heal these faces: a face round them meets them in more than one place")
+                try runs.push(BandRun(f, face.first + at, size, first, on_gap, use_start(w, start_use), use_end(w, end_use)))
+            at += size
+    if a < 0: error(invalid, "Delete cannot heal these faces: no face round them is left open all round")
+    if runs.count < 2: error(invalid, "Delete cannot heal these faces: too few faces round them")
+    let sa = w.faces.items[(usize)a].surface
+    # Where each run's ends go: along the ring edge running into the gap
+    # there, onto A's surface.
+    var before = try copied_points(w)
+    defer before.close()
+    var map = Growing[i64]()
+    defer map.close()
+    for v in 0..<w.points.count: try map.push((i64)v)
+    var moved = Growing[bool]()
+    defer moved.close()
+    try moved.fill(w.points.count, false)
+    for run in runs.view():
+        for v in [run.head, run.tail]:
+            if moved.items[(usize)v]: continue
+            let e = try ring_edge(w, &gap, deleted, v)
+            let p = try onto_surface(w, e, v, sa)
+            let n = try w.add_point(p)
+            try before.push(p)
+            map.items[(usize)v] = n
+            moved.items[(usize)v] = true
+    # The new edges, one per run, from its start's new place to its end's.
+    var made = Growing[i64]()
+    defer made.close()
+    for run in runs.view():
+        let p0 = w.points.items[(usize)map.items[(usize)run.head]]
+        let p1 = w.points.items[(usize)map.items[(usize)run.tail]]
+        if map.items[(usize)run.head] == map.items[(usize)run.tail]: error(invalid, "Delete cannot heal these faces: a face round them would meet the open face in a point")
+        # Where the run ran, to choose among the curves the surfaces share.
+        let middle_use = w.uses.items[run.loop_at + (run.start + run.count // 2) % run.loop_size]
+        let hint = try w.edge_at(edge_index(middle_use), 0.5)
+        let carrier = try band_carrier(w, (usize)a, run.face, p0, p1, hint)
+        let edge = try w.add_edge(ShapeEdge(carrier, 0.0, 0.0, map.items[(usize)run.head], map.items[(usize)run.tail]))
+        try fit_band_interval(w, (usize)edge)
+        try made.push(edge)
+    return try banded(w, deleted, &gap, (usize)a, a_loop_at, a_loop_size, runs.view(), made.view(), map.view(), before.view())
+
+## The kept edge between two ring faces that ends at gap vertex `v`.
+func ring_edge(w: const Shape*, gap: const Growing[bool]*, deleted: const bool[], v: i64) -> usize!:
+    var found: i64 = -1
+    for e in 0..<w.edges.count:
+        if gap.items[e]: continue
+        let edge = w.edges.items[e]
+        if edge.start != v and edge.end != v: continue
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0 or deleted[(usize)fa] or deleted[(usize)fb]: continue
+        if found >= 0: error(invalid, "Delete cannot heal these faces: more than one edge runs into the gap at a corner")
+        found = (i64)e
+    if found < 0: error(invalid, "Delete cannot heal these faces: two faces round them meet only at a point")
+    return (usize)found
+
+## Where edge `e`'s carrier, from its end at vertex `v` on, reaches surface
+## `s`: Newton along the carrier from that end.
+func onto_surface(w: const Shape*, e: usize, v: i64, s: i64) -> Vector3!:
+    let edge = w.edges.items[e]
+    let surface = &w.surfaces.items[(usize)s]
+    var t = edge.t0 if edge.start == v else edge.t1
+    for _ in 0..<60:
+        let (p, d1, _) = try w.derivatives(edge.carrier, t)
+        let (g, n) = try signed_gap(surface, p, w.tolerance)
+        if math.abs(g) <= w.tolerance * 0.01: return p
+        let slope = n.dot(d1)
+        if math.abs(slope) < 1e-12: break
+        t -= g / slope
+    let p = try w.at(edge.carrier, t)
+    let (g, _) = try signed_gap(surface, p, w.tolerance)
+    if math.abs(g) > w.tolerance * 10.0: error(invalid, "Delete cannot heal these faces: an edge running into the gap never reaches the open face's surface")
+    return p
+
+## The carrier where faces `fa` and `fb` meet from `start` to `end`: a
+## line between planes, an analytic curve nearest `hint`, else traced.
+func band_carrier(w: Shape*, fa: usize, fb: usize, start: Vector3, end: Vector3, hint: Vector3) -> i64!:
+    let sa = &w.surfaces.items[(usize)w.faces.items[fa].surface]
+    let sb = &w.surfaces.items[(usize)w.faces.items[fb].surface]
+    if sa.kind != surface_spline and sb.kind != surface_spline:
+        var curves = Growing[Carrier]()
+        defer curves.close()
+        if (try meet(sa, sb, w.tolerance, &curves)) == meet_curves:
+            let c = meeting_carrier(w, fa, fb, start, end, hint) catch failure:
+                _ = failure
+                return try traced_carrier(w, fa, fb, start, end, hint)
+            return try w.add_carrier(c)
+    return try traced_carrier(w, fa, fb, start, end, hint)
+
+## The curve on the surfaces of faces `fa` and `fb` from `start` to `end`,
+## traced (march.lucb's steps) and fitted by a cubic that stays on both.
+func traced_carrier(w: Shape*, fa: usize, fb: usize, start: Vector3, end: Vector3, hint: Vector3) -> i64!:
+    var f1 = field_of(&w.surfaces.items[(usize)w.faces.items[fa].surface])
+    var f2 = field_of(&w.surfaces.items[(usize)w.faces.items[fb].surface])
+    let span = math.max(end.subtract(start).length(), math.max(hint.subtract(start).length(), hint.subtract(end).length()))
+    if span <= w.tolerance * 10.0: error(invalid, "the healed edge has no length")
+    var line = Growing[Vector3]()
+    defer line.close()
+    var net = Growing[Vector3]()
+    defer net.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    var step = span / 32.0
+    for attempt in 0..<6:
+        try traced_run(&f1, &f2, start, end, hint, step, w.tolerance, &line)
+        try interpolate_cubic(line.view(), &net, &knots)
+        weights.clear()
+        for _ in net.view(): try weights.push(1.0)
+        if try stays_on(&f1, &f2, net.view(), weights.view(), knots.view(), line.count * 4, w.tolerance):
+            let spline = try w.store_spline(net.view(), weights.view(), knots.view(), 3, Matrix4())
+            return try w.add_carrier(Carrier(curve_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline))
+        if attempt == 5: break
+        step *= 0.5
+    error(invalid, "Delete cannot heal these faces: where the faces round them meet cannot be followed closely enough")
+
+## The points `step` apart on both fields from `start` to `end`, setting
+## out toward `hint` (where the edge runs), onto `out`.
+func traced_run(f1: Field*, f2: Field*, start: Vector3, end: Vector3, hint: Vector3, step: f64, tol: f64, out: Growing[Vector3]*) -> !:
+    out.clear()
+    unseed(f1)
+    unseed(f2)
+    try out.push(start)
+    var p = start
+    var t = (try curve_direction(f1, f2, start)) else error(invalid, "Delete cannot heal these faces: the faces round them touch where they should cross")
+    let toward = hint.subtract(start) if hint.subtract(start).length() > step else end.subtract(start)
+    if t.dot(toward) < 0.0: t = t.multiply_scalar(-1.0)
+    let limit = (usize)(end.subtract(start).length() / step * 8.0) + 64
+    for _ in 0..<limit:
+        if p.subtract(end).length() <= step * 1.5:
+            try out.push(end)
+            if out.count < 4:
+                # Too few for a cubic: the middles of the steps too.
+                var more = Growing[Vector3]()
+                defer more.close()
+                for k in 0..<out.count - 1:
+                    try more.push(out.items[k])
+                    let middle = (try onto_both(f1, f2, out.items[k].add(out.items[k + 1]).multiply_scalar(0.5), tol)) else error(invalid, "Delete cannot heal these faces: the faces round them stop meeting")
+                    try more.push(middle)
+                try more.push(end)
+                try out.assign(more.view())
+            return
+        let guess = p.add(t.multiply_scalar(step))
+        let next = (try onto_both(f1, f2, guess, tol)) else error(invalid, "Delete cannot heal these faces: the faces round them stop meeting")
+        let direction = (try curve_direction(f1, f2, next)) else error(invalid, "Delete cannot heal these faces: the faces round them touch where they should cross")
+        try out.push(next)
+        t = direction if direction.dot(t) > 0.0 else direction.multiply_scalar(-1.0)
+        p = next
+    error(invalid, "Delete cannot heal these faces: where the faces round them meet does not reach the next corner")
+
+## Edge `e`'s interval on its carrier from its ends: a line's, an arc's
+## the shorter way round, a traced spline's whole.
+func fit_band_interval(w: Shape*, e: usize) -> !:
+    let edge = w.edges.items[e]
+    let c = w.carriers.items[(usize)edge.carrier]
+    if c.kind == curve_spline:
+        let (points, _, knots, degree) = w.spline_net(c.spline)
+        w.edges.items[e] = ShapeEdge(edge.carrier, knots[(usize)degree], knots[points.length], edge.start, edge.end)
+        return
+    try fit_interval(w, e)
+
+## `w` with the band's faces gone: A's gap loop the new edges `made`
+## backwards, each ring run its new edge, vertices merged by `map`, edges
+## whose ends moved refitted on their carriers (`before`: where each old
+## vertex was), as a model.
+func banded(w: Shape*, deleted: const bool[], gap: const Growing[bool]*, a: usize, a_loop_at: usize, a_loop_size: usize, runs: const BandRun[], made: const i64[], map: const i64[], before: const Vector3[]) -> interop.Reference[CadModel]!:
+    var faces = Growing[ShapeFace]()
+    errdefer faces.close()
+    var uses = Growing[i64]()
+    errdefer uses.close()
+    var sizes = Growing[i64]()
+    errdefer sizes.close()
+    for f in 0..<w.faces.count:
+        if deleted[f]: continue
+        let face = w.faces.items[f]
+        let start_uses = uses.count
+        let start_sizes = sizes.count
+        var at = face.first
+        for loop in 0..<face.loops:
+            let size = (usize)w.sizes.items[face.loop_first + loop]
+            let before_loop = uses.count
+            if f == a and at == a_loop_at:
+                try band_loop(w, made, &uses)
+            else:
+                var run_of: i64 = -1
+                for k in 0..<runs.length:
+                    if runs[k].face == f and runs[k].loop_at == at: run_of = (i64)k
+                if run_of < 0:
+                    for use in w.uses.view()[at..<at + size]: try uses.push(use)
+                else:
+                    # The run's uses give way to its new edge, the loop
+                    # starting after the run.
+                    let run = runs[(usize)run_of]
+                    try uses.push(made[(usize)run_of] + 1)
+                    for k in run.count..<size:
+                        try uses.push(w.uses.items[at + (run.start + k) % size])
+            try sizes.push((i64)(uses.count - before_loop))
+            at += size
+        try faces.push(ShapeFace(face.surface, face.sense, start_uses, uses.count - start_uses, start_sizes, sizes.count - start_sizes, face.name))
+    _ = a_loop_size
+    w.faces.close()
+    w.uses.close()
+    w.sizes.close()
+    w.faces = faces
+    w.uses = uses
+    w.sizes = sizes
+    # Moved into the shape: the locals start again empty.
+    faces = Growing[ShapeFace]()
+    uses = Growing[i64]()
+    sizes = Growing[i64]()
+    var was = Growing[Vector3]()
+    defer was.close()
+    let first_made = (usize)made[0]
+    for e in 0..<w.edges.count:
+        var edge = w.edges.items[e]
+        if e >= first_made:
+            try was.push(w.points.items[(usize)edge.start])
+            try was.push(w.points.items[(usize)edge.end])
+            continue
+        try was.push(before[(usize)edge.start])
+        try was.push(before[(usize)edge.end])
+        edge.start = map[(usize)edge.start]
+        edge.end = map[(usize)edge.end]
+        w.edges.items[e] = edge
+    try w.index_sides()
+    var still = Growing[bool]()
+    defer still.close()
+    try still.fill(w.faces.count, false)
+    let fixed = FaceMove(move_replace, Vector3(), Vector3(), Vector3(), 0.0, 0.0)
+    for e in 0..<first_made:
+        if w.sides.items[e * 2] < 0 and w.sides.items[e * 2 + 1] < 0: continue
+        try refit_edge(w, e, still.view(), &fixed, was.items[e * 2], was.items[e * 2 + 1])
+    _ = gap
+    try check_loops(w)
+    try orient(w, w.faces.count)
+    let solid = try used_brep(w)
+    defer solid.release()
+    return try CadModel.of_brep(solid)
+
+## The new edges `made` as one loop of A: each used backwards (the ring
+## face uses it forwards), chained end to start.
+func band_loop(w: const Shape*, made: const i64[], uses: Growing[i64]*) -> !:
+    var taken = Growing[bool]()
+    defer taken.close()
+    try taken.fill(made.length, false)
+    var k: usize = 0
+    for _ in 0..<made.length:
+        taken.items[k] = true
+        try uses.push(-(made[k] + 1))
+        # Backwards it ends at its start: the next one ends there forwards.
+        let at = w.edges.items[(usize)made[k]].start
+        var next = made.length
+        for j in 0..<made.length:
+            if not taken.items[j] and w.edges.items[(usize)made[j]].end == at: next = j
+        if next == made.length: break
+        k = next
+    for t in taken.view():
+        if not t: error(invalid, "Delete cannot heal these faces: the faces round them do not close a ring")

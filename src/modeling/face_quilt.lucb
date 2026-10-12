@@ -1,0 +1,290 @@
+## Replace Face onto an open surface body spanning several surfaces (Fusion
+## replaces faces onto a quilt of a surface body): the quilt is closed into
+## a solid by sweeping it along the way the replaced faces face, far past
+## the body, and replaced_by_quilt (face_replace.lucb) then trims or
+## extends the body to it as to a solid's faces.
+##
+## The closing solid's faces: the quilt's (turned to face against the
+## sweep, toward the body), the quilt moved along the sweep (facing on),
+## and one wall per open edge of the quilt, the edge swept along: a plane
+## for a line or a flat curve the sweep lies in, a cylinder for a circle
+## about the sweep, else a ruled B-spline (the edge's net and its copy
+## moved; a circle or ellipse as its exact rational net first). The walls
+## meet at lines from the quilt's corners along the sweep.
+
+## `model` (as `w`) with faces `picked` replaced by the open quilt of
+## `t`'s faces `found`: closed by a sweep along the way the picked faces
+## face, then trimmed or extended to as a solid's faces.
+func replaced_by_open_quilt(model: interop.Reference[CadModel], w: const Shape*, picked: const usize[], t: const Shape*, found: const usize[]) -> interop.Reference[CadModel]!:
+    var way = Vector3()
+    for f in picked: way = way.add(try w.face_normal(f, try point_on_face(w, f)))
+    if way.length() <= 1e-9: error(invalid, "Replace Face onto a surface body needs the faces replaced to face one way")
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    for f in found:
+        let (l, h) = try face_box(t, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    let closed = try closed_quilt(t, found, try way.normalized(), high.subtract(low).length() * 8.0)
+    defer closed.release()
+    var c = try shape_of(closed.value())
+    defer c.close()
+    var quilt = Growing[usize]()
+    defer quilt.close()
+    for k in 0..<found.length: try quilt.push(k)
+    return try replaced_by_quilt(model, w, picked, closed, &c, quilt.view())
+
+## Whether any edge of `t`'s faces `found` lies on the body's open
+## boundary (a surface body's).
+func open_faces(t: const Shape*, found: const usize[]) -> bool!:
+    var used = try edge_uses(t)
+    defer used.close()
+    for f in found:
+        for use in t.face_uses(f):
+            if used.items[edge_index(use)] == 1: return true
+    return false
+
+## How many times `t`'s faces use each edge (a seam twice by one face;
+## once on a surface body's open boundary).
+func edge_uses(t: const Shape*) -> Growing[i64]!:
+    var used = Growing[i64]()
+    errdefer used.close()
+    try used.fill(t.edges.count, 0)
+    for f in 0..<t.faces.count:
+        for use in t.face_uses(f): used.items[edge_index(use)] += 1
+    return used
+
+## The name the closing solid's own faces carry.
+let quilt_tag = "#quilt"
+
+## `t`'s faces `found` (an open quilt) closed into a solid by sweeping them
+## `length` along unit `d`, as a model; the quilt's faces come first, in
+## `found`'s order, named `rename` when it is given.
+func closed_quilt(t: const Shape*, found: const usize[], d: Vector3, length: f64, rename: str = "") -> interop.Reference[CadModel]!:
+    var q = try shape_copy(t)
+    defer q.close()
+    let shift = d.multiply_scalar(length)
+    let name = try q.add_name(quilt_tag)
+    let own = try q.add_name(rename)
+    # How many times quilt faces use each edge: once on its open boundary.
+    var used = Growing[i64]()
+    defer used.close()
+    try used.fill(t.edges.count, 0)
+    for f in found:
+        for use in t.face_uses(f): used.items[edge_index(use)] += 1
+    # Each face turned to face against the sweep (toward the body).
+    var turned = Growing[bool]()
+    defer turned.close()
+    for f in found: try turned.push((try t.face_normal(f, try point_on_face(t, f))).dot(d) > 0.0)
+    # The quilt moved: its points, edges and surfaces.
+    var points = Growing[i64]()
+    defer points.close()
+    try points.fill(t.points.count, -1)
+    var edges = Growing[i64]()
+    defer edges.close()
+    try edges.fill(t.edges.count, -1)
+    for f in found:
+        for use in t.face_uses(f):
+            let e = edge_index(use)
+            if edges.items[e] >= 0: continue
+            let edge = t.edges.items[e]
+            for v in [edge.start, edge.end]:
+                if points.items[(usize)v] < 0: points.items[(usize)v] = try q.add_point(t.points.items[(usize)v].add(shift))
+            let carrier = try q.add_carrier(try moved_carrier(&q, &t.carriers.items[(usize)edge.carrier], shift))
+            edges.items[e] = try q.add_edge(ShapeEdge(carrier, edge.t0, edge.t1, points.items[(usize)edge.start], points.items[(usize)edge.end]))
+    # A line along the sweep from each corner of the open boundary.
+    var rises = Growing[i64]()
+    defer rises.close()
+    try rises.fill(t.points.count, -1)
+    for e in 0..<t.edges.count:
+        if used.items[e] != 1: continue
+        let edge = t.edges.items[e]
+        for v in [edge.start, edge.end]:
+            if rises.items[(usize)v] >= 0: continue
+            let line = try q.add_carrier(Carrier(curve_line, t.points.items[(usize)v], d, Vector3(), 0.0, 0.0, -1))
+            rises.items[(usize)v] = try q.add_edge(ShapeEdge(line, 0.0, length, v, points.items[(usize)v]))
+    var faces = Growing[ShapeFace]()
+    errdefer faces.close()
+    var uses = Growing[i64]()
+    errdefer uses.close()
+    var sizes = Growing[i64]()
+    errdefer sizes.close()
+    var loop = Growing[i64]()
+    defer loop.close()
+    # The quilt's faces, then their moved copies, each loop turned where
+    # the face is.
+    for copy in 0..<2:
+        for k in 0..<found.length:
+            let f = found[k]
+            let face = t.faces.items[f]
+            var surface = face.surface
+            if copy == 1:
+                let m = FaceMove(move_translate, shift, Vector3(), Vector3(), 0.0, 0.0)
+                try q.surfaces.push(try moved_surface(t, f, &m, 0.0))
+                surface = (i64)q.surfaces.count - 1
+            # The copy faces the other way from the quilt face.
+            let backwards = turned.items[k] != (copy == 1)
+            let first = uses.count
+            let loop_first = sizes.count
+            var at = face.first
+            for size in t.face_sizes(f):
+                loop.clear()
+                for use in t.uses.view()[at..<at + (usize)size]:
+                    let e = edge_index(use)
+                    let mine = (i64)e if copy == 0 else edges.items[e]
+                    try loop.push((mine + 1) if use > 0 else -(mine + 1))
+                try push_loop(&uses, loop.view(), backwards)
+                try sizes.push(size)
+                at += (usize)size
+            try faces.push(ShapeFace(surface, face.sense != backwards, first, uses.count - first, loop_first, sizes.count - loop_first, (face.name if rename == "" else own) if copy == 0 else name))
+    # A wall along each open edge, using it the other way from its quilt
+    # face: down the edge, along the sweep, back along the moved edge.
+    for k in 0..<found.length:
+        let f = found[k]
+        for use in t.face_uses(f):
+            let e = edge_index(use)
+            if used.items[e] != 1: continue
+            # The use as the turned quilt face runs it: from a to b.
+            let way = (use > 0) != turned.items[k]
+            let edge = t.edges.items[e]
+            let a = edge.start if way else edge.end
+            let b = edge.end if way else edge.start
+            let mine = (i64)e + 1
+            let moved = edges.items[e] + 1
+            let first = uses.count
+            try uses.push(-mine if way else mine)
+            try uses.push(rises.items[(usize)a] + 1)
+            try uses.push(moved if way else -moved)
+            try uses.push(-(rises.items[(usize)b] + 1))
+            # Outward: away from the quilt face's inside (left of a to b
+            # about its outward normal).
+            let middle = try t.edge_at(e, 0.5)
+            let along = (try t.leaving(e, 0)).multiply_scalar(1.0 if way else -1.0)
+            let outward_quilt = (try t.face_normal(f, middle)).multiply_scalar(-1.0 if turned.items[k] else 1.0)
+            var outward = along.cross(outward_quilt)
+            outward = outward.subtract(d.multiply_scalar(outward.dot(d)))
+            if outward.length() < 0.1:
+                # The face stands along the sweep at the edge (a fillet
+                # meeting a wall): away from a point inside the face.
+                let side = along.cross(d)
+                outward = side if (try point_on_face(t, f)).subtract(middle).dot(side) < 0.0 else side.multiply_scalar(-1.0)
+            try q.surfaces.push(try wall_surface(&q, &t.carriers.items[(usize)edge.carrier], edge.t0, edge.t1, d, length))
+            let surface = (i64)q.surfaces.count - 1
+            let n = try normal_at(&q.surfaces.items[(usize)surface], middle, q.tolerance)
+            try faces.push(ShapeFace(surface, n.dot(outward) > 0.0, first, 4, sizes.count, 1, name))
+            try sizes.push(4)
+    q.faces.close()
+    q.uses.close()
+    q.sizes.close()
+    q.faces = faces
+    q.uses = uses
+    q.sizes = sizes
+    # Moved into the shape: the locals start again empty.
+    faces = Growing[ShapeFace]()
+    uses = Growing[i64]()
+    sizes = Growing[i64]()
+    try q.index_sides()
+    orient(&q, q.faces.count) catch failure:
+        _ = failure
+        error(invalid, "Replace Face cannot close the target surface body into a solid: its faces do not join along their edges")
+    check_loops(&q) catch failure:
+        _ = failure
+        error(invalid, "Replace Face cannot close the target surface body into a solid: it folds back on the way the faces move")
+    let solid = try used_brep(&q)
+    defer solid.release()
+    return try CadModel.of_brep(solid)
+
+## Loop `loop` onto `uses`, or turned the other way round (each use
+## reversed, in reverse order).
+func push_loop(uses: Growing[i64]*, loop: const i64[], backwards: bool) -> !:
+    if not backwards:
+        for use in loop: try uses.push(use)
+        return
+    var at = loop.length
+    while at > 0:
+        at -= 1
+        try uses.push(-loop[at])
+
+## Carrier `c` of `q` moved by `shift` (a spline's net copied, moved).
+func moved_carrier(q: Shape*, c: const Carrier*, shift: Vector3) -> Carrier!:
+    if c.kind != curve_spline: return Carrier(c.kind, c.origin.add(shift), c.x, c.y, c.a, c.b, -1)
+    let (points, weights, knots, degree) = q.spline_net(c.spline)
+    let spline = try q.store_spline(points, weights, knots, degree, Matrix4(Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0), shift))
+    return Carrier(curve_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline)
+
+## The surface swept by carrier `c` (its interval t0..t1) moved `length`
+## along unit `d` (see the file's header).
+func wall_surface(q: Shape*, c: const Carrier*, t0: f64, t1: f64, d: Vector3, length: f64) -> Surface!:
+    if c.kind == curve_line:
+        let n = c.x.cross(d)
+        if n.length() <= 1e-9: error(invalid, "Replace Face cannot close the target surface body: an open edge runs along the way the faces move")
+        return try plane_surface(c.origin, c.x, try n.normalized())
+    if c.kind == curve_circle or c.kind == curve_ellipse:
+        let axis = try c.x.cross(c.y).normalized()
+        if math.abs(axis.dot(d)) <= 1e-9: return try plane_surface(c.origin, c.x, axis)
+        if c.kind == curve_circle and math.abs(axis.dot(d)) >= 1.0 - 1e-12:
+            var no_points = Growing[Vector3]()
+            defer no_points.close()
+            var knots = Growing[f64]()
+            defer knots.close()
+            return try Surface(surface_cylinder, c.origin, c.x, d, c.a, 0.0, no_points.view(), knots.view(), knots.view(), knots.view(), 0, 0, 0, 0)
+    var net = Growing[Vector3]()
+    defer net.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var degree: i64 = 2
+    if c.kind == curve_spline:
+        let (points, w, k, deg) = q.spline_net(c.spline)
+        try net.assign(points)
+        try weights.assign(w)
+        try knots.assign(k)
+        degree = deg
+    else:
+        try arc_net(c, t0, t1, &net, &weights, &knots)
+    var grid = Growing[Vector3]()
+    defer grid.close()
+    var grid_weights = Growing[f64]()
+    defer grid_weights.close()
+    for at in 0..<net.count:
+        try grid.push(net.items[at])
+        try grid.push(net.items[at].add(d.multiply_scalar(length)))
+        try grid_weights.push(weights.items[at])
+        try grid_weights.push(weights.items[at])
+    let rise_knots: f64[4] = [0.0, 0.0, 1.0, 1.0]
+    return try Surface(surface_spline, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, grid.view(), grid_weights.view(), knots.view(), rise_knots[..<4], (i64)net.count, 2, degree, 1)
+
+## Circle or ellipse `c` from angle `t0` to `t1` as an exact rational
+## quadratic net (spans of at most a quarter turn), its knots over the
+## angles so the edge's interval stays its parameters.
+func arc_net(c: const Carrier*, t0: f64, t1: f64, net: Growing[Vector3]*, weights: Growing[f64]*, knots: Growing[f64]*) -> !:
+    let b = c.a if c.kind == curve_circle else c.b
+    let spans = (i64)math.max(1.0, math.ceil(math.abs(t1 - t0) / (math.pi * 0.5) - 1e-9))
+    let step = (t1 - t0) / (f64)spans
+    let w = math.cos(step * 0.5)
+    try knots.push(t0)
+    try knots.push(t0)
+    try knots.push(t0)
+    for s in 0..<spans:
+        let a0 = t0 + step * (f64)s
+        let middle = a0 + step * 0.5
+        if s == 0:
+            try net.push(c.origin.add(c.x.multiply_scalar(c.a * math.cos(a0))).add(c.y.multiply_scalar(b * math.sin(a0))))
+            try weights.push(1.0)
+        # The corner where the span's end tangents meet.
+        try net.push(c.origin.add(c.x.multiply_scalar(c.a * math.cos(middle) / w)).add(c.y.multiply_scalar(b * math.sin(middle) / w)))
+        try weights.push(w)
+        let a1 = a0 + step
+        try net.push(c.origin.add(c.x.multiply_scalar(c.a * math.cos(a1))).add(c.y.multiply_scalar(b * math.sin(a1))))
+        try weights.push(1.0)
+        if s + 1 < spans:
+            try knots.push(a1)
+            try knots.push(a1)
+    try knots.push(t1)
+    try knots.push(t1)
+    try knots.push(t1)

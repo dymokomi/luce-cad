@@ -31,7 +31,7 @@ does today.
 | `inside(model, point)` | Whether a point lies inside a closed solid, by rays through its exact faces (`rays.lucb`): what an automatic Join or Cut asks. |
 | `shelled(model, faces, thickness, tag, side, chain, outside_thickness)` | Shell: hollowed to a wall `thickness` thick, the faces named opened (none: a closed void), the wall inside (`0`), outside (`1`) or both ways (`2`): half each way, or with `outside_thickness` 0 or more Fusion's Inside (`thickness`) and Outside thicknesses. With `chain` (Fusion's Tangent chain) the faces meeting opened ones tangentially open too. |
 | `combined(a, b, operation)` | Combine: `0` join, `1` cut (`a` without `b`), `2` intersect. Fusion's Keep Tools is the caller keeping `b`; several tools are combined one after another. |
-| `split_by_plane(model, origin, normal, tag)`, `split_by_face(model, tool, face, tag)` | Split Body: the piece on the plane's normal side (inside a curved face's surface) and the piece beyond, as two lumps of one model. |
+| `split_by_plane(model, origin, normal, tag)`, `split_by_face(model, tool, face, tag, extend)` | Split Body: the piece on the plane's normal side (inside a curved face's surface) and the piece beyond, as two lumps of one model. With `extend` off (Fusion's Extend splitting tool), the face cuts only where it reaches. |
 | `sliced(model, origin, normal, tag)` | Fusion's sketch Slice: what lies behind the plane (against its normal), the half-space in front taken away and the cut capped by faces named `<tag>/to/f<i>`; the model itself when nothing of it is in front; refused when all of it is. |
 | `lump_count(model)`, `lump(model, at)` | A model's separate pieces, each as a body of its own. |
 | `moved_body(model, by, origin, axis, angle, prefix)` | Move/Copy: turned about a line, then moved; a copy's faces take `prefix` so features tell it from the original. |
@@ -54,8 +54,8 @@ takes them, several apart by `;`:
 |---|---|
 | `offset_faces(model, faces, distance, chain)` | Offset Face, Press Pull on a face: each face moved along its outward normal (a plane moved, a cylinder's, cone's, sphere's or torus's radius changed). With `chain` (the default) the faces meeting them tangentially move too. |
 | `moved_faces(model, faces, by)`, `rotated_faces(model, faces, origin, axis, angle)` | Move Face: translated, or turned about a line. |
-| `replaced_faces(model, faces, target, target_faces, chain)` | Replace Face: the faces (with `chain`, their tangent chain too) on the target faces instead (names apart by `;`; empty: the whole target body). Targets on one surface move the faces onto it; targets on several surfaces, faces of a solid, trim or extend the body to them (`face_replace.lucb`). |
-| `deleted_faces(model, faces)` | Delete with healing: holes and bosses whole, one fillet, chamfer or corner face, or between flat faces any number of them at once (a rounded chain and its corners, strips apart). |
+| `replaced_faces(model, faces, target, target_faces, chain)` | Replace Face: the faces (with `chain`, their tangent chain too) on the target faces instead (names apart by `;`; empty: the whole target body). Targets on one surface move the faces onto it; targets on several surfaces, faces of a solid or of an open surface body, trim or extend the body to them (`face_replace.lucb`, `face_quilt.lucb`). |
+| `deleted_faces(model, faces)` | Delete with healing: holes and bosses whole, one fillet, chamfer or corner face, between flat faces any number of them at once (a rounded chain and its corners, strips apart), or a band between one face and a ring of faces, curved ones too (a top chain beside rounded uprights). |
 | `split_faces(model, faces, tool, tool_face, tag)`, `split_faces_by_plane(model, faces, origin, normal, tag)` | Fusion's Split Face: the faces split where a face's surface (extended) or a plane crosses them; one closed solid with the new edges. The pieces on the surface's outer side (a plane's normal side, the side a tool face faces; outside a curved surface) are named `<tag>/split[<name>]`, the others keep the face's name, so each can be picked apart. |
 | `tangent_chain(model, faces)` | Fusion's Tangent chain: the faces and every face meeting them tangentially, and so on, by name. |
 | `copied_faces(model, faces, prefix)` | Move/Copy of faces with Create copy: an open surface body of copies of the faces, their names with `prefix` before them. |
@@ -332,7 +332,11 @@ grow from one operation to the next.
 solid and without it. A plane's solid is a large box on its normal side; a cylinder's, cone's,
 sphere's or torus's is the primitive of that surface, made long enough. The two results go side by
 side into one model, two lumps (`lumps.lucb` finds a model's pieces by the edges its faces share). A
-surface that misses the body is refused. **Slice** (`behind_surface`) is the second boolean alone:
+surface that misses the body is refused. With Fusion's **Extend splitting tool off**, the tool is
+the face swept along its normal past the body (`face_quilt.lucb`): a piece cut off by the face alone is
+a piece; one the sweep's walls or far end cut too lay beside the face, not behind it, and is joined to
+the body again. A face that cuts nothing off alone (part way across) is refused, naming the Extend
+option. **Slice** (`behind_surface`) is the second boolean alone:
 the body without the plane's solid, capped where it was cut; the box round the body says first
 whether the plane cuts it at all.
 
@@ -753,12 +757,28 @@ caps' faces on a neighbor's plane merge into it, and their own names are dropped
 over, or a cap face standing on its own (a cap reaching past the body), is refused, as are curved
 faces round the gap. A box's top, say, has four parallel-sided neighbors that cannot close over it.
 
+**A band beside curved faces** (`face_band.lucb`), where the caps refuse because a curved face
+borders the gap: the deleted faces leave one face with a whole loop on the gap (a top) and a ring of
+faces round it, each with one run of gap edges (the sides and the rounded uprights, G1 cylinders or
+G2/G3 B-spline strips). Each ring face meets the top along a new edge where their surfaces cross: a
+line between planes, an analytic curve (a cylinder's circle), else traced on both surfaces and fitted
+by a cubic that stays on both (`march.lucb`'s steps). Each edge between two ring faces running into the
+gap keeps its carrier, lengthened by Newton along it until it reaches the top's surface. A rounded or
+chamfered top chain beside rounded uprights heals back to the rounded box exactly.
+
 **Replace Face onto several targets** (`face_replace.lucb`). Targets on one surface (coplanar faces,
 a split face's pieces) take the local operation. Targets on several surfaces must be faces of a solid:
 the replaced faces are pushed far past them (Offset Face), the target solid is taken away where it lies
 beyond them (its faces facing the body) or kept where it lies behind, and the piece holding no replaced
 face and most of the body's other faces is kept. A quilt that does not reach across the faces, or a
 target solid cutting into the body elsewhere, is refused.
+
+Targets on an **open surface body** (`face_quilt.lucb`) are closed into a solid first: the quilt swept
+far along the way the replaced faces face. Its faces are the quilt's (turned to face back toward the
+body), the quilt moved along the sweep, and a wall along each open edge: a plane for a line or a flat
+curve the sweep lies in, a cylinder for a circle about the sweep, else a ruled B-spline (a circle's or
+ellipse's exact rational net first). The walls meet at lines from the quilt's corners. The solid then
+goes through the booleans as a solid's faces do.
 
 **Split Face** (`face_split.lucb`) runs the booleans' first steps: the surface, as the faces of
 its solid lying on it (a plane's large square, a curved surface's long wall), meets only the chosen
@@ -937,6 +957,5 @@ Roughly in order of usefulness:
    analytic surfaces are recognized as coincident.
 5. **Sweep and loft.**
 6. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
-7. **Shell of B-spline faces** and draft; Delete healing several faces at once where curved faces
-   border them (a top chain next to rounded uprights); Replace Face onto several surfaces of an open
-   surface body.
+7. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
+   beyond a band round one face (strips apart, inside corners).

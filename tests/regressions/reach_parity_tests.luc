@@ -1,0 +1,131 @@
+## Fusion's direct modeling where curved faces, open quilts and unextended
+## tools are involved: Delete healing a rounded or chamfered top chain next
+## to rounded uprights (G1, G2, G3), Replace Face onto an open surface body
+## of several surfaces, Split Body with Extend splitting tool off.
+from luce_cad.modeling import CadModeling, CadDirect
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_cad.sketch import CadSketch
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+func solid(model: CadModel, expected: float, tolerance: float, what: str) -> unit!:
+    manifold(model.tessellate(32))
+    let v = volume(model.tessellate(64))
+    if math.abs(v - expected) > tolerance:
+        print(f"{what}: volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= tolerance)
+
+## The name of `model`'s flat face whose outward normal is `normal`.
+func flat(model: CadModel, normal: Vector3) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let frame = CadModeling.face_frame(model, name)
+        if frame.found and frame.u.cross(frame.v).dot(normal) > 0.999:
+            return name
+    assert(false, "no such face")
+    return ""
+
+## References to `model`'s edges whose ends both satisfy `keep`.
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> str!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return CadModeling.edge_references(model, found)
+
+## The names of `model`'s faces whose name contains `part`, apart by `;`.
+func named(model: CadModel, part: str) -> str!:
+    let found: list[str] = []
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        if name.contains(part) and not (name in found):
+            found.append(name)
+    return found.join(";")
+
+pub func reach_parity_tests() -> unit!:
+    curved_deletes()
+    quilt_replaces()
+    reach_splits()
+    print("PASS direct modeling reach: a rounded and a chamfered top chain deleted beside G1, G2 and G3 rounded uprights, healed to the rounded box; a box's top replaced onto an open valley quilt and onto an open plane-and-cylinder quilt; a U split by a face across one prong, extended through both, unextended through one, a face part way across refused")
+
+## The owner's case: a 2-box's uprights rounded 0.5 (G1, G2, G3), then its
+## top chain filleted 0.2 at the same continuity, or chamfered 0.2; the
+## top chain's faces deleted heal back to the box with rounded uprights.
+func curved_deletes() -> unit!:
+    for g in 1..<4:
+        let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+        let uprights = edges_where(box, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9 and math.abs(a.y - b.y) > 1.0)
+        let rounded = CadModeling.filleted(box, uprights, 0.5, "u", continuity = g)
+        let tops = edges_where(rounded, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.y - 1.0) < 1e-9 and math.abs(b.y - 1.0) < 1e-9)
+        let expected = volume(rounded.tessellate(64))
+        let filleted = CadModeling.filleted(rounded, tops, 0.2, "t", continuity = g)
+        assert(filleted.face_count() == 18)
+        let healed = CadDirect.deleted_faces(filleted, named(filleted, "t/"))
+        solid(healed, expected, 1e-5, f"G{g} top chain fillet deleted")
+        assert(healed.face_count() == 10)
+        let chamfered = CadModeling.chamfered(rounded, tops, 0.2, "c")
+        let unchamfered = CadDirect.deleted_faces(chamfered, named(chamfered, "c/"))
+        solid(unchamfered, expected, 1e-5, f"G{g} top chain chamfer deleted")
+        assert(unchamfered.face_count() == 10)
+
+## Replace Face onto an open surface body: a 2-box's top onto the two
+## under faces of a 4-block turned 45°, copied as a surface body (a valley
+## 1.5 + |x| over the middle): 12. Onto a quilt copied from a 4 x 2 x 4
+## block's top and its 1-rounded edge at x = 1.5 (the plane 2 high to
+## x = 0.5, then the quarter circle down): the box below it, 11.9566.
+func quilt_replaces() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = flat(box, Vector3(0.0, 1.0, 0.0))
+    let block = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0).transformed(Vector3(0.0, 1.5 + 2.0 * math.sqrt(2.0), 0.0), Vector3(0.0, 0.0, math.pi * 0.25), Vector3(1.0, 1.0, 1.0)), "block")
+    let under: list[str] = []
+    for f in 0..<block.face_count():
+        let name = CadModeling.face_name_of(block, f)
+        let frame = CadModeling.face_frame(block, name)
+        if frame.found and frame.u.cross(frame.v).y < -0.5:
+            under.append(name)
+    let sheet = CadDirect.copied_faces(block, under.join(";"), "q")
+    assert(sheet.face_count() == 2)
+    solid(CadDirect.replaced_faces(box, top, sheet, ""), 12.0, 1e-4, "top onto an open valley")
+    let big = CadModeling.tagged(CadSolids.box(4.0, 2.0, 4.0).transformed(Vector3(-0.5, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), "big")
+    let rim = edges_where(big, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.x - 1.5) < 1e-9 and math.abs(b.x - 1.5) < 1e-9 and math.abs(a.y - 2.0) < 1e-9 and math.abs(b.y - 2.0) < 1e-9)
+    let edged = CadModeling.filleted(big, rim, 1.0, "r")
+    let quilt = CadDirect.copied_faces(edged, f"{flat(edged, Vector3(0.0, 1.0, 0.0))};{named(edged, "r/")}", "q")
+    # Over x in -1..0.5 the plane 2 high, then 1 + sqrt(1 - (x - 0.5)²),
+    # from the box's bottom at -1, 2 deep.
+    let expected = 2.0 * (4.5 + 1.0 + (0.5 * math.sqrt(0.75) + math.asin(0.5)) * 0.5)
+    solid(CadDirect.replaced_faces(box, top, quilt, ""), expected, 1e-3, "top onto an open plane and cylinder")
+
+## Split Body by a face across one prong of a U (10 x 8, prongs 2 wide, 5
+## deep) at y = 5: extended, the plane cuts both prongs (three lumps);
+## unextended, only the prong the face crosses (two: 190 and 30). A face
+## only part way across a prong is refused.
+func reach_splits() -> unit!:
+    let s = CadSketch.parse("")
+    let corners = [[0.0, 0.0], [10.0, 0.0], [10.0, 8.0], [8.0, 8.0], [8.0, 2.0], [2.0, 2.0], [2.0, 8.0], [0.0, 8.0]]
+    let points: list[int] = []
+    for c in corners:
+        points.append(s.add_point(c[0], c[1]))
+    for at in 0..<8:
+        _ = s.add_line(points[at], points[(at + 1) % 8])
+    let u = CadModeling.extruded(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 5.0, 0.0, "u")
+    let plate = CadModeling.tagged(CadSolids.box(4.0, 1.0, 7.0).transformed(Vector3(1.0, 4.5, 2.5), Vector3(), Vector3(1.0, 1.0, 1.0)), "p")
+    let face = flat(plate, Vector3(0.0, 1.0, 0.0))
+    assert(CadModeling.lump_count(CadModeling.split_by_face(u, plate, face, "s")) == 3)
+    let only = CadModeling.split_by_face(u, plate, face, "s", extend = false)
+    assert(CadModeling.lump_count(only) == 2)
+    let volumes: list[float] = []
+    for k in 0..<2:
+        let lump = CadModeling.lump(only, k)
+        let mesh = lump.tessellate(16)
+        manifold(mesh)
+        volumes.append(volume(mesh))
+    assert(math.abs(math.min(volumes[0], volumes[1]) - 30.0) < 1e-6 and math.abs(math.max(volumes[0], volumes[1]) - 190.0) < 1e-6)
+    let short = CadModeling.tagged(CadSolids.box(2.0, 1.0, 7.0).transformed(Vector3(0.0, 4.5, 2.5), Vector3(), Vector3(1.0, 1.0, 1.0)), "p")
+    var refused = false
+    _ = CadModeling.split_by_face(u, short, flat(short, Vector3(0.0, 1.0, 0.0)), "s", extend = false) catch failure:
+        refused = failure.message.contains("reach")
+    assert(refused)
