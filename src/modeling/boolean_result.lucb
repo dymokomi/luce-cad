@@ -110,8 +110,19 @@ func final_shape(work: Work*) -> Shape!:
         try s.faces.push(ShapeFace(face.surface, face.sense, 0, 0, 0, 0))
     return s
 
-## Step 7: the kept pieces as a new B-rep.
+## Step 7: the kept pieces as a new B-rep, which must be closed.
 func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[], piece_name: const i64[], keep: const bool[], turn: const bool[]) -> interop.Reference[CadModel]!:
+    var none_given: f64[1]
+    return try write_pieces(work, pieces, piece_face, piece_name, keep, turn, true, 0.0, 0.0, none_given[..<0])
+
+## The kept pieces as a new B-rep: with `closed`, every edge must be used
+## twice, once each way (a solid); without, an edge used once is an open
+## body's boundary (Trim's sheets). Its tolerance takes in `precision`
+## (how far new edges may lie off their faces); with `exact` > 0 it is that
+## instead, and each vertex lying off its edges' ends by more is tolerant
+## by as much (Stitch's merged vertices).
+func write_pieces(work: Work*, pieces: const Pieces*, piece_face: const usize[], piece_name: const i64[], keep: const bool[], turn: const bool[], closed: bool, precision: f64, exact: f64,
+                  edge_slack: const f64[]) -> interop.Reference[CadModel]!:
     let w = &work.w
     var uses_count = Growing[i64]()
     defer uses_count.close()
@@ -129,17 +140,33 @@ func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[],
                 direction.items[e] += (1 if use > 0 else -1) * (-1 if turn[p] else 1)
     var open_edges = 0
     for e in 0..<work.finals.count:
-        if uses_count.items[e] != 0 and (uses_count.items[e] != 2 or direction.items[e] != 0):
-            open_edges += 1
+        let used = uses_count.items[e]
+        if closed and used != 0 and (used != 2 or direction.items[e] != 0): open_edges += 1
+        # Open, an edge is a boundary (once) or shared each way (twice).
+        if not closed and used > 1 and (used != 2 or direction.items[e] != 0): open_edges += 1
     if open_edges > 0:
-        error(invalid, "the result is not a closed solid (some edges are not shared by two faces); this operation is not supported for these shapes yet")
+        if closed: error(invalid, "the result is not a closed solid (some edges are not shared by two faces); this operation is not supported for these shapes yet")
+        error(invalid, "the result's faces do not meet edge to edge")
     # Merged vertices sit within ten tolerances of their curves.
-    let output = try BrepModel.held(math.max(work.tol * 20.0, least_tolerance))
+    let tolerance = exact if exact > 0.0 else math.min(1.0, math.max(math.max(work.tol * 20.0, precision * 2.0), least_tolerance))
+    let output = try BrepModel.held(math.max(tolerance, least_tolerance))
     defer output.release()
     let b = output.value()
     var vertex_ids = Growing[i64]()
     defer vertex_ids.close()
     for _ in work.vertices.view(): try vertex_ids.push(-1)
+    # With an exact tolerance, how far each vertex is from its edges' ends.
+    var slack = Growing[f64]()
+    defer slack.close()
+    try slack.fill(work.vertices.count, 0.0)
+    if exact > 0.0:
+        for e in 0..<work.finals.count:
+            if uses_count.items[e] == 0: continue
+            let edge = work.finals.items[e]
+            let a = (try w.at(edge.carrier, edge.t0)).subtract(work.vertices.items[(usize)edge.start]).length()
+            let z = (try w.at(edge.carrier, edge.t1)).subtract(work.vertices.items[(usize)edge.end]).length()
+            slack.items[(usize)edge.start] = math.max(slack.items[(usize)edge.start], a * 1.01)
+            slack.items[(usize)edge.end] = math.max(slack.items[(usize)edge.end], z * 1.01)
     var edge_ids = Growing[i64]()
     defer edge_ids.close()
     for e in 0..<work.finals.count:
@@ -147,8 +174,10 @@ func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[],
             try edge_ids.push(-1)
             continue
         let edge = work.finals.items[e]
-        if vertex_ids.items[(usize)edge.start] < 0: vertex_ids.items[(usize)edge.start] = try b.add_vertex(work.vertices.items[(usize)edge.start])
-        if vertex_ids.items[(usize)edge.end] < 0: vertex_ids.items[(usize)edge.end] = try b.add_vertex(work.vertices.items[(usize)edge.end])
+        for v in [edge.start, edge.end]:
+            if vertex_ids.items[(usize)v] >= 0: continue
+            vertex_ids.items[(usize)v] = try b.add_vertex(work.vertices.items[(usize)v])
+            if slack.items[(usize)v] > tolerance: try b.set_vertex_precision(vertex_ids.items[(usize)v], slack.items[(usize)v])
         let start = vertex_ids.items[(usize)edge.start]
         let end = vertex_ids.items[(usize)edge.end]
         let c = w.carriers.items[(usize)edge.carrier]
@@ -160,6 +189,8 @@ func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[],
         else:
             let (points, weights, knots, degree) = w.spline_net(c.spline)
             id = try b.add_spline_edge(start, end, points, weights, degree, knots, forward)
+        # A joined edge's precision: how far apart the edges it joined lay.
+        if e < edge_slack.length and edge_slack[e] > tolerance: try b.set_edge_precision(id, edge_slack[e])
         try edge_ids.push(id)
     var surface_ids = Growing[i64]()
     defer surface_ids.close()

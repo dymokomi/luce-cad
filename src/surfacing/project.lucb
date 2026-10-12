@@ -1,0 +1,356 @@
+## Surfacing Stage 3 (luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md
+## §4.3, §6.3 to §6.5): curves cast onto faces (Project) and where faces
+## meet (Intersect) as curves on faces; trimming faces by them (Keep,
+## Discard, Divide) with the stages Untrim pops; Trim Convert and Shrink;
+## Stitch and Unstitch with tolerant edges. The cutting, joining and
+## writing are luce_cad.modeling's (trim, stitch, untrim, face_meets); this
+## module fits the curves, keeps the stages and is what Luce calls
+## (CadSurfacing).
+##
+import interop
+import memory
+from luce_std import math
+from luce_geocore.geocore import Vector3, Matrix4, invalid, GeometrySet
+from luce_geocore.core.growing import Growing
+from geometry import Surface, surface_point, surface_jet, chart_uv, nearest_parameters, evaluate, edge_index, surface_spline, surface_torus, surface_distance
+from model import CadModel
+from modeling import Shape, Carrier, shape_of, empty_shape, face_chart, chart_winding, periodic, nearest_on, face_meets, trim_face, trim_regions, TrimCut, stitch_models, Stitched, unstitch_model, natural_face, replaced_face, plane_sheet, spline_face, with_face_surface
+from nurbs import Spline, Weighted, Net, held_spline, spline_in, empty_spline, weighted, uniform_knots, fit_parameters, make_fitter, net_of, surface_of, curves_along, net_from, extract, most_degree
+from curves import face_curve, edge_spline
+from cad_geometry import set_models, with_models
+from cad_curves import CadCurves
+from cad_trims import stage_model, stage_count, with_stage
+from geometry import curve_spline
+
+## This file: Project (surfacing Stage 3: Alias's Project, Rhino's Project and Pull;
+## §6.3 of luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md): a curve
+## cast onto a face along a vector (or the view) or along the face's
+## normals, as curves on the face.
+##
+## Along a vector d, each point C(t) of the curve goes where the line
+## C(t) + λ d meets the surface: S(u, v) = C(t) + λ d solved for (u, v, λ)
+## by Newton, seeded by the last point's answer along the curve, else by a
+## lattice over the face's chart (the nearest hit along the line wins: both
+## ways, or only ahead along d). Along the normal (Pull) each point goes to
+## its nearest point of the surface. A point whose answer lies outside the
+## face (its loops wind round it nowhere in the chart) is a miss, and runs
+## of hits are the pieces: a piece ends where the curve does or where it
+## leaves the face, found by halving the step there and then put on the
+## boundary edge it reached, exactly.
+##
+## Each piece is a curve on the face (cad_curves): a chart curve fitted at
+## degree 5, its spans doubled until the surface along it lies within the
+## tolerance of the projected points (Alias's Match original instead keeps
+## the curve's own degree and spans), and its 3D curve fitted along it.
+
+## A face being projected onto: its body's shape, the face, its loops in
+## its chart (for the inside test, sampled finely) and their box.
+struct Target:
+    var w: Shape
+    var f: usize
+    var chart: Growing[Vector3]
+    var starts: Growing[usize]
+    var low: Vector3
+    var high: Vector3
+    var size: f64
+
+    func close():
+        self.w.close()
+        self.chart.close()
+        self.starts.close()
+
+    func surface() -> const Surface*:
+        return &self.w.surfaces.items[(usize)self.w.faces.items[self.f].surface]
+
+    ## Whether chart point `uv` lies inside the face.
+    func holds(uv: Vector3) -> bool:
+        let s = self.surface()
+        return chart_winding(self.chart.view(), self.starts.view(), uv.x, uv.y, periodic(s), s.kind == surface_torus) != 0
+
+## The face named `face` of `model` as a projection target.
+func target_of(model: const CadModel*, face: str) -> Target!:
+    var w = try shape_of(model)
+    var t = Target(w, 0, Growing[Vector3](), Growing[usize](), Vector3(), Vector3(), 1.0)
+    errdefer t.close()
+    var found = false
+    for f in 0..<t.w.faces.count:
+        if t.w.face_name(f) == face:
+            t.f = f
+            found = true
+            break
+    if not found: error(invalid, "the face to project onto is not in the body: pick it again")
+    try face_chart(&t.w, t.f, &t.chart, &t.starts)
+    var low = Vector3(1.0e300, 1.0e300, 0.0)
+    var high = Vector3(-1.0e300, -1.0e300, 0.0)
+    for q in t.chart.view():
+        low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), 0.0)
+        high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), 0.0)
+    t.low = low
+    t.high = high
+    var box_low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var box_high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for use in t.w.face_uses(t.f):
+        for k in 0..<9:
+            let p = try t.w.edge_at(edge_index(use), (f64)k / 8.0)
+            box_low = Vector3(math.min(box_low.x, p.x), math.min(box_low.y, p.y), math.min(box_low.z, p.z))
+            box_high = Vector3(math.max(box_high.x, p.x), math.max(box_high.y, p.y), math.max(box_high.z, p.z))
+    t.size = math.max(1e-9, box_high.subtract(box_low).length())
+    return t
+
+## How a curve is cast: along `direction` (both ways with `both`, else only
+## ahead along it), or along the normal (`normal`).
+pub struct Casting:
+    pub var direction: Vector3
+    pub var normal: bool
+    pub var both: bool
+
+## Where `p` casts onto target `t` from chart point `seed` (or, with none,
+## the best of a lattice of starts): its chart point, or none for a miss.
+func cast_point(t: const Target*, how: const Casting*, p: Vector3, seed: Vector3?) -> Vector3?!:
+    let s = t.surface()
+    if how.normal:
+        if s.kind == surface_spline:
+            let start = seed else return try nearest_parameters(*s, p, Vector3(0.5, 0.5, 0.0), true)
+            return try nearest_parameters(*s, p, start, false)
+        let previous = seed else return chart_uv(*s, p, Vector3((t.low.x + t.high.x) * 0.5, 0.0, 0.0), true)
+        return chart_uv(*s, p, previous, true)
+    if let start = seed:
+        if let hit = try ray_newton(t, how, p, start):
+            return hit
+    # The lattice: of the starts that converge, the nearest along the line.
+    var best: Vector3? = none
+    var best_reach = 1.0e300
+    for i in 0..<9:
+        for j in 0..<9:
+            let start = Vector3(t.low.x + (t.high.x - t.low.x) * (f64)i / 8.0, t.low.y + (t.high.y - t.low.y) * (f64)j / 8.0, 0.0)
+            let hit = try ray_newton(t, how, p, start) else continue
+            let reach = math.abs((try surface_point(*s, hit)).subtract(p).dot(how.direction))
+            if reach < best_reach:
+                best_reach = reach
+                best = hit
+    return best
+
+## Newton on S(u, v) - p - λ d = 0 from chart point `start`: the chart point
+## where the line through `p` along d meets the surface, or none when it
+## does not converge (or lies behind, casting one way). Where the line runs
+## along the surface (d along a cylinder's rulings) the system is singular:
+## then `p`'s nearest point of the surface is the hit when the line passes
+## through it.
+func ray_newton(t: const Target*, how: const Casting*, p: Vector3, start: Vector3) -> Vector3?!:
+    let s = t.surface()
+    let d = how.direction
+    var uv = start
+    var lambda = (try surface_point(*s, uv)).subtract(p).dot(d)
+    for _ in 0..<40:
+        let j = try surface_jet(s, uv, false, false)
+        let r = j.p.subtract(p).subtract(d.multiply_scalar(lambda))
+        if r.length() <= t.size * 1e-12: break
+        # [su sv -d] x = -r by Cramer's rule.
+        let m = d.multiply_scalar(-1.0)
+        let det = j.su.dot(j.sv.cross(m))
+        if math.abs(det) <= 1e-9 * j.su.length() * j.sv.length(): return try along_surface(t, how, p, uv)
+        let minus = r.multiply_scalar(-1.0)
+        let du = minus.dot(j.sv.cross(m)) / det
+        let dv = j.su.dot(minus.cross(m)) / det
+        let dl = j.su.dot(j.sv.cross(minus)) / det
+        uv = Vector3(uv.x + du, uv.y + dv, 0.0)
+        lambda += dl
+        if s.kind == surface_spline: uv = Vector3(math.clamp(uv.x, 0.0, 1.0), math.clamp(uv.y, 0.0, 1.0), 0.0)
+        if not math.is_finite(uv.x) or not math.is_finite(uv.y): return none
+    let r = (try surface_point(*s, uv)).subtract(p).subtract(d.multiply_scalar(lambda))
+    if r.length() > t.size * 1e-8: return none
+    if not how.both and lambda < -t.size * 1e-9: return none
+    return uv
+
+## A line along the surface (see ray_newton): `p`'s foot on the surface,
+## when the line through `p` along d passes through it.
+func along_surface(t: const Target*, how: const Casting*, p: Vector3, seed: Vector3) -> Vector3?!:
+    let s = t.surface()
+    let uv = (try nearest_parameters(*s, p, seed, false)) if s.kind == surface_spline else chart_uv(*s, p, seed, true)
+    let q = try surface_point(*s, uv)
+    if q.subtract(p).cross(how.direction).length() > t.size * 1e-8: return none
+    if not how.both and q.subtract(p).dot(how.direction) < -t.size * 1e-9: return none
+    return uv
+
+## One run of the curve inside the face: its parameter range and where its
+## ends are (on the curve's ends, or leaving the face).
+struct Run:
+    var a: f64
+    var b: f64
+    var a_leaves: bool
+    var b_leaves: bool
+
+## The curve's runs inside the face: sampled, the edges of each run of hits
+## found by halving.
+func runs_of(t: const Target*, how: const Casting*, c: const Spline*, out: Growing[Run]*) -> !:
+    let low = c.low()
+    let high = c.high()
+    let samples = (usize)math.max(128.0, (f64)c.points.count * 16.0)
+    var inside = Growing[bool]()
+    defer inside.close()
+    var seed: Vector3? = none
+    for k in 0..<samples + 1:
+        let tk = low + (high - low) * (f64)k / (f64)samples
+        let hit = try cast_point(t, how, c.point_at(tk), seed)
+        var holds = false
+        if let uv = hit:
+            holds = t.holds(uv)
+            seed = uv
+        try inside.push(holds)
+    var k: usize = 0
+    while k <= samples:
+        if not inside.items[k]:
+            k += 1
+            continue
+        var end = k
+        while end + 1 <= samples and inside.items[end + 1]: end += 1
+        var run = Run(low + (high - low) * (f64)k / (f64)samples, low + (high - low) * (f64)end / (f64)samples, k > 0, end < samples)
+        if run.a_leaves: run.a = try edge_of_run(t, how, c, low + (high - low) * (f64)(k - 1) / (f64)samples, run.a)
+        if run.b_leaves: run.b = try edge_of_run(t, how, c, low + (high - low) * (f64)(end + 1) / (f64)samples, run.b)
+        if run.b > run.a: try out.push(run)
+        k = end + 1
+
+## Between `outside` (a miss) and `inside` (a hit): the last hit, halving
+## the step 48 times.
+func edge_of_run(t: const Target*, how: const Casting*, c: const Spline*, outside: f64, inside: f64) -> f64!:
+    var out_t = outside
+    var in_t = inside
+    var seed = try cast_point(t, how, c.point_at(inside), none)
+    for _ in 0..<48:
+        let middle = (out_t + in_t) * 0.5
+        let hit = try cast_point(t, how, c.point_at(middle), seed)
+        var holds = false
+        if let uv = hit:
+            holds = t.holds(uv)
+            if holds: seed = uv
+        if holds: in_t = middle
+        else: out_t = middle
+    return in_t
+
+## The chart point of the cast of `c` at `ct`, from `seed`: an error when
+## it misses (inside a run it does not).
+func cast_at(t: const Target*, how: const Casting*, c: const Spline*, ct: f64, seed: Vector3?) -> Vector3!:
+    let hit = try cast_point(t, how, c.point_at(ct), seed) else error(invalid, "the curve's cast left the face inside a piece")
+    return hit
+
+## Chart point `uv` moved onto the face's boundary edge nearest its point,
+## exactly (a piece leaving the face ends on it).
+func onto_boundary(t: const Target*, uv: Vector3) -> Vector3!:
+    let s = t.surface()
+    let p = try surface_point(*s, uv)
+    var best = p
+    var best_distance = 1.0e300
+    for use in t.w.face_uses(t.f):
+        let edge = t.w.edges.items[edge_index(use)]
+        let q = try t.w.at(edge.carrier, try nearest_on(&t.w, edge.carrier, p, edge.t0, edge.t1))
+        let d = q.subtract(p).length()
+        if d < best_distance:
+            best_distance = d
+            best = q
+    # Only a near edge: one far off means the halving stopped elsewhere.
+    if best_distance > t.size * 1e-3: return uv
+    if s.kind == surface_spline: return try nearest_parameters(*s, best, uv, false)
+    return chart_uv(*s, best, uv, true)
+
+## Run `run` of `c` as a chart curve: degree 5 on spans doubled until the
+## surface along it lies within `tolerance` of the cast points (or, with
+## `original`, `c`'s degree and spans in the run), its ends on the cast's
+## ends (on the boundary where it leaves the face). Its deviation onto
+## `deviation`.
+func fit_run(t: const Target*, how: const Casting*, c: const Spline*, run: Run, tolerance: f64, original: bool, deviation: f64*) -> Spline!:
+    let s = t.surface()
+    # The ends, the second by continuation along the run (a closed curve's
+    # chart runs on past a whole turn, not back to its start).
+    var first = try cast_at(t, how, c, run.a, none)
+    var last = first
+    let steps = 256
+    for k in 1..<steps + 1:
+        last = try cast_at(t, how, c, run.a + (run.b - run.a) * (f64)k / (f64)steps, last)
+    if run.a_leaves: first = try onto_boundary(t, first)
+    if run.b_leaves: last = try onto_boundary(t, last)
+    var degree: i64 = 5
+    var spans: usize = 1
+    if original:
+        degree = c.degree
+        var inner: usize = 0
+        var previous = run.a
+        for k in c.knots.view():
+            if k > run.a and k < run.b and k > previous:
+                inner += 1
+                previous = k
+        spans = inner + 1
+    while true:
+        var knots = Growing[f64]()
+        defer knots.close()
+        try uniform_knots(degree, spans, 0.0, 1.0, &knots)
+        var params = Growing[f64]()
+        defer params.close()
+        try fit_parameters(knots.view(), degree, 12, &params)
+        var fitter = try make_fitter(degree, knots.view(), params.view(), 0)
+        defer fitter.close()
+        var values = Growing[Weighted]()
+        defer values.close()
+        # The casts at the fit's parameters, each seeding the next.
+        var seed: Vector3? = first
+        for q in params.view():
+            let uv = try cast_at(t, how, c, run.a + (run.b - run.a) * q, seed)
+            seed = uv
+            try values.push(Weighted(uv.x, uv.y, 0.0, 1.0))
+        values.items[0] = Weighted(first.x, first.y, 0.0, 1.0)
+        values.items[values.count - 1] = Weighted(last.x, last.y, 0.0, 1.0)
+        var starts: Weighted[4]
+        var ends: Weighted[4]
+        starts[0] = values.items[0]
+        ends[0] = values.items[values.count - 1]
+        var made = empty_spline(degree)
+        errdefer made.close()
+        try made.knots.assign(knots.view())
+        try fitter.fit(values.view(), &starts, &ends, &made.points)
+        # How far the surface along the fit lies from the casts, eight
+        # checks a span (each end's last stretch to the boundary aside).
+        var worst = 0.0
+        let checks = spans * 8
+        var check_seed: Vector3? = first
+        for k in 1..<checks:
+            let q = (f64)k / (f64)checks
+            let uv = try cast_at(t, how, c, run.a + (run.b - run.a) * q, check_seed)
+            check_seed = uv
+            let fitted = made.point_at(q)
+            let gap = (try surface_point(*s, Vector3(fitted.x, fitted.y, 0.0))).subtract(try surface_point(*s, uv)).length()
+            worst = math.max(worst, gap)
+        if worst <= tolerance or spans >= 512 or original:
+            *deviation = worst
+            return made
+        made.close()
+        spans *= 2
+    error(invalid, "unreachable")
+
+## Curve `c` cast onto face `face` of `model` by `how`: each piece's chart
+## curve and its 3D curve (fitted within `tolerance`) onto `charts` and
+## `curves`, the worst deviation returned.
+pub func project_curve(model: const CadModel*, face: str, c: const Spline*, how: Casting, tolerance: f64, original: bool, charts: Growing[Spline]*, curves: Growing[Spline]*) -> f64!:
+    if not (tolerance > 0.0): error(invalid, "Project needs a positive tolerance")
+    var cast = how
+    if not cast.normal:
+        cast.direction = cast.direction.normalized() catch failure: error(invalid, "Project along a vector needs a direction")
+    var t = try target_of(model, face)
+    defer t.close()
+    var runs = Growing[Run]()
+    defer runs.close()
+    try runs_of(&t, &cast, c, &runs)
+    var worst = 0.0
+    for run in runs.view():
+        var deviation = 0.0
+        var chart = try fit_run(&t, &cast, c, run, tolerance, original, &deviation)
+        worst = math.max(worst, deviation)
+        var lifted = face_curve(t.surface(), &chart, tolerance * 0.1, &deviation) catch failure:
+            chart.close()
+            error(failure.code, failure.message)
+        charts.push(chart) catch failure:
+            chart.close()
+            lifted.close()
+            error(failure.code, failure.message)
+        curves.push(lifted) catch failure:
+            lifted.close()
+            error(failure.code, failure.message)
+    return worst

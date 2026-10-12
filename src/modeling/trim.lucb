@@ -1,0 +1,295 @@
+## Trim (surfacing Stage 3, Alias's Trim Surface; luced-3d's
+## docs/research/SURFACING-ALIAS-PLASTICITY.md §6.4): a face cut along curves
+## lying on it into regions, then the regions picked kept (Keep), taken
+## away (Discard), or every region made a face of its own (Divide).
+##
+## The booleans' steps do the cutting (boolean.lucb steps 1 to 4) with the
+## curves in place of a second solid's faces: each curve is clipped by the
+## face's boundary (its crossings cut the boundary edges, which the faces
+## next to it share) and the stretches inside the face become new edges
+## across it alone; the face is split along them (split.lucb). A stretch
+## with a loose end (a curve that stops inside the face, Alias's dangling
+## curve) cuts nothing and is left out; its end is reported. What is kept
+## is written as a body that may be open: a solid trimmed loses its
+## closure, as a shell trimmed in Alias does.
+##
+## Regions are told by points (a click on the face, its region marker):
+## each lies in the region whose loops wind about it in the surface's
+## chart.
+
+## Trim's modes (trim_face's `mode`).
+pub let trim_keep: i64 = 0
+pub let trim_discard: i64 = 1
+pub let trim_divide: i64 = 2
+
+## A face cut by curves: the regions found, each region's marker (a point
+## well inside it), and the loose curve ends left out.
+pub struct TrimCut:
+    pub var markers: Growing[Vector3]
+    pub var loose: Growing[Vector3]
+    ## Each crossing of a curve with the face's boundary or another curve.
+    pub var crossings: Growing[Vector3]
+
+    pub func close():
+        self.markers.close()
+        self.loose.close()
+        self.crossings.close()
+
+## The faces of `w` named `face`, marked.
+func trim_targets(w: const Shape*, face: str, out: Growing[bool]*) -> usize!:
+    var count: usize = 0
+    for f in 0..<w.faces.count:
+        let hit = w.face_name(f) == face
+        try out.push(hit)
+        if hit: count += 1
+    return count
+
+## The working state of a trim: the model's shape with the curves' carriers
+## added, each face named `face` (chosen) cut by them.
+func trim_work(model: const CadModel*, face: str, cuts: const Shape*, report: TrimCut*, needed: bool) -> Work!:
+    var w = try shape_of(model)
+    let faces = w.faces.count
+    var work = Work(w, faces, 1.0, 1e-9, Growing[Vector3](), Growing[i64](), Growing[Cut](), Growing[Section](), Growing[Imprint](),
+                    Growing[Coincident](), Growing[ShapeEdge](), Growing[i64](), Growing[usize](), Growing[i64](), Growing[bool]())
+    errdefer work.close()
+    if try trim_targets(&work.w, face, &work.chosen) == 0: error(invalid, "the face to trim is not in the body: pick it again")
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<faces:
+        let (l, h) = try face_box(&work.w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    work.size = math.max(1e-6, high.subtract(low).length())
+    work.tol = math.max(work.size * 1e-7, 1e-10)
+    for p in work.w.points.view(): try work.point_vertex.push(try work.vertex(p))
+    # The curves, as the work shape's carriers.
+    var carriers = Growing[i64]()
+    defer carriers.close()
+    for c in cuts.carriers.view():
+        if c.kind != curve_spline: error(invalid, "a trimming curve must be a B-spline")
+        let (points, weights, knots, degree) = cuts.spline_net(c.spline)
+        let stored = try work.w.store_spline(points, weights, knots, degree, Matrix4())
+        try carriers.push(try work.w.add_carrier(Carrier(curve_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, stored)))
+    var hits = Growing[Hit]()
+    defer hits.close()
+    var ts = Growing[f64]()
+    defer ts.close()
+    for f in 0..<faces:
+        if not work.chosen.items[f]: continue
+        for c in carriers.view():
+            let (points, weights, knots, degree) = work.w.spline_net(work.w.carriers.items[(usize)c].spline)
+            _ = weights
+            let lowest = knots[(usize)degree]
+            let highest = knots[points.length]
+            let closed = (try work.w.at(c, lowest)).subtract(try work.w.at(c, highest)).length() <= work.tol * 10.0
+            ts.clear()
+            for use in work.w.face_uses(f):
+                let e = edge_index(use)
+                hits.clear()
+                try crossings(&work.w, c, lowest, highest, e, work.size, work.tol, &hits)
+                for hit in hits.view():
+                    try work.cuts.push(Cut(e, hit.s))
+                    try ts.push(hit.t)
+                    try report.crossings.push(try work.w.at(c, hit.t))
+            # Other curves crossing this one cut it too.
+            for other in carriers.view():
+                if other == c: continue
+                try curve_crossings(&work, c, lowest, highest, other, &ts, report)
+            if not closed:
+                try ts.push(lowest)
+                try ts.push(highest)
+            sort.sort(ts.items[..<ts.count])
+            try add_sections(&work, c, closed, lowest, highest, ts.view(), f, f)
+    # Sections were added across the face twice (fa and fb both the face):
+    # once is enough.
+    for at in 0..<work.sections.count: work.sections.items[at].fb = -1
+    try drop_loose(&work, faces, report)
+    if work.sections.count == 0 and needed: error(invalid, "the curves do not cut the face into regions: each must run across it, or close on it (Show Intersections marks loose ends)")
+    return work
+
+## Where carrier `c` on [low, high] crosses carrier `other` (both on the
+## face): the local minima of their distance, sampled along `c` and refined
+## by alternating projections, that close to within the tolerance.
+func curve_crossings(work: Work*, c: i64, low: f64, high: f64, other: i64, ts: Growing[f64]*, report: TrimCut*) -> !:
+    let w = &work.w
+    let (points, weights, knots, degree) = w.spline_net(w.carriers.items[(usize)other].spline)
+    _ = weights
+    let other_low = knots[(usize)degree]
+    let other_high = knots[points.length]
+    let samples: usize = 256
+    var gaps = Growing[f64]()
+    defer gaps.close()
+    for k in 0..<samples + 1:
+        let p = try w.at(c, low + (high - low) * (f64)k / (f64)samples)
+        let s = try nearest_on(w, other, p, other_low, other_high)
+        try gaps.push((try w.at(other, s)).subtract(p).length())
+    for k in 0..<samples + 1:
+        let before = gaps.items[k - 1] if k > 0 else 1.0e300
+        let after = gaps.items[k + 1] if k < samples else 1.0e300
+        if not (gaps.items[k] <= before and gaps.items[k] < after): continue
+        let (t, _, gap) = try closest(w, c, low, high, other, other_low, other_high, low + (high - low) * (f64)k / (f64)samples)
+        if gap <= work.tol * 10.0:
+            try ts.push(t)
+            try report.crossings.push(try w.at(c, t))
+
+## The parameters on `c` and `other` where they come closest near `t`, and
+## the gap there (alternating projections).
+func closest(w: const Shape*, c: i64, low: f64, high: f64, other: i64, other_low: f64, other_high: f64, t: f64) -> (f64, f64, f64)!:
+    var a = t
+    var b = try nearest_on(w, other, try w.at(c, a), other_low, other_high)
+    for _ in 0..<40:
+        let next = try nearest_on(w, c, try w.at(other, b), low, high)
+        b = try nearest_on(w, other, try w.at(c, next), other_low, other_high)
+        if math.abs(next - a) <= (high - low) * 1e-15:
+            a = next
+            break
+        a = next
+    return (a, b, (try w.at(c, a)).subtract(try w.at(other, b)).length())
+
+## Sections with a loose end (an end no boundary vertex or other section
+## meets) taken out, again until none is left; their ends onto `report`.
+func drop_loose(work: Work*, faces: usize, report: TrimCut*) -> !:
+    var anchored = Growing[bool]()
+    defer anchored.close()
+    for _ in work.vertices.view(): try anchored.push(false)
+    for f in 0..<faces:
+        if not work.chosen.items[f]: continue
+        for use in work.w.face_uses(f):
+            let edge = work.w.edges.items[edge_index(use)]
+            anchored.items[(usize)work.point_vertex.items[(usize)edge.start]] = true
+            anchored.items[(usize)work.point_vertex.items[(usize)edge.end]] = true
+    for cut in work.cuts.view():
+        let v = (usize)(try work.vertex(try work.w.at(work.w.edges.items[cut.edge].carrier, cut.t)))
+        while anchored.count <= v: try anchored.push(false)
+        anchored.items[v] = true
+    while anchored.count < work.vertices.count: try anchored.push(false)
+    var changed = true
+    while changed:
+        changed = false
+        var degree = Growing[i64]()
+        defer degree.close()
+        try degree.fill(work.vertices.count, 0)
+        for s in work.sections.view():
+            degree.items[(usize)s.edge.start] += 1
+            degree.items[(usize)s.edge.end] += 1
+        var kept: usize = 0
+        for at in 0..<work.sections.count:
+            let s = work.sections.items[at]
+            let loose_start = degree.items[(usize)s.edge.start] < 2 and not anchored.items[(usize)s.edge.start]
+            let loose_end = degree.items[(usize)s.edge.end] < 2 and not anchored.items[(usize)s.edge.end]
+            if (loose_start or loose_end) and s.edge.start != s.edge.end:
+                if loose_start: try report.loose.push(work.vertices.items[(usize)s.edge.start])
+                if loose_end: try report.loose.push(work.vertices.items[(usize)s.edge.end])
+                changed = true
+                continue
+            work.sections.items[kept] = s
+            kept += 1
+        work.sections.count = kept
+
+## Whether `p` lies in piece `q` (of face `f`): its loops wind about p's
+## chart point.
+func piece_holds(work: const Work*, traced: const Shape*, f: usize, pieces: const Pieces*, q: usize, p: Vector3) -> bool!:
+    let face = work.w.faces.items[f]
+    let s = &work.w.surfaces.items[(usize)face.surface]
+    let (u, v) = surface_uv(s, p, math.max(work.tol * 1000.0, work.size * 1e-3)) catch failure: return false
+    var chart = Growing[Vector3]()
+    defer chart.close()
+    var starts = Growing[usize]()
+    defer starts.close()
+    for c in pieces.piece_cycles(q):
+        try starts.push(chart.count)
+        try loop_chart(traced, face.surface, try face_pole(&work.w, f), pieces.cycle(c), &chart)
+    try starts.push(chart.count)
+    return chart_winding(chart.view(), starts.view(), u, v, periodic(s), s.kind == surface_torus) != 0
+
+## Face `face` of `model` cut by the curves of `cuts` (each a B-spline
+## carrier lying on it): its regions' markers, crossings and loose ends.
+pub func trim_regions(model: const CadModel*, face: str, cuts: const Shape*) -> TrimCut!:
+    var report = TrimCut(Growing[Vector3](), Growing[Vector3](), Growing[Vector3]())
+    errdefer report.close()
+    var work = try trim_work(model, face, cuts, &report, false)
+    defer work.close()
+    # Nothing cuts it: no regions, only the loose ends.
+    if work.sections.count == 0: return report
+    var pieces = try new_pieces()
+    defer pieces.close()
+    var piece_face = Growing[usize]()
+    defer piece_face.close()
+    var piece_name = Growing[i64]()
+    defer piece_name.close()
+    try vertex_cuts(&work)
+    try cut_edges(&work)
+    var traced = try final_shape(&work)
+    defer traced.close()
+    try face_pieces(&work, &traced, work.faces_a, &pieces, &piece_face, &piece_name)
+    for p in 0..<pieces.piece_count():
+        if not work.chosen.items[piece_face.items[p]]: continue
+        try report.markers.push(try piece_point(&work, &traced, piece_face.items[p], &pieces, p))
+    return report
+
+## Face `face` of `model` trimmed by the curves of `cuts` (see the file's
+## header): with `mode` trim_keep the regions holding a point of `picks`
+## kept and the face's others taken away; trim_discard the other way round;
+## trim_divide every region its own face, the first keeping the face's
+## name, the others named `<tag>/divide<k>[<face>]`. `precision`: how far
+## the curves may lie off the face (their fit), which the result's
+## tolerance takes in.
+pub func trim_face(model: const CadModel*, face: str, cuts: const Shape*, picks: const Vector3[], mode: i64, tag: str, precision: f64) -> interop.Reference[CadModel]!:
+    if mode < trim_keep or mode > trim_divide: error(invalid, "Trim keeps, discards or divides")
+    if mode != trim_divide and picks.length == 0: error(invalid, "Trim: click the regions to keep or discard")
+    var report = TrimCut(Growing[Vector3](), Growing[Vector3](), Growing[Vector3]())
+    defer report.close()
+    var work = try trim_work(model, face, cuts, &report, true)
+    defer work.close()
+    var pieces = try new_pieces()
+    defer pieces.close()
+    var piece_face = Growing[usize]()
+    defer piece_face.close()
+    var piece_name = Growing[i64]()
+    defer piece_name.close()
+    try vertex_cuts(&work)
+    try cut_edges(&work)
+    var traced = try final_shape(&work)
+    defer traced.close()
+    try face_pieces(&work, &traced, work.faces_a, &pieces, &piece_face, &piece_name)
+    var keep = Growing[bool]()
+    defer keep.close()
+    var turn = Growing[bool]()
+    defer turn.close()
+    var picked = Growing[bool]()
+    defer picked.close()
+    try picked.fill(picks.length, false)
+    var regions: usize = 0
+    var name = Growing[u8]()
+    defer name.close()
+    for p in 0..<pieces.piece_count():
+        try turn.push(false)
+        let f = piece_face.items[p]
+        if not work.chosen.items[f]:
+            try keep.push(true)
+            continue
+        var holds = false
+        for k in 0..<picks.length:
+            if try piece_holds(&work, &traced, f, &pieces, p, picks[k]):
+                holds = true
+                picked.items[k] = true
+        if mode == trim_divide:
+            try keep.push(true)
+            if regions > 0:
+                try role_name(&name, tag, "divide")
+                try push_decimal(&name, (i64)regions)
+                try name.push(91)
+                for byte in work.w.face_name(f).bytes: try name.push(byte)
+                try name.push(93)
+                piece_name.items[p] = try work.w.add_name((str)name.view())
+        else:
+            try keep.push(holds == (mode == trim_keep))
+        regions += 1
+    if regions < 2: error(invalid, "the curves do not cut the face into more than one region")
+    for k in 0..<picks.length:
+        if not picked.items[k]: error(invalid, "Trim: a picked point lies in no region of the face: click inside the face")
+    var any = false
+    for k in keep.view(): any = any or k
+    if not any: error(invalid, "Trim would leave nothing of the body")
+    var none_given: f64[1]
+    return try write_pieces(&work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view(), false, precision, 0.0, none_given[..<0])

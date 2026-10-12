@@ -1,0 +1,480 @@
+## Luce's surfacing calls (Stage 3: CadSurfacing). Each takes a geometry
+## set and returns it changed, its bodies named by index (as
+## CadGeometry.model) and faces by name; curves on faces are the set's
+## CadCurves. A trim pushes the face as it was onto the set's trim stages
+## (cad_trims.lucb), which Untrim pops.
+
+## What a surfacing edit made: the set, and what it measured (Trim
+## Convert's deviations, Stitch's joins and widest gap, Project's fit).
+pub struct CadSurfaceEdit:
+    var made: interop.Reference[GeometrySet]?
+    pub var deviation: f64
+    pub var edge_deviation: f64
+    pub var count: i64
+    pub var widest: f64
+    pub var closed: bool
+
+    pub func init():
+        self.made = none
+        self.deviation = 0.0
+        self.edge_deviation = 0.0
+        self.count = 0
+        self.widest = 0.0
+        self.closed = false
+
+    pub func geometry() -> interop.Reference[GeometrySet]!:
+        let made = self.made else error(invalid, "a surfacing edit has no geometry")
+        return made.clone()
+
+    pub func close():
+        if let made = self.made: made.release()
+        self.made = none
+
+pub let cad_surface_edit_type: interop.Type[CadSurfaceEdit] = interop.Type[CadSurfaceEdit]("CadSurfaceEdit", CadSurfaceEdit.close, closeable = true)
+
+func edit_of(set: interop.Reference[GeometrySet]) -> interop.Reference[CadSurfaceEdit]!:
+    let result = interop.Reference[CadSurfaceEdit].adopt(new CadSurfaceEdit() in memory.heap, cad_surface_edit_type, memory.heap) catch failure:
+        set.release()
+        error(failure.code, failure.message)
+    result.value().made = set
+    return result
+
+## A face cut by its curves (Trim's region markers and Show Intersections):
+## a marker inside each region, where the curves cross the boundary and
+## each other, and the loose ends that cut nothing.
+pub struct CadTrimRegions:
+    var cut: TrimCut
+
+    pub func init():
+        self.cut = TrimCut(Growing[Vector3](), Growing[Vector3](), Growing[Vector3]())
+
+    pub func marker_count() -> i64:
+        return (i64)self.cut.markers.count
+
+    pub func marker(index: i64) -> Vector3!:
+        if index < 0 or (usize)index >= self.cut.markers.count: error(invalid, "region marker out of range")
+        return self.cut.markers.items[(usize)index]
+
+    pub func loose_count() -> i64:
+        return (i64)self.cut.loose.count
+
+    pub func loose(index: i64) -> Vector3!:
+        if index < 0 or (usize)index >= self.cut.loose.count: error(invalid, "loose end out of range")
+        return self.cut.loose.items[(usize)index]
+
+    pub func crossing_count() -> i64:
+        return (i64)self.cut.crossings.count
+
+    pub func crossing(index: i64) -> Vector3!:
+        if index < 0 or (usize)index >= self.cut.crossings.count: error(invalid, "crossing out of range")
+        return self.cut.crossings.items[(usize)index]
+
+    pub func close():
+        self.cut.close()
+
+pub let cad_trim_regions_type: interop.Type[CadTrimRegions] = interop.Type[CadTrimRegions]("CadTrimRegions", CadTrimRegions.close, closeable = true)
+
+## Body `body` of `set`.
+func body_of(set: interop.Reference[GeometrySet], body: i64) -> const CadModel*!:
+    let models = set_models(try set.get())
+    if body < 0 or (usize)body >= models.length: error(invalid, "the body is no longer in the model: pick it again")
+    return models[(usize)body].value()
+
+## `set` with body `body` replaced by `models` (none: removed).
+func with_body(set: interop.Reference[GeometrySet], body: i64, models: const interop.Reference[CadModel][]) -> interop.Reference[GeometrySet]!:
+    let source = try set.get()
+    let existing = set_models(source)
+    var list = Growing[interop.Reference[CadModel]]()
+    defer list.close()
+    for at in 0..<existing.length:
+        if (i64)at == body:
+            for m in models: try list.push(m)
+        else:
+            try list.push(existing[at])
+    return try with_models(source, list.view())
+
+## The tolerance curves are fitted to on body `model`: a ten-millionth of
+## its size, but not below its own tolerance.
+func fit_tolerance(model: const CadModel*) -> f64!:
+    var w = try shape_of(model)
+    defer w.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for p in w.points.view():
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    return math.max(w.tolerance, high.subtract(low).length() * 1e-7)
+
+## The set's curves `names` (apart by `;`; empty: every curve, or with
+## `face` every curve on that face) by index.
+func chosen_curves(set: interop.Reference[GeometrySet], names: str, face: str, out: Growing[i64]*) -> !:
+    let count = try CadCurves.count(set)
+    if names.length > 0:
+        var start: usize = 0
+        let bytes = names.bytes
+        for at in 0..<bytes.length + 1:
+            if at < bytes.length and bytes[at] != 59: continue
+            let name = (str)bytes[start..<at]
+            start = at + 1
+            if name.length == 0: continue
+            let index = try CadCurves.find(set, name)
+            if index < 0: error(invalid, "a curve to use is no longer in the model: pick it again")
+            try out.push(index)
+        return
+    for index in 0..<count:
+        if face.length > 0:
+            let on = try CadCurves.face(set, index)
+            defer on.release()
+            if on.value != face: continue
+        try out.push(index)
+
+## Surfacing calls, as static functions.
+pub struct CadSurfacing:
+    let reserved: u8 = 0
+
+    ## Project (project.lucb): the curves `curves` of `set` (names apart by
+    ## `;`) cast onto face `face` of body `body` along `direction` (both
+    ## ways with `both`) or along the face's normals (`normal`), each piece
+    ## a curve on the face named `stem` and a number, fitted within
+    ## `tolerance` (0: a ten-millionth of the body) or, with `original`, on
+    ## each curve's own degree and spans. `count` says how many pieces,
+    ## `deviation` the worst fit; none at all is refused.
+    pub static func projected(set: interop.Reference[GeometrySet], body: i64, face: str, curves: str, direction: Vector3, normal: bool = false, both: bool = true,
+                              original: bool = false, tolerance: f64 = 0.0, stem: str = "Projected") -> interop.Reference[CadSurfaceEdit]!:
+        let model = try body_of(set, body)
+        let fit = tolerance if tolerance > 0.0 else try fit_tolerance(model)
+        var chosen = Growing[i64]()
+        defer chosen.close()
+        try chosen_curves(set, curves, "", &chosen)
+        if chosen.count == 0: error(invalid, "Project: pick the curves to project")
+        var result = set.clone()
+        var made: i64 = 0
+        var worst = 0.0
+        for index in chosen.view():
+            let curve = try CadCurves.curve(set, index)
+            defer curve.release()
+            var charts = Growing[Spline]()
+            defer close_splines(&charts)
+            var lifted = Growing[Spline]()
+            defer close_splines(&lifted)
+            let cast = Casting(direction, normal, both)
+            worst = math.max(worst, try project_curve(model, face, spline_in(curve.value()), cast, fit, original, &charts, &lifted))
+            for k in 0..<charts.count:
+                let next = try add_on_face(result, stem, face, &lifted.items[k], &charts.items[k], "project")
+                result.release()
+                result = next
+                made += 1
+        if made == 0:
+            result.release()
+            error(invalid, "Project: the curves miss the face (along this direction)")
+        let edit = try edit_of(result)
+        edit.value().count = made
+        edit.value().deviation = worst
+        return edit
+
+    ## Intersect: where face `face` of body `body` meets face `other_face`
+    ## of body `other`, curves on the first face (and with `both` on the
+    ## second too), named `stem` and a number.
+    pub static func intersected(set: interop.Reference[GeometrySet], body: i64, face: str, other: i64, other_face: str, both: bool = false, tolerance: f64 = 0.0,
+                                stem: str = "Intersect") -> interop.Reference[CadSurfaceEdit]!:
+        let a = try body_of(set, body)
+        let b = try body_of(set, other)
+        var meets = try face_meets(a, face, b, other_face)
+        defer meets.close()
+        return try meeting_curves(set, &meets, a, face, b if both else none, other_face, tolerance, stem)
+
+    ## Intersect with a plane: where face `face` of body `body` meets the
+    ## plane through `origin` square to `normal`, as curves on the face.
+    pub static func intersected_plane(set: interop.Reference[GeometrySet], body: i64, face: str, origin: Vector3, normal: Vector3, tolerance: f64 = 0.0,
+                                      stem: str = "Intersect") -> interop.Reference[CadSurfaceEdit]!:
+        let a = try body_of(set, body)
+        let sheet = try plane_sheet(a, origin, normal)
+        defer sheet.release()
+        var meets = try face_meets(a, face, sheet.value(), "plane")
+        defer meets.close()
+        return try meeting_curves(set, &meets, a, face, none, "", tolerance, stem)
+
+    ## Face `face` of body `body` cut by its curves (`curves`, apart by `;`;
+    ## empty: every curve on it): the regions' markers, the crossings and
+    ## the loose ends (Trim's region markers, Show Intersections).
+    pub static func trim_regions(set: interop.Reference[GeometrySet], body: i64, face: str, curves: str = "") -> interop.Reference[CadTrimRegions]!:
+        let model = try body_of(set, body)
+        var cuts = try cutting_shape(set, model, face, curves)
+        defer cuts.close()
+        let cut = try trim_regions(model, face, &cuts)
+        let result = interop.Reference[CadTrimRegions].adopt(new CadTrimRegions() in memory.heap, cad_trim_regions_type, memory.heap) catch failure:
+            var owned = cut
+            owned.close()
+            error(failure.code, failure.message)
+        result.value().cut.close()
+        result.value().cut = cut
+        return result
+
+    ## Trim: face `face` of body `body` cut by its curves (as trim_regions),
+    ## the regions holding `picks` kept (`mode` 0), discarded (1), or every
+    ## region its own face (2, Divide); the face before it kept as a trim
+    ## stage. `tag` names Divide's new faces.
+    pub static func trimmed(set: interop.Reference[GeometrySet], body: i64, face: str, picks: const Vector3[], mode: i64 = 0, curves: str = "", tag: str = "trim") -> interop.Reference[GeometrySet]!:
+        let model = try body_of(set, body)
+        var cuts = try cutting_shape(set, model, face, curves)
+        defer cuts.close()
+        let precision = try fit_tolerance(model)
+        let made = try trim_face(model, face, &cuts, picks, mode, tag, precision)
+        defer made.release()
+        let one: interop.Reference[CadModel][1] = [made]
+        let replaced = try with_body(set, body, one[..<1])
+        defer replaced.release()
+        let before = try face_alone(model, face)
+        defer before.release()
+        return try with_stage(try replaced.get(), face, before, 0)
+
+    ## Untrim: face `face` of body `body` as it was before its last trim
+    ## (`all`: its first), from the set's trim stages; with none, its
+    ## natural surface (natural_face). The stages popped.
+    pub static func untrimmed(set: interop.Reference[GeometrySet], body: i64, face: str, all: bool = false) -> interop.Reference[GeometrySet]!:
+        let model = try body_of(set, body)
+        let source = try set.get()
+        var earlier = stage_model(source, face, not all)
+        defer:
+            if let held = earlier: held.release()
+        if earlier == none: earlier = try natural_face(model, face)
+        let restored = earlier else error(invalid, "Untrim found nothing to restore")
+        let made = try replaced_face(model, face, restored.value())
+        defer made.release()
+        let one: interop.Reference[CadModel][1] = [made]
+        let replaced = try with_body(set, body, one[..<1])
+        defer replaced.release()
+        if stage_count(source, face) == 0: return replaced.clone()
+        return try with_stage(try replaced.get(), face, none, -1 if all else 1)
+
+    ## How many trim stages `set` keeps for face `face`.
+    pub static func stages(set: interop.Reference[GeometrySet], face: str) -> i64!:
+        return (i64)stage_count(try set.get(), face)
+
+    ## Trim Convert (convert.lucb): face `face` of body `body` as an
+    ## untrimmed B-spline face of degrees `du`, `dv` on `su` by `sv` spans
+    ## (`swap`: u and v exchanged), in its place (stitched to its neighbors
+    ## within its edge deviation); with `keep`, the original kept as a body
+    ## of its own after the set's others. The deviations are reported.
+    pub static func trim_converted(set: interop.Reference[GeometrySet], body: i64, face: str, du: i64 = 5, dv: i64 = 5, su: i64 = 4, sv: i64 = 4, swap: bool = false,
+                                   keep: bool = false) -> interop.Reference[CadSurfaceEdit]!:
+        let model = try body_of(set, body)
+        var converted = try trim_convert(model, face, du, dv, su, sv, swap)
+        defer converted.model.release()
+        let b = model.brep() else error(invalid, "Trim Convert needs a B-rep body")
+        let gap = math.min(1.0, math.max(b.base_tolerance() * 10.0, converted.edge_deviation * 1.5))
+        let made = try replaced_face(model, face, converted.model.value(), gap)
+        defer made.release()
+        var bodies = Growing[interop.Reference[CadModel]]()
+        defer bodies.close()
+        try bodies.push(made)
+        if keep:
+            let original = try face_alone(model, face)
+            defer original.release()
+            let replaced = try with_body(set, body, bodies.view())
+            defer replaced.release()
+            var all = Growing[interop.Reference[CadModel]]()
+            defer all.close()
+            for m in set_models(try replaced.get()): try all.push(m)
+            try all.push(original)
+            let both = try with_models(try replaced.get(), all.view())
+            let edit = try edit_of(both)
+            edit.value().deviation = converted.surface_deviation
+            edit.value().edge_deviation = converted.edge_deviation
+            return edit
+        let edit = try edit_of(try with_body(set, body, bodies.view()))
+        edit.value().deviation = converted.surface_deviation
+        edit.value().edge_deviation = converted.edge_deviation
+        return edit
+
+    ## Shrink (convert.lucb): face `face` of body `body` on its surface cut
+    ## down to its loops' box.
+    pub static func shrunk(set: interop.Reference[GeometrySet], body: i64, face: str) -> interop.Reference[GeometrySet]!:
+        let model = try body_of(set, body)
+        let made = try shrunk_face(model, face)
+        defer made.release()
+        let one: interop.Reference[CadModel][1] = [made]
+        return try with_body(set, body, one[..<1])
+
+    ## Stitch (stitch.lucb): the bodies `bodies` (empty: all of them) joined
+    ## into one body where their boundary edges meet within `gap`, in the
+    ## first's place; `count` the edges joined, `widest` the widest gap
+    ## closed, `closed` whether every edge is shared (a solid).
+    pub static func stitched(set: interop.Reference[GeometrySet], bodies: const i64[], gap: f64 = 0.001) -> interop.Reference[CadSurfaceEdit]!:
+        let source = try set.get()
+        let existing = set_models(source)
+        var chosen = Growing[interop.Reference[CadModel]]()
+        defer chosen.close()
+        var marked = Growing[bool]()
+        defer marked.close()
+        try marked.fill(existing.length, bodies.length == 0)
+        for index in bodies:
+            if index < 0 or (usize)index >= existing.length: error(invalid, "a body to stitch is no longer in the model: pick it again")
+            marked.items[(usize)index] = true
+        for at in 0..<existing.length:
+            if marked.items[at]: try chosen.push(existing[at])
+        if chosen.count < 1: error(invalid, "Stitch: pick the surfaces to join")
+        let joined = try stitch_models(chosen.view(), gap)
+        defer joined.model.release()
+        var list = Growing[interop.Reference[CadModel]]()
+        defer list.close()
+        var placed = false
+        for at in 0..<existing.length:
+            if not marked.items[at]:
+                try list.push(existing[at])
+                continue
+            if not placed:
+                try list.push(joined.model)
+                placed = true
+        let edit = try edit_of(try with_models(source, list.view()))
+        edit.value().count = joined.joined
+        edit.value().widest = joined.widest
+        edit.value().closed = joined.closed
+        return edit
+
+    ## Unstitch (stitch.lucb): body `body`'s faces each an open body of its
+    ## own, in its place.
+    pub static func unstitched(set: interop.Reference[GeometrySet], body: i64) -> interop.Reference[GeometrySet]!:
+        let model = try body_of(set, body)
+        var pieces = Growing[interop.Reference[CadModel]]()
+        defer:
+            for m in pieces.view(): m.release()
+            pieces.close()
+        try unstitch_model(model, &pieces)
+        return try with_body(set, body, pieces.view())
+
+    ## Edge `edge`'s precision in `model` (Stitch's tolerant edges: how far
+    ## its faces may lie from it; the model's tolerance otherwise).
+    pub static func edge_precision(model: interop.Reference[CadModel], edge: i64) -> f64!:
+        let b = model.value().brep() else error(invalid, "the model has no B-rep")
+        return try b.edge_precision_of(edge)
+
+    pub static func vertex_precision(model: interop.Reference[CadModel], vertex: i64) -> f64!:
+        let b = model.value().brep() else error(invalid, "the model has no B-rep")
+        return try b.vertex_precision_of(vertex)
+
+    ## Whether every edge of `model` is shared by two faces (a closed solid).
+    pub static func is_closed(model: interop.Reference[CadModel]) -> bool!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        for e in 0..<w.edges.count:
+            if w.sides.items[e * 2] < 0: continue
+            if w.sides.items[e * 2 + 1] < 0:
+                # A seam (one face both ways) is closed.
+                var count = 0
+                for f in 0..<w.faces.count:
+                    for use in w.face_uses(f):
+                        if edge_index(use) == e: count += 1
+                if count < 2: return false
+        return true
+
+## The meeting curves of `meets` as curves on face `face` of `a` (and on
+## `other_face` of `b` when given), named `stem` and a number.
+func meeting_curves(set: interop.Reference[GeometrySet], meets: const Shape*, a: const CadModel*, face: str, b: const CadModel*?, other_face: str, tolerance: f64, stem: str) -> interop.Reference[CadSurfaceEdit]!:
+    if meets.edges.count == 0: error(invalid, "Intersect: the faces do not meet")
+    let fit = tolerance if tolerance > 0.0 else try fit_tolerance(a)
+    var result = set.clone()
+    var made: i64 = 0
+    var worst = 0.0
+    for e in 0..<meets.edges.count:
+        var exact = try edge_spline(meets, e)
+        defer exact.close()
+        for side in 0..<2:
+            var model = a
+            if side == 1:
+                let second = b else break
+                model = second
+            let on = face if side == 0 else other_face
+            var charts = Growing[Spline]()
+            defer close_splines(&charts)
+            var lifted = Growing[Spline]()
+            defer close_splines(&lifted)
+            let pull = Casting(Vector3(), true, true)
+            worst = math.max(worst, try project_curve(model, on, &exact, pull, fit, false, &charts, &lifted))
+            for k in 0..<charts.count:
+                let next = try add_on_face(result, stem, on, &lifted.items[k], &charts.items[k], "intersect")
+                result.release()
+                result = next
+                made += 1
+    if made == 0:
+        result.release()
+        error(invalid, "Intersect: the faces do not meet")
+    let edit = try edit_of(result)
+    edit.value().count = made
+    edit.value().deviation = worst
+    return edit
+
+## `set` with a curve on face `face`: its 3D curve `curve`, chart curve
+## `chart`, named `stem` and the first number free.
+func add_on_face(set: interop.Reference[GeometrySet], stem: str, face: str, curve: const Spline*, chart: const Spline*, source: str) -> interop.Reference[GeometrySet]!:
+    let name = try CadCurves.free_name(set, stem)
+    defer name.release()
+    let held = try held_spline(try curve.copy())
+    defer held.release()
+    let held_chart = try held_spline(try chart.copy())
+    defer held_chart.release()
+    return try CadCurves.with_curve(set, name.value, held, true, source, face, held_chart)
+
+func close_splines(list: Growing[Spline]*):
+    for s in list.view():
+        var owned = s
+        owned.close()
+    list.close()
+
+## The curves cutting face `face` of `model`: the set's curves on it (or
+## `names`), their 3D curves as a shape's B-spline carriers. Each must lie
+## on the face's surface within the fit tolerance (a curve left on a face
+## whose surface changed since is refused: project it again).
+func cutting_shape(set: interop.Reference[GeometrySet], model: const CadModel*, face: str, names: str) -> Shape!:
+    var chosen = Growing[i64]()
+    defer chosen.close()
+    try chosen_curves(set, names, face, &chosen)
+    if chosen.count == 0: error(invalid, "Trim: the face has no curves on it to trim with (Project or Intersect first)")
+    var w = try shape_of(model)
+    defer w.close()
+    var support: i64 = -1
+    for f in 0..<w.faces.count:
+        if w.face_name(f) == face:
+            support = w.faces.items[f].surface
+            break
+    if support < 0: error(invalid, "the face to trim is not in the body: pick it again")
+    let s = &w.surfaces.items[(usize)support]
+    let fit = try fit_tolerance(model)
+    var cuts = empty_shape(w.tolerance)
+    errdefer cuts.close()
+    for index in chosen.view():
+        let on = try CadCurves.face(set, index)
+        defer on.release()
+        if on.value != face: error(invalid, "a curve to trim with lies on another face")
+        let curve = try CadCurves.curve(set, index)
+        defer curve.release()
+        let c = spline_in(curve.value())
+        var seed = Vector3(0.5, 0.5, 0.0)
+        for k in 0..<33:
+            let p = c.point_at(c.low() + (c.high() - c.low()) * (f64)k / 32.0)
+            var off = 0.0
+            if s.kind == surface_spline:
+                seed = try nearest_parameters(*s, p, seed, k == 0)
+                off = (try evaluate(*s, seed)).subtract(p).length()
+            else:
+                off = surface_distance(s, p)
+            if off > fit * 10.0: error(invalid, "a curve to trim with no longer lies on the face (its surface changed): project it again")
+        var points = Growing[Vector3]()
+        defer points.close()
+        var weights = Growing[f64]()
+        defer weights.close()
+        for q in c.points.view():
+            try points.push(q.point())
+            try weights.push(q.w)
+        let stored = try cuts.add_spline(points.view(), weights.view(), c.knots.view(), c.degree)
+        _ = try cuts.add_carrier(Carrier(curve_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, stored))
+    return cuts
+
+## The faces of `model` named `face`, as a body (a trim's stage).
+func face_alone(model: const CadModel*, face: str) -> interop.Reference[CadModel]!:
+    var chosen = Growing[i64]()
+    defer chosen.close()
+    for f in 0..<model.face_count():
+        if (try model.face_name(f)) == face: try chosen.push(f)
+    if chosen.count == 0: error(invalid, "the face is not in the body: pick it again")
+    return try model.subset(chosen.view())

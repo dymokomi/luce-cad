@@ -1,0 +1,88 @@
+## Intersect (surfacing Stage 3, Alias's Intersect; §6.3 of luced-3d's
+## docs/research/SURFACING-ALIAS-PLASTICITY.md): where two faces meet, as
+## curves. The booleans' step 2 does it (boolean.lucb intersect_faces): the
+## surfaces' meeting curves (intersect.lucb in closed form, march.lucb's
+## traced curves for B-splines), each clipped to both faces.
+
+## Where the faces named `fa` of `a` meet the faces named `fb` of `b`: a
+## shape whose edges are the meeting curves (inside both faces), over its
+## own carriers. Refused when the faces lie on one surface.
+pub func face_meets(a: const CadModel*, fa: str, b: const CadModel*, fb: str) -> Shape!:
+    let first = try named_subset(a, fa)
+    defer first.release()
+    let second = try named_subset(b, fb)
+    defer second.release()
+    var w = try shape_of(first.value())
+    let faces_a = w.faces.count
+    var other = shape_of(second.value()) catch failure:
+        w.close()
+        error(failure.code, failure.message)
+    defer other.close()
+    append_shape(&w, &other) catch failure:
+        w.close()
+        error(failure.code, failure.message)
+    var work = Work(w, faces_a, 1.0, 1e-9, Growing[Vector3](), Growing[i64](), Growing[Cut](), Growing[Section](), Growing[Imprint](),
+                    Growing[Coincident](), Growing[ShapeEdge](), Growing[i64](), Growing[usize](), Growing[i64](), Growing[bool]())
+    defer work.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<work.w.faces.count:
+        let (l, h) = try face_box(&work.w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    work.size = math.max(1e-6, high.subtract(low).length())
+    work.tol = math.max(work.size * 1e-7, 1e-10)
+    for p in work.w.points.view(): try work.point_vertex.push(try work.vertex(p))
+    try intersect_faces(&work)
+    if work.coincident.count > 0: error(invalid, "the faces lie on one surface: they meet everywhere, not along a curve")
+    var made = empty_shape(work.tol)
+    errdefer made.close()
+    for p in work.vertices.view(): try made.points.push(p)
+    for c in work.w.carriers.view(): try made.carriers.push(c)
+    for sp in work.w.splines.view(): try made.splines.push(sp)
+    for p in work.w.spline_points.view(): try made.spline_points.push(p)
+    for x in work.w.spline_weights.view(): try made.spline_weights.push(x)
+    for k in work.w.spline_knots.view(): try made.spline_knots.push(k)
+    for section in work.sections.view(): try made.edges.push(section.edge)
+    return made
+
+## The faces of `model` named `face`, as a body.
+func named_subset(model: const CadModel*, face: str) -> interop.Reference[CadModel]!:
+    var chosen = Growing[i64]()
+    defer chosen.close()
+    for f in 0..<model.face_count():
+        if (try model.face_name(f)) == face: try chosen.push(f)
+    if chosen.count == 0: error(invalid, "the face to intersect is not in the body: pick it again")
+    return try model.subset(chosen.view())
+
+## A square sheet on the plane through `origin` square to `normal`, wide
+## enough to cross `model` (Intersect with a plane): a body of one face.
+pub func plane_sheet(model: const CadModel*, origin: Vector3, normal: Vector3) -> interop.Reference[CadModel]!:
+    let n = normal.normalized() catch failure: error(invalid, "Intersect with a plane needs its normal")
+    var w = try shape_of(model)
+    defer w.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(&w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    let span = high.subtract(low).length() * 2.0 + origin.subtract(low.add(high).multiply_scalar(0.5)).length() * 2.0 + 1.0
+    let seed = Vector3(1.0, 0.0, 0.0) if math.abs(n.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+    let x = try seed.subtract(n.multiply_scalar(seed.dot(n))).normalized()
+    let y = n.cross(x)
+    let center = origin
+    let output = try BrepModel.held(math.max(w.tolerance, least_tolerance))
+    defer output.release()
+    let b = output.value()
+    var corners: i64[4] = [0, 0, 0, 0]
+    let xs: f64[4] = [-span, span, span, -span]
+    let ys: f64[4] = [-span, -span, span, span]
+    for k in 0..<(usize)4: corners[k] = try b.add_vertex(center.add(x.multiply_scalar(xs[k])).add(y.multiply_scalar(ys[k])))
+    var loop: i64[4] = [0, 0, 0, 0]
+    for k in 0..<(usize)4: loop[k] = (try b.add_line(corners[k], corners[(k + 1) % 4])) + 1
+    let plane = try b.add_surface(surface_plane, center, n, x)
+    let sizes: i64[1] = [4]
+    let made = try b.add_face(plane, loop[..<4], sizes[..<1])
+    try b.set_face_name(made, "plane")
+    return try CadModel.of_brep(output)

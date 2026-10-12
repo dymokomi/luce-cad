@@ -52,6 +52,12 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
   points, from a model's edges and isoparms, on a face, Blend Curve to G4,
   Attach, Close, Stretch and Reverse. See [docs/MODELING.md](docs/MODELING.md),
   Curves.
+- `surfacing` (`luce_cad.surfacing`): `CadSurfacing`, surfacing Stage 3 on
+  a geometry set: Project (along a vector or the normals) and Intersect as
+  curves on faces; Trim (Keep, Discard, Divide) with trim stages Untrim pops,
+  a face's natural surface without them; Trim Convert, Shrink; Stitch and
+  Unstitch with tolerant edges. See [docs/MODELING.md](docs/MODELING.md),
+  Projection, trims and stitching.
 - `cad_exact` (`luce_cad.exact`, Base only): `FaceSupport`, the exact data
   exporters read (luce-usd writes CAD faces as USD NurbsPatch prims).
   `model.face_support(face)` copies a face's support out (kind, frame,
@@ -114,6 +120,14 @@ positions)` places cvs exactly (the editor's moves, through
 `CadModel.with_cvs_placed`). A moved surface's trim
 edges are re-projected onto it, so boundary cvs can move too; faces sharing
 an edge stay joined.
+
+Edges and vertices carry a **precision** (`edge_precision`,
+`vertex_precision`; Parasolid's tolerant edges): 0 is the model's
+tolerance; Stitch gives an edge it joined across a gap the gap and how far
+its faces lie from it, and a merged vertex how far it lies from its edges'
+ends. Building an edge checks its ends against its vertices' precision,
+the codec keeps both columns, and meshing and modeling work to
+`model_tolerance()`, the largest of them.
 
 Tessellation is a cache, not a conversion:
 
@@ -485,7 +499,12 @@ this list:
 - `tessellation/`: a whole B-rep's mesh: planning every face, meshing in
   parallel jobs, the per-face cache, curvature.
 - `brep/`: `BrepModel`, its columns, records, meshes, cv edits, codec.
-- `model/`, `modeling/`, `sketch/`: the public model, features and sketches.
+- `model/`, `modeling/`, `sketch/`: the public model, features and sketches
+  (`modeling/trim`, `stitch`, `untrim` and `face_meets` cut, join and
+  rebuild faces for surfacing).
+- `nurbs/`, `curves/`, `cad_curves`: the NURBS toolkit, CAD curves and
+  curves as set objects; `cad_trims`: a set's trim stages.
+- `surfacing/`: projection, trim conversion and `CadSurfacing`.
 
 ## Surface evaluation and trim meshing (`geometry`, `polygons`)
 

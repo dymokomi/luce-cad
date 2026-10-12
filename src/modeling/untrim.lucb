@@ -1,0 +1,282 @@
+## Untrim's natural faces and face replacement (surfacing Stage 3: Alias's
+## Untrim; §6.4 of luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md).
+##
+## Without a trim history a face untrims to its surface's natural extent:
+## a B-spline's whole domain (its four boundary rows as edges, a row that
+## closes on its opposite as one seam edge used both ways, a row shrunk to
+## a point left out); a plane's rectangle round the face's loops in the
+## plane's frame; a cylinder's or cone's whole turn between the heights the
+## face spans, with a seam; a sphere whole (two hemispheres) and a torus
+## whole, as luce-cad's primitives are made. With history the face's
+## earlier stage is put back instead (surfacing's trim stages).
+##
+## The face so made replaces the faces of its name in their body. It no
+## longer meets the faces round it along the trim, so it is stitched to
+## them where its edges do meet within the body's tolerance, and stands
+## alone in the body where they do not.
+
+## The natural face of the faces named `face` (their first's surface) as a
+## one-face body: placed, named and facing as they were.
+pub func natural_face(model: const CadModel*, face: str) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model)
+    defer w.close()
+    var f: i64 = -1
+    for k in 0..<w.faces.count:
+        if w.face_name(k) == face:
+            f = (i64)k
+            break
+    if f < 0: error(invalid, "the face to untrim is not in the body: pick it again")
+    let shape_face = w.faces.items[(usize)f]
+    let s = &w.surfaces.items[(usize)shape_face.surface]
+    let output = try BrepModel.held(math.max(w.tolerance, least_tolerance))
+    defer output.release()
+    let b = output.value()
+    if s.kind == surface_spline: try untrim_spline(b, s, shape_face.sense, w.tolerance)
+    elif s.kind == surface_plane: try untrim_plane(b, &w, (usize)f)
+    elif s.kind == surface_cylinder or s.kind == surface_cone: try untrim_band(b, &w, (usize)f)
+    elif s.kind == surface_sphere:
+        let east = try b.add_vertex(s.origin.add(s.x.multiply_scalar(s.radius)))
+        let equator = try b.add_circle(east, east, s.origin, s.z, s.x, s.radius)
+        let ball = try b.add_surface(surface_sphere, s.origin, s.z, s.x, s.radius)
+        # Inside out, each hemisphere runs the equator the other way.
+        let north: i64[1] = [(equator + 1) if shape_face.sense else -(equator + 1)]
+        let south: i64[1] = [-north[0]]
+        let one: i64[1] = [1]
+        _ = try b.add_face(ball, north[..<1], one[..<1], shape_face.sense)
+        _ = try b.add_face(ball, south[..<1], one[..<1], shape_face.sense)
+    else:
+        let outer = try b.add_vertex(s.origin.add(s.x.multiply_scalar(s.radius + s.angle)))
+        let ring = try b.add_circle(outer, outer, s.origin, s.z, s.x, s.radius + s.angle)
+        let meridian = try b.add_circle(outer, outer, s.origin.add(s.x.multiply_scalar(s.radius)), s.y.multiply_scalar(-1.0), s.x, s.angle)
+        let torus = try b.add_surface(surface_torus, s.origin, s.z, s.x, s.radius, s.angle)
+        let around: i64[4] = [ring + 1, meridian + 1, -(ring + 1), -(meridian + 1)]
+        let four: i64[1] = [4]
+        _ = try b.add_face(torus, around[..<4], four[..<1], shape_face.sense)
+    for k in 0..<b.face_count(): try b.set_face_name(k, face)
+    return try CadModel.of_brep(output)
+
+## A B-spline's whole domain: its boundary rows as edges, counterclockwise
+## in its chart (clockwise when the face faces against its normal).
+func untrim_spline(b: BrepModel*, s: const Surface*, sense: bool, tol: f64) -> !:
+    let surface = try b.add_spline_surface(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv)
+    let nu = (usize)s.nu
+    let nv = (usize)s.nv
+    # The corners (u, v) = (0, 0), (1, 0), (1, 1), (0, 1).
+    let corners: Vector3[4] = [s.points[0], s.points[(nu - 1) * nv], s.points[(nu - 1) * nv + nv - 1], s.points[nv - 1]]
+    var vertices: i64[4] = [-1, -1, -1, -1]
+    for k in 0..<(usize)4:
+        for j in 0..<k:
+            if vertices[k] < 0 and corners[j].subtract(corners[k]).length() <= tol: vertices[k] = vertices[j]
+        if vertices[k] < 0: vertices[k] = try b.add_vertex(corners[k])
+    # The four sides as (row, along u): v = 0 (u up), u = 1 (v up), v = 1
+    # (u down), u = 0 (v down); a side whose row closes on its opposite's
+    # is that one's seam.
+    var rows = Growing[Vector3]()
+    defer rows.close()
+    var row_weights = Growing[f64]()
+    defer row_weights.close()
+    var edges: i64[4] = [-1, -1, -1, -1]
+    var forward: bool[4] = [true, true, false, false]
+    var uses = Growing[i64]()
+    defer uses.close()
+    for side in 0..<(usize)4:
+        let along_u = side == 0 or side == 2
+        let fixed = (0 if side == 0 or side == 3 else (nv - 1 if side == 2 else nu - 1))
+        rows.clear()
+        row_weights.clear()
+        let count = nu if along_u else nv
+        for i in 0..<count:
+            let at = i * nv + fixed if along_u else fixed * nv + i
+            try rows.push(s.points[at])
+            try row_weights.push(s.weights[at])
+        # A row shrunk to a point (a pole) is no edge.
+        var spread = 0.0
+        for p in rows.view(): spread = math.max(spread, p.subtract(rows.items[0]).length())
+        if spread <= tol: continue
+        let start = vertices[side]
+        let end = vertices[(side + 1) % 4]
+        # The seam: this row lies on the opposite side's row (made first).
+        if side >= 2 and edges[side - 2] >= 0 and seam_row(s, side, tol):
+            edges[side] = edges[side - 2]
+            forward[side] = true
+            try uses.push(-(edges[side] + 1))
+            continue
+        let knots = s.ku if along_u else s.kv
+        let degree = s.du if along_u else s.dv
+        # Sides 2 and 3 run against their parameter.
+        let from_vertex = start if forward[side] else end
+        let to_vertex = end if forward[side] else start
+        edges[side] = try b.add_spline_edge(from_vertex, to_vertex, rows.view(), row_weights.view(), degree, knots, true)
+        try uses.push((edges[side] + 1) if forward[side] else -(edges[side] + 1))
+    if uses.count == 0: error(invalid, "the surface has no boundary to untrim to")
+    var loop = Growing[i64]()
+    defer loop.close()
+    if sense: try loop.assign(uses.view())
+    else:
+        var k = uses.count
+        while k > 0:
+            k -= 1
+            try loop.push(-uses.items[k])
+    let sizes: i64[1] = [(i64)loop.count]
+    _ = try b.add_face(surface, loop.view(), sizes[..<1], sense)
+
+## Whether side `side` (2: v = 1, 3: u = 0) of `s`'s net lies on its
+## opposite (0: v = 0, 1: u = 1): a closed surface's seam.
+func seam_row(s: const Surface*, side: usize, tol: f64) -> bool:
+    let nu = (usize)s.nu
+    let nv = (usize)s.nv
+    let along_u = side == 2
+    let count = nu if along_u else nv
+    for i in 0..<count:
+        let here = s.points[i * nv + nv - 1] if along_u else s.points[i]
+        let there = s.points[i * nv] if along_u else s.points[(nu - 1) * nv + i]
+        if here.subtract(there).length() > tol: return false
+    return true
+
+## A plane's rectangle round face `f`'s loops, in the plane's frame.
+func untrim_plane(b: BrepModel*, w: const Shape*, f: usize) -> !:
+    let face = w.faces.items[f]
+    let s = &w.surfaces.items[(usize)face.surface]
+    var low = Vector3(1.0e300, 1.0e300, 0.0)
+    var high = Vector3(-1.0e300, -1.0e300, 0.0)
+    for use in w.face_uses(f):
+        for k in 0..<17:
+            let p = (try w.edge_at(edge_index(use), (f64)k / 16.0)).subtract(s.origin)
+            low = Vector3(math.min(low.x, p.dot(s.x)), math.min(low.y, p.dot(s.y)), 0.0)
+            high = Vector3(math.max(high.x, p.dot(s.x)), math.max(high.y, p.dot(s.y)), 0.0)
+    let plane = try b.add_surface(surface_plane, s.origin, s.z, s.x)
+    var corners: i64[4] = [0, 0, 0, 0]
+    let xs: f64[4] = [low.x, high.x, high.x, low.x]
+    let ys: f64[4] = [low.y, low.y, high.y, high.y]
+    for k in 0..<(usize)4: corners[k] = try b.add_vertex(s.origin.add(s.x.multiply_scalar(xs[k])).add(s.y.multiply_scalar(ys[k])))
+    var loop: i64[4] = [0, 0, 0, 0]
+    for k in 0..<(usize)4:
+        let edge = try b.add_line(corners[k], corners[(k + 1) % 4])
+        loop[k] = edge + 1
+    if not face.sense:
+        let turned: i64[4] = [-loop[3], -loop[2], -loop[1], -loop[0]]
+        loop = turned
+    let sizes: i64[1] = [4]
+    _ = try b.add_face(plane, loop[..<4], sizes[..<1], face.sense)
+
+## A cylinder's or cone's whole turn between the heights face `f` spans,
+## as the primitives' sides: base circle, seam, top circle back, seam back.
+func untrim_band(b: BrepModel*, w: const Shape*, f: usize) -> !:
+    let face = w.faces.items[f]
+    let s = &w.surfaces.items[(usize)face.surface]
+    var h0 = 1.0e300
+    var h1 = -1.0e300
+    for use in w.face_uses(f):
+        for k in 0..<17:
+            let h = (try w.edge_at(edge_index(use), (f64)k / 16.0)).subtract(s.origin).dot(s.z)
+            h0 = math.min(h0, h)
+            h1 = math.max(h1, h)
+    if not (h1 - h0 > w.tolerance): error(invalid, "the face spans no height to untrim over")
+    let slope = math.tan(s.angle) if s.kind == surface_cone else 0.0
+    let r0 = s.radius + h0 * slope
+    let r1 = s.radius + h1 * slope
+    if r0 <= w.tolerance or r1 <= w.tolerance: error(invalid, "the cone's band reaches its apex: untrim it as a whole cone by hand")
+    let base_center = s.origin.add(s.z.multiply_scalar(h0))
+    let top_center = s.origin.add(s.z.multiply_scalar(h1))
+    let bottom = try b.add_vertex(base_center.add(s.x.multiply_scalar(r0)))
+    let top = try b.add_vertex(top_center.add(s.x.multiply_scalar(r1)))
+    let seam = try b.add_line(bottom, top)
+    let base = try b.add_circle(bottom, bottom, base_center, s.z, s.x, r0)
+    let rim = try b.add_circle(top, top, top_center, s.z, s.x, r1)
+    let side = (try b.add_surface(surface_cylinder, s.origin, s.z, s.x, s.radius)) if s.kind == surface_cylinder else (try b.add_surface(surface_cone, s.origin, s.z, s.x, s.radius, s.angle))
+    var around: i64[4] = [base + 1, seam + 1, -(rim + 1), -(seam + 1)]
+    if not face.sense:
+        let turned: i64[4] = [seam + 1, rim + 1, -(seam + 1), -(base + 1)]
+        around = turned
+    let sizes: i64[1] = [4]
+    _ = try b.add_face(side, around[..<4], sizes[..<1], face.sense)
+
+## Whether a face named `name` is face `face` or a piece Divide made of it
+## (`<tag>/divide<k>[<face>]`).
+pub func piece_of(name: str, face: str) -> bool:
+    if name == face: return true
+    let bytes = name.bytes
+    let wanted = face.bytes
+    if bytes.length < wanted.length + 2 or bytes[bytes.length - 1] != 93: return false
+    let start = bytes.length - 1 - wanted.length
+    if bytes[start - 1] != 91 or (str)bytes[start..<bytes.length - 1] != face: return false
+    # The role before the bracket is a divide's.
+    var at = start - 1
+    while at > 0 and bytes[at - 1] != 47: at -= 1
+    let role = (str)bytes[at..<start - 1]
+    return role.bytes.length > 6 and (str)role.bytes[..<6] == "divide"
+
+## `model` without the faces named `face` (and Divide's pieces of it), or
+## none when nothing is left.
+pub func without_face(model: const CadModel*, face: str) -> interop.Reference[CadModel]?!:
+    var kept = Growing[i64]()
+    defer kept.close()
+    for f in 0..<model.face_count():
+        if not piece_of(try model.face_name(f), face): try kept.push(f)
+    if kept.count == 0: return none
+    return try model.subset(kept.view())
+
+## One body of `a`'s and `b`'s faces, as they are (lumps of one body).
+pub func joined_bodies(a: const CadModel*, b: const CadModel*) -> interop.Reference[CadModel]!:
+    var w = try shape_of(a)
+    defer w.close()
+    var other = try shape_of(b)
+    defer other.close()
+    try append_shape(&w, &other)
+    try w.index_sides()
+    let joined = try brep_of(&w)
+    defer joined.release()
+    return try CadModel.of_brep(joined)
+
+## `model` with the faces named `face` replaced by `replacement`'s faces:
+## stitched to the body where their edges meet within `gap` (0: ten of the
+## body's tolerances), else beside it in the body.
+pub func replaced_face(model: const CadModel*, face: str, replacement: const CadModel*, gap: f64 = 0.0) -> interop.Reference[CadModel]!:
+    var whole = Growing[i64]()
+    defer whole.close()
+    for f in 0..<replacement.face_count(): try whole.push(f)
+    let held = try replacement.subset(whole.view())
+    defer held.release()
+    let rest = try without_face(model, face) else return held.clone()
+    defer rest.release()
+    let b = model.brep() else error(invalid, "Untrim needs a B-rep body")
+    let within = math.min(1.0, gap if gap > 0.0 else b.base_tolerance() * 10.0)
+    let pair: interop.Reference[CadModel][2] = [rest, held]
+    let stitched = stitch_models(pair[..<2], within) catch failure:
+        return try joined_bodies(rest.value(), replacement)
+    return stitched.model
+
+## A body of one B-spline face over its whole domain (Trim Convert's
+## result), named `name`, facing along its normal with `sense`.
+pub func spline_face(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], sense: bool, name: str, tolerance: f64) -> interop.Reference[CadModel]!:
+    var s = try Surface(surface_spline, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, points, weights, ku, kv, nu, nv, du, dv)
+    defer s.close()
+    let output = try BrepModel.held(math.max(tolerance, least_tolerance))
+    defer output.release()
+    let b = output.value()
+    try untrim_spline(b, &s, sense, tolerance)
+    for k in 0..<b.face_count(): try b.set_face_name(k, name)
+    return try CadModel.of_brep(output)
+
+## `model` with the faces named `face` on surface `s` instead, their edges
+## kept (Shrink: the same shape on a smaller net).
+pub func with_face_surface(model: const CadModel*, face: str, s: const Surface*) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model)
+    defer w.close()
+    let index = (i64)w.surfaces.count
+    try w.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
+    var any = false
+    for f in 0..<w.faces.count:
+        if w.face_name(f) != face: continue
+        w.faces.items[f].surface = index
+        any = true
+    if not any: error(invalid, "the face is not in the body: pick it again")
+    let b = try brep_of(&w)
+    defer b.release()
+    let made = try CadModel.of_brep(b)
+    defer made.release()
+    # The old surface, now unused, left out.
+    var all = Growing[i64]()
+    defer all.close()
+    for f in 0..<made.value().face_count(): try all.push(f)
+    return try made.value().subset(all.view())

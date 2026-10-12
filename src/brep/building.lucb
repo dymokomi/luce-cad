@@ -4,12 +4,18 @@ extend BrepModel:
     pub func add_vertex(point: Vector3) -> i64!:
         if not point.is_finite(): error(invalid, "invalid B-rep vertex")
         try self.vertices.push(point)
+        try self.vertex_precision.push(0.0)
         self.changed()
         return self.vertex_count() - 1
 
     func check_edge(start: i64, end: i64) -> !:
         if start < 0 or end < 0 or start >= self.vertex_count() or end >= self.vertex_count():
             error(invalid, "invalid B-rep edge endpoints")
+
+    ## How far an edge between vertices `start` and `end` may end from them:
+    ## the tolerance, or a tolerant vertex's precision (a stitch's).
+    func slack(start: i64, end: i64) -> f64:
+        return math.max(self.tolerance, math.max(self.vertex_precision.get((usize)start), self.vertex_precision.get((usize)end)))
 
     ## Append one curve's columns.
     func push_curve(kind: u8, start: i64, end: i64, frame: const f64[], points: const Vector3[], weights: const f64[], knots: const f64[], degree: i64, sense: bool) -> !:
@@ -25,6 +31,7 @@ extend BrepModel:
         try self.curve_weight_offsets.push((i32)self.curve_weights.count)
         try self.curve_knots.append(knots)
         try self.curve_knot_offsets.push((i32)self.curve_knots.count)
+        try self.edge_precision.push(0.0)
         self.changed()
 
     pub func add_line(start: i64, end: i64) -> i64!:
@@ -45,7 +52,8 @@ extend BrepModel:
             error(invalid, "invalid B-rep circle")
         let a = self.vertices.get((usize)start).subtract(origin)
         let b = self.vertices.get((usize)end).subtract(origin)
-        if math.abs(a.dot(z)) > self.tolerance or math.abs(b.dot(z)) > self.tolerance or math.abs(a.length() - radius) > self.tolerance or math.abs(b.length() - radius) > self.tolerance:
+        let slack = self.slack(start, end)
+        if math.abs(a.dot(z)) > slack or math.abs(b.dot(z)) > slack or math.abs(a.length() - radius) > slack or math.abs(b.length() - radius) > slack:
             error(invalid, "circle endpoints are not on the curve")
         let angle = math.atan2(a.dot(y), a.dot(x))
         let sweep = swept(math.atan2(b.dot(y), b.dot(x)) - angle, sense)
@@ -66,7 +74,8 @@ extend BrepModel:
         let b = self.vertices.get((usize)end).subtract(origin)
         let angle = math.atan2(a.dot(y) / minor, a.dot(x) / major)
         let end_angle = math.atan2(b.dot(y) / minor, b.dot(x) / major)
-        if a.subtract(x.multiply_scalar(major * math.cos(angle)).add(y.multiply_scalar(minor * math.sin(angle)))).length() > self.tolerance or b.subtract(x.multiply_scalar(major * math.cos(end_angle)).add(y.multiply_scalar(minor * math.sin(end_angle)))).length() > self.tolerance:
+        let slack = self.slack(start, end)
+        if a.subtract(x.multiply_scalar(major * math.cos(angle)).add(y.multiply_scalar(minor * math.sin(angle)))).length() > slack or b.subtract(x.multiply_scalar(major * math.cos(end_angle)).add(y.multiply_scalar(minor * math.sin(end_angle)))).length() > slack:
             error(invalid, "ellipse endpoints are not on the curve")
         let sweep = swept(end_angle - angle, sense)
         var empty: f64[1]
@@ -81,13 +90,14 @@ extend BrepModel:
         let low = knots[(usize)degree]
         let high = knots[points.length]
         # Inversion may land a hair outside the knots: the ends are in them.
-        let a = math.clamp(try curve_parameter(points, weights, degree, knots, self.vertices.get((usize)start), low if sense else high, self.tolerance), low, high)
-        let b = math.clamp(try curve_parameter(points, weights, degree, knots, self.vertices.get((usize)end), high if sense else low, self.tolerance), low, high)
+        let slack = self.slack(start, end)
+        let a = math.clamp(try curve_parameter(points, weights, degree, knots, self.vertices.get((usize)start), low if sense else high, slack), low, high)
+        let b = math.clamp(try curve_parameter(points, weights, degree, knots, self.vertices.get((usize)end), high if sense else low, slack), low, high)
         var sweep = b - a
         if (sense and sweep <= 0.0) or (not sense and sweep >= 0.0):
             let first = try NurbsCurve.at(points, weights, degree, knots, low)
             let last = try NurbsCurve.at(points, weights, degree, knots, high)
-            if first.subtract(last).length() > self.tolerance:
+            if first.subtract(last).length() > slack:
                 error(invalid, "B-spline trim orientation contradicts the edge sense")
             sweep += (high - low) * (1.0 if sense else -1.0)
         let frame = curve_frame(Vector3(), Vector3(), Vector3(), 0.0, a, sweep)

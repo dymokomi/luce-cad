@@ -1,0 +1,248 @@
+## Stitch and Unstitch (surfacing Stage 3: Alias's Shell Stitch and
+## Unstitch, Parasolid's sewing; §6.5 of luced-3d's
+## docs/research/SURFACING-ALIAS-PLASTICITY.md).
+##
+## Stitch joins bodies (open surface bodies above all) into one where their
+## boundary edges meet within a gap: vertices closer than the gap merge,
+## an edge passing a merged vertex within the gap is cut there, and two
+## edges between the same vertices whose middles lie within the gap become
+## one edge the two faces share (the booleans' vertex and edge steps,
+## boolean.lucb steps 1 and 3, at the gap). Faces are turned so neighbors
+## agree, and a body whose every edge is shared becomes a closed solid.
+##
+## The joined edges keep the first face's curve; the other face lies off it
+## by up to the gap. Each edge so made keeps that distance as its precision
+## and each merged vertex its own (Parasolid's tolerant edges and
+## vertices: BrepModel.edge_precision), so the model's tolerance is not
+## widened for all of it; meshing reads the largest.
+##
+## Unstitch is the other way: every face of a body its own open body, its
+## edges its own.
+
+## What a stitch did: the body, how many edges it joined, the widest gap
+## it closed, and whether the result is closed.
+pub struct Stitched:
+    pub var model: interop.Reference[CadModel]
+    pub var joined: i64
+    pub var widest: f64
+    pub var closed: bool
+
+## `models` stitched within `gap` (see the file's header).
+pub func stitch_models(models: const interop.Reference[CadModel][], gap: f64) -> Stitched!:
+    if not (gap > 0.0) or not math.is_finite(gap) or gap > 1.0: error(invalid, "Stitch's gap is between 0 and 1 model units, as Alias's")
+    if models.length == 0: error(invalid, "Stitch: pick the surfaces to join")
+    var w = try shape_of(models[0].value())
+    for at in 1..<models.length:
+        var other = shape_of(models[at].value()) catch failure:
+            w.close()
+            error(failure.code, failure.message)
+        defer other.close()
+        append_shape(&w, &other) catch failure:
+            w.close()
+            error(failure.code, failure.message)
+    let faces = w.faces.count
+    var work = Work(w, faces, 1.0, gap * 0.1, Growing[Vector3](), Growing[i64](), Growing[Cut](), Growing[Section](), Growing[Imprint](),
+                    Growing[Coincident](), Growing[ShapeEdge](), Growing[i64](), Growing[usize](), Growing[i64](), Growing[bool]())
+    defer work.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for p in work.w.points.view():
+        low = lower(low, p)
+        high = upper(high, p)
+    work.size = math.max(1e-6, high.subtract(low).length())
+    # Edges used once (each face's boundary), before: what may join.
+    var before = try stitch_open_edges(&work.w)
+    # Vertices within the gap merge (Work.vertex merges within ten
+    # tolerances: the gap).
+    for p in work.w.points.view(): try work.point_vertex.push(try work.vertex(p))
+    try vertex_cuts(&work)
+    try cut_edges(&work)
+    # Each face's loops in final edges: each use replaced by its pieces.
+    var pieces = try new_pieces()
+    defer pieces.close()
+    var piece_face = Growing[usize]()
+    defer piece_face.close()
+    var piece_name = Growing[i64]()
+    defer piece_name.close()
+    for f in 0..<faces:
+        var at: usize = 0
+        let uses = work.w.face_uses(f)
+        for size in work.w.face_sizes(f):
+            for use in uses[at..<at + (usize)size]:
+                let e = edge_index(use)
+                let first = work.piece_starts.items[e]
+                let last = work.piece_starts.items[e + 1]
+                for k in 0..<last - first:
+                    let id = work.piece_ids.items[first + k if use > 0 else last - 1 - k]
+                    try pieces.uses.push(id if use > 0 else -id)
+            at += (usize)size
+            try pieces.cycle_starts.push(pieces.uses.count)
+            try pieces.pieces.push(pieces.cycle_starts.count - 2)
+        try pieces.piece_starts.push(pieces.pieces.count)
+        try piece_face.push(f)
+        try piece_name.push(work.w.faces.items[f].name)
+    # How far apart the edges each final edge joins lie (sampled); joined
+    # edges farther apart than the gap (their middles matched, their
+    # bulges did not) refuse.
+    var gaps = Growing[f64]()
+    defer gaps.close()
+    try gaps.fill(work.finals.count, 0.0)
+    for e in 0..<work.w.edges.count:
+        let original = work.w.edges.items[e]
+        for k in work.piece_starts.items[e]..<work.piece_starts.items[e + 1]:
+            let id = edge_index(work.piece_ids.items[k])
+            let final = work.finals.items[id]
+            for step in 0..<9:
+                let p = try work.w.at(final.carrier, final.t0 + (final.t1 - final.t0) * (f64)step / 8.0)
+                let t = try nearest_on(&work.w, original.carrier, p, original.t0, original.t1)
+                gaps.items[id] = math.max(gaps.items[id], (try work.w.at(original.carrier, t)).subtract(p).length())
+    for g in gaps.view():
+        if g > gap * 1.5: error(invalid, "Stitch: two edges joined at their ends lie farther apart than the gap between them")
+    var turn = Growing[bool]()
+    defer turn.close()
+    try orient_shell(&work, &pieces, &turn)
+    var keep = Growing[bool]()
+    defer keep.close()
+    try keep.fill(faces, true)
+    let after = try stitch_open_pieces(&work, &pieces)
+    if after >= before: error(invalid, "Stitch: no boundary edges lie within the gap of each other (widen Gap to close larger gaps)")
+    # The models' own tolerance stays the body's; joins widen only theirs.
+    var base = 0.0
+    for model in models:
+        let b = model.value().brep() else error(invalid, "Stitch needs B-rep bodies")
+        base = math.max(base, b.base_tolerance())
+    let made = try write_pieces(&work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view(), false, 0.0, base, gaps.view())
+    errdefer made.release()
+    let widest = try tolerant_joins(made.value(), gap, base)
+    return Stitched(made, (i64)(before - after) // 2, widest, after == 0)
+
+## How many edges of `w` one face uses once and no other face uses.
+func stitch_open_edges(w: const Shape*) -> usize!:
+    var counts = Growing[i64]()
+    defer counts.close()
+    try counts.fill(w.edges.count, 0)
+    for f in 0..<w.faces.count:
+        for use in w.face_uses(f): counts.items[edge_index(use)] += 1
+    var open: usize = 0
+    for c in counts.view():
+        if c == 1: open += 1
+    return open
+
+## How many final edges the stitched faces use once.
+func stitch_open_pieces(work: const Work*, pieces: const Pieces*) -> usize!:
+    var counts = Growing[i64]()
+    defer counts.close()
+    try counts.fill(work.finals.count, 0)
+    for use in pieces.uses.view(): counts.items[edge_index(use)] += 1
+    var open: usize = 0
+    for at in 0..<counts.count:
+        if counts.items[at] == 1: open += 1
+        if counts.items[at] > 2: error(invalid, "Stitch: more than two faces would meet at an edge; stitch them in smaller sets")
+    return open
+
+## Which faces to turn so every shared edge is used once each way: from
+## each face not yet reached, its neighbors across shared edges, turned
+## when they use the edge the same way. A shell that cannot agree (a
+## Moebius band) refuses.
+func orient_shell(work: const Work*, pieces: const Pieces*, turn: Growing[bool]*) -> !:
+    let count = pieces.piece_count()
+    try turn.fill(count, false)
+    var reached = Growing[bool]()
+    defer reached.close()
+    try reached.fill(count, false)
+    # Each final edge's users: piece and way.
+    var users = Growing[i64]()
+    defer users.close()
+    try users.fill(work.finals.count * 2, 0)
+    for p in 0..<count:
+        for c in pieces.piece_cycles(p):
+            for use in pieces.cycle(c):
+                let e = edge_index(use)
+                let signed = ((i64)p + 1) * (1 if use > 0 else -1)
+                if users.items[e * 2] == 0: users.items[e * 2] = signed
+                elif users.items[e * 2 + 1] == 0 and edge_index(users.items[e * 2]) != p: users.items[e * 2 + 1] = signed
+    var queue = Growing[usize]()
+    defer queue.close()
+    for start in 0..<count:
+        if reached.items[start]: continue
+        reached.items[start] = true
+        queue.clear()
+        try queue.push(start)
+        var head: usize = 0
+        while head < queue.count:
+            let p = queue.items[head]
+            head += 1
+            for c in pieces.piece_cycles(p):
+                for use in pieces.cycle(c):
+                    let e = edge_index(use)
+                    let a = users.items[e * 2]
+                    let b = users.items[e * 2 + 1]
+                    if a == 0 or b == 0: continue
+                    let mine = a if edge_index(a) == p else b
+                    let theirs = b if edge_index(a) == p else a
+                    let q = edge_index(theirs)
+                    # Same way (after this face's own turn): turn the other.
+                    let same = ((mine > 0) != turn.items[p]) == (theirs > 0)
+                    if reached.items[q]:
+                        if same != turn.items[q]: error(invalid, "Stitch: the faces cannot all face one way (a one-sided shell)")
+                        continue
+                    turn.items[q] = same
+                    reached.items[q] = true
+                    try queue.push(q)
+    # Faces turned run their loops backwards in write_pieces; their normal
+    # turns with them, so the body faces one way.
+
+## Precision for `model`'s edges and vertices after a stitch within `gap`:
+## each edge shared by two faces keeps the most of the gap it closed (set
+## as it was written) and how far its faces' surfaces lie from it
+## (sampled), each vertex the most of its edges'; only when more than
+## `base`. Refused when an edge's faces lie farther than the gap. The
+## widest found.
+func tolerant_joins(model: const CadModel*, gap: f64, base: f64) -> f64!:
+    let b = model.brep() else error(invalid, "Stitch made no B-rep")
+    var w = try shape_of(model)
+    defer w.close()
+    let brep = (BrepModel*)b
+    var widest = 0.0
+    var vertex_most = Growing[f64]()
+    defer vertex_most.close()
+    try vertex_most.fill(w.points.count, 0.0)
+    for e in 0..<w.edges.count:
+        let f1 = w.sides.items[e * 2]
+        let f2 = w.sides.items[e * 2 + 1]
+        if f1 < 0 or f2 < 0: continue
+        var most = try b.edge_precision_of((i64)e)
+        if most <= base: most = 0.0
+        for k in 0..<17:
+            let p = try w.edge_at(e, (f64)k / 16.0)
+            most = math.max(most, try gap_off_surface(&w.surfaces.items[(usize)w.faces.items[(usize)f1].surface], p))
+            most = math.max(most, try gap_off_surface(&w.surfaces.items[(usize)w.faces.items[(usize)f2].surface], p))
+        if most > gap * 1.5: error(invalid, "Stitch: a joined edge lies farther from its faces than the gap")
+        widest = math.max(widest, most)
+        if most > base:
+            try brep.set_edge_precision((i64)e, most)
+            let edge = w.edges.items[e]
+            vertex_most.items[(usize)edge.start] = math.max(vertex_most.items[(usize)edge.start], most)
+            vertex_most.items[(usize)edge.end] = math.max(vertex_most.items[(usize)edge.end], most)
+    for v in 0..<vertex_most.count:
+        let now = try b.vertex_precision_of((i64)v)
+        if vertex_most.items[v] > now: try brep.set_vertex_precision((i64)v, vertex_most.items[v])
+    return widest
+
+## How far `p` lies from surface `s`.
+func gap_off_surface(s: const Surface*, p: Vector3) -> f64!:
+    if s.kind != surface_spline: return surface_distance(s, p)
+    let uv = try nearest_parameters(*s, p, Vector3(0.5, 0.5, 0.0), true)
+    return (try evaluate(*s, uv)).subtract(p).length()
+
+## Every face of `model` an open body of its own, its edges its own
+## (Unstitch).
+pub func unstitch_model(model: const CadModel*, out: Growing[interop.Reference[CadModel]]*) -> !:
+    let count = model.face_count()
+    if count == 0: error(invalid, "Unstitch: the body has no faces")
+    for f in 0..<count:
+        let one: i64[1] = [f]
+        let piece = try model.subset(one[..<1])
+        out.push(piece) catch failure:
+            piece.release()
+            error(failure.code, failure.message)

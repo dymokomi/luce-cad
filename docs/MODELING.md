@@ -1257,7 +1257,7 @@ Tests (`tests/regressions/nurbs_toolkit_tests.luc`), against closed forms:
   it the normal differs from the hull's; a net sent as text reads back the same surface.
 
 Not yet: knot vectors made compatible across a set of curves, reparameterization by chord
-length, extension (Stage 5), and Untrim (Stage 3).
+length, extension (Stage 5). Untrim is Stage 3's (Projection, trims and stitching, below).
 
 ## Curves (`curves/`, `cad_curves.lucb`)
 
@@ -1336,6 +1336,106 @@ way a line; a curve on the side lies on it within its tolerance; Attach Blend at
 halfway, G1; Close with Preserve Shape keeps the curve's points and closes G2, without it meets
 halfway G1; Stretch lands both handles exactly and moves the middle halfway; curves as objects
 replace in place, hide, pick, move through the CV cloud, place with the set, and save and load.
+
+## Projection, trims and stitching (`surfacing/`, `modeling/trim`, `stitch`, `untrim`, `face_meets`)
+
+Stage 3 of the surfacing plan (luced-3d `docs/research/SURFACING-ALIAS-PLASTICITY.md` §4.3,
+§6.3–§6.5): Alias's Project, Intersect, Trim, Untrim, Trim Convert and Shell Stitch, Rhino's
+ShrinkTrimmedSrf, and Parasolid's tolerant edges. `CadSurfacing` works on a geometry set, its bodies
+by index and faces by name; curves on faces are the set's `CadCurves`.
+
+| `CadSurfacing.` | What it does |
+|---|---|
+| `projected(set, body, face, curves, direction, normal, both, original, tolerance, stem)` | Project: the curves named (apart by `;`) cast onto the face along `direction` (both ways, or only ahead) or along its normals (Pull), each piece a curve on the face; `original` keeps each curve's degree and spans (Alias's Match original). A `CadSurfaceEdit`: the set, how many pieces, the worst fit. |
+| `intersected(set, body, face, other, other_face, both)`, `intersected_plane(set, body, face, origin, normal)` | Intersect: where two faces meet (or a face and a plane), as curves on the first face, with `both` on the second too. |
+| `trim_regions(set, body, face, curves)` | The face cut by its curves: a marker inside each region (Alias's region markers), the crossings, and the loose ends that cut nothing (Show Intersections). |
+| `trimmed(set, body, face, picks, mode, curves, tag)` | Trim: the regions holding `picks` kept (0) or discarded (1), or every region its own face (2, Divide, named `<tag>/divide<k>[<face>]`); the face before it pushed as a trim stage. |
+| `untrimmed(set, body, face, all)`, `stages(set, face)` | Untrim Last (or All): the face's latest (first) stage back in place of its pieces, stitched to its neighbors; with no stage, its natural surface. |
+| `trim_converted(set, body, face, du, dv, su, sv, swap, keep)` | Trim Convert: a four-sided face an untrimmed B-spline face of those degrees and spans, its surface and edge deviations reported; `keep` keeps the original as a body of its own. |
+| `shrunk(set, body, face)` | Shrink: a B-spline face's net cut down to its loops' box. |
+| `stitched(set, bodies, gap)`, `unstitched(set, body)` | Shell Stitch within a gap (how many edges it joined, the widest gap, whether it closed into a solid), and Unstitch (every face an open body). |
+| `edge_precision(model, edge)`, `vertex_precision(model, vertex)`, `is_closed(model)` | A tolerant edge's or vertex's precision; whether every edge is shared. |
+
+**Project** (`surfacing/project.lucb`). Along a vector d each point C(t) goes where the line
+C(t) + λd meets the surface: S(u, v) = C(t) + λd by Newton on (u, v, λ), seeded by the last point's
+answer along the curve, else by a 9 by 9 lattice over the face's chart, the nearest hit along the line
+winning (both ways, or ahead only). Where the line runs along the surface (d along a cylinder's
+rulings: the system is singular) the point's foot on the surface is the hit when the line passes
+through it, so a circle on a cylinder cast along its axis lands on itself. Along the normal each point
+goes to its nearest point of the surface. A point whose answer lies outside the face (its loops wind
+round it nowhere in the chart) misses; runs of hits are the pieces, their ends found by halving the
+step 48 times and then put on the boundary edge they reached exactly. Each piece's chart curve is
+fitted at degree 5, its spans doubled until the surface along it lies within the tolerance (a
+ten-millionth of the body by default) of the cast points, its far end found by continuation (a closed
+curve's chart runs on past a whole turn); the 3D curve is fitted along it (`curves.face_curve`).
+
+**Intersect** (`modeling/face_meets.lucb`) is the booleans' step 2 between two faces (their surfaces'
+meeting curves in closed form, or traced, each clipped to both faces); each curve is then cast onto the
+face along its normals, which gives its chart curve.
+
+**Trim** (`modeling/trim.lucb`) is the booleans' steps 1 to 4 with the curves in place of a second
+solid: each curve's crossings with the face's boundary (and with the other curves) cut it and the
+boundary edges, which the faces round it share; the stretches inside the face are new edges across it
+alone, and the face is split along them (`split.lucb`). A stretch with a loose end (a curve stopping
+inside the face, Alias's dangling curve) cuts nothing: it is left out, and its end reported. A region
+is told by a point: the region whose loops wind about it in the chart. What is kept is written as a
+body that may be open (`write_pieces` without `closed`): a solid trimmed loses its closure, as a shell
+trimmed in Alias does. The curves cutting the face are the set's curves on it, their 3D curves checked
+to lie on its surface (one left on a face whose surface changed since is refused: project it again).
+
+**Trim stages** (`cad_trims.lucb`): a set component holding, per trim, the face's name and the face
+as it was (a one-face body placed with the set; saved as element `cad_trims`). Untrim puts the latest
+(or with All, the first) back: the faces of that name and Divide's pieces of it go, the stage's face
+comes in, stitched to the body where their edges meet within ten tolerances. With no stage a face
+untrims to its natural surface (`modeling/untrim.lucb`): a B-spline's whole domain (its boundary rows
+as edges, a row closing on its opposite one seam edge, a pole left out), a plane's rectangle round its
+loops, a cylinder's or cone's whole turn between the heights it spans, a sphere or torus whole.
+
+**Trim Convert** (`surfacing/convert.lucb`): the face's four sides are found at its loop's four
+sharpest turns (a loop of four edges: its vertices) and followed in its chart by arc length; a Coons
+map of the four chart curves carries the unit square onto the region, and the surface sampled through
+it is fitted by least squares (rows, then columns; corners and sides held) on the degrees and spans
+asked. Its deviation inside (on a grid) and along its sides is reported; the new face replaces the old
+one, stitched to its neighbors within the edge deviation. **Shrink** cuts a B-spline's net down to the
+box its loops span in the chart, and a fiftieth more each way (the loops' samples miss a curve's bulge
+between them), by knot insertion (`nurbs.extract` along each direction); the edges stay.
+
+**Stitch** (`modeling/stitch.lucb`): the bodies' shapes in one; vertices within the gap merge
+(`Work.vertex` at a tenth of it), an edge passing a merged vertex within the gap is cut there, and two
+edges between the same vertices whose middles lie within ten gaps become one (`cut_edges`); each joined
+edge is then sampled against the edges it joined, refused when they lie farther apart than the gap. Faces
+are turned so every shared edge is used once each way (a breadth-first walk; a one-sided shell refuses),
+and a body whose every edge is shared is a closed solid. The joined edges keep the first face's curve;
+their **precision** is the widest the joined edges lay apart, or the faces' surfaces off the edge
+(sampled), and each merged vertex's the most of its edges'; the model's own tolerance stays as it was.
+Unstitch makes every face its own open body.
+
+Tests (`tests/regressions/surfacing_tests.luc`), against closed forms:
+
+- a circle of radius 2 in the plane z = 10 cast along −Z onto a cylinder of radius 3 about Y lies on
+  x² + y² = 4 and z = √(9 − x²) to 1e-5; a circle of the cylinder's radius cast along its axis lands on
+  itself to 1e-6; pulled along the normals each point keeps its height and lies on the ray to it; a
+  curve missing the face is refused;
+- the cylinder meets the plane y = 2 in its circle; a box's wall x = 1 meets it in four lines (two on
+  each face) at z = ±√8;
+- Trim on a 4-box's top cut by a projected unit circle: two region markers; Keep leaves area π (the box
+  opened), Discard 16 − π, Divide both faces with the sum 16 and the box still closed; the stage saves
+  and loads with the set; a curve stopping inside the face reports one loose end and no regions;
+- Divide, Unstitch and Stitch of the two pieces join one edge and leave one face's area round four open
+  edges; Untrim of the kept disc gives back the closed box of volume 64; after two trims Untrim takes
+  the last back (one hole) and Untrim All both; a stageless B-spline face untrims to its whole square;
+- a box unstitched into six open bodies stitches back into the closed cube of volume 8; with its top
+  raised 0.01, a gap of 0.02 stitches all twelve edges with precision 0.01 (kept when saved and
+  loaded) and Check passes G0 across them within 0.02; at 0.005 the sides join (8 edges) and the top
+  stays apart, and the top and one side alone refuse; a filleted box unstitched and stitched again
+  measures G1 across every fillet edge;
+- Trim Convert of a G1 fillet at 4 quintic spans lies within 1e-4 of it, its face a B-spline and the
+  body closed with the same volume; Shrink of a disc trimmed on a converted top keeps area π, the
+  net's corner moved in to the disc's box.
+
+Not yet: Alias's 3D Trimming (curves off the face projected as the trim runs), Trim's curves
+extended to the boundary, trims with Keep Originals on bodies, Stitch's detach of periodic surfaces
+and single-curve boundaries for export, Untrim of a cone's band reaching its apex.
 
 ## Sketches (`sketch/`)
 

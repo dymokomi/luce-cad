@@ -1,0 +1,329 @@
+## Trim Convert and Shrink (surfacing Stage 3; §6.4 of luced-3d's
+## docs/research/SURFACING-ALIAS-PLASTICITY.md).
+##
+## Trim Convert (Alias's): a trimmed face bounded by four sides becomes an
+## untrimmed B-spline face. Its sides are found at the four sharpest turns
+## of its loop (a loop of four edges: its vertices), each followed in the
+## face's chart by arc length. A Coons map of the four chart curves
+## (bilinearly blended) carries the unit square onto the region; the
+## surface is sampled through it and fitted by least squares on the degree
+## and spans asked (rows, then columns), its corners and sides held to the
+## sides. How far the result lies from the face inside (Show Surface
+## Deviation) and along its sides (Show Edge Deviation) is reported.
+##
+## Shrink (Rhino's ShrinkTrimmedSrf): a B-spline face's surface cut down to
+## the box its loops span in its chart (and a fiftieth more each way), by
+## knot insertion; the shape and the edges stay as they were.
+
+## A Trim Convert's result: the new face as a body, and its deviations.
+pub struct Converted:
+    pub var model: interop.Reference[CadModel]
+    pub var surface_deviation: f64
+    pub var edge_deviation: f64
+
+## A side of the region: its chart points and 3D points from one corner to
+## the next, and their arc-length fractions.
+struct Side:
+    var uv: Growing[Vector3]
+    var xyz: Growing[Vector3]
+    var at: Growing[f64]
+
+    func close():
+        self.uv.close()
+        self.xyz.close()
+        self.at.close()
+
+    ## The chart point at fraction `f` of its length.
+    func chart(f: f64) -> Vector3:
+        let n = self.at.count
+        if f <= 0.0: return self.uv.items[0]
+        if f >= 1.0: return self.uv.items[n - 1]
+        var lo: usize = 0
+        var hi: usize = n - 1
+        while hi - lo > 1:
+            let mid = (lo + hi) // 2
+            if self.at.items[mid] <= f: lo = mid
+            else: hi = mid
+        let span = self.at.items[hi] - self.at.items[lo]
+        let w = (f - self.at.items[lo]) / span if span > 0.0 else 0.0
+        return self.uv.items[lo].add(self.uv.items[hi].subtract(self.uv.items[lo]).multiply_scalar(w))
+
+    func point(f: f64) -> Vector3:
+        let n = self.at.count
+        if f <= 0.0: return self.xyz.items[0]
+        if f >= 1.0: return self.xyz.items[n - 1]
+        var lo: usize = 0
+        var hi: usize = n - 1
+        while hi - lo > 1:
+            let mid = (lo + hi) // 2
+            if self.at.items[mid] <= f: lo = mid
+            else: hi = mid
+        let span = self.at.items[hi] - self.at.items[lo]
+        let w = (f - self.at.items[lo]) / span if span > 0.0 else 0.0
+        return self.xyz.items[lo].add(self.xyz.items[hi].subtract(self.xyz.items[lo]).multiply_scalar(w))
+
+func empty_side() -> Side:
+    return Side(Growing[Vector3](), Growing[Vector3](), Growing[f64]())
+
+## Samples along each edge of a loop.
+let side_samples: usize = 256
+
+## The chart point of `p` on `s`, continuing from `previous`.
+func chart_of(s: const Surface*, p: Vector3, previous: Vector3?) -> Vector3!:
+    if s.kind == surface_spline:
+        let seed = previous else return try nearest_parameters(*s, p, Vector3(0.5, 0.5, 0.0), true)
+        return try nearest_parameters(*s, p, seed, false)
+    let seed = previous else return chart_uv(*s, p, Vector3(), false)
+    return chart_uv(*s, p, seed, true)
+
+## Face `f`'s four sides (see the file's header), into `sides`.
+func four_sides(w: const Shape*, f: usize, sides: Growing[Side]*) -> !:
+    if w.face_sizes(f).length != 1: error(invalid, "Trim Convert takes a region without holes")
+    let uses = w.face_uses(f)
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    # The loop's points, and where each edge starts in them.
+    var points = Growing[Vector3]()
+    defer points.close()
+    var firsts = Growing[usize]()
+    defer firsts.close()
+    for use in uses:
+        try firsts.push(points.count)
+        for k in 0..<side_samples:
+            let fraction = (f64)k / (f64)side_samples
+            try points.push(try w.edge_at(edge_index(use), fraction if use > 0 else 1.0 - fraction))
+    let n = points.count
+    # The turn at each edge's start: the angle between the way in and out.
+    var turns = Growing[f64]()
+    defer turns.close()
+    for e in 0..<firsts.count:
+        let at = firsts.items[e]
+        let before = points.items[(at + n - 1) % n]
+        let here = points.items[at]
+        let after = points.items[(at + 1) % n]
+        let a = here.subtract(before).normalized() catch failure: recover Vector3()
+        let b = after.subtract(here).normalized() catch failure: recover Vector3()
+        try turns.push(math.acos(math.clamp(a.dot(b), -1.0, 1.0)))
+    # The four sharpest turns, in loop order.
+    var corners = Growing[usize]()
+    defer corners.close()
+    if firsts.count == 4:
+        for e in 0..<4: try corners.push(firsts.items[e])
+    else:
+        var taken = Growing[bool]()
+        defer taken.close()
+        try taken.fill(firsts.count, false)
+        for _ in 0..<4:
+            var best: i64 = -1
+            for e in 0..<firsts.count:
+                if taken.items[e]: continue
+                if best < 0 or turns.items[e] > turns.items[(usize)best]: best = (i64)e
+            if best < 0 or turns.items[(usize)best] < 0.17: error(invalid, "Trim Convert needs a four-sided region: this one has fewer than four corners")
+            taken.items[(usize)best] = true
+        for e in 0..<firsts.count:
+            if taken.items[e]: try corners.push(firsts.items[e])
+    # Each side from its corner to the next, in the chart by arc length.
+    var previous: Vector3? = none
+    for c in 0..<4:
+        var side = empty_side()
+        errdefer side.close()
+        let start = corners.items[c]
+        let finish = corners.items[(c + 1) % 4]
+        let count = (finish + n - start) % n
+        var length = 0.0
+        for k in 0..<count + 1:
+            let p = points.items[(start + k) % n]
+            let uv = try chart_of(s, p, previous)
+            previous = uv
+            if k > 0: length += p.subtract(side.xyz.items[side.xyz.count - 1]).length()
+            try side.xyz.push(p)
+            try side.uv.push(uv)
+            try side.at.push(length)
+        if not (length > 0.0): error(invalid, "Trim Convert: a side of the region has no length")
+        for k in 0..<side.at.count: side.at.items[k] /= length
+        try sides.push(side)
+
+## The Coons map of the four sides at (s, t): bottom s, right t, top s
+## (back), left t (back).
+func coons(sides: const Side[], s: f64, t: f64) -> Vector3:
+    let bottom = sides[0].chart(s)
+    let right = sides[1].chart(t)
+    let top = sides[2].chart(1.0 - s)
+    let left = sides[3].chart(1.0 - t)
+    let p00 = sides[0].chart(0.0)
+    let p10 = sides[1].chart(0.0)
+    let p11 = sides[2].chart(0.0)
+    let p01 = sides[3].chart(0.0)
+    let ruled = bottom.multiply_scalar(1.0 - t).add(top.multiply_scalar(t)).add(left.multiply_scalar(1.0 - s)).add(right.multiply_scalar(s))
+    let corners = p00.multiply_scalar((1.0 - s) * (1.0 - t)).add(p10.multiply_scalar(s * (1.0 - t))).add(p01.multiply_scalar((1.0 - s) * t)).add(p11.multiply_scalar(s * t))
+    return ruled.subtract(corners)
+
+## Face `face` of `model` (its first by that name) as an untrimmed B-spline
+## face of degrees `du`, `dv` on `su` by `sv` spans (see the file's header);
+## with `swap` its u and v exchanged.
+pub func trim_convert(model: const CadModel*, face: str, du: i64, dv: i64, su: i64, sv: i64, swap: bool) -> Converted!:
+    if du < 1 or dv < 1 or du > most_degree or dv > most_degree: error(invalid, "Trim Convert's degrees are 1 to 11")
+    if su < 1 or sv < 1 or su > 256 or sv > 256: error(invalid, "Trim Convert's spans are 1 to 256")
+    var w = try shape_of(model)
+    defer w.close()
+    var f: i64 = -1
+    for k in 0..<w.faces.count:
+        if w.face_name(k) == face:
+            f = (i64)k
+            break
+    if f < 0: error(invalid, "the face to convert is not in the body: pick it again")
+    let s = &w.surfaces.items[(usize)w.faces.items[(usize)f].surface]
+    var sides = Growing[Side]()
+    defer:
+        for side in sides.view():
+            var owned = side
+            owned.close()
+        sides.close()
+    try four_sides(&w, (usize)f, &sides)
+    var ku = Growing[f64]()
+    defer ku.close()
+    var kv = Growing[f64]()
+    defer kv.close()
+    try uniform_knots(du, (usize)su, 0.0, 1.0, &ku)
+    try uniform_knots(dv, (usize)sv, 0.0, 1.0, &kv)
+    var pu = Growing[f64]()
+    defer pu.close()
+    var pv = Growing[f64]()
+    defer pv.close()
+    try fit_parameters(ku.view(), du, 8, &pu)
+    try fit_parameters(kv.view(), dv, 8, &pv)
+    var fit_u = try make_fitter(du, ku.view(), pu.view(), 0)
+    defer fit_u.close()
+    var fit_v = try make_fitter(dv, kv.view(), pv.view(), 0)
+    defer fit_v.close()
+    let nu = fit_u.count()
+    let nv = fit_v.count()
+    # Rows: for each v parameter, the u fit of the surface through the map.
+    var rows = Growing[Weighted]()
+    defer rows.close()
+    var values = Growing[Weighted]()
+    defer values.close()
+    var row = Growing[Weighted]()
+    defer row.close()
+    var starts: Weighted[4]
+    var ends: Weighted[4]
+    for t in pv.view():
+        values.clear()
+        for u in pu.view():
+            let q = try surface_point(*s, coons(sides.view(), u, t))
+            try values.push(weighted(q, 1.0))
+        starts[0] = values.items[0]
+        ends[0] = values.items[values.count - 1]
+        try fit_u.fit(values.view(), &starts, &ends, &row)
+        for q in row.view(): try rows.push(q)
+    # Columns: for each u control point, the v fit of the rows' points.
+    var net = Growing[Vector3]()
+    defer net.close()
+    try net.fill(nu * nv, Vector3())
+    var column = Growing[Weighted]()
+    defer column.close()
+    for i in 0..<nu:
+        values.clear()
+        for j in 0..<pv.count: try values.push(rows.items[j * nu + i])
+        starts[0] = values.items[0]
+        ends[0] = values.items[values.count - 1]
+        try fit_v.fit(values.view(), &starts, &ends, &column)
+        for j in 0..<nv: net.items[i * nv + j] = column.items[j].point()
+    var weights = Growing[f64]()
+    defer weights.close()
+    try weights.fill(nu * nv, 1.0)
+    # Swapped: the net transposed.
+    var points = Growing[Vector3]()
+    defer points.close()
+    if swap:
+        for j in 0..<nv:
+            for i in 0..<nu: try points.push(net.items[i * nv + j])
+    else:
+        try points.assign(net.view())
+    var made = try Surface(surface_spline, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, points.view(), weights.view(),
+                           kv.view() if swap else ku.view(), ku.view() if swap else kv.view(), (i64)(nv if swap else nu), (i64)(nu if swap else nv), dv if swap else du, du if swap else dv)
+    defer made.close()
+    # Deviations: inside on a grid, along the sides at their samples.
+    var inner = 0.0
+    let grid = (usize)math.max(16.0, math.max((f64)su, (f64)sv) * 4.0)
+    for a in 1..<grid:
+        for b in 1..<grid:
+            let u = (f64)a / (f64)grid
+            let v = (f64)b / (f64)grid
+            let want = try surface_point(*s, coons(sides.view(), u, v))
+            let got = try evaluate(made, Vector3(v, u, 0.0) if swap else Vector3(u, v, 0.0))
+            inner = math.max(inner, got.subtract(want).length())
+    var edge = 0.0
+    for k in 0..<grid + 1:
+        let x = (f64)k / (f64)grid
+        let fractions: Vector3[4] = [Vector3(x, 0.0, 0.0), Vector3(1.0, x, 0.0), Vector3(1.0 - x, 1.0, 0.0), Vector3(0.0, 1.0 - x, 0.0)]
+        for side in 0..<(usize)4:
+            let at = fractions[side]
+            let got = try evaluate(made, Vector3(at.y, at.x, 0.0) if swap else at)
+            edge = math.max(edge, got.subtract(sides.items[side].point(x)).length())
+    # Facing as the face did: its normal against the face's at the middle.
+    let middle = try surface_jet(&made, Vector3(0.5, 0.5, 0.0), false, false)
+    let was = try w.face_normal((usize)f, try surface_point(*s, coons(sides.view(), 0.5, 0.5)))
+    let sense = middle.su.cross(middle.sv).dot(was) >= 0.0
+    let body = try spline_face(points.view(), weights.view(), made.nu, made.nv, made.du, made.dv, made.ku, made.kv, sense, face, w.tolerance)
+    return Converted(body, math.max(inner, edge), edge)
+
+## Face `face` of `model` on its surface cut down to the box its loops span
+## in the chart (B-spline faces only), its edges kept.
+pub func shrunk_face(model: const CadModel*, face: str) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model)
+    defer w.close()
+    var f: i64 = -1
+    for k in 0..<w.faces.count:
+        if w.face_name(k) == face:
+            f = (i64)k
+            break
+    if f < 0: error(invalid, "the face to shrink is not in the body: pick it again")
+    let s = &w.surfaces.items[(usize)w.faces.items[(usize)f].surface]
+    if s.kind != surface_spline: error(invalid, "Shrink cuts down a B-spline's net: convert the face to a B-spline first")
+    var chart = Growing[Vector3]()
+    defer chart.close()
+    var starts = Growing[usize]()
+    defer starts.close()
+    try face_chart(&w, (usize)f, &chart, &starts)
+    var low = Vector3(1.0, 1.0, 0.0)
+    var high = Vector3(0.0, 0.0, 0.0)
+    for q in chart.view():
+        low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), 0.0)
+        high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), 0.0)
+    # The loops' samples miss a curve's bulge between them: a margin of a
+    # fiftieth of the box keeps every edge on the net.
+    let pad = Vector3((high.x - low.x) * 0.02, (high.y - low.y) * 0.02, 0.0)
+    low = Vector3(math.max(0.0, low.x - pad.x), math.max(0.0, low.y - pad.y), 0.0)
+    high = Vector3(math.min(1.0, high.x + pad.x), math.min(1.0, high.y + pad.y), 0.0)
+    if low.x <= 1e-9 and low.y <= 1e-9 and high.x >= 1.0 - 1e-9 and high.y >= 1.0 - 1e-9: error(invalid, "the face already fills its surface: nothing to shrink")
+    var net = try net_of(s)
+    defer net.close()
+    let u0 = net.u_low() + (net.u_high() - net.u_low()) * low.x
+    let u1 = net.u_low() + (net.u_high() - net.u_low()) * high.x
+    let v0 = net.v_low() + (net.v_high() - net.v_low()) * low.y
+    let v1 = net.v_low() + (net.v_high() - net.v_low()) * high.y
+    var narrowed = try net_piece(&net, 0, u0, u1)
+    defer narrowed.close()
+    var cut = try net_piece(&narrowed, 1, v0, v1)
+    defer cut.close()
+    var smaller = try surface_of(&cut)
+    defer smaller.close()
+    return try with_face_surface(model, face, &smaller)
+
+## `net`'s piece between knot values `a` and `b` along `direction` (0: u).
+func net_piece(net: const Net*, direction: i64, a: f64, b: f64) -> Net!:
+    var lines = Growing[Spline]()
+    defer:
+        for c in lines.view():
+            var owned = c
+            owned.close()
+        lines.close()
+    var pieces = Growing[Spline]()
+    defer:
+        for c in pieces.view():
+            var owned = c
+            owned.close()
+        pieces.close()
+    try curves_along(net, direction, &lines)
+    for c in lines.view(): try pieces.push(try extract(&c, a, b))
+    return try net_from(pieces.view(), direction, net)
