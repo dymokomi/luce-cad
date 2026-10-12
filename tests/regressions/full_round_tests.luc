@@ -1,0 +1,95 @@
+## Full round beyond flat sides along straight edges (full_round.lucb): a
+## curved rib (its top an annular sector, its sides cylinders about the
+## top's normal) by Pappus; the same rib tapered (its sides cones); a rib
+## whose sides bulge (cylinders along it), the round tangent to them where
+## the section's circle is; each at G1 and G2, closed, the top face gone and
+## the rib no higher.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.sketch import CadSketch
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+## The name of the flat face of `model` facing `normal`.
+func facing(model: CadModel, normal: Vector3) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let at = CadModeling.face_point(model, name)
+        if model.face_surface_kind(f) == 0 and at.found and at.normal.dot(normal) > 0.999:
+            return name
+    return ""
+
+## `model`'s top (facing `up`) rounded fully at G1 and G2: closed, no flat
+## face facing up left, no higher than `height`; G1's volume.
+func rounded(model: CadModel, up: Vector3, height: float) -> float!:
+    let top = facing(model, up)
+    assert(top != "")
+    var g1 = 0.0
+    for continuity in [1, 2]:
+        let round = CadModeling.full_round(model, top, "r", continuity = continuity)
+        let mesh = round.tessellate(48)
+        closed(mesh)
+        assert(facing(round, up) == "")
+        assert(math.abs(mesh.bounds().maximum.z - height) < 1e-3)
+        if continuity == 1:
+            g1 = volume(mesh)
+    return g1
+
+pub func full_round_tests() -> unit!:
+    # A quarter of a ring 10 to 14 round, 10 high: the round's radius is 2,
+    # its center 12 out; each section loses 4 x 2 - 2π, its centroid 12
+    # out (the two corners alike about it).
+    let s = CadSketch.parse("")
+    let o = s.add_point(0.0, 0.0)
+    let p = [s.add_point(10.0, 0.0), s.add_point(14.0, 0.0), s.add_point(0.0, 14.0), s.add_point(0.0, 10.0)]
+    _ = s.add_line(p[0], p[1])
+    _ = s.add_arc(o, p[1], p[2])
+    _ = s.add_line(p[2], p[3])
+    _ = s.add_arc(o, p[0], p[3])
+    let outline = s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0))
+    let ring = CadModeling.extruded(outline, 10.0, 0.0, "q")
+    let before = math.pi * 0.25 * (196.0 - 100.0) * 10.0
+    let g1 = rounded(ring, Vector3(0.0, 0.0, 1.0), 10.0)
+    let expected = before - (8.0 - 2.0 * math.pi) * 12.0 * math.pi * 0.5
+    if math.abs(g1 - expected) > 0.1: print(f"curved rib: {g1}, expected {expected}")
+    assert(math.abs(g1 - expected) < 0.1)
+    # Tapered: a section 4 wide at its foot, 2.5 at its top (its sides
+    # leaning in unalike) turned a quarter about Z: its sides cones, its
+    # ends flat through the axis. The round still touches the top.
+    let t = CadSketch.parse("")
+    let r = [t.add_point(10.0, 0.0), t.add_point(14.0, 0.0), t.add_point(13.5, 10.0), t.add_point(11.0, 10.0)]
+    for at in 0..<4:
+        _ = t.add_line(r[at], r[(at + 1) % 4])
+    let tapered = CadModeling.revolved_about(t.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0)), Vector3(), Vector3(0.0, 0.0, 1.0), "t", angle = math.pi * 0.5)
+    _ = rounded(tapered, Vector3(0.0, 0.0, 1.0), 10.0)
+    # Ends that are not flat through the axis (an extrusion's, tapered):
+    # said.
+    var said = ""
+    let drafted = CadModeling.extruded_sides(outline, 10.0, 0.0, "d", taper = 5.0 * math.pi / 180.0)
+    _ = CadModeling.full_round(drafted, facing(drafted, Vector3(0.0, 0.0, 1.0)), "r") catch failure:
+        said = failure.message
+    assert(said.contains("through its axis"), said)
+    # A rib 6 wide at its foot and top, 10 high, its sides arcs bulging out
+    # (circles about (∓5, 5) through its corners, radius √89), 20 long:
+    # the circle tangent to the top and both sides has
+    # √(25 + (5 - r)²) = √89 - r.
+    let b = CadSketch.parse("")
+    let left = b.add_point(5.0, 5.0)
+    let right = b.add_point(-5.0, 5.0)
+    let q = [b.add_point(-3.0, 0.0), b.add_point(3.0, 0.0), b.add_point(3.0, 10.0), b.add_point(-3.0, 10.0)]
+    _ = b.add_line(q[0], q[1])
+    _ = b.add_arc(right, q[1], q[2])
+    _ = b.add_line(q[2], q[3])
+    _ = b.add_arc(left, q[3], q[0])
+    let bulging = CadModeling.extruded(b.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0)), 20.0, 0.0, "b")
+    let root = math.sqrt(89.0)
+    let radius = (50.0 - 89.0) / (10.0 - 2.0 * root)
+    assert(math.abs(math.sqrt(25.0 + (5.0 - radius) * (5.0 - radius)) - (root - radius)) < 1e-9)
+    let top = facing(bulging, Vector3(0.0, 0.0, 1.0))
+    let round = CadModeling.full_round(bulging, top, "r")
+    let mesh = round.tessellate(48)
+    closed(mesh)
+    assert(facing(round, Vector3(0.0, 0.0, 1.0)) == "")
+    assert(math.abs(mesh.bounds().maximum.z - 10.0) < 1e-3)
+    print("PASS full rounds: a curved rib (its round by Pappus), tapered (cones; an extrusion's drafted ends refused), a rib with bulging sides (the circle tangent to the top and both arcs), G1 and G2, closed, the top gone, no higher")

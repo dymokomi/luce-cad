@@ -1,0 +1,190 @@
+## Variable radius fillets beyond one straight edge with square ends
+## (variable_fillet.lucb, radius_law.lucb): G2 and G3 along a box's edge
+## (the section's area times the integral of r² along it); an edge ending at
+## a slanted face, in the open and against a wall; a box's top loop after
+## its uprights were rounded (a tangent chain round a flat face), whole and
+## from a line alone running out round the uprights; a drilled ball's rim
+## (a loop between two curved faces). Each result closed, its volume
+## between the constant fillets of its least and largest radius.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_cad.sketch import CadSketch
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+## The ids of `model`'s edges whose start and middle `keep` takes.
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 0.5)) and not (id in found):
+                found.append(id)
+    return found
+
+## The ids of `model`'s curved edges whose start and middle `keep` takes.
+func curved_edges(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for id in edges_where(model, keep):
+        for face in 0..<model.face_count():
+            for use in 0..<model.face_edge_count(face):
+                if model.face_edge_id(face, use) == id and not model.face_edge_linear(face, use) and not (id in found):
+                    found.append(id)
+    return found
+
+## What `made` took from `model` (meshed alike).
+func taken(model: CadModel, made: CadModel) -> float!:
+    let mesh = made.tessellate(64)
+    closed(mesh)
+    return volume(model.tessellate(64)) - volume(mesh)
+
+pub func variable_chain_tests() -> unit!:
+    straight_continuity()
+    slanted_ends()
+    rounded_top()
+    drilled_rim()
+    refused()
+    print("PASS variable radius chains: G2 and G3 along an edge (area × ∫ r²), an edge ending at a slanted face in the open (as the constant fillet) and against a wall; a rounded box's top loop (G1, G2) and a line of it running out round its uprights; a drilled ball's rim; two chains refused")
+
+## A 20 box's front top edge, radius 1 to 3 straight: G2 and G3 take their
+## section's area at unit radius times 20 × 13/3 (∫ r² ds).
+func straight_continuity() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "box")
+    let front_top = func (a: Vector3, b: Vector3) -> bool:
+        return a.y > 9.99 and b.y > 9.99 and a.z > 9.99 and b.z > 9.99
+    let edge = CadModeling.edge_references(box, edges_where(box, front_top))
+    let areas = [0.17678573604910766, 0.1641116415388808]
+    for at in 0..<2:
+        let continuity = at + 2
+        let made = CadModeling.variable_filleted(box, edge, [0.0, 1.0], [1.0, 3.0], "v", smooth = false, continuity = continuity)
+        let removed = taken(box, made)
+        let expected = areas[at] * 20.0 * 13.0 / 3.0
+        if math.abs(removed - expected) > 0.05: print(f"G{continuity}: taken {removed}, expected {expected}")
+        assert(math.abs(removed - expected) < 0.05)
+        # A constant law is the constant fillet.
+        let held = CadModeling.variable_filleted(box, edge, [0.0, 1.0], [2.0, 2.0], "v", continuity = continuity)
+        let constant = CadModeling.filleted(box, edge, 2.0, "v", continuity)
+        assert(math.abs(taken(box, held) - taken(box, constant)) < 0.02)
+
+## A prism whose top front edge ends at x = 30 on a face slanted 45°
+## (the corner past it empty): reaching past it, as the constant fillet
+## does. A step whose top edge runs into a slanted wall: cut by the wall's
+## plane.
+func slanted_ends() -> unit!:
+    let s = CadSketch.parse("")
+    let p = [s.add_point(0.0, 0.0), s.add_point(40.0, 0.0), s.add_point(30.0, 10.0), s.add_point(0.0, 10.0)]
+    for at in 0..<4:
+        _ = s.add_line(p[at], p[(at + 1) % 4])
+    let prism = CadModeling.extruded(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 20.0, 0.0, "t")
+    let ridge = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.y - 10.0) < 1e-9 and math.abs(b.y - 10.0) < 1e-9 and math.abs(a.z - 20.0) < 1e-9 and math.abs(b.z - 20.0) < 1e-9
+    let edge = CadModeling.edge_references(prism, edges_where(prism, ridge))
+    let held = CadModeling.variable_filleted(prism, edge, [0.0, 1.0], [2.0, 2.0], "v")
+    let constant = CadModeling.filleted(prism, edge, 2.0, "v")
+    let same = taken(prism, held)
+    if math.abs(same - taken(prism, constant)) > 0.02: print(f"slanted: {same} against {taken(prism, constant)}")
+    assert(math.abs(same - taken(prism, constant)) < 0.02)
+    let rising = CadModeling.variable_filleted(prism, edge, [0.0, 1.0], [1.0, 2.0], "v", continuity = 2)
+    let some = taken(prism, rising)
+    assert(some > 0.17 * 30.0 * 1.0 and some < 0.18 * 32.0 * 4.0)
+    # The step: a 20 x 10 base, a wall on it from x = 12 leaning to x = 16
+    # at its top (its outline extruded 20).
+    let w = CadSketch.parse("")
+    let q = [w.add_point(0.0, 0.0), w.add_point(20.0, 0.0), w.add_point(20.0, 20.0), w.add_point(16.0, 20.0), w.add_point(12.0, 10.0), w.add_point(0.0, 10.0)]
+    for at in 0..<6:
+        _ = w.add_line(q[at], q[(at + 1) % 6])
+    let step = CadModeling.extruded(w.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 20.0, 0.0, "s")
+    let tread = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.y - 10.0) < 1e-9 and math.abs(b.y - 10.0) < 1e-9 and math.abs(a.z - 20.0) < 1e-9 and math.abs(b.z - 20.0) < 1e-9 and b.x < 12.0
+    let picked = edges_where(step, tread)
+    assert(picked.length == 1)
+    # Radius 2 all along: the strip ends in the wall's plane (it leans 0.4
+    # back per unit down), so it takes the flush tool less the wedge behind
+    # that plane: 0.4 × the section's centroid depth × its area.
+    let edge_ref = CadModeling.edge_references(step, picked)
+    let area = (1.0 - math.pi * 0.25) * 4.0
+    let depth = 2.0 * (10.0 - 3.0 * math.pi) / (12.0 - 3.0 * math.pi)
+    let into_wall = taken(step, CadModeling.variable_filleted(step, edge_ref, [0.0, 1.0], [2.0, 2.0], "v"))
+    let expected = area * 12.0 - 0.4 * depth * area
+    if math.abs(into_wall - expected) > 0.01: print(f"into the wall: {into_wall}, expected {expected}")
+    assert(math.abs(into_wall - expected) < 0.01)
+    # 1 to 2 along it: between the flush tools of 1 and 2 all along.
+    let rising_wall = taken(step, CadModeling.variable_filleted(step, edge_ref, [0.0, 1.0], [1.0, 2.0], "v", smooth = false))
+    assert(rising_wall > area * 3.0 * 0.25 and rising_wall < area * 12.0)
+    # The inside corner where the tread meets the wall, the step sliced
+    # by a plane leaning 0.3 out of square: a concave edge with slanted
+    # ends, its tool cut by them; a constant law adds what the constant
+    # fillet adds.
+    let leaning = CadModeling.sliced(step, Vector3(0.0, 0.0, 18.0), Vector3(0.0, 0.3, 1.0), "c")
+    let inner = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - 12.0) < 1e-9 and math.abs(b.x - 12.0) < 1e-9 and math.abs(a.y - 10.0) < 1e-9 and math.abs(b.y - 10.0) < 1e-9
+    let corner = CadModeling.edge_references(leaning, edges_where(leaning, inner))
+    let added = -taken(leaning, CadModeling.variable_filleted(leaning, corner, [0.0, 1.0], [1.0, 1.0], "v"))
+    let fixed = -taken(leaning, CadModeling.filleted(leaning, corner, 1.0, "v"))
+    if math.abs(added - fixed) > 0.02: print(f"inside slanted: {added} against {fixed}")
+    assert(added > 0.0 and math.abs(added - fixed) < 0.02)
+
+## A 2 box whose uprights were rounded 0.4: its top loop's radius 0.1 at
+## the start, 0.2 halfway round, 0.1 at the end (one point: a closed
+## loop), G1 and G2, between the constant 0.1 and 0.2 loops. A line of it
+## alone (Tangent chain off), 0.1 to 0.2: runs out round the uprights.
+func rounded_top() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "#b")
+    let upright = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9
+    let top = func (a: Vector3, b: Vector3) -> bool:
+        return a.y > 0.99 and b.y > 0.99
+    let rounded = CadModeling.filleted(box, CadModeling.edge_references(box, edges_where(box, upright)), 0.4, "#f")
+    let loop = edges_where(rounded, top)
+    assert(loop.length == 8)
+    var line = -1
+    for face in 0..<rounded.face_count():
+        for use in 0..<rounded.face_edge_count(face):
+            let id = rounded.face_edge_id(face, use)
+            if id in loop and rounded.face_edge_linear(face, use):
+                line = id
+    let refs = CadModeling.edge_references(rounded, [line])
+    for continuity in [1, 2]:
+        let made = CadModeling.variable_filleted(rounded, refs, [0.0, 0.5, 1.0], [0.1, 0.2, 0.1], "#v", continuity = continuity)
+        assert(made.face_count() == 18)
+        let removed = taken(rounded, made)
+        let low = taken(rounded, CadModeling.filleted(rounded, refs, 0.1, "#g", continuity))
+        let high = taken(rounded, CadModeling.filleted(rounded, refs, 0.2, "#g", continuity))
+        if not (removed > low * 1.2 and removed < high * 0.9): print(f"top loop G{continuity}: {removed} between {low} and {high}")
+        assert(removed > low * 1.2 and removed < high * 0.9)
+    # The line alone: 0.1 at its start, 0.2 at its end, run out at both.
+    let alone = CadModeling.variable_filleted(rounded, refs, [0.0, 1.0], [0.1, 0.2], "#v", chain = false)
+    let removed = taken(rounded, alone)
+    let corner = 1.0 - math.pi * 0.25
+    assert(removed > corner * 1.2 * (0.01 + 0.01 + 0.04) / 3.0)
+
+## A unit ball drilled by a hole of 0.5: one rim (a loop between the
+## sphere and the cylinder) 0.08, 0.12 halfway round, 0.08: between the
+## constant fillets.
+func drilled_rim() -> unit!:
+    let ball = CadModeling.tagged(CadSolids.sphere(1.0), "ball")
+    let drilled = CadModeling.combined(ball, CadModeling.tagged(CadSolids.cylinder(0.5, 4.0), "hole"), 1)
+    let rims = func (a: Vector3, b: Vector3) -> bool:
+        return a.y > 0.8 and math.abs(math.hypot(b.x, b.z) - 0.5) < 1e-6
+    let rim = CadModeling.edge_references(drilled, curved_edges(drilled, rims))
+    let made = CadModeling.variable_filleted(drilled, rim, [0.0, 0.5, 1.0], [0.08, 0.12, 0.08], "#v")
+    let removed = taken(drilled, made)
+    let low = taken(drilled, CadModeling.filleted(drilled, rim, 0.08, "#c"))
+    let high = taken(drilled, CadModeling.filleted(drilled, rim, 0.12, "#c"))
+    if not (removed > low and removed < high): print(f"rim: {removed} between {low} and {high}")
+    assert(removed > low and removed < high)
+
+## Two edges that make no one chain: said.
+func refused() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "box")
+    let two = func (a: Vector3, b: Vector3) -> bool:
+        return a.y > 9.99 and b.y > 9.99 and math.abs(a.z) > 9.99 and math.abs(b.z) > 9.99
+    let picked = edges_where(box, two)
+    assert(picked.length == 2)
+    var said = ""
+    _ = CadModeling.variable_filleted(box, CadModeling.edge_references(box, picked), [0.0, 1.0], [1.0, 2.0], "v") catch failure:
+        said = failure.message
+    assert(said.contains("one tangent chain"), said)
+

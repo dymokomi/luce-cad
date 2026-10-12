@@ -22,7 +22,7 @@ does today.
 | `revolved(set, axis, tag, angle)` | Each region turned about the plane's u (`0`) or v (`1`) axis: a full turn, or `angle` radians closed by the profile at each end. |
 | `revolved_about(set, origin, direction, tag, angle)` | The same about any line in the sketch's plane: a sketch line, a body edge, a construction axis. |
 | `edge_axis(model, reference)` | A line edge's line, or a circular edge's axis, for Revolve. |
-| `edge_frame(model, reference)`, `face_point(model, name)` | Where a feature's viewport handle stands (`handles.lucb`): an edge's middle, its direction and the way out of the corner between its faces (a blend's radius arrow); a point near a face's middle and its outward normal (Press Pull's arrow). |
+| `edge_frame(model, reference)`, `face_point(model, name)` | Where a feature's viewport handle stands (`handles.lucb`): an edge's middle, its direction and the way out of the corner between its faces (a blend's radius arrow); a point near a face's middle and its outward normal (Press Pull's arrow): on a B-spline face the nearest point to the middle of its edges, searched for (a lattice of starts, then Newton) when that middle lies off the surface, as on a G2 or G3 strip. |
 | `profile_count(set)` | How many regions the sketch has. |
 | `profile_keys(set)`, `profile_at(set, point)` | The keys of the sketch's faces; the key of the face under a point (a click). `extruded` and `revolved` take keys to choose faces. |
 | `CadProfileMap.of(set)`, `key_at(point)` | The sketch's faces laid out once (`profile_map.lucb`), so the face under a moving pointer is a containment test, not an arrangement made again. |
@@ -376,22 +376,60 @@ r cot(θ/2) from it, 2r cos(θ/2) apart, so the radius is chord / (2 cos(θ/2));
 touch where the circle does. Edges whose faces meet at different angles would need different
 radii: refused.
 
-**Full round** (`full_round.lucb`): for a flat center face between flat sides along it (a rib's
-top, square or tapered), the circle tangent to the three planes in the section (Cramer's rule on
-n·X + r = h for each) gives the radius, and both the center face's edges with the sides are
-filleted to it: the two strips touch the center face at the same line, so it goes and the strips
-are one cylinder (G2 and G3: two strips meeting with zero curvature).
+**Full round** (`full_round.lucb`): for a flat center face between sides along it, the round is
+the circle tangent to the center face and both sides in the section across them. The center face's
+edges with the sides must run alike, so every section is the same:
+- **Parallel lines** (a rib's top): the sides flat, tapered, or curved along the rib (cylinders
+  whose axes run with the edges, a bulging side). Both edges are filleted to the circle's radius:
+  the two strips touch the center face at the same line, so it goes and the strips are one cylinder
+  (G2 and G3: two strips meeting with zero curvature).
+- **Concentric arcs** (a curved rib): the sides cylinders or cones about the center face's normal,
+  the ends flat faces through the axis (a revolved rib's; an extrusion's drafted ends are refused).
+  Two fillets' part-torus tools would touch each other along the round's top, which the booleans
+  cannot part, so the round is made in two steps: the slab over the chord between the side contacts
+  is taken away, then the cap between that chord and the round is added back, both turned about the
+  axis along the arcs and flush with the ends. The round is one torus at G1, two strips of revolution
+  meeting where the center face was at G2 and G3.
 
-**Variable radius** (`variable_fillet.lucb`): the rolling ball's circle swept with its radius
-changing. In each section square to the edge it is the rational quadratic arc from contact to
-contact whose middle control point is the edge's own point (weight sin(θ/2)); the contacts lie
-r cot(θ/2) along each face, so every row of the net is the edge's point plus a multiple of r(s).
-With r(s) a piecewise cubic (smooth: each radius held a moment at its point, t²(3 − 2t) between;
-or straight) the face is exactly a rational B-spline, degree 2 across and 3 along, a knot thrice
-at each point. Its tool, the region between the edge and that face, ends flush with the faces at
-the edge's ends, which must be square to it; taken away (added for an inside edge) by the
-booleans, its net keeping to one side of each face's plane. One straight edge between flat faces,
-G1; `fillet_option_tests` checks the volume taken against (1 − π/4) × length × ∫ r² ds.
+The circle comes from the faces' tangent planes where the section meets them (Cramer's rule on
+n·X + r = h for each), refined by Newton on each face's signed distance (exact for flat sides and
+for a curved rib's, whose sides are straight in the section); it is converged to the last digits,
+since strips a hair apart leave a sliver of the center face the booleans cannot take.
+`full_round_tests` checks a curved rib by Pappus, a revolved rib with unlike tapers (cones), and a
+rib with bulging sides.
+
+**Variable radius** (`variable_fillet.lucb`, `radius_law.lucb`): Fusion's radii at points along a
+tangent chain, positions 0 to 1 as fractions of the chain's length (Fusion's API: "the percentage
+along the curve"). The chain starts at an open end, the first named edge's chain followed back, or
+for a closed loop at the first named edge's start; a closed loop's start and end radii must agree.
+Between points the radius is held a moment at each (smooth: t²(3 − 2t) between) or straight. G1,
+G2 and G3.
+- **Chains** are built as a constant fillet's are, the radius asked of the law at each section:
+  loops round a flat face and their run-outs (`cap_blend.lucb`: a box's top past rounded uprights,
+  an edge ending where an earlier fillet's edge goes on), loops between two curved faces
+  (`curved_blend.lucb`: a drilled ball's rim). Their rows are fitted along the chain within the
+  tolerance; the exact line and arc rows of a constant radius are not used.
+- **One straight edge between flat faces** is exact: in each section every control point is the
+  edge's point plus r(s) times a fixed vector (G1: the rational quadratic arc whose middle control
+  point is the edge's own point, weight sin(θ/2), contacts r cot(θ/2) along each face; G2, G3: the
+  fillet's B-spline on those contacts), so with r(s) a piecewise cubic the face is a B-spline, cubic
+  along with a knot thrice at each point. Its tool is the region between the edge and that face,
+  taken away (added for an inside edge); its net keeps to one side of each face's plane. Ends:
+  - square to the edge: flush;
+  - slanted with nothing beyond: past by a margin (a straight law going on straight, a smooth one
+    held), so the end face trims the strip;
+  - where the body goes on (a wall a convex edge runs into, an inside edge's slanted end): each row
+    of the net stops where it meets the end face's plane, its first or last piece the same
+    polynomial from there, so the rows keep their knots, the end section lies in the plane, and no
+    boolean cuts the strip (an exact cylinder when the radius holds).
+
+`fillet_option_tests` checks the volume taken along a box's edge against (1 − π/4) × ∫ r² ds;
+`variable_chain_tests` checks G2 and G3 against their sections' areas, a slanted open end against
+the constant fillet, an edge running into a leaning wall against the flush tool less the wedge
+behind the wall's plane, an inside edge with slanted ends, a rounded box's top loop (G1, G2) and a
+line of it running out, a drilled ball's rim, and two chains refused. Corners where a variable
+fillet meets other fillets in one feature (three edges at a vertex) are not built: Fusion's
+variable sets are one tangent chain each too.
 
 **Chamfer types and distances** (`chamfers.lucb`). Fusion's Chamfer has Equal distance, Two
 distances and Distance and angle. Each distance is measured from the original edge (what Autodesk's
@@ -497,7 +535,9 @@ plane's rule holding n·X = h·w at each point's weight. The seams' G1 rows hold
 homogeneous coordinate, so they hold for the rational quads. One row beyond each side (G1). The
 direct build rounds G1 corners with balls, so G1 setbacks go to the booleans.
 
-**Too large.** Before any tool, each edge's blend must fit:
+**Too large.** Before any tool, each edge's blend must fit (the way into each face is found a
+quarter of the reach in, clear of where a curved boundary's chart, its chords, strays off the
+edge: a hair in, the chords of a large arc said the face was on the other side):
 - **Its faces:** samples along the edge step into each face by the contact distance, and must stay
   on it.
 - **Its rounded corners:** must leave the edge some length.
@@ -954,8 +994,8 @@ Not yet: ellipses, splines, slots and text; curvature (G2) constraints; Blend Cu
 Roughly in order of usefulness:
 
 1. **Fillet corners beyond three edges.**
-2. **Variable radius fillets** beyond one straight edge between flat faces with square ends
-   (chains, curved faces, edges meeting other fillets at corners), and G2/G3 variable radii.
+2. **Variable radius fillets meeting other fillets at a corner** of three edges within one
+   feature, and full rounds of curved ribs whose ends are not flat through the axis.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
    the loop turns a sharp corner rather than going on tangentially.

@@ -1,0 +1,174 @@
+## A variable radius fillet's radius along its tangent chain (Fusion's
+## Variable radius: radii at positions 0 to 1 along the chain, its start and
+## end among them; Fusion's API measures a position as the fraction of the
+## curve's length). The chain is the picked edges in order: it starts at an
+## open end (the first named edge's chain followed back), or, a closed loop,
+## at the first named edge's start. Each edge's arc length is tabled once, so
+## the radius at any parameter of any chain edge is a lookup.
+##
+## Between points the radius is held a moment at each (a cubic with no slope
+## there: smooth, Inventor's Smooth radius transition, which Fusion's looks
+## like) or straight. Blends that take a law (cap_blend.lucb, curved_blend.lucb)
+## ask it for the radius at each section.
+
+## Samples of each edge's arc length table.
+let law_samples: usize = 64
+
+## The radius at `s` (0 to 1) of points `positions` (ascending, 0 and 1
+## among them) with `radii`, `smooth` or straight between them.
+func radius_at(positions: const f64[], radii: const f64[], smooth: bool, s: f64) -> f64:
+    var k: usize = 0
+    while k + 2 < positions.length and s > positions[k + 1]: k += 1
+    let span = positions[k + 1] - positions[k]
+    var t = (s - positions[k]) / span if span > 0.0 else 0.0
+    t = math.clamp(t, 0.0, 1.0)
+    let blend = t * t * (3.0 - 2.0 * t) if smooth else t
+    return radii[k] + (radii[k + 1] - radii[k]) * blend
+
+## A radius law over a chain of a shape's edges (see the header).
+struct RadiusLaw:
+    var positions: Growing[f64]
+    var radii: Growing[f64]
+    var smooth: bool
+    ## Per shape edge: its place in the chain (-1: not on it), whether the
+    ## chain runs its way (t0 to t1), the chain's length before it, and its
+    ## arc length table (law_samples + 1 values from t0).
+    var place: Growing[i64]
+    var forward: Growing[bool]
+    var before: Growing[f64]
+    var lengths: Growing[f64]
+    var total: f64
+    var closed: bool
+
+    func close():
+        self.positions.close()
+        self.radii.close()
+        self.smooth = false
+        self.place.close()
+        self.forward.close()
+        self.before.close()
+        self.lengths.close()
+
+    ## The largest radius.
+    func largest() -> f64:
+        var most = 0.0
+        for r in self.radii.view(): most = math.max(most, r)
+        return most
+
+    ## The radius at fraction `s` of the chain.
+    func at_fraction(s: f64) -> f64:
+        return radius_at(self.positions.view(), self.radii.view(), self.smooth, s)
+
+    ## The fraction of the chain at edge `e`'s carrier parameter `t`.
+    func fraction(w: const Shape*, e: usize, t: f64) -> f64!:
+        let k = self.place.items[e]
+        if k < 0: error(invalid, "a variable radius was asked off its chain")
+        let edge = w.edges.items[e]
+        let span = edge.t1 - edge.t0
+        let f = math.clamp((t - edge.t0) / span, 0.0, 1.0) if span != 0.0 else 0.0
+        let at = f * (f64)law_samples
+        let low = (usize)math.min(math.floor(at), (f64)(law_samples - 1))
+        let row = e * (law_samples + 1)
+        let table = &self.lengths
+        let run = table.items[row + low] + (table.items[row + low + 1] - table.items[row + low]) * (at - (f64)low)
+        let own = table.items[row + law_samples]
+        let into = run if self.forward.items[e] else own - run
+        return math.clamp((self.before.items[e] + into) / self.total, 0.0, 1.0)
+
+    ## The radius at edge `e`'s carrier parameter `t`.
+    func at_edge(w: const Shape*, e: usize, t: f64) -> f64!:
+        return self.at_fraction(try self.fraction(w, e, t))
+
+## The law of radii `radii` at `positions` (0 to 1, rising; the ends are
+## added from the nearest radius when missing) along edges `chosen` of `w`,
+## which must make one chain; `first` the edge it starts from (the first
+## named).
+func chain_law(w: const Shape*, chosen: const usize[], first: usize, positions: const f64[], radii: const f64[], smooth: bool) -> RadiusLaw!:
+    var law = RadiusLaw(Growing[f64](), Growing[f64](), smooth, Growing[i64](), Growing[bool](), Growing[f64](), Growing[f64](), 0.0, false)
+    errdefer law.close()
+    try law_points(&law, positions, radii)
+    try law.place.fill(w.edges.count, -1)
+    try law.forward.fill(w.edges.count, true)
+    try law.before.fill(w.edges.count, 0.0)
+    try law.lengths.fill(w.edges.count * (law_samples + 1), 0.0)
+    var picked = Growing[bool]()
+    defer picked.close()
+    try picked.fill(w.edges.count, false)
+    for e in chosen: picked.items[e] = true
+    # Back from the first edge's start to an open end (or round to itself).
+    var e = first
+    var v = w.edges.items[first].start
+    law.closed = w.edges.items[first].start == w.edges.items[first].end
+    var steps: usize = 0
+    while not law.closed and steps < chosen.length:
+        let previous = try next_on_chain(w, &picked, e, v)
+        if previous < 0: break
+        if (usize)previous == first:
+            law.closed = true
+            break
+        let p = w.edges.items[(usize)previous]
+        v = p.start if p.end == v else p.end
+        e = (usize)previous
+        steps += 1
+    if law.closed:
+        e = first
+        v = w.edges.items[first].start
+    # Forward from there, each edge's length tabled.
+    var count: usize = 0
+    while true:
+        let edge = w.edges.items[e]
+        law.place.items[e] = (i64)count
+        law.forward.items[e] = edge.start == v
+        law.before.items[e] = law.total
+        law.total += try table_edge(w, e, &law.lengths)
+        count += 1
+        v = edge.end if edge.start == v else edge.start
+        let next = try next_on_chain(w, &picked, e, v)
+        if next < 0 or law.place.items[(usize)next] >= 0: break
+        e = (usize)next
+    if count != chosen.length: error(invalid, "a variable radius runs along one tangent chain: pick one edge or one chain")
+    if law.total <= w.tolerance: error(invalid, "a variable radius's chain has no length")
+    if law.closed and math.abs(law.radii.items[0] - law.radii.items[law.radii.count - 1]) > w.tolerance:
+        error(invalid, "a closed loop's variable radius starts and ends at one point: its start and end radii must be the same")
+    return law
+
+## The positions and radii checked, the chain's ends added.
+func law_points(law: RadiusLaw*, positions: const f64[], radii: const f64[]) -> !:
+    if positions.length != radii.length or positions.length == 0: error(invalid, "a variable radius needs a radius at each position")
+    for k in 0..<positions.length:
+        if not math.is_finite(positions[k]) or positions[k] < 0.0 or positions[k] > 1.0: error(invalid, "a variable radius's positions run from 0 to 1 along the edge")
+        if not math.is_finite(radii[k]) or radii[k] <= 0.0: error(invalid, "a variable radius's radii are positive")
+        if k > 0 and positions[k] <= positions[k - 1]: error(invalid, "a variable radius's positions must rise along the edge")
+    if positions[0] > 0.0:
+        try law.positions.push(0.0)
+        try law.radii.push(radii[0])
+    for k in 0..<positions.length:
+        try law.positions.push(positions[k])
+        try law.radii.push(radii[k])
+    if positions[positions.length - 1] < 1.0:
+        try law.positions.push(1.0)
+        try law.radii.push(radii[radii.length - 1])
+
+## The picked edge other than `e` at vertex `v` (-1: none, an open end).
+func next_on_chain(w: const Shape*, picked: const Growing[bool]*, e: usize, v: i64) -> i64!:
+    for g in 0..<w.edges.count:
+        if g == e or not picked.items[g]: continue
+        let other = w.edges.items[g]
+        if other.start == v or other.end == v: return (i64)g
+    return -1
+
+## Edge `e`'s arc length from t0 at law_samples + 1 even steps of its
+## parameter into its rows of `tables` (chords of a fine polyline); its
+## whole length.
+func table_edge(w: const Shape*, e: usize, tables: Growing[f64]*) -> f64!:
+    let edge = w.edges.items[e]
+    let row = e * (law_samples + 1)
+    var previous = try w.at(edge.carrier, edge.t0)
+    tables.items[row] = 0.0
+    var run = 0.0
+    for k in 1..<law_samples + 1:
+        let here = try w.at(edge.carrier, edge.t0 + (edge.t1 - edge.t0) * (f64)k / (f64)law_samples)
+        run += here.subtract(previous).length()
+        tables.items[row + k] = run
+        previous = here
+    return run

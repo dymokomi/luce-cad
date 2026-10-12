@@ -60,41 +60,47 @@ func corner_at(b: const Cap*, side: const CapSide*, t: f64) -> (f64, f64)!:
     let tangent = try (try b.w.tangent(edge.carrier, t)).normalized()
     let lambda = s.subtract(tangent.multiply_scalar(s.dot(tangent))).dot(u)
     if math.abs(lambda) > 1.0 - 1e-6: error(invalid, "a blend's wall lies along its cap")
-    return (lambda, try contact_distance(b, lambda))
+    return (lambda, try contact_distance(b, lambda, try reach_at(b, side, t)))
 
-## How far a blend's contact on the cap is from a corner of cosine
-## `lambda`: a fillet's, both its contacts' r cot(θ/2); a chamfer's leg
-## on the cap (its first distance, or the second's when the wall is its
-## first face: chamfers.lucb).
-func contact_distance(b: const Cap*, lambda: f64) -> f64!:
+## The fillet's radius (a chamfer's size) at side `side`'s carrier
+## parameter `t`: the blend's own, or its radius law's there.
+func reach_at(b: const Cap*, side: const CapSide*, t: f64) -> f64!:
+    if let law = b.law: return try law.at_edge(b.w, side.edge, t)
+    return b.reach
+
+## How far a blend of radius (or size) `r` has its contact on the cap from
+## a corner of cosine `lambda`: a fillet's, both its contacts' r cot(θ/2); a
+## chamfer's leg on the cap (its first distance, or the second's when the
+## wall is its first face: chamfers.lucb).
+func contact_distance(b: const Cap*, lambda: f64, r: f64) -> f64!:
     if not b.round:
-        if b.cap_first: return b.reach
-        return try second_leg(b.chamfer, b.reach, math.acos(lambda))
-    return b.reach * (1.0 + lambda) / math.sqrt(1.0 - lambda * lambda)
+        if b.cap_first: return r
+        return try second_leg(b.chamfer, r, math.acos(lambda))
+    return r * (1.0 + lambda) / math.sqrt(1.0 - lambda * lambda)
 
-## How far a blend's contact on the wall is from a corner of cosine
-## `lambda` (along the wall's ruling, across the edge): a fillet's as the
-## cap's, a chamfer's leg on the wall.
-func wall_distance(b: const Cap*, lambda: f64) -> f64!:
+## How far a blend of radius (or size) `r` has its contact on the wall from
+## a corner of cosine `lambda` (along the wall's ruling, across the edge): a
+## fillet's as the cap's, a chamfer's leg on the wall.
+func wall_distance(b: const Cap*, lambda: f64, r: f64) -> f64!:
     if not b.round:
-        if not b.cap_first: return b.reach
-        return try second_leg(b.chamfer, b.reach, math.acos(lambda))
-    return try contact_distance(b, lambda)
+        if not b.cap_first: return r
+        return try second_leg(b.chamfer, r, math.acos(lambda))
+    return try contact_distance(b, lambda, r)
 
-## The section of a corner of cosine `lambda`: its control points as steps
+## The section of radius (or size) `r` at a corner of cosine `lambda`: its control points as steps
 ## along u (`along_cap`) and S (`along_wall`) from the corner, from the cap's
 ## contact to the wall's; its knots, weights and degree. A chamfer's line;
 ## G1 a circle's arc (rational, its middle weight the chain's: b.weight);
 ## G2, G3 the fillet's B-spline (fillet_section).
-func section_at(b: const Cap*, lambda: f64, along_cap: Growing[f64]*, along_wall: Growing[f64]*, knots: Growing[f64]*, weights: Growing[f64]*) -> i64!:
+func section_at(b: const Cap*, lambda: f64, r: f64, along_cap: Growing[f64]*, along_wall: Growing[f64]*, knots: Growing[f64]*, weights: Growing[f64]*) -> i64!:
     along_cap.clear()
     along_wall.clear()
     knots.clear()
     weights.clear()
-    let c = try contact_distance(b, lambda)
+    let c = try contact_distance(b, lambda, r)
     if not b.round:
         let a: f64[2] = [c, 0.0]
-        let z: f64[2] = [0.0, try wall_distance(b, lambda)]
+        let z: f64[2] = [0.0, try wall_distance(b, lambda, r)]
         let k: f64[4] = [0.0, 0.0, 1.0, 1.0]
         try along_cap.assign(a[..<2])
         try along_wall.assign(z[..<2])
@@ -133,7 +139,7 @@ func rows_at(b: const Cap*, side: const CapSide*, t: f64, out: Growing[Vector3]*
     defer knots.close()
     var weights = Growing[f64]()
     defer weights.close()
-    _ = try section_at(b, lambda, &a, &z, &knots, &weights)
+    _ = try section_at(b, lambda, try reach_at(b, side, t), &a, &z, &knots, &weights)
     let (u, _) = try into_cap(b, side, t)
     let s = try ruling_at(b, side, t)
     let e = try b.w.at(edge.carrier, t)
@@ -150,6 +156,8 @@ func along_rows(b: const Cap*, side: const CapSide*, rows: usize, net: Growing[V
     let w = b.w
     let edge = w.edges.items[side.edge]
     let carrier = w.carriers.items[(usize)edge.carrier]
+    # A radius changing along the edge: always fitted.
+    if b.law != none: return try fitted_rows(b, side, rows, net, knots, weights)
     if carrier.kind == curve_line and side.ruling == ruling_between:
         var first = Growing[Vector3]()
         defer first.close()
@@ -178,7 +186,7 @@ func along_rows(b: const Cap*, side: const CapSide*, rows: usize, net: Growing[V
     defer section_knots.close()
     var section_weights = Growing[f64]()
     defer section_weights.close()
-    _ = try section_at(b, lambda, &a, &z, &section_knots, &section_weights)
+    _ = try section_at(b, lambda, b.reach, &a, &z, &section_knots, &section_weights)
     let sweep = edge.t1 - edge.t0
     let spans = (usize)math.max(1.0, math.ceil(math.abs(sweep) / (math.pi * 0.5) - 1e-9))
     let half = sweep / (2.0 * (f64)spans)

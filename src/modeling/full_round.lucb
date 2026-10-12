@@ -1,12 +1,22 @@
 ## Fusion's Full Round Fillet: a center face rounded away whole, the round
 ## tangent to it and to the side faces on each side. For a flat center face
-## between flat sides along it (a rib's top, square or tapered), the round
-## is the circle tangent to all three planes in the section across them:
-## it is the fillet, of that one radius, of both the center face's edges
-## with the sides, the two fillets touching the center face at the same
-## line, so the face goes and the two strips are one cylinder.
+## between sides along it, the round is the circle tangent to all three
+## faces in the section across them: it is the fillet, of that one radius,
+## of both the center face's edges with the sides, the two fillets touching
+## the center face at the same line, so the face goes and the two strips
+## are one surface.
+##
+## The center face's edges with the sides run alike: parallel lines (a
+## rib's top, the sides flat, tapered, or curved along it: cylinders whose
+## axes run with the edges) or concentric arcs (a curved rib: the sides
+## cylinders or cones about the center face's normal). Every section across
+## them is then the same, and the circle is solved in one: its center X and
+## radius r with each face's outward signed distance at X equal to -r,
+## Newton from the circle tangent to the faces' tangent planes at the edges
+## (Cramer's rule on n·X + r = h for each), which is the answer when they
+## are flat.
 ## The sides, when not named, are the center face's neighbors across its
-## longest pair of parallel straight edges.
+## longest pair of such edges.
 
 ## `model` with face `center` rounded fully between faces `side1` and
 ## `side2` (empty: found as above), of `continuity` (1 G1, 2 G2, 3 G3), the
@@ -22,60 +32,298 @@ func full_rounded(model: const CadModel*, center: str, side1: str, side2: str, t
         sides[1] = try named_face(&w, side2)
     else:
         sides = try round_sides(&w, c)
-    # The edges between the center and each side, and the way along them.
+    # The edges between the center and each side: alike, one per side.
     var edges = Growing[i64]()
     defer edges.close()
-    var along = Vector3()
+    var first: i64 = -1
     for use in w.face_uses(c):
         let e = edge_index(use)
         let (fa, fb) = try edge_faces(&w, e)
         let other = fb if fa == c else fa
         if other != sides[0] and other != sides[1]: continue
-        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line: error(invalid, "a full round's center face meets its sides along straight edges")
-        let way = try along_edge(&w, e)
-        if along.length() == 0.0: along = way
-        elif math.abs(math.abs(way.dot(along)) - 1.0) > 1e-9: error(invalid, "a full round's sides run along the center face: its edges with them are parallel")
+        if first >= 0 and not try alike(&w, (usize)first, e): error(invalid, "a full round's center face meets its sides along parallel lines or concentric arcs")
+        if first < 0: first = (i64)e
         try edges.push((i64)e)
     if edges.count < 2: error(invalid, "the center face does not meet both sides")
-    let radius = try inscribed_radius(&w, c, sides, along)
+    let (radius, center_point) = try inscribed_circle(&w, c, sides, (usize)first)
+    # Arcs (a curved rib): the slab over the round's chord taken away and
+    # the cap under the round added back (round_part).
+    if w.carriers.items[(usize)w.edges.items[(usize)first].carrier].kind == curve_circle:
+        let other = (usize)edges.items[1] if edges.items[0] == first else (usize)edges.items[0]
+        try radial_ends(&w, c, sides, (usize)first)
+        let slab = try round_part(&w, c, (usize)first, other, radius, center_point, continuity, tag, 0)
+        defer slab.release()
+        let cut = try combine(model, slab.value(), op_subtract)
+        defer cut.release()
+        let cap = try round_part(&w, c, (usize)first, other, radius, center_point, continuity, tag, 1)
+        defer cap.release()
+        return try combine(cut.value(), cap.value(), op_union)
     var text = Growing[u8]()
     defer text.close()
     try references_of(&w, edges.view(), &text)
     return try blended(model, (str)text.view(), radius, true, tag, continuity, false)
 
-## The radius of the circle tangent to the planes of faces `c` and `sides`
-## inside the body, in the section square to `along`.
-func inscribed_radius(w: const Shape*, c: usize, sides: const usize[2], along: Vector3) -> f64!:
-    let faces: usize[3] = [c, sides[0], sides[1]]
+## A full round of a curved rib (radius `radius`, center `center` in the
+## section through edge `ea`'s middle) over center face `c` between its
+## arcs `ea` and `eb` (concentric, the sides cylinders or cones about their
+## axis), turned about the axis along the arcs, flush with the rib's ends:
+## `part` 0 the slab over the chord between the side contacts (the sides
+## above them and a line above the center face), taken away; 1 the cap
+## between the chord and the round, added back. The round touches the
+## center face's plane along a circle, so one tool of the region over it
+## would touch the body there, which the booleans cannot part; the slab and
+## the cap meet the body only on their own faces. The round is a torus (G1;
+## one face, named for both edges' blends) or, G2 and G3, two strips of
+## revolution meeting where the center face was.
+func round_part(w: const Shape*, c: usize, ea: usize, eb: usize, radius: f64, center: Vector3, continuity: i64, tag: str, part: i64) -> interop.Reference[CadModel]!:
+    let edge = w.edges.items[ea]
+    let carrier = w.carriers.items[(usize)edge.carrier]
+    let p = try w.edge_at(ea, 0.5)
+    let along = try along_edge(w, ea)
+    let side_a = try other_side(w, c, ea)
+    let side_b = try other_side(w, c, eb)
+    let q = try section_foot(w, c, side_b, p, along)
+    let up = try w.face_normal(c, p)
+    let width = try q.subtract(p).normalized()
+    # Each side's outward normal at its contact (the same along its line in
+    # the section: a cylinder's or cone's about the axis) and its way up.
+    let na = try w.face_normal(side_a, p)
+    let nb = try w.face_normal(side_b, q)
+    let mid = center.add(up.multiply_scalar(radius))
+    let contact_a = center.add(na.multiply_scalar(radius))
+    let contact_b = center.add(nb.multiply_scalar(radius))
+    let rise_a = try rising(along.cross(na), up)
+    let rise_b = try rising(along.cross(nb), up)
+    # Up each side to the radius above the center face.
+    let lift = radius
+    let above_a = p.add(rise_a.multiply_scalar(lift / math.max(0.2, rise_a.dot(up))))
+    let above_b = q.add(rise_b.multiply_scalar(lift / math.max(0.2, rise_b.dot(up))))
+    # Turned along the arcs, past an open end (nothing beyond) by a margin:
+    # the profile built where the tool starts.
+    var a = carrier.x.cross(carrier.y)
+    if a.cross(p.subtract(carrier.origin)).dot(along) < 0.0: a = a.multiply_scalar(-1.0)
+    let sweep = math.abs(edge.t1 - edge.t0)
+    let back = -sweep * 0.5
+    let o = carrier.origin
+    let way = turned_direction(along, a, back)
+    let flat = turned_direction(width, a, back)
+    var profile = Profiles(turned_point(p, o, a, back), way, flat, way.cross(flat), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+                           Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+    defer profile.close()
+    try profile.loop_offsets.push(0)
+    let ta = turned_point(contact_a, o, a, back)
+    let tb = turned_point(contact_b, o, a, back)
+    let tm = turned_point(mid, o, a, back)
+    let tc = turned_point(center, o, a, back)
+    if part == 0:
+        # The slab: up side a, across above, down side b, the chord back.
+        let corners: Vector3[4] = [above_a, above_b, contact_b, contact_a]
+        var previous = ta
+        for point in corners:
+            let next = turned_point(point, o, a, back)
+            try profile.edges.push(line_edge(previous, next))
+            previous = next
+        try profile.loop_offsets.push(profile.edges.count)
+        try single_region(&profile)
+        let slab = try BrepModel.sized(carrier.a + radius * 4.0)
+        defer slab.release()
+        try revolve_into(slab.value(), &profile, o, a, (carrier.a + radius) * 1e-7, "", sweep)
+        for face in 0..<slab.value().face_count():
+            try slab.value().set_face_name(face, "")
+        return try CadModel.of_brep(slab)
+    # The cap: the round first (faces 0, and 1 for G2/G3), from side b's
+    # contact over the top to side a's, then the chord back.
+    if continuity == 1:
+        let leaving = tb.subtract(tc)
+        let arriving = ta.subtract(tc)
+        let toward_top = tm.subtract(tc)
+        # Signed about the way along, the long way when the top is not on
+        # the short one.
+        var turn = math.atan2(way.dot(leaving.cross(arriving)), leaving.dot(arriving))
+        let to_top = math.atan2(way.dot(leaving.cross(toward_top)), leaving.dot(toward_top))
+        if (to_top > 0.0) != (turn > 0.0) or math.abs(to_top) > math.abs(turn): turn = turn - math.pi * 2.0 * (1.0 if turn > 0.0 else -1.0)
+        try profile.edges.push(ProfileEdge(1, tb, ta, tc, radius, turn, -1))
+    else:
+        for half in 0..<(usize)2:
+            let head = tb if half == 0 else tm
+            let tail = tm if half == 0 else ta
+            # Each half a fillet's section between its contacts, its legs
+            # meeting where the side's and the center face's tangents do.
+            let side_point = contact_b if half == 0 else contact_a
+            let side_normal = nb if half == 0 else na
+            let leg = turned_point(try lines_meet(side_point, along.cross(side_normal), mid, width), o, a, back)
+            let first_point = profile.spline_points.count
+            let knot_first = profile.spline_knots.count
+            try fillet_section(head, tail, leg, continuity, &profile.spline_points, &profile.spline_knots)
+            let count = profile.spline_points.count - first_point
+            while profile.spline_weights.count < profile.spline_points.count: try profile.spline_weights.push(1.0)
+            try profile.splines.push(ProfileSpline(first_point, count, knot_first, 5))
+            try profile.edges.push(ProfileEdge(2, head, tail, Vector3(), 0.0, 0.0, (i64)profile.splines.count - 1))
+    # The chord back: the cap meets the cut body on it.
+    try profile.edges.push(line_edge(ta, tb))
+    try profile.loop_offsets.push(profile.edges.count)
+    try single_region(&profile)
+    let solid = try BrepModel.sized(carrier.a + radius * 4.0)
+    defer solid.release()
+    try revolve_into(solid.value(), &profile, o, a, (carrier.a + radius) * 1e-7, "", sweep)
+    # The round's faces named for the edges' blends.
+    var name_a = Growing[u8]()
+    defer name_a.close()
+    var name_b = Growing[u8]()
+    defer name_b.close()
+    try blend_name(w, ea, tag, &name_a)
+    try blend_name(w, eb, tag, &name_b)
+    let b = solid.value()
+    for face in 0..<b.face_count():
+        try b.set_face_name(face, "")
+    if continuity == 1:
+        var both = Growing[u8]()
+        defer both.close()
+        for byte in name_b.view(): try both.push(byte)
+        try both.push(124)
+        for byte in name_a.view(): try both.push(byte)
+        try b.set_face_name(0, (str)both.view())
+    else:
+        try b.set_face_name(0, (str)name_b.view())
+        try b.set_face_name(1, (str)name_a.view())
+    return try CadModel.of_brep(solid)
+
+## `d` made unit and turned to point the way `up` does.
+func rising(d: Vector3, up: Vector3) -> Vector3!:
+    let way = try d.normalized()
+    return way if way.dot(up) >= 0.0 else way.multiply_scalar(-1.0)
+
+## The side of center face `c` across edge `e`.
+func other_side(w: const Shape*, c: usize, e: usize) -> usize!:
+    let (fa, fb) = try edge_faces(w, e)
+    return fb if fa == c else fa
+
+## Whether edges `a` and `b` run alike: parallel lines, or arcs about one
+## axis.
+func alike(w: const Shape*, a: usize, b: usize) -> bool!:
+    let ca = w.carriers.items[(usize)w.edges.items[a].carrier]
+    let cb = w.carriers.items[(usize)w.edges.items[b].carrier]
+    if ca.kind == curve_line and cb.kind == curve_line: return math.abs(math.abs(ca.x.dot(cb.x)) - 1.0) <= 1e-9
+    if ca.kind != curve_circle or cb.kind != curve_circle: return false
+    let axis_a = ca.x.cross(ca.y)
+    let axis_b = cb.x.cross(cb.y)
+    if math.abs(math.abs(axis_a.dot(axis_b)) - 1.0) > 1e-9: return false
+    let offset = cb.origin.subtract(ca.origin)
+    return offset.subtract(axis_a.multiply_scalar(offset.dot(axis_a))).length() <= w.tolerance * 10.0
+
+## The circle tangent to faces `c` and `sides` inside the body, in the
+## section square to edge `e` at its middle (see the header): its radius
+## and center.
+func inscribed_circle(w: const Shape*, c: usize, sides: const usize[2], e: usize) -> (f64, Vector3)!:
+    let edge = w.edges.items[e]
+    let p = try w.edge_at(e, 0.5)
+    let along = try (try w.tangent(edge.carrier, (edge.t0 + edge.t1) * 0.5)).normalized()
+    var faces: usize[3] = [c, sides[0], sides[1]]
+    # The faces' tangent planes where the section meets them: at the
+    # middle of the center's edge with each (the center's own at p).
+    var feet: Vector3[3] = [p, p, p]
+    for k in 1..<(usize)3:
+        feet[k] = try section_foot(w, c, faces[k], p, along)
     let u = try across(along)
     let v = along.cross(u)
-    # Each plane in the section: n . x = h (outward n); the center X is r in
-    # from each: nu X.u + nv X.v + r = h.
+    # Each tangent plane in the section: n . x = h (outward n); the center X
+    # is r in from each: nu X.u + nv X.v + r = h.
     var m: f64[9]
     var b: f64[3]
     for k in 0..<(usize)3:
-        let s = &w.surfaces.items[(usize)w.faces.items[faces[k]].surface]
-        if s.kind != surface_plane: error(invalid, "a full round takes flat side faces")
-        let n = face_outward(w, faces[k])
-        if math.abs(n.dot(along)) > 1e-9: error(invalid, "a full round's faces must run along its edges")
+        let n = try w.face_normal(faces[k], feet[k])
+        if math.abs(n.dot(along)) > 1e-6: error(invalid, "a full round's faces must run along its edges")
         m[k * 3] = n.dot(u)
         m[k * 3 + 1] = n.dot(v)
         m[k * 3 + 2] = 1.0
-        b[k] = n.dot(s.origin)
+        b[k] = n.dot(feet[k].subtract(p))
     let det = determinant(m)
     if math.abs(det) < 1e-12: error(invalid, "no circle touches the center face and both sides: they must close round the rib")
+    var mx: f64[9]
+    var my: f64[9]
     var mr: f64[9]
-    for k in 0..<(usize)9: mr[k] = m[k]
-    for k in 0..<(usize)3: mr[k * 3 + 2] = b[k]
-    let radius = determinant(mr) / det
+    for k in 0..<(usize)9:
+        mx[k] = m[k]
+        my[k] = m[k]
+        mr[k] = m[k]
+    for k in 0..<(usize)3:
+        mx[k * 3] = b[k]
+        my[k * 3 + 1] = b[k]
+        mr[k * 3 + 2] = b[k]
+    var x = p.add(u.multiply_scalar(determinant(mx) / det)).add(v.multiply_scalar(determinant(my) / det))
+    var radius = determinant(mr) / det
     if not (radius > 0.0): error(invalid, "the sides open away from the center face: no full round fits")
-    return radius
+    # Refined on the faces themselves (curved sides): Newton on the three
+    # signed distances and the section's plane, to the last digits (the
+    # two strips must meet exactly: a hair apart, the booleans see a
+    # sliver of the center face).
+    let scale = math.max(radius, w.tolerance)
+    var rows: f64[16]
+    var values: f64[4]
+    var base: f64[4]
+    for _ in 0..<60:
+        try round_gaps(w, faces[..<3], x, radius, p, along, values[..<4])
+        var worst = 0.0
+        for k in 0..<(usize)4: worst = math.max(worst, math.abs(values[k]))
+        if worst <= scale * 1e-14: break
+        let h = scale * 1e-7
+        let steps: Vector3[3] = [Vector3(h, 0.0, 0.0), Vector3(0.0, h, 0.0), Vector3(0.0, 0.0, h)]
+        for k in 0..<(usize)4: base[k] = values[k]
+        for col in 0..<(usize)3:
+            try round_gaps(w, faces[..<3], x.add(steps[col]), radius, p, along, values[..<4])
+            for row in 0..<(usize)4: rows[row * 4 + col] = (values[row] - base[row]) / h
+        for row in 0..<(usize)4:
+            rows[row * 4 + 3] = 1.0 if row < 3 else 0.0
+            values[row] = base[row]
+        if not solve_small(rows[..<16], values[..<4], 4): error(invalid, "no circle touches the center face and both sides: they must close round the rib")
+        x = x.subtract(Vector3(values[0], values[1], values[2]))
+        radius -= values[3]
+        if not (radius > 0.0): error(invalid, "the sides open away from the center face: no full round fits")
+    try round_gaps(w, faces[..<3], x, radius, p, along, values[..<4])
+    for k in 0..<(usize)3:
+        if math.abs(values[k]) > w.tolerance: error(invalid, "no circle touches the center face and both sides: they must close round the rib")
+    return (radius, x)
+
+## The full round's equations at center `x` and radius `radius`: each
+## face's outward signed distance plus the radius, and `x`'s offset from
+## the section's plane (through `p`, square to `along`).
+func round_gaps(w: const Shape*, faces: const usize[], x: Vector3, radius: f64, p: Vector3, along: Vector3, out: f64[]) -> !:
+    for k in 0..<(usize)3:
+        let face = w.faces.items[faces[k]]
+        let (gap, _) = try signed_gap(&w.surfaces.items[(usize)face.surface], x, w.tolerance)
+        out[k] = (gap if face.sense else -gap) + radius
+    out[3] = x.subtract(p).dot(along)
+
+## Where the section through `p` square to `along` meets the edge between
+## faces `c` and `side` (the side's foot).
+func section_foot(w: const Shape*, c: usize, side: usize, p: Vector3, along: Vector3) -> Vector3!:
+    for use in w.face_uses(c):
+        let e = edge_index(use)
+        let (fa, fb) = try edge_faces(w, e)
+        if fa != side and fb != side: continue
+        let edge = w.edges.items[e]
+        var low = math.min(edge.t0, edge.t1)
+        var high = math.max(edge.t0, edge.t1)
+        # Bisection on the side of the section's plane.
+        var f_low = (try w.at(edge.carrier, low)).subtract(p).dot(along)
+        let f_high = (try w.at(edge.carrier, high)).subtract(p).dot(along)
+        if f_low * f_high > 0.0: return try w.at(edge.carrier, low if math.abs(f_low) < math.abs(f_high) else high)
+        for _ in 0..<80:
+            let middle = (low + high) * 0.5
+            let f = (try w.at(edge.carrier, middle)).subtract(p).dot(along)
+            if (f < 0.0) == (f_low < 0.0):
+                low = middle
+                f_low = f
+            else:
+                high = middle
+        return try w.at(edge.carrier, (low + high) * 0.5)
+    error(invalid, "the center face does not meet both sides")
 
 func determinant(m: const f64[9]) -> f64:
     return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6])
 
-## The faces across the center face `c`'s longest pair of parallel
-## straight edges (a rib's sides).
+## The faces across the center face `c`'s longest pair of edges that run
+## alike (parallel lines, concentric arcs: a rib's sides).
 func round_sides(w: const Shape*, c: usize) -> usize[2]!:
     var best = 0.0
     var found: usize[2] = [0, 0]
@@ -83,14 +331,13 @@ func round_sides(w: const Shape*, c: usize) -> usize[2]!:
     let uses = w.face_uses(c)
     for i in 0..<uses.length:
         let a = edge_index(uses[i])
-        if w.carriers.items[(usize)w.edges.items[a].carrier].kind != curve_line: continue
-        let way_a = try along_edge(w, a)
-        let length_a = (try w.edge_at(a, 1.0)).subtract(try w.edge_at(a, 0.0)).length()
+        let kind_a = w.carriers.items[(usize)w.edges.items[a].carrier].kind
+        if kind_a != curve_line and kind_a != curve_circle: continue
+        let length_a = try edge_length(w, a)
         for j in i + 1..<uses.length:
             let b = edge_index(uses[j])
-            if w.carriers.items[(usize)w.edges.items[b].carrier].kind != curve_line: continue
-            if math.abs(math.abs((try along_edge(w, b)).dot(way_a)) - 1.0) > 1e-9: continue
-            let length_b = (try w.edge_at(b, 1.0)).subtract(try w.edge_at(b, 0.0)).length()
+            if not try alike(w, a, b): continue
+            let length_b = try edge_length(w, b)
             let (fa, fb) = try edge_faces(w, a)
             let (ga, gb) = try edge_faces(w, b)
             let side_a = fb if fa == c else fa
@@ -100,5 +347,29 @@ func round_sides(w: const Shape*, c: usize) -> usize[2]!:
                 best = length_a + length_b
                 found = [side_a, side_b]
                 any = true
-    if not any: error(invalid, "the center face has no pair of parallel straight edges: pick its side faces")
+    if not any: error(invalid, "the center face has no pair of parallel or concentric edges: pick its side faces")
     return found
+
+## Edge `e`'s length (a fine polyline's).
+func edge_length(w: const Shape*, e: usize) -> f64!:
+    var total = 0.0
+    var previous = try w.edge_at(e, 0.0)
+    for k in 1..<33:
+        let here = try w.edge_at(e, (f64)k / 32.0)
+        total += here.subtract(previous).length()
+        previous = here
+    return total
+
+## A curved rib's ends, where the center face's other edges are: flat faces
+## through the arcs' axis (the round's slab and cap end flush with them).
+func radial_ends(w: const Shape*, c: usize, sides: const usize[2], e: usize) -> !:
+    let carrier = w.carriers.items[(usize)w.edges.items[e].carrier]
+    let axis = carrier.x.cross(carrier.y)
+    for use in w.face_uses(c):
+        let g = edge_index(use)
+        let (fa, fb) = try edge_faces(w, g)
+        let other = fb if fa == c else fa
+        if other == sides[0] or other == sides[1]: continue
+        let s = &w.surfaces.items[(usize)w.faces.items[other].surface]
+        let through = s.kind == surface_plane and math.abs(s.z.dot(axis)) < 1e-9 and math.abs(carrier.origin.subtract(s.origin).dot(s.z)) <= w.tolerance * 10.0
+        if not through: error(invalid, "a curved rib's full round needs its ends flat and square to it (through its axis)")

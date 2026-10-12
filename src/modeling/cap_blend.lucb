@@ -68,6 +68,7 @@ struct Cap:
     var w: const Shape*
     var out: Shape
     var reach: f64
+    var law: const RadiusLaw*?
     var round: bool
     var continuity: i64
     var weight: f64
@@ -127,13 +128,15 @@ struct Cap:
         return try self.out.add_edge(ShapeEdge(c, low if forward else high, high if forward else low, a, b))
 
 ## Edges `chosen` of `w` blended round their caps (see the file's header):
-## filleted to `size` (`continuity` 1 to 3) when `round`, else chamfered
-## (by `sides` when given: chamfers.lucb); none when they are not all such
-## loops (the booleans then try).
-pub func cap_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str, sides: const ChamferSides*? = none) -> interop.Reference[CadModel]?!:
+## filleted to `size` (`continuity` 1 to 3) when `round`, its radius
+## changing along the chain by `law` when given (`size` then its largest),
+## else chamfered (by `sides` when given: chamfers.lucb); none when they are
+## not all such loops (the booleans then try).
+pub func cap_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str, sides: const ChamferSides*? = none, law: const RadiusLaw*? = none) -> interop.Reference[CadModel]?!:
     var made = try new_cap(w, size, round, continuity)
     defer made.close()
     let b = &made
+    b.law = law
     if not try cap_eligible(b, chosen): return none
     try chamfer_first(b, sides)
     try chain_weight(b)
@@ -155,7 +158,7 @@ func new_cap(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cap!:
     for k in w.spline_knots.view(): try out.spline_knots.push(k)
     for s in w.surfaces.view():
         try out.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
-    var made = Cap(w, out, size, round, continuity, math.sqrt(0.5), none, true, Growing[CapSide](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](),
+    var made = Cap(w, out, size, none, round, continuity, math.sqrt(0.5), none, true, Growing[CapSide](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](),
                    Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[Runout](), Growing[i64](), Growing[u8]())
     errdefer made.close()
     try made.side_of.fill(w.edges.count, -1)
@@ -222,7 +225,7 @@ func cap_contacts(b: Cap*) -> !:
             let s = try ruling_at(b, &side, t)
             let p = w.points.items[(usize)v]
             b.on_cap.items[(usize)v] = try b.out.add_point(p.add(u.multiply_scalar(c)))
-            b.on_wall.items[(usize)v] = try b.out.add_point(p.add(s.multiply_scalar(try wall_distance(b, lambda))))
+            b.on_wall.items[(usize)v] = try b.out.add_point(p.add(s.multiply_scalar(try wall_distance(b, lambda, try reach_at(b, &side, t)))))
     try cap_runouts(b)
     for v in 0..<w.points.count:
         if flat_end(b, v): b.end_lines.items[v] = try b.line(b.on_cap.items[v], (i64)v)
@@ -260,7 +263,8 @@ func cap_room(b: const Cap*) -> !:
         for k in 0..<(usize)5:
             let t = edge.t0 + (edge.t1 - edge.t0) * (f64)k / 4.0
             let (lambda, c) = try corner_at(b, &side, t)
-            factor = math.max(factor, math.max(c, try wall_distance(b, lambda)) / b.reach)
+            let r = try reach_at(b, &side, t)
+            factor = math.max(factor, math.max(c, try wall_distance(b, lambda, r)) / r)
         most = math.min(most, try offset_room(b, &side))
     var ends = Growing[i64]()
     defer ends.close()
@@ -308,6 +312,7 @@ func offset_room(b: const Cap*, side: const CapSide*) -> f64!:
 ## parallel and square to it, an arc on a cylinder or cone about the cap's
 ## normal. Its strip is then a cylinder, plane, torus or cone.
 func regular_side(b: const Cap*, side: const CapSide*) -> bool!:
+    if b.law != none: return false
     let w = b.w
     let edge = w.edges.items[side.edge]
     let kind = w.carriers.items[(usize)edge.carrier].kind
@@ -356,7 +361,7 @@ func cap_strip(b: Cap*, k: usize) -> !:
         let radius = carrier.a + c * outward
         let c_cap = try b.out.add_carrier(Carrier(1, carrier.origin, carrier.x, carrier.y, radius, radius, -1))
         b.sides.items[k].outer = try b.out.add_edge(ShapeEdge(c_cap, edge.t0, edge.t1, cap_start, cap_end))
-        let down = try wall_distance(b, lambda)
+        let down = try wall_distance(b, lambda, b.reach)
         let wall_radius = carrier.a + down * lambda * outward
         let lowered = carrier.origin.add(side.into_wall.multiply_scalar(down * mu))
         let c_wall = try b.out.add_carrier(Carrier(1, lowered, carrier.x, carrier.y, wall_radius, wall_radius, -1))
@@ -384,7 +389,7 @@ func cap_strip(b: Cap*, k: usize) -> !:
     defer ku.close()
     var wu = Growing[f64]()
     defer wu.close()
-    let du = try section_at(b, lambda, &a, &z, &ku, &wu)
+    let du = try section_at(b, lambda, b.reach, &a, &z, &ku, &wu)
     var net = Growing[Vector3]()
     defer net.close()
     var kv = Growing[f64]()
@@ -395,7 +400,7 @@ func cap_strip(b: Cap*, k: usize) -> !:
     let nv = wv.count
     let nu = a.count
     if b.sides.items[k].outer < 0:
-        if carrier.kind == curve_line and side.ruling == ruling_between:
+        if carrier.kind == curve_line and side.ruling == ruling_between and b.law == none:
             # Exact lines between the contacts.
             b.sides.items[k].outer = try b.line(cap_start, cap_end)
             b.sides.items[k].inner = try b.line(wall_start, wall_end)
@@ -443,7 +448,7 @@ func finish_strip(b: Cap*, k: usize) -> !:
         # the chamfer's, between its contacts.
         let (lambda, c) = try corner_at(b, &side, t)
         let center = corner.add(u.multiply_scalar(c)).add(side.into_wall.multiply_scalar(b.reach))
-        let middle = center.add((try corner.subtract(center).normalized()).multiply_scalar(b.reach)) if b.round else corner.add(u.multiply_scalar(c * 0.5)).add(s.multiply_scalar(try wall_distance(b, lambda) * 0.5))
+        let middle = center.add((try corner.subtract(center).normalized()).multiply_scalar(b.reach)) if b.round else corner.add(u.multiply_scalar(c * 0.5)).add(s.multiply_scalar(try wall_distance(b, lambda, b.reach) * 0.5))
         normal = try normal_at(surf, middle, b.w.tolerance * 100.0)
     b.sides.items[k].sense = normal.dot(outward) > 0.0
     # A fitted strip is parametrized with its normal into the material (its
@@ -511,18 +516,19 @@ func cap_sections(b: Cap*) -> !:
                 b.sections.items[v] = try b.line(head, tail)
                 continue
             let tangent = try (try w.tangent(edge.carrier, t)).normalized()
+            let r = try reach_at(b, &side, t)
             if b.continuity == 1 and math.abs(s.dot(tangent)) <= 1e-12 * s.length():
                 # A circle's arc square to the edge, from the cap's contact
                 # round to the wall's: π - θ.
                 let (_, c) = try corner_at(b, &side, t)
-                let center = corner.add(u.multiply_scalar(c)).add(side.into_wall.multiply_scalar(b.reach))
+                let center = corner.add(u.multiply_scalar(c)).add(side.into_wall.multiply_scalar(r))
                 let x = try b.at(head).subtract(center).normalized()
                 let to_tail = b.at(tail).subtract(center)
                 let y = try to_tail.subtract(x.multiply_scalar(to_tail.dot(x))).normalized()
-                let carrier = try b.out.add_carrier(Carrier(1, center, x, y, b.reach, b.reach, -1))
+                let carrier = try b.out.add_carrier(Carrier(1, center, x, y, r, r, -1))
                 b.sections.items[v] = try b.out.add_edge(ShapeEdge(carrier, 0.0, math.pi - math.acos(lambda), head, tail))
                 continue
-            let degree = try section_at(b, lambda, &a, &z, &ku, &wu)
+            let degree = try section_at(b, lambda, r, &a, &z, &ku, &wu)
             net.clear()
             for i in 0..<a.count: try net.push(corner.add(u.multiply_scalar(a.items[i])).add(s.multiply_scalar(z.items[i])))
             b.sections.items[v] = try b.spline(head, tail, net.view(), wu.view(), ku.view(), degree, true)

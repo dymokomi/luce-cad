@@ -52,6 +52,7 @@ struct Curved:
     var w: const Shape*
     var out: Shape
     var reach: f64
+    var law: const RadiusLaw*?
     var round: bool
     var continuity: i64
     var chamfer: const ChamferSides*?
@@ -79,13 +80,15 @@ struct Curved:
 
 ## Edges `chosen` of `w` blended between their curved faces (see the
 ## file's header): filleted to `size` (`continuity` 1 to 3) when `round`,
-## else chamfered (by `sides` when given); none when they are not such
-## loops.
-pub func curved_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str, sides: const ChamferSides*? = none) -> interop.Reference[CadModel]?!:
+## its radius changing along the loop by `law` when given (`size` then its
+## largest), else chamfered (by `sides` when given); none when they are not
+## such loops.
+pub func curved_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str, sides: const ChamferSides*? = none, law: const RadiusLaw*? = none) -> interop.Reference[CadModel]?!:
     var made = try new_curved(w, size, round, continuity)
     defer made.close()
     let c = &made
     c.chamfer = sides
+    c.law = law
     if not try curved_eligible(c, chosen): return none
     try curved_contacts(c)
     for k in 0..<c.sides.count: try curved_strip(c, k)
@@ -95,7 +98,7 @@ pub func curved_blend(w: const Shape*, chosen: const usize[], size: f64, round: 
 func new_curved(w: const Shape*, size: f64, round: bool, continuity: i64) -> Curved!:
     var out = try shape_copy(w)
     errdefer out.close()
-    var made = Curved(w, out, size, round, continuity, none, Growing[CurvedSide](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[Vector3](), Growing[Field](), Growing[u8]())
+    var made = Curved(w, out, size, none, round, continuity, none, Growing[CurvedSide](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[Vector3](), Growing[Field](), Growing[u8]())
     errdefer made.close()
     try made.side_of.fill(w.edges.count, -1)
     try made.shortened.fill(w.edges.count, -1)
@@ -222,7 +225,8 @@ func section_on(c: Curved*, side: const CurvedSide*, t: f64) -> CurvedSection!:
     if t == edge.t0 or t == edge.t1:
         let shared = c.tangents.items[(usize)(edge.start if t == edge.t0 else edge.end)]
         if shared.length() > 0.0: tangent = (try shared.normalized()).multiply_scalar(1.0 if shared.dot(tangent) >= 0.0 else -1.0)
-    let r = c.reach
+    var r = c.reach
+    if let law = c.law: r = try law.at_edge(w, side.edge, t)
     # Each section searches B-splines afresh (sections far apart along the
     # edge would mislead the last nearest point).
     unseed(&c.fields.items[side.a])
