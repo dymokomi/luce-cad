@@ -19,11 +19,14 @@ pub struct CadSketch:
     ## How many edges the last relink added (its projected faces' loops
     ## gained them).
     var gained_edges: i64
+    ## The dimension last laid out (lay_out).
+    var layout: DimensionLayout
 
     pub func close():
         self.sketch.close()
         self.boxes.close()
         self.projected.close()
+        self.layout.close()
         self.forget()
 
     func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
@@ -35,7 +38,7 @@ pub struct CadSketch:
     pub static func parse(text: str) -> interop.Reference[CadSketch]!:
         var s = try read_sketch(text)
         errdefer s.close()
-        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1), Growing[i64](), Growing[i64](), 0) in memory.heap, cad_sketch_type, memory.heap)
+        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1), Growing[i64](), Growing[i64](), 0, new_dimension_layout()) in memory.heap, cad_sketch_type, memory.heap)
 
     ## The sketch as text.
     pub func text() -> interop.Owned[str]!:
@@ -339,6 +342,48 @@ pub struct CadSketch:
     pub func redundant_count() -> i64:
         let f = self.freedom else return 0
         return (i64)f.redundant.count
+
+    ## Lay out dimension `at` for drawing (sketch/dimensions.lucb), a
+    ## screen point being `pixel` long on the plane: false when it is no
+    ## dimension or measures nothing. layout_line, layout_arrow and
+    ## label_x, label_y read it: lines as x1, y1, x2, y2 (`which` 0 to 3),
+    ## arrowheads as their tip and the unit way they point (x, y, dx, dy).
+    pub func lay_out(at: i64, pixel: f64) -> bool!:
+        if at < 0 or at >= (i64)self.sketch.constraints.count: return false
+        return try lay_out_dimension(&self.sketch, at, pixel, &self.layout)
+
+    pub func layout_line_count() -> i64:
+        return (i64)self.layout.lines.count // 4
+
+    pub func layout_line(at: i64, which: i64) -> f64:
+        return self.layout.lines.items[(usize)(at * 4 + which)]
+
+    pub func layout_arrow_count() -> i64:
+        return (i64)self.layout.arrows.count // 4
+
+    pub func layout_arrow(at: i64, which: i64) -> f64:
+        return self.layout.arrows.items[(usize)(at * 4 + which)]
+
+    pub func label_x() -> f64:
+        return self.layout.label_x
+
+    pub func label_y() -> f64:
+        return self.layout.label_y
+
+    ## Put dimension `at`'s label at (`x`, `y`): it stays there as placed
+    ## relative to what it measures (the sketch's text keeps it).
+    pub func place_label(at: i64, x: f64, y: f64) -> !:
+        if at < 0 or at >= (i64)self.sketch.constraints.count: error(invalid, "the sketch has no such dimension")
+        let found = dimension_frame(&self.sketch, at)
+        let f = found else error(invalid, "the dimension measures nothing to place its label by")
+        let (a, b) = label_numbers(&f, x, y)
+        self.sketch.constraints.items[(usize)at].placed = true
+        self.sketch.constraints.items[(usize)at].label_a = a
+        self.sketch.constraints.items[(usize)at].label_b = b
+
+    ## Whether dimension `at`'s label was put somewhere (place_label).
+    pub func label_placed(at: i64) -> bool:
+        return self.sketch.constraints.items[(usize)at].placed
 
     ## Fusion's MODIFY tools (sketch/modify.lucb). Trim the piece of curve
     ## `curve` round (`x`, `y`) between its nearest crossings (the whole

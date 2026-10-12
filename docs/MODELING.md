@@ -642,6 +642,20 @@ the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
   conics) are fit point splines outside the relation. Removing the constraint removes the
   relation. Without `relation`, each line copy gets its own parallel and distance (what the
   editor uses until Stage 3 moves it over).
+- **Dimensions drawn** (`dimensions.lucb`), as drawings draw them. `lay_out(at, pixel)` gives a
+  dimension's lines, arrowheads and label place on the plane, with screen sizes (gaps,
+  overshoots, the default offset) in multiples of `pixel`, a screen point's length there:
+  - a length: extension lines square to a dimension line through the label, with an arrow at
+    each end (outside, pointing in, when the ends are close on screen); a point's distance from
+    a line starts its extension on the line;
+  - a radius or diameter: a line through the center at the label's angle, arrows on the curve;
+  - an angle: an arc between the lines' rays, with extension lines along them when it lies past
+    their segments; an Offset relation is a length across the copy and its source.
+
+  `place_label(at, x, y)` keeps where a label was put as two numbers measured from what the
+  dimension measures (`SketchConstraint.label_a`, `label_b`; the text's `g` lines), so it moves
+  with the geometry. An unplaced label sits a little off the geometry, outward of the sketch's
+  middle.
 
 Not yet: ellipses, splines, slots and text; curvature (G2) and polygon constraints; Blend Curve.
 

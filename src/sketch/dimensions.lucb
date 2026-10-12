@@ -1,0 +1,401 @@
+## How a sketch's dimensions are drawn, as drawings draw them: extension
+## lines from the measured geometry to a dimension line with an arrowhead
+## at each end and the value over it; a radius or diameter by a line through
+## the center with arrows at the curve; an angle by an arc between the two
+## lines. Everything is in sketch coordinates; sizes meant for the screen
+## (gaps, overshoots, the default offset) are in multiples of `pixel`, a
+## screen point's size on the plane, so a dimension keeps its look at any
+## zoom.
+##
+## Each dimension has a frame (dimension_frame): what it measures, reduced
+## to points and directions. Its label sits by two numbers kept on the
+## constraint (SketchConstraint.label_a, label_b), measured in that frame,
+## so a label that was put somewhere moves with the geometry:
+##   lengths     its offset across the dimension line and along it, from the
+##               middle of what is measured (mm)
+##   radius, Ø   the angle of its leader (radians) and its distance from the
+##               center (mm)
+##   angles      the arc's radius (mm) and where along the sweep (0 at the
+##               first line, 1 at the second)
+## An unplaced label goes a little off the geometry, outward from the
+## sketch's middle.
+
+## Screen points from the geometry to an extension line's start, and past
+## the dimension line to its end.
+let extension_gap = 3.0
+let extension_overshoot = 5.0
+## Screen points an unplaced label sits off the geometry.
+let default_offset = 26.0
+## Below this many screen points between its ends, a length's arrows go
+## outside, pointing in.
+let narrow_span = 28.0
+## Pieces of an angle's arc.
+let arc_pieces: usize = 32
+
+## What a dimension measures: a length between `a` and `b` along `d`; a
+## radius or diameter of a circle about `c`; an angle at `c` from direction
+## `d` turning by `sweep`. `has_segment`: a length whose `a` is on a line
+## running from `s0` to `s1` (a point's distance from a line: the extension
+## line starts on the line itself). An angle's lines run from the vertex
+## between `t0` and `t1` (first) and `u0` and `u1` (second) along their rays.
+pub struct DimensionFrame:
+    ## 0 a length, 1 a radius, 2 a diameter, 3 an angle.
+    pub var shape: i64 = 0
+    pub var ax: f64 = 0.0
+    pub var ay: f64 = 0.0
+    pub var bx: f64 = 0.0
+    pub var by: f64 = 0.0
+    pub var dx: f64 = 1.0
+    pub var dy: f64 = 0.0
+    pub var cx: f64 = 0.0
+    pub var cy: f64 = 0.0
+    pub var r: f64 = 0.0
+    pub var sweep: f64 = 0.0
+    pub var has_segment: bool = false
+    pub var s0: f64 = 0.0
+    pub var s1: f64 = 0.0
+    pub var t0: f64 = 0.0
+    pub var t1: f64 = 0.0
+    pub var u0: f64 = 0.0
+    pub var u1: f64 = 0.0
+    ## An arc's middle angle, where its radius goes by default (NaN: a
+    ## circle's, at 45°).
+    pub var middle: f64 = 0.0
+    ## Which side of the dimension line an unplaced label goes (+1 along
+    ## the normal (-dy, dx), -1 against it).
+    pub var out: f64 = 1.0
+
+## A dimension as drawn: its lines (x1, y1, x2, y2 each), its arrowheads
+## (tip x, y and the unit direction they point, x, y each) and its label's
+## middle.
+pub struct DimensionLayout:
+    pub var lines: Growing[f64]
+    pub var arrows: Growing[f64]
+    pub var label_x: f64
+    pub var label_y: f64
+
+    pub func close():
+        self.lines.close()
+        self.arrows.close()
+
+    func line(x1: f64, y1: f64, x2: f64, y2: f64) -> !:
+        for value in [x1, y1, x2, y2]: try self.lines.push(value)
+
+    func arrow(x: f64, y: f64, dx: f64, dy: f64) -> !:
+        for value in [x, y, dx, dy]: try self.arrows.push(value)
+
+pub func new_dimension_layout() -> DimensionLayout:
+    return DimensionLayout(Growing[f64](), Growing[f64](), 0.0, 0.0)
+
+## Constraint `at`'s frame, or none when it is no dimension or what it
+## measures has no size (two points on each other).
+pub func dimension_frame(sketch: const Sketch*, at: i64) -> DimensionFrame?:
+    let k = sketch.constraints.items[(usize)at]
+    var f = DimensionFrame()
+    if k.kind == ConstraintKind.distance or k.kind == ConstraintKind.horizontal_distance or k.kind == ConstraintKind.vertical_distance:
+        f.ax = sketch.x(k.first)
+        f.ay = sketch.y(k.first)
+        f.bx = sketch.x(k.second)
+        f.by = sketch.y(k.second)
+        if k.kind == ConstraintKind.horizontal_distance:
+            f.dx = 1.0
+            f.dy = 0.0
+        elif k.kind == ConstraintKind.vertical_distance:
+            f.dx = 0.0
+            f.dy = 1.0
+        elif not unit_between(&f, f.ax, f.ay, f.bx, f.by):
+            return none
+        # A line's own length: the label outward of the sketch's middle.
+        f.out = outward_side(sketch, (f.ax + f.bx) * 0.5, (f.ay + f.by) * 0.5, -f.dy, f.dx)
+        return f
+    if k.kind == ConstraintKind.line_distance:
+        return point_line_frame(sketch, k.first, k.second)
+    if k.kind == ConstraintKind.offset:
+        let source = sketch.entity(k.first)
+        if source.kind == EntityKind.line:
+            return point_line_frame(sketch, sketch.point_of(sketch.entity(k.second), 0), k.first)
+        # Concentric copies: across both radii, on a ray at the source's
+        # middle (an arc's) or at 45° (a circle's).
+        let c = sketch.point_of(source, 0)
+        let angle = arc_middle(sketch, source)
+        let ux = math.cos(angle)
+        let uy = math.sin(angle)
+        let r1 = sketch.params.items[(usize)sketch.scalar_of(source)]
+        let r2 = sketch.params.items[(usize)sketch.scalar_of(sketch.entity(k.second))]
+        f.ax = sketch.x(c) + ux * r1
+        f.ay = sketch.y(c) + uy * r1
+        f.bx = sketch.x(c) + ux * r2
+        f.by = sketch.y(c) + uy * r2
+        if not unit_between(&f, f.ax, f.ay, f.bx, f.by): return none
+        return f
+    if k.kind == ConstraintKind.radius or k.kind == ConstraintKind.diameter:
+        let e = sketch.entity(k.first)
+        let scalar = sketch.scalar_of(e)
+        if scalar < 0: return none
+        let c = sketch.point_of(e, 0)
+        f.shape = 1 if k.kind == ConstraintKind.radius else 2
+        f.cx = sketch.x(c)
+        f.cy = sketch.y(c)
+        f.r = sketch.params.items[(usize)scalar]
+        f.middle = arc_middle(sketch, e)
+        return f
+    if k.kind == ConstraintKind.angle:
+        return angle_frame(sketch, k.first, k.second, k.value)
+    return none
+
+## The frame of point `point`'s distance from line `line`: from the point's
+## foot on the line to the point, the extension line starting on the line.
+func point_line_frame(sketch: const Sketch*, point: i64, line: i64) -> DimensionFrame?:
+    let l = sketch.entity(line)
+    let p0 = sketch.point_of(l, 0)
+    let p1 = sketch.point_of(l, 1)
+    let x0 = sketch.x(p0)
+    let y0 = sketch.y(p0)
+    let lx = sketch.x(p1) - x0
+    let ly = sketch.y(p1) - y0
+    let length = math.hypot(lx, ly)
+    if length <= 0.0: return none
+    let point_x = sketch.x(point)
+    let point_y = sketch.y(point)
+    let t = ((point_x - x0) * lx + (point_y - y0) * ly) / (length * length)
+    var f = DimensionFrame()
+    f.ax = x0 + lx * t
+    f.ay = y0 + ly * t
+    f.bx = point_x
+    f.by = point_y
+    if not unit_between(&f, f.ax, f.ay, f.bx, f.by): return none
+    f.has_segment = true
+    # The line's run along the dimension line's normal (-dy, dx).
+    f.s0 = (x0 - f.ax) * -f.dy + (y0 - f.ay) * f.dx
+    f.s1 = (x0 + lx - f.ax) * -f.dy + (y0 + ly - f.ay) * f.dx
+    # Beside the line's segment, on the side away from its middle.
+    let middle = (f.s0 + f.s1) * 0.5
+    f.out = 1.0 if middle <= 0.0 else -1.0
+    return f
+
+## The frame of the angle `value` from line `first` to line `second`: at
+## their crossing, from the first line's ray toward its segment, turning
+## by the value (so the arc shows the angle the dimension holds).
+func angle_frame(sketch: const Sketch*, first: i64, second: i64, value: f64) -> DimensionFrame?:
+    let a = sketch.entity(first)
+    let b = sketch.entity(second)
+    let a0 = sketch.point_of(a, 0)
+    let a1 = sketch.point_of(a, 1)
+    let b0 = sketch.point_of(b, 0)
+    let b1 = sketch.point_of(b, 1)
+    let ax = sketch.x(a0)
+    let ay = sketch.y(a0)
+    let adx = sketch.x(a1) - ax
+    let ady = sketch.y(a1) - ay
+    let bx = sketch.x(b0)
+    let by = sketch.y(b0)
+    let bdx = sketch.x(b1) - bx
+    let bdy = sketch.y(b1) - by
+    let cross = adx * bdy - ady * bdx
+    let la = math.hypot(adx, ady)
+    let lb = math.hypot(bdx, bdy)
+    if la <= 0.0 or lb <= 0.0 or math.abs(cross) <= 1e-12 * la * lb: return none
+    # The crossing: a + s (b - a)'s direction.
+    let s = ((bx - ax) * bdy - (by - ay) * bdx) / cross
+    var f = DimensionFrame()
+    f.shape = 3
+    f.cx = ax + adx * s
+    f.cy = ay + ady * s
+    f.dx = adx / la
+    f.dy = ady / la
+    # Toward the first segment's middle.
+    if (ax + adx * 0.5 - f.cx) * f.dx + (ay + ady * 0.5 - f.cy) * f.dy < 0.0:
+        f.dx = -f.dx
+        f.dy = -f.dy
+    f.sweep = value
+    # Where each segment lies along its ray from the vertex.
+    f.t0 = (ax - f.cx) * f.dx + (ay - f.cy) * f.dy
+    f.t1 = (ax + adx - f.cx) * f.dx + (ay + ady - f.cy) * f.dy
+    let rx = math.cos(value) * f.dx - math.sin(value) * f.dy
+    let ry = math.sin(value) * f.dx + math.cos(value) * f.dy
+    f.u0 = (bx - f.cx) * rx + (by - f.cy) * ry
+    f.u1 = (bx + bdx - f.cx) * rx + (by + bdy - f.cy) * ry
+    return f
+
+## `f`'s direction from (`ax`, `ay`) to (`bx`, `by`); false when they are
+## one point.
+func unit_between(f: DimensionFrame*, ax: f64, ay: f64, bx: f64, by: f64) -> bool:
+    let length = math.hypot(bx - ax, by - ay)
+    if length <= 0.0: return false
+    f.dx = (bx - ax) / length
+    f.dy = (by - ay) / length
+    return true
+
+## +1 when normal (`nx`, `ny`) at (`x`, `y`) points away from the middle
+## of the sketch's points, else -1.
+func outward_side(sketch: const Sketch*, x: f64, y: f64, nx: f64, ny: f64) -> f64:
+    var sx = 0.0
+    var sy = 0.0
+    var count = 0.0
+    for at in 0..<sketch.entities.count:
+        if sketch.entities.items[at].kind != EntityKind.point: continue
+        sx += sketch.x((i64)at)
+        sy += sketch.y((i64)at)
+        count += 1.0
+    if count == 0.0: return 1.0
+    return 1.0 if (x - sx / count) * nx + (y - sy / count) * ny >= 0.0 else -1.0
+
+## An arc's middle angle, or 45° for a circle.
+func arc_middle(sketch: const Sketch*, e: SketchEntity) -> f64:
+    if e.kind != EntityKind.arc: return math.pi * 0.25
+    let c = e.first
+    let start = math.atan2(sketch.y(e.third) - sketch.y(c), sketch.x(e.third) - sketch.x(c))
+    var end = math.atan2(sketch.y(e.fourth) - sketch.y(c), sketch.x(e.fourth) - sketch.x(c))
+    while end <= start: end += 2.0 * math.pi
+    return (start + end) * 0.5
+
+## The label's two numbers in frame `f` for a label put at (`x`, `y`).
+pub func label_numbers(f: const DimensionFrame*, x: f64, y: f64) -> (f64, f64):
+    if f.shape == 0:
+        let mx = (f.ax + f.bx) * 0.5
+        let my = (f.ay + f.by) * 0.5
+        return ((x - mx) * -f.dy + (y - my) * f.dx, (x - mx) * f.dx + (y - my) * f.dy)
+    if f.shape == 1 or f.shape == 2:
+        return (math.atan2(y - f.cy, x - f.cx), math.hypot(x - f.cx, y - f.cy))
+    # An angle: the radius, and how far round the sweep from the first ray.
+    let radius = math.hypot(x - f.cx, y - f.cy)
+    let turned = math.atan2((x - f.cx) * -f.dy + (y - f.cy) * f.dx, (x - f.cx) * f.dx + (y - f.cy) * f.dy)
+    var fraction = 0.5
+    if math.abs(f.sweep) > 1e-12:
+        fraction = turned / f.sweep
+        # Turned the other way round, past the start: measured from there.
+        if fraction < -0.5: fraction += 2.0 * math.pi / math.abs(f.sweep)
+    return (radius, fraction)
+
+## The label's two numbers for constraint `k` in frame `f`: where it was
+## put, else the default `pixel` points off the geometry.
+func label_of(k: SketchConstraint, f: const DimensionFrame*, pixel: f64) -> (f64, f64):
+    if k.placed: return (k.label_a, k.label_b)
+    if f.shape == 0: return (f.out * default_offset * pixel, 0.0)
+    if f.shape == 1 or f.shape == 2: return (f.middle, f.r + default_offset * pixel)
+    let reach = math.max(math.max(math.abs(f.t0), math.abs(f.t1)), math.max(math.abs(f.u0), math.abs(f.u1)))
+    return (math.max(40.0 * pixel, reach * 0.6), 0.5)
+
+## Lay out constraint `at` of `sketch` into `out` (cleared): false when it
+## is no dimension, or what it measures has no size.
+pub func lay_out_dimension(sketch: const Sketch*, at: i64, pixel: f64, out: DimensionLayout*) -> bool!:
+    out.lines.clear()
+    out.arrows.clear()
+    let found = dimension_frame(sketch, at)
+    let f = found else return false
+    let (first, second) = label_of(sketch.constraints.items[(usize)at], &f, pixel)
+    if f.shape == 0: try lay_out_length(&f, first, second, pixel, out)
+    elif f.shape == 3: try lay_out_angle(&f, first, second, pixel, out)
+    else: try lay_out_round(&f, first, second, out)
+    return true
+
+## A length: extension lines square to the dimension line, which runs
+## through the label with an arrow at each end (outside, pointing in, when
+## the ends are close on screen); out to the label when it was put beyond
+## an end.
+func lay_out_length(f: const DimensionFrame*, across: f64, along: f64, pixel: f64, out: DimensionLayout*) -> !:
+    let nx = -f.dy
+    let ny = f.dx
+    let mx = (f.ax + f.bx) * 0.5
+    let my = (f.ay + f.by) * 0.5
+    let lx = mx + nx * across + f.dx * along
+    let ly = my + ny * across + f.dy * along
+    out.label_x = lx
+    out.label_y = ly
+    # The dimension line's ends: each measured point moved across to it.
+    let ha = (lx - f.ax) * nx + (ly - f.ay) * ny
+    let hb = (lx - f.bx) * nx + (ly - f.by) * ny
+    let pax = f.ax + nx * ha
+    let pay = f.ay + ny * ha
+    let pbx = f.bx + nx * hb
+    let pby = f.by + ny * hb
+    # Extension lines from the geometry (a line's low_end piece, for a
+    # point's distance from it) past the dimension line.
+    var start_a = 0.0
+    if f.has_segment:
+        # The line runs from s0 to s1 across; the extension starts where it
+        # is low_end the dimension line.
+        start_a = math.max(math.min(f.s0, f.s1), math.min(math.max(f.s0, f.s1), ha))
+    try extension_line(out, f.ax, f.ay, nx, ny, start_a, ha, pixel)
+    try extension_line(out, f.bx, f.by, nx, ny, 0.0, hb, pixel)
+    let span = math.hypot(pbx - pax, pby - pay)
+    # Along the dimension line from its first end.
+    let t = (lx - pax) * f.dx + (ly - pay) * f.dy
+    if span < narrow_span * pixel:
+        # Too close for arrows inside: outside, pointing in, on stubs.
+        let stub = 14.0 * pixel
+        try out.line(pax - f.dx * stub, pay - f.dy * stub, pbx + f.dx * stub, pby + f.dy * stub)
+        try out.arrow(pax, pay, f.dx, f.dy)
+        try out.arrow(pbx, pby, -f.dx, -f.dy)
+    else:
+        try out.line(pax, pay, pbx, pby)
+        try out.arrow(pax, pay, -f.dx, -f.dy)
+        try out.arrow(pbx, pby, f.dx, f.dy)
+    # A label beyond an end: the dimension line goes on out to it.
+    if t < 0.0: try out.line(pax, pay, lx, ly)
+    elif t > span: try out.line(pbx, pby, lx, ly)
+
+## An extension line at (`x`, `y`) along (`nx`, `ny`): from `start` (a gap
+## past it toward the dimension line) to the dimension line at `end`, and
+## a little beyond.
+func extension_line(out: DimensionLayout*, x: f64, y: f64, nx: f64, ny: f64, start: f64, end: f64, pixel: f64) -> !:
+    let way = 1.0 if end >= start else -1.0
+    let begin = start + way * extension_gap * pixel
+    let finish = end + way * extension_overshoot * pixel
+    if (finish - begin) * way <= 0.0: return
+    try out.line(x + nx * begin, y + ny * begin, x + nx * finish, y + ny * finish)
+
+## A radius or diameter: a line through the center at the label's angle,
+## arrows on the curve pointing out (a diameter's at both ends), on out to
+## the label when it is beyond the curve.
+func lay_out_round(f: const DimensionFrame*, angle: f64, distance: f64, out: DimensionLayout*) -> !:
+    let ux = math.cos(angle)
+    let uy = math.sin(angle)
+    out.label_x = f.cx + ux * distance
+    out.label_y = f.cy + uy * distance
+    let reach = math.max(f.r, distance)
+    let back = -f.r if f.shape == 2 else 0.0
+    try out.line(f.cx + ux * back, f.cy + uy * back, f.cx + ux * reach, f.cy + uy * reach)
+    try out.arrow(f.cx + ux * f.r, f.cy + uy * f.r, ux, uy)
+    if f.shape == 2: try out.arrow(f.cx - ux * f.r, f.cy - uy * f.r, -ux, -uy)
+
+## An angle: an arc of radius `radius` about the vertex from the first ray
+## through the sweep (on round to the label when it was put past either
+## end), arrows at its ends along it, and extension lines along each ray
+## where the arc lies past (or short of) its segment.
+func lay_out_angle(f: const DimensionFrame*, radius: f64, fraction: f64, pixel: f64, out: DimensionLayout*) -> !:
+    let base = math.atan2(f.dy, f.dx)
+    let at = base + f.sweep * fraction
+    out.label_x = f.cx + math.cos(at) * radius
+    out.label_y = f.cy + math.sin(at) * radius
+    let low = math.min(0.0, fraction)
+    let high = math.max(1.0, fraction)
+    var previous_x = f.cx + math.cos(base + f.sweep * low) * radius
+    var previous_y = f.cy + math.sin(base + f.sweep * low) * radius
+    for piece in 1..<arc_pieces + 1:
+        let angle = base + f.sweep * (low + (high - low) * (f64)piece / (f64)arc_pieces)
+        let x = f.cx + math.cos(angle) * radius
+        let y = f.cy + math.sin(angle) * radius
+        try out.line(previous_x, previous_y, x, y)
+        previous_x = x
+        previous_y = y
+    # The arrows along the arc, pointing away from its inside.
+    let way = 1.0 if f.sweep >= 0.0 else -1.0
+    let end = base + f.sweep
+    try out.arrow(f.cx + math.cos(base) * radius, f.cy + math.sin(base) * radius, way * math.sin(base), -way * math.cos(base))
+    try out.arrow(f.cx + math.cos(end) * radius, f.cy + math.sin(end) * radius, -way * math.sin(end), way * math.cos(end))
+    try ray_extension(out, f.cx, f.cy, base, f.t0, f.t1, radius, pixel)
+    try ray_extension(out, f.cx, f.cy, end, f.u0, f.u1, radius, pixel)
+
+## Along the ray from (`cx`, `cy`) at `angle`, a segment from `t0` to `t1`:
+## an extension line from it to the arc at `radius` when the arc is past
+## it (or short of it).
+func ray_extension(out: DimensionLayout*, cx: f64, cy: f64, angle: f64, t0: f64, t1: f64, radius: f64, pixel: f64) -> !:
+    let ux = math.cos(angle)
+    let uy = math.sin(angle)
+    let low_end = math.min(t0, t1)
+    let high_end = math.max(t0, t1)
+    if radius > high_end:
+        try extension_line(out, cx, cy, ux, uy, high_end, radius, pixel)
+    elif radius < low_end:
+        try extension_line(out, cx, cy, ux, uy, low_end, radius, pixel)
