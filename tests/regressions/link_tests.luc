@@ -1,0 +1,65 @@
+## Projections made and repaired away from the body (sketch/shadows.lucb,
+## CadSketch's links): a box's edges cast, carried as text and read back
+## where no body is, the one under a point projected with its link; a
+## face's projection known by name; a link pointed at an edge that is gone
+## lost at the next relink (named), re-linked to an edge, or broken.
+from luce_cad.sketch import CadSketch, CadProjection, CadShadows
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from luce_std import math
+
+func near(a: float, b: float) -> bool:
+    return math.abs(a - b) <= 1e-6 * math.max(1.0, math.abs(b))
+
+## The name of `model`'s flat face whose outward normal is +Y.
+func top_name(model: CadModel) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let frame = CadModeling.face_frame(model, name)
+        if frame.found and frame.u.cross(frame.v).y > 0.99:
+            return name
+    assert(false, "no top face")
+    return ""
+
+pub func link_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(4.0, 2.0, 2.0), "box")
+    let top = top_name(box)
+    let frame = CadModeling.face_frame(box, top)
+    let origin = Vector3(0.0, 1.0, 0.0)
+    let cast = CadProjection.of(box, origin, frame.u, frame.v)
+    # Carried as text: the same edges, the same one nearest a point.
+    let shadows = CadShadows.parse(CadShadows.text_of(cast))
+    assert(shadows.edge_count() == cast.edge_count())
+    let x = 2.0 if math.abs(frame.u.x) > 0.5 else 0.0
+    let y = 0.0 if math.abs(frame.u.x) > 0.5 else 2.0
+    let edge = shadows.nearest(x, y, 0.01)
+    assert(edge >= 0 and edge == cast.nearest(x, y, 0.01))
+    assert(shadows.reference(edge) == cast.reference(edge))
+    assert(CadShadows.parse("").edge_count() == 0)
+    # Projected from the shadows: a linked line that follows the box.
+    let s = CadSketch.parse("")
+    let line = s.project_shadow(shadows, edge)
+    assert(s.linked(line) and s.link_count() == 1)
+    let wider = CadModeling.tagged(CadSolids.box(6.0, 2.0, 2.0), "box")
+    assert(s.relink(wider, origin, frame.u, frame.v) == 0 and not s.lost_link(line))
+    let moved = s.part(line, 0)
+    # The +X end's edge, now at x = 3.
+    assert(near(math.abs(s.x(moved) if math.abs(frame.u.x) > 0.5 else s.y(moved)), 3.0), f"{s.x(moved)}, {s.y(moved)}")
+    # A face's loops: known by name.
+    let f = CadSketch.parse("")
+    assert(not f.projects_face(top))
+    _ = f.project_face(box, top, origin, frame.u, frame.v)
+    assert(f.projects_face(top) and not f.projects_face("nothing"))
+    # Pointed at an edge that is not there: lost at the next relink, kept
+    # where it was; re-linked to the edge, found again; broken, a plain
+    # curve.
+    s.link_to(line, "nowhere")
+    assert(s.relink(wider, origin, frame.u, frame.v) == 1 and s.lost_link(line) and s.linked(line))
+    s.link_to(line, shadows.reference(edge))
+    assert(s.relink(wider, origin, frame.u, frame.v) == 0 and not s.lost_link(line))
+    s.break_link(line)
+    assert(not s.linked(line) and s.link_count() == 0)
+    assert(CadSketch.parse(s.text()).link_count() == 0)
+    print("PASS links: a box's edges cast, carried as text and projected from it, linked and following the box; a face's projection known by name; a link to an edge that is gone lost (kept where it was), re-linked, and broken")

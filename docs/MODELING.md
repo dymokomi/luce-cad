@@ -633,6 +633,13 @@ the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
     is counted (a warning);
   - edges a projected face's loops gained (a notch cut into it) are projected too, `gained()`
     of them.
+
+  Lost links are named: `lost_link(at)` after a relink. `link_to(at, reference)` points a curve
+  at another edge (Re-link), `break_link(at)` makes it a plain curve (Break Link), `linked(at)`
+  and `projects_face(name)` say what is projected. A cast can travel without its body
+  (`shadows.lucb`): `CadShadows.text_of(projection)` writes every edge's samples and reference
+  where the body is (the editor's compute worker), `CadShadows.parse` reads them where it is
+  not, and `project_shadow(shadows, edge)` projects one, linked as `project` would.
 - **Offset relation.** `offset(curves, distance, x, y, relation = true)` holds the whole chain's
   copies by one constraint (`ConstraintKind.offset`): one value, one dimension. Its first pair is
   the constraint's own curves; the others are the sketch's `offsets`, grouped by the first copy.

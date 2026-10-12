@@ -1,0 +1,116 @@
+## A projection's shadows carried as text: what CadProjection casts (each
+## edge's samples on the plane) with each edge's reference, without the
+## body. A cast made where the body is (the editor's compute worker) is
+## written with CadProjection.shadows_text, and read where it is not
+## (CadShadows.parse): there the editor draws the shadows, finds the one
+## under the pointer and projects it (CadSketch.project_shadow), linked by
+## its reference as a projection made from the body is.
+##
+## The text: a line per edge, `e <reference> <x> <y> …`, the reference
+## escaped as a sketch text's words, `projection_per_edge` x, y pairs.
+
+pub struct CadShadows:
+    var samples: Growing[f64]
+    ## Each edge's reference, a run of `names`.
+    var starts: Growing[usize]
+    var names: Growing[u8]
+
+    pub func close():
+        self.samples.close()
+        self.starts.close()
+        self.names.close()
+
+    func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
+        _ = visit
+        _ = context
+
+    ## The shadows `text` describes (empty: none).
+    pub static func parse(text: str) -> interop.Reference[CadShadows]!:
+        var samples = Growing[f64]()
+        errdefer samples.close()
+        var starts = Growing[usize]()
+        errdefer starts.close()
+        var names = Growing[u8]()
+        errdefer names.close()
+        let per = projection_per_edge()
+        var fields: str[72] = ---
+        for at in 0..<(usize)72: fields[at] = ""
+        let bytes = text.bytes
+        var start: usize = 0
+        while start < bytes.length:
+            var end = start
+            while end < bytes.length and bytes[end] != 10: end += 1
+            let count = split((str)bytes[start..<end], fields[0..])
+            start = end + 1
+            if count == 0: continue
+            if fields[0] != "e" or count != 2 + 2 * per: error(invalid, "a shadows text has a line it does not know")
+            try starts.push(names.count)
+            try unescape(fields[1], &names)
+            for at in 0..<2 * per:
+                try samples.push(try strings.parse_f64(fields[2 + at]))
+        try starts.push(names.count)
+        return try interop.Reference[CadShadows].adopt(new CadShadows(samples, starts, names) in memory.heap, cad_shadows_type, memory.heap)
+
+    pub func edge_count() -> i64:
+        return (i64)(self.samples.count // (2 * projection_per_edge()))
+
+    ## The edge whose shadow passes nearest (`x`, `y`), within `reach`, or -1.
+    pub func nearest(x: f64, y: f64, reach: f64) -> i64:
+        return nearest_run(self.samples.view(), x, y, reach)
+
+    ## Edge `edge`'s reference.
+    pub func reference(edge: i64) -> interop.Owned[str]!:
+        if edge < 0 or edge >= self.edge_count(): error(invalid, "the shadows have no such edge")
+        return try interop.copy_text((str)self.names.view()[self.starts.items[(usize)edge]..<self.starts.items[(usize)edge + 1]])
+
+    ## `projection`'s shadows as text, every edge's reference with its
+    ## samples (made where the body is).
+    pub static func text_of(projection: interop.Reference[CadProjection]) -> interop.Owned[str]!:
+        let p = try projection.get()
+        let per = projection_per_edge()
+        let samples = projection_samples(p)
+        var w = try shape_of(p.model.value())
+        defer w.close()
+        var out = Growing[u8]()
+        defer out.close()
+        var reference = Growing[u8]()
+        defer reference.close()
+        for e in 0..<samples.length // (2 * per):
+            reference.clear()
+            try references_of(&w, [(i64)e], &reference)
+            try put_text(&out, "e ")
+            try put_escaped(&out, (str)reference.view())
+            for value in samples[e * 2 * per..<(e + 1) * 2 * per]:
+                try put_number(&out, value)
+            try out.push(10)
+        return try interop.copy_text((str)out.view())
+
+    ## Edge `edge`'s samples (x, y pairs on the plane).
+    func run(edge: i64) -> const f64[]:
+        let per = projection_per_edge()
+        return self.samples.view()[(usize)edge * 2 * per..<((usize)edge + 1) * 2 * per]
+
+pub let cad_shadows_type: interop.Type[CadShadows] = interop.Type[CadShadows]("CadShadows", CadShadows.close, CadShadows.trace, closeable = true)
+
+## The samples of shadows (x, y pairs, projection_per_edge an edge), for
+## the editor's drawing.
+pub func shadow_samples(s: const CadShadows*) -> const f64[]:
+    return s.samples.view()
+
+## The run (of `projection_per_edge` x, y pairs) in `samples` passing
+## nearest (`x`, `y`) within `reach`, an edge seen end-on skipped; -1 for
+## none.
+func nearest_run(samples: const f64[], x: f64, y: f64, reach: f64) -> i64:
+    let per = projection_per_edge()
+    var best: i64 = -1
+    var best_distance = reach
+    for e in 0..<samples.length // (2 * per):
+        let run = samples[e * 2 * per..<(e + 1) * 2 * per]
+        if end_on(run, 1e-9 * math.max(1.0, reach)): continue
+        for k in 0..<per - 1:
+            let d = segment_distance(x, y, run[2 * k], run[2 * k + 1], run[2 * k + 2], run[2 * k + 3])
+            if d <= best_distance:
+                best_distance = d
+                best = (i64)e
+    return best
+

@@ -21,12 +21,15 @@ pub struct CadSketch:
     var gained_edges: i64
     ## The dimension last laid out (lay_out).
     var layout: DimensionLayout
+    ## The curves whose links the last relink lost.
+    var lost: Growing[i64]
 
     pub func close():
         self.sketch.close()
         self.boxes.close()
         self.projected.close()
         self.layout.close()
+        self.lost.close()
         self.forget()
 
     func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
@@ -38,7 +41,7 @@ pub struct CadSketch:
     pub static func parse(text: str) -> interop.Reference[CadSketch]!:
         var s = try read_sketch(text)
         errdefer s.close()
-        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1), Growing[i64](), Growing[i64](), 0, new_dimension_layout()) in memory.heap, cad_sketch_type, memory.heap)
+        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1), Growing[i64](), Growing[i64](), 0, new_dimension_layout(), Growing[i64]()) in memory.heap, cad_sketch_type, memory.heap)
 
     ## The sketch as text.
     pub func text() -> interop.Owned[str]!:
@@ -250,9 +253,58 @@ pub struct CadSketch:
     ## gained are projected too; gained() says how many.
     pub func relink(model: interop.Reference[CadModel], origin: Vector3, u: Vector3, v: Vector3) -> i64!:
         self.forget()
-        let (lost, gained) = try relink_sketch(&self.sketch, model.value(), origin, u, v)
+        let (lost, gained) = try relink_sketch(&self.sketch, model.value(), origin, u, v, &self.lost)
         self.gained_edges = gained
         return lost
+
+    ## Whether entity `at` lost its link at the last relink (it stays as it
+    ## was: a warning, drawn apart).
+    pub func lost_link(at: i64) -> bool:
+        for entity in self.lost.view():
+            if entity == at: return true
+        return false
+
+    ## Whether entity `at` is projected: linked to a body edge.
+    pub func linked(at: i64) -> bool:
+        for l in self.sketch.links.view():
+            if l.entity == at: return true
+        return false
+
+    ## Break curve `at`'s link (Fusion's Break Link): it stays where it is,
+    ## a plain curve.
+    pub func break_link(at: i64):
+        self.forget()
+        self.sketch.unlink(at)
+        var kept: usize = 0
+        for at_lost in 0..<self.lost.count:
+            if self.lost.items[at_lost] == at: continue
+            self.lost.items[kept] = self.lost.items[at_lost]
+            kept += 1
+        self.lost.count = kept
+
+    ## Link curve `at` to the body edge `reference` names instead (Re-link
+    ## of a lost projection); the next relink moves it onto that edge.
+    pub func link_to(at: i64, reference: str) -> !:
+        self.forget()
+        self.sketch.unlink(at)
+        try self.sketch.link(at, reference)
+
+    ## Whether the loops of face `name` are projected (project_face).
+    pub func projects_face(name: str) -> bool:
+        for f in self.sketch.faces.view():
+            if self.sketch.face_reference(f) == name: return true
+        return false
+
+    ## Project edge `edge` of `shadows` (a cast made where the body is,
+    ## sketch/shadows.lucb) into the sketch, fixed and linked to its edge,
+    ## as project does from the body.
+    pub func project_shadow(shadows: interop.Reference[CadShadows], edge: i64) -> i64!:
+        self.forget()
+        let s = try shadows.get()
+        if edge < 0 or edge >= s.edge_count(): error(invalid, "the shadows have no such edge")
+        var reference = try s.reference(edge)
+        defer reference.release()
+        return try add_shadow(&self.sketch, s.run(edge), reference.value)
 
     pub func gained() -> i64:
         return self.gained_edges
