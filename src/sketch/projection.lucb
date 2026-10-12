@@ -167,52 +167,178 @@ func circle_through(run: const f64[], tolerance: f64) -> f64[3]?:
 
 ## Cast every linked edge of `sketch` again from `model` onto the plane
 ## through `origin` (axes `u`, `v`): each shadow's points and radius follow
-## its edge. How many links no longer find their edge, or find it
-## another kind of curve now (they stay as they were).
-pub func relink_sketch(sketch: Sketch*, model: const CadModel*, origin: Vector3, u: Vector3, v: Vector3) -> i64!:
-    if sketch.links.count == 0: return 0
+## its edge (a split edge: its piece nearest where it was), a linked point
+## the edge's end nearest it. Edges the projected
+## faces' loops gained get shadows of their own. How many links no longer
+## find their edge, or find it another kind of curve now (they stay as
+## they were), and how many edges were gained.
+pub func relink_sketch(sketch: Sketch*, model: const CadModel*, origin: Vector3, u: Vector3, v: Vector3) -> (i64, i64)!:
+    if sketch.links.count == 0 and sketch.faces.count == 0: return (0, 0)
     var w = try shape_of(model)
     defer w.close()
     var edges = Growing[usize]()
     defer edges.close()
-    var run = Growing[f64]()
-    defer run.close()
+    var runs = Growing[f64]()
+    defer runs.close()
+    # The curves that follow, each with where its samples start in `runs`.
+    var plan = Growing[(i64, usize)]()
+    defer plan.close()
+    var followed = Growing[bool]()
+    defer followed.close()
+    try followed.fill(w.edges.count, false)
     let tolerance = 1e-6 * math.max(1.0, size_of(sketch))
     var lost: i64 = 0
     for l in sketch.links.view():
         resolve_edges(&w, sketch.link_reference(l), &edges) catch failure:
             lost += 1
             continue
-        if edges.count != 1:
+        # An edge split upstream follows its piece nearest where it was
+        # (resolve_edges gives that first); the other pieces are gained.
+        let e = edges.items[0]
+        let at = runs.count
+        try cast_edge(&w, e, origin, u, v, &runs)
+        let run = runs.view()[at..<runs.count]
+        let kind = sketch.entity(l.entity).kind
+        if kind != EntityKind.point and (end_on(run, tolerance) or shadow_kind(run, tolerance) != kind):
             lost += 1
+            runs.count = at
             continue
-        run.clear()
-        try cast_edge(&w, edges.items[0], origin, u, v, &run)
-        if end_on(run.view(), tolerance) or shadow_kind(run.view(), tolerance) != sketch.entity(l.entity).kind:
-            lost += 1
-            continue
-        try follow(sketch, l.entity, run.view())
-    return lost
+        followed.items[e] = true
+        try plan.push((l.entity, at))
+    try follow_all(sketch, plan.view(), runs.view(), tolerance)
+    let gained = try add_gained_edges(sketch, &w, followed.view(), origin, u, v)
+    return (lost, gained)
 
-## Shadow curve `curve` moved onto the samples `run` of its edge now.
-func follow(sketch: Sketch*, curve: i64, run: const f64[]) -> !:
+## Every planned curve (entity, where its edge's samples start in `runs`)
+## moved onto its edge now. Ends first, from where the curves are now: a
+## point several curves share goes where the first puts it, and a curve
+## that would put it elsewhere (its edge was split, or the loop changed)
+## gets a point of its own there. Then centers, radii and a spline's
+## inner points.
+func follow_all(sketch: Sketch*, plan: const (i64, usize)[], runs: const f64[], tolerance: f64) -> !:
+    let per = per_edge * 2
+    # Each curve's end targets, from the points as they are before any
+    # moves (the way a curve runs is judged from them).
+    var targets = Growing[EndTarget]()
+    defer targets.close()
+    for (curve, at) in plan:
+        try end_targets(sketch, curve, runs[at..<at + per], &targets)
+    # Where each point goes, and the curve that put it there.
+    var owner = Growing[i64]()
+    defer owner.close()
+    try owner.fill(sketch.entities.count, -1)
+    var place = Growing[f64]()
+    defer place.close()
+    try place.fill(sketch.entities.count * 2, 0.0)
+    for target in targets.view():
+        let p = (usize)target.point
+        if p < owner.count and owner.items[p] >= 0 and owner.items[p] != target.curve and math.hypot(place.items[2 * p] - target.x, place.items[2 * p + 1] - target.y) > tolerance:
+            # Taken elsewhere: this curve's own point.
+            let own = try sketch.add_point(target.x, target.y)
+            rewire(sketch, target.curve, target.point, own)
+            continue
+        owner.items[p] = target.curve
+        place.items[2 * p] = target.x
+        place.items[2 * p + 1] = target.y
+    for p in 0..<owner.count:
+        if owner.items[p] >= 0: sketch.place((i64)p, place.items[2 * p], place.items[2 * p + 1])
+    for (curve, at) in plan:
+        try follow_inside(sketch, curve, runs[at..<at + per])
+
+## Where one end of a following curve goes: point `point` of curve `curve`.
+struct EndTarget:
+    var curve: i64
+    var point: i64
+    var x: f64
+    var y: f64
+
+## Curve `curve`'s ends onto the ends of its edge's samples `run`, as
+## targets onto `out`: a line's and a spline's by the way it runs, an
+## arc's counterclockwise; a linked point to the nearer end.
+func end_targets(sketch: const Sketch*, curve: i64, run: const f64[], out: Growing[EndTarget]*) -> !:
     let e = sketch.entity(curve)
     let n = run.length // 2
+    let (sx, sy, ex, ey) = (run[0], run[1], run[2 * n - 2], run[2 * n - 1])
+    if e.kind == EntityKind.point:
+        let to_start = math.hypot(sx - sketch.x(curve), sy - sketch.y(curve))
+        let to_end = math.hypot(ex - sketch.x(curve), ey - sketch.y(curve))
+        try out.push(EndTarget(curve, curve, sx if to_start <= to_end else ex, sy if to_start <= to_end else ey))
+        return
+    var first: i64 = -1
+    var last: i64 = -1
+    var against = false
     if e.kind == EntityKind.line:
-        sketch.place(e.first, run[0], run[1])
-        sketch.place(e.second, run[2 * n - 2], run[2 * n - 1])
-    elif e.kind == EntityKind.circle or e.kind == EntityKind.arc:
+        first = e.first
+        last = e.second
+        against = runs_against(sketch, first, last, run)
+    elif e.kind == EntityKind.arc:
+        let circle = circle_through(run, 1e300) else return
+        first = e.third
+        last = e.fourth
+        # Counterclockwise: from the samples' end when they turn clockwise.
+        against = (run[2] - run[0]) * (run[1] - circle[1]) - (run[3] - run[1]) * (run[0] - circle[0]) > 0.0
+    elif e.kind == EntityKind.spline:
+        first = sketch.spline_point(e, 0)
+        last = sketch.spline_point(e, e.second - 1)
+        against = runs_against(sketch, first, last, run)
+    else:
+        return
+    try out.push(EndTarget(curve, first, ex if against else sx, ey if against else sy))
+    if last != first: try out.push(EndTarget(curve, last, sx if against else ex, sy if against else ey))
+
+## Curve `curve` drawn on point `after` where it was on point `before`.
+func rewire(sketch: Sketch*, curve: i64, before: i64, after: i64):
+    let e = &sketch.entities.items[(usize)curve]
+    if e.kind == EntityKind.line:
+        if e.first == before: e.first = after
+        if e.second == before: e.second = after
+    elif e.kind == EntityKind.arc:
+        if e.third == before: e.third = after
+        if e.fourth == before: e.fourth = after
+    elif e.kind == EntityKind.spline:
+        for k in 0..<e.second:
+            let at = (usize)(e.first + k)
+            if sketch.lists.items[at] == before: sketch.lists.items[at] = after
+
+## What follows a curve's ends onto its edge's samples `run`: a circle's
+## or arc's center and radius, a spline's inner points over the samples
+## evenly (its ends are placed).
+func follow_inside(sketch: Sketch*, curve: i64, run: const f64[]) -> !:
+    let e = sketch.entity(curve)
+    let n = run.length // 2
+    if e.kind == EntityKind.circle or e.kind == EntityKind.arc:
         let circle = circle_through(run, 1e300) else return
         sketch.place(e.first, circle[0], circle[1])
         sketch.params.items[(usize)e.second] = circle[2]
-        if e.kind == EntityKind.arc:
-            let turning = (run[2] - run[0]) * (run[1] - circle[1]) - (run[3] - run[1]) * (run[0] - circle[0])
-            let (start, end) = (n - 1, (usize)0) if turning > 0.0 else ((usize)0, n - 1)
-            sketch.place(e.third, run[2 * start], run[2 * start + 1])
-            sketch.place(e.fourth, run[2 * end], run[2 * end + 1])
     elif e.kind == EntityKind.spline:
-        # Its points over the samples again, evenly.
         let count = (usize)e.second
-        for k in 0..<count:
+        let first = sketch.spline_point(e, 0)
+        let last = sketch.spline_point(e, (i64)count - 1)
+        # Its ends are placed: the way it runs is the way they lie now.
+        let against = first != last and math.hypot(sketch.x(first) - run[2 * n - 2], sketch.y(first) - run[2 * n - 1]) < math.hypot(sketch.x(first) - run[0], sketch.y(first) - run[1])
+        for k in 1..<count - 1:
             let sample = (k * (n - 1)) // (count - 1)
-            sketch.place(sketch.spline_point(e, (i64)k), run[2 * sample], run[2 * sample + 1])
+            let point = sketch.spline_point(e, (i64)(count - 1 - k) if against else (i64)k)
+            sketch.place(point, run[2 * sample], run[2 * sample + 1])
+
+## A fixed point at end `end` (0 its start, 1 its end) of the edge whose
+## samples are `run`, linked to `reference`: a body vertex in the sketch.
+pub func add_end_point(sketch: Sketch*, run: const f64[], end: i64, reference: str) -> i64!:
+    let n = run.length // 2
+    let k = 0 if end == 0 else n - 1
+    let p = try sketch.add_point(run[2 * k], run[2 * k + 1])
+    _ = try sketch.constrain(ConstraintKind.fix, p)
+    try sketch.link(p, reference)
+    return p
+
+## Whether the curve from point `first` to point `last` runs against its
+## edge's samples `run` (the edge may run either way, and a projected
+## loop's curves run as the loop does).
+func runs_against(sketch: const Sketch*, first: i64, last: i64, run: const f64[]) -> bool:
+    let n = run.length // 2
+    let dx = sketch.x(last) - sketch.x(first)
+    let dy = sketch.y(last) - sketch.y(first)
+    if dx * dx + dy * dy == 0.0:
+        # Closed: by the way it leaves its start.
+        return false
+    return dx * (run[2 * n - 2] - run[0]) + dy * (run[2 * n - 1] - run[1]) < 0.0

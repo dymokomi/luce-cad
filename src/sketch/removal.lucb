@@ -29,12 +29,28 @@ pub func remove_entity(sketch: Sketch*, at: i64) -> !:
             if not (try curve_on_point(sketch, p, gone.view())): gone.items[(usize)p] = true
     try compact(sketch, gone.view())
 
-## Remove constraint `at`.
+## Remove constraint `at` (an Offset relation with all its pairs).
 pub func remove_constraint(sketch: Sketch*, at: i64) -> !:
     if at < 0 or at >= (i64)sketch.constraints.count: error(invalid, "the sketch has no such constraint")
+    let k = sketch.constraints.items[(usize)at]
     for index in (usize)at..<sketch.constraints.count - 1:
         sketch.constraints.items[index] = sketch.constraints.items[index + 1]
     sketch.constraints.count -= 1
+    if k.kind == ConstraintKind.offset: drop_pairs(sketch)
+
+## Drop the Offset pairs whose relation is gone (no offset constraint has
+## their group as its copy).
+func drop_pairs(sketch: Sketch*):
+    var kept: usize = 0
+    for at in 0..<sketch.offsets.count:
+        let pair = sketch.offsets.items[at]
+        var kept_by = false
+        for k in sketch.constraints.view():
+            if k.kind == ConstraintKind.offset and k.second == pair.group: kept_by = true
+        if not kept_by: continue
+        sketch.offsets.items[kept] = pair
+        kept += 1
+    sketch.offsets.count = kept
 
 ## Whether a curve other than `except` is drawn on point `point`.
 pub func point_used(sketch: const Sketch*, point: i64, except: i64 = -1) -> bool!:
@@ -110,10 +126,21 @@ func compact(sketch: Sketch*, gone: const bool[]) -> !:
         let moved = renumbered.items[(usize)l.entity]
         if moved < 0: continue
         try links.push(Link(moved, l.reference, l.reference_length))
+    # Offset pairs of curves that stay (and relations that stay, below).
+    var offsets = Growing[OffsetPair]()
+    errdefer offsets.close()
+    for pair in sketch.offsets.view():
+        let group = renumbered.items[(usize)pair.group]
+        let source = renumbered.items[(usize)pair.source]
+        let copy = renumbered.items[(usize)pair.copy]
+        if group < 0 or source < 0 or copy < 0: continue
+        try offsets.push(OffsetPair(group, source, copy, pair.side))
     let labels = sketch.labels
     let chars = sketch.chars
+    let faces = sketch.faces
     sketch.labels = Growing[Label]()
     sketch.chars = Growing[u8]()
+    sketch.faces = Growing[ProjectedFace]()
     sketch.close()
     sketch.params = params
     sketch.entities = kept
@@ -122,3 +149,6 @@ func compact(sketch: Sketch*, gone: const bool[]) -> !:
     sketch.labels = labels
     sketch.chars = chars
     sketch.links = links
+    sketch.offsets = offsets
+    sketch.faces = faces
+    drop_pairs(sketch)

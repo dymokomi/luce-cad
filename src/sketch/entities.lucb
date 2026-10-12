@@ -32,7 +32,8 @@ from luce_geocore.kernel import CurvesBuilder, CurveType, SketchPlane, empty_set
 from luce_std import files, utf8
 from luce_fonts import opentype
 from model import CadModel
-from modeling import Shape, shape_of, resolve_edges, references_of
+from modeling import Shape, shape_of, resolve_edges, references_of, names_meet
+from geometry import edge_index
 
 pub enum EntityKind as u8:
     point = 0
@@ -97,14 +98,22 @@ pub enum ConstraintKind as u8:
     ## and the end's curvature changing as the other's does (not at all on
     ## a line, circle or arc).
     smooth = 21
+    ## Fusion's Offset kept as one relation: curve `second` a copy of curve
+    ## `first` `value` to side `side`, and with it every pair of the
+    ## sketch's `offsets` whose group is `second` (offset.lucb). Lines stay
+    ## parallel at that distance (`side`: the copy's side of its source as
+    ## the source runs); circles and arcs share their source's center, the
+    ## copy's radius the source's plus `side` times the distance. One value
+    ## for the whole chain: one dimension.
+    offset = 22
 
 ## How many kinds of constraint there are.
-pub let constraint_kind_count: usize = 22
+pub let constraint_kind_count: usize = 23
 
 ## Whether constraint kind `kind` is a length (a distance, a radius, a
 ## diameter): what scaling the sketch scales.
 pub func is_length_dimension(kind: ConstraintKind) -> bool:
-    return kind == ConstraintKind.distance or kind == ConstraintKind.line_distance or kind == ConstraintKind.horizontal_distance or kind == ConstraintKind.vertical_distance or kind == ConstraintKind.radius or kind == ConstraintKind.diameter
+    return kind == ConstraintKind.distance or kind == ConstraintKind.line_distance or kind == ConstraintKind.horizontal_distance or kind == ConstraintKind.vertical_distance or kind == ConstraintKind.radius or kind == ConstraintKind.diameter or kind == ConstraintKind.offset
 
 pub struct SketchEntity:
     pub var kind: EntityKind
@@ -139,6 +148,21 @@ pub struct Link:
     pub var reference: usize
     pub var reference_length: usize
 
+## A copied curve of an Offset relation beyond its first: `copy` follows
+## `source` at the distance of the `offset` constraint whose copy (its
+## `second`) is `group`, on side `side`.
+pub struct OffsetPair:
+    pub var group: i64
+    pub var source: i64
+    pub var copy: i64
+    pub var side: f64
+
+## A body face whose loops the sketch projected (face_projection.lucb):
+## its name, a run of a sketch's `chars`.
+pub struct ProjectedFace:
+    pub var name: usize
+    pub var name_length: usize
+
 pub struct SketchConstraint:
     pub var kind: ConstraintKind
     ## The entities it holds (-1: none).
@@ -163,6 +187,11 @@ pub struct Sketch:
     pub var chars: Growing[u8]
     ## Projected curves and the body edges they follow (projection.lucb).
     pub var links: Growing[Link]
+    ## The pairs of Offset relations beyond each one's first.
+    pub var offsets: Growing[OffsetPair]
+    ## The faces whose loops were projected: relinking adds the edges a
+    ## loop gains.
+    pub var faces: Growing[ProjectedFace]
 
     pub func close():
         self.params.close()
@@ -172,6 +201,8 @@ pub struct Sketch:
         self.labels.close()
         self.chars.close()
         self.links.close()
+        self.offsets.close()
+        self.faces.close()
 
     ## A new point at (`x`, `y`).
     pub func add_point(x: f64, y: f64, construction: bool = false) -> i64!:
@@ -273,6 +304,26 @@ pub struct Sketch:
         for byte in reference.bytes: try self.chars.push(byte)
         try self.links.push(Link(entity, at, reference.length))
 
+    ## Face `face`'s name.
+    pub func face_reference(face: ProjectedFace) -> str:
+        return (str)self.chars.view()[face.name..<face.name + face.name_length]
+
+    ## Remember that face `name`'s loops are projected (once).
+    pub func project_face_name(name: str) -> !:
+        for f in self.faces.view():
+            if self.face_reference(f) == name: return
+        let at = self.chars.count
+        for byte in name.bytes: try self.chars.push(byte)
+        try self.faces.push(ProjectedFace(at, name.length))
+
+    ## Copy `copy` of curve `source` joins the Offset relation whose first
+    ## copy is `group`, on side `side`.
+    pub func offset_pair(group: i64, source: i64, copy: i64, side: f64) -> !:
+        for named in [group, source, copy]:
+            if named < 0 or named >= (i64)self.entities.count: error(invalid, "an offset names an entity the sketch does not have")
+        if not offset_fits(self.entity(source).kind, self.entity(copy).kind): error(invalid, "an offset copies a line to a line, a circle or arc to one about its center")
+        try self.offsets.push(OffsetPair(group, source, copy, side))
+
     ## A sketch of its own with everything this one has.
     pub func copy() -> Sketch!:
         var s = new_sketch()
@@ -284,6 +335,8 @@ pub struct Sketch:
         try s.labels.assign(self.labels.view())
         try s.chars.assign(self.chars.view())
         try s.links.assign(self.links.view())
+        try s.offsets.assign(self.offsets.view())
+        try s.faces.assign(self.faces.view())
         return s
 
     ## Curve `entity` no longer follows the edge it was projected from
@@ -397,6 +450,7 @@ pub struct Sketch:
         if kind == ConstraintKind.midpoint or kind == ConstraintKind.line_distance: return a == point and b == line and third < 0
         if kind == ConstraintKind.concentric: return ra and rb and third < 0
         if kind == ConstraintKind.symmetric: return a == point and b == point and c == line
+        if kind == ConstraintKind.offset: return first >= 0 and second >= 0 and third < 0 and offset_fits(self.entities.items[(usize)first].kind, self.entities.items[(usize)second].kind)
         # Radius and diameter, the last kinds.
         return ra and second < 0
 
@@ -416,6 +470,13 @@ pub struct Sketch:
         if at < 0 or at >= (i64)self.entities.count or self.entities.items[(usize)at].kind != kind:
             error(invalid, "a sketch entity is not of the kind it needs to be")
 
+## Whether an Offset relation holds a copy of kind `copy` to a source of
+## kind `source`: a line to a line, a circle or arc to a circle or arc.
+pub func offset_fits(source: EntityKind, copy: EntityKind) -> bool:
+    if source == EntityKind.line: return copy == EntityKind.line
+    let round = source == EntityKind.circle or source == EntityKind.arc
+    return round and (copy == EntityKind.circle or copy == EntityKind.arc)
+
 ## An empty sketch.
 pub func new_sketch() -> Sketch:
-    return Sketch(Growing[f64](), Growing[SketchEntity](), Growing[SketchConstraint](), Growing[i64](), Growing[Label](), Growing[u8](), Growing[Link]())
+    return Sketch(Growing[f64](), Growing[SketchEntity](), Growing[SketchConstraint](), Growing[i64](), Growing[Label](), Growing[u8](), Growing[Link](), Growing[OffsetPair](), Growing[ProjectedFace]())

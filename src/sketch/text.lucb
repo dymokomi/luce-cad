@@ -19,6 +19,10 @@
 ##                                    as a text's words)
 ##   k <kind> <first> <second> <third> <value> <side> [d]
 ##                                    a constraint; `d`: driven
+##   m <group> <source> <copy> <side> a pair of the Offset relation whose
+##                                    first copy is `group`, beyond its first
+##   f <name>                         a face whose loops are projected
+##                                    (escaped as a text's words)
 ##
 ## Entities are numbered in order from 0 and may name any of the points; a
 ## constraint's kind is its ConstraintKind name. Points hold where the last
@@ -89,6 +93,17 @@ pub func write_sketch(sketch: const Sketch*, out: Growing[u8]*) -> !:
         try put_number(out, k.side)
         if k.driven: try put_text(out, " d")
         try out.push(10)
+    for pair in sketch.offsets.view():
+        try put_text(out, "m")
+        try put_index(out, pair.group)
+        try put_index(out, pair.source)
+        try put_index(out, pair.copy)
+        try put_number(out, pair.side)
+        try out.push(10)
+    for face in sketch.faces.view():
+        try put_text(out, "f ")
+        try put_escaped(out, sketch.face_reference(face))
+        try out.push(10)
 
 ## The sketch `text` describes (empty text: an empty sketch).
 pub func read_sketch(text: str) -> Sketch!:
@@ -111,7 +126,7 @@ pub func read_sketch(text: str) -> Sketch!:
         # says `c` is not a construction text): `d` on a constraint, `c`
         # on an entity.
         let expected = fields_of(tag, count)
-        let marked = expected >= 0 and count == (usize)expected + 1 and fields[count - 1] == ("d" if tag == "k" else "c") and tag != "j"
+        let marked = expected >= 0 and count == (usize)expected + 1 and fields[count - 1] == ("d" if tag == "k" else "c") and tag != "j" and tag != "f" and tag != "m"
         let given = count - 1 if marked else count
         if tag == "p" and given == 3:
             _ = try s.add_point(try strings.parse_f64(fields[1]), try strings.parse_f64(fields[2]), marked)
@@ -163,11 +178,21 @@ pub func read_sketch(text: str) -> Sketch!:
                 checked = true
             let kind = try kind_named(fields[1])
             _ = try s.constrain(kind, try whole(fields[2]), try whole(fields[3]), try whole(fields[4]), try strings.parse_f64(fields[5]), try strings.parse_f64(fields[6]), marked)
+        elif tag == "m" and given == 5:
+            if not checked:
+                try check_entities(&s)
+                checked = true
+            try s.offset_pair(try whole(fields[1]), try whole(fields[2]), try whole(fields[3]), try strings.parse_f64(fields[4]))
+        elif tag == "f" and given == 2:
+            var name = Growing[u8]()
+            defer name.close()
+            try unescape(fields[1], &name)
+            try s.project_face_name((str)name.view())
         else:
             error(invalid, "a sketch's text has a line it does not know")
     if not checked: try check_entities(&s)
     for l in s.links.view():
-        if l.entity < 0 or l.entity >= (i64)s.entities.count or s.entities.items[(usize)l.entity].kind == EntityKind.point or s.entities.items[(usize)l.entity].kind == EntityKind.text or l.reference_length == 0:
+        if l.entity < 0 or l.entity >= (i64)s.entities.count or s.entities.items[(usize)l.entity].kind == EntityKind.text or l.reference_length == 0:
             error(invalid, "a sketch's projection names a curve the sketch does not have")
     return s
 
@@ -175,9 +200,10 @@ pub func read_sketch(text: str) -> Sketch!:
 ## all `count` but a trailing `c`), -1 for a tag there is not.
 func fields_of(tag: str, count: usize) -> i64:
     if tag == "s": return (i64)count - 1
+    if tag == "f": return 2
     if tag == "p" or tag == "l" or tag == "o" or tag == "j": return 3
     if tag == "e": return 4
-    if tag == "a" or tag == "n" or tag == "t": return 5
+    if tag == "a" or tag == "n" or tag == "t" or tag == "m": return 5
     if tag == "k": return 7
     return -1
 
@@ -202,9 +228,9 @@ func check_entities(s: const Sketch*) -> !:
         if scalar >= 0 and not s.scalar_fits(e, s.params.items[(usize)scalar]): error(invalid, "a sketch curve's radius, height or minor radius is not positive, or its rho not between 0 and 1")
 
 ## The names of ConstraintKind's values, in order.
-func kind_names() -> str[22]:
+func kind_names() -> str[23]:
     return ["coincident", "on_curve", "horizontal", "vertical", "parallel", "perpendicular", "tangent", "equal", "fix", "midpoint",
-            "concentric", "collinear", "symmetric", "distance", "line_distance", "horizontal_distance", "vertical_distance", "angle", "radius", "diameter", "curvature", "smooth"]
+            "concentric", "collinear", "symmetric", "distance", "line_distance", "horizontal_distance", "vertical_distance", "angle", "radius", "diameter", "curvature", "smooth", "offset"]
 
 func kind_named(name: str) -> ConstraintKind!:
     let names = kind_names()

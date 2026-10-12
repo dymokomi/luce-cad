@@ -1,0 +1,139 @@
+## Fusion's auto-projection of a face: a sketch on a body's face gets the
+## face's outer and inner loops as fixed curves, each linked to its edge
+## by the edge's reference (projection.lucb's links), so relinking casts
+## them again when the body changes upstream. Curves meeting at a vertex
+## share one sketch point, so a loop stays one closed chain (a profile, and
+## a chain Offset takes whole). The face is remembered by name: relinking
+## adds the shadows of edges its loops gained.
+
+## Project the loops of `model`'s faces named `name` (any alias: a face
+## split by later features is all its pieces) onto `sketch`'s plane
+## through `origin` (axes `u`, `v`): one fixed, linked curve per edge,
+## neighbors sharing their points. The curves made onto `out`.
+pub func project_face_loops(sketch: Sketch*, model: const CadModel*, name: str, origin: Vector3, u: Vector3, v: Vector3, out: Growing[i64]*) -> !:
+    out.clear()
+    if name == "": error(invalid, "pick the face to project")
+    var w = try shape_of(model)
+    defer w.close()
+    # The sketch point of each body vertex, made when first used.
+    var points = Growing[i64]()
+    defer points.close()
+    try points.fill(w.points.count, -1)
+    var run = Growing[f64]()
+    defer run.close()
+    var reference = Growing[u8]()
+    defer reference.close()
+    var found = false
+    for f in 0..<w.faces.count:
+        if not (try names_meet(w.face_name(f), name)): continue
+        found = true
+        for use in w.face_uses(f):
+            let made = try project_use(sketch, &w, use, origin, u, v, &points, &run, &reference)
+            if made >= 0: try out.push(made)
+    if not found: error(invalid, "the face to project is no longer on the body")
+    try sketch.project_face_name(name)
+
+## Project the edge of loop use `use` of `w` (signed: +(edge + 1) forward)
+## as a curve from its start's sketch point to its end's (`points`, by body
+## vertex), fixed and linked; the curve, or -1 for an edge seen end-on
+## (its two ends become one point).
+func project_use(sketch: Sketch*, w: const Shape*, use: i64, origin: Vector3, u: Vector3, v: Vector3, points: Growing[i64]*, run: Growing[f64]*, reference: Growing[u8]*) -> i64!:
+    let e = edge_index(use)
+    let edge = w.edges.items[e]
+    let forward = use > 0
+    let (start, end) = (edge.start, edge.end) if forward else (edge.end, edge.start)
+    run.clear()
+    try cast_edge(w, e, origin, u, v, run)
+    if not forward: reverse_pairs(run)
+    let tolerance = 1e-6 * math.max(1.0, size_of(sketch))
+    if end_on(run.view(), tolerance):
+        # Seen end-on: both ends at one point.
+        let p = try vertex_point(sketch, points, start, run.items[0], run.items[1])
+        if points.items[(usize)end] < 0: points.items[(usize)end] = p
+        return -1
+    let n = run.count // 2
+    let kind = shadow_kind(run.view(), tolerance)
+    var made: i64 = -1
+    if kind == EntityKind.circle:
+        # A whole circle: no ends to share.
+        let circle = circle_through(run.view(), tolerance) else error(invalid, "a circular shadow has no circle")
+        made = try sketch.add_circle(try sketch.add_point(circle[0], circle[1]), circle[2])
+        _ = try sketch.constrain(ConstraintKind.fix, made)
+        try references_of(w, [(i64)e], reference)
+        try sketch.link(made, (str)reference.view())
+        return made
+    let a = try vertex_point(sketch, points, start, run.items[0], run.items[1])
+    let b = try vertex_point(sketch, points, end, run.items[2 * n - 2], run.items[2 * n - 1])
+    if kind == EntityKind.line:
+        made = try sketch.add_line(a, b)
+    elif kind == EntityKind.arc:
+        let circle = circle_through(run.view(), tolerance) else error(invalid, "a circular shadow has no circle")
+        let center = try sketch.add_point(circle[0], circle[1])
+        # Arcs run counterclockwise: from the end when the samples turn
+        # clockwise.
+        let r = run.view()
+        let turning = (r[2] - r[0]) * (r[1] - circle[1]) - (r[3] - r[1]) * (r[0] - circle[0])
+        made = try sketch.add_arc(center, b if turning > 0.0 else a, a if turning > 0.0 else b)
+    else:
+        # A fit point spline through every fourth sample, between the
+        # shared ends.
+        var through = Growing[i64]()
+        defer through.close()
+        try through.push(a)
+        var k: usize = 4
+        while k + 1 < n:
+            try through.push(try sketch.add_point(run.items[2 * k], run.items[2 * k + 1]))
+            k += 4
+        try through.push(b)
+        made = try sketch.add_spline(through.view(), true)
+    _ = try sketch.constrain(ConstraintKind.fix, made)
+    try references_of(w, [(i64)e], reference)
+    try sketch.link(made, (str)reference.view())
+    return made
+
+## The sketch point of body vertex `vertex`, made at (`x`, `y`) when it has
+## none yet.
+func vertex_point(sketch: Sketch*, points: Growing[i64]*, vertex: i64, x: f64, y: f64) -> i64!:
+    let at = (usize)vertex
+    if points.items[at] < 0: points.items[at] = try sketch.add_point(x, y)
+    return points.items[at]
+
+## The x, y pairs of `run` in the other order.
+func reverse_pairs(run: Growing[f64]*):
+    let n = run.count // 2
+    for k in 0..<n // 2:
+        let j = n - 1 - k
+        let (x, y) = (run.items[2 * k], run.items[2 * k + 1])
+        run.items[2 * k] = run.items[2 * j]
+        run.items[2 * k + 1] = run.items[2 * j + 1]
+        run.items[2 * j] = x
+        run.items[2 * j + 1] = y
+
+## The edges of `w`'s faces named as `sketch`'s projected faces that no
+## link resolved to (`followed` marks the resolved ones), their shadows
+## added as projected curves (their own points, fixed and linked); how many.
+pub func add_gained_edges(sketch: Sketch*, w: const Shape*, followed: const bool[], origin: Vector3, u: Vector3, v: Vector3) -> i64!:
+    var gained: i64 = 0
+    var run = Growing[f64]()
+    defer run.close()
+    var reference = Growing[u8]()
+    defer reference.close()
+    var done = Growing[bool]()
+    defer done.close()
+    try done.fill(w.edges.count, false)
+    let tolerance = 1e-6 * math.max(1.0, size_of(sketch))
+    for face in sketch.faces.view():
+        let name = sketch.face_reference(face)
+        for f in 0..<w.faces.count:
+            if not (try names_meet(w.face_name(f), name)): continue
+            for use in w.face_uses(f):
+                let e = edge_index(use)
+                if followed[e] or done.items[e]: continue
+                done.items[e] = true
+                run.clear()
+                try cast_edge(w, e, origin, u, v, &run)
+                if end_on(run.view(), tolerance): continue
+                try references_of(w, [(i64)e], &reference)
+                _ = try add_shadow(sketch, run.view(), (str)reference.view())
+                gained += 1
+    return gained

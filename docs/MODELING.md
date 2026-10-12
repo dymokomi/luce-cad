@@ -167,8 +167,10 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    through points exactly on both surfaces.
 3. **Clipping to faces.** Each curve is clipped to both faces (`clip.lucb`). Its crossings with
    either face's boundary are found on samples, then refined by Newton steps on the exact curves.
-   Those crossings cut the curve and the boundary edges. The stretches inside both faces become new
-   edges.
+   Those crossings cut the curve, and they cut a boundary edge only where the other face is: a
+   crossing outside it ends no new edge, and would leave a stray vertex on the edge (a notch at
+   one end of a box would cut the far end's edges too). The stretches inside both faces become
+   new edges.
 
    A curve lying along an existing edge is that edge: it is cut and imprinted, never doubled.
    Coincident faces imprint each other's boundaries.
@@ -504,6 +506,32 @@ the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
   side, the copies meeting where they cross (lines kept parallel). Move/Copy and Scale act on
   entities (Scale scales their dimensions too). Ends left over are reused, not removed, so only
   trimming a curve away whole renumbers entities.
+
+- **Projection** (`projection.lucb`, `face_projection.lucb`), Fusion's Project and its
+  auto-projection of a sketch's face. `CadSketch.project(projection, edge)` casts one body edge;
+  `project_face(model, face, origin, u, v)` casts the outer and inner loops of the faces going by
+  that name, one fixed curve per edge (a line, circle or arc when the shadow is one, else a fit
+  point spline), neighbors sharing their sketch points, so each loop is one closed chain: a
+  profile, and a chain Offset takes whole. `project_end(projection, edge, end)` casts a body
+  vertex as a fixed point. Every projected curve and point is linked to its edge's reference
+  (`references.lucb`), and the face is remembered by name. `relink(model, origin, u, v)` casts
+  them again from the body as it is now:
+  - each curve's ends move first, from where they were: a point several curves share goes where
+    the first puts it, and a curve that would put it elsewhere gets a point of its own;
+  - an edge split upstream is followed by its piece nearest where it was;
+  - a link whose edge is gone, or is now another kind of curve, is lost: it stays as it was and
+    is counted (a warning);
+  - edges a projected face's loops gained (a notch cut into it) are projected too, `gained()`
+    of them.
+- **Offset relation.** `offset(curves, distance, x, y, relation = true)` holds the whole chain's
+  copies by one constraint (`ConstraintKind.offset`): one value, one dimension. Its first pair is
+  the constraint's own curves; the others are the sketch's `offsets`, grouped by the first copy.
+  A line copy stays parallel to its source with its start at the distance; an arc or circle copy
+  shares its source's center, its radius the source's plus or minus the distance. Corners follow
+  because neighboring copies share their meeting points. Free-form copies (splines, ellipses,
+  conics) are fit point splines outside the relation. Removing the constraint removes the
+  relation. Without `relation`, each line copy gets its own parallel and distance (what the
+  editor uses until Stage 3 moves it over).
 
 Not yet: ellipses, splines, slots and text; curvature (G2) and polygon constraints; Blend Curve.
 

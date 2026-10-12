@@ -14,10 +14,16 @@ pub struct CadSketch:
     var snapped: SnapHit
     ## What the last box held (select_box).
     var boxes: Growing[i64]
+    ## The curves the last project_face made.
+    var projected: Growing[i64]
+    ## How many edges the last relink added (its projected faces' loops
+    ## gained them).
+    var gained_edges: i64
 
     pub func close():
         self.sketch.close()
         self.boxes.close()
+        self.projected.close()
         self.forget()
 
     func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
@@ -29,7 +35,7 @@ pub struct CadSketch:
     pub static func parse(text: str) -> interop.Reference[CadSketch]!:
         var s = try read_sketch(text)
         errdefer s.close()
-        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1), Growing[i64]()) in memory.heap, cad_sketch_type, memory.heap)
+        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1), Growing[i64](), Growing[i64](), 0) in memory.heap, cad_sketch_type, memory.heap)
 
     ## The sketch as text.
     pub func text() -> interop.Owned[str]!:
@@ -207,11 +213,50 @@ pub struct CadSketch:
         defer reference.release()
         return try add_shadow(&self.sketch, run, reference.value)
 
+    ## Project edge `edge`'s end `end` (0 its start, 1 its end) of
+    ## `projection` into the sketch: a fixed point linked to the edge, which
+    ## follows that end (a body vertex to dimension to).
+    pub func project_end(projection: interop.Reference[CadProjection], edge: i64, end: i64) -> i64!:
+        self.forget()
+        let p = try projection.get()
+        if edge < 0 or edge >= p.edge_count(): error(invalid, "the projection has no such edge")
+        let per = projection_per_edge()
+        let run = p.samples.view()[(usize)edge * 2 * per..<((usize)edge + 1) * 2 * per]
+        var reference = try p.reference(edge)
+        defer reference.release()
+        return try add_end_point(&self.sketch, run, end, reference.value)
+
+    ## Project the outer and inner loops of `model`'s face named `face`
+    ## (CadModeling.face_name_of's name) onto the plane through `origin`
+    ## (axes `u`, `v`), as Fusion projects a sketch's face: a fixed curve
+    ## per edge, linked to it, neighbors sharing their points, so each
+    ## loop is one chain. How many curves were made; projected_curve(at) reads them.
+    pub func project_face(model: interop.Reference[CadModel], face: str, origin: Vector3, u: Vector3, v: Vector3) -> i64!:
+        self.forget()
+        try project_face_loops(&self.sketch, model.value(), face, origin, u, v, &self.projected)
+        return (i64)self.projected.count
+
+    ## The `at`th curve the last project_face made, or -1.
+    pub func projected_curve(at: i64) -> i64:
+        if at < 0 or (usize)at >= self.projected.count: return -1
+        return self.projected.items[(usize)at]
+
     ## Cast the linked edges again from `model` onto the plane through
-    ## `origin` (axes `u`, `v`); how many no longer find their edge.
+    ## `origin` (axes `u`, `v`); how many no longer find their edge (a
+    ## warning: they stay as they were). Edges a projected face's loops
+    ## gained are projected too; gained() says how many.
     pub func relink(model: interop.Reference[CadModel], origin: Vector3, u: Vector3, v: Vector3) -> i64!:
         self.forget()
-        return try relink_sketch(&self.sketch, model.value(), origin, u, v)
+        let (lost, gained) = try relink_sketch(&self.sketch, model.value(), origin, u, v)
+        self.gained_edges = gained
+        return lost
+
+    pub func gained() -> i64:
+        return self.gained_edges
+
+    ## How many faces' loops are projected.
+    pub func projected_face_count() -> i64:
+        return (i64)self.sketch.faces.count
 
     ## How many curves are projected (linked to body edges).
     pub func link_count() -> i64:
@@ -323,13 +368,44 @@ pub struct CadSketch:
         return try chamfer_corner(&self.sketch, first, second, distance)
 
     ## Copies of the chain `curves` `distance` to the side of (`x`, `y`);
-    ## how many curves were made (the last entities).
-    pub func offset(curves: const i64[], distance: f64, x: f64, y: f64) -> i64!:
+    ## how many curves were made (the last entities). With `relation`, one
+    ## Offset relation (ConstraintKind offset, 22) holds every line, arc and
+    ## circle copy at the one distance: a single dimension for the chain,
+    ## its value the constraint's; otherwise each line copy gets its own
+    ## parallel and distance.
+    pub func offset(curves: const i64[], distance: f64, x: f64, y: f64, relation: bool = false) -> i64!:
         self.forget()
         var made = Growing[i64]()
         defer made.close()
-        try offset_chain(&self.sketch, curves, distance, x, y, &made)
+        try offset_chain(&self.sketch, curves, distance, x, y, &made, relation)
         return (i64)made.count
+
+    ## How many copies Offset relation `at` (a constraint of kind offset)
+    ## holds, and copy `which` of them and its source.
+    pub func offset_count(at: i64) -> i64:
+        let k = self.sketch.constraints.items[(usize)at]
+        if k.kind != ConstraintKind.offset: return 0
+        var count: i64 = 1
+        for pair in self.sketch.offsets.view():
+            if pair.group == k.second: count += 1
+        return count
+
+    pub func offset_copy(at: i64, which: i64) -> i64:
+        return self.offset_member(at, which, false)
+
+    pub func offset_source(at: i64, which: i64) -> i64:
+        return self.offset_member(at, which, true)
+
+    func offset_member(at: i64, which: i64, source: bool) -> i64:
+        let k = self.sketch.constraints.items[(usize)at]
+        if k.kind != ConstraintKind.offset or which < 0: return -1
+        if which == 0: return k.first if source else k.second
+        var seen: i64 = 0
+        for pair in self.sketch.offsets.view():
+            if pair.group != k.second: continue
+            seen += 1
+            if seen == which: return pair.source if source else pair.copy
+        return -1
 
     ## Move `entities` by (`dx`, `dy`), or copies of them (`copy`).
     pub func move(entities: const i64[], dx: f64, dy: f64, copy: bool = false) -> !:

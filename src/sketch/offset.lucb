@@ -10,8 +10,11 @@
 ## dimension (so the offset is a value to change); arc copies keep their
 ## center; a lone circle's copy is concentric, toward the point; a spline's,
 ## ellipse's or conic's copy is a fit point spline through its offset
-## samples.
-pub func offset_chain(sketch: Sketch*, curves: const i64[], distance: f64, qx: f64, qy: f64, out: Growing[i64]*) -> !:
+## samples. With `relation`, the line, arc and circle copies are held by
+## one Offset relation instead (ConstraintKind.offset): one distance for
+## the chain, so changing it moves every copy, the corners following as
+## the copies share their meeting points. Free-form copies stay as made.
+pub func offset_chain(sketch: Sketch*, curves: const i64[], distance: f64, qx: f64, qy: f64, out: Growing[i64]*, relation: bool = false) -> !:
     if curves.length == 0: error(invalid, "offset needs curves")
     if not (distance > 0.0): error(invalid, "an offset needs a positive distance")
     for c in curves:
@@ -24,7 +27,9 @@ pub func offset_chain(sketch: Sketch*, curves: const i64[], distance: f64, qx: f
         let r = sketch.radius_of(curves[0])
         let nr = r + distance if math.hypot(qx - sketch.x(e.first), qy - sketch.y(e.first)) > r else r - distance
         if nr <= 0.0: error(invalid, "the offset is larger than the circle's radius")
-        try out.push(try sketch.add_circle(e.first, nr, e.construction))
+        let made = try sketch.add_circle(e.first, nr, e.construction)
+        try out.push(made)
+        if relation: _ = try sketch.constrain(ConstraintKind.offset, curves[0], made, value = distance, side = 1.0 if nr > r else -1.0)
         return
     # Which way each curve runs along the chain, and the chain's side: +1
     # its left as it goes.
@@ -70,12 +75,17 @@ pub func offset_chain(sketch: Sketch*, curves: const i64[], distance: f64, qx: f
         let p = start_points.items[0] if last and closed else try sketch.add_point(end_xy.items[at * 2], end_xy.items[at * 2 + 1])
         try end_points.push(p)
         if not last: try start_points.push(p)
+    # The relation's first copy (its group), once made.
+    var group: i64 = -1
     for at in 0..<n:
         let c = curves[at]
         let e = sketch.entity(c)
         let k = carriers.items[at]
         let first = start_points.items[at]
         let last = end_points.items[at]
+        # The copy's side of its source: a line's as the source runs; an
+        # arc's radius grows by it.
+        let copy_side = side * (-1.0 if reversed.items[at] else 1.0)
         if k.freeform:
             # Through every fourth offset sample, from the copy's start to
             # its end (in the chain's order).
@@ -92,15 +102,28 @@ pub func offset_chain(sketch: Sketch*, curves: const i64[], distance: f64, qx: f
         elif k.line:
             let made = try sketch.add_line(first, last, e.construction)
             try out.push(made)
-            _ = try sketch.constrain(ConstraintKind.parallel, c, made)
-            # The copy's side of the original line, as that line runs.
-            _ = try sketch.constrain(ConstraintKind.line_distance, first, c, value = distance, side = side * (-1.0 if reversed.items[at] else 1.0))
+            if relation:
+                group = try offset_held(sketch, group, c, made, copy_side, distance)
+            else:
+                _ = try sketch.constrain(ConstraintKind.parallel, c, made)
+                _ = try sketch.constrain(ConstraintKind.line_distance, first, c, value = distance, side = copy_side)
         else:
             # Counterclockwise from its own start: against the chain, from
             # the copy's last point.
             let made = try sketch.add_arc(e.first, last if reversed.items[at] else first, first if reversed.items[at] else last, e.construction)
             sketch.params.items[(usize)sketch.entity(made).second] = k.r
             try out.push(made)
+            if relation: group = try offset_held(sketch, group, c, made, -copy_side, distance)
+
+## Copy `copy` of `source` held by the chain's Offset relation on side
+## `side`: the relation itself when `group` is -1 (none yet), else a pair
+## of it. The relation's group.
+func offset_held(sketch: Sketch*, group: i64, source: i64, copy: i64, side: f64, distance: f64) -> i64!:
+    if group < 0:
+        _ = try sketch.constrain(ConstraintKind.offset, source, copy, value = distance, side = side)
+        return copy
+    try sketch.offset_pair(group, source, copy, side)
+    return group
 
 ## Whether each curve of the chain `curves` runs against it (its end
 ## where the chain comes in), onto `out`.

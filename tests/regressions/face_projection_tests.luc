@@ -1,0 +1,214 @@
+## A sketch on a body's face, as Fusion makes one: the face's loops
+## projected and linked, a whole loop offset as one relation, and both
+## following the body when it changes upstream.
+from luce_cad.sketch import CadSketch, CadProjection
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+## ConstraintKind's order (sketch/entities.lucb).
+let fix = 8
+let offset = 22
+## EntityKind's.
+let point_kind = 0
+let line_kind = 1
+let circle_kind = 2
+
+func near(a: float, b: float) -> bool:
+    return math.abs(a - b) <= 1e-6 * math.max(1.0, math.abs(b))
+
+## The name of `model`'s flat face whose outward normal is +Y.
+func top_name(model: CadModel) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let frame = CadModeling.face_frame(model, name)
+        if frame.found and frame.u.cross(frame.v).y > 0.99:
+            return name
+    assert(false, "no top face")
+    return ""
+
+## The sketch points' places, as (x, y) of each point entity.
+func corners(s: CadSketch, curves: list[int]) -> list[list[float]]:
+    let found: list[list[float]] = []
+    for c in curves:
+        let p = s.part(c, 0)
+        found.append([s.x(p), s.y(p)])
+    return found
+
+## Whether every line among `curves` has its start at |x| = `a`, |y| = `b`
+## (a rectangle about the origin).
+func rectangle(s: CadSketch, curves: list[int], a: float, b: float) -> bool:
+    for c in curves:
+        if s.kind(c) != line_kind:
+            continue
+        for end in 0..<2:
+            let p = s.part(c, end)
+            if not (near(math.abs(s.x(p)), a) and near(math.abs(s.y(p)), b)):
+                print(f"corner {s.x(p)}, {s.y(p)}; expected ±{a}, ±{b}")
+                return false
+    return true
+
+pub func face_projection_tests() -> unit!:
+    # A 4 x 2 x 2 box (its faces named), its top face at y = 1.
+    let box = CadModeling.tagged(CadSolids.box(4.0, 2.0, 2.0), "box")
+    let top = top_name(box)
+    let frame = CadModeling.face_frame(box, top)
+    # The frame's origin is the face's surface origin: the face centered on
+    # it, so the corners are at ±2 and ±1 along the face's axes (either
+    # way round).
+    let s = CadSketch.parse("")
+    assert(s.project_face(box, top, Vector3(0.0, 1.0, 0.0), frame.u, frame.v) == 4)
+    let lines: list[int] = []
+    for at in 0..<4:
+        lines.append(s.projected_curve(at))
+        assert(s.kind(lines[at]) == line_kind)
+    # Four points, shared by the lines meeting there.
+    var points = 0
+    for e in 0..<s.entity_count():
+        if s.kind(e) == point_kind:
+            points += 1
+    assert(points == 4 and s.link_count() == 4 and s.projected_face_count() == 1)
+    let along_x = math.abs(frame.u.x) > 0.5
+    let (a, b) = (2.0, 1.0) if along_x else (1.0, 2.0)
+    assert(rectangle(s, lines, a, b))
+    # The loop is one profile: the 4 x 2 face.
+    let face_profile = s.curves(Vector3(0.0, 1.0, 0.0), frame.u, frame.v)
+    assert(CadModeling.profile_count(face_profile) == 1)
+    # Offset inward by 0.25 as one relation: one constraint, four copies.
+    let before = s.constraint_count()
+    assert(s.offset(lines, 0.25, 0.0, 0.0, relation = true) == 4)
+    var relation = -1
+    for at in before..<s.constraint_count():
+        if s.constraint_kind(at) == offset:
+            assert(relation < 0, "one offset relation")
+            relation = at
+    assert(relation >= 0 and s.offset_count(relation) == 4 and s.constraint_count() == before + 1)
+    let copies: list[int] = []
+    for at in 0..<4:
+        copies.append(s.offset_copy(relation, at))
+    assert(s.solve())
+    assert(rectangle(s, copies, a - 0.25, b - 0.25))
+    # The one value moves the whole chain.
+    s.set_value(relation, 0.4)
+    assert(s.solve())
+    assert(rectangle(s, copies, a - 0.4, b - 0.4))
+    # Kept as text and read back.
+    let again = CadSketch.parse(s.text())
+    assert(again.offset_count(relation) == 4 and again.projected_face_count() == 1 and again.link_count() == 4)
+    assert(again.text() == s.text())
+    # The ring between the loop and its offset, and the inner rectangle.
+    let rings = s.curves(Vector3(0.0, 1.0, 0.0), frame.u, frame.v)
+    assert(CadModeling.profile_keys(rings).split(";").length == 2)
+    let ring = CadModeling.extruded(rings, 1.0, 0.0, "e", CadModeling.profile_at(rings, Vector3(a - 0.2, 1.0, 0.0) if along_x else Vector3(0.0, 1.0, a - 0.2)))
+    let m = ring.tessellate(16)
+    manifold(m)
+    assert(near(volume(m), 8.0 - (2.0 * a - 0.8) * (2.0 * b - 0.8)))
+    # The box grows to 6 wide upstream: the projection follows, and the
+    # offset with it.
+    let wider = CadModeling.tagged(CadSolids.box(6.0, 2.0, 2.0), "box")
+    let wide_frame = CadModeling.face_frame(wider, top)
+    assert(wide_frame.found)
+    assert(s.relink(wider, Vector3(0.0, 1.0, 0.0), frame.u, frame.v) == 0 and s.gained() == 0)
+    assert(s.solve())
+    let (wa, wb) = (3.0, 1.0) if along_x else (1.0, 3.0)
+    assert(rectangle(s, lines, wa, wb))
+    assert(rectangle(s, copies, wa - 0.4, wb - 0.4))
+    holes_and_gains()
+    vertex_links()
+    arcs_offset()
+    print("PASS face projection: a box's top face projected as four linked lines on shared points (one profile), offset inward as one relation whose one value moves every copy, kept through text, extruded as a ring; the box widened upstream moves the projection and the offset follows; a drilled face's hole projected as a linked circle; a notch cut upstream adds the loop's new edges; a vertex linked as a point; arcs and circles offset by the relation")
+
+## A face with a hole: its outer loop and the hole's circle, two loops,
+## a ring profile. A notch cut into the face's edge upstream: relinking
+## keeps the old edges (a split one follows its piece nearest where it
+## was) and adds the loop's new ones.
+func holes_and_gains() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(4.0, 2.0, 2.0), "box")
+    let pin = CadModeling.tagged(CadSolids.cylinder(0.5, 4.0), "pin")
+    let drilled = CadModeling.combined(box, pin, 1)
+    let top = top_name(drilled)
+    let frame = CadModeling.face_frame(drilled, top)
+    let s = CadSketch.parse("")
+    assert(s.project_face(drilled, top, Vector3(0.0, 1.0, 0.0), frame.u, frame.v) == 5)
+    var circles = 0
+    for at in 0..<5:
+        if s.kind(s.projected_curve(at)) == circle_kind:
+            circles += 1
+            assert(near(s.radius(s.projected_curve(at)), 0.5))
+    assert(circles == 1)
+    let profiles = s.curves(Vector3(0.0, 1.0, 0.0), frame.u, frame.v)
+    assert(CadModeling.profile_count(profiles) == 1)
+    # A notch from the +X end: the top loop gains three edges.
+    let cutter = CadModeling.tagged(CadSolids.box(1.0, 1.0, 1.0).transformed(Vector3(2.0, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), "notch")
+    let notched = CadModeling.combined(drilled, cutter, 1)
+    let lost = s.relink(notched, Vector3(0.0, 1.0, 0.0), frame.u, frame.v)
+    assert(lost == 0, f"lost {lost}")
+    # Three new edges, and the second piece of the edge the notch split
+    # (its first piece keeps the old curve).
+    assert(s.gained() == 4, f"gained {s.gained()}")
+    assert(s.solve())
+    # Still one region: the notched face less its hole.
+    let after = s.curves(Vector3(0.0, 1.0, 0.0), frame.u, frame.v)
+    assert(CadModeling.profile_count(after) == 1)
+    let slab = CadModeling.extruded(after, 1.0, 0.0, "e")
+    let m = slab.tessellate(24)
+    manifold(m)
+    assert(math.abs(volume(m) - (8.0 - 0.5 - math.pi * 0.25)) < 0.01, f"volume {volume(m)}")
+
+## A box's corner as a linked point: it follows the corner upstream.
+func vertex_links() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = top_name(box)
+    let frame = CadModeling.face_frame(box, top)
+    let p = CadSketch.parse("")
+    let projection = CadProjection.of(box, Vector3(0.0, 1.0, 0.0), frame.u, frame.v)
+    # The edge through the middle of one side (at 1 along v).
+    let edge = projection.nearest(0.0, 1.0, 0.01)
+    assert(edge >= 0)
+    let corner = p.project_end(projection, edge, 0)
+    let x0 = p.x(corner)
+    let y0 = p.y(corner)
+    assert(near(math.abs(x0), 1.0) and near(math.abs(y0), 1.0))
+    let bigger = CadModeling.tagged(CadSolids.box(4.0, 2.0, 4.0), "box")
+    assert(p.relink(bigger, Vector3(0.0, 1.0, 0.0), frame.u, frame.v) == 0)
+    assert(near(p.x(corner), x0 * 2.0) and near(p.y(corner), y0 * 2.0))
+
+## Arcs and a lone circle offset by the relation: an arc slot's outline
+## offset out grows its arcs' radii with the one value.
+func arcs_offset() -> unit!:
+    let s = CadSketch.parse("")
+    # A slot: two lines and two half circles, centers 4 apart, radius 1.
+    let c0 = s.add_point(0.0, 0.0)
+    let c1 = s.add_point(4.0, 0.0)
+    let p0 = s.add_point(0.0, -1.0)
+    let p1 = s.add_point(4.0, -1.0)
+    let p2 = s.add_point(4.0, 1.0)
+    let p3 = s.add_point(0.0, 1.0)
+    let chain = [s.add_line(p0, p1), s.add_arc(c1, p1, p2), s.add_line(p2, p3), s.add_arc(c0, p3, p0)]
+    # Held where they are, as projected curves are: the copies move.
+    for c in chain:
+        _ = s.constrain(fix, c)
+    assert(s.offset(chain, 0.5, 0.0, 3.0, relation = true) == 4)
+    let relation = s.constraint_count() - 1
+    assert(s.constraint_kind(relation) == offset and s.offset_count(relation) == 4)
+    assert(s.solve())
+    assert(near(s.radius(s.offset_copy(relation, 1)), 1.5) and near(s.radius(s.offset_copy(relation, 3)), 1.5))
+    s.set_value(relation, 0.75)
+    assert(s.solve())
+    assert(near(s.radius(s.offset_copy(relation, 1)), 1.75) and near(s.radius(s.offset_copy(relation, 3)), 1.75))
+    let top_copy = s.offset_copy(relation, 2)
+    assert(near(s.y(s.part(top_copy, 0)), 1.75) and near(s.y(s.part(top_copy, 1)), 1.75))
+    # A lone circle: concentric, inward.
+    let ring = s.add_circle(s.add_point(10.0, 0.0), 2.0)
+    _ = s.constrain(fix, ring)
+    assert(s.offset([ring], 0.5, 10.0, 0.0, relation = true) == 1)
+    let held = s.constraint_count() - 1
+    s.set_value(held, 0.8)
+    assert(s.solve())
+    assert(near(s.radius(s.offset_copy(held, 0)), 1.2))
+    # Removing the relation takes its pairs; the copies stay, free.
+    s.unconstrain(relation)
+    assert(CadSketch.parse(s.text()).constraint_count() == s.constraint_count())
