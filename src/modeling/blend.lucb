@@ -9,8 +9,9 @@
 ## between the edge and its section (a circle of `radius` touching both
 ## faces, or a G2/G3 B-spline). Where fillets meet at corners: corners.lucb
 ## (balls), setback.lucb (G2/G3); every edge of a convex polyhedron rounded
-## whole: rounded.lucb. Straight edges between planes are first tried
-## directly (local_blend.lucb). Whether a blend fits: blend_fits.lucb.
+## whole: rounded.lucb. Tangent loops round a flat face (cap_blend.lucb) and
+## straight edges between planes (local_blend.lucb) are first built directly.
+## Whether a blend fits: blend_fits.lucb.
 
 ## The unit direction across face `f` from the middle of edge `e`, into the
 ## face, perpendicular to the edge.
@@ -49,19 +50,24 @@ func is_rim(w: const Shape*, e: usize, fa: usize, fb: usize) -> bool:
     let radius = round.radius + (height * math.tan(round.angle) if round.kind == surface_cone else 0.0)
     return offset.subtract(round.z.multiply_scalar(height)).length() < c.a * 1e-6 and math.abs(radius - c.a) < c.a * 1e-6
 
-## Whether edge `e` can be blended: a line between two planar faces, or a
-## rim (is_rim), convex or concave but not flat.
+## Whether edge `e` can be blended: a line between two planar faces, a
+## rim (is_rim), or an edge round a flat face whose wall stands square to
+## it (cap_blend.lucb: a box's top after its uprights were filleted),
+## convex or concave but not flat.
 func blendable(w: const Shape*, e: usize) -> bool!:
     let edge = w.edges.items[e]
     let kind = w.carriers.items[(usize)edge.carrier].kind
-    if kind != curve_line and kind != curve_circle: return false
+    if kind != curve_line and kind != curve_circle and kind != curve_spline: return false
     # A seam (one face's both ways) is no edge between two faces.
     let (fa, fb) = edge_faces(w, e) catch failure:
         _ = failure
         return false
-    if kind == curve_circle:
+    let capped = cap_candidate(w, e, fa, fb) or cap_candidate(w, e, fb, fa)
+    if kind == curve_spline:
+        if not capped: return false
+    elif kind == curve_circle:
         if not is_rim(w, e, fa, fb): return false
-    elif not flat_pair(w, fa, fb) and ruled_pair(w, e, fa, fb) < 0: return false
+    elif not flat_pair(w, fa, fb) and ruled_pair(w, e, fa, fb) < 0 and not capped: return false
     let along = try along_edge(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
@@ -122,8 +128,9 @@ func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize
     else:
         try resolve_edges(w, references, chosen)
         for e in chosen.view():
-            if not try blendable(w, e): error(invalid, "only straight edges between flat faces, and rims (a circle or arc between a flat face and a cylinder about it), can be blended yet")
+            if not try blendable(w, e): error(invalid, "only straight edges between flat faces, rims (a circle or arc between a flat face and a cylinder about it), and edges round a flat face whose walls stand square to it can be blended yet")
         if chain: try tangent_chains(w, chosen)
+        else: try refuse_open_spline_chains(w, chosen.view())
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
 
 ## `model` (its shape `w`) with edges `chosen` blended to `size` (`every`:
@@ -134,11 +141,18 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     # Each edge's blend must fit its faces: said precisely, before any tool.
     for e in chosen: try check_fits(w, e, size, round)
-    # Straight edges between flat faces are built directly; what that
-    # declines (curved faces at a corner, mixed corners, chamfers...) the
+    # Tangent loops round a flat face (its walls square to it) and
+    # straight edges between flat faces are built directly; what those
+    # decline (curved faces at a corner, mixed corners, chamfers...) the
     # booleans below make.
+    if direct:
+        if let made = try cap_blend(w, chosen, size, round, continuity, tag): return made
     if round and direct:
         if let made = try local_blend(w, chosen, size, continuity, tag, patches): return made
+    # The booleans' tools follow lines and rims only.
+    for e in chosen:
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_spline:
+            error(invalid, "an edge along a B-spline face is blended only with its whole tangent loop round a flat face (each joint a tangent one, the walls square to the face): keep Tangent chain on, or pick the loop")
     # Inside and outside fillets meeting at a corner: one side first, the
     # other then runs around it (a torus), by name on the result.
     if round and not every:
@@ -360,6 +374,18 @@ func tangent_chains(w: const Shape*, chosen: Growing[usize]*) -> !:
                 if leaving.dot(arriving) < 1.0 - 1e-6: continue
                 if not try blendable(w, f) or try convex(w, f) != outward: continue
                 try chosen.push(f)
+
+## Without Tangent chain, an edge may stop where a line or arc continues
+## it (its tool ends in a wall there), but not where a B-spline edge does:
+## that loop is blended whole (cap_blend.lucb) or not at all.
+func refuse_open_spline_chains(w: const Shape*, chosen: const usize[]) -> !:
+    var chained = Growing[usize]()
+    defer chained.close()
+    try chained.assign(chosen)
+    try tangent_chains(w, &chained)
+    for e in chained.view()[chosen.length..]:
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_spline:
+            error(invalid, "this edge continues smoothly into a curved edge that is not picked: turn Tangent chain on, or pick the whole loop")
 
 ## The name of edge `e`'s blend, `tag/blend[A&B]`, into `out` (empty
 ## when its faces have no names).

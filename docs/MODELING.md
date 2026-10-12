@@ -382,6 +382,41 @@ changed. luced-3d's Fillet node keeps its plan on the compute worker, so draggin
 rebuilds. On every edge of a box, a radius costs 1 ms at G2 and 1.5 ms at G3, against 33 ms and 55
 ms afresh.
 
+### Loops round a flat face (`cap_blend.lucb`)
+
+A flat face's edges where it meets walls standing square to it are blended directly too, as a
+whole tangent loop. A wall may be a plane containing the face's normal, a cylinder about it, or a
+B-spline face swept straight along it, as an extrusion's sides and an earlier fillet's strips are.
+The top of a box whose uprights were filleted is such a loop: four lines and the uprights' G1 arcs
+or G2/G3 sections, tangent where they meet. So is a hole's rim. Every vertex of the loop must be a
+joint: two picked edges meeting tangentially, and one seam between two walls along the face's
+normal. Anything else is left to the booleans.
+
+Every section across such an edge is the same square corner. The blend is that one 2D section (a
+quarter circle, the G2/G3 B-spline, or a chamfer's line) carried along the edge, in the frame of the
+face's normal and the edge's normal in the face. OpenCASCADE and Parasolid build a ball rolling
+along a curve the same way.
+- **Lines and arcs** stay exact. G1 and chamfers make a cylinder or plane along a line, and a torus
+  or cone about an arc. G2 and G3 sweep their section along the edge: straight, or as rational
+  arcs about an arc's axis.
+- **B-spline edges** are approximated. Each row of the section's control points follows an offset
+  of the edge. Its ends and end tangents are exact, and its interior is a least-squares fit on the
+  edge's own parameter, degree and knots. Spans that stray beyond the shape's tolerance are halved,
+  and the rows are fitted again. The rows on the face and on the wall are those faces' new edges,
+  so they are shared exactly. The rows along the wall are the edge moved, which the knots hold
+  exactly.
+
+The face's loop moves onto the contacts. Each wall's edge moves down to its contact: the wall's own
+section, moved. Each seam is shortened, and each joint gets one section edge, which both of its
+strips share. The result is closed by construction, and checked.
+
+**Too large** is said with the size that fits. A contact on the face must stay short of where the
+edge's offset folds (the edge's least radius of curvature toward the face: 0.341 for G3 uprights of
+0.4). Each seam must keep some length (half its length when both its ends are blended).
+
+**Without Tangent chain,** an edge whose loop continues into B-spline edges is refused: "turn
+Tangent chain on, or pick the whole loop". Booleans can't end a tool on a B-spline wall.
+
 ### Fillets meeting at corners (`corners.lucb`)
 
 - **Two fillets** of one radius meeting where the third edge stays sharp meet in a miter. Both
@@ -478,7 +513,8 @@ Roughly in order of usefulness:
 
 1. **Fillet corners beyond three edges,** and G1 setback corners (the same patch with one row:
    unequal radii, Fusion's other corner type).
-2. **Blends on other curved edges:** ellipses, and edges between two curved faces.
+2. **Blends on other curved edges:** ellipses, and edges between two curved faces; open
+   chains along B-spline walls (a fillet ending where a tangent loop goes on).
 3. **B-spline surfaces in booleans** beyond a plane meeting a swept profile: marching on parametric
    surfaces. Rays through them are exact (`spline_rays.lucb`).
 4. **Sweep and loft;** tapered extrudes; Extrude "to object".

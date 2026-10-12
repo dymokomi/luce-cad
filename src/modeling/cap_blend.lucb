@@ -1,0 +1,776 @@
+## Blends round a flat face's tangent loops, built directly (no booleans):
+## the edges where a flat face (the cap) meets walls standing square to
+## it, swept along its normal. Planes, cylinders about the normal and
+## B-spline faces swept straight along it, as an extrusion's sides or an
+## earlier fillet's strips are. The top of a box whose uprights were
+## filleted is such a loop: lines and the fillets' sections, tangent where
+## they meet.
+##
+## Every section across such an edge is the same square corner, so the
+## blend is one 2D section (a circle's quarter, a G2/G3 B-spline, or a
+## chamfer's line) carried along the edge in the frame of the cap's
+## normal and the edge's normal in the cap. As OpenCASCADE and Parasolid
+## do for a rolling ball along a curve, the strip over a B-spline edge is
+## approximated: each row of its section's control points follows an
+## offset of the edge (fitted, degree and knots of the edge refined until
+## within the shape's tolerance), so its rows on the cap and the wall are
+## the face boundaries themselves. Lines and arcs stay exact: a cylinder
+## or a plane along a line, a torus or a cone about an arc (G1 and
+## chamfers); their G2/G3 strips are their sections swept along them
+## exactly (rational arcs for arcs).
+##
+## The cap's loop is replaced by the contacts on it, each wall's edge by
+## its contact (the wall's own section moved down), and each joint's seam
+## (the line between two walls) is shortened; joints get one section
+## edge both strips share. Every vertex of a picked edge must be such a
+## joint: two picked edges meeting tangentially on the cap and one seam
+## along its normal. Anything else is declined (blend.lucb's booleans).
+
+## A picked edge of a cap loop: its cap and wall faces, the side of its
+## cap normal its cap lies on (`sign`: the way into the cap is `sign`
+## (n x the edge's carrier tangent)), the way into the wall, whether the
+## edge is convex, and what it becomes: its contact edges on the cap
+## (`outer`) and the wall (`inner`), and its strip's surface and sense.
+struct CapSide:
+    var edge: usize
+    var cap: usize
+    var wall: usize
+    var sign: f64
+    var into_wall: Vector3
+    var convex: bool
+    var outer: i64
+    var inner: i64
+    var surface: i64
+    var sense: bool
+
+## The builder: the body `w`, the result `out` (begun as a copy of the
+## body, so its points, edges and surfaces keep their numbers), the blend
+## (contact distance `reach`: a fillet's radius, a chamfer's size), and
+## for each body edge its picked side (-1) or new seam (-1), for each
+## body vertex its contacts on the cap and wall and its section (-1).
+struct Cap:
+    var w: const Shape*
+    var out: Shape
+    var reach: f64
+    var round: bool
+    var continuity: i64
+    var sides: Growing[CapSide]
+    var side_of: Growing[i64]
+    var seams: Growing[i64]
+    var on_cap: Growing[i64]
+    var on_wall: Growing[i64]
+    var sections: Growing[i64]
+    var name: Growing[u8]
+
+    func close():
+        self.out.close()
+        self.sides.close()
+        self.side_of.close()
+        self.seams.close()
+        self.on_cap.close()
+        self.on_wall.close()
+        self.sections.close()
+        self.name.close()
+
+    func at(id: i64) -> Vector3:
+        return self.out.points.items[(usize)id]
+
+    ## A straight out edge from point `a` to `b`.
+    func line(a: i64, b: i64) -> i64!:
+        let pa = self.at(a)
+        let span = self.at(b).subtract(pa)
+        let length = span.length()
+        if length <= self.w.tolerance: error(invalid, "a blend would make an edge of no length")
+        let c = try self.out.add_carrier(Carrier(0, pa, span.multiply_scalar(1.0 / length), Vector3(), 0.0, 0.0, -1))
+        return try self.out.add_edge(ShapeEdge(c, 0.0, length, a, b))
+
+    ## A non-rational B-spline out edge over its whole domain, from point
+    ## `a` to `b`: from its first control point to its last (`forward`),
+    ## or back.
+    func spline(a: i64, b: i64, net: const Vector3[], knots: const f64[], degree: i64, forward: bool) -> i64!:
+        var weights = Growing[f64]()
+        defer weights.close()
+        try weights.fill(net.length, 1.0)
+        let index = try self.out.store_spline(net, weights.view(), knots, degree, Matrix4())
+        let c = try self.out.add_carrier(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, index))
+        let low = knots[(usize)degree]
+        let high = knots[net.length]
+        return try self.out.add_edge(ShapeEdge(c, low if forward else high, high if forward else low, a, b))
+
+## Edges `chosen` of `w` blended round their caps (see the file's header):
+## filleted to `size` (`continuity` 1 to 3) when `round`, else chamfered;
+## none when they are not all such loops (the booleans then try).
+pub func cap_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str) -> interop.Reference[CadModel]?!:
+    var made = try new_cap(w, size, round, continuity)
+    defer made.close()
+    let b = &made
+    if not try cap_eligible(b, chosen): return none
+    try cap_room(b)
+    try cap_contacts(b)
+    for k in 0..<b.sides.count: try cap_strip(b, k)
+    try cap_sections(b)
+    return try cap_result(b, tag)
+
+func new_cap(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cap!:
+    var out = empty_shape(w.tolerance)
+    errdefer out.close()
+    for p in w.points.view(): try out.points.push(p)
+    for c in w.carriers.view(): try out.carriers.push(c)
+    for edge in w.edges.view(): try out.edges.push(edge)
+    for sp in w.splines.view(): try out.splines.push(sp)
+    for p in w.spline_points.view(): try out.spline_points.push(p)
+    for x in w.spline_weights.view(): try out.spline_weights.push(x)
+    for k in w.spline_knots.view(): try out.spline_knots.push(k)
+    for s in w.surfaces.view():
+        try out.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
+    var made = Cap(w, out, size, round, continuity, Growing[CapSide](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[u8]())
+    errdefer made.close()
+    try made.side_of.fill(w.edges.count, -1)
+    try made.seams.fill(w.edges.count, -1)
+    try made.on_cap.fill(w.points.count, -1)
+    try made.on_wall.fill(w.points.count, -1)
+    try made.sections.fill(w.points.count, -1)
+    return made
+
+## Whether face `wall` stands square to the plane of normal `n` along it:
+## a plane containing `n`, a cylinder about it, or a B-spline swept
+## straight along it (two rows a constant step along `n` apart).
+func wall_along(w: const Shape*, wall: usize, n: Vector3) -> bool:
+    let s = w.surfaces.items[(usize)w.faces.items[wall].surface]
+    if s.kind == surface_plane: return math.abs(s.z.dot(n)) < 1e-9
+    if s.kind == surface_cylinder: return math.abs(s.z.dot(n)) > 1.0 - 1e-12
+    if s.kind != surface_spline: return false
+    # The swept way is v (two rows per u) or u (two rows per v).
+    let along_v = s.nv == 2 and s.dv == 1
+    let along_u = s.nu == 2 and s.du == 1
+    if not along_v and not along_u: return false
+    let count = s.nu if along_v else s.nv
+    var step = Vector3()
+    for i in 0..<(usize)count:
+        let first = i * 2 if along_v else i
+        let second = i * 2 + 1 if along_v else (usize)s.nv + i
+        if math.abs(s.weights[first] - s.weights[second]) > 1e-12: return false
+        let d = s.points[second].subtract(s.points[first])
+        if i == 0:
+            step = d
+            if step.length() <= w.tolerance or step.cross(n).length() > step.length() * 1e-9: return false
+        elif d.subtract(step).length() > w.tolerance: return false
+    return true
+
+## Whether edge `e` lies where flat face `cap` meets a wall (`wall`)
+## standing square to it: what this file blends.
+func cap_candidate(w: const Shape*, e: usize, cap: usize, wall: usize) -> bool:
+    if cap == wall: return false
+    let s = w.surfaces.items[(usize)w.faces.items[cap].surface]
+    if s.kind != surface_plane: return false
+    let kind = w.carriers.items[(usize)w.edges.items[e].carrier].kind
+    if kind != curve_line and kind != curve_circle and kind != curve_spline: return false
+    return wall_along(w, wall, s.z)
+
+## The picked edges' sides, when every one lies on a cap loop and every
+## vertex of theirs is a joint (two of them meeting tangentially on the
+## cap, and one seam along its normal); false otherwise.
+func cap_eligible(b: Cap*, chosen: const usize[]) -> bool!:
+    let w = b.w
+    if chosen.length == 0: return false
+    # Each edge's possible caps (one of its faces, or both).
+    var caps = Growing[i64]()
+    defer caps.close()
+    for e in chosen:
+        if b.side_of.items[e] >= 0: return false
+        b.side_of.items[e] = 0
+        let (fa, fb) = try edge_faces(w, e)
+        let a = cap_candidate(w, e, fa, fb)
+        let z = cap_candidate(w, e, fb, fa)
+        if not a and not z: return false
+        try caps.push((i64)fa if a else -1)
+        try caps.push((i64)fb if z else -1)
+    for e in chosen: b.side_of.items[e] = -1
+    # Picked ends at each vertex: exactly two (a closed edge's both).
+    var ends = Growing[i64]()
+    defer ends.close()
+    try ends.fill(w.points.count, 0)
+    for e in chosen:
+        ends.items[(usize)w.edges.items[e].start] += 1
+        ends.items[(usize)w.edges.items[e].end] += 1
+    for e in chosen:
+        if ends.items[(usize)w.edges.items[e].start] != 2 or ends.items[(usize)w.edges.items[e].end] != 2: return false
+    # Edges meeting at a joint share their cap: keep only caps the
+    # neighbour allows, until nothing changes.
+    var changed = true
+    while changed:
+        changed = false
+        for i in 0..<chosen.length:
+            for j in 0..<chosen.length:
+                if i == j: continue
+                let ei = w.edges.items[chosen[i]]
+                let ej = w.edges.items[chosen[j]]
+                if ei.start != ej.start and ei.start != ej.end and ei.end != ej.start and ei.end != ej.end: continue
+                for k in 0..<(usize)2:
+                    let c = caps.items[i * 2 + k]
+                    if c < 0 or c == caps.items[j * 2] or c == caps.items[j * 2 + 1]: continue
+                    caps.items[i * 2 + k] = -1
+                    changed = true
+    for i in 0..<chosen.length:
+        let e = chosen[i]
+        let first = caps.items[i * 2]
+        let second = caps.items[i * 2 + 1]
+        if (first < 0) == (second < 0): return false
+        let cap = (usize)(first if first >= 0 else second)
+        let (fa, fb) = try edge_faces(w, e)
+        let wall = fb if fa == cap else fa
+        let n = w.surfaces.items[(usize)w.faces.items[cap].surface].z
+        let along = try along_edge(w, e)
+        let edge = w.edges.items[e]
+        let middle = (edge.t0 + edge.t1) * 0.5
+        let crosswise = try n.cross(try w.tangent(edge.carrier, middle)).normalized()
+        let cap_way = try into_face(w, cap, e, along)
+        let wall_way = try into_face(w, wall, e, along)
+        if math.abs(wall_way.dot(n)) < 1.0 - 1e-9: return false
+        try b.sides.push(CapSide(e, cap, wall, 1.0 if crosswise.dot(cap_way) > 0.0 else -1.0, n.multiply_scalar(1.0 if wall_way.dot(n) > 0.0 else -1.0),
+                                 try convex(w, e), -1, -1, -1, true))
+        b.side_of.items[e] = (i64)b.sides.count - 1
+    # Each joint: its two picked edges tangent, on one cap, the wall on the
+    # same side, and one other edge, a seam along the cap's normal.
+    for side in b.sides.view():
+        let edge = w.edges.items[side.edge]
+        let vertices: i64[2] = [edge.start, edge.end]
+        for v in vertices:
+            var seams: usize = 0
+            for g in 0..<w.edges.count:
+                let other = w.edges.items[g]
+                if other.start != v and other.end != v: continue
+                let k = b.side_of.items[g]
+                if k >= 0:
+                    let next = b.sides.items[(usize)k]
+                    if next.cap != side.cap or next.into_wall.dot(side.into_wall) < 0.0 or next.convex != side.convex: return false
+                    if g != side.edge:
+                        let mine = try w.leaving(side.edge, 0 if edge.start == v else 1)
+                        let theirs = try w.leaving(g, 0 if other.start == v else 1)
+                        if mine.dot(theirs) > -1.0 + 1e-9: return false
+                    continue
+                if w.carriers.items[(usize)other.carrier].kind != curve_line: return false
+                if math.abs(w.carriers.items[(usize)other.carrier].x.dot(side.into_wall)) < 1.0 - 1e-9: return false
+                seams += 1
+            if seams != 1: return false
+    return true
+
+## The way into side `side`'s cap at its carrier's parameter `t`, and how
+## it turns (its derivative by `t`).
+func into_cap(b: const Cap*, side: const CapSide*, t: f64) -> (Vector3, Vector3)!:
+    let w = b.w
+    let n = w.surfaces.items[(usize)w.faces.items[side.cap].surface].z
+    let (_, d1, d2) = try w.derivatives(w.edges.items[side.edge].carrier, t)
+    let crosswise = n.cross(d1)
+    let turning = n.cross(d2)
+    let length = crosswise.length()
+    if length <= 1e-300: error(invalid, "a blend's edge stops along it")
+    let u = crosswise.multiply_scalar(side.sign / length)
+    let du = turning.multiply_scalar(1.0 / length).subtract(crosswise.multiply_scalar(crosswise.dot(turning) / (length * length * length)))
+    return (u, du.multiply_scalar(side.sign))
+
+## The point of side `side`'s section row (`a` into the cap, `z` into
+## the wall, from the edge) at parameter `t`, and its derivative.
+func row_at(b: const Cap*, side: const CapSide*, a: f64, z: f64, t: f64) -> (Vector3, Vector3)!:
+    let (p, d1, _) = try b.w.derivatives(b.w.edges.items[side.edge].carrier, t)
+    let (u, du) = try into_cap(b, side, t)
+    return (p.add(u.multiply_scalar(a)).add(side.into_wall.multiply_scalar(z)), d1.add(du.multiply_scalar(a)))
+
+## Each joint's contacts on the cap and the wall, and each seam shortened
+## to its wall contacts: it must keep some length.
+func cap_contacts(b: Cap*) -> !:
+    let w = b.w
+    for side in b.sides.view():
+        let edge = w.edges.items[side.edge]
+        for end in 0..<(usize)2:
+            let v = edge.start if end == 0 else edge.end
+            if b.on_cap.items[(usize)v] >= 0: continue
+            let (u, _) = try into_cap(b, &side, edge.t0 if end == 0 else edge.t1)
+            let p = w.points.items[(usize)v]
+            b.on_cap.items[(usize)v] = try b.out.add_point(p.add(u.multiply_scalar(b.reach)))
+            b.on_wall.items[(usize)v] = try b.out.add_point(p.add(side.into_wall.multiply_scalar(b.reach)))
+    for g in 0..<w.edges.count:
+        let seam = w.edges.items[g]
+        if b.side_of.items[g] >= 0: continue
+        let low = b.on_wall.items[(usize)seam.start]
+        let high = b.on_wall.items[(usize)seam.end]
+        if low < 0 and high < 0: continue
+        let a = low if low >= 0 else seam.start
+        let z = high if high >= 0 else seam.end
+        b.seams.items[g] = try b.line(a, z)
+
+## The largest blend the loops take, an error when the blend is not
+## smaller: each contact on the cap must stay short of where the edge's
+## offset folds (its radius of curvature toward the cap), and each seam
+## between walls must keep some length (its whole length, or half when
+## blends shorten it at both ends).
+func cap_room(b: const Cap*) -> !:
+    let w = b.w
+    var most = 1.0e300
+    var what = "this curved edge"
+    for side in b.sides.view():
+        most = math.min(most, try offset_room(b, &side))
+    var ends = Growing[i64]()
+    defer ends.close()
+    try ends.fill(w.points.count, 0)
+    for side in b.sides.view():
+        let edge = w.edges.items[side.edge]
+        ends.items[(usize)edge.start] = 1
+        ends.items[(usize)edge.end] = 1
+    for g in 0..<w.edges.count:
+        if b.side_of.items[g] >= 0: continue
+        let seam = w.edges.items[g]
+        let shortened = ends.items[(usize)seam.start] + ends.items[(usize)seam.end]
+        if shortened == 0: continue
+        let height = w.points.items[(usize)seam.end].subtract(w.points.items[(usize)seam.start]).length() / (f64)shortened
+        if height < most:
+            most = height
+            what = "the height of its walls"
+    if b.reach >= most: try too_large(b.round, b.reach, most, what)
+
+## An error: a blend of `size` is too large for `what`; it must be less
+## than `most`.
+func too_large(round: bool, size: f64, most: f64, what: str) -> !:
+    var buffer: u8[256]
+    let text = try strings.format(buffer, f"a fillet radius of {rounded_text(size)} is too large for {what}: it must be less than {rounded_text(most)}") if round else try strings.format(buffer, f"a chamfer of {rounded_text(size)} is too large for {what}: it must be less than {rounded_text(most)}")
+    let owned = try interop.copy_text(text)
+    if let owner = owned.owner: _ = ownership.pool_object(owner)
+    error(invalid, owned.value)
+
+## The section's control points as steps into the cap (`caps`) and
+## the wall (`walls`) from the corner, from the cap's contact to the
+## wall's; its knots, weights and degree. A chamfer's line; G1, a quarter
+## circle (rational); G2, G3 the fillet's B-spline (fillet_section).
+func section_rows(b: const Cap*, caps: Growing[f64]*, walls: Growing[f64]*, knots: Growing[f64]*, weights: Growing[f64]*) -> i64!:
+    let d = b.reach
+    if not b.round:
+        let a: f64[2] = [d, 0.0]
+        let z: f64[2] = [0.0, d]
+        let k: f64[4] = [0.0, 0.0, 1.0, 1.0]
+        try caps.assign(a[..<2])
+        try walls.assign(z[..<2])
+        try knots.assign(k[..<4])
+        try weights.fill(2, 1.0)
+        return 1
+    if b.continuity == 1:
+        let a: f64[3] = [d, 0.0, 0.0]
+        let z: f64[3] = [0.0, 0.0, d]
+        let k: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+        let x: f64[3] = [1.0, math.sqrt(0.5), 1.0]
+        try caps.assign(a[..<3])
+        try walls.assign(z[..<3])
+        try knots.assign(k[..<6])
+        try weights.assign(x[..<3])
+        return 2
+    var points = Growing[Vector3]()
+    defer points.close()
+    try fillet_section(Vector3(d, 0.0, 0.0), Vector3(0.0, d, 0.0), Vector3(), b.continuity, &points, knots)
+    for p in points.view():
+        try caps.push(p.x)
+        try walls.push(p.y)
+    try weights.fill(points.count, 1.0)
+    return 5
+
+## How far side `side`'s cap contact may go in before its offset of the
+## edge folds back (where the edge curves toward the cap: its radius of
+## curvature there); very large when it never does.
+func offset_room(b: const Cap*, side: const CapSide*) -> f64!:
+    let edge = b.w.edges.items[side.edge]
+    var least = 1.0e300
+    for k in 0..<(usize)65:
+        let t = edge.t0 + (edge.t1 - edge.t0) * (f64)k / 64.0
+        let (_, d1, _) = try b.w.derivatives(edge.carrier, t)
+        let (_, du) = try into_cap(b, side, t)
+        let turning = du.dot(d1)
+        if turning < 0.0: least = math.min(least, d1.dot(d1) / -turning)
+    return least
+
+## Side `k`'s contact edges and strip surface.
+func cap_strip(b: Cap*, k: usize) -> !:
+    let side = b.sides.items[k]
+    let w = b.w
+    let edge = w.edges.items[side.edge]
+    let carrier = w.carriers.items[(usize)edge.carrier]
+    var a = Growing[f64]()
+    defer a.close()
+    var z = Growing[f64]()
+    defer z.close()
+    var ku = Growing[f64]()
+    defer ku.close()
+    var wu = Growing[f64]()
+    defer wu.close()
+    let du = try section_rows(b, &a, &z, &ku, &wu)
+    let cap_start = b.on_cap.items[(usize)edge.start]
+    let cap_end = b.on_cap.items[(usize)edge.end]
+    let wall_start = b.on_wall.items[(usize)edge.start]
+    let wall_end = b.on_wall.items[(usize)edge.end]
+    let corner = w.points.items[(usize)edge.start]
+    let (u0, _) = try into_cap(b, &side, edge.t0)
+    var empty_points: Vector3[]
+    var empty_numbers: f64[]
+    if carrier.kind == curve_line:
+        b.sides.items[k].outer = try b.line(cap_start, cap_end)
+        b.sides.items[k].inner = try b.line(wall_start, wall_end)
+        let along = carrier.x.multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
+        if b.round and b.continuity == 1:
+            let axis = corner.add(u0.multiply_scalar(b.reach)).add(side.into_wall.multiply_scalar(b.reach))
+            try b.out.surfaces.push(try Surface(1, axis, try b.at(cap_start).subtract(axis).normalized(), along, b.reach, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+            return try finish_strip(b, k)
+        if not b.round:
+            let normal = try along.cross(b.at(wall_start).subtract(b.at(cap_start))).normalized()
+            try b.out.surfaces.push(try Surface(0, b.at(cap_start), along, normal, 0.0, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+            return try finish_strip(b, k)
+    elif carrier.kind == curve_circle:
+        # Concentric arcs: the cap's contact a circle of the radius moved by
+        # the reach, the wall's the edge's own circle moved along the wall.
+        let radial = w.points.items[(usize)edge.start].subtract(carrier.origin)
+        let outward = 1.0 if u0.dot(radial) > 0.0 else -1.0
+        let radius = carrier.a + b.reach * outward
+        let c_cap = try b.out.add_carrier(Carrier(1, carrier.origin, carrier.x, carrier.y, radius, radius, -1))
+        b.sides.items[k].outer = try b.out.add_edge(ShapeEdge(c_cap, edge.t0, edge.t1, cap_start, cap_end))
+        let lowered = carrier.origin.add(side.into_wall.multiply_scalar(b.reach))
+        let c_wall = try b.out.add_carrier(Carrier(1, lowered, carrier.x, carrier.y, carrier.a, carrier.a, -1))
+        b.sides.items[k].inner = try b.out.add_edge(ShapeEdge(c_wall, edge.t0, edge.t1, wall_start, wall_end))
+        if b.round and b.continuity == 1:
+            # A torus about the arc's axis, its tube's center the ball's path.
+            try b.out.surfaces.push(try Surface(5, lowered, carrier.x, carrier.x.cross(carrier.y), radius, b.reach, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+            return try finish_strip(b, k)
+        if not b.round:
+            # A cone through both contact circles, opening its own way.
+            let opening = carrier.a - radius
+            let axis = side.into_wall if opening > 0.0 else side.into_wall.multiply_scalar(-1.0)
+            let origin = carrier.origin if opening > 0.0 else lowered
+            let start_radius = radius if opening > 0.0 else carrier.a
+            try b.out.surfaces.push(try Surface(2, origin, carrier.x, axis, start_radius, math.atan2(math.abs(opening), b.reach), empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+            return try finish_strip(b, k)
+    # The section swept along the edge: rows of control points, each an
+    # exact or fitted offset of the edge, sharing the edge's knots.
+    var net = Growing[Vector3]()
+    defer net.close()
+    var kv = Growing[f64]()
+    defer kv.close()
+    var wv = Growing[f64]()
+    defer wv.close()
+    let dv = try along_rows(b, &side, a.view(), z.view(), &net, &kv, &wv)
+    let nv = wv.count
+    let nu = a.count
+    if carrier.kind == curve_spline:
+        # The contacts are the first and last rows; they run as the carrier.
+        let forward = edge.t1 > edge.t0
+        b.sides.items[k].outer = try b.spline(cap_start, cap_end, net.view()[..<nv], kv.view(), dv, forward)
+        b.sides.items[k].inner = try b.spline(wall_start, wall_end, net.view()[(nu - 1) * nv..<nu * nv], kv.view(), dv, forward)
+    var weights = Growing[f64]()
+    defer weights.close()
+    for i in 0..<nu:
+        for j in 0..<nv: try weights.push(wu.items[i] * wv.items[j])
+    try b.out.surfaces.push(try Surface(3, Vector3(), Vector3(), Vector3(), 0.0, 0.0, net.view(), weights.view(), ku.view(), kv.view(), (i64)nu, (i64)nv, du, dv))
+    try finish_strip(b, k)
+
+## Side `k`'s strip is the surface just made: its sense, outward (away
+## from the material) at the section's middle halfway along.
+func finish_strip(b: Cap*, k: usize) -> !:
+    let side = b.sides.items[k]
+    let edge = b.w.edges.items[side.edge]
+    let surface = (i64)b.out.surfaces.count - 1
+    b.sides.items[k].surface = surface
+    let t = (edge.t0 + edge.t1) * 0.5
+    let (u, _) = try into_cap(b, &side, t)
+    let bisector = try u.add(side.into_wall).normalized()
+    let outward = bisector.multiply_scalar(-1.0 if side.convex else 1.0)
+    let corner = try b.w.at(edge.carrier, t)
+    # A point of the strip there: the circle's middle (G1), the chamfer's,
+    # or near the B-spline's (its normal by parameters, so near is enough).
+    let s = &b.out.surfaces.items[(usize)surface]
+    var normal = Vector3()
+    if s.kind == surface_spline:
+        let u_mid = (s.ku[(usize)s.du] + s.ku[(usize)s.nu]) * 0.5
+        let v_low = s.kv[(usize)s.dv]
+        let v_high = s.kv[(usize)s.nv]
+        # Halfway along the rows is halfway along the edge (a B-spline's
+        # rows run on its parameter, a line's and an arc's over [0, 1]).
+        normal = try surface_normal_checked(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv, u_mid, (v_low + v_high) * 0.5)
+    else:
+        let middle = corner.add(u.multiply_scalar(b.reach)).add(side.into_wall.multiply_scalar(b.reach)).subtract(bisector.multiply_scalar(b.reach)) if b.round else corner.add(u.add(side.into_wall).multiply_scalar(b.reach * 0.5))
+        normal = try normal_at(s, middle, b.w.tolerance * 100.0)
+    b.sides.items[k].sense = normal.dot(outward) > 0.0
+
+## Side `side`'s rows (steps `a` into the cap and `z` into the wall) as
+## curves sharing knots: the net (row-major, a row per section point)
+## onto `net`, the along knots and weights onto `knots` and `weights`;
+## the degree. A line's are lines, an arc's rational arcs (concentric,
+## exact) from its start to its end over [0, 1]; a B-spline's fitted.
+func along_rows(b: const Cap*, side: const CapSide*, a: const f64[], z: const f64[], net: Growing[Vector3]*, knots: Growing[f64]*, weights: Growing[f64]*) -> i64!:
+    let w = b.w
+    let edge = w.edges.items[side.edge]
+    let carrier = w.carriers.items[(usize)edge.carrier]
+    if carrier.kind == curve_spline: return try fitted_rows(b, side, a, z, net, knots, weights)
+    if carrier.kind == curve_line:
+        let start = w.points.items[(usize)edge.start]
+        let end = w.points.items[(usize)edge.end]
+        let (u, _) = try into_cap(b, side, edge.t0)
+        for i in 0..<a.length:
+            let step = u.multiply_scalar(a[i]).add(side.into_wall.multiply_scalar(z[i]))
+            try net.push(start.add(step))
+            try net.push(end.add(step))
+        let k: f64[4] = [0.0, 0.0, 1.0, 1.0]
+        try knots.assign(k[..<4])
+        try weights.fill(2, 1.0)
+        return 1
+    # An arc in spans of at most a quarter turn, each a rational quadratic.
+    let sweep = edge.t1 - edge.t0
+    let spans = (usize)math.max(1.0, math.ceil(math.abs(sweep) / (math.pi * 0.5) - 1e-9))
+    let half = sweep / (2.0 * (f64)spans)
+    let radial = w.points.items[(usize)edge.start].subtract(carrier.origin)
+    let (u0, _) = try into_cap(b, side, edge.t0)
+    let outward = 1.0 if u0.dot(radial) > 0.0 else -1.0
+    for i in 0..<a.length:
+        let radius = carrier.a + a[i] * outward
+        let center = carrier.origin.add(side.into_wall.multiply_scalar(z[i]))
+        for j in 0..<spans * 2 + 1:
+            let angle = edge.t0 + half * (f64)j
+            let direction = carrier.x.multiply_scalar(math.cos(angle)).add(carrier.y.multiply_scalar(math.sin(angle)))
+            let scale = radius if j % 2 == 0 else radius / math.cos(half)
+            try net.push(center.add(direction.multiply_scalar(scale)))
+    for _ in 0..<(usize)3: try knots.push(0.0)
+    for j in 1..<spans:
+        try knots.push((f64)j / (f64)spans)
+        try knots.push((f64)j / (f64)spans)
+    for _ in 0..<(usize)3: try knots.push(1.0)
+    for j in 0..<spans * 2 + 1: try weights.push(1.0 if j % 2 == 0 else math.cos(half))
+    return 2
+
+## Side `side`'s rows over a B-spline edge, fitted: least squares on the
+## edge's own parameter, its degree (at least 3) and knots (within the
+## edge's interval), the rows' ends and end tangents exact; spans whose
+## rows stray more than the tolerance are halved, and it is fitted again.
+## The rows into the wall only (`a` 0) are the edge moved, which the
+## knots hold exactly.
+func fitted_rows(b: const Cap*, side: const CapSide*, a: const f64[], z: const f64[], net: Growing[Vector3]*, knots: Growing[f64]*, weights: Growing[f64]*) -> i64!:
+    let w = b.w
+    let edge = w.edges.items[side.edge]
+    let (_, _, ck, cd) = w.spline_net(w.carriers.items[(usize)edge.carrier].spline)
+    let low = math.min(edge.t0, edge.t1)
+    let high = math.max(edge.t0, edge.t1)
+    let p = (usize)math.max((f64)cd, 3.0)
+    knots.clear()
+    for _ in 0..<p + 1: try knots.push(low)
+    var at: usize = 0
+    while at < ck.length:
+        let value = ck[at]
+        var multiplicity: usize = 0
+        while at + multiplicity < ck.length and ck[at + multiplicity] == value: multiplicity += 1
+        at += multiplicity
+        if value <= low or value >= high: continue
+        for _ in 0..<(usize)math.min((f64)p, (f64)(multiplicity + p - (usize)cd)): try knots.push(value)
+    for _ in 0..<p + 1: try knots.push(high)
+    var marked = Growing[bool]()
+    defer marked.close()
+    for _ in 0..<12:
+        let m = knots.count - p - 1
+        marked.clear()
+        try marked.fill(knots.count, m < 6)
+        if m >= 6:
+            try fit_once(b, side, a, z, p, knots.view(), net)
+            if not try mark_strays(b, side, a, z, p, knots.view(), net.view(), &marked): break
+        # Each marked span halved.
+        var k = knots.count - 1
+        while k > 0:
+            k -= 1
+            if marked.items[k] and knots.items[k + 1] > knots.items[k]: try knots.insert(k + 1, (knots.items[k] + knots.items[k + 1]) * 0.5)
+        if knots.count > 4096: error(invalid, "a blend along this curved edge could not be fitted within the tolerance")
+    let m = knots.count - p - 1
+    if net.count != m * a.length: error(invalid, "a blend along this curved edge could not be fitted within the tolerance")
+    try weights.fill(m, 1.0)
+    return (i64)p
+
+## Samples per knot span when fitting a row of degree `p`.
+func samples_per_span(p: usize) -> usize:
+    return 2 * p + 2
+
+## One least-squares fit of each row (as fitted_rows) on `knots`, onto
+## `net` (row-major): the normal equations factored once, solved per row.
+func fit_once(b: const Cap*, side: const CapSide*, a: const f64[], z: const f64[], p: usize, knots: const f64[], net: Growing[Vector3]*) -> !:
+    let m = knots.length - p - 1
+    let unknowns = m - 4
+    let low = knots[p]
+    let high = knots[m]
+    let rows = a.length
+    net.clear()
+    try net.fill(m * rows, Vector3())
+    # The fixed ends: each row's end points and the next ones in, along
+    # its end tangents.
+    for r in 0..<rows:
+        let (p0, d0) = try row_at(b, side, a[r], z[r], low)
+        let (p1, d1) = try row_at(b, side, a[r], z[r], high)
+        net.items[r * m] = p0
+        net.items[r * m + 1] = p0.add(d0.multiply_scalar((knots[p + 1] - low) / (f64)p))
+        net.items[r * m + m - 1] = p1
+        net.items[r * m + m - 2] = p1.subtract(d1.multiply_scalar((high - knots[m - 1]) / (f64)p))
+    var matrix = Growing[f64]()
+    defer matrix.close()
+    try matrix.fill(unknowns * unknowns, 0.0)
+    var rhs = Growing[f64]()
+    defer rhs.close()
+    try rhs.fill(unknowns * rows * 3, 0.0)
+    var values: f64[9]
+    let per = samples_per_span(p)
+    for span in p..<m:
+        let k0 = knots[span]
+        let k1 = knots[span + 1]
+        if k1 <= k0: continue
+        for j in 0..<per:
+            let t = k0 + (k1 - k0) * ((f64)j + 0.5) / (f64)per
+            let first = nurbs_basis(knots, (i64)m, (i64)p, t, &values)
+            for i in 0..<p + 1:
+                let row = first + i
+                if row < 2 or row >= m - 2: continue
+                for k in 0..<p + 1:
+                    let column = first + k
+                    if column < 2 or column >= m - 2: continue
+                    matrix.items[(row - 2) * unknowns + column - 2] += values[i] * values[k]
+            for r in 0..<rows:
+                let (exact, _) = try row_at(b, side, a[r], z[r], t)
+                var target = exact
+                for k in 0..<p + 1:
+                    let column = first + k
+                    if column < 2 or column >= m - 2: target = target.subtract(net.items[r * m + column].multiply_scalar(values[k]))
+                for i in 0..<p + 1:
+                    let row = first + i
+                    if row < 2 or row >= m - 2: continue
+                    let at = (r * unknowns + row - 2) * 3
+                    rhs.items[at] += values[i] * target.x
+                    rhs.items[at + 1] += values[i] * target.y
+                    rhs.items[at + 2] += values[i] * target.z
+    try cholesky_factor(matrix.items[..<unknowns * unknowns], unknowns)
+    var column = Growing[f64]()
+    defer column.close()
+    try column.fill(unknowns, 0.0)
+    for r in 0..<rows:
+        for axis in 0..<(usize)3:
+            for i in 0..<unknowns: column.items[i] = rhs.items[(r * unknowns + i) * 3 + axis]
+            cholesky_apply(matrix.items[..<unknowns * unknowns], column.items[..<unknowns], unknowns)
+            for i in 0..<unknowns:
+                let q = net.items[r * m + i + 2]
+                net.items[r * m + i + 2] = Vector3(column.items[i] if axis == 0 else q.x, column.items[i] if axis == 1 else q.y, column.items[i] if axis == 2 else q.z)
+
+## Marks onto `marked` (by knot index) the spans where a fitted row
+## strays from its exact offset by more than the tolerance; whether any.
+func mark_strays(b: const Cap*, side: const CapSide*, a: const f64[], z: const f64[], p: usize, knots: const f64[], net: const Vector3[], marked: Growing[bool]*) -> bool!:
+    let m = knots.length - p - 1
+    let per = samples_per_span(p)
+    var values: f64[9]
+    var any = false
+    for span in p..<m:
+        let k0 = knots[span]
+        let k1 = knots[span + 1]
+        if k1 <= k0: continue
+        for j in 0..<per + 1:
+            let t = k0 + (k1 - k0) * (f64)j / (f64)per
+            let first = nurbs_basis(knots, (i64)m, (i64)p, math.min(t, knots[m] - (k1 - k0) * 1e-12), &values)
+            for r in 0..<a.length:
+                var fitted = Vector3()
+                for k in 0..<p + 1: fitted = fitted.add(net[r * m + first + k].multiply_scalar(values[k]))
+                let (exact, _) = try row_at(b, side, a[r], z[r], t)
+                if fitted.subtract(exact).length() > b.w.tolerance:
+                    marked.items[span] = true
+                    any = true
+    return any
+
+## Symmetric positive definite `matrix` (n x n) factored in place, L Lᵀ
+## (L in the lower triangle).
+func cholesky_factor(matrix: f64[], n: usize) -> !:
+    for j in 0..<n:
+        var d = matrix[j * n + j]
+        for k in 0..<j: d -= matrix[j * n + k] * matrix[j * n + k]
+        if d <= 0.0: error(invalid, "a blend's fit along its edge is singular")
+        let diagonal = math.sqrt(d)
+        matrix[j * n + j] = diagonal
+        for i in j + 1..<n:
+            var s = matrix[i * n + j]
+            for k in 0..<j: s -= matrix[i * n + k] * matrix[j * n + k]
+            matrix[i * n + j] = s / diagonal
+
+## `rhs` solved in place against a factored `matrix` (cholesky_factor).
+func cholesky_apply(matrix: const f64[], rhs: f64[], n: usize):
+    for i in 0..<n:
+        var s = rhs[i]
+        for k in 0..<i: s -= matrix[i * n + k] * rhs[k]
+        rhs[i] = s / matrix[i * n + i]
+    var i = n
+    while i > 0:
+        i -= 1
+        var s = rhs[i]
+        for k in i + 1..<n: s -= matrix[k * n + i] * rhs[k]
+        rhs[i] = s / matrix[i * n + i]
+
+## Each joint's section, from its cap contact to its wall contact, shared
+## by the strips meeting there: a chamfer's line, a quarter circle (G1),
+## or the G2/G3 B-spline.
+func cap_sections(b: Cap*) -> !:
+    let w = b.w
+    var a = Growing[f64]()
+    defer a.close()
+    var z = Growing[f64]()
+    defer z.close()
+    var ku = Growing[f64]()
+    defer ku.close()
+    var wu = Growing[f64]()
+    defer wu.close()
+    let degree = try section_rows(b, &a, &z, &ku, &wu)
+    var net = Growing[Vector3]()
+    defer net.close()
+    for side in b.sides.view():
+        let edge = w.edges.items[side.edge]
+        for end in 0..<(usize)2:
+            let v = (usize)(edge.start if end == 0 else edge.end)
+            if b.sections.items[v] >= 0: continue
+            let (u, _) = try into_cap(b, &side, edge.t0 if end == 0 else edge.t1)
+            let corner = w.points.items[v]
+            let head = b.on_cap.items[v]
+            let tail = b.on_wall.items[v]
+            if not b.round:
+                b.sections.items[v] = try b.line(head, tail)
+                continue
+            if b.continuity == 1:
+                let center = corner.add(u.multiply_scalar(b.reach)).add(side.into_wall.multiply_scalar(b.reach))
+                let x = try b.at(head).subtract(center).normalized()
+                let y = try b.at(tail).subtract(center).normalized()
+                let c = try b.out.add_carrier(Carrier(1, center, x, y, b.reach, b.reach, -1))
+                b.sections.items[v] = try b.out.add_edge(ShapeEdge(c, 0.0, math.pi * 0.5, head, tail))
+                continue
+            net.clear()
+            for i in 0..<a.count: try net.push(corner.add(u.multiply_scalar(a.items[i])).add(side.into_wall.multiply_scalar(z.items[i])))
+            b.sections.items[v] = try b.spline(head, tail, net.view(), ku.view(), degree, true)
+
+## The result: the body's faces, the cap's loops on its contacts, each
+## wall's edge on its contact and its seams shortened, then the strips;
+## turned to agree and checked closed (local_blend_result.lucb's orient).
+func cap_result(b: Cap*, tag: str) -> interop.Reference[CadModel]!:
+    let w = b.w
+    var uses = Growing[i64]()
+    defer uses.close()
+    for f in 0..<w.faces.count:
+        uses.clear()
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            var id = (i64)e
+            let k = b.side_of.items[e]
+            if k >= 0:
+                let side = b.sides.items[(usize)k]
+                id = side.outer if side.cap == f else side.inner
+            elif b.seams.items[e] >= 0:
+                id = b.seams.items[e]
+            try uses.push((id + 1) if use > 0 else -(id + 1))
+        let face = w.faces.items[f]
+        try b.out.add_face(face.surface, face.sense, uses.view(), w.face_sizes(f), try b.out.add_name(w.face_name(f)))
+    let fixed = b.out.faces.count
+    for side in b.sides.view():
+        let edge = w.edges.items[side.edge]
+        let loop: i64[4] = [side.outer + 1, b.sections.items[(usize)edge.end] + 1, -(side.inner + 1), -(b.sections.items[(usize)edge.start] + 1)]
+        let size: i64[1] = [4]
+        try blend_name(w, side.edge, tag, &b.name)
+        try b.out.add_face(side.surface, side.sense, loop[..<4], size[..<1], try b.out.add_name((str)b.name.view()))
+    try orient(&b.out, fixed)
+    let solid = try used_brep(&b.out)
+    defer solid.release()
+    return try CadModel.of_brep(solid)
