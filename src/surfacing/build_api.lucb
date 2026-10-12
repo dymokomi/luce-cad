@@ -16,11 +16,21 @@ pub struct CadSurfaceBuild:
     ## boundary's continuity in `continuity` (square_free, square_g0, ...
     ## square_angle; four of them, in the picked order) and Tangent Angle
     ## in `angles` (degrees); Blend `cubic` (else Linear); Explicit Control
-    ## with degrees and spans.
+    ## with degrees and spans; per picked boundary `rebuild` and
+    ## `colinear`, per pair of opposite boundaries (1-3,
+    ## 2-4) the Boundary Blend `blend` (0.17 to 0.83) and `influence`
+    ## (0.1 to 3).
     pub static func square(set: interop.Reference[GeometrySet], boundaries: str, continuity: const i64[], angles: const f64[], cubic: bool = false, explicit: bool = false,
-                           degree_u: i64 = 5, spans_u: i64 = 1, degree_v: i64 = 5, spans_v: i64 = 1, name: str = "Square") -> interop.Reference[CadSurfaceEdit]!:
+                           degree_u: i64 = 5, spans_u: i64 = 1, degree_v: i64 = 5, spans_v: i64 = 1, name: str = "Square",
+                           rebuild: const bool[] = [false, false, false, false], colinear: const bool[] = [false, false, false, false], blend: const f64[] = [0.5, 0.5], influence: const f64[] = [1.0, 1.0]) -> interop.Reference[CadSurfaceEdit]!:
         if continuity.length != 4 or angles.length != 4: error(invalid, "Square: one continuity and one angle for each of the four boundaries")
-        var opts = SquareOptions([continuity[0], continuity[1], continuity[2], continuity[3]], [angles[0], angles[1], angles[2], angles[3]], cubic, explicit, degree_u, spans_u, degree_v, spans_v)
+        if rebuild.length != 4 or colinear.length != 4: error(invalid, "Square: Rebuild and Colinear take one flag for each of the four boundaries")
+        if blend.length != 2 or influence.length != 2: error(invalid, "Square: Boundary Blend and Influence take one value for 1-3 and one for 2-4")
+        for k in 0..<(usize)2:
+            if not (blend[k] >= 0.17 and blend[k] <= 0.83): error(invalid, "Square: Boundary Blend is 0.17 to 0.83")
+            if not (influence[k] >= 0.1 and influence[k] <= 3.0): error(invalid, "Square: Influence is 0.1 to 3")
+        var opts = SquareOptions([continuity[0], continuity[1], continuity[2], continuity[3]], [angles[0], angles[1], angles[2], angles[3]], cubic, explicit, degree_u, spans_u, degree_v, spans_v,
+                                 [rebuild[0], rebuild[1], rebuild[2], rebuild[3]], [colinear[0], colinear[1], colinear[2], colinear[3]], [blend[0], blend[1]], [influence[0], influence[1]])
         for k in 0..<(usize)4:
             if continuity[k] < square_free or continuity[k] > square_angle: error(invalid, "Square: a boundary's continuity is Free, G0, G1, G2, Implied Tangent, Implied Curvature or Tangent Angle")
         var made = try square_net(set, boundaries, &opts)
@@ -34,32 +44,62 @@ pub struct CadSurfaceBuild:
         return edit
 
     ## Skin (skin.lucb): a surface through the sections `sections` in
-    ## their order, `degree` across (lowered to what they allow), `closed`
+    ## their order (each a curve, or a set of curves end to end apart by
+    ## `+`), `degree` across (lowered to what they allow), `closed`
     ## round, the first and last section's side matched G`start` and
-    ## G`end` (0 to 3) to the surface it lies on.
-    pub static func skin(set: interop.Reference[GeometrySet], sections: str, degree: i64 = 5, closed: bool = false, start: i64 = 0, end: i64 = 0, name: str = "Skin") -> interop.Reference[CadSurfaceEdit]!:
+    ## G`end` (0 to 3) to the surface it lies on; Alias's Multiple
+    ## Surfaces (`multiple`: a sheet for each curve of the sets) and
+    ## Proportional Crown (`crown`, -0.25 to 0.25 of the gap, two
+    ## sections).
+    pub static func skin(set: interop.Reference[GeometrySet], sections: str, degree: i64 = 5, closed: bool = false, start: i64 = 0, end: i64 = 0, name: str = "Skin",
+                         multiple: bool = false, crown: f64 = 0.0) -> interop.Reference[CadSurfaceEdit]!:
         if start < 0 or start > 3 or end < 0 or end > 3: error(invalid, "Skin's start and end continuity are G0 to G3")
-        let opts = SkinOptions(degree, closed, start, end)
-        var net = try skin_net(set, sections, &opts)
-        defer net.close()
-        return try added_sheet(set, &net, name)
+        if not (crown >= -0.25 and crown <= 0.25): error(invalid, "Skin's Proportional Crown is -0.25 to 0.25")
+        let opts = SkinOptions(degree, closed, start, end, crown)
+        var nets = Growing[Net]()
+        defer close_nets(&nets)
+        try skin_nets(set, sections, &opts, multiple, &nets)
+        if nets.count == 1: return try added_sheet(set, &nets.items[0], name)
+        # Multiple Surfaces: a body each, named after the first.
+        var list = Growing[interop.Reference[CadModel]]()
+        defer release_models(&list)
+        for k in 0..<nets.count:
+            var buffer: u8[200]
+            let label = name if k == 0 else try strings.format(buffer, f"{name}{k + 1}")
+            try list.push(try net_body(&nets.items[k], label, true))
+        let edit = try edit_of(try with_bodies_added(set, list.view()))
+        edit.value().count = (i64)nets.count
+        return edit
 
     ## Rail (sweep.lucb): the generation curves `sections` swept along the
-    ## rails `rails` (one or two): `mode` sweep_natural, sweep_parallel or
-    ## sweep_vector (along `vector`); two rails' `transform` (two_rail_scale,
-    ## two_rail_stretch, two_rail_rotate); the generation curves blended by
-    ## `bias` (1 evenly); `continuity` G0 to G3 at the first rail, the
-    ## second, the first and the last generation curve.
+    ## rails `rails` (one or two): `mode` sweep_natural, sweep_parallel,
+    ## sweep_vector (along `vector`) or sweep_spine (square to the curve
+    ## `spine`); two rails' `transform` (two_rail_scale, two_rail_stretch,
+    ## two_rail_rotate); the generation curves blended by `bias` (1
+    ## evenly); `continuity` G0 to G3 at the first rail, the second, the
+    ## first and the last generation curve. Alias's Sweep Pivot `pivot`
+    ## (pivot_closest, pivot_on_curve: fractions `pivot_rail` and
+    ## `pivot_generation` along the rail and the first generation curve,
+    ## pivot_off_curve: `pivot_rail` and the point `pivot_point`) with
+    ## Fixed Curve `fixed` (fixed_rail moves the generation curve onto the
+    ## rail, fixed_generation the rail onto it); Curve Segments
+    ## `segments` (fractions: rail 1 from and to, rail 2, the generation
+    ## curves).
     pub static func rail(set: interop.Reference[GeometrySet], sections: str, rails: str, mode: i64 = 0, vector: Vector3 = Vector3(0.0, 0.0, 1.0), transform: i64 = 0,
-                         bias: f64 = 1.0, continuity: const i64[] = [0, 0, 0, 0], name: str = "Rail") -> interop.Reference[CadSurfaceEdit]!:
-        if mode < sweep_natural or mode > sweep_vector: error(invalid, "Rail's sweep mode is Natural, Parallel or Vector")
+                         bias: f64 = 1.0, continuity: const i64[] = [0, 0, 0, 0], name: str = "Rail", spine: str = "", pivot: i64 = 0, pivot_rail: f64 = 0.0,
+                         pivot_generation: f64 = 0.0, pivot_point: Vector3 = Vector3(), fixed: i64 = 0, segments: const f64[] = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]) -> interop.Reference[CadSurfaceEdit]!:
+        if mode != sweep_natural and mode != sweep_parallel and mode != sweep_vector and mode != sweep_spine: error(invalid, "Rail's sweep mode is Natural, Parallel, Vector or Spine")
         if transform < two_rail_scale or transform > two_rail_rotate: error(invalid, "Rail's two-rail transform is Scale, Non-proportional scale or Rotate")
+        if pivot < pivot_closest or pivot > pivot_off_curve: error(invalid, "Rail's Sweep Pivot is Closest, On Curve or Off Curve")
+        if fixed != fixed_rail and fixed != fixed_generation: error(invalid, "Rail's Fixed Curve is Rail or Gen.")
+        if segments.length != 6: error(invalid, "Rail's Curve Segments are six fractions: rail 1, rail 2 and the generation curves, each from and to")
         var orders: i64[4] = [0, 0, 0, 0]
         for k in 0..<fewer(4, continuity.length):
             if continuity[k] < 0 or continuity[k] > 3: error(invalid, "Rail's continuity is G0 to G3")
             orders[k] = continuity[k]
-        let opts = SweepOptions(mode, vector, transform, transition_linear, bias, orders)
-        var net = try sweep_net(set, sections, rails, &opts)
+        let opts = SweepOptions(mode, vector, transform, transition_linear, bias, orders, pivot, pivot_rail, pivot_generation, pivot_point, fixed,
+                                [segments[0], segments[1], segments[2], segments[3], segments[4], segments[5]])
+        var net = try sweep_net(set, sections, rails, &opts, spine)
         defer net.close()
         return try added_sheet(set, &net, name)
 
@@ -74,7 +114,7 @@ pub struct CadSurfaceBuild:
         if transition < transition_linear or transition > transition_limited: error(invalid, "Profile's transition is Linear, Local, Global or Limited")
         let modes: i64[3] = [sweep_parallel, sweep_natural, sweep_normal]
         let opts = SweepOptions(modes[(usize)orientation], Vector3(0.0, 0.0, 1.0), two_rail_scale, transition, 1.0, [0, 0, 0, 0])
-        var net = try sweep_net(set, profiles, rail, &opts)
+        var net = try sweep_net(set, profiles, rail, &opts, "")
         defer net.close()
         return try added_sheet(set, &net, name)
 
@@ -107,14 +147,57 @@ pub struct CadSurfaceBuild:
 
     ## Extend (extend.lucb): the face edge or curve end `input` ("face
     ## <name> x y z": the face's natural side nearest the point; "curve
-    ## <name> x y z": the end nearest it) carried on `distance` (a
-    ## percentage of its length with `percent`) by `kind` (extend_linear,
-    ## extend_natural, extend_soft, extend_reflective); `merge` false keeps
-    ## a surface's extension a sheet of its own.
-    pub static func extended(set: interop.Reference[GeometrySet], input: str, kind: i64 = 1, distance: f64 = 1.0, percent: bool = false, merge: bool = true) -> interop.Reference[CadSurfaceEdit]!:
-        let edit = try edit_of(try extended_set(set, input, kind, distance, percent, merge))
+    ## <name> x y z": the end nearest it; several apart by `;`) carried on
+    ## `distance` (a percentage of its length with `percent`) by `kind`
+    ## (extend_linear, extend_natural, extend_soft, extend_reflective);
+    ## `merge` false keeps a surface's extension a sheet of its own;
+    ## `chain` (Alias's Chain Select) adds every face edge running on
+    ## tangent from a picked one.
+    pub static func extended(set: interop.Reference[GeometrySet], input: str, kind: i64 = 1, distance: f64 = 1.0, percent: bool = false, merge: bool = true, chain: bool = false) -> interop.Reference[CadSurfaceEdit]!:
+        let edit = try edit_of(try extended_inputs(set, input, kind, distance, percent, merge, chain))
         edit.value().count = 1
         return edit
+
+    ## The curve `words` names (Align's master words: a curve, an edge, an
+    ## isoparm) as a free curve: what a builder takes from it.
+    pub static func curve_of(set: interop.Reference[GeometrySet], words: str) -> interop.Reference[CadSpline]!:
+        var m = try master_of(set, words, -1, Vector3())
+        defer m.close()
+        if m.curve.points.count == 0: error(invalid, "pick a curve, an edge or an isoparm, not a face")
+        return try held_spline(try m.curve.copy())
+
+    ## The curves `words` names (Align's master words apart by `;`: curves,
+    ## edges, isoparms) as polylines of `samples` points each, a line of
+    ## "x y z" triples apart by spaces for each (a word that names nothing
+    ## an empty line): the viewport lights a builder's picks with them.
+    pub static func picked_lines(set: interop.Reference[GeometrySet], words: str, samples: i64 = 48) -> interop.Owned[str]!:
+        if samples < 2 or samples > 4096: error(invalid, "a picked curve's line takes 2 to 4096 points")
+        var out = Growing[u8]()
+        defer out.close()
+        let bytes = words.bytes
+        var start: usize = 0
+        for at in 0..<bytes.length + 1:
+            if at < bytes.length and bytes[at] != 59: continue
+            let one = (str)bytes[start..<at]
+            start = at + 1
+            if one.length == 0: continue
+            var m = master_of(set, one, -1, Vector3()) catch failure:
+                try out.push(10)
+                continue
+            defer m.close()
+            let c = &m.curve
+            if c.points.count == 0:
+                # A face (Extend's side), not a curve.
+                try out.push(10)
+                continue
+            for k in 0..<(usize)samples:
+                let p = c.point_at(c.low() + (c.high() - c.low()) * (f64)k / (f64)(samples - 1))
+                for value in [p.x, p.y, p.z]:
+                    var buffer: u8[64]
+                    for byte in (try strings.format_f64(value, buffer[0..])).bytes: try out.push(byte)
+                    try out.push(32)
+            try out.push(10)
+        return try interop.copy_text((str)out.view())
 
 ## `set` with a body of one sheet on `net` named `name` added.
 func added_sheet(set: interop.Reference[GeometrySet], net: const Net*, name: str) -> interop.Reference[CadSurfaceEdit]!:
@@ -123,3 +206,13 @@ func added_sheet(set: interop.Reference[GeometrySet], net: const Net*, name: str
     let edit = try edit_of(try with_body_added(set, body))
     edit.value().count = 1
     return edit
+
+func close_nets(list: Growing[Net]*):
+    for n in list.view():
+        var owned = n
+        owned.close()
+    list.close()
+
+func release_models(list: Growing[interop.Reference[CadModel]]*):
+    for m in list.view(): m.release()
+    list.close()

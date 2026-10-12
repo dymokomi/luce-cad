@@ -45,6 +45,12 @@ pub let square_angle: i64 = 6
 ## Square's options (Alias's Square Control): per picked boundary its
 ## continuity (the codes above) and Tangent Angle (degrees); Blend Cubic
 ## (else Linear); Explicit Control's degrees and spans (0: as built).
+## Alias's others: per picked boundary Rebuild (the curve rebuilt by arc
+## length to the fewest spans within the build tolerance: less data, a
+## better parameterization) and Colinear (the isoparms line up with the
+## neighbor's across it); per pair of opposite boundaries (1-3, 2-4) the
+## Boundary Blend (where the two boundaries' influence meets, 0.17 to
+## 0.83, 0.5 halfway) and the Influence (how far both reach, 1 as built).
 pub struct SquareOptions:
     pub var continuity: i64[4]
     pub var angle: f64[4]
@@ -54,6 +60,10 @@ pub struct SquareOptions:
     pub var spans_u: i64
     pub var degree_v: i64
     pub var spans_v: i64
+    pub var rebuild: bool[4]
+    pub var colinear: bool[4]
+    pub var blend: f64[2]
+    pub var influence: f64[2]
 
 ## A side of the patch: its boundary curve (compatible with the side across, running along the
 ## side's direction), the picked boundary it came from (its master too),
@@ -65,6 +75,10 @@ struct SquareSide:
     var code: i64
     var angle: f64
     var fields: Growing[Spline]
+    ## How far its fields reach (Boundary Blend and Influence: the scale
+    ## of its slope across, off the corners), and Colinear.
+    var reach: f64
+    var colinear: bool
 
     func close():
         self.curve.close()
@@ -78,7 +92,7 @@ struct SquareSide:
         return self.fields.count - 1
 
 func blank_side() -> SquareSide:
-    return SquareSide(empty_spline(1), 0, square_g0, 0.0, Growing[Spline]())
+    return SquareSide(empty_spline(1), 0, square_g0, 0.0, Growing[Spline](), 1.0, false)
 
 ## What Square made: the net, the worst fit of a field (model units), and
 ## each picked boundary's side (0 A, 1 B, 2 C, 3 D).
@@ -160,6 +174,22 @@ func order_of_code(code: i64, cubic: bool) -> usize:
     if code == square_g1 or code == square_implied_tangent or code == square_angle: return 1
     return 1 if cubic else 0
 
+## 0 at a side's ends rising to 1 a quarter of the way in (a quintic
+## smoothstep, flat to the second order at the ends): where Boundary
+## Blend, Influence and Colinear act, leaving the corners as they are.
+func plateau(t: f64) -> f64:
+    let x = math.min(1.0, math.min(t, 1.0 - t) * 4.0)
+    if x <= 0.0: return 0.0
+    return x * x * x * (10.0 - 15.0 * x + 6.0 * x * x)
+
+## Picked boundary `k`'s reach: its pair's Influence, and the Boundary
+## Blend's share (the first of the pair 2 b, the second 2 (1 - b), so b
+## above a half moves where they meet toward the second).
+func side_reach(opts: const SquareOptions*, k: usize) -> f64:
+    let pair = k % 2
+    let share = 2.0 * opts.blend[pair] if k < 2 else 2.0 * (1.0 - opts.blend[pair])
+    return opts.influence[pair] * share
+
 ## The cross derivatives side `s` asks at fraction `t` along it (1 and,
 ## for G2, 2), onto `out` (out[1], out[2]); `sides` all four, `lin` the
 ## G0 patch (its slope gives the probe's way out and the corners' twists).
@@ -186,8 +216,11 @@ func field_targets(sides: SquareSide[4]*, masters: Growing[Master]*, s: usize, l
     let twist1 = Vector3(shown[5].x, shown[5].y, shown[5].z)
     let l = cubic_hermite(j0.d[1], twist0, j1.d[1], twist1, t)
     let m = j0.d[2].multiply_scalar(1.0 - t).add(j1.d[2].multiply_scalar(t))
+    # Boundary Blend and Influence: the slope across scaled off the
+    # corners (the corners' own data untouched).
+    let reach = 1.0 + (side.reach - 1.0) * plateau(t)
     if code == square_implied_tangent or code == square_implied_curvature:
-        (*out)[1] = plane.multiply_scalar(l.dot(plane))
+        (*out)[1] = plane.multiply_scalar(l.dot(plane) * reach)
         (*out)[2] = m.subtract(plane.multiply_scalar(m.dot(plane)))
         return
     # The G0 patch's slope across (Blend Cubic's field for G0 and Free).
@@ -196,7 +229,7 @@ func field_targets(sides: SquareSide[4]*, masters: Growing[Master]*, s: usize, l
     euclidean_partials(&parts, &shown)
     let slope = Vector3(shown[4].x, shown[4].y, shown[4].z) if s < 2 else Vector3(shown[1].x, shown[1].y, shown[1].z)
     if not wants_tangent(code):
-        (*out)[1] = slope
+        (*out)[1] = slope.multiply_scalar(reach)
         return
     # The neighbor's answer at the boundary's point there.
     let outward = slope.multiply_scalar(-1.0) if s == 0 or s == 2 else slope
@@ -205,14 +238,45 @@ func field_targets(sides: SquareSide[4]*, masters: Growing[Master]*, s: usize, l
     let goal = try m_master.target(m_master.nearest(point.d[0]), &probe, 0.0)
     var n = goal.n
     if not (n.length() > 0.0): error(invalid, "Square: G1 and G2 need the boundary on a surface (an edge, or a curve on a face)")
+    # The way on from the neighbor across the boundary, in its tangent
+    # plane square to the boundary (the neighbor continued).
+    var on = goal.t.multiply_scalar(-1.0)
     if code == square_angle:
         # The neighbor's tangent plane turned about the edge: positive
         # angles lift the surface toward the neighbor's normal side (its
-        # way across, d, turns toward n).
-        let d = goal.t.multiply_scalar(-1.0)
+        # way across turns toward n).
         let a = side.angle * math.pi / 180.0
-        n = n.multiply_scalar(math.cos(a)).subtract(d.multiply_scalar(math.sin(a)))
-    let d1 = l.subtract(n.multiply_scalar(l.dot(n)))
+        let tilted = n.multiply_scalar(math.cos(a)).subtract(on.multiply_scalar(math.sin(a)))
+        on = on.multiply_scalar(math.cos(a)).add(n.multiply_scalar(math.sin(a)))
+        n = tilted
+    # The slope across: L's part along the boundary kept (the skew the
+    # corners give), its part across turned onto the way on with its
+    # length. Where the neighbors' tangents lie in the neighbor's plane (a
+    # hole in one smooth surface) that is L in the plane, as a projection
+    # gives; where they leave it (a cap on a box's walls) a projection would
+    # shrink the slope to nothing, and this keeps its size (Alias's Square
+    # rises square off such walls).
+    let tangent = point.d[1].normalized() catch failure: error(invalid, "Square: a boundary stops (its tangent vanishes)")
+    # The neighbor's way across follows its isoparm; square it to the
+    # boundary, still in its tangent plane.
+    on = on.subtract(tangent.multiply_scalar(on.dot(tangent))).normalized() catch failure: error(invalid, "Square: the neighbor runs along the boundary there")
+    let along = tangent.multiply_scalar(l.dot(tangent))
+    # ∂S/∂u at u = 1 (and ∂S/∂v at v = 1) leaves the patch, into the
+    # neighbor: the way on reversed there.
+    let inward = 1.0 if s == 0 or s == 2 else -1.0
+    let across = l.subtract(along).length()
+    var d1 = along.add(on.multiply_scalar(inward * across))
+    if side.colinear and code != square_angle:
+        # Colinear: off the corners the slope runs along the neighbor's
+        # own isoparm across (as Align without skew), its part square to
+        # the boundary the same; at the corners the corners' lines.
+        let iso = goal.t.multiply_scalar(-1.0)
+        let square_part = iso.dot(on)
+        if square_part > 1e-6:
+            let lined = iso.multiply_scalar(inward * across / square_part)
+            let c = plateau(t)
+            d1 = d1.multiply_scalar(1.0 - c).add(lined.multiply_scalar(c))
+    d1 = d1.multiply_scalar(reach)
     (*out)[1] = d1
     if code == square_g2:
         let ab = chart_direction(goal.su, goal.sv, d1)
@@ -281,11 +345,61 @@ func corner_set(sides: SquareSide[4]*, masters: Growing[Master]*, lin: const Net
                     elif b <= o_cd: value = from_cd[a]
                     out.items[corner + a * 3 + b] = value
 
+# -- Corners whose neighbors disagree.
+#
+# Where the two neighbors at a corner ask different things there (a cap on
+# a box's walls: each wall wants the patch rising square off it, while the
+# other boundary leaves the corner flat along the top), no surface meets
+# both fields at the corner itself: such a corner is singular. Gregory's
+# patch (1974) keeps each side's own field everywhere but the corner and
+# lets the twist there depend on the way in; ours does the same locally: a
+# side's field is its own target, plus the corner set's mismatch (its
+# value and first two derivatives) carried down to nothing by a quintic
+# Hermite within the corner zone, a span of its own. Off the zone each field is
+# exactly what its continuity asks, so the boundary measures G1 or G2 all
+# along it but for the zone's sliver at the corner, which Alias's Square
+# leaves as a break at the corner too.
+
+## The corner zone: the fraction of a side the mismatch fades over.
+let corner_zone: f64 = 1.0 / 256.0
+
+## The quintic Hermite on the zone (s from 0 to 1 across it) taking the
+## values `d` (the mismatch and its first two derivatives, by the side's
+## parameter, `h` the zone's length signed the way in) at s = 0 down to
+## nothing, flat to the second order, at s = 1: one quintic span, so a
+## field's fit holds it exactly.
+func zone_hermite(d: const Vector3[3]*, s: f64, h: f64) -> Vector3:
+    if s >= 1.0: return Vector3()
+    let s2 = s * s
+    let s3 = s2 * s
+    let h0 = 1.0 - s3 * (10.0 - 15.0 * s + 6.0 * s2)
+    let h1 = s - s3 * (6.0 - 8.0 * s + 3.0 * s2)
+    let h2 = 0.5 * (s2 - s3 * (3.0 - 3.0 * s + s2))
+    return (*d)[0].multiply_scalar(h0).add((*d)[1].multiply_scalar(h * h1)).add((*d)[2].multiply_scalar(h * h * h2))
+
+## A field's corner mismatches at its start and end (derivatives 0 to 2
+## along the side) and whether each end has one.
+struct ZoneFix:
+    var start: Vector3[3]
+    var end: Vector3[3]
+    var at_start: bool
+    var at_end: bool
+
+    ## The correction at `t` along the side.
+    func at(t: f64) -> Vector3:
+        var fix = Vector3()
+        if self.at_start and t < corner_zone: fix = fix.add(zone_hermite(&self.start, t / corner_zone, corner_zone))
+        if self.at_end and t > 1.0 - corner_zone: fix = fix.add(zone_hermite(&self.end, (1.0 - t) / corner_zone, -corner_zone))
+        return fix
+
 ## Side `s`'s fields (see the file's header) onto it, each holding the
 ## corner set's derivatives along the side (to the second) at both ends;
 ## the worst fit of a field returned, and the middles of the spans that
 ## missed `tolerance` (against the largest value it holds) onto `missed`.
-func make_fields(sides: SquareSide[4]*, masters: Growing[Master]*, s: usize, lin: const Net*, cubic: bool, corners: const Vector3[], tolerance: f64, missed: Growing[f64]*) -> f64!:
+## A corner whose mismatch would move the field beyond the tolerance gets
+## its zone (see above): the zone's knot, when the side lacks it, onto
+## `zones` (the patch is then built again with it).
+func make_fields(sides: SquareSide[4]*, masters: Growing[Master]*, s: usize, lin: const Net*, cubic: bool, corners: const Vector3[], tolerance: f64, missed: Growing[f64]*, zones: Growing[f64]*) -> f64!:
     let order = order_of_code((*sides)[s].code, cubic)
     try (*sides)[s].fields.push(try (*sides)[s].curve.copy())
     if order == 0: return 0.0
@@ -303,13 +417,6 @@ func make_fields(sides: SquareSide[4]*, masters: Growing[Master]*, s: usize, lin
     defer fitter.close()
     var worst = 0.0
     for k in 1..<order + 1:
-        var values = Growing[Weighted]()
-        defer values.close()
-        var largest = 0.0
-        for t in params.view():
-            let target = try target_at(sides, masters, s, lin, plane, k, t)
-            try values.push(Weighted(target.x, target.y, target.z, 0.0))
-            largest = math.max(largest, target.length())
         # The corners: A and B (s 0, 1) meet C at their start, D at their
         # end; C and D meet A and B. Derivative k across, b along.
         var starts: Weighted[4]
@@ -317,6 +424,11 @@ func make_fields(sides: SquareSide[4]*, masters: Growing[Master]*, s: usize, lin
         for b in 0..<(usize)4:
             starts[b] = Weighted(0.0, 0.0, 0.0, 0.0)
             ends[b] = Weighted(0.0, 0.0, 0.0, 0.0)
+        var own_start: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+        var own_end: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+        try target_ends(sides, masters, s, lin, plane, k, false, &own_start)
+        try target_ends(sides, masters, s, lin, plane, k, true, &own_end)
+        var fix = ZoneFix([Vector3(), Vector3(), Vector3()], [Vector3(), Vector3(), Vector3()], false, false)
         for b in 0..<keep + 1:
             let first = (s * 2 + 0) * 9 + k * 3 + b if s < 2 else ((s - 2) * 9 + b * 3 + k)
             let last = (s * 2 + 1) * 9 + k * 3 + b if s < 2 else ((2 + s - 2) * 9 + b * 3 + k)
@@ -324,6 +436,24 @@ func make_fields(sides: SquareSide[4]*, masters: Growing[Master]*, s: usize, lin
             let a1 = corners[last]
             starts[b] = Weighted(a0.x, a0.y, a0.z, 0.0)
             ends[b] = Weighted(a1.x, a1.y, a1.z, 0.0)
+            fix.start[b] = a0.subtract(own_start[b])
+            fix.end[b] = a1.subtract(own_end[b])
+        var largest = 0.0
+        for t in params.view(): largest = math.max(largest, (try target_at(sides, masters, s, lin, plane, k, t)).length())
+        # A corner zone where the field itself must break off (its value
+        # disagrees with the corner's), its knot first. A disagreement in
+        # the twists alone is a gentle one, spread along the side by the
+        # fit as Coons patches do.
+        fix.at_start = fix.start[0].length() > tolerance * 0.1 * math.max(largest, 1e-300)
+        fix.at_end = fix.end[0].length() > tolerance * 0.1 * math.max(largest, 1e-300)
+        let joint = (usize)math.max(1.0, (f64)(q - 2))
+        if fix.at_start and multiplicity(knots.view(), corner_zone, 1e-12) < joint: try zones.push(corner_zone)
+        if fix.at_end and multiplicity(knots.view(), 1.0 - corner_zone, 1e-12) < joint: try zones.push(1.0 - corner_zone)
+        var values = Growing[Weighted]()
+        defer values.close()
+        for t in params.view():
+            let target = (try target_at(sides, masters, s, lin, plane, k, t)).add(fix.at(t))
+            try values.push(Weighted(target.x, target.y, target.z, 0.0))
         var made = empty_spline(q)
         errdefer made.close()
         try made.knots.assign(knots.view())
@@ -336,7 +466,7 @@ func make_fields(sides: SquareSide[4]*, masters: Growing[Master]*, s: usize, lin
             var off = 0.0
             for i in 1..<(usize)8:
                 let t = a + (b - a) * (f64)i / 8.0
-                let target = try target_at(sides, masters, s, lin, plane, k, t)
+                let target = (try target_at(sides, masters, s, lin, plane, k, t)).add(fix.at(t))
                 let got = try field_jet(&made, t, 0, false)
                 off = math.max(off, got.d[0].subtract(target).length())
             worst = math.max(worst, off)
@@ -453,9 +583,13 @@ func square_net(set: interop.Reference[GeometrySet], words: str, opts: const Squ
     defer close_splines_of(&raw)
     for m in masters.view(): try raw.push(try m.curve.copy())
     let tolerance = build_tolerance(raw.view())
-    for c in raw.view():
-        var copy = try plain_curve(&c, tolerance)
+    for k in 0..<raw.count:
+        var copy = try plain_curve(&raw.items[k], tolerance)
         unit_domain(&copy)
+        if opts.rebuild[k]:
+            let rebuilt = try rebuilt_curve(&copy, tolerance)
+            copy.close()
+            copy = rebuilt
         try picked_curves.push(copy)
     var picked: usize[4] = [0, 0, 0, 0]
     var turned_round: bool[4] = [false, false, false, false]
@@ -468,13 +602,17 @@ func square_net(set: interop.Reference[GeometrySet], words: str, opts: const Squ
     defer extra_u.close()
     var extra_v = Growing[f64]()
     defer extra_v.close()
+    var corner_u = Growing[f64]()
+    defer corner_u.close()
+    var corner_v = Growing[f64]()
+    defer corner_v.close()
     var attempt: usize = 0
     while true:
         var sides: SquareSide[4] = [blank_side(), blank_side(), blank_side(), blank_side()]
         for s in 0..<(usize)4:
             let source = &picked_curves.items[picked[s]]
             let curve = try reversed_spline(source) if turned_round[s] else try source.copy()
-            sides[s] = SquareSide(curve, picked[s], opts.continuity[picked[s]], opts.angle[picked[s]], Growing[Spline]())
+            sides[s] = SquareSide(curve, picked[s], opts.continuity[picked[s]], opts.angle[picked[s]], Growing[Spline](), side_reach(opts, picked[s]), opts.colinear[picked[s]])
         defer close_sides(&sides)
         # The pairs across made compatible, with the spans added so far.
         for pair in 0..<(usize)2:
@@ -489,6 +627,13 @@ func square_net(set: interop.Reference[GeometrySet], words: str, opts: const Squ
             let extra = extra_v.view() if pair == 0 else extra_u.view()
             for t in extra:
                 for k in 0..<(usize)2: _ = try insert_knot(&two.items[k], t, 1)
+            # Corner zones end in a C2 joint: the knot degree - 2 times.
+            let zone = corner_v.view() if pair == 0 else corner_u.view()
+            let joint = (usize)math.max(1.0, (f64)(two.items[0].degree - 2))
+            for t in zone:
+                for k in 0..<(usize)2:
+                    let have = multiplicity(two.items[k].knots.view(), t, 1e-12)
+                    if have < joint: _ = try insert_knot(&two.items[k], t, joint - have)
             try two.items[1].knots.assign(two.items[0].knots.view())
             sides[pair * 2].curve = two.items[0]
             sides[pair * 2 + 1].curve = two.items[1]
@@ -510,8 +655,19 @@ func square_net(set: interop.Reference[GeometrySet], words: str, opts: const Squ
         var corners = Growing[Vector3]()
         defer corners.close()
         try corner_set(&sides, &masters, &lin, opts.cubic, &corners)
+        var zones_u = Growing[f64]()
+        defer zones_u.close()
+        var zones_v = Growing[f64]()
+        defer zones_v.close()
         for s in 0..<(usize)4:
-            worst = math.max(worst, try make_fields(&sides, &masters, s, &lin, opts.cubic, corners.view(), 1e-6, &missed_v if s < 2 else &missed_u))
+            worst = math.max(worst, try make_fields(&sides, &masters, s, &lin, opts.cubic, corners.view(), 1e-6, &missed_v if s < 2 else &missed_u, &zones_v if s < 2 else &zones_u))
+        if zones_u.count > 0 or zones_v.count > 0:
+            # The corner zones' knots, then the patch again (once).
+            for t in zones_u.view():
+                if multiplicity(corner_u.view(), t, 1e-12) == 0: try corner_u.push(t)
+            for t in zones_v.view():
+                if multiplicity(corner_v.view(), t, 1e-12) == 0: try corner_v.push(t)
+            continue
         let spans = span_count(&sides[0].curve) + span_count(&sides[2].curve)
         if (missed_u.count > 0 or missed_v.count > 0) and attempt < 6 and spans < 128:
             for t in missed_u.view(): try extra_u.push(t)

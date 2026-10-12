@@ -13,7 +13,9 @@
 ## polynomial, Linear meets G1 and not G2, Soft and Reflective G2; Detach
 ## periodic splits a closed B-spline sheet; Align's proxy is the input's
 ## own hull; a curve's Modify Both against an edge moves both to the
-## middle; Project takes a temporary isoparm.
+## middle; Project takes a temporary isoparm. Square's corners whose
+## neighbors disagree (a cap on a box's four walls) still meet every wall
+## G1 and G2; its Rebuild, Boundary Blend, Influence and Colinear.
 from luce_cad.surfacing import CadSurfacing, CadSurfaceBuild
 from luce_cad.cad_geometry import CadGeometry
 from luce_cad.cad_curves import CadCurves
@@ -28,14 +30,19 @@ pub func surface_build_tests() -> unit!:
     square_lines()
     square_hole()
     square_options()
+    square_corners()
+    square_controls()
     skins()
+    skin_options()
     rails()
+    rail_options()
     profiles()
     sheets()
     extends()
+    extend_chain()
     detach_closed()
     align_followups()
-    print("PASS surface build: Square is bilinear on four lines and meets a hole's neighbors G0, G1 and G2 on every edge (Cubic, Implied Tangent, Tangent Angle too); Skin of circles is a cone and a surface of revolution exactly, closed smoothly, G1 to an edge at its start; Rail round a circle is a torus and reaches both of two rails; Profile passes its profiles, Limited without overshoot; Set Planar, Extrude and Revolve are exact; Extend Natural keeps the polynomial, Linear is G1 only, Soft and Reflective G2; Detach periodic splits a closed sheet; Align's proxy is the old hull; a curve's Modify Both meets an edge halfway; Project takes an isoparm")
+    print("PASS surface build: Square is bilinear on four lines and meets a hole's neighbors G0, G1 and G2 on every edge (Cubic, Implied Tangent, Tangent Angle too); Skin of circles is a cone and a surface of revolution exactly, closed smoothly, G1 to an edge at its start; Rail round a circle is a torus and reaches both of two rails; Profile passes its profiles, Limited without overshoot; Set Planar, Extrude and Revolve are exact; Extend Natural keeps the polynomial, Linear is G1 only, Soft and Reflective G2; Detach periodic splits a closed sheet; Align's proxy is the old hull; a curve's Modify Both meets an edge halfway; Project takes an isoparm; a cap on four walls meets them G1 and G2; Boundary Blend, Influence, Colinear and Rebuild; Rail's Spine, Sweep Pivot, Fixed Curve and Curve Segments; Skin's curve sets, Multiple Surfaces and Proportional Crown; Extend's Chain Select")
 
 # -- Shapes.
 
@@ -211,6 +218,108 @@ func square_options() -> unit!:
     let angle = math.acos(math.min(1.0, math.abs(n.z))) * 180.0 / math.pi
     assert(math.abs(angle - 30.0) < 1e-6, f"Tangent Angle 30 leans {angle}")
 
+## A wall from the edge `a` to `b` hanging down by `depth`.
+func box_wall(a: Vector3, b: Vector3, depth: float, name: str) -> CadModel!:
+    let down = Vector3(0.0, 0.0, -depth)
+    return CadSurfacing.patch([a, a.add(down), b, b.add(down)], [1.0, 1.0, 1.0, 1.0], 2, 2, 1, 1, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], name)
+
+func square_corners() -> unit!:
+    # A cap on a box's four walls: each wall asks the cap to rise square off
+    # it while the next wall's top edge leaves each corner flat, so no
+    # surface meets both at a corner itself; off the corner zones every
+    # edge measures what was asked.
+    var data = CadGeometry.of_model(box_wall(Vector3(0.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0), 1.0, "south"))
+    data = data.merged(CadGeometry.of_model(box_wall(Vector3(2.0, 0.0, 0.0), Vector3(2.0, 2.0, 0.0), 1.0, "east")))
+    data = data.merged(CadGeometry.of_model(box_wall(Vector3(2.0, 2.0, 0.0), Vector3(0.0, 2.0, 0.0), 1.0, "north")))
+    data = data.merged(CadGeometry.of_model(box_wall(Vector3(0.0, 2.0, 0.0), Vector3(0.0, 0.0, 0.0), 1.0, "west")))
+    let words = "edge south 1 0 0;edge east 2 1 0;edge north 1 2 0;edge west 0 1 0"
+    for order in 1..<3:
+        let code = order + 1
+        let made = CadSurfaceBuild.square(data, words, [code, code, code, code], [0.0, 0.0, 0.0, 0.0])
+        assert(made.deviation < 1e-9, f"the cap's fields fit to {made.deviation}")
+        let found = levels(made.geometry())
+        assert(found.length == 8, f"G{order} cap: {found.length} shared edges")
+        var walls = 0
+        for level in found:
+            if level >= order:
+                walls += 1
+        # The four walls' own corners stay square (G0, 90°).
+        assert(walls == 4, f"the G{order} cap measures {found}")
+        # It rises square off the walls: up the middle of the south wall.
+        let (model, s) = sheet_of(made.geometry(), 4)
+        let top = CadNurbs.point_at(model, s, 0.5, 0.5)
+        assert(math.abs(top.x - 1.0) < 1e-9 and math.abs(top.y - 1.0) < 1e-9 and top.z > 0.5, f"the cap's middle {top}")
+
+func square_controls() -> unit!:
+    var data = CadGeometry.of_model(piece(0.0, 1.0, 1.0, 2.0, "left"))
+    data = data.merged(CadGeometry.of_model(piece(2.0, 3.0, 1.0, 2.0, "right")))
+    data = data.merged(CadGeometry.of_model(piece(1.0, 2.0, 0.0, 1.0, "bottom")))
+    data = data.merged(CadGeometry.of_model(piece(1.0, 2.0, 2.0, 3.0, "top")))
+    let words = f"edge left 1 1.5 {height(1.0, 1.5)};edge bottom 1.5 1 {height(1.5, 1.0)};edge right 2 1.5 {height(2.0, 1.5)};edge top 1.5 2 {height(1.5, 2.0)}"
+    let g1 = [2, 2, 2, 2]
+    let level_angles = [0.0, 0.0, 0.0, 0.0]
+    let plain = CadSurfaceBuild.square(data, words, g1, level_angles)
+    let (m0, s0) = sheet_of(plain.geometry(), 4)
+    # Boundary Blend and Influence keep G1 on every edge and change only
+    # the inside: a blend toward boundary 3 (right) bends the middle.
+    for (blend, influence) in [(0.3, 1.0), (0.7, 1.0), (0.5, 2.0), (0.5, 0.4)]:
+        let made = CadSurfaceBuild.square(data, words, g1, level_angles, blend = [blend, 0.5], influence = [influence, influence])
+        for level in levels(made.geometry()):
+            assert(level >= 1, f"Boundary Blend {blend} Influence {influence} breaks G1")
+        let (m, s) = sheet_of(made.geometry(), 4)
+        let moved = CadNurbs.point_at(m, s, 0.5, 0.5).subtract(CadNurbs.point_at(m0, s0, 0.5, 0.5)).length()
+        assert(moved > 1e-4, f"Boundary Blend {blend} Influence {influence} moves the middle {moved}")
+    # Colinear on the left boundary: off its corners the surface leaves it
+    # along the left piece's own isoparms (along x), not square to it.
+    let side = plain.side(0)
+    let lined = CadSurfaceBuild.square(data, words, g1, level_angles, colinear = [true, false, false, false])
+    for level in levels(lined.geometry()):
+        assert(level >= 1, "Colinear breaks G1")
+    let (m1, s1) = sheet_of(lined.geometry(), 4)
+    for (model, s, want) in [(m0, s0, false), (m1, s1, true)]:
+        let t = 0.5
+        let u = 0.0 if side == 0 else (1.0 if side == 1 else t)
+        let v = t if side < 2 else (0.0 if side == 2 else 1.0)
+        let h = 1e-6
+        let a = CadNurbs.point_at(model, s, u, v)
+        let b = CadNurbs.point_at(model, s, u + h if side == 0 else u, v + h if side == 2 else v)
+        let across = b.subtract(a).normalized()
+        if want:
+            assert(math.abs(across.y) < 1e-4, f"Colinear leaves along {across}")
+        else:
+            assert(math.abs(across.y) > 1e-3, f"square to the boundary it leaves along {across}")
+    # Rebuild: a boundary drawn with bunched control points (eight spans of
+    # a line) comes out evenly parameterized: its middle by length is the
+    # surface's middle along it.
+    var lines = GeometrySet()
+    let xs = [0.0, 0.02, 0.05, 0.1, 0.2, 0.4, 0.7, 1.0, 1.3, 1.6, 2.0]
+    let bunched: list[Vector3] = []
+    for x in xs:
+        bunched.append(Vector3(x, 0.0, 0.0))
+    lines = CadCurves.with_curve(lines, "c0", CadCurveTools.by_points(bunched, 3))
+    lines = CadCurves.with_curve(lines, "c1", CadCurveTools.by_points([Vector3(2.0, 0.0, 0.0), Vector3(2.0, 1.0, 0.0)], 1))
+    lines = CadCurves.with_curve(lines, "c2", CadCurveTools.by_points([Vector3(2.0, 1.0, 0.0), Vector3(0.0, 1.0, 0.0)], 1))
+    lines = CadCurves.with_curve(lines, "c3", CadCurveTools.by_points([Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 0.0)], 1))
+    let fours = "curve c0;curve c1;curve c2;curve c3"
+    let ones = [1, 1, 1, 1]
+    # The viewport's lines of the picks: one a curve, five points each.
+    let shown = CadSurfaceBuild.picked_lines(lines, fours, 5).trim().split("\n")
+    assert(shown.length == 4 and shown[0].trim().split(" ").length == 15, f"picked lines {shown}")
+    let raw = CadSurfaceBuild.square(lines, fours, ones, level_angles)
+    let rebuilt = CadSurfaceBuild.square(lines, fours, ones, level_angles, rebuild = [true, false, false, false])
+    let (mr, sr) = sheet_of(raw.geometry(), 0)
+    let (mb, sb) = sheet_of(rebuilt.geometry(), 0)
+    let at = raw.side(0)
+    let uu = 0.5 if at >= 2 else (0.0 if at == 0 else 1.0)
+    let vv = 0.5 if at < 2 else (0.0 if at == 2 else 1.0)
+    let before = CadNurbs.point_at(mr, sr, uu, vv)
+    let after = CadNurbs.point_at(mb, sb, uu, vv)
+    assert(math.abs(before.x - 1.0) > 0.05, f"the bunched boundary's middle is already {before}")
+    assert(math.abs(after.x - 1.0) < 1e-3 and math.abs(after.y) < 1e-9, f"the rebuilt boundary's middle is {after}")
+    let shape_raw = CadNurbs.structure(mr, sr)
+    let shape_built = CadNurbs.structure(mb, sb)
+    assert(shape_built.nu * shape_built.nv < shape_raw.nu * shape_raw.nv, f"Rebuild keeps {shape_built.nu} x {shape_built.nv} control points (was {shape_raw.nu} x {shape_raw.nv})")
+
 # -- Skin.
 
 ## The largest |radius(z) - want(z)| over sheet `index` of `data`.
@@ -272,6 +381,43 @@ func skins() -> unit!:
     let found = levels(skinned.geometry())
     assert(found.length == 1 and found[0] >= 1, f"Skin Start G1 measured {found}")
 
+func skin_options() -> unit!:
+    # Curve sets: two curves end to end each. Single Surface joins each
+    # set; Multiple Surfaces skins the first curves and the second ones.
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "a1", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0)], 1))
+    data = CadCurves.with_curve(data, "a2", CadCurveTools.by_points([Vector3(2.0, 0.0, 0.5), Vector3(1.0, 0.0, 0.0)], 1))
+    data = CadCurves.with_curve(data, "b1", CadCurveTools.by_points([Vector3(0.0, 2.0, 0.0), Vector3(1.0, 2.0, 0.0)], 1))
+    data = CadCurves.with_curve(data, "b2", CadCurveTools.by_points([Vector3(1.0, 2.0, 0.0), Vector3(2.0, 2.0, 1.0)], 1))
+    let sets = "curve a1+curve a2;curve b1+curve b2"
+    let single = CadSurfaceBuild.skin(data, sets)
+    assert(single.count == 1 and CadGeometry.model_count(single.geometry()) == 1, f"Single Surface made {single.count}")
+    let (sm, ss) = sheet_of(single.geometry(), 0)
+    var far = 0.0
+    for u in [0.0, 1.0]:
+        for v in [0.0, 1.0]:
+            far = math.max(far, CadNurbs.point_at(sm, ss, u, v).x)
+    assert(math.abs(far - 2.0) < 1e-12, f"the joined sets reach x {far}")
+    let several = CadSurfaceBuild.skin(data, sets, multiple = true)
+    assert(several.count == 2 and CadGeometry.model_count(several.geometry()) == 2, f"Multiple Surfaces made {several.count}")
+    let (second, s2) = sheet_of(several.geometry(), 1)
+    for u in [0.0, 1.0]:
+        for v in [0.0, 1.0]:
+            let p = CadNurbs.point_at(second, s2, u, v)
+            assert(p.x > 1.0 - 1e-12, f"the second sheet reaches back to {p}")
+    # Proportional Crown 0.1 between two lines 2 apart: the middle rises
+    # 0.2 off their plane all along, the sections kept.
+    var pair = GeometrySet()
+    pair = CadCurves.with_curve(pair, "c", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0)], 1))
+    pair = CadCurves.with_curve(pair, "d", CadCurveTools.by_points([Vector3(0.0, 2.0, 0.0), Vector3(2.0, 2.0, 0.0)], 1))
+    let crowned = CadSurfaceBuild.skin(pair, "curve c;curve d", crown = 0.1)
+    let (cm, cs) = sheet_of(crowned.geometry(), 0)
+    for k in 0..<11:
+        let u = float(k) / 10.0
+        let mid = CadNurbs.point_at(cm, cs, u, 0.5)
+        assert(math.abs(math.abs(mid.z) - 0.2) < 1e-9 and math.abs(mid.y - 1.0) < 1e-9, f"the crown's middle at {mid}")
+        assert(math.abs(CadNurbs.point_at(cm, cs, u, 0.0).z) < 1e-12 and math.abs(CadNurbs.point_at(cm, cs, u, 1.0).z) < 1e-12, "the crown moves a section")
+
 # -- Rail and Profile.
 
 func rails() -> unit!:
@@ -303,6 +449,59 @@ func rails() -> unit!:
             let da = r1.at(CadCurveTools.nearest(r1, a)).subtract(a).length()
             let db = r2.at(CadCurveTools.nearest(r2, b)).subtract(b).length()
             assert(da < 1e-5 and db < 1e-5, f"two rails ({transform}): a section misses them by {da} and {db}")
+
+## Sheet `index`'s point at (u, v).
+func corner(data: GeometrySet, index: int, u: float, v: float) -> Vector3!:
+    let (model, s) = sheet_of(data, index)
+    return CadNurbs.point_at(model, s, u, v)
+
+func rail_options() -> unit!:
+    # Spine: a wavy rail with a straight spine along X keeps every section
+    # in a plane square to the spine (x constant across it).
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "wave", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.3), Vector3(2.0, -1.0, -0.2), Vector3(3.0, 0.0, 0.0)], 3))
+    data = CadCurves.with_curve(data, "spine", CadCurveTools.by_points([Vector3(0.0, 0.0, -1.0), Vector3(3.0, 0.0, -1.0)], 1))
+    data = CadCurves.with_curve(data, "post", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(0.0, 0.3, 1.0)], 1))
+    let spined = CadSurfaceBuild.rail(data, "curve post", "curve wave", mode = 4, spine = "curve spine")
+    let (model, s) = sheet_of(spined.geometry(), 0)
+    for k in 0..<11:
+        let v = float(k) / 10.0
+        let a = CadNurbs.point_at(model, s, 0.0, v)
+        let b = CadNurbs.point_at(model, s, 1.0, v)
+        assert(math.abs(a.x - b.x) < 1e-5, f"Spine: a section leans off the spine's plane ({a.x} to {b.x})")
+    # Natural mode leans them with the rail.
+    let natural = CadSurfaceBuild.rail(data, "curve post", "curve wave")
+    let (nm, ns) = sheet_of(natural.geometry(), 0)
+    var lean = 0.0
+    for k in 0..<11:
+        let v = float(k) / 10.0
+        lean = math.max(lean, math.abs(CadNurbs.point_at(nm, ns, 0.0, v).x - CadNurbs.point_at(nm, ns, 1.0, v).x))
+    assert(lean > 0.05, f"Natural leans {lean}")
+    # Sweep Pivot: a post off the rail, its foot moved onto the rail's
+    # start (Fixed Curve Rail), or the rail moved to the post (Gen.).
+    var off = GeometrySet()
+    off = CadCurves.with_curve(off, "line", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(3.0, 0.0, 0.0)], 1))
+    off = CadCurves.with_curve(off, "post", CadCurveTools.by_points([Vector3(5.0, 5.0, 0.0), Vector3(5.0, 5.0, 1.0)], 1))
+    let onto = CadSurfaceBuild.rail(off, "curve post", "curve line", pivot = 1, pivot_rail = 0.0, pivot_generation = 0.0)
+    let moved = CadSurfaceBuild.rail(off, "curve post", "curve line", pivot = 1, pivot_rail = 0.0, pivot_generation = 0.0, fixed = 1)
+    let points = CadSurfaceBuild.rail(off, "curve post", "curve line", pivot = 2, pivot_rail = 0.0, pivot_point = Vector3(5.0, 5.0, -1.0))
+    var lows: list[Vector3] = []
+    var highs: list[Vector3] = []
+    for made in [onto, moved, points]:
+        let a = corner(made.geometry(), 0, 0.0, 0.0)
+        let b = corner(made.geometry(), 0, 1.0, 1.0)
+        lows.append(Vector3(math.min(a.x, b.x), math.min(a.y, b.y), math.min(a.z, b.z)))
+        highs.append(Vector3(math.max(a.x, b.x), math.max(a.y, b.y), math.max(a.z, b.z)))
+    let want_low = [Vector3(0.0, 0.0, 0.0), Vector3(5.0, 5.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+    let want_high = [Vector3(3.0, 0.0, 1.0), Vector3(8.0, 5.0, 1.0), Vector3(3.0, 0.0, 2.0)]
+    for k in 0..<3:
+        assert(lows[k].subtract(want_low[k]).length() < 1e-6 and highs[k].subtract(want_high[k]).length() < 1e-6, f"pivot case {k}: {lows[k]} to {highs[k]}")
+    # Curve Segments: the middle half of the rail, the lower half of the post.
+    let part = CadSurfaceBuild.rail(off, "curve post", "curve line", pivot = 1, segments = [0.25, 0.75, 0.0, 1.0, 0.0, 0.5])
+    let a = corner(part.geometry(), 0, 0.0, 0.0)
+    let b = corner(part.geometry(), 0, 1.0, 1.0)
+    assert(math.abs(math.min(a.x, b.x) - 0.75) < 1e-6 and math.abs(math.max(a.x, b.x) - 2.25) < 1e-6, f"rail segment {a} {b}")
+    assert(math.abs(math.max(a.z, b.z) - 0.5) < 1e-6, f"generation segment {a} {b}")
 
 func profiles() -> unit!:
     # Three circles of radii 1, 2, 1 on a straight rail up Z: Global passes
@@ -405,6 +604,24 @@ func extends() -> unit!:
     for k in 0..<11:
         let p = arc.at(arc.low() + (arc.high() - arc.low()) * float(k) / 10.0)
         assert(math.abs(p.length() - 1.0) < 1e-6, f"a circle's arc extended Natural leaves the circle at {p}")
+
+func extend_chain() -> unit!:
+    # Two sheets side by side: Chain Select from one's front edge carries
+    # the other's on too (it runs on tangent); without it only the one.
+    var data = CadGeometry.of_model(flat(Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), "a"))
+    data = data.merged(CadGeometry.of_model(flat(Vector3(1.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.0), "b")))
+    let lone = CadSurfaceBuild.extended(data, "face a 0.5 0 0", 0, 0.5)
+    let chained = CadSurfaceBuild.extended(data, "face a 0.5 0 0", 0, 0.5, chain = true)
+    let both = CadSurfaceBuild.extended(data, "face a 0.5 0 0;face b 1.5 0 0", 0, 0.5)
+    for (made, reach_b) in [(lone, 0.0), (chained, -0.5), (both, -0.5)]:
+        for (index, want) in [(0, -0.5), (1, reach_b)]:
+            let model = CadGeometry.model(made.geometry(), index)
+            let s = CadNurbs.surface_of_face(model, model.face_name(0))
+            var low = 1.0e300
+            for u in [0.0, 1.0]:
+                for v in [0.0, 1.0]:
+                    low = math.min(low, CadNurbs.point_at(model, s, u, v).y)
+            assert(math.abs(low - want) < 1e-9, f"sheet {index} reaches y {low}, wants {want}")
 
 # -- Stage 4 and 3 follow-ups.
 

@@ -15,7 +15,16 @@
 ##     turns with it and makes a torus;
 ##   Parallel: no turning, the offsets only carried along;
 ##   Vector (Alias's View): the frame keeps a fixed direction up;
-##   Surface normal (Profile on a curve on a face): the face's normal up.
+##   Surface normal (Profile on a curve on a face): the face's normal up;
+##   Spine (Alias's): a spine curve's rotation-minimizing frame where the
+##     plane square to the spine passes the rail's point, so every section
+##     stays square to the spine.
+## Alias's Sweep Pivot sets where the first generation curve meets the
+## rail: Closest (the closest points), On Curve (fractions along both) or
+## Off Curve (a fraction along the rail and a point of space); Fixed Curve
+## then moves the generation curve onto the rail (Rail) or the rail onto
+## it (Gen.) so the two pivots coincide. Curve Segments sweep only a
+## stretch of each rail and generation curve.
 ## With two rails each section reaches from the first rail to the second:
 ## its offsets along the chord between them, scaled to it uniformly
 ## (Scale), along it only (Non-proportional) or not at all (Rotate).
@@ -29,6 +38,14 @@ pub let sweep_natural: i64 = 0
 pub let sweep_parallel: i64 = 1
 pub let sweep_vector: i64 = 2
 pub let sweep_normal: i64 = 3
+pub let sweep_spine: i64 = 4
+
+pub let pivot_closest: i64 = 0
+pub let pivot_on_curve: i64 = 1
+pub let pivot_off_curve: i64 = 2
+
+pub let fixed_rail: i64 = 0
+pub let fixed_generation: i64 = 1
 
 pub let two_rail_scale: i64 = 0
 pub let two_rail_stretch: i64 = 1
@@ -41,7 +58,11 @@ pub let transition_limited: i64 = 3
 
 ## A sweep's options: the frame mode, its vector, two rails' transform,
 ## the blend between sections (a transition, Rail's bias), each side's
-## continuity (the first rail, the second, the first section, the last).
+## continuity (the first rail, the second, the first section, the last);
+## Sweep Pivot (its kind, the fractions along the rail and the generation
+## curve, Off Curve's point) and Fixed Curve; Curve Segments (fractions of
+## each rail's and each generation curve's domain to sweep: rail 1 from
+## and to, rail 2 from and to, the generation curves from and to).
 pub struct SweepOptions:
     pub var mode: i64
     pub var vector: Vector3
@@ -49,6 +70,12 @@ pub struct SweepOptions:
     pub var transition: i64
     pub var bias: f64
     pub var continuity: i64[4]
+    pub var pivot: i64 = 0
+    pub var pivot_rail: f64 = 0.0
+    pub var pivot_generation: f64 = 0.0
+    pub var pivot_point: Vector3 = Vector3()
+    pub var fixed: i64 = 0
+    pub var segments: f64[6] = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
 
 ## The rail's frames, sampled finely: points, tangents and reference
 ## directions (square to the tangent), transported by the mode.
@@ -71,9 +98,14 @@ func square_to(t: Vector3) -> Vector3!:
 
 ## The frame of `frames` at `t` (point, tangent, up), one double
 ## reflection on from the sample before it (natural), or the mode's.
-func frame_at(rail: const Spline*, frames: const Frames*, mode: i64, vector: Vector3, normals: Master*, t: f64) -> (Vector3, Vector3, Vector3)!:
+func frame_at(rail: const Spline*, frames: const Frames*, mode: i64, vector: Vector3, normals: Master*, spine: const Spline*, spine_frames: const Frames*, t: f64) -> (Vector3, Vector3, Vector3)!:
     let j = try curve_jet(rail, t, 1, t >= rail.high())
     let x = j.d[0]
+    if mode == sweep_spine:
+        # The spine's frame where its square plane passes x: x's foot.
+        let at = spline_nearest(spine, x)
+        let (_, along, up) = try frame_at(spine, spine_frames, sweep_natural, vector, normals, spine, spine_frames, at)
+        return (x, along, up)
     let tangent = j.d[1].normalized() catch failure: error(invalid, "Rail: the rail stops (its tangent vanishes)")
     if mode == sweep_vector:
         let up = vector.subtract(tangent.multiply_scalar(vector.dot(tangent))).normalized() catch failure: error(invalid, "Rail: the vector runs along the rail")
@@ -211,11 +243,16 @@ struct Sweeper:
     var transform: i64
     var transition: i64
     var bias: f64
+    ## Spine mode's spine and its natural frames.
+    var spine: Spline
+    var spine_frames: Frames
 
     func close():
         self.rail.close()
         self.other.close()
         self.frames.close()
+        self.spine.close()
+        self.spine_frames.close()
         self.rail_arc.close()
         self.other_arc.close()
         for c in self.locals.view():
@@ -229,7 +266,7 @@ struct Sweeper:
 ## point, tangent, up and their cross, unit scales.
 func axes_at(w: Sweeper*, normals: Master*, s: f64) -> (Vector3, Vector3, Vector3, Vector3, f64, f64)!:
     let t = try arc_param(&w.rail, &w.rail_arc, s)
-    let (x, tangent, up) = try frame_at(&w.rail, &w.frames, w.mode, w.vector, normals, t)
+    let (x, tangent, up) = try frame_at(&w.rail, &w.frames, w.mode, w.vector, normals, &w.spine, &w.spine_frames, t)
     if not w.two: return (x, tangent, up, tangent.cross(up), 1.0, 1.0)
     let p2 = w.other.point_at(try arc_param(&w.other, &w.other_arc, s))
     let chord = p2.subtract(x)
@@ -351,26 +388,34 @@ func section_at(w: Sweeper*, normals: Master*, t: f64, out: Growing[Weighted]*) 
             continue
         try out.push(weighted(o.add(x.multiply_scalar(p.x * stretch)).add(y.multiply_scalar(p.y * across)).add(z.multiply_scalar(p.z * across)), q.w))
 
-## Section `c` placed on the sweep: where it comes nearest the rail, and
-## its control points as offsets in the frame there.
-func place_section(w: Sweeper*, normals: Master*, c: const Spline*) -> !:
-    # The nearest pair of points (section, rail), by sampling then Newton.
-    var best = 1.0e300
+## Section `c` placed on the sweep, and its control points as offsets in
+## the frame there: where it comes nearest the rail (Closest), or at the
+## rail's point `pivot` (a fraction of its domain, at least 0) with the
+## section's point `from` moved onto it (`shift` true: Fixed Curve Rail;
+## else the section stays and the rail is moved later).
+func place_section(w: Sweeper*, normals: Master*, c: const Spline*, pivot: f64, start: Vector3, shift: bool) -> !:
     var at = 0.0
-    for k in 0..<(usize)65:
-        let p = c.point_at(c.low() + (c.high() - c.low()) * (f64)k / 64.0)
-        let t = spline_nearest(&w.rail, p)
-        let d = w.rail.point_at(t).subtract(p).length()
-        if d < best:
-            best = d
-            at = t
+    if pivot >= 0.0:
+        at = w.rail.low() + (w.rail.high() - w.rail.low()) * math.clamp(pivot, 0.0, 1.0)
+    else:
+        # The nearest pair of points (section, rail), by sampling.
+        var best = 1.0e300
+        for k in 0..<(usize)65:
+            let p = c.point_at(c.low() + (c.high() - c.low()) * (f64)k / 64.0)
+            let t = spline_nearest(&w.rail, p)
+            let d = w.rail.point_at(t).subtract(p).length()
+            if d < best:
+                best = d
+                at = t
     let place = try arc_fraction(&w.rail, &w.rail_arc, at)
     let (o, x, y, z, stretch, across) = try axes_at(w, normals, place)
+    # Fixed Curve Rail: the section moved so its pivot is the rail's.
+    let move = o.subtract(start) if shift else Vector3()
     var local = try c.copy()
     errdefer local.close()
     for k in 0..<local.points.count:
         let q = c.points.items[k]
-        let d = q.point().subtract(o)
+        let d = q.point().add(move).subtract(o)
         let p = d if w.mode == sweep_parallel and not w.two else Vector3(d.dot(x) / stretch, d.dot(y) / across, d.dot(z) / across)
         local.points.items[k] = weighted(p, q.w)
     # In order along the rail.
@@ -476,10 +521,21 @@ func rail_side(net: const Net*, rail: const Spline*, tolerance: f64) -> i64:
         if on: return side
     return -1
 
+## The stretch of `c` from fraction `a` to `b` of its domain (Curve
+## Segments), on 0..1.
+func segment_of(c: const Spline*, a: f64, b: f64) -> Spline!:
+    if a <= 0.0 and b >= 1.0:
+        var whole = try c.copy()
+        unit_domain(&whole)
+        return whole
+    var made = try extract(c, c.low() + (c.high() - c.low()) * a, c.low() + (c.high() - c.low()) * b)
+    unit_domain(&made)
+    return made
+
 ## A sweep of the sections `sections` along the rails `rails` (one or
 ## two; Align's master words apart by `;`) by `opts`; `profile` places
 ## them as Profile does (one rail, the transition between them).
-func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, opts: const SweepOptions*) -> Net!:
+func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, opts: const SweepOptions*, spine_words: str) -> Net!:
     var rail_masters = Growing[Master]()
     defer close_masters(&rail_masters)
     try builder_masters(set, rails, &rail_masters)
@@ -489,13 +545,15 @@ func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, o
     try builder_masters(set, sections, &section_masters)
     if section_masters.count < 1: error(invalid, "Rail: pick the generation curves (the sections) too")
     let two = rail_masters.count == 2
-    var rail = try rail_masters.items[0].curve.copy()
-    unit_domain(&rail)
+    for k in 0..<(usize)3:
+        let a = opts.segments[2 * k]
+        let b = opts.segments[2 * k + 1]
+        if not (a >= 0.0 and b <= 1.0 and b - a > 1e-6): error(invalid, "Rail: a curve segment runs from 0 to 1 of its curve, start before end")
+    var rail = try segment_of(&rail_masters.items[0].curve, opts.segments[0], opts.segments[1])
     var other = empty_spline(1)
     if two:
         other.close()
-        other = try rail_masters.items[1].curve.copy()
-        unit_domain(&other)
+        other = try segment_of(&rail_masters.items[1].curve, opts.segments[2], opts.segments[3])
         # The second rail runs the way the first does.
         if rail.point_at(0.0).subtract(other.point_at(1.0)).length() < rail.point_at(0.0).subtract(other.point_at(0.0)).length():
             let turned_round = try reversed_spline(&other)
@@ -504,8 +562,7 @@ func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, o
     var curves = Growing[Spline]()
     defer close_splines_of(&curves)
     for m in section_masters.view():
-        var c = try m.curve.copy()
-        unit_domain(&c)
+        var c = try segment_of(&m.curve, opts.segments[4], opts.segments[5])
         if curves.count > 0 and runs_against(&c, &curves.items[0]):
             let turned_round = try reversed_spline(&c)
             c.close()
@@ -522,15 +579,45 @@ func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, o
     let first_point = curves.items[0].point_at(0.5)
     let near = rail.point_at(spline_nearest(&rail, first_point))
     start_up = first_point.subtract(near)
+    # Spine mode's spine and its frames.
+    var spine = empty_spline(1)
+    var spine_frames = Frames(Growing[f64](), Growing[Vector3](), Growing[Vector3](), Growing[Vector3]())
+    if opts.mode == sweep_spine:
+        var spines = Growing[Master]()
+        defer close_masters(&spines)
+        try builder_masters(set, spine_words, &spines)
+        if spines.count != 1: error(invalid, "Rail: Spine mode takes one spine curve")
+        spine.close()
+        spine = try segment_of(&spines.items[0].curve, 0.0, 1.0)
+        spine_frames = try make_frames(&spine, Vector3()) catch failure:
+            spine.close()
+            error(failure.code, failure.message)
     var w = Sweeper(rail, other, two, try make_frames(&rail, start_up), try arc_table(&rail), try arc_table(&other) if two else ArcTable(Growing[f64]()),
-                    Growing[Spline](), Growing[f64](), opts.mode, opts.vector, opts.transform, opts.transition, opts.bias)
+                    Growing[Spline](), Growing[f64](), opts.mode, opts.vector, opts.transform, opts.transition, opts.bias, spine, spine_frames)
     defer w.close()
     # The face a curve-on-face rail lies on, for Surface normal.
     var normals = &rail_masters.items[0]
     if opts.mode == sweep_normal and not normals.has_face: error(invalid, "Profile: Surface normal needs the rail on a face (a curve on a face, or an edge)")
-    for c in curves.view(): try place_section(&w, normals, &c)
+    # The first generation curve at its pivot, the others where they come
+    # nearest the rail.
+    var shift = Vector3()
+    for k in 0..<curves.count:
+        let c = &curves.items[k]
+        if k > 0 or opts.pivot == pivot_closest:
+            try place_section(&w, normals, c, -1.0, Vector3(), false)
+            continue
+        let held = opts.pivot_point if opts.pivot == pivot_off_curve else c.point_at(c.low() + (c.high() - c.low()) * math.clamp(opts.pivot_generation, 0.0, 1.0))
+        try place_section(&w, normals, c, opts.pivot_rail, held, true)
+        if opts.fixed == fixed_generation:
+            # Fixed Curve Gen.: the rail moved onto the generation curve.
+            shift = held.subtract(w.rail.point_at(w.rail.low() + (w.rail.high() - w.rail.low()) * math.clamp(opts.pivot_rail, 0.0, 1.0)))
     var net = try sweep_fit(&w, normals, tolerance)
     errdefer net.close()
+    if shift.length() > 0.0:
+        if opts.continuity[0] > 0 or opts.continuity[1] > 0: error(invalid, "Rail: a rail's continuity needs the rail kept where it is (Fixed Curve Rail)")
+        for at in 0..<net.points.count:
+            let q = net.points.items[at]
+            net.points.items[at] = weighted(q.point().add(shift), q.w)
     # Continuity: the rails' sides, then the first and last sections'.
     for r in 0..<rail_masters.count:
         let order = opts.continuity[r]

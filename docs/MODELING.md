@@ -1659,9 +1659,28 @@ surface toward its normal side). The corners' mixed derivatives are one set ever
 (`corner_set`: the boundaries' own along them, the mean of the two sides' targets where both have a
 field, measured by fourth-order differences a thousandth apart), each field fitted on its pair's knots
 holding them to the second derivative at both ends; spans are added where a field misses its target
-by more than a millionth until it does. When neighbors meet consistently at a corner (one smooth
-surface, a vault's walls and arcs rising square from them) every edge meets its continuity; where they
-cannot (a corner whose boundary leaves the neighbor's tangent plane) the patch takes the mean there.
+by more than a millionth until it does. The G1 slope keeps L's part along the boundary and turns its
+part across onto the neighbor's own way on (its tangent plane, square to the boundary) with its
+length, so walls whose next boundary leaves their plane (a cap on a box's four walls) still make the
+patch rise square off them instead of shrinking the slope to nothing.
+
+*Corners whose neighbors disagree.* At a cap on four perpendicular walls each wall asks the patch to
+rise square off it while the next wall's top edge leaves the corner flat: no surface meets both at
+the corner itself (the corner is singular). As Gregory's patch keeps each side's own field everywhere
+but at the corner, each field here is its own target plus the corner set's mismatch (value and first
+two derivatives) carried down to nothing by a quintic Hermite within a corner zone, 1/256 of the side,
+a span of its own ending in a C2 joint (the knot degree − 2 times), so the fit is exact; off the zones
+every boundary meets its continuity. Only a mismatch in the field itself makes a zone; twists alone
+that disagree are spread along the side by the fit, as Coons patches do.
+
+*Alias's other options.* **Boundary Blend** (1-3 and 2-4, 0.17 to 0.83) moves where a pair's influence
+meets: the first boundary's slope across scaled by 2b and the second's by 2(1 − b); **Influence** scales
+both; each acts off the corners (a quintic smoothstep over the first and last quarter, so the corners'
+data stay) on boundaries with a slope across (G1, G2, Implied, Cubic), their continuity unchanged.
+**Colinear** (per boundary) lays the slope along the neighbor's own isoparm across (Align without
+skew) off the corners, so isoparms run on across the boundary. **Rebuild** (per boundary) refits the
+curve by its arc length at its degree (5 at least) on the fewest uniform spans within the build
+tolerance, its ends and tangents kept (`rebuilt_curve`, shared by the builders).
 Explicit Control refits to the degrees and spans asked, its sides held.
 
 **Skin** (`skin.lucb`; Alias's Skin, Loft). The sections turned to run alike (each the way nearer the
@@ -1670,7 +1689,13 @@ across at the mean chord between neighbors by a B-spline of the degree asked (qu
 less than the sections), homogeneous, so two coaxial circles give exactly a cylinder or a cone and
 three a surface of revolution. Closed: interpolated with three loops more either side and cut back to
 the loop, the seam smooth. Start and End continuity match the first and last section's side G1 to
-G3 to the surface it lies on by Align's rows (`match_side`: Explicit Control off, Refine).
+G3 to the surface it lies on by Align's rows (`match_side`: Explicit Control off, Refine). A section may
+be a curve set (curves end to end, words apart by `+`, Alias's): Single Surface joins each set into one
+curve, **Multiple Surfaces** skins the sets' first curves, their second ones and so on, a sheet each
+(bodies `Skin`, `Skin2`...). **Proportional Crown** (two sections, −0.25 to 0.25 of the gap) raises the
+surface to degree 2 across and pushes the middle row along the normal at each control point's Greville
+place by twice the crown times the gap, so the middle rises by the crown times the gap; then quintic
+across.
 
 **Rail and Profile** (`sweep.lucb`; Alias's Rail Surface and Profile, Rhino's Sweep1 and Sweep2). Each
 generation curve (profile) is placed where it comes nearest the rail and kept as offsets in the rail's
@@ -1685,7 +1710,14 @@ arc table, Newton within a step), not its parameter: a circle's quarters are onl
 length as smooth as the rail. The surface is the sections' control points fitted along the rail at
 degree 5, the first and last exactly, knots at each section's place as often as the blend's kink asks,
 spans doubled until the sections between lie within a ten-millionth. A rail or the end generation curve
-on a surface matches that side G1 to G3 (Align's rows).
+on a surface matches that side G1 to G3 (Align's rows). **Spine** mode takes the frame of a spine curve
+(its natural frame where the plane square to it passes the rail's point), so every section stays square
+to the spine. **Sweep Pivot** sets where the first generation curve meets the rail: Closest (as above),
+On Curve (fractions along both) or Off Curve (a fraction along the rail and a point in space); **Fixed
+Curve** Rail moves the generation curve so its pivot is the rail's, Gen. sweeps so and then moves the
+whole sheet back by the same, the rail carried onto the generation curve (refused with a rail's
+continuity). **Curve Segments** sweep only a stretch of each rail and of the generation curves
+(fractions of their domains, `segment_of`).
 
 **Set Planar, Extrude, Revolve** (`sheets.lucb`). Set Planar: the curves' plane (Newell's normal of their
 samples; refused beyond a ten-thousandth off it), a plane face wide enough, trimmed by the curves cast
@@ -1702,7 +1734,14 @@ Natural (the last span's own polynomial carried past the end by de Casteljau bey
 an arc stays on its circle: the same surface), Soft (C2, the second derivative dying to straight:
 E + hsD1 + h²D2 g(s)/2, g'' = 2(1 − s)²) and Reflective (C2, the curvature's change mirrored:
 E + hsD1 + (hs)²D2/2 − (hs)³D3/6). Merge off keeps the extension a sheet of its own. A trimmed face is
-refused (Untrim or Trim Convert it first).
+refused (Untrim or Trim Convert it first). Several inputs (words apart by `;`) extend one after
+another; **Chain Select** adds, from each picked face edge, the natural sides of other untrimmed faces
+that meet it end to end (within a millionth of the set's size) and run on the way it arrived (within a
+degree), both ways along (`chain_from`).
+
+For the viewport, `CadSurfaceBuild.picked_lines` gives each named curve (curve, edge, isoparm) as a
+polyline, which luced-3d lights while a builder waits, and `curve_of` gives the curve itself (Blend
+Curve between temporary isoparms).
 
 **Stage 3 and 4 follow-ups that came with it.** Stitch's Detach periodic splits closed B-spline faces too
 (`detach.lucb`: a natural face whose seam edge it uses both ways, cut at the middle of the direction it
@@ -1724,11 +1763,21 @@ exact to 1e-12; Extend Natural keeps the old surface inside the new to 1e-9 and 
 meets G1 (not G2), Natural G3, Soft and Reflective G2; a quarter circle extended Natural stays on its
 circle; Detach periodic splits a closed Skin into two faces of the same area; Align's proxy is the
 input's own hull; a curve's Modify Both against a cylinder's edge meets the surface halfway; Project
-casts an isoparm.
+casts an isoparm. The follow-ups: a G1 (and G2) cap on a box's four walls measures G1 (G2) on all four
+walls, its fields fitted exactly (12 rows), its middle rising; Boundary Blend 0.3 and 0.7 and Influence
+2 and 0.4 keep G1 on every edge of the hole and move its middle; Colinear leaves along the neighbor's
+isoparm (square to the boundary without it); Rebuild of a bunched eight-span line puts its middle by
+length at the surface's middle along it, with fewer control points; Spine keeps every section square
+to the spine (Natural leans); On Curve with Fixed Rail moves a post onto the rail, Fixed Gen. moves the
+sheet to the post, Off Curve by the point; Curve Segments sweep the middle half of the rail and the
+lower half of the post; Skin of two curve sets is one sheet joined, or two with Multiple Surfaces;
+Proportional Crown 0.1 between lines 2 apart lifts the middle 0.2 all along; Extend with Chain Select
+carries a neighbor's edge on too, as two picks do; `picked_lines` gives one line a curve.
 
-Not yet: Square's Rebuild per edge, Boundary Blend and Influence, Colinear Options; Rail's Spine mode,
-Sweep Pivot and Curve Segments; Skin's Multiple surfaces (one per pair) and Proportional Crown;
-Alias's Multi-Surface Draft and N-sided (Stage 7's fill).
+Not yet: Skin's Flow Control and Modify Range, Rail's Colinear Options and Rebuild per curve, the
+builders' Explicit Control on Skin, Rail and Profile; Alias's Multi-Surface Draft and N-sided (Stage 7's
+fill). Align's Vector type stays at G1 and G2, as Alias's (its 2015 reference offers Vector at those
+orders only; G3 asks the Edge type).
 
 ## Sketches (`sketch/`)
 

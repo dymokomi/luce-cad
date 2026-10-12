@@ -14,14 +14,22 @@
 ## to the loop, so the seam is smooth. With the first or last section on
 ## a surface (an edge, a curve on a face), Start and End continuity match
 ## that side G1 to G3 by Align's rows (align.lucb).
+##
+## A section may be a set of curves end to end (Alias's curve sets: words
+## apart by `+`): Single Surface joins each set into one curve; Multiple
+## Surfaces skins the sets' first curves, their second ones and so on,
+## one sheet each. Proportional Crown (two sections) raises the middle
+## between them along the surface's normal by a fraction of the gap.
 
 ## Skin's options: the degree across, a closed loop, the start and end
-## continuity (0 G0 to 3 G3).
+## continuity (0 G0 to 3 G3), Proportional Crown's value (a fraction of
+## the gap between two sections, 0 none).
 pub struct SkinOptions:
     pub var degree: i64
     pub var closed: bool
     pub var start: i64
     pub var end: i64
+    pub var crown: f64 = 0.0
 
 ## The mean distance between the control points of `a` and `b` (alike).
 func mean_gap(a: const Spline*, b: const Spline*) -> f64:
@@ -44,20 +52,105 @@ func runs_against(c: const Spline*, before: const Spline*) -> bool:
 func wrap_of(q: usize, n: usize) -> usize:
     return q + 3 * n
 
-## Skin's net through the sections `words` (Align's master words apart by
-## `;`), in their order, by `opts`.
-func skin_net(set: interop.Reference[GeometrySet], words: str, opts: const SkinOptions*) -> Net!:
+## The curve sets `words` names (sections apart by `;`, a set's curves by
+## `+`): every curve's master onto `masters` and each set's size onto
+## `sizes`.
+func section_sets(set: interop.Reference[GeometrySet], words: str, masters: Growing[Master]*, sizes: Growing[usize]*) -> !:
+    let bytes = words.bytes
+    var start: usize = 0
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 59: continue
+        let section = (str)bytes[start..<at]
+        start = at + 1
+        if section.length == 0: continue
+        let before = masters.count
+        let inner = section.bytes
+        var from_at: usize = 0
+        for k in 0..<inner.length + 1:
+            if k < inner.length and inner[k] != 43: continue
+            if k > from_at: try masters.push(try master_of(set, (str)inner[from_at..<k], -1, Vector3()))
+            from_at = k + 1
+        if masters.count > before: try sizes.push(masters.count - before)
+
+## The curves of one set (`masters`) joined end to end into one, on 0..1.
+func joined_set(masters: const Master[]) -> Spline!:
+    var made = try masters[0].curve.copy()
+    errdefer made.close()
+    unit_domain(&made)
+    if masters.length == 1: return made
+    # The first runs toward the second.
+    let next = &masters[1].curve
+    let tail = made.point_at(1.0)
+    let head = made.point_at(0.0)
+    let reach = math.min(next.point_at(next.low()).subtract(tail).length(), next.point_at(next.high()).subtract(tail).length())
+    if math.min(next.point_at(next.low()).subtract(head).length(), next.point_at(next.high()).subtract(head).length()) < reach:
+        let turned_round = try reversed_spline(&made)
+        made.close()
+        made = turned_round
+    for k in 1..<masters.length:
+        var c = try masters[k].curve.copy()
+        defer c.close()
+        unit_domain(&c)
+        let end = made.point_at(made.high())
+        if c.point_at(c.high()).subtract(end).length() < c.point_at(c.low()).subtract(end).length():
+            let turned_round = try reversed_spline(&c)
+            c.close()
+            c = turned_round
+        let gap = c.point_at(c.low()).subtract(end).length()
+        if gap > size_of(&made) * 1e-4: error(invalid, "Skin: the curves of a set must meet end to end")
+        if made.degree < c.degree: try elevate(&made, (usize)(c.degree - made.degree))
+        if c.degree < made.degree: try elevate(&c, (usize)(made.degree - c.degree))
+        let longer = try joined(&made, &c)
+        made.close()
+        made = longer
+    return made
+
+## Skin's nets through the sections `words` (curve sets in Align's master
+## words: sections apart by `;`, a set's curves by `+`), in their order, by
+## `opts`: one net (Single Surface, each set joined) or one a curve of the
+## sets (`multiple`, the sets alike in size), onto `out`.
+func skin_nets(set: interop.Reference[GeometrySet], words: str, opts: const SkinOptions*, multiple: bool, out: Growing[Net]*) -> !:
     var masters = Growing[Master]()
     defer close_masters(&masters)
-    try builder_masters(set, words, &masters)
-    let n = masters.count
+    var sizes = Growing[usize]()
+    defer sizes.close()
+    try section_sets(set, words, &masters, &sizes)
+    let n = sizes.count
     if n < 2: error(invalid, "Skin needs two sections or more")
+    if opts.crown != 0.0 and (n != 2 or opts.closed): error(invalid, "Skin: Proportional Crown takes two open sections")
+    if multiple:
+        for k in 1..<n:
+            if sizes.items[k] != sizes.items[0]: error(invalid, "Skin: Multiple Surfaces needs every set to hold as many curves")
+        for j in 0..<sizes.items[0]:
+            var picked = Growing[Spline]()
+            defer close_splines_of(&picked)
+            var ends: Master*[2] = [&masters.items[j], &masters.items[(n - 1) * sizes.items[0] + j]]
+            for k in 0..<n:
+                var c = try masters.items[k * sizes.items[0] + j].curve.copy()
+                unit_domain(&c)
+                try picked.push(c)
+            try out.push(try skin_from(&picked, ends, opts))
+        return
+    var joined_sections = Growing[Spline]()
+    defer close_splines_of(&joined_sections)
+    var first: usize = 0
+    for k in 0..<n:
+        try joined_sections.push(try joined_set(masters.view()[first..<first + sizes.items[k]]))
+        first += sizes.items[k]
+    # Start and End continuity need the end sections single curves.
+    if (opts.start > 0 and sizes.items[0] != 1) or (opts.end > 0 and sizes.items[n - 1] != 1): error(invalid, "Skin: Start and End continuity take a single curve at that end (or Multiple Surfaces)")
+    var ends: Master*[2] = [&masters.items[0], &masters.items[masters.count - 1]]
+    try out.push(try skin_from(&joined_sections, ends, opts))
+
+## Skin's net through `picked` (curves on 0..1, in order), the first and
+## last sections' masters `ends` (Start and End continuity), by `opts`.
+func skin_from(picked: Growing[Spline]*, ends: Master*[2], opts: const SkinOptions*) -> Net!:
+    let n = picked.count
     if opts.degree < 1 or opts.degree > most_degree: error(invalid, "Skin's degree across is 1 to 11")
     var sections = Growing[Spline]()
     defer close_splines_of(&sections)
     for at in 0..<n:
-        var c = try masters.items[at].curve.copy()
-        unit_domain(&c)
+        var c = try picked.items[at].copy()
         if at > 0 and runs_against(&c, &sections.items[at - 1]):
             let turned_round = try reversed_spline(&c)
             c.close()
@@ -132,9 +225,39 @@ func skin_net(set: interop.Reference[GeometrySet], words: str, opts: const SkinO
         made.close()
         made = loop
     else:
+        if opts.crown != 0.0: try crowned(&made, opts.crown)
         for k in [(i64)0, (i64)1]:
             let order_asked = opts.start if k == 0 else opts.end
             if order_asked <= 0: continue
-            let at = 0 if k == 0 else n - 1
-            try match_side(&made, 2 + k, &masters.items[at], order_asked, tolerance)
+            try match_side(&made, 2 + k, ends[(usize)k], order_asked, tolerance)
     return made
+
+## Proportional Crown on a Skin of two sections (`net` of degree 1
+## across, v): raised to degree 2 across, its middle row pushed along the
+## surface's normal at each control point's Greville place by twice
+## `crown` times the gap there, so the middle between the sections rises
+## by `crown` times the gap; then quintic across, the same surface.
+func crowned(net: Net*, crown: f64) -> !:
+    if net.dv != 1 or net.nv != 2: error(invalid, "Skin: Proportional Crown takes two sections")
+    try net_elevate(net, 1, 1)
+    let p = (usize)net.du
+    # The pushes first (from the surface as it was), then applied.
+    var pushes = Growing[Vector3]()
+    defer pushes.close()
+    for i in 0..<net.nu:
+        var place = 0.0
+        for k in 1..<p + 1: place += net.ku.items[i + k]
+        place = place / (f64)math.max(1.0, (f64)p)
+        var parts: Weighted[16]
+        var shown: Weighted[16]
+        net.partials(place, 0.5, &parts)
+        euclidean_partials(&parts, &shown)
+        let su = Vector3(shown[4].x, shown[4].y, shown[4].z)
+        let sv = Vector3(shown[1].x, shown[1].y, shown[1].z)
+        let normal = su.cross(sv).normalized() catch failure: error(invalid, "Skin: Proportional Crown needs the surface to have a normal (sections apart)")
+        let gap = net.points.items[i * 3 + 2].point().subtract(net.points.items[i * 3].point()).length()
+        try pushes.push(normal.multiply_scalar(2.0 * crown * gap))
+    for i in 0..<net.nu:
+        let q = net.points.items[i * 3 + 1]
+        net.points.items[i * 3 + 1] = weighted(q.point().add(pushes.items[i]), q.w)
+    try net_elevate(net, 1, 3)

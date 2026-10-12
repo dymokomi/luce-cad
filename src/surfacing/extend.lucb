@@ -279,3 +279,138 @@ func unify_columns(longer: Growing[Spline]*, columns: Growing[Spline]*, pieces: 
         longer.items[at].close()
         longer.items[at] = again
     for at in 1..<longer.count: try longer.items[at].knots.assign(longer.items[0].knots.view())
+
+# -- Several edges at once (Alias's Extend with Chain Select).
+
+## A natural side of a face, for chaining: its face's name (its place in
+## a name buffer), samples along it, and at each end the point and the
+## direction leaving the side there.
+struct ChainSide:
+    var name_start: usize
+    var name_end: usize
+    var samples: Vector3[9]
+    var ends: Vector3[2]
+    var outs: Vector3[2]
+    var used: bool
+
+## Every natural side of every untrimmed face of `set`'s bodies onto
+## `out`, their faces' names into `names`.
+func chain_sides(set: interop.Reference[GeometrySet], names: Growing[u8]*, out: Growing[ChainSide]*) -> !:
+    let models = set_models(try set.get())
+    for at in 0..<models.length:
+        var w = try shape_of(models[at].value())
+        defer w.close()
+        for f in 0..<w.faces.count:
+            var net = surface_net(&w, (usize)w.faces.items[f].surface) catch failure: continue
+            defer net.close()
+            if not (natural(&w, f, &net) catch failure: recover false): continue
+            let name = w.face_name(f)
+            let start = names.count
+            for b in name.bytes: try names.push(b)
+            for side in 0..<(i64)4:
+                var made = ChainSide(start, names.count, [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()], [Vector3(), Vector3()], [Vector3(), Vector3()], false)
+                for k in 0..<(usize)9: made.samples[k] = side_point(&net, side, (f64)k / 8.0)
+                let h = 1e-6
+                made.ends[0] = made.samples[0]
+                made.ends[1] = made.samples[8]
+                made.outs[0] = made.ends[0].subtract(side_point(&net, side, h)).normalized() catch failure: continue
+                made.outs[1] = made.ends[1].subtract(side_point(&net, side, 1.0 - h)).normalized() catch failure: continue
+                try out.push(made)
+
+## The point of `net`'s side `side` (as turned's: 0 u low, 1 u high, 2 v
+## low, 3 v high) at fraction `f` along it.
+func side_point(net: const Net*, side: i64, f: f64) -> Vector3:
+    let u = net.u_low() if side == 0 else (net.u_high() if side == 1 else net.u_low() + (net.u_high() - net.u_low()) * f)
+    let v = net.v_low() if side == 2 else (net.v_high() if side == 3 else net.v_low() + (net.v_high() - net.v_low()) * f)
+    return net.point_at(u, v)
+
+## The sides chained to the side of face `name` nearest `near`: from each
+## end on, the side whose end meets it (within `gap`) and leaves the way
+## it arrived (within a degree), and so on, both ways; their indices onto
+## `chain` (the picked one first).
+func chain_from(sides: Growing[ChainSide]*, names: const u8[], name: str, near: Vector3, gap: f64, chain: Growing[usize]*) -> !:
+    var picked: i64 = -1
+    var best = 1.0e300
+    for k in 0..<sides.count:
+        let s = &sides.items[k]
+        if (str)names[s.name_start..<s.name_end] != name: continue
+        for p in s.samples:
+            let d = p.subtract(near).length()
+            if d < best:
+                best = d
+                picked = (i64)k
+    if picked < 0: error(invalid, "Extend: Chain Select needs a natural edge of an untrimmed face")
+    sides.items[(usize)picked].used = true
+    try chain.push((usize)picked)
+    let turn = math.cos(math.pi / 180.0)
+    for way in 0..<(usize)2:
+        var at = sides.items[(usize)picked].ends[way]
+        var going = sides.items[(usize)picked].outs[way]
+        while true:
+            var next: i64 = -1
+            var enter: usize = 0
+            for k in 0..<sides.count:
+                let s = &sides.items[k]
+                if s.used: continue
+                for j in 0..<(usize)2:
+                    if s.ends[j].subtract(at).length() <= gap and s.outs[j].multiply_scalar(-1.0).dot(going) >= turn:
+                        next = (i64)k
+                        enter = j
+            if next < 0: break
+            let s = &sides.items[(usize)next]
+            s.used = true
+            try chain.push((usize)next)
+            at = s.ends[1 - enter]
+            going = s.outs[1 - enter]
+
+## Extend of several inputs (`inputs`: extended_set's words apart by `;`),
+## each in turn; with `chain`, every face edge's tangent chain (see
+## chain_from) extended too.
+func extended_inputs(set: interop.Reference[GeometrySet], inputs: str, kind: i64, distance: f64, percent: bool, merge: bool, chain: bool) -> interop.Reference[GeometrySet]!:
+    var words = Growing[u8]()
+    defer words.close()
+    var starts = Growing[usize]()
+    defer starts.close()
+    # Each input's words, and with Chain Select its chain's sides.
+    var names = Growing[u8]()
+    defer names.close()
+    var sides = Growing[ChainSide]()
+    defer sides.close()
+    if chain: try chain_sides(set, &names, &sides)
+    let bytes = inputs.bytes
+    var from_at: usize = 0
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 59: continue
+        let one = (str)bytes[from_at..<at]
+        from_at = at + 1
+        if one.length == 0: continue
+        try starts.push(words.count)
+        for b in one.bytes: try words.push(b)
+        if not chain: continue
+        let what = try input_of(one)
+        if what.curve: continue
+        var found = Growing[usize]()
+        defer found.close()
+        var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+        var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+        for s in sides.view():
+            for p in s.samples:
+                low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+                high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+        try chain_from(&sides, names.view(), what.name, what.near, high.subtract(low).length() * 1e-6, &found)
+        for k in 1..<found.count:
+            let s = &sides.items[found.items[k]]
+            let middle = s.samples[4]
+            var buffer: u8[400]
+            let word = try strings.format(buffer, f"face {(str)names.view()[s.name_start..<s.name_end]} {middle.x} {middle.y} {middle.z}")
+            try starts.push(words.count)
+            for b in word.bytes: try words.push(b)
+    if starts.count == 0: error(invalid, "Extend: pick an edge or a curve's end")
+    try starts.push(words.count)
+    var current = set.clone()
+    defer current.release()
+    for k in 0..<starts.count - 1:
+        let next = try extended_set(current, (str)words.view()[starts.items[k]..<starts.items[k + 1]], kind, distance, percent, merge)
+        current.release()
+        current = next
+    return current.clone()

@@ -75,6 +75,83 @@ func plain_curve(c: const Spline*, tolerance: f64) -> Spline!:
         spans *= 2
     error(invalid, "unreachable")
 
+## Alias's Rebuild of a builder's curve ("to reduce data and improve
+## parameterization"): `c` (a polynomial curve on 0..1) taken by its arc
+## length and refitted at its degree (5 at least) on uniform spans, the
+## fewest (doubling from one) within `tolerance`, its ends and their
+## tangents kept. Its points lie on `c`'s to the tolerance; its speed is
+## near constant.
+func rebuilt_curve(c: const Spline*, tolerance: f64) -> Spline!:
+    # Arc length by chords at fine steps: the fraction of length at each
+    # step (an approximation of the parameter only, the points stay on c).
+    let steps: usize = 4096
+    var lengths = Growing[f64]()
+    defer lengths.close()
+    try lengths.push(0.0)
+    var last = c.point_at(c.low())
+    for k in 1..<steps + 1:
+        let p = c.point_at(c.low() + (c.high() - c.low()) * (f64)k / (f64)steps)
+        try lengths.push(lengths.items[k - 1] + p.subtract(last).length())
+        last = p
+    let total = lengths.items[steps]
+    if not (total > 0.0): error(invalid, "Rebuild: the curve has no length")
+    let degree = (i64)math.max(5.0, (f64)c.degree)
+    var spans: usize = 1
+    while true:
+        var knots = Growing[f64]()
+        defer knots.close()
+        try uniform_knots(degree, spans, 0.0, 1.0, &knots)
+        var params = Growing[f64]()
+        defer params.close()
+        try fit_parameters(knots.view(), degree, 2 * ((usize)degree + 1), &params)
+        var fitter = try make_fitter(degree, knots.view(), params.view(), 1)
+        defer fitter.close()
+        var values = Growing[Weighted]()
+        defer values.close()
+        for s in params.view(): try values.push(weighted(c.point_at(length_parameter(c, lengths.view(), s)), 1.0))
+        let j0 = try field_jet(c, c.low(), 1, false)
+        let j1 = try field_jet(c, c.high(), 1, true)
+        let d0 = j0.d[1].multiply_scalar(total / math.max(1e-300, j0.d[1].length()))
+        let d1 = j1.d[1].multiply_scalar(total / math.max(1e-300, j1.d[1].length()))
+        var starts: Weighted[4] = [Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+        var ends: Weighted[4] = [Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+        starts[0] = weighted(j0.d[0], 1.0)
+        starts[1] = Weighted(d0.x, d0.y, d0.z, 0.0)
+        ends[0] = weighted(j1.d[0], 1.0)
+        ends[1] = Weighted(d1.x, d1.y, d1.z, 0.0)
+        var made = empty_spline(degree)
+        errdefer made.close()
+        try made.knots.assign(knots.view())
+        try fitter.fit(values.view(), &starts, &ends, &made.points)
+        # How far it lies from c: each sample's distance to c near where it
+        # was taken from.
+        var off = 0.0
+        let samples = 16 * spans
+        for k in 0..<samples + 1:
+            let s = (f64)k / (f64)samples
+            let p = made.point_at(s)
+            let near = spline_nearest(c, p)
+            off = math.max(off, c.point_at(near).subtract(p).length())
+        if off <= tolerance or spans >= 256: return made
+        made.close()
+        spans *= 2
+    error(invalid, "unreachable")
+
+## The parameter of `c` at fraction `s` of its length, by its chord
+## `lengths` (cumulative, at equal steps of the parameter).
+func length_parameter(c: const Spline*, lengths: const f64[], s: f64) -> f64:
+    let steps = lengths.length - 1
+    let goal = s * lengths[steps]
+    var low: usize = 0
+    var high = steps
+    while high - low > 1:
+        let mid = (low + high) // 2
+        if lengths[mid] < goal: low = mid
+        else: high = mid
+    let span = lengths[high] - lengths[low]
+    let f = (goal - lengths[low]) / span if span > 0.0 else 0.0
+    return c.low() + (c.high() - c.low()) * ((f64)low + math.clamp(f, 0.0, 1.0)) / (f64)steps
+
 ## The size of `curves` together: their hulls' box diagonal.
 func curves_size(curves: const Spline[]) -> f64:
     var low = Vector3(1.0e300, 1.0e300, 1.0e300)
@@ -265,11 +342,16 @@ func net_body_within(net: const Net*, name: str, sense: bool, tolerance: f64) ->
 
 ## `set` with `model` added as a body after its others.
 func with_body_added(set: interop.Reference[GeometrySet], model: interop.Reference[CadModel]) -> interop.Reference[GeometrySet]!:
+    let one: interop.Reference[CadModel][1] = [model]
+    return try with_bodies_added(set, one[..<1])
+
+## `set` with `models` added as bodies after its others.
+func with_bodies_added(set: interop.Reference[GeometrySet], models: const interop.Reference[CadModel][]) -> interop.Reference[GeometrySet]!:
     let source = try set.get()
     var list = Growing[interop.Reference[CadModel]]()
     defer list.close()
     for m in set_models(source): try list.push(m)
-    try list.push(model)
+    for m in models: try list.push(m)
     return try with_models(source, list.view())
 
 ## The homogeneous derivatives of `c` at `t` to `order` (from below with
