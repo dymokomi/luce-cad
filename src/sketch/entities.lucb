@@ -109,9 +109,18 @@ pub enum ConstraintKind as u8:
     ## Arc `first` sweeping `value` radians counterclockwise from its start
     ## to its end (an angle dimension on the arc, as a typed Sweep makes).
     sweep = 23
+    ## Fusion's Polygon: a regular polygon about circle `first` (its one
+    ## construction circle), its sides the lines `second` to `third` (made
+    ## together, so numbered in a row; each starts where the one before
+    ## ends, the last ends where the first starts). Inscribed (`side` +1):
+    ## its corners on the circle. Circumscribed (`side` -1): its sides
+    ## touching the circle at their middles, its corners the circle's
+    ## radius over cos(π / n) from the center. The sides stay equal, so the
+    ## circle's radius alone sizes it.
+    polygon = 24
 
 ## How many kinds of constraint there are.
-pub let constraint_kind_count: usize = 24
+pub let constraint_kind_count: usize = 25
 
 ## Whether constraint kind `kind` is a length (a distance, a radius, a
 ## diameter): what scaling the sketch scales.
@@ -273,6 +282,24 @@ pub struct Sketch:
         let start = (i64)self.lists.count
         for p in points: try self.lists.push(p)
         return try self.add(SketchEntity(EntityKind.spline, start, (i64)points.length, degree, 1 if fit else 0, construction))
+
+    ## A regular polygon on `corners` (points, in order round it) about
+    ## point `center`, as Fusion makes one: its sides in a row, its one
+    ## construction circle (through the corners when `inscribed`, else
+    ## touching the sides at their middles) and the Polygon constraint
+    ## holding it regular; the circle.
+    pub func add_polygon(center: i64, corners: const i64[], inscribed: bool) -> i64!:
+        if corners.length < 3: error(invalid, "a polygon has three sides or more")
+        try self.require(center, EntityKind.point)
+        for p in corners: try self.require(p, EntityKind.point)
+        let n = corners.length
+        let first = (i64)self.entities.count
+        for at in 0..<n: _ = try self.add_line(corners[at], corners[(at + 1) % n])
+        let reach = self.distance(center, corners[0])
+        let radius = reach if inscribed else reach * math.cos(math.pi / (f64)n)
+        let circle = try self.add_circle(center, radius, true)
+        _ = try self.constrain(ConstraintKind.polygon, circle, first, first + (i64)n - 1, side = 1.0 if inscribed else -1.0)
+        return circle
 
     ## An ellipse about point `center`, its major axis out to point `major`,
     ## its minor radius `minor` (at most the major's).
@@ -438,6 +465,7 @@ pub struct Sketch:
     pub func constrain(kind: ConstraintKind, first: i64, second: i64 = -1, third: i64 = -1, value: f64 = 0.0, side: f64 = 1.0, driven: bool = false) -> i64!:
         for named in [first, second, third]:
             if named >= (i64)self.entities.count or named < -1: error(invalid, "a constraint names an entity the sketch does not have")
+        if kind == ConstraintKind.polygon and not self.polygon_chain(second, third): error(invalid, "a polygon's sides are lines made in a row, each starting where the one before ends, closing where they began")
         if not self.fits(kind, first, second, third): error(invalid, "a constraint is between entities of kinds it does not join")
         try self.constraints.push(SketchConstraint(kind, first, second, third, value, side, driven))
         return (i64)self.constraints.count - 1
@@ -502,8 +530,21 @@ pub struct Sketch:
         if kind == ConstraintKind.symmetric: return a == point and b == point and c == line
         if kind == ConstraintKind.sweep: return a == (i64)(u8)EntityKind.arc and second < 0
         if kind == ConstraintKind.offset: return first >= 0 and second >= 0 and third < 0 and offset_fits(self.entities.items[(usize)first].kind, self.entities.items[(usize)second].kind)
+        if kind == ConstraintKind.polygon: return a == (i64)(u8)EntityKind.circle and b == line and c == line
         # Radius and diameter, the last kinds.
         return ra and second < 0
+
+    ## Whether lines `first` to `last` close a polygon: three or more, each
+    ## starting where the one before ends, the last ending where the first
+    ## starts.
+    pub func polygon_chain(first: i64, last: i64) -> bool:
+        if first < 0 or last < first + 2 or last >= (i64)self.entities.count: return false
+        for at in first..<last + 1:
+            let e = self.entities.items[(usize)at]
+            if e.kind != EntityKind.line: return false
+            let next = self.entities.items[(usize)(at + 1 if at < last else first)]
+            if next.kind != EntityKind.line or next.first != e.second: return false
+        return true
 
     ## Entity `at`'s kind as a number (EntityKind's), -1 for none.
     func kind_at(at: i64) -> i64:

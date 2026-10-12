@@ -1,0 +1,70 @@
+## Fusion's Polygon constraint (CadSketch.add_polygon, ConstraintKind
+## polygon): a hexagon drawn roughly, circumscribed about its one
+## construction circle, then inscribed in it. Solved regular: corners the
+## circle's radius (or that over cos 30°) from the center, every side's
+## middle on the circle when circumscribed; with the center fixed and the
+## radius dimensioned, one freedom left (its turn); a corner dragged keeps
+## it regular; kept as text and read back; removing a side takes the
+## constraint with it.
+from luce_cad.sketch import CadSketch
+from luce_std import math
+
+## ConstraintKind's order (sketch/entities.lucb).
+let fix = 8
+let radius = 18
+let polygon = 24
+
+func near(a: float, b: float) -> bool:
+    return math.abs(a - b) <= 1e-6 * math.max(1.0, math.abs(b))
+
+pub func polygon_tests() -> unit!:
+    for inscribed in [false, true]:
+        let s = CadSketch.parse("")
+        let center = s.add_point(0.3, -0.2)
+        # Six corners roughly round a circle of 10.
+        let corners: list[int] = []
+        for at in 0..<6:
+            let angle = float(at) * math.pi / 3.0 + 0.05 * float(at % 2)
+            corners.append(s.add_point(10.0 * math.cos(angle) + 0.4 * float(at % 3), 10.0 * math.sin(angle)))
+        let circle = s.add_polygon(center, corners, inscribed)
+        # One circle, its constraint the last one.
+        var circles = 0
+        for at in 0..<s.entity_count():
+            if s.kind(at) == 2:
+                circles += 1
+        assert(circles == 1 and s.construction(circle))
+        let made = s.constraint_count() - 1
+        assert(s.constraint_kind(made) == polygon and s.constraint_entity(made, 0) == circle)
+        _ = s.constrain(fix, center)
+        _ = s.constrain(radius, circle, value = 8.0)
+        assert(s.solve())
+        regular(s, center, corners, 8.0, inscribed)
+        s.analyze()
+        assert(s.degrees() == 1 and s.conflicting_count() == 0)
+        # A corner dragged: the polygon turns and stays regular.
+        assert(s.drag(corners[2], 0.0, 12.0))
+        regular(s, center, corners, 8.0, inscribed)
+        # Kept as text and read back.
+        let back = CadSketch.parse(s.text())
+        assert(back.text() == s.text())
+        # A side removed takes the constraint.
+        let before = s.constraint_count()
+        s.remove(circle - 6 + 2)
+        assert(s.constraint_count() == before - 1)
+    print("PASS polygons: a rough hexagon circumscribed about and inscribed in its one construction circle, solved regular to a radius, one freedom left, dragged regular, kept as text, a side removed taking the constraint")
+
+## The polygon on `corners` about `center` is regular for a circle of `r`:
+## corners r (inscribed) or r / cos(π/n) from the center, sides equal,
+## a circumscribed one's side middles r from it.
+func regular(s: CadSketch, center: int, corners: list[int], r: float, inscribed: bool) -> unit!:
+    let n = corners.length
+    let reach = r if inscribed else r / math.cos(math.pi / float(n))
+    for at in 0..<n:
+        let p = corners[at]
+        let q = corners[(at + 1) % n]
+        assert(near(math.hypot(s.x(p) - s.x(center), s.y(p) - s.y(center)), reach))
+        assert(near(math.hypot(s.x(q) - s.x(p), s.y(q) - s.y(p)), 2.0 * reach * math.sin(math.pi / float(n))))
+        if not inscribed:
+            let mx = (s.x(p) + s.x(q)) * 0.5 - s.x(center)
+            let my = (s.y(p) + s.y(q)) * 0.5 - s.y(center)
+            assert(near(math.hypot(mx, my), r))

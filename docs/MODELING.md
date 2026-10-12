@@ -752,6 +752,15 @@ the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
   conics) are fit point splines outside the relation. Removing the constraint removes the
   relation. Without `relation`, each line copy gets its own parallel and distance (what the
   editor uses until Stage 3 moves it over).
+- **Polygon** (`ConstraintKind.polygon`, `add_polygon(center, corners, inscribed)`), Fusion's: a
+  regular polygon held by one constraint about its one construction circle. Its sides are lines
+  made in a row (the constraint names the circle and the first and last side; a chain each starting
+  where the one before ends). Inscribed, its corners lie on the circle; circumscribed, its sides
+  touch the circle at their middles, so its corners lie on the circle's radius over cos(π/n): the
+  row is the corner's distance from the center against the radius plus (sec(π/n) − 1) times it.
+  With every side as long as the first, that is 2n − 1 rows for the 2n − 1 freedoms a regular
+  polygon's corners lose; the circle's radius alone sizes it (a radius dimension is Fusion's), and
+  centered and sized it keeps one freedom, its turn. Removing any side removes the constraint.
 - **The origin** (`entities.lucb` `origin_entity`), Fusion's origin point and axes in every
   sketch: `origin(which)` gives the point (0) or the x (1) or y (2) axis as an entity, made when
   first asked for: the point fixed at (0, 0); an axis a construction line from it to a fixed point
@@ -791,7 +800,7 @@ the curves Extrude and Revolve read. Lengths are millimeters, angles radians.
   row further out on each; a radius's round its circle; an angle's arc wider), which the editor
   tries when another label is in the way. A placed label stays.
 
-Not yet: ellipses, splines, slots and text; curvature (G2) and polygon constraints; Blend Curve.
+Not yet: ellipses, splines, slots and text; curvature (G2) constraints; Blend Curve.
 
 ## Limits, and what comes next
 
