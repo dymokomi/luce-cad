@@ -416,16 +416,17 @@ G2 and G3.
   along with a knot thrice at each point. Its tool is the region between the edge and that face,
   taken away (added for an inside edge); its net keeps to one side of each face's plane. Ends:
   - square to the edge: flush;
-  - slanted with nothing beyond: past by a margin (a straight law going on straight, a smooth one
-    held), so the end face trims the strip;
-  - where the body goes on (a wall a convex edge runs into, an inside edge's slanted end): each row
-    of the net stops where it meets the end face's plane, its first or last piece the same
-    polynomial from there, so the rows keep their knots, the end section lies in the plane, and no
-    boolean cuts the strip (an exact cylinder when the radius holds).
+  - any other flat end face, leaning either way (a slanted end, a wall a convex edge runs into, an
+    inside edge's end): each row of the net stops where it meets the end face's plane, its first
+    or last piece the same polynomial from there, so the rows keep their knots, the end section lies
+    in the plane, and no boolean crosses the strip there (an exact cylinder when the radius holds).
+    Reaching past and letting the end face trim the strip was tried first: a G2 strip's marched
+    crossing with a slanted face, tangent to the cap's edge at the contact, could not be split.
 
 `fillet_option_tests` checks the volume taken along a box's edge against (1 − π/4) × ∫ r² ds;
-`variable_chain_tests` checks G2 and G3 against their sections' areas, a slanted open end against
-the constant fillet, an edge running into a leaning wall against the flush tool less the wedge
+`variable_chain_tests` checks G2 and G3 against their sections' areas, a slanted end exactly in its
+face's plane (by the classifier; the sheared strip's mesh volume is within 0.3% of the constant
+fillet's), an edge running into a leaning wall against the flush tool less the wedge
 behind the wall's plane, an inside edge with slanted ends, a rounded box's top loop (G1, G2) and a
 line of it running out, a drilled ball's rim, and two chains refused. Corners where a variable
 fillet meets other fillets in one feature (three edges at a vertex) are not built: Fusion's

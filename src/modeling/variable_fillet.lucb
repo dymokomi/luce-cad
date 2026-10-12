@@ -21,14 +21,13 @@
 ## face, taken away (an inside edge: added) by the booleans. Its net keeps
 ## to one side of each face's plane, touching it only along the contact
 ## row, so it meets the body only along curves both carry (kept_apart). At
-## an end square to the edge it ends flush; at a slanted end with nothing
-## beyond it reaches past (a straight law going on straight, a smooth one
-## held), so the end face trims the strip. Where the body goes on past the
-## end (a wall a convex edge runs into, an inside edge's slanted end) each
-## row of the net instead stops where it meets the end face's plane: its
-## first or last piece is the same polynomial from there, so the rows keep
-## their knots, the end's section lies in that plane, and no boolean has to
-## cut the strip (an exact cylinder when the radius holds).
+## an end square to the edge it ends flush. At another flat end face,
+## leaning either way (a slanted end, a wall a convex edge runs into, an
+## inside edge's end), each row of the net stops where it meets the end
+## face's plane: its first or last piece is the same polynomial from there,
+## so the rows keep their knots, the end's section lies in that plane, and
+## no boolean has to cross the strip there (an exact cylinder when the
+## radius holds).
 
 ## `model` with the edges `reference` names (with their tangent chains when
 ## `chain`) filleted with `radii` at `positions` along the chain (0 its
@@ -74,29 +73,18 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
     let reach = 1.0 / math.tan(theta * 0.5)
     let weight = math.sin(theta * 0.5)
     let convex_edge = try convex(w, e)
-    # How each end goes: flush at a face square to the edge; past it by a
-    # margin where the corner beyond is empty (the end face then trims the
-    # strip); else (a wall a convex edge runs into, an inside edge's end)
-    # ending in the end face's plane, each row of the net where it meets it.
-    let largest = law.largest()
-    let margin = largest * 4.0 + length * 0.1
-    var body = try shape_rays(w)
-    defer body.close()
-    var past: f64[2] = [0.0, 0.0]
+    # How each end goes: flush at a face square to the edge; at another
+    # flat face, leaning either way, each row of the net stops in its plane
+    # (no boolean then crosses the strip there: a G2 strip's crossing with
+    # a slanted face, marched, could not be split cleanly).
     var ends = EndPlanes(along.multiply_scalar(-1.0), 0.0, false, along, 0.0, false)
     for k in 0..<(usize)2:
         let v = edge.start if k == 0 else edge.end
         let point = start if k == 0 else end
-        let outward = along.multiply_scalar(-1.0 if k == 0 else 1.0)
         if ends_square(w, v, fa, fb, along): continue
-        let r = law.radii.items[0 if k == 0 else law.radii.count - 1]
-        let probe = point.add(outward.multiply_scalar(r * 0.5)).add((try ua.add(ub).normalized()).multiply_scalar(r * 0.25))
-        if convex_edge and not try body.inside(w, probe, math.max(length, largest) * 4.0):
-            past[k] = margin
-            continue
         let (n, h) = end_plane(w, point, fa, fb) catch failure:
             _ = failure
-            error(invalid, "a variable radius fillet's edge must end in the open or at a flat face")
+            error(invalid, "a variable radius fillet's edge must end at a flat face")
         if k == 0:
             ends.n0 = n
             ends.h0 = h
@@ -105,46 +93,27 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
             ends.n1 = n
             ends.h1 = h
             ends.slanted1 = true
-    # The law over the edge with its reaches past the ends: a smooth law
-    # held there (its slope is none at its ends), a straight one going on
-    # straight (no crease where the end face crosses the strip) while it
-    # keeps half its end radius, else held.
-    let total = length + past[0] + past[1]
-    var at = Growing[f64]()
-    defer at.close()
-    var sizes = Growing[f64]()
-    defer sizes.close()
-    let n = law.positions.count
-    if past[0] > 0.0:
-        try at.push(0.0)
-        try sizes.push(try law_beyond(law, 0, past[0] / length))
-    for k in 0..<n:
-        try at.push((past[0] + law.positions.items[k] * length) / total)
-        try sizes.push(law.radii.items[k])
-    if past[1] > 0.0:
-        try at.push(1.0)
-        try sizes.push(try law_beyond(law, n - 1, past[1] / length))
-    # Points that change nothing (on a straight run of the law, or between
-    # equal radii) go: no knot where an end face crosses the strip.
+    # The law's points that change nothing (on a straight run, or between
+    # equal radii) go: fewer knots.
     var kept_at = Growing[f64]()
     defer kept_at.close()
     var kept_sizes = Growing[f64]()
     defer kept_sizes.close()
-    for k in 0..<at.count:
-        if k > 0 and k + 1 < at.count:
+    let at = law.positions.view()
+    let sizes = law.radii.view()
+    for k in 0..<at.length:
+        if k > 0 and k + 1 < at.length:
             let previous = kept_sizes.items[kept_sizes.count - 1]
-            let before = (sizes.items[k] - previous) / (at.items[k] - kept_at.items[kept_at.count - 1])
-            let after = (sizes.items[k + 1] - sizes.items[k]) / (at.items[k + 1] - at.items[k])
-            let flat = previous == sizes.items[k] and sizes.items[k] == sizes.items[k + 1]
+            let before = (sizes[k] - previous) / (at[k] - kept_at.items[kept_at.count - 1])
+            let after = (sizes[k + 1] - sizes[k]) / (at[k + 1] - at[k])
+            let flat = previous == sizes[k] and sizes[k] == sizes[k + 1]
             if flat or (not law.smooth and math.abs(before - after) <= 1e-12 * math.max(1.0, math.abs(before))): continue
-        try kept_at.push(at.items[k])
-        try kept_sizes.push(sizes.items[k])
+        try kept_at.push(at[k])
+        try kept_sizes.push(sizes[k])
     var name = Growing[u8]()
     defer name.close()
     try blend_name(w, e, tag, &name)
-    let low = start.subtract(along.multiply_scalar(past[0]))
-    let high = end.add(along.multiply_scalar(past[1]))
-    let tool = try variable_tool(low, high, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), law.smooth, (str)name.view(), convex_edge, continuity, &ends)
+    let tool = try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), law.smooth, (str)name.view(), convex_edge, continuity, &ends)
     defer tool.release()
     return try combine(model, tool.value(), op_subtract if convex_edge else op_union)
 
@@ -181,18 +150,6 @@ func row_meets(low: Vector3, span: Vector3, q: Vector3, positions: const f64[], 
         if math.abs(next - x) <= 1e-14: return next
         x = next
     return x
-
-## The radius a fraction `reach` of the edge's length past law point `k`
-## (the first or the last): its own for a smooth law, else its straight
-## span going_on on, while that keeps half of it.
-func law_beyond(law: const RadiusLaw*, k: usize, reach: f64) -> f64!:
-    let r = law.radii.items[k]
-    if law.smooth: return r
-    let other = 1 if k == 0 else k - 1
-    let span = math.abs(law.positions.items[k] - law.positions.items[other])
-    let slope = (r - law.radii.items[other]) / span
-    let going_on = r + slope * reach
-    return going_on if going_on >= r * 0.5 else r
 
 ## Whether the edge between faces `fa` and `fb` ends at vertex `v` at a
 ## flat face square to its way `along`.
