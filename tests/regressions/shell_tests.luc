@@ -1,0 +1,74 @@
+## Shell, checked against closed forms: a box opened at its top with the
+## wall inside, outside and both ways; a closed void; a cylinder cup; a box
+## with rounded uprights (its inner fillets the radius less the wall); too
+## thick a wall refused.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from checks import manifold, volume
+from luce_std import math
+
+func solid(model: CadModel, expected: float, tolerance: float, what: str) -> unit!:
+    let mesh = model.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > tolerance:
+        print(f"{what}: volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= tolerance)
+
+## The name of `model`'s flat face facing +Y.
+func top_name(model: CadModel) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let frame = CadModeling.face_frame(model, name)
+        if frame.found and frame.u.cross(frame.v).y > 0.99:
+            return name
+    assert(false, "no top")
+    return ""
+
+## References to `box`'s four upright edges.
+func uprights(box: CadModel) -> str!:
+    let found: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let id = box.face_edge_id(face, use)
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            if box.face_edge_linear(face, use) and math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9 and not (id in found):
+                found.append(id)
+    return CadModeling.edge_references(box, found)
+
+pub func shell_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = top_name(box)
+    # Inside: the 1.8 x 1.9 x 1.8 hollow open at the top.
+    let inside = CadModeling.shelled(box, top, 0.1, "s")
+    solid(inside, 8.0 - 1.8 * 1.9 * 1.8, 1e-5, "inside")
+    assert(inside.face_count() == 11)
+    var inner_named = false
+    for f in 0..<inside.face_count():
+        if CadModeling.face_name_of(inside, f).starts_with("s/box/"):
+            inner_named = true
+    assert(inner_named)
+    # Outside: a 2.2 x 2.1 x 2.2 body less the box; both ways: 2.1 x 2.05
+    # x 2.1 less 1.9 x 1.95 x 1.9.
+    solid(CadModeling.shelled(box, top, 0.1, "s", 1), 2.2 * 2.1 * 2.2 - 8.0, 1e-5, "outside")
+    solid(CadModeling.shelled(box, top, 0.1, "s", 2), 2.1 * 2.05 * 2.1 - 1.9 * 1.95 * 1.9, 1e-5, "both")
+    # Nothing removed: a closed void, two shells.
+    solid(CadModeling.shelled(box, "", 0.1, "s"), 8.0 - 1.8 * 1.8 * 1.8, 1e-5, "closed")
+    # A cylinder of radius 1, 2 high, opened at its top: a cup.
+    let can = CadModeling.tagged(CadSolids.cylinder(1.0, 2.0), "can")
+    solid(CadModeling.shelled(can, top_name(can), 0.1, "s"), math.pi * 2.0 - math.pi * 0.81 * 1.9, 0.01, "cup")
+    # Rounded uprights of 0.3: the hollow's are 0.2.
+    let rounded = CadModeling.filleted(box, uprights(box), 0.3, "f")
+    let corner_out = 0.09 - math.pi * 0.09 * 0.25
+    let corner_in = 0.04 - math.pi * 0.04 * 0.25
+    let outer = 8.0 - 8.0 * corner_out
+    let hollow = (1.8 * 1.8 - 4.0 * corner_in) * 1.9
+    solid(CadModeling.shelled(rounded, top_name(rounded), 0.1, "s"), outer - hollow, 0.01, "rounded box")
+    # A wall thicker than the fillets' radius: refused.
+    var refused = false
+    _ = CadModeling.shelled(rounded, top_name(rounded), 0.5, "s") catch failure:
+        refused = failure.message.contains("too large")
+    assert(refused)
+    print("PASS shell: a box opened at its top, the wall inside, outside and both ways; a closed void; a cylinder cup; a box with rounded uprights; too thick a wall refused")

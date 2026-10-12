@@ -25,6 +25,7 @@ does today.
 | `profile_fills(set, keys)` | The regions of the profiles `keys` names (empty: every profile), triangulated flat on the plane by the trim mesher (`polygons/`), to shade them. A region whose loops touch is left out. |
 | `profile_anchor(set, keys)` | Where a feature's arrow stands on those profiles (empty: the closed shapes Extrude takes): a point inside them (the middle of their area when it lies on them, else of their largest triangle), the plane's normal, their area. |
 | `inside(model, point)` | Whether a point lies inside a closed solid, by rays through its exact faces (`rays.lucb`): what an automatic Join or Cut asks. |
+| `shelled(model, faces, thickness, tag, side)` | Shell: hollowed to a wall `thickness` thick, the faces named opened (none: a closed void), the wall inside (`0`), outside (`1`) or half each way (`2`). |
 | `combined(a, b, operation)` | `0` union, `1` `a` without `b`, `2` intersection. |
 | `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
 | `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |
@@ -540,6 +541,20 @@ The edges running into the gap keep their carriers, lengthened to the new corner
 refused, saying what Delete heals. A box's top, say, has four parallel-sided neighbors that cannot
 close over it.
 
+### Shell (`shell.lucb`)
+
+Two offset bodies are made with the local face operations above. The outer one has every face moved
+out by the outside thickness; the removed faces stay where they are. The inner one has every face
+moved in by the inside thickness, while the removed faces move out past the outer body, so the inner
+body pokes through where the hollow opens. The shell is the outer body less the inner one. Without
+removed faces the inner body lies wholly inside: a closed void, a second shell.
+
+Faces offset as Offset Face's do, so a box's rounded uprights of 0.3 give a hollow rounded by 0.2
+for a wall of 0.1. A wall thicker than a rounded face's radius, or one that would change the body's
+topology, is refused: "the shell's thickness is too large for this body". The inner wall's faces are
+named `<tag>/` and the face's own name. B-spline faces are not offset yet (they would need a fitted
+degree 5 approximation).
+
 ### Every edge rounded whole (`rounded.lucb`)
 
 When no edges are picked, filleting every edge of a convex polyhedron is built whole, as a
@@ -633,5 +648,5 @@ Roughly in order of usefulness:
    surfaces. Rays through them are exact (`spline_rays.lucb`).
 4. **Sweep and loft;** Extrude's Thin option and a start offset by a face.
 5. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
-6. **Shell** and draft; Delete healing more than one strip or corner at a time (a chain of
+6. **Shell of B-spline faces** and draft; Delete healing more than one strip or corner at a time (a chain of
    fillets), and faces with more than four neighbors.

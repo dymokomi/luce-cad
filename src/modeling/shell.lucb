@@ -1,0 +1,70 @@
+## Shell (Fusion's Shell): a solid hollowed to a wall of one thickness,
+## with the chosen faces removed so the hollow opens there (none: a closed
+## void inside). The wall lies inside the body, outside it, or both ways,
+## half each.
+##
+## Two offset bodies are made with the local face operations
+## (face_moves.lucb): an outer one, every face moved out by the outside
+## thickness (the removed faces stay), and an inner one, every face moved
+## in by the inside thickness while the removed faces move out past the
+## outer body, so the inner one pokes through where the hollow opens. The
+## shell is the outer body less the inner one (the booleans). Faces keep
+## their names; the inner wall's are the feature's tag, `/`, and the face's
+## own name.
+##
+## Faces offset as Offset Face's do: a plane moved, a cylinder's, cone's,
+## sphere's or torus's radius changed. A thickness larger than a curved
+## face's radius, or one that changes the body's topology (a wall thinner
+## than the thickness), is refused; so are B-spline faces.
+
+## Shell sides (shelled's `side`).
+pub let shell_inside: i64 = 0
+pub let shell_outside: i64 = 1
+pub let shell_both: i64 = 2
+
+## `model` shelled to `thickness` (see above), faces `removed` (marked)
+## opened, the wall on `side`.
+func shell_of(model: interop.Reference[CadModel], removed: const bool[], thickness: f64, side: i64, tag: str) -> interop.Reference[CadModel]!:
+    if not (thickness > 0.0) or not math.is_finite(thickness): error(invalid, "a shell needs a positive thickness")
+    if side < shell_inside or side > shell_both: error(invalid, "a shell's wall is inside (0), outside (1) or both (2)")
+    let wall_in = thickness if side == shell_inside else (0.0 if side == shell_outside else thickness * 0.5)
+    let wall_out = thickness - wall_in
+    let faces = removed.length
+    var all = Growing[usize]()
+    defer all.close()
+    for f in 0..<faces: try all.push(f)
+    var distances = Growing[f64]()
+    defer distances.close()
+    var targets = Growing[Surface]()
+    defer targets.close()
+    var senses = Growing[bool]()
+    defer senses.close()
+    let m = FaceMove(move_offset, Vector3(), Vector3(), Vector3(), 0.0, 0.0)
+    # The outer body: every face out by the outside thickness, the removed
+    # ones where they are.
+    var outer = model.clone()
+    defer outer.release()
+    if wall_out > 0.0:
+        var bigger = try shape_of(model.value())
+        defer bigger.close()
+        distances.clear()
+        for f in 0..<faces: try distances.push(0.0 if removed[f] else wall_out)
+        let grown = try substitute(&bigger, all.view(), &m, targets.view(), senses.view(), distances.view())
+        outer.release()
+        outer = grown
+    # The inner body: every face in by the inside thickness, the removed
+    # ones out past the outer body.
+    var w = try shape_of(model.value())
+    defer w.close()
+    distances.clear()
+    for f in 0..<faces: try distances.push(thickness if removed[f] else -wall_in)
+    let inner = try substitute(&w, all.view(), &m, targets.view(), senses.view(), distances.view()) catch failure:
+        error(invalid, "the shell's thickness is too large for this body: a wall or a rounded face is thinner than it")
+    defer inner.release()
+    var name = Growing[u8]()
+    defer name.close()
+    for byte in tag.bytes: try name.push(byte)
+    try name.push(47)
+    let named = try CadModeling.prefixed(inner, (str)name.view())
+    defer named.release()
+    return try combine(outer.value(), named.value(), op_subtract)
