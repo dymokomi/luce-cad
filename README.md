@@ -42,7 +42,16 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
   `check` (continuity G0 to G3 across edges at stations, from exact third
   derivatives, with curvature combs and the lines that draw the result) and
   `deviation` (a model's tessellation colored by its signed distance from
-  another's surfaces). See [docs/MODELING.md](docs/MODELING.md), Measuring.
+  another's surfaces), and `curve_join` (how two curves meet, G0 to G4, by
+  their arc-length derivatives). See [docs/MODELING.md](docs/MODELING.md),
+  Measuring.
+- `cad_curves` (`luce_cad.cad_curves`): `CadCurves`, a set's CAD curves as
+  objects beside its bodies and sketches: free curves and curves on faces,
+  named, drawn, picked and saved; their control points join the CV cloud.
+- `curves` (`luce_cad.curves`): `CadCurveTools`, curves through or with
+  points, from a model's edges and isoparms, on a face, Blend Curve to G4,
+  Attach, Close, Stretch and Reverse. See [docs/MODELING.md](docs/MODELING.md),
+  Curves.
 - `cad_exact` (`luce_cad.exact`, Base only): `FaceSupport`, the exact data
   exporters read (luce-usd writes CAD faces as USD NurbsPatch prims).
   `model.face_support(face)` copies a face's support out (kind, frame,

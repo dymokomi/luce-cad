@@ -1,0 +1,176 @@
+## CAD curves (surfacing Stage 2, luced-3d docs/research/
+## SURFACING-ALIAS-PLASTICITY.md §6.2): free 3D curves and curves on faces
+## as objects of a geometry set (cad_curves.lucb), Blend Curve to G4, the
+## curve steps Alias offers (Attach, Detach, Close, Stretch, Reverse) and
+## the curves made from a model (an edge, an isoparm, points on a face).
+## Curves are nurbs.lucb's homogeneous splines.
+##
+## This file: a curve's derivatives to the fifth order, exactly, and its
+## derivatives by arc length, which G4 needs. A derivative of a B-spline is
+## a B-spline of one degree less on the inner knots (The NURBS Book, 3.3);
+## the homogeneous derivatives are summed that way, then the quotient rule
+## gives the curve's own. Two curves meet at G_k when their arc-length
+## derivatives to order k agree (Faa di Bruno with the inverse of s(t)).
+import interop
+import memory
+import strings
+from luce_std import math
+from luce_geocore.geocore import Vector3, Matrix4, Mesh, invalid
+from luce_geocore.core.growing import Growing
+from geometry import Surface, basis_jet, surface_point, surface_distance, edge_index, surface_spline, chart_uv, nearest_parameters, curve_line, curve_circle, curve_ellipse
+from nurbs import Spline, Weighted, Net, CadSpline, held_spline, spline_in, empty_spline, spline_of, weighted, find_span, insert_knot, elevate, extract, choose, fewer, size_of, uniform_knots, fit_parameters, make_fitter, analytic_net, net_of, most_degree, arc_spline
+from model import CadModel
+from modeling import Shape, shape_of, resolve_edges
+
+## The highest derivative kept: G4 needs four, the fifth checks a blend.
+pub let jet_order: usize = 5
+
+## A curve's point and its derivatives by its own parameter: d[0] the
+## point, d[k] the k-th derivative.
+pub struct Jet:
+    pub var d: Vector3[6]
+
+pub func empty_jet() -> Jet:
+    return Jet([Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()])
+
+## The B-spline bases of `degree` at `t` (the limit from below at an inner
+## knot with `left`): their values onto `out`, the first one's index
+## returned. Cox and de Boor (A2.2).
+pub func bases_at(knots: const f64[], count: usize, degree: usize, t: f64, left: bool, out: f64[12]*) -> usize:
+    let low = knots[degree]
+    let high = knots[count]
+    let u = math.clamp(t, low, high)
+    # The span: knots[k] <= u < knots[k + 1]; from below, knots[k] < u <= knots[k + 1].
+    var k = find_span(knots, count, (i64)degree, u)
+    if left:
+        while k > degree and knots[k] >= u: k -= 1
+    var lefts: f64[12]
+    var rights: f64[12]
+    (*out)[0] = 1.0
+    for j in 1..<degree + 1:
+        lefts[j] = u - knots[k + 1 - j]
+        rights[j] = knots[k + j] - u
+        var saved = 0.0
+        for r in 0..<j:
+            let gap = rights[r + 1] + lefts[j - r]
+            let temp = (*out)[r] / gap if gap != 0.0 else 0.0
+            (*out)[r] = saved + rights[r + 1] * temp
+            saved = lefts[j - r] * temp
+        (*out)[j] = saved
+    return k - degree
+
+## The homogeneous derivatives of `s` at `t` to `order` (at most 5): the
+## derivative curves' control points (A3.3) evaluated there.
+pub func homogeneous_jet(s: const Spline*, t: f64, order: usize, left: bool, out: Weighted[6]*) -> !:
+    let p = (usize)s.degree
+    let n = s.points.count
+    for k in 0..<(usize)6: (*out)[k] = Weighted(0.0, 0.0, 0.0, 0.0)
+    var points = Growing[Weighted]()
+    defer points.close()
+    try points.assign(s.points.view())
+    var count = n
+    for k in 0..<fewer(order, jet_order) + 1:
+        if k > p: break
+        # Derivative curve k: degree p - k on knots[k..<len - k].
+        let knots = s.knots.view()[k..<s.knots.count - k]
+        var values: f64[12]
+        let first = bases_at(knots, count, p - k, t, left, &values)
+        var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+        for j in 0..<p - k + 1: sum = sum.plus(points.items[first + j].times(values[j]))
+        (*out)[k] = sum
+        if k == order or k == p: break
+        # The next derivative's control points.
+        for i in 0..<count - 1:
+            let gap = s.knots.items[i + p + 1] - s.knots.items[i + k + 1]
+            let factor = (f64)(p - k) / gap if gap > 0.0 else 0.0
+            points.items[i] = points.items[i + 1].minus(points.items[i]).times(factor)
+        count -= 1
+
+## The curve's derivatives (Euclidean) at `t` to `order`, by the quotient
+## rule on the homogeneous ones.
+pub func curve_jet(s: const Spline*, t: f64, order: usize, left: bool) -> Jet!:
+    var a: Weighted[6]
+    try homogeneous_jet(s, t, order, left, &a)
+    var j = empty_jet()
+    let w0 = a[0].w
+    if not (w0 > 0.0): error(invalid, "a curve's weight vanished")
+    for k in 0..<fewer(order, jet_order) + 1:
+        var v = Vector3(a[k].x, a[k].y, a[k].z)
+        for i in 1..<k + 1: v = v.subtract(j.d[k - i].multiply_scalar(choose(k, i) * a[i].w))
+        j.d[k] = v.multiply_scalar(1.0 / w0)
+    return j
+
+## The derivatives by arc length (d[1] the unit tangent, d[2] the curvature
+## vector, d[3] and d[4] their rates) of a jet by any regular parameter, to
+## the fourth order.
+pub func arc_jet(j: const Jet*) -> Jet!:
+    let c1 = j.d[1]
+    let c2 = j.d[2]
+    let c3 = j.d[3]
+    let c4 = j.d[4]
+    # g = |C'|^2 and its derivatives; v = sqrt(g) and its.
+    let g0 = c1.dot(c1)
+    if not (g0 > 0.0): error(invalid, "the curve stops there (its tangent vanishes)")
+    let g1 = 2.0 * c1.dot(c2)
+    let g2 = 2.0 * (c2.dot(c2) + c1.dot(c3))
+    let g3 = 2.0 * (3.0 * c2.dot(c3) + c1.dot(c4))
+    let v0 = math.sqrt(g0)
+    let v1 = g1 / (2.0 * v0)
+    let v2 = (g2 / 2.0 - v1 * v1) / v0
+    let v3 = (g3 / 2.0 - 3.0 * v1 * v2) / v0
+    # t(s): its derivatives by inverting s(t), whose derivatives are v's.
+    let t1 = 1.0 / v0
+    let t2 = -v1 / (v0 * v0 * v0)
+    let t3 = (3.0 * v1 * v1 - v0 * v2) / math.pow(v0, 5.0)
+    let t4 = (-15.0 * v1 * v1 * v1 + 10.0 * v0 * v1 * v2 - v0 * v0 * v3) / math.pow(v0, 7.0)
+    var out = empty_jet()
+    out.d[0] = j.d[0]
+    out.d[1] = c1.multiply_scalar(t1)
+    out.d[2] = c2.multiply_scalar(t1 * t1).add(c1.multiply_scalar(t2))
+    out.d[3] = c3.multiply_scalar(t1 * t1 * t1).add(c2.multiply_scalar(3.0 * t1 * t2)).add(c1.multiply_scalar(t3))
+    out.d[4] = c4.multiply_scalar(t1 * t1 * t1 * t1).add(c3.multiply_scalar(6.0 * t1 * t1 * t2)).add(c2.multiply_scalar(3.0 * t2 * t2 + 4.0 * t1 * t3)).add(c1.multiply_scalar(t4))
+    return out
+
+## The jet `j` with its parameter run backwards (t -> -t): odd orders turn.
+pub func reversed_jet(j: const Jet*) -> Jet:
+    var out = *j
+    for k in 0..<(usize)6:
+        if k % 2 == 1: out.d[k] = j.d[k].multiply_scalar(-1.0)
+    return out
+
+## Faa di Bruno: the derivatives of C(phi(tau)) at tau = 0 where phi' =
+## alpha, phi'' = beta, phi''' = gamma, phi'''' = delta and C's are `c`'s.
+pub func reparameterized(c: const Jet*, alpha: f64, beta: f64, gamma: f64, delta: f64) -> Jet:
+    var out = empty_jet()
+    let a1 = c.d[1]
+    let a2 = c.d[2]
+    let a3 = c.d[3]
+    let a4 = c.d[4]
+    out.d[0] = c.d[0]
+    out.d[1] = a1.multiply_scalar(alpha)
+    out.d[2] = a2.multiply_scalar(alpha * alpha).add(a1.multiply_scalar(beta))
+    out.d[3] = a3.multiply_scalar(alpha * alpha * alpha).add(a2.multiply_scalar(3.0 * alpha * beta)).add(a1.multiply_scalar(gamma))
+    out.d[4] = a4.multiply_scalar(alpha * alpha * alpha * alpha).add(a3.multiply_scalar(6.0 * alpha * alpha * beta)).add(a2.multiply_scalar(3.0 * beta * beta + 4.0 * alpha * gamma)).add(a1.multiply_scalar(delta))
+    return out
+
+## A copy of `s` running the other way (its knots mirrored).
+pub func reversed_spline(s: const Spline*) -> Spline!:
+    var made = empty_spline(s.degree)
+    errdefer made.close()
+    let low = s.low()
+    let high = s.high()
+    var i = s.knots.count
+    while i > 0:
+        i -= 1
+        try made.knots.push(low + high - s.knots.items[i])
+    i = s.points.count
+    while i > 0:
+        i -= 1
+        try made.points.push(s.points.items[i])
+    return made
+
+## `s` on the domain 0..1 (its knots scaled; the same curve).
+pub func unit_domain(s: Spline*):
+    let low = s.low()
+    let span = s.high() - low
+    for k in 0..<s.knots.count: s.knots.items[k] = (s.knots.items[k] - low) / span

@@ -1,0 +1,142 @@
+## Luce's curve calls: CadCurveTools makes curves (CadSpline) from points,
+## a model's edges and isoparms, points on a face, blends, and Alias's
+## curve edits (measure's CadMeasure.curve_join checks how two meet).
+
+## Where on a model's face a curve on it lies: the face's surface record.
+func face_support(w: const Shape*, face: str) -> usize!:
+    for f in 0..<w.faces.count:
+        if w.face_name(f) == face: return (usize)w.faces.items[f].surface
+    error(invalid, "the face this curve lies on is not in the model: pick it again")
+
+## The curve tools, as static functions; each returns a new curve.
+pub struct CadCurveTools:
+    let reserved: u8 = 0
+
+    ## A curve with `points` as its control points (Alias's CV curve), at
+    ## `degree` (lowered to what they allow), on equal spans.
+    pub static func by_points(points: const Vector3[], degree: i64 = 5) -> interop.Reference[CadSpline]!:
+        return try held_spline(try cv_curve(points, degree))
+
+    ## A curve through `points` (Alias's EP curve) at `degree`.
+    pub static func through(points: const Vector3[], degree: i64 = 5) -> interop.Reference[CadSpline]!:
+        return try held_spline(try through_points(points, degree))
+
+    ## The edge `reference` (CadModeling's edge references) names, as a
+    ## free curve from its start to its end, exactly (Duplicate Curve).
+    pub static func edge(model: interop.Reference[CadModel], reference: str) -> interop.Reference[CadSpline]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var found = Growing[usize]()
+        defer found.close()
+        try resolve_edges(&w, reference, &found)
+        if found.count == 0: error(invalid, "the edge is not in the model: pick it again")
+        return try held_spline(try edge_spline(&w, found.items[0]))
+
+    ## The isoparm of the face named `face`'s surface at `fraction` of its
+    ## domain: along v at that u (`direction` 0) or along u at that v (1),
+    ## exactly (an analytic face's through its exact B-spline).
+    pub static func isoparm(model: interop.Reference[CadModel], face: str, direction: i64, fraction: f64) -> interop.Reference[CadSpline]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var net = try surface_net(&w, try face_support(&w, face))
+        defer net.close()
+        return try held_spline(try isoparm_spline(&net, direction, fraction))
+
+    ## The chart coordinates (x, y) on the face named `face` of the point
+    ## of its surface nearest `p` (a B-spline's normalized domain).
+    pub static func face_uv(model: interop.Reference[CadModel], face: str, p: Vector3) -> Vector3!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        let s = &w.surfaces.items[try face_support(&w, face)]
+        if s.kind == surface_spline: return try nearest_parameters(*s, p, Vector3(0.5, 0.5, 0.0), true)
+        return chart_uv(*s, p, Vector3(), false)
+
+    ## The name of the face of `model` that point `p` lies on: within
+    ## `fraction` of the face's size of its surface and inside its edges'
+    ## box (the nearest such); "" when none is (Curve on Surface's clicks,
+    ## which land on the tessellation, a little off the exact surface).
+    pub static func face_at(model: interop.Reference[CadModel], p: Vector3, fraction: f64 = 0.005) -> interop.Owned[str]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var best = math.infinity
+        var found: i64 = -1
+        for f in 0..<w.faces.count:
+            var low = Vector3(math.infinity, math.infinity, math.infinity)
+            var high = Vector3(-math.infinity, -math.infinity, -math.infinity)
+            for use in w.face_uses(f):
+                for k in 0..<(usize)9:
+                    let q = try w.edge_at(edge_index(use), (f64)k / 8.0)
+                    low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), math.min(low.z, q.z))
+                    high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), math.max(high.z, q.z))
+            let size = math.max(1e-9, high.subtract(low).length())
+            let d = surface_distance(&w.surfaces.items[(usize)w.faces.items[f].surface], p)
+            if not (d <= fraction * size) or d >= best: continue
+            let slack = fraction * size
+            if p.x < low.x - slack or p.y < low.y - slack or p.z < low.z - slack or p.x > high.x + slack or p.y > high.y + slack or p.z > high.z + slack: continue
+            best = d
+            found = (i64)f
+        return try interop.copy_text(w.face_name((usize)found) if found >= 0 else "")
+
+    ## The point of the face named `face`'s surface at chart coordinates `uv`.
+    pub static func face_point(model: interop.Reference[CadModel], face: str, uv: Vector3) -> Vector3!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        return try surface_point(w.surfaces.items[try face_support(&w, face)], uv)
+
+    ## The 3D curve of the curve `uv` on the face named `face` (chart
+    ## coordinates in its x and y): fitted within `tolerance`.
+    pub static func on_face(model: interop.Reference[CadModel], face: str, uv: interop.Reference[CadSpline], tolerance: f64 = 0.0001) -> interop.Reference[CadSpline]!:
+        if not (tolerance > 0.0): error(invalid, "a curve on a face needs a tolerance")
+        var w = try shape_of(model.value())
+        defer w.close()
+        var deviation = 0.0
+        return try held_spline(try face_curve(&w.surfaces.items[try face_support(&w, face)], spline_in(uv.value()), tolerance, &deviation))
+
+    ## Blend Curve (blend.lucb): from `a` at `ta` (leaving it toward
+    ## increasing parameters with `sa` 1, decreasing with -1) at G`ga` to
+    ## `b` at `tb` (likewise `sb`) at G`gb`; `degree` and `extra` spans; its
+    ## shape (eight numbers, chord multiples, or none: tangents of the
+    ## chord, the rest 0): tangent at the start and the end, then
+    ## curvature, rate and fourth, start and end each.
+    pub static func blend(a: interop.Reference[CadSpline], ta: f64, sa: i64, ga: i64, b: interop.Reference[CadSpline], tb: f64, sb: i64, gb: i64,
+                          degree: i64, shape: const f64[], extra: i64 = 0) -> interop.Reference[CadSpline]!:
+        var values: f64[8] = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        if shape.length != 0 and shape.length != 8: error(invalid, "a blend's shape is eight numbers")
+        for k in 0..<shape.length: values[k] = shape[k]
+        if extra < 0: error(invalid, "a blend's extra spans cannot be negative")
+        let start = BlendEnd(try leaving_jet(spline_in(a.value()), ta, sa), ga, values[0], values[2], values[4], values[6])
+        let finish = BlendEnd(try leaving_jet(spline_in(b.value()), tb, sb), gb, values[1], values[3], values[5], values[7])
+        return try held_spline(try blend_curve(&start, &finish, degree, (usize)extra))
+
+    ## The spans a blend of `degree` with ends at G`a` and G`b` takes.
+    pub static func blend_span_count(degree: i64, a: i64, b: i64) -> i64:
+        return (i64)blend_spans(degree, a, b)
+
+    ## Attach (edits.lucb): `a`'s end to `b`'s start; Blend (`blend`) at
+    ## `bias` with G`continuity` (0 to 3), else Connect.
+    pub static func attached(a: interop.Reference[CadSpline], b: interop.Reference[CadSpline], blend: bool, bias: f64 = 0.5, continuity: i64 = 1) -> interop.Reference[CadSpline]!:
+        return try held_spline(try attached(spline_in(a.value()), spline_in(b.value()), blend, bias, continuity))
+
+    ## Close (edits.lucb), Preserve Shape on or off.
+    pub static func closed(s: interop.Reference[CadSpline], preserve: bool = true) -> interop.Reference[CadSpline]!:
+        return try held_spline(try closed(spline_in(s.value()), preserve))
+
+    ## Stretch (edits.lucb): the points at `params` moved by `moves`.
+    pub static func stretched(s: interop.Reference[CadSpline], params: const f64[], moves: const Vector3[], floating: bool = false) -> interop.Reference[CadSpline]!:
+        return try held_spline(try stretched(spline_in(s.value()), params, moves, floating))
+
+    ## The same curve running the other way.
+    pub static func reversed(s: interop.Reference[CadSpline]) -> interop.Reference[CadSpline]!:
+        return try held_spline(try reversed_spline(spline_in(s.value())))
+
+    ## The parameter of `s` nearest `p`.
+    pub static func nearest(s: interop.Reference[CadSpline], p: Vector3) -> f64:
+        let c = spline_in(s.value())
+        return nearest_on(c, p, (c.low() + c.high()) * 0.5)
+
+    ## `s`'s derivative of order `order` (0 to 5) at `t`, from below with
+    ## `left`.
+    pub static func derivative(s: interop.Reference[CadSpline], t: f64, order: i64, left: bool = false) -> Vector3!:
+        if order < 0 or order > 5: error(invalid, "derivatives go to the fifth order")
+        let j = try curve_jet(spline_in(s.value()), t, (usize)order, left)
+        return j.d[(usize)order]

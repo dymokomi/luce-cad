@@ -1203,7 +1203,8 @@ B-spline faces with their trims. Everything works on homogeneous control points
 | `knots_matched(model, surface, other, other_surface, keep_u, keep_v)` | Match Knots: rebuilt on another surface's degrees and knots. |
 | `converted(model, surface)` | An analytic face (plane, cylinder, cone, sphere, torus) as an exact rational B-spline: a bilinear patch, or a surface of revolution (A8.1) of a line or arc profile through an arc (A7.1), over its faces' chart box. |
 | `structure`, `knot`, `knot_count`, `parameters_at`, `point_at`, `surface_of_face`, `surface_of_cv`, `first_cv` | What the UI reads: degrees, counts, spans, rational; knots as domain fractions; a point's parameters. |
-| `cloud_moved(cloud, ids, mode, amount, falloff, reach, exponent, curve)` | CV moves on a control vertex cloud (`cv_moves.lucb`): World, NUV, Slide, Project, Parallel and View, with Rows, Hull-distance or Radius falloff. `cloud_frame` and `cloud_row` give the gizmo's frame and a hull row's group. |
+| `cloud_moved(cloud, ids, mode, amount, falloff, reach, exponent, curve, mirror)` | CV moves on a control vertex cloud (`cv_moves.lucb`): World, NUV, Slide, Project, Parallel and View, with Rows, Hull-distance or Radius falloff, mirrored across X, Y or Z with `mirror` (each moved CV's mirror partner moves as its reflection, a CV on the plane stays on it). `cloud_frame` (the surface's frame NUV uses), `cloud_hull_frame` (the hull's, Slide's) and `cloud_row` give the gizmo's frames and a hull row's group. |
+| `surface_text(model, surface)`, `CadNetProbe.parse(text)` | A surface's net as text, and read back elsewhere: `point(u, v)` at domain fractions, `knot_count` and `knot` (inner knots as fractions). luced-3d's viewport draws Insert Knot's isoparm under the pointer from it. |
 
 Each surface edit returns a `CadNurbsEdit`: the model, how far the surface moved (0 for the exact
 edits) and how many control points or knots changed. The edited surface is marked edited, so its
@@ -1220,12 +1221,18 @@ to two quintic spans held to G2 still measures G2 at its contacts. Explicit Cont
 of degree 7 holds G2 at both ends with its eight control points; G3 needs eight a direction.
 
 **Converting.** A face whose loops go round the axis with no seam edge (a sphere's caps from
-`CadSolids.sphere`) is refused: its trim would run off the B-spline's domain at the seam. Split
-it through the axis first. A sphere's or cone's face that caps the pole or apex runs to it.
+`CadSolids.sphere`) would run off the B-spline's domain at the seam, so it is split first, as
+Alias does: by the plane through the axis furthest from the face's vertices (`cap_faces`,
+`caps_split`), each half then having a seam of its own. A sphere's or cone's face that caps the
+pole or apex runs to it.
 
 **CV clouds.** `CadGeometry.cv_cloud` points carry `cad_cv_model`, `cad_cv_surface`, `cad_cv_u`,
 `cad_cv_v`, `cad_cv_nu` and `cad_cv_nv`: a pick takes a hull row by them, and Rows falloff counts
-rows with them.
+rows with them. They also carry their surface's frame at the CV's Greville point
+(`cad_cv_normal`, `cad_cv_du`, `cad_cv_dv`: brep's `placed_cv_frames`), which NUV moves along, as
+Alias's and Rhino's do; on a curved net it differs from the hull's. A set's CAD curves' control
+points follow the models' (`cad_cv_model` -1, `cad_cv_surface` the curve's index, a net one row
+wide), a curve on a face's as its chart curve's points mapped onto the face.
 
 Tests (`tests/regressions/nurbs_toolkit_tests.luc`), against closed forms:
 
@@ -1240,13 +1247,95 @@ Tests (`tests/regressions/nurbs_toolkit_tests.luc`), against closed forms:
   meets 1e-5; Bezier and Del multi knots are exact.
 - **Conversion.** A G1 fillet's cylinder becomes a rational B-spline within 1e-12 of radius r,
   its contacts still G1; a cylinder's, a cone's and a torus's whole sides convert and mesh; a
-  sphere's cap is refused with the reason; a box face becomes a bilinear patch.
+  sphere's caps are split through the axis and convert, every piece on the sphere to 1e-9; a box
+  face becomes a bilinear patch.
 - **CV moves.** On a 3 by 3 planar net: NUV moves the middle CV along the normal alone; Rows
   falloff with one row moves a neighbor by 0.5^e and a corner by its square; hull distance 3
-  moves a neighbor two away by 1/3; Slide stops at the net's edge; Parallel moves two CVs alike.
+  moves a neighbor two away by 1/3; Slide stops at the net's edge; Parallel moves two CVs alike;
+  Symmetry moves a CV's mirror partner as its reflection and keeps a CV on the plane on it.
+- **Frames.** On a G2 fillet's quintic net every CV's cloud frame is `cv_frame`'s to 1e-6, and on
+  it the normal differs from the hull's; a net sent as text reads back the same surface.
 
 Not yet: knot vectors made compatible across a set of curves, reparameterization by chord
 length, extension (Stage 5), and Untrim (Stage 3).
+
+## Curves (`curves/`, `cad_curves.lucb`)
+
+Stage 2 of the surfacing plan: CAD curves as objects of a geometry set, beside its bodies and
+sketches (the owner's answer: free 3D curves and curves on surfaces are first-class), Blend Curve
+to G4, and Alias's curve edits.
+
+**Curves as objects** (`cad_curves.lucb`, `CadCurves`). A set's `cad_curves` component holds named
+curves: an exact rational B-spline each, shown or hidden, its source ("edge <reference>",
+"isoparm <face> u 0.5", "blend", …) and, for a curve on a face, the face's name and the curve in
+the face's chart coordinates (a plane's x and y, a cylinder's angle and height, a B-spline's
+normalized domain). It places with the set (control points moved, chart curves kept), joins,
+filters by name as an object path and is saved in geometry files (element `cad_curves`).
+`with_curve`, `with_visible`, `without_curve`, `free_name`; `curve`, `chart_curve`, `face`,
+`source`. luced-3d draws them (`curve_lines`, a curve on a face lifted off it a hair so the face
+does not hide it; `curve_hulls`), picks them (`pick_mesh`: each segment a zero-area triangle whose
+edges carry `cad_curve`, `cad_edge` and `cad_curve_name`) and edits their control points in the
+CV cloud (`curve_cloud`, `moved_curves`: a curve on a face's moved points go back onto the face,
+its 3D curve fitted again).
+
+**Making curves** (`CadCurveTools`):
+
+| Call | What it does |
+|---|---|
+| `by_points(points, degree)` | Alias's CV curve: the points as control points, clamped, equal spans, degree 5 by default (lowered to what the points allow). |
+| `through(points, degree)` | Alias's EP curve: global interpolation (A9.1) at chord-length parameters, knots averaged. |
+| `edge(model, reference)` | Duplicate Curve of an edge, exactly: a line (degree 1), a circle or ellipse arc (rational quadratics, A7.1), a B-spline edge's piece; from the edge's start to its end. |
+| `isoparm(model, face, direction, fraction)` | Duplicate Curve of an isoparm, exactly: the net's row combined at that parameter (an analytic face through its exact net). |
+| `face_at(model, p, fraction)`, `face_uv(model, face, p)`, `face_point(model, face, uv)` | The face a clicked point lies on (within a fraction of its size, inside its edges' box), a point's chart coordinates on it, and back. |
+| `on_face(model, face, uv, tolerance)` | A curve on a face: the 3D curve along chart curve `uv`, fitted at degree 5 on equal spans, doubled until within `tolerance`, its ends on the surface. |
+| `blend(a, ta, sa, ga, b, tb, sb, gb, degree, shape, extra)` | Blend Curve (below). |
+| `attached(a, b, blend, bias, continuity)`, `closed(s, preserve)`, `stretched(s, params, moves, floating)`, `reversed(s)`, `nearest(s, p)`, `derivative(s, t, order)` | Alias's curve edits (below), the nearest parameter, derivatives to the fifth order. |
+
+**Blend Curve** (`blend.lucb`, §6.2 of the plan). Each end is a point of a curve and the way the
+blend leaves it (`sa` 1: past the curve's high end, its part below kept; -1 the other way). The
+blend near an end is that curve reparameterized, B(τ) = C(φ(τ)) with φ' = α (the tangent's
+length, Start tangent times the chord), φ'' = β (curvature's shape), φ''' = γ, φ'''' = δ, so its
+derivatives there follow by Faà di Bruno and are G_k exactly whatever α > 0 and the others are.
+The derivatives of a clamped B-spline at its start rest on its first k + 1 control points alone
+(at its end on its last), so an end at G_k fixes k + 1 of them by a triangular solve on the
+derivative curves' control points (A3.3). The other control points minimize ∫|B'''|² (∫|B''|²
+when both ends are G0) with the fixed ones held: a Gram matrix by Gauss–Legendre on each span,
+one linear solve. Degree 5 by default on as many equal spans as the fixed control points need:
+G1 and G2 both ends one span, G3 three, G4 five (the table in §6.2); degree 7 gives a single span
+to G3 (Explicit Control); `extra` adds spans whose points bend as little as they can. G4 is for
+blend curves only (the owner's answer). A degree below the continuity asked is refused.
+
+**The curve edits** (`edits.lucb`):
+
+- **Attach** joins a's end to b's start as one curve. Blend moves both ends to meet at Blend Bias
+  between them (0 a's end, 1 b's start); each curve's last rows of control points are set so both
+  share the average of their arc-length derivatives there to G0–G3; the joint is a knot of full
+  multiplicity, the curve G_k across it. Connect keeps the ends and bridges a gap with a straight
+  span raised to their degree.
+- **Close**: with Preserve Shape a G2 blend span from the end back to the start, attached; without,
+  the two ends moved to meet halfway, G1.
+- **Stretch**: up to degree + 1 handles on the curve moved; every control point follows a
+  polynomial field of the parameter through the handles' moves (at its Greville abscissa), then a
+  least-norm correction lands the handles exactly. Locked keeps the handles' parameters; Floating
+  moves each to the point of the new curve nearest its target (three rounds).
+- **Detach** is `piece`; **Reverse** mirrors the knots.
+
+**Checking curves** (`measure/curve_joins.lucb`, `CadMeasure.curve_join`). Two curves meet at G_k
+when their derivatives by arc length agree to order k: the unit tangent, the curvature vector and
+its first and second rates, from the parametric ones by the inverse of s(t) (`arc_jet`). The join
+reports the gap, the tangents' angle and the relative differences of the three higher vectors in
+percent, and the order reached (gap 1e-6 of the curves' size, 0.01°, 0.01%).
+
+Tests (`tests/regressions/curve_tests.luc`), against closed forms: blends G0 to G4 between a
+quarter circle and a twisted quintic measure the order asked at both ends and not one more by
+chance, with 6 + spans − 1 control points as §6.2's table says; mixed G3/G1 is one span; a single
+span of degree 7 holds G3; a G2 blend leaving a circle of radius 2 starts at curvature 1/2 along
+its tangent to 1e-9, its tangent as long as the chord; G4 at degree 3 is refused saying why; a
+cylinder's rim comes out a circle of radius 3 to 1e-12 and its side's isoparm a circle, the other
+way a line; a curve on the side lies on it within its tolerance; Attach Blend at 0.5 meets
+halfway, G1; Close with Preserve Shape keeps the curve's points and closes G2, without it meets
+halfway G1; Stretch lands both handles exactly and moves the middle halfway; curves as objects
+replace in place, hide, pick, move through the CV cloud, place with the set, and save and load.
 
 ## Sketches (`sketch/`)
 

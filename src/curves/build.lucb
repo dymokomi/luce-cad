@@ -1,0 +1,213 @@
+## Curves made from points and from a model: a curve through its control
+## points (Alias's CV curve) or through points (its EP curve, global
+## interpolation, The NURBS Book A9.1); an edge or an isoparm as a free
+## curve, exactly (Alias's Duplicate Curve); and curves on a face, a curve
+## in the face's chart coordinates whose 3D curve is fitted to the surface
+## along it within a tolerance (§6.3: Parasolid's SP-curves, Alias's
+## curves on surface).
+
+## A clamped curve of `degree` (lowered to what the points allow) with
+## `points` as its control points, on equal spans.
+pub func cv_curve(points: const Vector3[], degree: i64) -> Spline!:
+    if points.length < 2: error(invalid, "a curve needs two control points or more")
+    let p = (i64)fewer((usize)degree, points.length - 1)
+    var knots = Growing[f64]()
+    defer knots.close()
+    try uniform_knots(p, points.length - (usize)p, 0.0, 1.0, &knots)
+    var weights = Growing[f64]()
+    defer weights.close()
+    try weights.fill(points.length, 1.0)
+    return try spline_of(points, weights.view(), p, knots.view())
+
+## The curve of `degree` (lowered to what the points allow) through
+## `points`, at chord-length parameters, its knots their averages.
+pub func through_points(points: const Vector3[], degree: i64) -> Spline!:
+    let n = points.length
+    if n < 2: error(invalid, "a curve through points needs two points or more")
+    let p = fewer((usize)degree, n - 1)
+    var params = Growing[f64]()
+    defer params.close()
+    var total = 0.0
+    for i in 1..<n: total += points[i].subtract(points[i - 1]).length()
+    if not (total > 0.0): error(invalid, "a curve through points needs points apart")
+    try params.push(0.0)
+    var run = 0.0
+    for i in 1..<n:
+        run += points[i].subtract(points[i - 1]).length()
+        try params.push(run / total)
+    params.items[n - 1] = 1.0
+    var knots = Growing[f64]()
+    defer knots.close()
+    for _ in 0..<p + 1: try knots.push(0.0)
+    for j in 1..<n - p:
+        var sum = 0.0
+        for i in j..<j + p: sum += params.items[i]
+        try knots.push(sum / (f64)p)
+    for _ in 0..<p + 1: try knots.push(1.0)
+    # The collocation matrix, solved densely (a few hundred points at most).
+    var matrix = Growing[f64]()
+    defer matrix.close()
+    try matrix.fill(n * n, 0.0)
+    for r in 0..<n:
+        var values: f64[12]
+        let first = bases_at(knots.view(), n, p, params.items[r], false, &values)
+        for j in 0..<p + 1: matrix.items[r * n + first + j] = values[j]
+    var solved = Growing[Vector3]()
+    defer solved.close()
+    try solved.assign(points)
+    try solve_dense(&matrix, n, &solved)
+    var weights = Growing[f64]()
+    defer weights.close()
+    try weights.fill(n, 1.0)
+    return try spline_of(solved.view(), weights.view(), (i64)p, knots.view())
+
+## Gaussian elimination with partial pivoting: `matrix` (n by n, row
+## major) times x = `values`, x onto `values`.
+pub func solve_dense(matrix: Growing[f64]*, n: usize, values: Growing[Vector3]*) -> !:
+    for col in 0..<n:
+        var pivot = col
+        for r in col + 1..<n:
+            if math.abs(matrix.items[r * n + col]) > math.abs(matrix.items[pivot * n + col]): pivot = r
+        if not (math.abs(matrix.items[pivot * n + col]) > 1e-300): error(invalid, "the curve's equations have no unique answer (points repeated?)")
+        if pivot != col:
+            for c in 0..<n:
+                let held = matrix.items[col * n + c]
+                matrix.items[col * n + c] = matrix.items[pivot * n + c]
+                matrix.items[pivot * n + c] = held
+            let kept = values.items[col]
+            values.items[col] = values.items[pivot]
+            values.items[pivot] = kept
+        for r in col + 1..<n:
+            let f = matrix.items[r * n + col] / matrix.items[col * n + col]
+            if f == 0.0: continue
+            for c in col..<n: matrix.items[r * n + c] -= f * matrix.items[col * n + c]
+            values.items[r] = values.items[r].subtract(values.items[col].multiply_scalar(f))
+    var r = n
+    while r > 0:
+        r -= 1
+        var sum = values.items[r]
+        for c in r + 1..<n: sum = sum.subtract(values.items[c].multiply_scalar(matrix.items[r * n + c]))
+        values.items[r] = sum.multiply_scalar(1.0 / matrix.items[r * n + r])
+
+## Edge `e` of `w` as a curve running from its start to its end: a line
+## (degree 1), a circle or ellipse arc (rational quadratics), or its
+## B-spline's piece.
+pub func edge_spline(w: const Shape*, e: usize) -> Spline!:
+    let edge = w.edges.items[e]
+    let carrier = w.carriers.items[(usize)edge.carrier]
+    let a = math.min(edge.t0, edge.t1)
+    let b = math.max(edge.t0, edge.t1)
+    var made = empty_spline(1)
+    errdefer made.close()
+    if carrier.kind == curve_line:
+        var weights: f64[2] = [1.0, 1.0]
+        let knots: f64[4] = [0.0, 0.0, 1.0, 1.0]
+        var ends: Vector3[2] = [carrier.origin.add(carrier.x.multiply_scalar(a)), carrier.origin.add(carrier.x.multiply_scalar(b))]
+        made.close()
+        made = try spline_of(ends[..<2], weights[..<2], 1, knots[..<4])
+    elif carrier.kind == curve_circle or carrier.kind == curve_ellipse:
+        var circle = Growing[Vector3]()
+        defer circle.close()
+        var weights = Growing[f64]()
+        defer weights.close()
+        var knots = Growing[f64]()
+        defer knots.close()
+        try arc_spline(a, b, &circle, &weights, &knots)
+        let minor = carrier.a if carrier.kind == curve_circle else carrier.b
+        var points = Growing[Vector3]()
+        defer points.close()
+        for q in circle.view(): try points.push(carrier.origin.add(carrier.x.multiply_scalar(carrier.a * q.x)).add(carrier.y.multiply_scalar(minor * q.y)))
+        made.close()
+        made = try spline_of(points.view(), weights.view(), 2, knots.view())
+    else:
+        let (points, weights, knots, degree) = w.spline_net(carrier.spline)
+        var whole = try spline_of(points, weights, degree, knots)
+        defer whole.close()
+        made.close()
+        made = try extract(&whole, math.max(a, whole.low()), math.min(b, whole.high()))
+    if edge.t1 < edge.t0:
+        let turned = try reversed_spline(&made)
+        made.close()
+        made = turned
+    unit_domain(&made)
+    return made
+
+## The net of surface `s` of `w`: its own, or an analytic one's exact
+## rational net over its faces (nurbs' analytic_net).
+pub func surface_net(w: const Shape*, s: usize) -> Net!:
+    let surface = w.surfaces.items[s]
+    if surface.kind == surface_spline: return try net_of(&w.surfaces.items[s])
+    return try analytic_net(w, s)
+
+## The isoparm of `net` at `fraction` of its domain along `direction` (0:
+## the curve along v at that u, 1: along u at that v), exactly.
+pub func isoparm_spline(net: const Net*, direction: i64, fraction: f64) -> Spline!:
+    if not (fraction >= 0.0 and fraction <= 1.0): error(invalid, "an isoparm's place is 0 to 1 along the surface")
+    let along_v = direction == 0
+    let knots = net.ku.view() if along_v else net.kv.view()
+    let count = net.nu if along_v else net.nv
+    let degree = (usize)(net.du if along_v else net.dv)
+    let low = knots[degree]
+    let high = knots[count]
+    var values: f64[12]
+    let first = bases_at(knots, count, degree, low + (high - low) * fraction, fraction >= 1.0, &values)
+    var made = empty_spline(net.dv if along_v else net.du)
+    errdefer made.close()
+    try made.knots.assign(net.kv.view() if along_v else net.ku.view())
+    let others = net.nv if along_v else net.nu
+    for j in 0..<others:
+        var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+        for k in 0..<degree + 1:
+            let i = first + k
+            let q = net.points.items[i * net.nv + j] if along_v else net.points.items[j * net.nv + i]
+            sum = sum.plus(q.times(values[k]))
+        try made.points.push(sum)
+    unit_domain(&made)
+    return made
+
+## The 3D curve of the curve `uv` on surface `surface` (chart coordinates
+## in its points' x and y): fitted at degree 5 on equal spans, doubled
+## until it lies within `tolerance` of the surface's points along `uv`
+## (eight checks a span), its ends on the surface exactly. Its deviation
+## onto `deviation`.
+pub func face_curve(surface: const Surface*, uv: const Spline*, tolerance: f64, deviation: f64*) -> Spline!:
+    var spans: usize = 1
+    var inner = Growing[f64]()
+    defer inner.close()
+    for k in uv.knots.view():
+        if k > uv.low() and k < uv.high() and (inner.count == 0 or inner.items[inner.count - 1] != k): try inner.push(k)
+    spans = inner.count + 1
+    while true:
+        var knots = Growing[f64]()
+        defer knots.close()
+        try uniform_knots(5, spans, uv.low(), uv.high(), &knots)
+        var params = Growing[f64]()
+        defer params.close()
+        try fit_parameters(knots.view(), 5, 12, &params)
+        var fitter = try make_fitter(5, knots.view(), params.view(), 0)
+        defer fitter.close()
+        var values = Growing[Weighted]()
+        defer values.close()
+        for t in params.view():
+            let c = uv.point_at(t)
+            try values.push(weighted(try surface_point(*surface, Vector3(c.x, c.y, 0.0)), 1.0))
+        var starts: Weighted[4]
+        var ends: Weighted[4]
+        starts[0] = values.items[0]
+        ends[0] = values.items[values.count - 1]
+        var made = empty_spline(5)
+        errdefer made.close()
+        try made.knots.assign(knots.view())
+        try fitter.fit(values.view(), &starts, &ends, &made.points)
+        var worst = 0.0
+        let checks = spans * 8
+        for k in 0..<checks + 1:
+            let t = uv.low() + (uv.high() - uv.low()) * (f64)k / (f64)checks
+            let c = uv.point_at(t)
+            worst = math.max(worst, made.point_at(t).subtract(try surface_point(*surface, Vector3(c.x, c.y, 0.0))).length())
+        if worst <= tolerance or spans >= 256:
+            *deviation = worst
+            return made
+        made.close()
+        spans *= 2
+    error(invalid, "unreachable")

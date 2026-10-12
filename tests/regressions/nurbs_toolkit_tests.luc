@@ -5,7 +5,7 @@
 ## filleted box, surface edits keep the shape (exact ones) or the fillet's
 ## G2 contacts (a rebuild held to G2), and a converted G1 fillet stays a
 ## cylinder of radius r.
-from luce_cad.nurbs import CadNurbs, CadSpline, rebuild_explicit, rebuild_tolerance, rebuild_polynomial, rebuild_bezier, rebuild_single, cv_nuv, cv_slide, cv_parallel, cv_world, falloff_rows, falloff_hull
+from luce_cad.nurbs import CadNurbs, CadNetProbe, CadSpline, rebuild_explicit, rebuild_tolerance, rebuild_polynomial, rebuild_bezier, rebuild_single, cv_nuv, cv_slide, cv_parallel, cv_world, falloff_rows, falloff_hull
 from luce_cad.cad_geometry import CadGeometry
 from luce_geocore.geocore import Mesh
 from luce_cad.measure import CadMeasure
@@ -19,7 +19,8 @@ pub func nurbs_toolkit_tests() -> unit!:
     curve_operations()
     surface_operations()
     cv_moves()
-    print("PASS NURBS toolkit: insertion and elevation keep a circle to 1e-12, removal undoes insertion and refuses a real knot, rebuilds report deviation and hold curvature, surface edits keep the shape or G2, a converted fillet stays a cylinder, CVs move along their normal, hull and rows with Alias's falloff")
+    surface_frames()
+    print("PASS NURBS toolkit: insertion and elevation keep a circle to 1e-12, removal undoes insertion and refuses a real knot, rebuilds report deviation and hold curvature, surface edits keep the shape or G2, a converted fillet stays a cylinder, a sphere's caps split and convert, CVs move along their surface's normal, mirrored, hull and rows with Alias's falloff")
 
 ## A quarter circle of radius 3 as one rational quadratic, then a half
 ## circle of two.
@@ -193,13 +194,17 @@ func surface_operations() -> unit!:
     assert(shape_flat.kind == 3 and shape_flat.du == 1 and shape_flat.nu == 2)
     # Whole solids of revolution: each curved surface converted lies on
     # the analytic one and meshes (a seam all the way round, poles).
-    # A sphere's caps go round with no seam: refused, the reason given.
+    # A sphere's caps go round with no seam: split through the axis first
+    # (Alias's), then converted; every piece still on the sphere.
     let ball = CadSolids.sphere(2.0)
-    var refused = ""
-    _ = CadNurbs.converted(ball, ball.face_surface_id(0)) catch failure:
-        refused = failure.message
-        recover CadNurbs.inserted(g2, s, 0, 0.5)
-    assert(refused.contains("seam"), refused)
+    let rounded = CadNurbs.converted(ball, ball.face_surface_id(0)).model()
+    assert(meshes(rounded), rounded.preview().first_error())
+    assert(rounded.face_count() > ball.face_count(), f"{rounded.face_count()} faces")
+    let globe = surface_of_kind(rounded, 3)
+    for i in 0..<9:
+        for j in 0..<9:
+            let p = CadNurbs.point_at(rounded, globe, float(i) / 8.0, float(j) / 8.0)
+            assert(math.abs(p.length() - 2.0) < 1e-9, f"converted sphere off by {p.length() - 2.0}")
     for (solid, kind) in [(CadSolids.cylinder(2.0, 3.0), 1), (CadSolids.cone(2.0, 3.0, 1.0), 2), (CadSolids.torus(3.0, 1.0), 5)]:
         let curved = surface_of_kind(solid, kind)
         let turned = CadNurbs.converted(solid, curved).model()
@@ -216,6 +221,30 @@ func surface_operations() -> unit!:
     # Every edited model still meshes.
     for model in [inserted, raised, made, single.model(), fitted.model(), converted, plain.model(), flat]:
         assert(meshes(model), model.preview().first_error())
+
+## NUV on a curved net (a G2 fillet's quintic): each CV's frame is its
+## surface's at its Greville point (CadNurbs.cv_frame), which on a curved
+## net is not its hull's.
+func surface_frames() -> unit!:
+    let g2 = filleted_box(2)
+    let s = surface_of_kind(g2, 3)
+    let cloud = CadGeometry.cv_cloud(CadGeometry.of_model(g2))
+    let first = CadNurbs.first_cv(g2, s)
+    var differs = false
+    for k in 0..<CadNurbs.structure(g2, s).nu * CadNurbs.structure(g2, s).nv:
+        let cv = first + k
+        for which in 0..<3:
+            let own = CadNurbs.cloud_frame(cloud, cv, which)
+            let exact = CadNurbs.cv_frame(g2, cv, which)
+            assert(own.subtract(exact).length() < 1e-6, f"cv {cv} frame {which}: {own} against {exact}")
+        differs = differs or CadNurbs.cloud_frame(cloud, cv, 0).subtract(CadNurbs.cloud_hull_frame(cloud, cv, 0)).length() > 1e-3
+    assert(differs)
+    # The net as text, read back elsewhere (luced-3d's Insert Knot preview):
+    # the same surface, its knots as fractions.
+    let probe = CadNetProbe.parse(CadNurbs.surface_text(g2, s))
+    for (u, v) in [(0.0, 0.0), (0.3, 0.7), (1.0, 0.5)]:
+        assert(probe.point(u, v).subtract(CadNurbs.point_at(g2, s, u, v)).length() < 1e-9)
+    assert(probe.knot_count(0) + probe.knot_count(1) == CadNurbs.structure(g2, s).spans_u + CadNurbs.structure(g2, s).spans_v - 2)
 
 ## The cloud point of `surface`'s CV (u, v).
 func cv_at(cloud: Mesh, surface: int, u: int, v: int) -> int!:
@@ -273,6 +302,18 @@ func cv_moves() -> unit!:
     # Parallel: two CVs moved along the first one's u hull line, alike.
     let both = CadNurbs.cloud_moved(cloud, [middle, corner], cv_parallel, Vector3(0.25, 0.0, 0.0))
     assert(both.point(middle).subtract(cloud.point(middle)).subtract(both.point(corner).subtract(cloud.point(corner))).length() < 1e-6)
+    # Symmetry: the side CV's mirror partner (the net's other side, same
+    # row) moves as its reflection; the middle CV, on the plane, keeps on
+    # it. The plane is square to X or Y, as the net's u runs.
+    let partner = cv_at(cloud, s, 2, 1)
+    let across_x = math.abs(cloud.point(side).x + cloud.point(partner).x) < 1e-9 and math.abs(cloud.point(side).x) > 0.5
+    let axis = 1 if across_x else 2
+    let mirrored = CadNurbs.cloud_moved(cloud, [side, middle], cv_world, Vector3(0.3, 0.3, 0.2), mirror = axis)
+    let image = mirrored.point(partner).subtract(cloud.point(partner))
+    let expected = Vector3(-0.3, 0.3, 0.2) if across_x else Vector3(0.3, -0.3, 0.2)
+    assert(image.subtract(expected).length() < 1e-6, f"partner {image}")
+    let kept_on = mirrored.point(middle).subtract(cloud.point(middle))
+    assert(math.abs(kept_on.x if across_x else kept_on.y) < 1e-6, f"middle {kept_on}")
     # A whole row as a group, and back into the model.
     let row = CadNurbs.cloud_row(cloud, middle, 0)
     assert(row.contains("cad_cv_u=1"), row)

@@ -1,0 +1,216 @@
+## Blend Curve in 3D, G0 to G4 (§6.2; Alias's Blend Curve, Rhino's
+## BlendCrv): a curve between two ends, each a point of a curve with the
+## way the blend leaves it, continuous with it to the order asked.
+##
+## At each end the blend is the end's curve reparameterized: B(tau) =
+## C(phi(tau)) to order k, with phi' = alpha (the tangent's length), phi''
+## = beta (curvature's shape), phi''' = gamma, phi'''' = delta. Matching
+## those derivatives is G_k exactly, whatever alpha > 0 and the others
+## are. The derivatives of a clamped B-spline at its start rest on its
+## first k + 1 control points alone (and at its end on its last), so an
+## end at G_k fixes k + 1 of them, by a triangular solve. The others, when
+## there are any, minimize the bending energy integral of |B'''|^2 (of
+## |B''|^2 below degree 3): one linear solve.
+##
+## The blend is degree 5 by default, on as many equal spans as its fixed
+## control points need (6 + spans - 1 at least the sum of both ends' k +
+## 1): G1 and G2 both ends one span, G3 three, G4 five.
+
+## One end of a blend: the curve's jet where the blend leaves it, by a
+## parameter running out of the curve into the blend (jets.lucb's
+## reversed_jet for an end the curve reaches backwards), its continuity
+## and its shape: alpha as a length (|B'| at the end, tangent scale times
+## the chord), beta, gamma and delta as lengths too (their factor times
+## the chord, along the end's tangent).
+pub struct BlendEnd:
+    pub var jet: Jet
+    pub var continuity: i64
+    pub var tangent: f64
+    pub var curvature: f64
+    pub var rate: f64
+    pub var fourth: f64
+
+## The blend's spans at `degree` for ends at G`a` and G`b`.
+pub func blend_spans(degree: i64, a: i64, b: i64) -> usize:
+    let needed = a + 1 + b + 1
+    let spans = needed - degree
+    return (usize)spans if spans > 1 else 1
+
+## The derivatives at the start (`at_end` false) or end of a clamped
+## B-spline of `degree` on `knots` with `count` control points, as rows
+## of coefficients over its first (last) `order + 1` control points:
+## row k, column i at [k * 6 + i] (at the end, i counts from the last).
+func end_rows(knots: const f64[], count: usize, degree: usize, order: usize, at_end: bool, rows: f64[36]*):
+    for k in 0..<(usize)36: (*rows)[k] = 0.0
+    # Control point i of the k-th derivative curve as coefficients over the
+    # original's: cur[i * 6 + c] for the end's first (last) six.
+    var cur: f64[36]
+    for k in 0..<(usize)36: cur[k] = 0.0
+    for i in 0..<(usize)6: cur[i * 6 + i] = 1.0
+    (*rows)[0] = 1.0
+    for k in 1..<order + 1:
+        var next: f64[36]
+        for x in 0..<(usize)36: next[x] = 0.0
+        for i in 0..<fewer((usize)6 - k, count - k):
+            # Derivative k's point i from k - 1's points i and i + 1 (at the
+            # end, counted back from the last: i + 1 is the earlier one).
+            var gap = 0.0
+            if at_end:
+                let j = count - 1 - k - i
+                gap = knots[j + degree + 1] - knots[j + k]
+            else: gap = knots[i + degree + 1] - knots[i + k]
+            let factor = (f64)(degree + 1 - k) / gap if gap > 0.0 else 0.0
+            for c in 0..<(usize)6:
+                if at_end: next[i * 6 + c] = (cur[i * 6 + c] - cur[(i + 1) * 6 + c]) * factor
+                else: next[i * 6 + c] = (cur[(i + 1) * 6 + c] - cur[i * 6 + c]) * factor
+        for x in 0..<(usize)36: cur[x] = next[x]
+        for c in 0..<(usize)6: (*rows)[k * 6 + c] = cur[c]
+
+## The control points an end's derivatives `targets` (orders 0 to
+## `order`) fix, by forward substitution on `rows` (end_rows).
+func solve_end(rows: const f64[36]*, targets: const Jet*, order: usize, out: Vector3[6]*) -> !:
+    for k in 0..<order + 1:
+        var sum = targets.d[k]
+        for i in 0..<k: sum = sum.subtract((*out)[i].multiply_scalar((*rows)[k * 6 + i]))
+        let diagonal = (*rows)[k * 6 + k]
+        if not (math.abs(diagonal) > 1e-300): error(invalid, "a blend end's derivatives do not fix its control points")
+        (*out)[k] = sum.multiply_scalar(1.0 / diagonal)
+
+## The end's derivatives the blend takes, by the blend's parameter running
+## from the end (alpha and the others scaled to the chord).
+func end_targets(end: const BlendEnd*, chord: f64) -> Jet!:
+    let speed = end.jet.d[1].length()
+    if not (speed > 0.0): error(invalid, "a blend end's curve stops there (its tangent vanishes)")
+    let alpha = end.tangent * chord / speed
+    if not (alpha > 0.0): error(invalid, "a blend end's tangent must be longer than nothing")
+    return reparameterized(&end.jet, alpha, end.curvature * chord / speed, end.rate * chord / speed, end.fourth * chord / speed)
+
+## The blend from `start` to `finish` at `degree` with `extra` spans more
+## than it needs: the start's jet runs into the blend, the finish's out of
+## its curve (both by parameters leaving their curves, BlendEnd's).
+pub func blend_curve(start: const BlendEnd*, finish: const BlendEnd*, degree: i64, extra: usize) -> Spline!:
+    let a = start.continuity
+    let b = finish.continuity
+    if a < 0 or a > 4 or b < 0 or b > 4: error(invalid, "a blend's ends are G0 to G4")
+    if degree < 1 or degree > most_degree: error(invalid, "a blend's degree is 1 to 11")
+    if (a > degree or b > degree) and (a > 1 or b > 1):
+        var buffer: u8[120]
+        error(invalid, try strings.format(buffer, f"G{a if a > b else b} needs degree {a if a > b else b} or more"))
+    let chord = finish.jet.d[0].subtract(start.jet.d[0]).length()
+    if not (chord > 0.0): error(invalid, "a blend's ends are the same point")
+    let spans = blend_spans(degree, a, b) + extra
+    let p = (usize)degree
+    let n = p + spans
+    var knots = Growing[f64]()
+    defer knots.close()
+    try uniform_knots(degree, spans, 0.0, 1.0, &knots)
+    var points = Growing[Vector3]()
+    defer points.close()
+    try points.fill(n, Vector3())
+    var fixed = Growing[bool]()
+    defer fixed.close()
+    try fixed.fill(n, false)
+    # The start's derivatives as they are; the finish's turned to run with
+    # the blend (it arrives where its curve leaves).
+    let from_start = try end_targets(start, chord)
+    let leaving = try end_targets(finish, chord)
+    let into_finish = reversed_jet(&leaving)
+    var rows: f64[36]
+    var solved: Vector3[6] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    end_rows(knots.view(), n, p, (usize)a, false, &rows)
+    try solve_end(&rows, &from_start, (usize)a, &solved)
+    for i in 0..<(usize)a + 1:
+        points.items[i] = solved[i]
+        fixed.items[i] = true
+    end_rows(knots.view(), n, p, (usize)b, true, &rows)
+    try solve_end(&rows, &into_finish, (usize)b, &solved)
+    for i in 0..<(usize)b + 1:
+        points.items[n - 1 - i] = solved[i]
+        fixed.items[n - 1 - i] = true
+    # G0 at both ends leaves a parabola free under |B'''|^2: bend less.
+    try relax_free(knots.view(), p, &points, fixed.view(), 3 if a + b >= 1 else 2)
+    var weights = Growing[f64]()
+    defer weights.close()
+    try weights.fill(n, 1.0)
+    return try spline_of(points.view(), weights.view(), degree, knots.view())
+
+## The free control points of `points` (not `fixed`) placed to minimize
+## the integral of |B^(q)|^2 (q at most the degree), with
+## the fixed ones held (`order` the derivative, at most 3): the energy's
+## Gram matrix by Gauss quadrature on each span, then Gaussian elimination.
+pub func relax_free(knots: const f64[], degree: usize, points: Growing[Vector3]*, fixed: const bool[], order: usize) -> !:
+    let n = points.count
+    var free_index = Growing[i64]()
+    defer free_index.close()
+    var count: usize = 0
+    for i in 0..<n:
+        try free_index.push((i64)count if not fixed[i] else -1)
+        if not fixed[i]: count += 1
+    if count == 0: return
+    let q = fewer(fewer(order, 3), degree)
+    var gram = Growing[f64]()
+    defer gram.close()
+    try gram.fill(count * count, 0.0)
+    var rhs = Growing[Vector3]()
+    defer rhs.close()
+    try rhs.fill(count, Vector3())
+    # Four-point Gauss-Legendre on each span (exact to degree 7).
+    let nodes: f64[4] = [-0.8611363115940526, -0.3399810435848563, 0.3399810435848563, 0.8611363115940526]
+    let gauss: f64[4] = [0.3478548451374538, 0.6521451548625461, 0.6521451548625461, 0.3478548451374538]
+    for span in degree..<n:
+        let a = knots[span]
+        let b = knots[span + 1]
+        if not (b > a): continue
+        for g in 0..<(usize)4:
+            let t = (a + b) * 0.5 + (b - a) * 0.5 * nodes[g]
+            let weight = gauss[g] * (b - a) * 0.5
+            var ders: f64[48]
+            let first = basis_jet(knots, (i64)n, (i64)degree, t, false, &ders)
+            for x in 0..<degree + 1:
+                let i = first + x
+                let fi = free_index.items[i]
+                if fi < 0: continue
+                let di = ders[q * 12 + x]
+                for y in 0..<degree + 1:
+                    let j = first + y
+                    let dj = ders[q * 12 + y]
+                    let fj = free_index.items[j]
+                    if fj >= 0: gram.items[(usize)fi * count + (usize)fj] += weight * di * dj
+                    else: rhs.items[(usize)fi] = rhs.items[(usize)fi].subtract(points.items[j].multiply_scalar(weight * di * dj))
+    # Gaussian elimination with partial pivoting.
+    for col in 0..<count:
+        var pivot = col
+        for r in col + 1..<count:
+            if math.abs(gram.items[r * count + col]) > math.abs(gram.items[pivot * count + col]): pivot = r
+        if not (math.abs(gram.items[pivot * count + col]) > 1e-300): error(invalid, "a blend's free control points have no unique place")
+        if pivot != col:
+            for c in 0..<count:
+                let held = gram.items[col * count + c]
+                gram.items[col * count + c] = gram.items[pivot * count + c]
+                gram.items[pivot * count + c] = held
+            let kept = rhs.items[col]
+            rhs.items[col] = rhs.items[pivot]
+            rhs.items[pivot] = kept
+        for r in col + 1..<count:
+            let f = gram.items[r * count + col] / gram.items[col * count + col]
+            if f == 0.0: continue
+            for c in col..<count: gram.items[r * count + c] -= f * gram.items[col * count + c]
+            rhs.items[r] = rhs.items[r].subtract(rhs.items[col].multiply_scalar(f))
+    var r = count
+    while r > 0:
+        r -= 1
+        var sum = rhs.items[r]
+        for c in r + 1..<count: sum = sum.subtract(rhs.items[c].multiply_scalar(gram.items[r * count + c]))
+        rhs.items[r] = sum.multiply_scalar(1.0 / gram.items[r * count + r])
+    for i in 0..<n:
+        let fi = free_index.items[i]
+        if fi >= 0: points.items[i] = rhs.items[(usize)fi]
+
+## The jet of `s` at `t` by a parameter leaving it into a blend: toward
+## increasing parameters (`sign` 1: the blend runs on past the curve's
+## high end, the curve's part below `t` kept) or decreasing ones (-1).
+pub func leaving_jet(s: const Spline*, t: f64, sign: i64) -> Jet!:
+    let at = math.clamp(t, s.low(), s.high())
+    let j = try curve_jet(s, at, jet_order, sign > 0)
+    if sign < 0: return reversed_jet(&j)
+    return j

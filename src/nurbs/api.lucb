@@ -160,6 +160,29 @@ pub struct CadNurbs:
         let chosen = su if which == 1 else (sv if which == 2 else su.cross(sv))
         return chosen.normalized() catch failure: error(invalid, "this control vertex's surface is degenerate there")
 
+    ## Surface `surface`'s net as text (CadNetProbe's words); an analytic
+    ## surface's exact net over its faces.
+    pub static func surface_text(model: interop.Reference[CadModel], surface: i64) -> interop.Owned[str]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        let s = try surface_in(&w, surface)
+        var net = try (net_of(s) if s.kind == surface_spline else analytic_net(&w, (usize)surface))
+        defer net.close()
+        var out = Growing[u8]()
+        defer out.close()
+        try put_word(&out, (f64)net.du)
+        try put_word(&out, (f64)net.dv)
+        try put_word(&out, (f64)net.nu)
+        try put_word(&out, (f64)net.nv)
+        for k in net.ku.view(): try put_word(&out, k)
+        for k in net.kv.view(): try put_word(&out, k)
+        for q in net.points.view():
+            try put_word(&out, q.x)
+            try put_word(&out, q.y)
+            try put_word(&out, q.z)
+            try put_word(&out, q.w)
+        return try interop.copy_text((str)out.view())
+
     ## Control vertex cloud `cloud` (CadGeometry.cv_cloud) with points `ids`
     ## moved in `mode` (cv_world, cv_nuv, cv_slide, cv_project, cv_parallel,
     ## cv_view) by `amount`, the others following by `falloff`
@@ -167,13 +190,20 @@ pub struct CadNurbs:
     ## `reach` (rows along u and v in x and y, a distance in z) with
     ## `exponent` (rows and hull) or the radius curve `curve_kind`
     ## (cv_moves.lucb). CadGeometry.with_cv_cloud takes the moved cloud back.
-    pub static func cloud_moved(cloud: interop.Reference[Mesh], ids: const i64[], mode: i64, amount: Vector3, falloff: i64 = 0, reach: Vector3 = Vector3(), exponent: f64 = 1.0, curve_kind: i64 = 3) -> interop.Reference[Mesh]!:
+    pub static func cloud_moved(cloud: interop.Reference[Mesh], ids: const i64[], mode: i64, amount: Vector3, falloff: i64 = 0, reach: Vector3 = Vector3(), exponent: f64 = 1.0, curve_kind: i64 = 3, mirror: i64 = 0) -> interop.Reference[Mesh]!:
         if exponent < -5.0 or exponent > 5.0: error(invalid, "a falloff's exponent is -5 to 5")
-        return try moved_cvs(try cloud.get(), ids, mode, amount, falloff, reach, exponent, curve_kind)
+        if mirror < 0 or mirror > 3: error(invalid, "symmetry is none, X, Y or Z")
+        return try moved_cvs(try cloud.get(), ids, mode, amount, falloff, reach, exponent, curve_kind, mirror)
+
+    ## Cloud point `id`'s NUV frame: its surface's unit normal at its
+    ## Greville point (`which` 0), u (1) or v (2) tangent (cv_frame's, kept
+    ## with the cloud).
+    pub static func cloud_frame(cloud: interop.Reference[Mesh], id: i64, which: i64) -> Vector3!:
+        return try cv_surface_frame(try cloud.get(), id, which)
 
     ## Cloud point `id`'s hull frame: its net's normal there (`which` 0),
-    ## its u (1) or v (2) hull direction.
-    pub static func cloud_frame(cloud: interop.Reference[Mesh], id: i64, which: i64) -> Vector3!:
+    ## its u (1) or v (2) hull direction (Slide, Project, Parallel).
+    pub static func cloud_hull_frame(cloud: interop.Reference[Mesh], id: i64, which: i64) -> Vector3!:
         return try cv_hull_frame(try cloud.get(), id, which)
 
     ## The group expression of the row through cloud point `id`: along v
@@ -307,8 +337,13 @@ pub struct CadNurbs:
 
     ## Analytic surface `surface` (plane, cylinder, cone, sphere, torus) as
     ## an exact rational B-spline over its faces.
+    ## A face going round the surface's axis with no seam edge (a
+    ## sphere's cap) is split through the axis first, as Alias does when
+    ## it converts: each half then has a seam and a chart of its own.
     pub static func converted(model: interop.Reference[CadModel], surface: i64) -> interop.Reference[CadNurbsEdit]!:
-        var w = try shape_of(model.value())
+        let ready = try caps_split(model, surface)
+        defer ready.release()
+        var w = try shape_of(ready.value())
         defer w.close()
         _ = try surface_in(&w, surface)
         var net = try analytic_net(&w, (usize)surface)
@@ -327,6 +362,126 @@ pub struct CadNurbs:
             for f in 0..<w.faces.count:
                 if w.faces.items[f].surface == surface: w.faces.items[f].sense = not w.faces.items[f].sense
         return try edit_of(&w, surface, &net, true, 0.0, 0)
+
+## `model` with the faces of surface `surface` that go round its axis
+## without a seam (cap_faces) split by the plane through the axis; the
+## same model without any. The split keeps the surfaces' order.
+func caps_split(model: interop.Reference[CadModel], surface: i64) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model.value())
+    defer w.close()
+    let s = try surface_in(&w, surface)
+    var caps = Growing[usize]()
+    defer caps.close()
+    try cap_faces(&w, (usize)surface, &caps)
+    if caps.count == 0: return model.clone()
+    # Faces need names to be picked by: the unnamed ones get them.
+    let named = try CadModeling.tagged(model, "#nurbs")
+    defer named.release()
+    var n = try shape_of(named.value())
+    defer n.close()
+    var names = Growing[u8]()
+    defer names.close()
+    for f in caps.view():
+        if names.count > 0: try names.push(59)
+        for byte in n.face_name(f).bytes: try names.push(byte)
+    # The plane through the axis furthest from the caps' vertices (a cut
+    # through a vertex has nothing to split there).
+    var normal = s.y
+    var best = -1.0
+    for k in 0..<(usize)12:
+        let angle = math.pi * (f64)k / 12.0
+        let candidate = s.x.multiply_scalar(math.sin(angle)).add(s.y.multiply_scalar(math.cos(angle)))
+        var nearest = math.infinity
+        for f in caps.view():
+            for use in w.face_uses(f):
+                let e = w.edges.items[edge_index(use)]
+                for v in [e.start, e.end]: nearest = math.min(nearest, math.abs(w.points.items[(usize)v].subtract(s.origin).dot(candidate)))
+        if nearest > best:
+            best = nearest
+            normal = candidate
+    let split = try CadDirect.split_faces_by_plane(named, (str)names.view(), s.origin, normal, "#nurbs/cap")
+    var check = try shape_of(split.value())
+    defer check.close()
+    if check.surfaces.count != w.surfaces.count:
+        split.release()
+        error(invalid, "splitting the face through its axis changed the model's surfaces: split it yourself first")
+    return split
+
+## A surface's net as text (CadNurbs.surface_text), read back by
+## CadNetProbe on another thread or process: luced-3d's viewport draws
+## Insert Knot's isoparm under the pointer from it while the model stays
+## with its compute worker. Its words: du dv nu nv, the u knots, the v
+## knots, then each control point's x y z w (homogeneous).
+pub struct CadNetProbe:
+    var net: Net
+
+    pub func init():
+        self.net = empty_net()
+
+    pub func close():
+        self.net.close()
+
+    ## The net `text` (surface_text's) describes.
+    pub static func parse(text: str) -> interop.Reference[CadNetProbe]!:
+        let result = try interop.Reference[CadNetProbe].adopt(new CadNetProbe() in memory.heap, cad_net_probe_type, memory.heap)
+        let net = &result.value().net
+        var words = Growing[f64]()
+        defer words.close()
+        var start: usize = 0
+        let bytes = text.bytes
+        for at in 0..<bytes.length + 1:
+            if at < bytes.length and bytes[at] != 32 and bytes[at] != 10: continue
+            if at > start: try words.push(try strings.parse_f64((str)bytes[start..<at]))
+            start = at + 1
+        if words.count < 4: error(invalid, "a surface's text is too short")
+        net.du = (i64)words.items[0]
+        net.dv = (i64)words.items[1]
+        net.nu = (usize)words.items[2]
+        net.nv = (usize)words.items[3]
+        let ku = net.nu + (usize)net.du + 1
+        let kv = net.nv + (usize)net.dv + 1
+        if net.du < 1 or net.dv < 1 or net.du > most_degree or net.dv > most_degree or words.count != 4 + ku + kv + 4 * net.nu * net.nv: error(invalid, "a surface's text does not hold its net")
+        try net.ku.assign(words.view()[4..<4 + ku])
+        try net.kv.assign(words.view()[4 + ku..<4 + ku + kv])
+        let first = 4 + ku + kv
+        for k in 0..<net.nu * net.nv:
+            let w = words.items[first + 4 * k + 3]
+            try net.points.push(Weighted(words.items[first + 4 * k], words.items[first + 4 * k + 1], words.items[first + 4 * k + 2], w))
+        return result
+
+    ## The point at fractions (u, v) of its domain.
+    pub func point(u: f64, v: f64) -> Vector3:
+        let n = &self.net
+        return n.point_at(n.u_low() + (n.u_high() - n.u_low()) * u, n.v_low() + (n.v_high() - n.v_low()) * v)
+
+    ## Its distinct inner knots along `direction` (0 u, 1 v), as fractions.
+    pub func knot_count(direction: i64) -> i64:
+        var count: i64 = 0
+        let knots = self.net.ku.view() if direction == 0 else self.net.kv.view()
+        let low = self.net.u_low() if direction == 0 else self.net.v_low()
+        let high = self.net.u_high() if direction == 0 else self.net.v_high()
+        for k in 0..<knots.length:
+            if knots[k] > low and knots[k] < high and (k == 0 or knots[k] != knots[k - 1]): count += 1
+        return count
+
+    pub func knot(direction: i64, index: i64) -> f64!:
+        var count: i64 = 0
+        let knots = self.net.ku.view() if direction == 0 else self.net.kv.view()
+        let low = self.net.u_low() if direction == 0 else self.net.v_low()
+        let high = self.net.u_high() if direction == 0 else self.net.v_high()
+        for k in 0..<knots.length:
+            if knots[k] > low and knots[k] < high and (k == 0 or knots[k] != knots[k - 1]):
+                if count == index: return (knots[k] - low) / (high - low)
+                count += 1
+        error(invalid, "knot out of range")
+
+pub let cad_net_probe_type: interop.Type[CadNetProbe] = interop.Type[CadNetProbe]("CadNetProbe", CadNetProbe.close, closeable = true)
+
+## `value` and a space onto `out`.
+func put_word(out: Growing[u8]*, value: f64) -> !:
+    var buffer: u8[64]
+    for byte in (try strings.format_f64(value, buffer[0..])).bytes: try out.push(byte)
+    try out.push(32)
 
 ## Surface `index` of `w`, checked.
 func surface_in(w: const Shape*, index: i64) -> const Surface*!:
@@ -477,7 +632,12 @@ pub struct CadSpline:
 
 pub let cad_spline_type: interop.Type[CadSpline] = interop.Type[CadSpline]("CadSpline", CadSpline.close, closeable = true)
 
-func held_spline(curve: Spline) -> interop.Reference[CadSpline]!:
+## The spline a CadSpline holds (Base callers: luce_cad.curves).
+pub func spline_in(s: const CadSpline*) -> const Spline*:
+    return &s.curve
+
+## A held CadSpline taking `curve`.
+pub func held_spline(curve: Spline) -> interop.Reference[CadSpline]!:
     let result = try interop.Reference[CadSpline].adopt(new CadSpline() in memory.heap, cad_spline_type, memory.heap)
     var old = result.value().curve
     old.close()

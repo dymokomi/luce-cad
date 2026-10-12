@@ -1,0 +1,229 @@
+## CAD curves (surfacing Stage 2: luce_cad.curves, luce_cad.cad_curves)
+## against closed forms: Blend Curve's ends measure G0 to G4 by the
+## Check tools (CadMeasure.curve_join, by arc length) and take the control
+## points §6.2's table gives; a blend between a line and a circle is
+## tangent to the circle and as curved as it; an edge and an isoparm come
+## out exactly (a circle's radius to 1e-12); a curve on a face lies on it;
+## Attach Blend at 0.5 meets in the middle; Close and Stretch do what
+## Alias's do; curves as objects of a set place, filter and save.
+from luce_cad.curves import CadCurveTools
+from luce_cad.measure import CadMeasure
+from luce_cad.cad_curves import CadCurves
+from luce_cad.cad_geometry import CadGeometry
+from luce_cad.nurbs import CadSpline
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3, GeometryFile
+from luce_std import files, paths
+from luce_std import math
+
+pub func curve_tests() -> unit!:
+    blends()
+    from_models()
+    edits()
+    objects()
+    print("PASS CAD curves: blends measure G0-G4 with §6.2's control points, edges and isoparms exact, curves on faces lie on them, Attach meets at its bias, Close and Stretch, curves as set objects")
+
+## A quarter circle of radius 2 about the origin in XY, from (2, 0) to (0, 2).
+func quarter() -> CadSpline!:
+    let w = math.sqrt(0.5)
+    return CadSpline.make([Vector3(2.0, 0.0, 0.0), Vector3(2.0, 2.0, 0.0), Vector3(0.0, 2.0, 0.0)], [1.0, w, 1.0], 2, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+
+## A space curve (a twisted quintic) from (5, 0, 0) on.
+func twisted() -> CadSpline!:
+    return CadCurveTools.by_points([Vector3(5.0, 0.0, 0.0), Vector3(6.0, 1.0, 0.5), Vector3(7.0, 1.5, 1.5), Vector3(8.0, 1.0, 3.0), Vector3(9.0, -0.5, 3.5), Vector3(10.0, -1.0, 3.0)], 5)
+
+func blends() -> unit!:
+    let a = quarter()
+    let b = twisted()
+    # From the quarter's end (0, 2) on past it, into the twisted curve's start.
+    for g in 0..<5:
+        let made = CadCurveTools.blend(a, a.high(), 1, g, b, b.low(), -1, g, 5, [])
+        # §6.2's table: 6 + spans - 1 control points, spans from both ends.
+        let needed = 2 * (g + 1)
+        let spans = needed - 5 if needed > 6 else 1
+        assert(made.degree() == 5 and made.count() == 5 + spans, f"G{g}: {made.count()} control points")
+        assert(CadCurveTools.blend_span_count(5, g, g) == spans)
+        let start = CadMeasure.curve_join(a, a.high(), 1, made, made.low(), -1)
+        let finish = CadMeasure.curve_join(made, made.high(), 1, b, b.low(), -1)
+        assert(start.level >= g and finish.level >= g, f"G{g}: start reached G{start.level} ({start.angle} {start.curvature}% {start.rate}% {start.fourth}%), end G{finish.level} ({finish.angle} {finish.curvature}% {finish.rate}% {finish.fourth}%)")
+        # One order more is not met by chance on these curves.
+        if g < 4:
+            assert(start.level == g or finish.level == g, f"G{g} blend met G{start.level} and G{finish.level}")
+    # Mixed ends: G3 at the start, G1 at the end: one span (6 points).
+    let mixed = CadCurveTools.blend(a, a.high(), 1, 3, b, b.low(), -1, 1, 5, [])
+    assert(mixed.count() == 6)
+    assert(CadMeasure.curve_join(a, a.high(), 1, mixed, mixed.low(), -1).level >= 3 and CadMeasure.curve_join(mixed, mixed.high(), 1, b, b.low(), -1).level >= 1)
+    # Explicit Control: a single span of degree 7 at G3 both ends.
+    let single = CadCurveTools.blend(a, a.high(), 1, 3, b, b.low(), -1, 3, 7, [])
+    assert(single.degree() == 7 and single.count() == 8)
+    assert(CadMeasure.curve_join(a, a.high(), 1, single, single.low(), -1).level >= 3)
+    # Closed form: a G2 blend leaving the circle has the circle's curvature
+    # (1/2) and tangent (-1, 0, 0) where it starts.
+    let g2 = CadCurveTools.blend(a, a.high(), 1, 2, b, b.low(), -1, 2, 5, [])
+    let d1 = CadCurveTools.derivative(g2, g2.low(), 1)
+    let d2 = CadCurveTools.derivative(g2, g2.low(), 2)
+    let speed = d1.length()
+    let kappa = d1.cross(d2).length() / (speed * speed * speed)
+    assert(math.abs(kappa - 0.5) < 1e-9 and d1.multiply_scalar(1.0 / speed).subtract(Vector3(-1.0, 0.0, 0.0)).length() < 1e-12, f"{kappa} {d1}")
+    # The start's tangent is as long as the chord (Relax), scaled by the
+    # shape's numbers.
+    let chord = b.at(b.low()).subtract(a.at(a.high())).length()
+    assert(math.abs(speed - chord) < 1e-9)
+    let tight = CadCurveTools.blend(a, a.high(), 1, 2, b, b.low(), -1, 2, 5, [0.5, 0.5, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0])
+    assert(math.abs(CadCurveTools.derivative(tight, tight.low(), 1).length() - chord * 0.5) < 1e-9)
+    assert(CadMeasure.curve_join(a, a.high(), 1, tight, tight.low(), -1).level >= 2)
+    # From an end the curve reaches backwards: the quarter's start (2, 0),
+    # leaving it downward.
+    let back = CadCurveTools.blend(a, a.low(), -1, 2, b, b.low(), -1, 2, 5, [])
+    assert(back.at(back.low()).subtract(Vector3(2.0, 0.0, 0.0)).length() < 1e-12)
+    assert(CadMeasure.curve_join(a, a.low(), -1, back, back.low(), -1).level >= 2)
+    # G4 at degree 3 is refused, saying why.
+    var refused = ""
+    _ = CadCurveTools.blend(a, a.high(), 1, 4, b, b.low(), -1, 4, 3, []) catch failure:
+        refused = failure.message
+        recover a
+    assert(refused.contains("degree 4"), refused)
+
+func from_models() -> unit!:
+    # A cylinder's top rim: a circle of radius 3, exactly.
+    let body = CadModeling.tagged(CadSolids.cylinder(3.0, 4.0), "c")
+    var rim: CadSpline? = none
+    for e in 0..<body.edge_count():
+        # (A seam edge, with the side on both of its sides, has no reference.)
+        var reference = ""
+        reference = CadModeling.edge_references(body, [e]) catch failure:
+            recover ""
+        if reference == "":
+            continue
+        let curve = CadCurveTools.edge(body, reference)
+        let p = curve.at((curve.low() + curve.high()) * 0.5)
+        if math.abs(p.y - 2.0) < 1e-9 and math.abs(math.hypot(p.x, p.z) - 3.0) < 1e-9:
+            rim = curve
+    let circle = rim else trap("no rim edge")
+    for k in 0..<33:
+        let p = circle.at(circle.low() + (circle.high() - circle.low()) * float(k) / 32.0)
+        assert(math.abs(math.hypot(p.x, p.z) - 3.0) < 1e-12 and math.abs(p.y - 2.0) < 1e-12, f"{p}")
+    # The side's isoparm halfway up: a circle of radius 3 at y = 0; across
+    # it a line from bottom to top.
+    let side = side_face(body)
+    let ring = CadCurveTools.isoparm(body, side, 1, 0.5)
+    for k in 0..<17:
+        let p = ring.at(ring.low() + (ring.high() - ring.low()) * float(k) / 16.0)
+        assert(math.abs(math.hypot(p.x, p.z) - 3.0) < 1e-12 and math.abs(p.y) < 1e-12, f"ring {p}")
+    let line = CadCurveTools.isoparm(body, side, 0, 0.25)
+    assert(math.abs(line.at(line.low()).y - line.at(line.high()).y) > 3.999)
+    # A curve on the side: chart (angle, height) points through a diagonal;
+    # its 3D curve lies on the cylinder within its tolerance.
+    let chart = CadCurveTools.through([Vector3(0.2, -1.5, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(2.0, 1.5, 0.0)], 5)
+    let on = CadCurveTools.on_face(body, side, chart, 0.00001)
+    for k in 0..<65:
+        let p = on.at(on.low() + (on.high() - on.low()) * float(k) / 64.0)
+        assert(math.abs(math.hypot(p.x, p.z) - 3.0) < 0.00002, f"off the cylinder: {p}")
+    let start = CadCurveTools.face_point(body, side, Vector3(0.2, -1.5, 0.0))
+    assert(on.at(on.low()).subtract(start).length() < 1e-9)
+    # The face a point drawn on the side lies on, a little off its exact
+    # surface (a click lands on the tessellation); none in the air, nor on
+    # the side's surface below the face.
+    let inside = CadCurveTools.face_point(body, side, Vector3(0.2, 1.0, 0.0))
+    assert(CadCurveTools.face_at(body, Vector3(inside.x * 1.0005, inside.y, inside.z * 1.0005)) == side)
+    assert(CadCurveTools.face_at(body, start) == "")
+    assert(CadCurveTools.face_at(body, Vector3(9.0, 9.0, 9.0)) == "")
+    let uv = CadCurveTools.face_uv(body, side, start)
+    assert(math.abs(uv.x - 0.2) < 1e-9 and math.abs(uv.y + 1.5) < 1e-9, f"{uv}")
+
+## The cylinder's side face's name.
+func side_face(body: CadModel) -> str!:
+    for f in 0..<body.face_count():
+        let name = CadModeling.face_name_of(body, f)
+        let at = CadModeling.face_point(body, name)
+        if at.found and math.abs(at.normal.y) < 1e-6:
+            return name
+    trap("no side face")
+
+func edits() -> unit!:
+    # Attach Blend at 0.5: two lines apart by a gap meet in its middle,
+    # tangent there.
+    let left = CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0), Vector3(3.0, 0.0, 0.0)], 3)
+    let right = CadCurveTools.by_points([Vector3(3.0, 1.0, 0.0), Vector3(4.0, 1.2, 0.0), Vector3(5.0, 1.4, 0.0), Vector3(6.0, 1.6, 0.0)], 3)
+    let joined = CadCurveTools.attached(left, right, true, 0.5, 1)
+    let middle = Vector3(3.0, 0.5, 0.0)
+    let at = CadCurveTools.nearest(joined, middle)
+    assert(joined.at(at).subtract(middle).length() < 1e-9, f"{joined.at(at)}")
+    assert(joined.at(joined.low()).length() < 1e-12 and joined.at(joined.high()).subtract(Vector3(6.0, 1.6, 0.0)).length() < 1e-12)
+    # G1 across the joint (the joint is a full knot: checked from both sides).
+    let joint = CadMeasure.curve_join(joined, at, 1, joined, at, -1)
+    assert(joint.level >= 1 and joint.gap < 1e-12, f"joint G{joint.level} {joint.angle}")
+    # Attach Blend at 0 leaves the first curve's end where it was.
+    let kept = CadCurveTools.attached(left, right, true, 0.0, 2)
+    assert(kept.at(CadCurveTools.nearest(kept, Vector3(3.0, 0.0, 0.0))).subtract(Vector3(3.0, 0.0, 0.0)).length() < 1e-9)
+    # Connect: the ends kept, a straight span between.
+    let connected = CadCurveTools.attached(left, right, false)
+    let bridge = connected.at(CadCurveTools.nearest(connected, Vector3(3.0, 0.5, 0.0)))
+    assert(bridge.subtract(Vector3(3.0, 0.5, 0.0)).length() < 1e-9 and connected.degree() == 3)
+    # Close with Preserve Shape: the curve's own points stay; it ends where
+    # it starts, G2 at both joints.
+    let arc = quarter()
+    let closed = CadCurveTools.closed(arc, true)
+    assert(closed.at(closed.low()).subtract(closed.at(closed.high())).length() < 1e-12)
+    assert(closed.at(CadCurveTools.nearest(closed, Vector3(math.sqrt(2.0), math.sqrt(2.0), 0.0))).subtract(Vector3(math.sqrt(2.0), math.sqrt(2.0), 0.0)).length() < 1e-9)
+    let seam = CadMeasure.curve_join(closed, closed.high(), 1, closed, closed.low(), -1)
+    assert(seam.level >= 2, f"closed seam G{seam.level}")
+    # Close without: the ends meet halfway, G1.
+    let met = CadCurveTools.closed(arc, false)
+    assert(met.at(met.low()).subtract(Vector3(1.0, 1.0, 0.0)).length() < 1e-9 and CadMeasure.curve_join(met, met.high(), 1, met, met.low(), -1).level >= 1)
+    # Stretch: both ends moved, locked; they land exactly, the control
+    # points keep their count, and the middle follows halfway.
+    let line = CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(2.0, 0.0, 0.0), Vector3(3.0, 0.0, 0.0), Vector3(4.0, 0.0, 0.0), Vector3(5.0, 0.0, 0.0)], 5)
+    let pulled = CadCurveTools.stretched(line, [line.low(), line.high()], [Vector3(0.0, 0.0, 0.0), Vector3(0.0, 2.0, 0.0)], false)
+    assert(pulled.count() == line.count() and pulled.at(pulled.high()).subtract(Vector3(5.0, 2.0, 0.0)).length() < 1e-12 and pulled.at(pulled.low()).length() < 1e-12)
+    let half = pulled.at((pulled.low() + pulled.high()) * 0.5)
+    assert(math.abs(half.y - 1.0) < 1e-9, f"{half}")
+    # Reverse: the same points the other way.
+    let turned = CadCurveTools.reversed(arc)
+    assert(turned.at(turned.low()).subtract(arc.at(arc.high())).length() < 1e-12)
+
+func objects() -> unit!:
+    let body = CadSolids.box(2.0, 2.0, 2.0)
+    var held = CadGeometry.of_model(body)
+    held = CadCurves.with_curve(held, "Curve1", quarter(), source = "points")
+    held = CadCurves.with_curve(held, "Curve2", twisted())
+    assert(CadCurves.count(held) == 2 and CadCurves.find(held, "Curve2") == 1 and CadCurves.free_name(held, "Curve") == "Curve3")
+    # Replacing keeps its place; hiding and removing.
+    held = CadCurves.with_curve(held, "Curve1", twisted())
+    assert(CadCurves.find(held, "Curve1") == 0 and CadCurves.curve(held, 0).count() == 6)
+    held = CadCurves.with_visible(held, "Curve2", false)
+    assert(not CadCurves.visible(held, 1))
+    # The pick mesh: shown curves only, every edge tagged with its curve.
+    let picks = CadCurves.pick_mesh(held)
+    assert(picks.face_count() > 0 and picks.find_attribute("cad_curve", 4) >= 0)
+    # The CV cloud carries the box's CVs and the curves' after them.
+    let cloud = CadGeometry.cv_cloud(held)
+    assert(cloud.point_count() == body.cv_count() + 12, f"{cloud.point_count()}")
+    # Moving a curve's control point through the cloud moves it alone.
+    let points: list[Vector3] = []
+    for i in 0..<cloud.point_count():
+        points.append(cloud.point(i))
+    points[cloud.point_count() - 1] = points[cloud.point_count() - 1].add(Vector3(0.0, 1.0, 0.0))
+    let moved = CadGeometry.with_cv_cloud(held, cloud, cloud.with_positions(points))
+    assert(CadCurves.curve(moved, 1).point(5).subtract(twisted().point(5).add(Vector3(0.0, 1.0, 0.0))).length() < 1e-6)
+    assert(CadCurves.curve(moved, 0).point(5).subtract(twisted().point(5)).length() < 1e-12)
+    # Placed with the set: moved 3 along x.
+    let placed = held.transformed(Vector3(3.0, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    assert(CadCurves.curve(placed, 1).point(0).subtract(twisted().point(0).add(Vector3(3.0, 0.0, 0.0))).length() < 1e-12)
+    # Saved in a geometry file and read back, hidden curves hidden.
+    let scratch = files.TemporaryDirectory()
+    let saved = paths.join(scratch.path(), "curves.prism")
+    _ = GeometryFile.save(held, saved)
+    let loaded = GeometryFile.load(saved)
+    assert(CadCurves.count(loaded) == 2 and CadCurves.name(loaded, 1) == "Curve2" and not CadCurves.visible(loaded, 1))
+    assert(CadCurves.curve(loaded, 1).deviation(twisted()) < 1e-12 and CadCurves.source(loaded, 0) == "")
+    # A curve on a face keeps its face and chart curve.
+    let chart = CadCurveTools.through([Vector3(0.1, 0.2, 0.0), Vector3(0.5, 0.6, 0.0)], 5)
+    let face = CadModeling.face_name_of(CadModeling.tagged(body, "b"), 0)
+    let tagged = CadGeometry.of_model(CadModeling.tagged(body, "b"))
+    let on = CadCurves.with_curve(tagged, "Curve4", CadCurveTools.on_face(CadModeling.tagged(body, "b"), face, chart), face = face, chart = chart)
+    assert(CadCurves.face(on, 0) == face and CadCurves.chart_curve(on, 0).count() == 2)
+    held = CadCurves.without_curve(held, "Curve2")
+    assert(CadCurves.count(held) == 1)

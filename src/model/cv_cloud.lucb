@@ -8,7 +8,8 @@
 ## every face they do not reach. A moved cv takes its exact old position
 ## plus the cloud point's change.
 ##
-## Each point carries where it is in its net: `cad_cv_model` (the model's
+## Each point carries its surface's frame at its Greville point
+## (`cad_cv_normal`, `cad_cv_du`, `cad_cv_dv`), and where it is in its net: `cad_cv_model` (the model's
 ## index in the set), `cad_cv_surface` (its surface), `cad_cv_u` and
 ## `cad_cv_v` (its row and column) and `cad_cv_nu` and `cad_cv_nv` (the
 ## net's size), so a pick can take a whole row (Alias's hull picking) and
@@ -17,11 +18,14 @@
 ## The detail attribute that marks a cv cloud.
 let cloud_marker = ".cad_cvs"
 
-## The cloud of `models`' cvs.
-pub func cloud_mesh(models: const interop.Reference[CadModel][]) -> interop.Reference[Mesh]!:
+## The cloud of `models`' cvs, then `extra_points` (a set's curves' cvs,
+## cad_curves.lucb) with their places (six numbers a point, as
+## net_places) and frames (three vectors a point).
+pub func cloud_mesh(models: const interop.Reference[CadModel][], extra_points: const Vector3[], extra_places: const f64[], extra_frames: const Vector3[]) -> interop.Reference[Mesh]!:
     var points = Growing[Vector3]()
     defer points.close()
     for model in models: try placed_cvs(model.value(), &points)
+    for point in extra_points: try points.push(point)
     var builder = try MeshBuilder()
     defer builder.close()
     for point in points.view(): _ = try builder.point(point)
@@ -30,6 +34,12 @@ pub func cloud_mesh(models: const interop.Reference[CadModel][]) -> interop.Refe
     var places = Growing[f64]()
     defer places.close()
     for at in 0..<models.length: try net_places(models[at].value(), at, &places)
+    for value in extra_places: try places.push(value)
+    var frames = Growing[Vector3]()
+    defer frames.close()
+    for model in models: try placed_cv_frames(model.value(), &frames)
+    for frame in extra_frames: try frames.push(frame)
+    if places.count != points.count * 6 or frames.count != points.count * 3: error(invalid, "a control vertex cloud's places do not match its points")
     var named = bare.clone()
     let names: str[6] = ["cad_cv_model", "cad_cv_surface", "cad_cv_u", "cad_cv_v", "cad_cv_nu", "cad_cv_nv"]
     var column = Growing[f64]()
@@ -38,6 +48,20 @@ pub func cloud_mesh(models: const interop.Reference[CadModel][]) -> interop.Refe
         column.clear()
         for at in 0..<points.count: try column.push(places.items[at * 6 + k])
         let next = named.value().with_attribute(names[k], 0, 1, column.view()) catch failure:
+            named.release()
+            error(failure.code, failure.message)
+        named.release()
+        named = next
+    # The surface frames NUV moves along (Alias's): normal, u and v.
+    let frame_names: str[3] = ["cad_cv_normal", "cad_cv_du", "cad_cv_dv"]
+    for k in 0..<(usize)3:
+        column.clear()
+        for at in 0..<points.count:
+            let f = frames.items[at * 3 + k]
+            try column.push(f.x)
+            try column.push(f.y)
+            try column.push(f.z)
+        let next = named.value().with_attribute(frame_names[k], 0, 3, column.view()) catch failure:
             named.release()
             error(failure.code, failure.message)
         named.release()
@@ -70,8 +94,10 @@ pub func is_cloud(mesh: const Mesh*) -> bool:
     return mesh.face_count() == 0 and mesh.find_attribute(cloud_marker, (i64)(u8)Domain.detail) >= 0
 
 ## `models` with the cvs `after` moved relative to `before` (both clouds of
-## `models`), into `out`; a model none of whose cvs moved is shared.
-pub func moved_models(models: const interop.Reference[CadModel][], before: const Mesh*, after: const Mesh*, out: Growing[interop.Reference[CadModel]]*) -> !:
+## `models`, perhaps with a set's curves' cvs after theirs), into `out`; a
+## model none of whose cvs moved is shared. Returns where the models'
+## cvs end in the cloud.
+pub func moved_models(models: const interop.Reference[CadModel][], before: const Mesh*, after: const Mesh*, out: Growing[interop.Reference[CadModel]]*) -> usize!:
     let old_points = before.point_span()
     let new_points = after.point_span()
     if old_points.length != new_points.length: error(invalid, "the control vertex cloud changed its point count")
@@ -109,4 +135,5 @@ pub func moved_models(models: const interop.Reference[CadModel][], before: const
         out.push(result) catch failure:
             result.release()
             error(failure.code, failure.message)
-    if first != old_points.length: error(invalid, "the control vertex cloud does not match its models")
+    if first > old_points.length: error(invalid, "the control vertex cloud does not match its models")
+    return first

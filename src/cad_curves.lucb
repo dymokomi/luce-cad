@@ -1,0 +1,667 @@
+## CAD curves as objects of a geometry set (surfacing Stage 2; the owner's
+## answer: free 3D curves and curves on surfaces beside sketches and
+## bodies): Alias's free curves, blend curves and curves on surface. A
+## set's curve component holds named curves, each an exact rational
+## B-spline (luce_cad.nurbs' homogeneous form), whether it shows, where it
+## came from (a source text: "edge <reference>", "isoparm <face> u 0.5",
+## "blend", "points"...) and, for a curve on a face, the face's name and
+## the curve in that face's chart coordinates (its 3D curve then fitted to
+## the surface along it, curves.face_curve).
+##
+## The component places with the set (control points moved, chart curves
+## kept), joins, filters by name as an object path, and is saved in
+## geometry files (element `cad_curves`, a child per curve). Luce reaches
+## it through `CadCurves`; luced-3d draws its curves (curve_lines), picks
+## them (pick_mesh) and edits their control points in the CV cloud
+## (cad_geometry.lucb's cv_cloud).
+import interop
+import memory
+from luce_std import math
+from luce_geocore.geocore import Vector3, Matrix4, Bounds, Mesh, invalid, GeometrySet
+from luce_geocore.core.growing import Growing
+from luce_geocore.core.shared import Column
+import ownership
+from luce_geocore.geocore import MeshBuilder
+from luce_geocore.kernel import ComponentType, Placement, IdSet, TableBuilder, PathFilter, Domain, Float3, dtype_float64
+from luce_geocore.kernel import adopt_set, dispose_set, append_text, append_number, text_attribute
+from luce_geocore.kernel import register_codec, GeometryWriter, GeometryReader
+from geometry import push_decimal, surface_jet, surface_point, nearest_parameters, chart_uv, surface_spline
+from nurbs import Spline, Weighted, CadSpline, held_spline, spline_in, empty_spline, weighted
+from curves import face_curve, curve_jet
+from model import CadModel
+from modeling import Shape, shape_of
+
+## One curve: its name (unique in the set), its spline, whether it shows,
+## its source, and for a curve on a face the face and the chart curve
+## (`uv`, no points when it is free).
+struct CurveEntry:
+    var name: Growing[u8]
+    var curve: Spline
+    var visible: bool
+    var source: Growing[u8]
+    var face: Growing[u8]
+    var uv: Spline
+
+    func close():
+        self.name.close()
+        self.curve.close()
+        self.source.close()
+        self.face.close()
+        self.uv.close()
+
+    func on_face() -> bool:
+        return self.face.count > 0 and self.uv.points.count > 0
+
+## A copy of entry parts.
+func make_entry(name: str, curve: const Spline*, visible: bool, source: str, face: str, uv: const Spline*?) -> CurveEntry!:
+    var entry = CurveEntry(Growing[u8](), empty_spline(1), visible, Growing[u8](), Growing[u8](), empty_spline(1))
+    errdefer entry.close()
+    try entry.name.assign(name.bytes)
+    entry.curve.close()
+    entry.curve = try curve.copy()
+    try entry.source.assign(source.bytes)
+    try entry.face.assign(face.bytes)
+    if let chart = uv:
+        entry.uv.close()
+        entry.uv = try chart.copy()
+    return entry
+
+## A set's curves: immutable once published; each owner has its own copy.
+pub struct CurveList:
+    var entries: Growing[CurveEntry]
+
+    func add_entry(entry: const CurveEntry*) -> !:
+        var made = try make_entry((str)entry.name.view(), &entry.curve, entry.visible, (str)entry.source.view(), (str)entry.face.view(), &entry.uv if entry.on_face() else none)
+        self.entries.push(made) catch failure:
+            made.close()
+            error(failure.code, failure.message)
+
+    func find(name: str) -> usize?:
+        for at in 0..<self.entries.count:
+            if (str)self.entries.items[at].name.view() == name: return at
+        return none
+
+func new_list() -> CurveList*!:
+    let storage = try new CurveList[1] --- in memory.heap
+    storage[0].entries = Growing[CurveEntry]()
+    return storage.data
+
+pub let curve_component: ComponentType = ComponentType("cad_curves", share_list, close_list, list_size, list_bytes, list_bounds, place_list, join_lists, list_paths, filter_list, describe_list,
+                                                       "", trace_nothing)
+
+## Curves hold no Luce objects.
+func trace_nothing(data: const void*, visit: func(ownership.Object*, void*) -> unit, context: void*):
+    _ = data
+    _ = visit
+    _ = context
+
+func share_list(data: const void*) -> void*!:
+    let copy = try new_list()
+    errdefer close_list((void*)copy)
+    for entry in ((const CurveList*)data).entries.view(): try copy.add_entry(&entry)
+    return (void*)copy
+
+func close_list(data: void*):
+    let list = (CurveList*)data
+    for at in 0..<list.entries.count: list.entries.items[at].close()
+    list.entries.close()
+    free(CurveList[](list, 1)) in memory.heap
+
+func list_size(data: const void*) -> usize:
+    return ((const CurveList*)data).entries.count
+
+func list_bytes(data: const void*, ids: IdSet*) -> usize!:
+    _ = ids
+    var total: usize = 64
+    for entry in ((const CurveList*)data).entries.view(): total += entry.name.count + entry.curve.points.count * 32 + entry.curve.knots.count * 8 + entry.uv.points.count * 32 + 96
+    return total
+
+## The bounds of the curves' control points (a curve lies in its hull).
+func list_bounds(data: const void*, matrix: Matrix4, out: Bounds*) -> bool!:
+    var any = false
+    var low = Vector3()
+    var high = Vector3()
+    for entry in ((const CurveList*)data).entries.view():
+        for q in entry.curve.points.view():
+            let p = matrix.transform_point(q.point())
+            if not any:
+                low = p
+                high = p
+                any = true
+            low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+            high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    if any: *out = Bounds(low, high)
+    return any
+
+## Each curve's control points placed (weights kept: a placement is
+## affine, which a rational curve follows exactly); chart curves kept.
+func place_list(data: const void*, placement: const Placement*) -> void*!:
+    let placed = try new_list()
+    errdefer close_list((void*)placed)
+    for entry in ((const CurveList*)data).entries.view():
+        var moved = try entry.curve.copy()
+        defer moved.close()
+        for k in 0..<moved.points.count:
+            let q = moved.points.items[k]
+            moved.points.items[k] = weighted(placement.matrix.transform_point(q.point()), q.w)
+        var made = try make_entry((str)entry.name.view(), &moved, entry.visible, (str)entry.source.view(), (str)entry.face.view(), &entry.uv if entry.on_face() else none)
+        placed.entries.push(made) catch failure:
+            made.close()
+            error(failure.code, failure.message)
+    return (void*)placed
+
+func join_lists(first: const void*, second: const void*) -> void*!:
+    let joined = try new_list()
+    errdefer close_list((void*)joined)
+    for entry in ((const CurveList*)first).entries.view(): try joined.add_entry(&entry)
+    for entry in ((const CurveList*)second).entries.view(): try joined.add_entry(&entry)
+    return (void*)joined
+
+## Curve names are their object paths.
+func list_paths(data: const void*, out: TableBuilder*) -> !:
+    for entry in ((const CurveList*)data).entries.view():
+        if entry.name.count > 0: _ = try out.intern((str)entry.name.view())
+
+func filter_list(data: const void*, filter: const PathFilter*, keep: bool) -> void*!:
+    let filtered = try new_list()
+    errdefer close_list((void*)filtered)
+    for entry in ((const CurveList*)data).entries.view():
+        let selected = filter.is_empty() or filter.matches((str)entry.name.view())
+        if selected == keep: try filtered.add_entry(&entry)
+    return (void*)filtered
+
+func describe_list(data: const void*, out: Growing[u8]*) -> !:
+    let count = ((const CurveList*)data).entries.count
+    try append_number(out, count)
+    try append_text(out, " CAD curve" if count == 1 else " CAD curves")
+
+# -- Geometry files: element `cad_curves`, a child `c<i>` per curve.
+
+## `s` as properties `<prefix>_degree`, `_knots` and `_points` (the
+## homogeneous points, four numbers each).
+func write_spline(writer: GeometryWriter*, uv: bool, s: const Spline*) -> !:
+    try writer.crate.integer("uv_degree" if uv else "curve_degree", s.degree)
+    let knots = s.knots.view()
+    try writer.column("uv_knots" if uv else "curve_knots", dtype_float64, knots.length, 1, u8[]((u8*)knots.data, knots.length * 8))
+    let points = s.points.view()
+    try writer.column("uv_points" if uv else "curve_points", dtype_float64, points.length, 4, u8[]((u8*)points.data, points.length * 32))
+
+func encode_list(data: const void*, writer: GeometryWriter*, path: str) -> !:
+    let list = (const CurveList*)data
+    try writer.crate.element(path, "cad_curves")
+    try writer.crate.integer("count", (i64)list.entries.count)
+    var base = Growing[u8]()
+    defer base.close()
+    try base.assign(path.bytes)
+    var name = Growing[u8]()
+    defer name.close()
+    for index in 0..<list.entries.count:
+        let entry = &list.entries.items[index]
+        try name.assign("c".bytes)
+        try push_decimal(&name, (i64)index)
+        try writer.crate.element(try writer.child((str)base.view(), (str)name.view()), "cad_curve")
+        try writer.crate.text("name", (str)entry.name.view())
+        try writer.crate.text("source", (str)entry.source.view())
+        try writer.crate.text("face", (str)entry.face.view())
+        try writer.crate.integer("visible", 1 if entry.visible else 0)
+        try write_spline(writer, false, &entry.curve)
+        if entry.on_face(): try write_spline(writer, true, &entry.uv)
+
+func decode_list(reader: GeometryReader*, path: str) -> void*!:
+    let list = try new_list()
+    errdefer close_list((void*)list)
+    var base = Growing[u8]()
+    defer base.close()
+    try base.assign(path.bytes)
+    while let header = try reader.next_property(): _ = header
+    while let child = try reader.next_child((str)base.view()):
+        _ = child
+        var entry = CurveEntry(Growing[u8](), empty_spline(1), true, Growing[u8](), Growing[u8](), empty_spline(1))
+        errdefer entry.close()
+        while let header = try reader.next_property():
+            if header.name == "name": try reader.text(header, &entry.name)
+            elif header.name == "source": try reader.text(header, &entry.source)
+            elif header.name == "face": try reader.text(header, &entry.face)
+            elif header.name == "visible": entry.visible = (try reader.integer(header)) != 0
+            elif header.name == "curve_degree": entry.curve.degree = try reader.integer(header)
+            elif header.name == "uv_degree": entry.uv.degree = try reader.integer(header)
+            elif header.name == "curve_knots" or header.name == "uv_knots":
+                var column = try reader.column[f64](header)
+                defer column.release()
+                if header.name == "curve_knots": try entry.curve.knots.assign(column.view())
+                else: try entry.uv.knots.assign(column.view())
+            elif header.name == "curve_points" or header.name == "uv_points":
+                var column = try reader.column[Weighted](header)
+                defer column.release()
+                if header.name == "curve_points": try entry.curve.points.assign(column.view())
+                else: try entry.uv.points.assign(column.view())
+        if entry.curve.points.count < 2 or entry.curve.knots.count != entry.curve.points.count + (usize)entry.curve.degree + 1: error(invalid, "a saved CAD curve is incomplete")
+        try list.entries.push(entry)
+    return (void*)list
+
+# -- Reading a set's curves.
+
+func list_of(set: const GeometrySet*) -> const CurveList*?:
+    let data = set.find(&curve_component) else return none
+    return (const CurveList*)data
+
+func entry_at(set: interop.Reference[GeometrySet], index: i64) -> const CurveEntry*!:
+    let list = list_of(try set.get()) else error(invalid, "the geometry has no CAD curves")
+    if index < 0 or (usize)index >= list.entries.count: error(invalid, "CAD curve index out of range")
+    return &list.entries.items[(usize)index]
+
+## `set` with `list` as its curves (none when empty, which is closed).
+func with_list(set: const GeometrySet*, list: CurveList*) -> interop.Reference[GeometrySet]!:
+    let result = set.storage() catch failure:
+        close_list((void*)list)
+        error(failure.code, failure.message)
+    result.remove(&curve_component)
+    if list.entries.count == 0:
+        close_list((void*)list)
+    else:
+        result.put(&curve_component, (void*)list) catch failure:
+            close_list((void*)list)
+            dispose_set(result)
+            error(failure.code, failure.message)
+    return try adopt_set(result)
+
+## Samples a span when drawn.
+let per_span: usize = 24
+
+## Each shown curve as line segments (point pairs) placed by `matrix`,
+## onto `out`: luced-3d's curve batch. A curve on a face of `models` is
+## lifted off it along its normal by a five-hundredth of the curve's size,
+## so the face's own shading does not hide it.
+pub func curve_lines(set: const GeometrySet*, models: const interop.Reference[CadModel][], matrix: Matrix4, out: Growing[Vector3]*) -> !:
+    let list = list_of(set) else return
+    for entry in list.entries.view():
+        if not entry.visible: continue
+        var samples = Growing[Vector3]()
+        defer samples.close()
+        try sample_curve(&entry.curve, &samples)
+        if entry.on_face():
+            try lifted(&entry, models, &samples)
+        for k in 1..<samples.count:
+            try out.push(matrix.transform_point(samples.items[k - 1]))
+            try out.push(matrix.transform_point(samples.items[k]))
+
+## A curve on a face's samples (sample_curve's, along its 3D curve) moved
+## off the face along its normal there (none when the face is gone).
+func lifted(entry: const CurveEntry*, models: const interop.Reference[CadModel][], samples: Growing[Vector3]*) -> !:
+    let home = try face_home(models, (str)entry.face.view()) else return
+    let (model, surface) = home
+    var w = try shape_of(models[model].value())
+    defer w.close()
+    let s = &w.surfaces.items[surface]
+    var low = samples.items[0]
+    var high = low
+    for p in samples.view():
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    let lift = math.max(1e-6, high.subtract(low).length() * 0.002)
+    let sense = face_sense(&w, (str)entry.face.view())
+    for i in 0..<samples.count:
+        let p = samples.items[i]
+        # Seeded by the chart curve at the same fraction of its domain.
+        let seed = entry.uv.point_at(entry.uv.low() + (entry.uv.high() - entry.uv.low()) * (f64)i / (f64)math.max(1.0, (f64)(samples.count - 1)))
+        var uv = Vector3(seed.x, seed.y, 0.0)
+        if s.kind == surface_spline: uv = nearest_parameters(*s, p, uv, false) catch failure: recover uv
+        else: uv = chart_uv(*s, p, uv, true)
+        let jet = surface_jet(s, uv, false, false) catch failure: continue
+        let normal = jet.su.cross(jet.sv).normalized() catch failure: continue
+        # Toward the outside: a face reversed on its surface turns it.
+        samples.items[i] = p.add(normal.multiply_scalar(lift * sense))
+
+## 1 when the face named `face` faces along its surface's normal, else -1.
+func face_sense(w: const Shape*, face: str) -> f64:
+    for f in 0..<w.faces.count:
+        if w.face_name(f) == face: return 1.0 if w.faces.items[f].sense else -1.0
+    return 1.0
+
+## Each shown curve's control polygon (point pairs) placed by `matrix`.
+pub func curve_hulls(set: const GeometrySet*, matrix: Matrix4, out: Growing[Vector3]*) -> !:
+    let list = list_of(set) else return
+    for entry in list.entries.view():
+        if not entry.visible: continue
+        for k in 1..<entry.curve.points.count:
+            try out.push(matrix.transform_point(entry.curve.points.items[k - 1].point()))
+            try out.push(matrix.transform_point(entry.curve.points.items[k].point()))
+
+## Points along `s`: per_span in each span between distinct knots.
+func sample_curve(s: const Spline*, out: Growing[Vector3]*) -> !:
+    try out.push(s.point_at(s.low()))
+    for k in (usize)s.degree..<s.points.count:
+        let a = s.knots.items[k]
+        let b = s.knots.items[k + 1]
+        if not (b > a): continue
+        for i in 1..<per_span + 1: try out.push(s.point_at(a + (b - a) * (f64)i / (f64)per_span))
+
+## The model of `models` holding the face named `face`, and the face's
+## surface's index there, or none.
+func face_home(models: const interop.Reference[CadModel][], face: str) -> (usize, usize)?!:
+    for at in 0..<models.length:
+        var w = try shape_of(models[at].value())
+        defer w.close()
+        for f in 0..<w.faces.count:
+            if w.face_name(f) == face: return (at, (usize)w.faces.items[f].surface)
+    return none
+
+## The control vertices of `set`'s curves for the CV cloud: free curves'
+## own, a curve on a face its chart curve's mapped onto the face (Alias
+## moves a curve on surface's CVs on the surface). Their places (model
+## -1, surface the curve's index, u its index along it, nu its count),
+## and frames (the face's normal or the curve's, its tangent, their
+## cross product) onto `points`, `places` and `frames`.
+pub func curve_cloud(set: const GeometrySet*, models: const interop.Reference[CadModel][], points: Growing[Vector3]*, places: Growing[f64]*, frames: Growing[Vector3]*) -> !:
+    let list = list_of(set) else return
+    for c in 0..<list.entries.count:
+        let entry = &list.entries.items[c]
+        var home: (usize, usize)? = none
+        if entry.on_face(): home = try face_home(models, (str)entry.face.view())
+        let count = entry.uv.points.count if home != none else entry.curve.points.count
+        for i in 0..<count:
+            try places.push(-1.0)
+            try places.push((f64)c)
+            try places.push((f64)i)
+            try places.push(0.0)
+            try places.push((f64)count)
+            try places.push(1.0)
+        if let found = home:
+            let (model, surface) = found
+            var w = try shape_of(models[model].value())
+            defer w.close()
+            let s = &w.surfaces.items[surface]
+            for i in 0..<count:
+                let q = entry.uv.points.items[i].point()
+                let uv = Vector3(q.x, q.y, 0.0)
+                try points.push(try surface_point(*s, uv))
+                let jet = try surface_jet(s, uv, false, false)
+                let normal = jet.su.cross(jet.sv).normalized() catch failure: recover Vector3(0.0, 0.0, 1.0)
+                try push_frame(&entry.curve, i, count, normal, frames)
+            continue
+        for i in 0..<count:
+            try points.push(entry.curve.points.items[i].point())
+            try push_frame(&entry.curve, i, count, Vector3(), frames)
+
+## Control point `i` of `count` of `s`: its frame (a normal, the tangent
+## at its Greville place, their cross product), `normal` when given, else
+## the curve's principal normal there (any square to a straight one).
+func push_frame(s: const Spline*, i: usize, count: usize, normal: Vector3, frames: Growing[Vector3]*) -> !:
+    let t = s.low() + (s.high() - s.low()) * (f64)i / (f64)math.max(1.0, (f64)(count - 1))
+    let jet = try curve_jet(s, t, 2, t >= s.high())
+    let tangent = jet.d[1].normalized() catch failure: recover Vector3(1.0, 0.0, 0.0)
+    var n = normal
+    if not (n.length() > 0.0):
+        let bent = jet.d[2].subtract(tangent.multiply_scalar(jet.d[2].dot(tangent)))
+        let seed = Vector3(0.0, 0.0, 1.0) if math.abs(tangent.z) < 0.9 else Vector3(1.0, 0.0, 0.0)
+        let square = seed.subtract(tangent.multiply_scalar(seed.dot(tangent))).normalized() catch failure: recover Vector3(0.0, 0.0, 1.0)
+        n = bent.normalized() catch failure: recover square
+    try frames.push(n)
+    try frames.push(tangent)
+    try frames.push(n.cross(tangent).normalized() catch failure: recover Vector3(0.0, 1.0, 0.0))
+
+## `set`'s curves with the cloud points from `first` on (curve_cloud's
+## order) moved from `before` to `after`; a curve on a face takes its
+## moved points back onto the face (nearest), its chart curve's control
+## points there, its 3D curve fitted again. `models` hold the faces.
+pub func moved_curves(set: const GeometrySet*, models: const interop.Reference[CadModel][], before: const Mesh*, after: const Mesh*, first: usize) -> interop.Reference[GeometrySet]!:
+    let list = list_of(set) else return try adopt_set(try set.storage())
+    let old_points = before.point_span()
+    let new_points = after.point_span()
+    let old_origin = before.position_origin()
+    let new_origin = after.position_origin()
+    let made = try new_list()
+    var at = first
+    for c in 0..<list.entries.count:
+        let entry = &list.entries.items[c]
+        var home: (usize, usize)? = none
+        if entry.on_face():
+            home = face_home(models, (str)entry.face.view()) catch failure:
+                close_list((void*)made)
+                error(failure.code, failure.message)
+        let count = entry.uv.points.count if home != none else entry.curve.points.count
+        if at + count > old_points.length:
+            close_list((void*)made)
+            error(invalid, "the control vertex cloud does not match its curves")
+        var curve = entry.curve.copy() catch failure:
+            close_list((void*)made)
+            error(failure.code, failure.message)
+        defer curve.close()
+        var uv = entry.uv.copy() catch failure:
+            close_list((void*)made)
+            error(failure.code, failure.message)
+        defer uv.close()
+        var any = false
+        for i in 0..<count:
+            let was = old_points[at + i].vector().add(old_origin)
+            let now = new_points[at + i].vector().add(new_origin)
+            let change = now.subtract(was)
+            if change.length() == 0.0: continue
+            any = true
+            if home == none:
+                let q = curve.points.items[i]
+                curve.points.items[i] = weighted(q.point().add(change), q.w)
+        if any:
+            if let found = home:
+                let (model, surface) = found
+                refit_on_face(models[model].value(), surface, &uv, &curve, old_points, new_points, old_origin, new_origin, at) catch failure:
+                    close_list((void*)made)
+                    error(failure.code, failure.message)
+        at += count
+        var entry_made = make_entry((str)entry.name.view(), &curve, entry.visible, (str)entry.source.view(), (str)entry.face.view(), &uv if entry.on_face() else none) catch failure:
+            close_list((void*)made)
+            error(failure.code, failure.message)
+        made.entries.push(entry_made) catch failure:
+            entry_made.close()
+            close_list((void*)made)
+            error(failure.code, failure.message)
+    return try with_list(set, made)
+
+## A curve on a face whose mapped control points moved: each moved one's
+## new place taken back onto the face (its chart coordinates), the 3D
+## curve fitted again.
+func refit_on_face(model: const CadModel*, surface: usize, uv: Spline*, curve: Spline*, old_points: const Float3[], new_points: const Float3[], old_origin: Vector3, new_origin: Vector3, first: usize) -> !:
+    var w = try shape_of(model)
+    defer w.close()
+    let s = &w.surfaces.items[surface]
+    for i in 0..<uv.points.count:
+        let was = old_points[first + i].vector().add(old_origin)
+        let now = new_points[first + i].vector().add(new_origin)
+        if now.subtract(was).length() == 0.0: continue
+        let q = uv.points.items[i]
+        let seed = q.point()
+        var placed = Vector3()
+        if s.kind == surface_spline: placed = try nearest_parameters(*s, now, Vector3(seed.x, seed.y, 0.0), false)
+        else: placed = chart_uv(*s, now, Vector3(seed.x, seed.y, 0.0), true)
+        uv.points.items[i] = weighted(Vector3(placed.x, placed.y, 0.0), q.w)
+    var deviation = 0.0
+    let fitted = try face_curve(s, uv, fit_tolerance(curve), &deviation)
+    curve.close()
+    *curve = fitted
+
+## The tolerance a curve on a face is fitted to: a millionth of its size.
+func fit_tolerance(s: const Spline*) -> f64:
+    var low = s.points.items[0].point()
+    var high = low
+    for q in s.points.view():
+        let p = q.point()
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    return math.max(1e-9, high.subtract(low).length() * 1e-6)
+
+## Luce's view of a set's curves.
+pub struct CadCurves:
+    let reserved: u8 = 0
+
+    ## Register the curves' codec (CadGeometry.register_codec does it).
+    pub static func register_codec() -> i64!:
+        try register_codec(&curve_component, encode_list, decode_list)
+        return 0
+
+    pub static func count(set: interop.Reference[GeometrySet]) -> i64!:
+        let list = list_of(try set.get()) else return 0
+        return (i64)list.entries.count
+
+    ## The index of the curve named `name`, or -1.
+    pub static func find(set: interop.Reference[GeometrySet], name: str) -> i64!:
+        let list = list_of(try set.get()) else return -1
+        let at = list.find(name) else return -1
+        return (i64)at
+
+    pub static func name(set: interop.Reference[GeometrySet], index: i64) -> interop.Owned[str]!:
+        return try interop.copy_text((str)(try entry_at(set, index)).name.view())
+
+    pub static func visible(set: interop.Reference[GeometrySet], index: i64) -> bool!:
+        return (try entry_at(set, index)).visible
+
+    ## Where it came from ("edge <reference>", "blend", …).
+    pub static func source(set: interop.Reference[GeometrySet], index: i64) -> interop.Owned[str]!:
+        return try interop.copy_text((str)(try entry_at(set, index)).source.view())
+
+    ## The face a curve on a face lies on ("" for a free curve).
+    pub static func face(set: interop.Reference[GeometrySet], index: i64) -> interop.Owned[str]!:
+        let entry = try entry_at(set, index)
+        return try interop.copy_text((str)entry.face.view() if entry.on_face() else "")
+
+    ## Its 3D curve.
+    pub static func curve(set: interop.Reference[GeometrySet], index: i64) -> interop.Reference[CadSpline]!:
+        return try held_spline(try (try entry_at(set, index)).curve.copy())
+
+    ## A curve on a face's curve in the face's chart coordinates.
+    pub static func chart_curve(set: interop.Reference[GeometrySet], index: i64) -> interop.Reference[CadSpline]!:
+        let entry = try entry_at(set, index)
+        if not entry.on_face(): error(invalid, "this curve is not on a face")
+        return try held_spline(try entry.uv.copy())
+
+    ## `set` with curve `name` (replaced in place, else added last): `curve`,
+    ## shown or not, its source, and for a curve on a face, the face and
+    ## its chart curve.
+    pub static func with_curve(set: interop.Reference[GeometrySet], name: str, curve: interop.Reference[CadSpline], visible: bool = true, source: str = "",
+                               face: str = "", chart: interop.Reference[CadSpline]? = none) -> interop.Reference[GeometrySet]!:
+        if name == "": error(invalid, "a curve needs a name")
+        if (face == "") != (chart == none): error(invalid, "a curve on a face needs its face and its chart curve")
+        let source_set = try set.get()
+        let list = try new_list()
+        var held: const Spline*? = none
+        if let c = chart: held = spline_in(c.value())
+        var entry = make_entry(name, spline_in(curve.value()), visible, source, face, held) catch failure:
+            close_list((void*)list)
+            error(failure.code, failure.message)
+        var placed = false
+        if let existing = list_of(source_set):
+            for at in 0..<existing.entries.count:
+                if (str)existing.entries.items[at].name.view() == name and not placed:
+                    list.entries.push(entry) catch failure:
+                        entry.close()
+                        close_list((void*)list)
+                        error(failure.code, failure.message)
+                    placed = true
+                    continue
+                list.add_entry(&existing.entries.items[at]) catch failure:
+                    if not placed: entry.close()
+                    close_list((void*)list)
+                    error(failure.code, failure.message)
+        if not placed:
+            list.entries.push(entry) catch failure:
+                entry.close()
+                close_list((void*)list)
+                error(failure.code, failure.message)
+        return try with_list(source_set, list)
+
+    ## `set` with curve `name` shown or hidden.
+    pub static func with_visible(set: interop.Reference[GeometrySet], name: str, visible: bool) -> interop.Reference[GeometrySet]!:
+        let source_set = try set.get()
+        let existing = list_of(source_set) else error(invalid, "the curve is not in the model")
+        if existing.find(name) == none: error(invalid, "the curve is not in the model")
+        let list = try new_list()
+        for at in 0..<existing.entries.count:
+            list.add_entry(&existing.entries.items[at]) catch failure:
+                close_list((void*)list)
+                error(failure.code, failure.message)
+            if (str)existing.entries.items[at].name.view() == name: list.entries.items[list.entries.count - 1].visible = visible
+        return try with_list(source_set, list)
+
+    ## `set` without curve `name` (the same set when it has none).
+    pub static func without_curve(set: interop.Reference[GeometrySet], name: str) -> interop.Reference[GeometrySet]!:
+        let source_set = try set.get()
+        let existing = list_of(source_set) else return set.clone()
+        let list = try new_list()
+        for entry in existing.entries.view():
+            if (str)entry.name.view() == name: continue
+            list.add_entry(&entry) catch failure:
+                close_list((void*)list)
+                error(failure.code, failure.message)
+        return try with_list(source_set, list)
+
+    ## `set` without any curves.
+    pub static func without_curves(set: interop.Reference[GeometrySet]) -> interop.Reference[GeometrySet]!:
+        let source_set = try set.get()
+        if list_of(source_set) == none: return set.clone()
+        let result = try source_set.storage()
+        result.remove(&curve_component)
+        return try adopt_set(result)
+
+    ## A name for a new curve: `stem` and the first number free.
+    pub static func free_name(set: interop.Reference[GeometrySet], stem: str) -> interop.Owned[str]!:
+        var name = Growing[u8]()
+        defer name.close()
+        var n: i64 = 1
+        while true:
+            try name.assign(stem.bytes)
+            try push_decimal(&name, n)
+            if (try CadCurves.find(set, (str)name.view())) < 0: return try interop.copy_text((str)name.view())
+            n += 1
+        error(invalid, "unreachable")
+
+    ## What the Curves level picks on: each shown curve's drawn segments
+    ## as zero-area triangles (a, its middle, b), every edge tagged with
+    ## its curve in `cad_curve` and `cad_edge` (so the viewport's CAD edge
+    ## pick finds it) and named in `cad_curve_name`; hidden curves left out.
+    pub static func pick_mesh(set: interop.Reference[GeometrySet]) -> interop.Reference[Mesh]!:
+        var builder = try MeshBuilder()
+        defer builder.close()
+        var owners = Growing[f64]()
+        defer owners.close()
+        if let list = list_of(try set.get()):
+            for c in 0..<list.entries.count:
+                let entry = &list.entries.items[c]
+                if not entry.visible: continue
+                var samples = Growing[Vector3]()
+                defer samples.close()
+                try sample_curve(&entry.curve, &samples)
+                for k in 1..<samples.count:
+                    let a = try builder.point(samples.items[k - 1])
+                    let m = try builder.point(samples.items[k - 1].add(samples.items[k]).multiply_scalar(0.5))
+                    let b = try builder.point(samples.items[k])
+                    try builder.face(3)
+                    try builder.corner(a)
+                    try builder.corner(m)
+                    try builder.corner(b)
+                    try owners.push((f64)c)
+        let bare = try builder.finish()
+        defer bare.release()
+        let mesh = bare.value()
+        # Each edge's curve: the curve of the face its first point is on.
+        let edges = (usize)(try mesh.edge_count())
+        var per_edge = Growing[f64]()
+        defer per_edge.close()
+        var names = Growing[i32]()
+        defer names.close()
+        var strings = TableBuilder()
+        defer strings.close()
+        var interned = Growing[i32]()
+        defer interned.close()
+        if let list = list_of(try set.get()):
+            for entry in list.entries.view(): try interned.push(try strings.intern((str)entry.name.view()))
+        for e in 0..<edges:
+            let point = (usize)(try mesh.edge_point((i64)e, 0))
+            let owner = owners.items[point // 3]
+            try per_edge.push(owner)
+            try names.push(interned.items[(usize)owner])
+        let tagged = try mesh.with_attribute("cad_curve", 2, 1, owners.view())
+        defer tagged.release()
+        let edged = try tagged.value().with_attribute("cad_curve", 4, 1, per_edge.view())
+        defer edged.release()
+        let picked = try edged.value().with_attribute("cad_edge", 4, 1, per_edge.view())
+        defer picked.release()
+        return try picked.value().with_attribute_entry(try text_attribute("cad_curve_name", Domain.edge, edges, &strings, names.view()))

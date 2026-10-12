@@ -114,6 +114,47 @@ extend BrepModel:
                 out.items[out.count] = place.transform_point(point)
                 out.count += 1
 
+    ## Each cv's surface frame, placed as placed_cvs places it: at the cv's
+    ## Greville point its surface's unit normal, u and v tangents (three
+    ## vectors a cv, appended to `out`): the frame Alias's NUV moves along.
+    ## A degenerate point (a pole) takes the hull's directions there.
+    pub func placed_cv_frames(matrix: Matrix4, out: Growing[Vector3]*) -> !:
+        var placements = Growing[Matrix4]()
+        defer placements.close()
+        try self.surface_placements(&placements)
+        for surface in 0..<(usize)self.surface_count():
+            if self.cvs_of(surface).length == 0: continue
+            let place = matrix.multiply(placements.items[surface])
+            var record = try self.surface((usize)surface)
+            defer record.close()
+            let low_u = record.ku[(usize)record.du]
+            let high_u = record.ku[(usize)record.nu]
+            let low_v = record.kv[(usize)record.dv]
+            let high_v = record.kv[(usize)record.nv]
+            for iu in 0..<(usize)record.nu:
+                for iv in 0..<(usize)record.nv:
+                    let u = (greville_of(record.ku, iu, record.du) - low_u) / (high_u - low_u)
+                    let v = (greville_of(record.kv, iv, record.dv) - low_v) / (high_v - low_v)
+                    let jet = try surface_jet(&record, Vector3(u, v, 0.0), u >= 1.0, v >= 1.0)
+                    var du = place.transform_direction(jet.su)
+                    var dv = place.transform_direction(jet.sv)
+                    # At a pole one tangent vanishes: the net's own row.
+                    let at = iu * (usize)record.nv + iv
+                    if not (du.length() > 1e-12):
+                        let ahead = record.points[fewer_index(at + (usize)record.nv, at, (usize)(record.nu * record.nv))]
+                        let behind = record.points[at - (usize)record.nv if iu > 0 else at]
+                        du = place.transform_direction(ahead.subtract(behind))
+                    if not (dv.length() > 1e-12):
+                        let ahead = record.points[at + 1 if iv + 1 < (usize)record.nv else at]
+                        let behind = record.points[at - 1 if iv > 0 else at]
+                        dv = place.transform_direction(ahead.subtract(behind))
+                    let su = du.normalized() catch failure: recover Vector3(1.0, 0.0, 0.0)
+                    let sv = dv.normalized() catch failure: recover Vector3(0.0, 1.0, 0.0)
+                    let normal = su.cross(sv).normalized() catch failure: recover Vector3(0.0, 0.0, 1.0)
+                    try out.push(normal)
+                    try out.push(su)
+                    try out.push(sv)
+
     ## Another model over the same columns (O(1) each), with copies of the
     ## face paths and a face cache inherited from this one.
     func shared_copy() -> interop.Reference[BrepModel]!:
@@ -169,3 +210,13 @@ extend BrepModel:
         if let cache = derived.faces: target.derived.faces = try inherited(cache)
         try target.derived.boundaries.assign(derived.boundaries.view())
         return output
+
+## The Greville abscissa of control point `i`: its knots' average.
+func greville_of(knots: const f64[], i: usize, degree: i64) -> f64:
+    var sum = 0.0
+    for k in 1..<(usize)degree + 1: sum += knots[i + k]
+    return sum / (f64)degree
+
+## `ahead` when it is inside `count`, else `here`.
+func fewer_index(ahead: usize, here: usize, count: usize) -> usize:
+    return ahead if ahead < count else here

@@ -14,6 +14,7 @@ from luce_geocore.kernel import adopt_set, dispose_set, empty_set, set_mesh, app
 from model import CadModel, cad_model_type, encode_model, decode_model, cloud_mesh, is_cloud, moved_models
 from geometry import push_decimal
 from cad_sketches import CadSketches
+from cad_curves import CadCurves, curve_cloud, moved_curves
 from luce_geocore.kernel import register_codec, GeometryWriter, GeometryReader
 
 ## The models of one set: immutable once published; every owning set has
@@ -230,6 +231,7 @@ pub struct CadGeometry:
     pub static func register_codec() -> i64!:
         try register_codec(&cad_component, encode_parts, decode_parts)
         _ = try CadSketches.register_codec()
+        _ = try CadCurves.register_codec()
         return 0
 
     ## A set holding `model`.
@@ -257,33 +259,50 @@ pub struct CadGeometry:
         if index < 0 or (usize)index >= parts.count(): error(invalid, "CAD model index out of range")
         return parts.models.items[(usize)index].clone()
 
-    ## The set's own models' control vertices as a point cloud (placed; no
-    ## faces), which point verbs edit (cv_cloud.lucb).
+    ## The set's own models' control vertices, then its curves' (cad_curves'
+    ## curve_cloud), as a point cloud (placed; no faces), which point verbs
+    ## edit (cv_cloud.lucb).
     pub static func cv_cloud(set: interop.Reference[GeometrySet]) -> interop.Reference[Mesh]!:
-        let data = (try set.get()).find(&cad_component) else error(invalid, "the geometry has no CAD models")
-        return try cloud_mesh(((const CadParts*)data).models.view())
+        let source = try set.get()
+        let models = set_models(source)
+        if models.length == 0 and (try CadCurves.count(set)) == 0: error(invalid, "the geometry has no CAD models or curves")
+        var points = Growing[Vector3]()
+        defer points.close()
+        var places = Growing[f64]()
+        defer places.close()
+        var frames = Growing[Vector3]()
+        defer frames.close()
+        try curve_cloud(source, models, &points, &places, &frames)
+        return try cloud_mesh(models, points.view(), places.view(), frames.view())
 
     pub static func is_cv_cloud(mesh: interop.Reference[Mesh]) -> bool!:
         return is_cloud(try mesh.get())
 
-    ## The set with the cvs `after` moved relative to `before` (its clouds).
+    ## The set with the cvs `after` moved relative to `before` (its clouds):
+    ## its models', then its curves'.
     pub static func with_cv_cloud(set: interop.Reference[GeometrySet], before: interop.Reference[Mesh], after: interop.Reference[Mesh]) -> interop.Reference[GeometrySet]!:
         let source = try set.get()
-        let data = source.find(&cad_component) else error(invalid, "the geometry has no CAD models")
         let parts = try new_parts()
         let result = source.storage() catch failure:
             close_parts((void*)parts)
             error(failure.code, failure.message)
-        moved_models(((const CadParts*)data).models.view(), try before.get(), try after.get(), &parts.models) catch failure:
+        let first = moved_models(set_models(source), try before.get(), try after.get(), &parts.models) catch failure:
             close_parts((void*)parts)
             dispose_set(result)
             error(failure.code, failure.message)
         result.remove(&cad_component)
-        result.put(&cad_component, (void*)parts) catch failure:
+        if parts.models.count > 0:
+            result.put(&cad_component, (void*)parts) catch failure:
+                close_parts((void*)parts)
+                dispose_set(result)
+                error(failure.code, failure.message)
+        else:
             close_parts((void*)parts)
-            dispose_set(result)
-            error(failure.code, failure.message)
-        return try adopt_set(result)
+        let moved = try adopt_set(result)
+        defer moved.release()
+        # The curves on faces lie on the moved models' faces.
+        let curved = try moved_curves(try moved.get(), set_models(try moved.get()), try before.get(), try after.get(), first)
+        return curved
 
     ## Faces of a CAD tessellation left out because their moved control
     ## vertices pulled their trims into a shape that no longer meshes.

@@ -1,0 +1,285 @@
+## Alias's curve edits (Curve Edit): Attach, Close and Stretch. Detach is
+## a split (nurbs' extract) and Reverse a mirrored knot vector
+## (jets.lucb), both exact.
+##
+## Attach joins the end of one curve to the start of another as one curve:
+##   Connect: the ends kept where they are; a gap between them bridged by
+##     a straight span. The joint is a knot of full multiplicity.
+##   Blend: both ends moved to meet at Blend Bias between them (0 the
+##     first's end, 1 the second's start), each curve's last rows of
+##     control points set so the two share their derivatives by arc length
+##     there to the continuity asked (G0 to G3): their tangents, curvature
+##     vectors and rates averaged. The joint is a knot of full multiplicity
+##     too, and the curve is G_k across it.
+## Close (Preserve Shape on) adds a G2 blend from the curve's end back to
+## its start; off, it moves the two ends to meet halfway, as a Blend
+## attach of the curve to itself, G1.
+## Stretch moves up to degree + 1 handles on the curve to new places,
+## every control point following a smooth field (a polynomial of the
+## curve's parameter through the handles' moves), so the curve keeps its
+## layout of control points and its shape's character, as Alias's does.
+
+## `a` and `b` brought to one degree (the higher), each on knots from 0
+## to its length so far: both made ready to join end to start.
+func same_degree(a: Spline*, b: Spline*) -> !:
+    if a.degree < b.degree: try elevate(a, (usize)(b.degree - a.degree))
+    if b.degree < a.degree: try elevate(b, (usize)(a.degree - b.degree))
+
+## The curve made of `a` and then `b` (a's end where b starts, one degree)
+## on one knot vector, the joint a knot of full multiplicity. `b`'s knots
+## are scaled so its first span is as long in parameter as a's last per
+## unit of length (the joint's parameter speed alike on both sides).
+pub func joined(a: const Spline*, b: const Spline*) -> Spline!:
+    if a.degree != b.degree: error(invalid, "joined curves need one degree")
+    let p = (usize)a.degree
+    var made = empty_spline(a.degree)
+    errdefer made.close()
+    let shift = a.high()
+    # b's knots from shift on, scaled by the curves' speeds at the joint.
+    let ja = try curve_jet(a, a.high(), 1, true)
+    let jb = try curve_jet(b, b.low(), 1, false)
+    let sa = ja.d[1].length()
+    let sb = jb.d[1].length()
+    let scale = sb / sa if sa > 0.0 and sb > 0.0 else (a.high() - a.low()) / (b.high() - b.low())
+    for k in 0..<a.knots.count - 1: try made.knots.push(a.knots.items[k])
+    # The joint: p knots (a's end and b's start, one point shared).
+    for k in p + 1..<b.knots.count: try made.knots.push(shift + (b.knots.items[k] - b.low()) * scale)
+    for q in a.points.view(): try made.points.push(q)
+    # b's first point is a's last: one of them, with b's weight scaled to
+    # a's so the rational curve is continuous.
+    let ratio = a.points.items[a.points.count - 1].w / b.points.items[0].w
+    for k in 1..<b.points.count: try made.points.push(b.points.items[k].times(ratio))
+    unit_domain(&made)
+    return made
+
+## `s` with enough control points that its last (first, `at_start`) `rows`
+## of them can be set apart from its other end's: knots inserted in its
+## middle span until it has 2 rows + 1.
+func roomy(s: Spline*, rows: usize) -> !:
+    var guard = 0
+    while s.points.count < 2 * rows + 1 and guard < 32:
+        # Halve the longest span.
+        var best: usize = (usize)s.degree
+        for k in (usize)s.degree..<s.points.count:
+            if s.knots.items[k + 1] - s.knots.items[k] > s.knots.items[best + 1] - s.knots.items[best]: best = k
+        _ = try insert_knot(s, (s.knots.items[best] + s.knots.items[best + 1]) * 0.5, 1)
+        guard += 1
+
+## Set the last `order + 1` control points of `s` (its first, `at_start`)
+## so its derivatives there are `targets` (by its own parameter, toward
+## its end), weights kept.
+func set_end_rows(s: Spline*, targets: const Jet*, order: usize, at_start: bool) -> !:
+    let n = s.points.count
+    var rows: f64[36]
+    end_rows(s.knots.view(), n, (usize)s.degree, order, not at_start, &rows)
+    var solved: Vector3[6] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    # Rational ends: the rows act on the homogeneous points; a curve with
+    # equal weights there is set exactly, others near enough for a joint.
+    try solve_end(&rows, targets, order, &solved)
+    for i in 0..<order + 1:
+        let index = i if at_start else n - 1 - i
+        s.points.items[index] = weighted(solved[i], s.points.items[index].w)
+
+## Attach (see the file's header): `a`'s end to `b`'s start, `blend`
+## moving both to meet at `bias` with continuity `continuity` (0 to 3),
+## else Connect.
+pub func attached(a: const Spline*, b: const Spline*, blend: bool, bias: f64, continuity: i64) -> Spline!:
+    if continuity < 0 or continuity > 3: error(invalid, "Attach keeps G0 to G3 at the joint")
+    var first = try a.copy()
+    defer first.close()
+    var second = try b.copy()
+    defer second.close()
+    try same_degree(&first, &second)
+    let p = first.degree
+    let end_a = first.point_at(first.high())
+    let start_b = second.point_at(second.low())
+    let gap = start_b.subtract(end_a).length()
+    if not blend:
+        if gap <= 1e-9 * math.max(1.0, size_of(&first)):
+            return try joined(&first, &second)
+        # A straight span between them, raised to their degree.
+        var weights: f64[2] = [1.0, 1.0]
+        let knots: f64[4] = [0.0, 0.0, 1.0, 1.0]
+        var ends: Vector3[2] = [end_a, start_b]
+        var bridge = try spline_of(ends[..<2], weights[..<2], 1, knots[..<4])
+        defer bridge.close()
+        try elevate(&bridge, (usize)(p - 1))
+        var half = try joined(&first, &bridge)
+        defer half.close()
+        return try joined(&half, &second)
+    if (usize)continuity > (usize)p: error(invalid, "Attach's continuity needs as high a degree")
+    let order = (usize)continuity
+    try roomy(&first, order + 1)
+    try roomy(&second, order + 1)
+    # The shared derivatives by arc length at the joint: the average of
+    # each curve's own, at the point Blend Bias puts between their ends.
+    let raw_a = try curve_jet(&first, first.high(), 4, true)
+    let raw_b = try curve_jet(&second, second.low(), 4, false)
+    let ja = try arc_jet(&raw_a)
+    let jb = try arc_jet(&raw_b)
+    let meet = end_a.add(start_b.subtract(end_a).multiply_scalar(math.clamp(bias, 0.0, 1.0)))
+    var shared = empty_jet()
+    shared.d[0] = meet
+    let tangent = ja.d[1].add(jb.d[1]).normalized() catch failure: error(invalid, "the curves leave their ends in opposite directions: reverse one")
+    shared.d[1] = tangent
+    for k in 2..<(usize)5: shared.d[k] = ja.d[k].add(jb.d[k]).multiply_scalar(0.5)
+    # Each curve's own derivatives at the joint: the shared ones at its
+    # own parameter speed there (alpha), nothing else changed.
+    let speed_a = (try curve_jet(&first, first.high(), 1, true)).d[1].length()
+    let speed_b = (try curve_jet(&second, second.low(), 1, false)).d[1].length()
+    let to_a = reparameterized(&shared, speed_a, 0.0, 0.0, 0.0)
+    let to_b = reparameterized(&shared, speed_b, 0.0, 0.0, 0.0)
+    try set_end_rows(&first, &to_a, order, false)
+    try set_end_rows(&second, &to_b, order, true)
+    return try joined(&first, &second)
+
+## Close (see the file's header): with `preserve`, a G2 blend from the end
+## back to the start added; without, the ends meet halfway at G1.
+pub func closed(s: const Spline*, preserve: bool) -> Spline!:
+    let low = s.point_at(s.low())
+    let high = s.point_at(s.high())
+    let size = size_of(s)
+    if high.subtract(low).length() <= 1e-9 * math.max(1.0, size): error(invalid, "the curve is closed already")
+    if preserve:
+        var start = BlendEnd(try leaving_jet(s, s.high(), 1), 2, 1.0, 0.0, 0.0, 0.0)
+        var finish = BlendEnd(try leaving_jet(s, s.low(), -1), 2, 1.0, 0.0, 0.0, 0.0)
+        # A tangent a third of the gap at each end: Alias's Close keeps the
+        # curve's shape and closes it gently.
+        start.tangent = 1.0
+        finish.tangent = 1.0
+        var bridge = try blend_curve(&start, &finish, (i64)math.max(5.0, (f64)s.degree), 0)
+        defer bridge.close()
+        var body = try s.copy()
+        defer body.close()
+        try same_degree(&body, &bridge)
+        return try joined(&body, &bridge)
+    # The curve attached to itself: its end and start meet halfway, then
+    # the joint becomes the curve's ends (it starts and ends there).
+    var turned = try s.copy()
+    defer turned.close()
+    let p = (usize)turned.degree
+    if p < 1: error(invalid, "a curve to close needs degree 1 or more")
+    try roomy(&turned, 2)
+    let raw_a = try curve_jet(&turned, turned.high(), 4, true)
+    let raw_b = try curve_jet(&turned, turned.low(), 4, false)
+    let ja = try arc_jet(&raw_a)
+    let jb = try arc_jet(&raw_b)
+    var shared = empty_jet()
+    shared.d[0] = low.add(high).multiply_scalar(0.5)
+    shared.d[1] = ja.d[1].add(jb.d[1]).normalized() catch failure: error(invalid, "the curve's ends leave in opposite directions")
+    let speed_a = (try curve_jet(&turned, turned.high(), 1, true)).d[1].length()
+    let speed_b = (try curve_jet(&turned, turned.low(), 1, false)).d[1].length()
+    let order: usize = 1 if p >= 1 else 0
+    let to_end = reparameterized(&shared, speed_a, 0.0, 0.0, 0.0)
+    let to_start = reparameterized(&shared, speed_b, 0.0, 0.0, 0.0)
+    try set_end_rows(&turned, &to_end, order, false)
+    try set_end_rows(&turned, &to_start, order, true)
+    return try turned.copy()
+
+## Stretch (see the file's header): `s` with the points at `params` moved
+## by `moves` (as many, at most degree + 1). Locked: the handles stay at
+## their parameters; floating (`floating`), each handle's parameter goes
+## to the point of the new curve nearest its target, and the field is
+## made again (three rounds).
+pub func stretched(s: const Spline*, params: const f64[], moves: const Vector3[], floating: bool) -> Spline!:
+    let h = params.length
+    if h == 0 or h != moves.length: error(invalid, "Stretch needs its handles' places and moves")
+    if h > (usize)s.degree + 1: error(invalid, "Stretch takes at most degree + 1 handles")
+    var ts = Growing[f64]()
+    defer ts.close()
+    for t in params:
+        if t < s.low() or t > s.high(): error(invalid, "a Stretch handle is on the curve: its place is in its domain")
+        try ts.push(t)
+    var targets = Growing[Vector3]()
+    defer targets.close()
+    for i in 0..<h: try targets.push(s.point_at(ts.items[i]).add(moves[i]))
+    var made = try s.copy()
+    errdefer made.close()
+    let rounds = 3 if floating else 1
+    for attempt in 0..<rounds:
+        var next = try s.copy()
+        errdefer next.close()
+        # The field: a polynomial of the parameter through each handle's
+        # move (Lagrange, degree h - 1), at every control point's Greville
+        # abscissa, then the handles made exact by a least-norm correction.
+        var wanted = Growing[Vector3]()
+        defer wanted.close()
+        for i in 0..<h: try wanted.push(targets.items[i].subtract(s.point_at(ts.items[i])))
+        let n = next.points.count
+        for j in 0..<n:
+            var g = 0.0
+            for k in 1..<(usize)next.degree + 1: g += next.knots.items[j + k]
+            g = g / (f64)next.degree
+            var shift = Vector3()
+            for i in 0..<h:
+                var l = 1.0
+                for m in 0..<h:
+                    if m != i: l = l * (g - ts.items[m]) / (ts.items[i] - ts.items[m])
+                shift = shift.add(wanted.items[i].multiply_scalar(l))
+            let q = next.points.items[j]
+            next.points.items[j] = weighted(q.point().add(shift), q.w)
+        try exact_handles(&next, ts.view(), targets.view())
+        made.close()
+        made = next
+        if floating and attempt + 1 < rounds:
+            for i in 0..<h: ts.items[i] = nearest_on(&made, targets.items[i], ts.items[i])
+    return made
+
+## Least-norm control point changes that bring `s`'s points at `ts` onto
+## `targets` exactly (two rounds for a rational curve).
+func exact_handles(s: Spline*, ts: const f64[], targets: const Vector3[]) -> !:
+    let h = ts.length
+    let n = s.points.count
+    let p = (usize)s.degree
+    for _ in 0..<(usize)2:
+        # Rows: each handle's rational bases R_j(t) (equal weights: bases).
+        var rows = Growing[f64]()
+        defer rows.close()
+        try rows.fill(h * n, 0.0)
+        for i in 0..<h:
+            var values: f64[12]
+            let first = bases_at(s.knots.view(), n, p, ts[i], false, &values)
+            var total = 0.0
+            for k in 0..<p + 1: total += values[k] * s.points.items[first + k].w
+            for k in 0..<p + 1: rows.items[i * n + first + k] = values[k] * s.points.items[first + k].w / total
+        # (R R^T) y = d, change = R^T y.
+        var gram = Growing[f64]()
+        defer gram.close()
+        try gram.fill(h * h, 0.0)
+        for a in 0..<h:
+            for b in 0..<h:
+                var sum = 0.0
+                for j in 0..<n: sum += rows.items[a * n + j] * rows.items[b * n + j]
+                gram.items[a * h + b] = sum
+        var d = Growing[Vector3]()
+        defer d.close()
+        for i in 0..<h: try d.push(targets[i].subtract(s.point_at(ts[i])))
+        try solve_dense(&gram, h, &d)
+        for j in 0..<n:
+            var change = Vector3()
+            for i in 0..<h: change = change.add(d.items[i].multiply_scalar(rows.items[i * n + j]))
+            let q = s.points.items[j]
+            s.points.items[j] = weighted(q.point().add(change), q.w)
+
+## The parameter of `s` nearest `target`, by Newton from `seed` after a
+## coarse search.
+pub func nearest_on(s: const Spline*, target: Vector3, seed: f64) -> f64:
+    var best = seed
+    var least = s.point_at(seed).subtract(target).length()
+    for k in 0..<(usize)129:
+        let t = s.low() + (s.high() - s.low()) * (f64)k / 128.0
+        let d = s.point_at(t).subtract(target).length()
+        if d < least:
+            least = d
+            best = t
+    var t = best
+    for _ in 0..<(usize)20:
+        let j = curve_jet(s, t, 2, false) catch failure: return t
+        let r = j.d[0].subtract(target)
+        let f = r.dot(j.d[1])
+        let df = j.d[1].dot(j.d[1]) + r.dot(j.d[2])
+        if not (math.abs(df) > 1e-300): break
+        let next = math.clamp(t - f / df, s.low(), s.high())
+        if math.abs(next - t) <= 1e-15 * math.max(1.0, math.abs(t)): return next
+        t = next
+    return t

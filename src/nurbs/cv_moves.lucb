@@ -10,9 +10,15 @@
 ##   Project: each CV along its own hull line (the straight line through
 ##     its neighbors), off the polyline;
 ##   Parallel: every CV along the first picked CV's hull lines.
-## A CV's frame comes from its hull: u from its neighbors along u (one
-## side at an end), v likewise, the normal their cross product. On a
-## planar net that is the plane's normal exactly.
+## NUV's frame is the surface's at the CV's Greville point (the cloud's
+## `cad_cv_normal`, `cad_cv_du` and `cad_cv_dv`, cv_cloud.lucb), as Alias's
+## and Rhino's are; a curve's CVs carry their curve's (tangent, normal).
+## Slide, Project and Parallel go along the hull: u from a CV's neighbors
+## along u (one side at an end), v likewise.
+##
+## Symmetry (the Edit node's): each moved CV's mirror image across the
+## plane through the origin square to X, Y or Z, when the cloud has a CV
+## there, moves as its reflection; a CV on the plane stays on it.
 ##
 ## Falloff: the picked CVs move fully, others by a weight:
 ##   Rows: within `reach` rows along u and v of a picked CV on its net,
@@ -44,6 +50,8 @@ struct Places:
     var v: Growing[i64]
     var nu: Growing[i64]
     var nv: Growing[i64]
+    ## Surface frames, three a point (normal, u, v); empty without them.
+    var frames: Growing[Vector3]
 
     func close():
         self.model.close()
@@ -52,6 +60,7 @@ struct Places:
         self.v.close()
         self.nu.close()
         self.nv.close()
+        self.frames.close()
 
     ## Point `i`'s neighbor `du`, `dv` rows away on its net (-1: off it).
     func neighbor(i: usize, du: i64, dv: i64) -> i64:
@@ -61,8 +70,16 @@ struct Places:
         return (i64)i + du * self.nv.items[i] + dv
 
 func places_of(cloud: const Mesh*) -> Places!:
-    var p = Places(Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64]())
+    var p = Places(Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[Vector3]())
     errdefer p.close()
+    let names: str[3] = ["cad_cv_normal", "cad_cv_du", "cad_cv_dv"]
+    var columns: i64[3] = [-1, -1, -1]
+    for k in 0..<(usize)3: columns[k] = cloud.find_attribute(names[k], 0)
+    if columns[0] >= 0 and columns[1] >= 0 and columns[2] >= 0:
+        for i in 0..<(usize)cloud.point_count():
+            for k in 0..<(usize)3:
+                let entry = try cloud.attribute_entry(columns[k])
+                try p.frames.push(Vector3(entry.number(i, 0), entry.number(i, 1), entry.number(i, 2)))
     try read_place(cloud, "cad_cv_model", &p.model)
     try read_place(cloud, "cad_cv_surface", &p.surface)
     try read_place(cloud, "cad_cv_u", &p.u)
@@ -177,7 +194,7 @@ func falloff_weights(points: const Vector3[], p: const Places*, ids: const i64[]
 ## (reserved for a picked vector), their neighbors following by `falloff`
 ## (reach: rows along u and v in x and y, a distance in z), its exponent or
 ## the radius curve `curve_kind`.
-pub func moved_cvs(cloud: const Mesh*, ids: const i64[], mode: i64, amount: Vector3, falloff: i64, reach: Vector3, exponent: f64, curve_kind: i64) -> interop.Reference[Mesh]!:
+pub func moved_cvs(cloud: const Mesh*, ids: const i64[], mode: i64, amount: Vector3, falloff: i64, reach: Vector3, exponent: f64, curve_kind: i64, mirror: i64 = 0) -> interop.Reference[Mesh]!:
     if not amount.is_finite(): error(invalid, "a control vertex move must be finite")
     let n = (usize)cloud.point_count()
     for id in ids:
@@ -207,9 +224,7 @@ pub func moved_cvs(cloud: const Mesh*, ids: const i64[], mode: i64, amount: Vect
         if mode == cv_world or mode == cv_view:
             next = at.add(amount.multiply_scalar(w))
         elif mode == cv_nuv:
-            let u = hull_direction(points.view(), &p, i, true)
-            let v = hull_direction(points.view(), &p, i, false)
-            let normal = u.cross(v).normalized() catch failure: recover Vector3()
+            let (normal, u, v) = nuv_frame(points.view(), &p, i)
             next = at.add(normal.multiply_scalar(amount.x * w)).add(u.multiply_scalar(amount.y * w)).add(v.multiply_scalar(amount.z * w))
         elif mode == cv_slide:
             next = slid(points.view(), &p, i, true, amount.x * w)
@@ -220,7 +235,67 @@ pub func moved_cvs(cloud: const Mesh*, ids: const i64[], mode: i64, amount: Vect
             next = at.add(shared_u.multiply_scalar(amount.x * w)).add(shared_v.multiply_scalar(amount.y * w))
         else: error(invalid, "unknown control vertex move mode")
         try moved.push(next)
+    if mirror > 0: try mirrored(points.view(), &moved, mirror)
     return try cloud.with_positions(moved.view())
+
+## Point `i`'s NUV frame: its surface's (the cloud's frames), else its hull's.
+func nuv_frame(points: const Vector3[], p: const Places*, i: usize) -> (Vector3, Vector3, Vector3):
+    if p.frames.count == points.length * 3:
+        return (p.frames.items[i * 3], p.frames.items[i * 3 + 1], p.frames.items[i * 3 + 2])
+    let u = hull_direction(points, p, i, true)
+    let v = hull_direction(points, p, i, false)
+    let normal = u.cross(v).normalized() catch failure: recover Vector3()
+    return (normal, u, v)
+
+## Symmetry across the plane square to axis `mirror` (1 X, 2 Y, 3 Z)
+## through the origin: each moved point's mirror partner (a point within
+## a millionth of the cloud's size of its reflection) that did not move
+## takes the reflected move; a point on the plane keeps on it.
+func mirrored(points: const Vector3[], moved: Growing[Vector3]*, mirror: i64) -> !:
+    let n = points.length
+    var low = points[0]
+    var high = points[0]
+    for q in points:
+        low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), math.min(low.z, q.z))
+        high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), math.max(high.z, q.z))
+    let near = math.max(1e-9, high.subtract(low).length() * 1e-6)
+    var changed = Growing[bool]()
+    defer changed.close()
+    for i in 0..<n: try changed.push(moved.items[i].subtract(points[i]).length() > 0.0)
+    for i in 0..<n:
+        if not changed.items[i]: continue
+        let image = reflect(points[i], mirror)
+        let shift = moved.items[i].subtract(points[i])
+        if image.subtract(points[i]).length() <= near:
+            # On the plane: its move along the plane only.
+            moved.items[i] = points[i].add(shift.add(reflect(shift, mirror)).multiply_scalar(0.5))
+            continue
+        for j in 0..<n:
+            if j == i or changed.items[j]: continue
+            if points[j].subtract(image).length() <= near:
+                moved.items[j] = points[j].add(reflect(shift, mirror))
+                break
+
+## `v` reflected across the plane square to axis `mirror`.
+func reflect(v: Vector3, mirror: i64) -> Vector3:
+    if mirror == 1: return Vector3(-v.x, v.y, v.z)
+    if mirror == 2: return Vector3(v.x, -v.y, v.z)
+    return Vector3(v.x, v.y, -v.z)
+
+## Cloud point `id`'s surface frame: normal (`which` 0), u (1), v (2);
+## its hull's without the cloud's frames.
+pub func cv_surface_frame(cloud: const Mesh*, id: i64, which: i64) -> Vector3!:
+    let n = (usize)cloud.point_count()
+    if id < 0 or (usize)id >= n: error(invalid, "that control vertex is not in the cloud")
+    var p = try places_of(cloud)
+    defer p.close()
+    var points = Growing[Vector3]()
+    defer points.close()
+    for i in 0..<n: try points.push(try cloud.point((i64)i))
+    let (normal, u, v) = nuv_frame(points.view(), &p, (usize)id)
+    if which == 1: return u
+    if which == 2: return v
+    return normal
 
 ## The NUV frame (normal, u, v) at cloud point `id`, for the gizmo.
 pub func cv_hull_frame(cloud: const Mesh*, id: i64, which: i64) -> Vector3!:
