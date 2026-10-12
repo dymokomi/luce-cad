@@ -1,0 +1,60 @@
+## Fusion's Rule Fillet (CadModeling.rule_edges): on an L-bracket, rounds
+## (its 17 convex edges), fillets (its one inside corner), both, and the
+## edges between the two inner walls; the inside corner filleted by its
+## rule, closed and larger; a box has no fillets to take.
+from luce_cad.sketch import CadSketch
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+pub func rule_tests() -> unit!:
+    let s = CadSketch.parse("")
+    let corners = [[0.0, 0.0], [10.0, 0.0], [10.0, 2.0], [2.0, 2.0], [2.0, 8.0], [0.0, 8.0]]
+    let points: list[int] = []
+    for c in corners:
+        points.append(s.add_point(c[0], c[1]))
+    for at in 0..<6:
+        _ = s.add_line(points[at], points[(at + 1) % 6])
+    let bracket = CadModeling.extruded(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 5.0, 0.0, "l")
+    assert(count(CadModeling.rule_edges(bracket, true, false)) == 17)
+    assert(count(CadModeling.rule_edges(bracket, false, true)) == 1)
+    assert(count(CadModeling.rule_edges(bracket, true, true)) == 18)
+    # Between the inner walls (x = 2 facing +X, y = 2 facing +Y): the corner.
+    let wall = facing(bracket, Vector3(1.0, 0.0, 0.0), 2.0, 0)
+    let floor = facing(bracket, Vector3(0.0, 1.0, 0.0), 2.0, 1)
+    assert(count(CadModeling.rule_edges(bracket, true, true, wall, floor)) == 1)
+    # On the inner wall alone: its four edges.
+    assert(count(CadModeling.rule_edges(bracket, true, true, wall)) == 4)
+    let filleted = CadModeling.filleted(bracket, CadModeling.rule_edges(bracket, false, true), 0.5, "f")
+    let mesh = filleted.tessellate(32)
+    manifold(mesh)
+    let added = volume(mesh) - 160.0
+    let expected = (0.25 - math.pi * 0.25 / 4.0) * 5.0
+    if math.abs(added - expected) > 1e-3: print(f"rule fillet added {added}, expected {expected}")
+    assert(math.abs(added - expected) <= 1e-3)
+    var refused = false
+    _ = CadModeling.rule_edges(CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box"), false, true) catch failure:
+        refused = failure.message.contains("no edges")
+    assert(refused)
+    print("PASS rule fillets: an L-bracket's rounds (17), fillets (1), both (18), between its inner walls (1) and on one (4); its inside corner filleted by rule, closed, adding the corner's area along it; a box has no fillets to take")
+
+func count(references: str) -> int:
+    return references.split(";").length
+
+## The name of `model`'s flat face facing `normal` whose frame's
+## coordinate `along` is `at`.
+func facing(model: CadModel, normal: Vector3, at: float, along: int) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let frame = CadModeling.face_frame(model, name)
+        if not frame.found or frame.u.cross(frame.v).dot(normal) < 0.999:
+            continue
+        let o = frame.origin
+        let c = o.x if along == 0 else (o.y if along == 1 else o.z)
+        if math.abs(c - at) < 1e-9:
+            return name
+    assert(false, "no such face")
+    return ""

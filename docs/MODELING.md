@@ -35,6 +35,8 @@ does today.
 | `moved_body(model, by, origin, axis, angle, prefix)` | Move/Copy: turned about a line, then moved; a copy's faces take `prefix` so features tell it from the original. |
 | `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
 | `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |
+| `rule_edges(model, rounds, fillets, faces, others)` | Fusion's Rule Fillet (`rules.lucb`): references to the blendable edges a rule takes, convex ones (rounds), concave ones (fillets) or both; with `faces` named, only edges on those faces, and with `others` too, only edges between the two sets. Made again on every cook, the edges follow the body. |
+| `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Straight outside edges between flat faces for now; others are refused with why. |
 | `edge_references(model, edges)` | References to edges, given by their B-rep numbers (what a viewport pick gives). |
 | `resolved_count(model, references)` | How many edges the references find, or an error when one is gone. |
 | `tagged(model, tag)` | Unnamed faces named `tag/f<i>`, for bodies made without names, such as primitives. |
@@ -768,12 +770,16 @@ Roughly in order of usefulness:
 
 1. **Fillet corners beyond three edges,** and G1 setback corners (the same patch with one row:
    unequal radii, Fusion's other corner type).
-2. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
+2. **Two distances and Distance and angle chamfers** beyond straight outside edges between flat
+   faces: rims, edges round a flat face whose walls are ruled away, loops between curved faces,
+   inside edges; and Fusion's chamfer corner types (Chamfer, Miter, Blend).
+3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
    the loop turns a sharp corner rather than going on tangentially.
-3. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
+4. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
    analytic surfaces are recognized as coincident.
-4. **Sweep and loft;** Extrude's Thin option and a start offset by a face.
-5. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
-6. **Shell of B-spline faces** and draft; Delete healing more than one strip or corner at a time (a chain of
+5. **Sweep and loft;** Extrude's Thin option, a start offset by a face, and a start offset with the
+   To object and All extents; Revolve's To object extent.
+6. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
+7. **Shell of B-spline faces** and draft; Delete healing more than one strip or corner at a time (a chain of
    fillets), and faces with more than four neighbors.

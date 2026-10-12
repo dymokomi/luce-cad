@@ -8,13 +8,15 @@
 
 ## The section of edge `e`'s blend at `p` (its start), swept along `along`:
 ## the corner profile between two planes, or between a plane and a
-## cylinder along the edge (ruled_profile).
-func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, round: bool, continuity: i64) -> Profiles!:
+## cylinder along the edge (ruled_profile). A chamfer between two planes
+## reaches `other` along the edge's second face when it is positive
+## (chamfers.lucb's two-sided ones), else `size` like the first.
+func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, round: bool, continuity: i64, other: f64 = -1.0) -> Profiles!:
     let (fa, fb) = try edge_faces(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     let cylinder = ruled_pair(w, e, fa, fb)
-    if cylinder < 0: return try corner_profile(p, along, ua, ub, size, round, continuity)
+    if cylinder < 0: return try corner_profile(p, along, ua, ub, size, round, continuity, other)
     if round and continuity > 1: error(invalid, "G2 and G3 fillets between a plane and a cylinder are not supported yet")
     let plane = fb if (usize)cylinder == fa else fa
     return try ruled_profile(w, plane, (usize)cylinder, p, along, ua if plane == fa else ub, ub if plane == fa else ua, size, round, try convex(w, e))
@@ -93,8 +95,9 @@ func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, 
 ## end only where nothing is there (an outside corner), and stops flush
 ## where the solid goes on (a wall the edge runs into).
 ## An end marked exact (where a corner ball takes over) stops right there.
-## Its blend face is named `name`.
-func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str) -> interop.Reference[CadModel]!:
+## Its blend face is named `name`. A two-sided chamfer reaches `other`
+## along the second face (section_profile).
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str, other: f64 = -1.0) -> interop.Reference[CadModel]!:
     if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_circle: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
@@ -107,7 +110,7 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i6
     let extent = math.max(length, size) * 4.0
     let before = 0.0 if exact_start or try body.inside(w, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
     let after = 0.0 if exact_end or try body.inside(w, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
-    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity)
+    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity, other)
     defer profile.close()
     let solid = try BrepModel.sized(length + margin * 2.0)
     defer solid.release()
@@ -122,12 +125,13 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i6
 ## 2 or 3 (G2, G3) a Bezier curve between the same contact points whose
 ## first three or four control points lie along each face, so its
 ## curvature (and for G3 its change) is zero where it meets them. Its
-## middle edge is the blend's.
-func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool, continuity: i64) -> Profiles!:
+## middle edge is the blend's. A chamfer reaches `other` along `ub` when
+## it is positive (a two-sided one), else `size`.
+func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool, continuity: i64, other: f64 = -1.0) -> Profiles!:
     let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
     let reach = size / math.tan(angle * 0.5) if round else size
     let ta = p.add(ua.multiply_scalar(reach))
-    let tb = p.add(ub.multiply_scalar(reach))
+    let tb = p.add(ub.multiply_scalar(other if not round and other > 0.0 else reach))
     var profile = Profiles(p, along, ua, along.cross(ua), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
                            Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
     errdefer profile.close()

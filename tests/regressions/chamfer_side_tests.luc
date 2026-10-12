@@ -1,0 +1,79 @@
+## Fusion's Two distances and Distance and angle chamfers
+## (CadModeling.chamfered_sides) on a 2-box: one edge, its prism's volume
+## taken (½ × the two reaches × its length); the top's rim, the top taking
+## the first distance (its own loop), flipped the sides take it; an edge
+## between curved faces refused with why.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3, Mesh
+from checks import manifold, volume
+from luce_std import math
+
+pub func chamfer_side_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let edge = CadModeling.edge_references(box, edges_where(box, front_top))
+    # Two distances: 0.5 and 0.2 along the faces (either way: the same volume).
+    solid(CadModeling.chamfered_sides(box, edge, 0.5, 0.2, 0.0, "c"), 8.0 - 0.05 * 2.0, "two distances")
+    # Distance and angle: 0.5 along the first, leaving it at 30°: 0.5 sin 30° / sin 120° along the other.
+    let other = 0.5 * math.sin(math.pi / 6.0) / math.sin(math.pi * 2.0 / 3.0)
+    solid(CadModeling.chamfered_sides(box, edge, 0.5, 0.0, math.pi / 6.0, "c"), 8.0 - 0.25 * other * 2.0, "distance and angle")
+    # The top's rim: 0.3 on the top (its loop's face), 0.1 down the sides.
+    let rim = CadModeling.edge_references(box, edges_where(box, top_ring))
+    let made = CadModeling.chamfered_sides(box, rim, 0.3, 0.1, 0.0, "c")
+    assert(made.face_count() == 10)
+    let mesh = made.tessellate(16)
+    manifold(mesh)
+    assert(reach(mesh, 1.0) < 0.7 + 1e-6 and lowest_on_side(mesh) > 0.9 - 1e-6)
+    # Flipped: 0.3 down the sides, 0.1 on the top.
+    let flipped = CadModeling.chamfered_sides(box, rim, 0.3, 0.1, 0.0, "c", true, true).tessellate(16)
+    manifold(flipped)
+    assert(reach(flipped, 1.0) > 0.9 - 1e-6 and reach(flipped, 1.0) < 0.9 + 1e-6)
+    # A cylinder's rim is not between flat faces: refused, saying so.
+    let pin = CadModeling.tagged(CadSolids.cylinder(1.0, 2.0), "pin")
+    var refused = false
+    _ = CadModeling.chamfered_sides(pin, CadModeling.edge_references(pin, edges_where(pin, top_ring)), 0.2, 0.1, 0.0, "c") catch failure:
+        refused = failure.message.contains("Equal distance")
+    assert(refused)
+    print("PASS sided chamfers: a box edge by two distances and by distance and angle (the prism taken), the top's rim with the top taking the first distance and flipped, a rim between a plane and a cylinder refused with why")
+
+func solid(model: CadModel, expected: float, what: str) -> unit!:
+    let mesh = model.tessellate(16)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > 1e-6: print(f"{what}: volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= 1e-6)
+
+func front_top(a: Vector3, b: Vector3) -> bool:
+    return a.y > 0.999 and b.y > 0.999 and a.z > 0.999 and b.z > 0.999
+
+func top_ring(a: Vector3, b: Vector3) -> bool:
+    return a.y > 0.999 and b.y > 0.999
+
+## The ids of `model`'s edges whose ends `keep` takes.
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return found
+
+## The farthest x any point at height `y` reaches.
+func reach(mesh: Mesh, y: float) -> float!:
+    var most = 0.0
+    for at in 0..<mesh.point_count():
+        let p = mesh.point(at)
+        if math.abs(p.y - y) < 1e-9 and p.x > most:
+            most = p.x
+    return most
+
+## The highest any point on the +X side (x = 1) reaches.
+func lowest_on_side(mesh: Mesh) -> float!:
+    var most = -1.0
+    for at in 0..<mesh.point_count():
+        let p = mesh.point(at)
+        if math.abs(p.x - 1.0) < 1e-9 and p.y > most:
+            most = p.y
+    return most

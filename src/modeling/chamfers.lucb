@@ -1,0 +1,79 @@
+## Fusion's Chamfer types beyond Equal distance: Two distances (one along
+## each face) and Distance and angle (a distance along the first face, the
+## chamfer leaving it at an angle), made as blend.lucb's equal chamfers
+## are: a tool swept along each edge, taken away. Straight outside edges
+## between flat faces for now; any other edge is refused with why.
+##
+## Which face takes the first distance: of each chosen edge's two faces,
+## the one more of the chosen edges lie on (a loop's own face: a box's top
+## round its rim), a tie going to the name first in byte order; `flip`
+## turns every edge round.
+
+## `model` with the edges `references` names (with their tangent chains
+## when `chain`) chamfered `distance` along the first face and, when
+## `second` is positive, `second` along the other; else leaving the first
+## face at `angle` (radians), which reaches the other face that far:
+## distance × sin(angle) / sin(corner + angle) for the faces' corner angle.
+## The chamfers' faces are named for `tag` as blended's.
+func sided_chamfer(model: const CadModel*, references: str, distance: f64, second: f64, angle: f64, tag: str, chain: bool, flip: bool) -> interop.Reference[CadModel]!:
+    if not math.is_finite(distance) or distance <= 0.0: error(invalid, "a chamfer needs a positive distance")
+    if second <= 0.0 and (not math.is_finite(angle) or angle <= 0.0 or angle >= math.pi): error(invalid, "a chamfer's angle is between 0° and 180°")
+    var w = try shape_of(model)
+    defer w.close()
+    var chosen = Growing[usize]()
+    defer chosen.close()
+    try choose_edges(&w, references, chain, &chosen)
+    # How many chosen edges each face holds.
+    var counts = Growing[i64]()
+    defer counts.close()
+    try counts.fill(w.faces.count, 0)
+    for e in chosen.view():
+        let (fa, fb) = try edge_faces(&w, e)
+        counts.items[fa] += 1
+        counts.items[fb] += 1
+    # Each edge's sizes along its faces fa and fb, checked before any tool.
+    var sizes = Growing[f64]()
+    defer sizes.close()
+    for e in chosen.view():
+        let (fa, fb) = try edge_faces(&w, e)
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line or not flat_pair(&w, fa, fb) or not (try convex(&w, e)):
+            error(invalid, "Two distances and Distance and angle chamfers work on straight outside edges between flat faces for now; chamfer this edge by Equal distance")
+        var a_first = counts.items[fa] > counts.items[fb] or (counts.items[fa] == counts.items[fb] and text_before(w.face_name(fa), w.face_name(fb)))
+        if flip: a_first = not a_first
+        let along = try along_edge(&w, e)
+        let corner = math.acos(math.clamp((try into_face(&w, fa, e, along)).dot(try into_face(&w, fb, e, along)), -1.0, 1.0))
+        var other = second
+        if second <= 0.0:
+            if corner + angle >= math.pi - 1e-9: error(invalid, "the chamfer's angle is too steep for this corner: it never meets the other face")
+            other = distance * math.sin(angle) / math.sin(corner + angle)
+        let size_a = distance if a_first else other
+        let size_b = other if a_first else distance
+        try check_fits(&w, e, math.max(size_a, size_b), false)
+        try sizes.push(size_a)
+        try sizes.push(size_b)
+    var body = try shape_rays(&w)
+    defer body.close()
+    var name = Growing[u8]()
+    defer name.close()
+    var result = try copy_model(model)
+    for at in 0..<chosen.count:
+        let e = chosen.items[at]
+        let low = w.edge_at(e, 0.0) catch failure:
+            result.release()
+            error(failure.code, failure.message)
+        let high = w.edge_at(e, 1.0) catch failure:
+            result.release()
+            error(failure.code, failure.message)
+        blend_name(&w, e, tag, &name) catch failure:
+            result.release()
+            error(failure.code, failure.message)
+        let tool = edge_tool(&w, e, sizes.items[at * 2], false, 1, low, high, false, false, &body, (str)name.view(), sizes.items[at * 2 + 1]) catch failure:
+            result.release()
+            error(failure.code, failure.message)
+        defer tool.release()
+        let next = combine(result.value(), tool.value(), op_subtract) catch failure:
+            result.release()
+            error(failure.code, failure.message)
+        result.release()
+        result = next
+    return result
