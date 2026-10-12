@@ -6,29 +6,147 @@
 ## at the first named edge's start. Each edge's arc length is tabled once, so
 ## the radius at any parameter of any chain edge is a lookup.
 ##
-## Between points the radius is held a moment at each (a cubic with no slope
-## there: smooth, Inventor's Smooth radius transition, which Fusion's looks
-## like) or straight. Blends that take a law (cap_blend.lucb, curved_blend.lucb)
-## ask it for the radius at each section.
+## Between points the radius is a cubic (Hermite) on each piece, its slope
+## at each point either Fusion's (law_slopes, the default: straight between
+## two radii, a natural cubic spline through more, held flat at an extreme
+## and along equal radii) or nil (smooth: held a moment at every point,
+## Inventor's Smooth radius transition). A closed loop's law is Fusion's
+## too: its radii at mid points only, round the loop (the start and end
+## radii are not used; one mid radius holds all round). Blends that take a
+## law (cap_blend.lucb, curved_blend.lucb) ask it for the radius at each
+## section.
 
 ## Samples of each edge's arc length table.
 let law_samples: usize = 64
 
 ## The radius at `s` (0 to 1) of points `positions` (ascending, 0 and 1
-## among them) with `radii`, `smooth` or straight between them.
-func radius_at(positions: const f64[], radii: const f64[], smooth: bool, s: f64) -> f64:
+## among them) with `radii` and `slopes` (per unit of `s`) there.
+func radius_at(positions: const f64[], radii: const f64[], slopes: const f64[], s: f64) -> f64:
     var k: usize = 0
     while k + 2 < positions.length and s > positions[k + 1]: k += 1
-    let span = positions[k + 1] - positions[k]
-    var t = (s - positions[k]) / span if span > 0.0 else 0.0
-    t = math.clamp(t, 0.0, 1.0)
-    let blend = t * t * (3.0 - 2.0 * t) if smooth else t
-    return radii[k] + (radii[k + 1] - radii[k]) * blend
+    return hermite(positions, radii, slopes, k, math.clamp(s, positions[k], positions[k + 1]))
+
+## Piece `k`'s cubic (from point k to k + 1) at `s`, carried on outside it.
+func hermite(positions: const f64[], radii: const f64[], slopes: const f64[], k: usize, s: f64) -> f64:
+    let h = positions[k + 1] - positions[k]
+    if h <= 0.0: return radii[k]
+    let u = (s - positions[k]) / h
+    let u2 = u * u
+    let u3 = u2 * u
+    return (2.0 * u3 - 3.0 * u2 + 1.0) * radii[k] + (u3 - 2.0 * u2 + u) * h * slopes[k] + (3.0 * u2 - 2.0 * u3) * radii[k + 1] + (u3 - u2) * h * slopes[k + 1]
+
+## The slopes at `positions` (rising) of Fusion's law through `radii` onto
+## `slopes` (all nil when `smooth`). Fusion 2705 read back (probes 5 to 7
+## of 2026-10-12, luce_work/cad/fusion/FINDINGS.md): two radii run straight
+## (and points in a line); otherwise the law is a natural cubic spline, to
+## 0.003 where that spline keeps to the radii's shape. Where it would not,
+## Fusion keeps the shape: flat at a point that is an extreme or beside an
+## equal radius (equal radii hold between them), so the runs between such
+## points are natural splines held flat at those ends. Those runs whose
+## spline would still turn back (a steep piece beside a shallow one) are
+## limited as Fritsch and Carlson's monotone cubic is. Fusion's own pieces
+## there (into a flat run from an open end, steep beside shallow) are not
+## cubics and are not decoded: ours differ by up to 0.4 (MODELING.md,
+## Variable radius); the spline's pieces, the extremes and flat runs are
+## Fusion's.
+func law_slopes(positions: const f64[], radii: const f64[], smooth: bool, slopes: Growing[f64]*) -> !:
+    let n = positions.length
+    slopes.clear()
+    try slopes.fill(n, 0.0)
+    if smooth or n < 2: return
+    # Held flat: interior extremes and points beside an equal radius.
+    var held = Growing[bool]()
+    defer held.close()
+    try held.fill(n, false)
+    for i in 1..<n - 1:
+        if (radii[i] - radii[i - 1]) * (radii[i + 1] - radii[i]) <= 0.0: held.items[i] = true
+    # Each run between held points (or the ends) a natural spline, held
+    # flat at its held ends: the slope form, tridiagonal.
+    var a: usize = 0
+    while a < n - 1:
+        var b = a + 1
+        while b < n - 1 and not held.items[b]: b += 1
+        try run_slopes(positions, radii, a, b, held.items[a], held.items[b], slopes)
+        a = b
+    # Fritsch-Carlson: a piece's slopes kept to its chord's sign and within
+    # the circle of 3 in the chord's units, so it never turns back.
+    for k in 0..<n - 1:
+        let d = (radii[k + 1] - radii[k]) / (positions[k + 1] - positions[k])
+        if d == 0.0:
+            slopes.items[k] = 0.0
+            slopes.items[k + 1] = 0.0
+            continue
+        var alpha = slopes.items[k] / d
+        var beta = slopes.items[k + 1] / d
+        if alpha < 0.0: alpha = 0.0
+        if beta < 0.0: beta = 0.0
+        let q = alpha * alpha + beta * beta
+        if q > 9.0:
+            let tau = 3.0 / math.sqrt(q)
+            alpha *= tau
+            beta *= tau
+        slopes.items[k] = alpha * d
+        slopes.items[k + 1] = beta * d
+
+## The natural spline's slopes through points `a` to `b`, nil at an end
+## that is `held` (else natural: no curvature there), onto `slopes`.
+func run_slopes(positions: const f64[], radii: const f64[], a: usize, b: usize, held_a: bool, held_b: bool, slopes: Growing[f64]*) -> !:
+    let count = b - a + 1
+    var below = Growing[f64]()
+    defer below.close()
+    var diagonal = Growing[f64]()
+    defer diagonal.close()
+    var above = Growing[f64]()
+    defer above.close()
+    var sides = Growing[f64]()
+    defer sides.close()
+    for j in 0..<count:
+        let i = a + j
+        var l = 0.0
+        var m = 1.0
+        var u = 0.0
+        var r = 0.0
+        let pinned = (j == 0 and held_a) or (j == count - 1 and held_b)
+        if pinned:
+            m = 1.0
+        elif j == 0:
+            let h = positions[i + 1] - positions[i]
+            m = 2.0 / h
+            u = 1.0 / h
+            r = 3.0 * (radii[i + 1] - radii[i]) / (h * h)
+        elif j == count - 1:
+            let h = positions[i] - positions[i - 1]
+            l = 1.0 / h
+            m = 2.0 / h
+            r = 3.0 * (radii[i] - radii[i - 1]) / (h * h)
+        else:
+            let h0 = positions[i] - positions[i - 1]
+            let h1 = positions[i + 1] - positions[i]
+            l = 1.0 / h0
+            m = 2.0 * (1.0 / h0 + 1.0 / h1)
+            u = 1.0 / h1
+            r = 3.0 * ((radii[i] - radii[i - 1]) / (h0 * h0) + (radii[i + 1] - radii[i]) / (h1 * h1))
+        try below.push(l)
+        try diagonal.push(m)
+        try above.push(u)
+        try sides.push(r)
+    # Thomas: forward, then back.
+    for j in 1..<count:
+        let f = below.items[j] / diagonal.items[j - 1]
+        diagonal.items[j] -= f * above.items[j - 1]
+        sides.items[j] -= f * sides.items[j - 1]
+    slopes.items[b] = sides.items[count - 1] / diagonal.items[count - 1]
+    var j = count - 1
+    while j > 0:
+        j -= 1
+        slopes.items[a + j] = (sides.items[j] - above.items[j] * slopes.items[a + j + 1]) / diagonal.items[j]
 
 ## A radius law over a chain of a shape's edges (see the header).
 struct RadiusLaw:
     var positions: Growing[f64]
     var radii: Growing[f64]
+    ## The law's slope at each point (law_slopes).
+    var slopes: Growing[f64]
     var smooth: bool
     ## Per shape edge: its place in the chain (-1: not on it), whether the
     ## chain runs its way (t0 to t1), the chain's length before it, and its
@@ -43,6 +161,7 @@ struct RadiusLaw:
     func close():
         self.positions.close()
         self.radii.close()
+        self.slopes.close()
         self.smooth = false
         self.place.close()
         self.forward.close()
@@ -57,7 +176,7 @@ struct RadiusLaw:
 
     ## The radius at fraction `s` of the chain.
     func at_fraction(s: f64) -> f64:
-        return radius_at(self.positions.view(), self.radii.view(), self.smooth, s)
+        return radius_at(self.positions.view(), self.radii.view(), self.slopes.view(), s)
 
     ## The fraction of the chain at edge `e`'s carrier parameter `t`.
     func fraction(w: const Shape*, e: usize, t: f64) -> f64!:
@@ -84,7 +203,7 @@ struct RadiusLaw:
 ## which must make one chain; `first` the edge it starts from (the first
 ## named).
 func chain_law(w: const Shape*, chosen: const usize[], first: usize, positions: const f64[], radii: const f64[], smooth: bool) -> RadiusLaw!:
-    var law = RadiusLaw(Growing[f64](), Growing[f64](), smooth, Growing[i64](), Growing[bool](), Growing[f64](), Growing[f64](), 0.0, false)
+    var law = RadiusLaw(Growing[f64](), Growing[f64](), Growing[f64](), smooth, Growing[i64](), Growing[bool](), Growing[f64](), Growing[f64](), 0.0, false)
     errdefer law.close()
     try law_points(&law, positions, radii)
     try law.place.fill(w.edges.count, -1)
@@ -128,9 +247,55 @@ func chain_law(w: const Shape*, chosen: const usize[], first: usize, positions: 
         e = (usize)next
     if count != chosen.length: error(invalid, "a variable radius runs along one tangent chain: pick one edge or one chain")
     if law.total <= w.tolerance: error(invalid, "a variable radius's chain has no length")
-    if law.closed and math.abs(law.radii.items[0] - law.radii.items[law.radii.count - 1]) > w.tolerance:
-        error(invalid, "a closed loop's variable radius starts and ends at one point: its start and end radii must be the same")
+    if law.closed: try loop_law(&law, positions, radii)
+    else: try law_slopes(law.positions.view(), law.radii.view(), smooth, &law.slopes)
     return law
+
+## A closed loop's law, as Fusion's: through its mid points (positions
+## strictly inside 0 to 1) round the loop, the start and end radii not used
+## (with no mid point, the start radius all round); the points three times
+## over (a turn back, this turn, a turn on) give this turn's slopes, and the
+## law's value and slope at 0 close it at both ends.
+func loop_law(law: RadiusLaw*, positions: const f64[], radii: const f64[]) -> !:
+    var at = Growing[f64]()
+    defer at.close()
+    var sizes = Growing[f64]()
+    defer sizes.close()
+    for turn in 0..<(usize)3:
+        for k in 0..<positions.length:
+            if positions[k] <= 0.0 or positions[k] >= 1.0: continue
+            try at.push(positions[k] + (f64)turn - 1.0)
+            try sizes.push(radii[k])
+    let mids = at.count // 3
+    law.positions.clear()
+    law.radii.clear()
+    law.slopes.clear()
+    if mids == 0:
+        try law.positions.push(0.0)
+        try law.positions.push(1.0)
+        try law.radii.push(radii[0])
+        try law.radii.push(radii[0])
+        try law.slopes.fill(2, 0.0)
+        return
+    var slopes = Growing[f64]()
+    defer slopes.close()
+    try law_slopes(at.view(), sizes.view(), law.smooth, &slopes)
+    let start = radius_at(at.view(), sizes.view(), slopes.view(), 0.0)
+    # The slope at 0, of the piece holding it.
+    var k: usize = 0
+    while at.items[k + 1] < 0.0: k += 1
+    let h = 1e-6
+    let rate = (hermite(at.view(), sizes.view(), slopes.view(), k, h) - hermite(at.view(), sizes.view(), slopes.view(), k, -h)) / (2.0 * h)
+    try law.positions.push(0.0)
+    try law.radii.push(start)
+    try law.slopes.push(rate)
+    for j in mids..<2 * mids:
+        try law.positions.push(at.items[j])
+        try law.radii.push(sizes.items[j])
+        try law.slopes.push(slopes.items[j])
+    try law.positions.push(1.0)
+    try law.radii.push(start)
+    try law.slopes.push(rate)
 
 ## The positions and radii checked, the chain's ends added.
 func law_points(law: RadiusLaw*, positions: const f64[], radii: const f64[]) -> !:

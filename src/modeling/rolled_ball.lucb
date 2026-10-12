@@ -1,0 +1,196 @@
+## Fusion's G1 variable radius fillet at a Tangency weight of 1 (exactly)
+## rolls a ball (probe 5 of 2026-10-12): along one straight edge between
+## flat faces the blend is the envelope of the balls, each of the law's
+## radius, centered on the bisecting plane r / sin(θ/2) from the edge. One
+## straight piece of the law makes a cone (variable_fillet.lucb,
+## rolling_weight); any other law a canal surface, made here:
+## - its sections in planes square to the edge (so its ends stop in the
+##   end faces' planes, as Fusion's trimmed face does): at each, points of
+##   the envelope found along rays from the edge, between the ways into the
+##   faces (Newton on the distance to the nearest ball, the ball's place
+##   along the edge the second unknown: where the distance is least);
+## - each section a degree 5 Bezier through the contacts, its second and
+##   fifth points along the faces (G1 there), the inner two fitted by least
+##   squares with the samples' parameters corrected toward their feet:
+##   within 1e-5 of the envelope at radii of a few millimeters;
+## - the sections' control points fitted along the edge as rows
+##   (row_fit.lucb), so the face is a B-spline within the tolerance of them.
+## The law is carried on past the edge's ends, as Fusion extends its face
+## and trims it, since the balls near an end reach past it.
+
+## A rolled strip's frame: the edge from `start` along `along`, `length`
+## long, the ways `ua` and `ub` into its faces `theta` apart, the centers'
+## offset `k` per unit radius, and the law (radius_law.lucb's points).
+struct Rolled:
+    var start: Vector3
+    var along: Vector3
+    var length: f64
+    var ua: Vector3
+    var ub: Vector3
+    var theta: f64
+    var k: Vector3
+    var positions: const f64[]
+    var radii: const f64[]
+    var slopes: const f64[]
+
+## The radius at `z` along the edge, the law's end pieces carried on past
+## its ends.
+func rolled_radius(r: const Rolled*, z: f64) -> f64:
+    let s = z / r.length
+    var k: usize = 0
+    while k + 2 < r.positions.length and s > r.positions[k + 1]: k += 1
+    return hermite(r.positions, r.radii, r.slopes, k, s)
+
+## The ball at `s` along the edge: its center, radius, and their rates.
+func rolled_ball_at(r: const Rolled*, s: f64) -> (Vector3, f64, Vector3, f64):
+    let h = r.length * 1e-6
+    let radius = rolled_radius(r, s)
+    let rate = (rolled_radius(r, s + h) - rolled_radius(r, s - h)) / (2.0 * h)
+    let center = r.start.add(r.along.multiply_scalar(s)).add(r.k.multiply_scalar(radius))
+    return (center, radius, r.along.add(r.k.multiply_scalar(rate)), rate)
+
+## The envelope's point in the section at `z` along the ray from the edge
+## `tau` of the way from `ua` to `ub`: where the ray first enters the balls,
+## the least of its distances to each ball (ray_meets) over their places
+## along the edge (sampled about `z`, then golden section: at the least
+## the ball touches the envelope there, its characteristic).
+func rolled_point(r: const Rolled*, z: f64, tau: f64) -> Vector3!:
+    let e = r.start.add(r.along.multiply_scalar(z))
+    # The contacts: each ball touches a face at the foot of its center.
+    let foot = rolled_radius(r, z) / math.tan(r.theta * 0.5)
+    if tau == 0.0: return e.add(r.ua.multiply_scalar(foot))
+    if tau == 1.0: return e.add(r.ub.multiply_scalar(foot))
+    let way = r.ua.multiply_scalar(math.sin((1.0 - tau) * r.theta)).add(r.ub.multiply_scalar(math.sin(tau * r.theta))).multiply_scalar(1.0 / math.sin(r.theta))
+    let reach = 2.0 * rolled_radius(r, z)
+    # The local least nearest `z` (the characteristic of the balls about
+    # it: where steep radii swallow a valley's small balls, the strip runs
+    # on through them as Fusion's does, not over the outer balls' crease).
+    let steps: usize = 64
+    var values: f64[65]
+    for k in 0..<steps + 1: values[k] = ray_meets(r, e, way, z - reach + 2.0 * reach * (f64)k / (f64)steps)
+    var at = z
+    var nearest = 1.0e300
+    for k in 0..<steps + 1:
+        let s = z - reach + 2.0 * reach * (f64)k / (f64)steps
+        let left = values[k - 1] if k > 0 else 1.0e300
+        let right = values[k + 1] if k < steps else 1.0e300
+        if values[k] < 1.0e299 and values[k] <= left and values[k] <= right and math.abs(s - z) < nearest:
+            nearest = math.abs(s - z)
+            at = s
+    var low = at - 2.0 * reach / (f64)steps
+    var high = at + 2.0 * reach / (f64)steps
+    let golden = (math.sqrt(5.0) - 1.0) * 0.5
+    var x1 = high - golden * (high - low)
+    var x2 = low + golden * (high - low)
+    var f1 = ray_meets(r, e, way, x1)
+    var f2 = ray_meets(r, e, way, x2)
+    for _ in 0..<100:
+        if f1 < f2:
+            high = x2
+            x2 = x1
+            f2 = f1
+            x1 = high - golden * (high - low)
+            f1 = ray_meets(r, e, way, x1)
+        else:
+            low = x1
+            x1 = x2
+            f1 = f2
+            x2 = low + golden * (high - low)
+            f2 = ray_meets(r, e, way, x2)
+        if high - low <= r.length * 1e-14: break
+    let d = math.min(f1, f2)
+    if d >= 1.0e299: error(invalid, "a rolled fillet's section could not be found: no ball reaches the ray")
+    return e.add(way.multiply_scalar(d))
+
+## Where the ray from `e` along `way` first meets the ball at `s` (very far
+## when it passes it).
+func ray_meets(r: const Rolled*, e: Vector3, way: Vector3, s: f64) -> f64:
+    let (center, radius, _, _) = rolled_ball_at(r, s)
+    if radius <= 0.0: return 1.0e300
+    let q = e.subtract(center)
+    let b = q.dot(way)
+    let disc = b * b - (q.dot(q) - radius * radius)
+    if disc < 0.0: return 1.0e300
+    return -b - math.sqrt(disc)
+
+## Bernstein weights of degree 5 at `t`.
+func bernstein5(t: f64) -> f64[6]:
+    let u = 1.0 - t
+    return [u * u * u * u * u, 5.0 * t * u * u * u * u, 10.0 * t * t * u * u * u, 10.0 * t * t * t * u * u, 5.0 * t * t * t * t * u, t * t * t * t * t]
+
+## The section at `z`: its six control points onto `out` (see the header).
+func rolled_section(r: const Rolled*, z: f64, out: Growing[Vector3]*) -> !:
+    let samples: usize = 40
+    var points = Growing[Vector3]()
+    defer points.close()
+    for k in 0..<samples + 1: try points.push(try rolled_point(r, z, (f64)k / (f64)samples))
+    let a = points.items[0]
+    let b = points.items[samples]
+    # The samples' parameters: chord lengths first.
+    var params = Growing[f64]()
+    defer params.close()
+    try params.push(0.0)
+    for k in 1..<samples + 1: try params.push(params.items[k - 1] + points.items[k].subtract(points.items[k - 1]).length())
+    let total = params.items[samples]
+    for k in 0..<samples + 1: params.items[k] /= total
+    # The plane's frame: x along ua, y across in the section.
+    let y = try r.ub.subtract(r.ua.multiply_scalar(r.ub.dot(r.ua))).normalized()
+    let e = r.start.add(r.along.multiply_scalar(z))
+    var control: Vector3[6] = [a, a, a, b, b, b]
+    for _ in 0..<16:
+        # Least squares for α, β (the legs) and the inner points' x, y.
+        var normal: f64[36] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        var rhs: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        for k in 0..<samples + 1:
+            let w = bernstein5(params.items[k])
+            let fixed = a.multiply_scalar(w[0] + w[1]).add(b.multiply_scalar(w[4] + w[5])).add(e.multiply_scalar(w[2] + w[3]))
+            let residual = points.items[k].subtract(fixed)
+            for axis in 0..<(usize)2:
+                let dir = r.ua if axis == 0 else y
+                let row: f64[6] = [-w[1] * r.ua.dot(dir), -w[4] * r.ub.dot(dir), w[2] if axis == 0 else 0.0, w[2] if axis == 1 else 0.0, w[3] if axis == 0 else 0.0, w[3] if axis == 1 else 0.0]
+                let value = residual.dot(dir)
+                for i in 0..<(usize)6:
+                    rhs[i] += row[i] * value
+                    for j in 0..<(usize)6: normal[i * 6 + j] += row[i] * row[j]
+        if not solve_small(normal[..<36], rhs[..<6], 6): error(invalid, "a rolled fillet's section could not be fitted")
+        control = [a, a.subtract(r.ua.multiply_scalar(rhs[0])), e.add(r.ua.multiply_scalar(rhs[2])).add(y.multiply_scalar(rhs[3])), e.add(r.ua.multiply_scalar(rhs[4])).add(y.multiply_scalar(rhs[5])), b.subtract(r.ub.multiply_scalar(rhs[1])), b]
+        # Each inner sample's parameter moved to its foot (Newton).
+        for k in 1..<samples:
+            for _ in 0..<3:
+                let t = params.items[k]
+                let w = bernstein5(t)
+                var at = Vector3()
+                for i in 0..<(usize)6: at = at.add(control[i].multiply_scalar(w[i]))
+                var slope = Vector3()
+                for i in 0..<(usize)5: slope = slope.add(control[i + 1].subtract(control[i]).multiply_scalar(5.0 * bernstein4(t, i)))
+                let speed = slope.dot(slope)
+                if speed > 0.0: params.items[k] = math.clamp(t - at.subtract(points.items[k]).dot(slope) / speed, 0.0, 1.0)
+    out.clear()
+    for p in control: try out.push(p)
+
+## Bernstein weight `i` of degree 4 at `t`.
+func bernstein4(t: f64, i: usize) -> f64:
+    let u = 1.0 - t
+    let c: f64[5] = [1.0, 4.0, 6.0, 4.0, 1.0]
+    return c[i] * math.pow(t, (f64)i) * math.pow(u, (f64)(4 - i))
+
+func rolled_rows_at(context: void*, t: f64, out: Growing[Vector3]*) -> !:
+    try rolled_section((Rolled*)context, t, out)
+
+## The rolled strip's net (6 rows across, fitted along z from 0 to the
+## edge's length), its weights (1) and knots along onto `net`, `weights`
+## and `knots`; the degree along.
+func rolled_net(r: Rolled*, tolerance: f64, net: Growing[Vector3]*, weights: Growing[f64]*, knots: Growing[f64]*) -> i64!:
+    # The law's cubics meet with their slopes alike (C1) at its points:
+    # knots there four times (a quintic's C1), and halfway between.
+    let p: usize = 5
+    for _ in 0..<p + 1: try knots.push(0.0)
+    for k in 0..<r.positions.length - 1:
+        if k > 0:
+            for _ in 0..<(usize)4: try knots.push(r.length * r.positions[k])
+        try knots.push(r.length * (r.positions[k] + r.positions[k + 1]) * 0.5)
+    for _ in 0..<p + 1: try knots.push(r.length)
+    var source = RowSource((void*)r, rolled_rows_at, 0.0, r.length, tolerance)
+    try fit_rows(&source, 6, p, knots, net)
+    try weights.fill(net.count, 1.0)
+    return (i64)p

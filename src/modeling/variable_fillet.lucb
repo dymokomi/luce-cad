@@ -1,6 +1,6 @@
 ## Fusion's Variable radius fillet: radii at points along a tangent chain
-## of edges (positions 0 to 1 along it: radius_law.lucb), blending between
-## them smoothly or straight, G1, G2 or G3, under Fusion's Tangency weight
+## of edges (positions 0 to 1 along it), Fusion's law between them or held
+## at each (radius_law.lucb), G1, G2 or G3, under Fusion's Tangency weight
 ## (fillet_section, arc_section) as a constant fillet's.
 ##
 ## The chain is built as a constant fillet's would be, the radius asked of
@@ -34,7 +34,7 @@
 ## `model` with the edges `reference` names (with their tangent chains when
 ## `chain`) filleted with `radii` at `positions` along the chain (0 its
 ## start, 1 its end; the ends are added from the nearest radius when
-## missing), smoothly or straight between them, of `continuity`, the blend
+## missing), Fusion's law between them or `smooth`, of `continuity`, the blend
 ## named for feature `tag`, under Tangency weight `tangency`.
 func variable_filleted_edge(model: const CadModel*, reference: str, positions: const f64[], radii: const f64[], smooth: bool, tag: str, continuity: i64 = 1, chain: bool = true, tangency: f64 = 1.0) -> interop.Reference[CadModel]!:
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
@@ -102,26 +102,54 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
     defer kept_at.close()
     var kept_sizes = Growing[f64]()
     defer kept_sizes.close()
+    var kept_slopes = Growing[f64]()
+    defer kept_slopes.close()
     let at = law.positions.view()
     let sizes = law.radii.view()
+    let slopes = law.slopes.view()
     for k in 0..<at.length:
         if k > 0 and k + 1 < at.length:
-            let previous = kept_sizes.items[kept_sizes.count - 1]
-            let before = (sizes[k] - previous) / (at[k] - kept_at.items[kept_at.count - 1])
-            let after = (sizes[k + 1] - sizes[k]) / (at[k + 1] - at[k])
-            let flat = previous == sizes[k] and sizes[k] == sizes[k + 1]
-            if flat or (not law.smooth and math.abs(before - after) <= 1e-12 * math.max(1.0, math.abs(before))): continue
+            # Within one straight run (a flat one too): the slopes all the
+            # chord from the last point kept to the next.
+            let chord = (sizes[k + 1] - kept_sizes.items[kept_sizes.count - 1]) / (at[k + 1] - kept_at.items[kept_at.count - 1])
+            let near = 1e-12 * math.max(1.0, math.abs(chord))
+            let on = math.abs(sizes[k] - (sizes[k + 1] - chord * (at[k + 1] - at[k]))) <= near
+            if on and math.abs(kept_slopes.items[kept_slopes.count - 1] - chord) <= near and math.abs(slopes[k] - chord) <= near and math.abs(slopes[k + 1] - chord) <= near: continue
         try kept_at.push(at[k])
         try kept_sizes.push(sizes[k])
+        try kept_slopes.push(slopes[k])
     var name = Growing[u8]()
     defer name.close()
     try blend_name(w, e, tag, &name)
     # Fusion rolls a ball at G1 under the weight of 1 (exactly; 0.999 and
     # 1.001 scale the section): one straight piece of the law makes a cone.
+    let straight = kept_at.count == 2 and math.abs(kept_slopes.items[0] - (kept_sizes.items[1] - kept_sizes.items[0])) <= 1e-12 * math.max(1.0, kept_sizes.items[1])
     var cone = -1.0
-    if continuity == 1 and tangency == 1.0 and kept_at.count == 2 and not law.smooth:
+    if continuity == 1 and tangency == 1.0 and straight:
         cone = rolling_weight(theta, (kept_sizes.items[1] - kept_sizes.items[0]) / (length * (kept_at.items[1] - kept_at.items[0])))
-    let tool = try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), law.smooth, (str)name.view(), convex_edge, continuity, &ends, tangency, cone)
+    if continuity == 1 and tangency == 1.0 and not straight:
+        # Any other law: the balls' envelope (rolled_ball.lucb).
+        if ends.slanted0 or ends.slanted1: error(invalid, "a G1 variable fillet (Tangency weight 1) along a law with points between, ending at a slanted face, is not built yet: give it another weight, or end it square")
+        var rolled = Rolled(start, along, length, ua, ub, theta, try ua.add(ub).normalized().multiply_scalar(1.0 / math.sin(theta * 0.5)), kept_at.view(), kept_sizes.view(), kept_slopes.view())
+        var net = Growing[Vector3]()
+        defer net.close()
+        var weights = Growing[f64]()
+        defer weights.close()
+        var knots = Growing[f64]()
+        defer knots.close()
+        let along_degree = rolled_net(&rolled, math.max(w.tolerance, length * 1e-6), &net, &weights, &knots) catch failure:
+            if failure.code != invalid: error(failure.code, failure.message)
+            error(invalid, "a G1 variable fillet (Tangency weight 1) changes its radius too steeply here to roll its ball: spread its points, or give it another weight")
+        var section_knots = Growing[f64]()
+        defer section_knots.close()
+        for _ in 0..<(usize)6: try section_knots.push(0.0)
+        for _ in 0..<(usize)6: try section_knots.push(1.0)
+        # The net row-major across (6 rows, each along).
+        let count = net.count // 6
+        let rolled_tool = try strip_solid(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), net.view(), weights.view(), 6, count, 5, along_degree, section_knots.view(), knots.view(), length + reach * law.largest() * 4.0, (str)name.view(), convex_edge, &ends)
+        defer rolled_tool.release()
+        return try combine(model, rolled_tool.value(), op_subtract if convex_edge else op_union)
+    let tool = try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), kept_slopes.view(), (str)name.view(), convex_edge, continuity, &ends, tangency, cone)
     defer tool.release()
     return try combine(model, tool.value(), op_subtract if convex_edge else op_union)
 
@@ -156,23 +184,20 @@ struct EndPlanes:
     var h1: f64
     var slanted1: bool
 
-## The radius of law piece `j` (points `positions`, `radii`) at `s`, its
-## polynomial carried on outside the piece.
-func piece_radius(positions: const f64[], radii: const f64[], smooth: bool, j: usize, s: f64) -> f64:
-    let span = positions[j + 1] - positions[j]
-    let t = (s - positions[j]) / span
-    let blend = t * t * (3.0 - 2.0 * t) if smooth else t
-    return radii[j] + (radii[j + 1] - radii[j]) * blend
+## The radius of law piece `j` (points `positions`, `radii`, `slopes`) at
+## `s`, its polynomial carried on outside the piece.
+func piece_radius(positions: const f64[], radii: const f64[], slopes: const f64[], j: usize, s: f64) -> f64:
+    return hermite(positions, radii, slopes, j, s)
 
 ## Where a row of a variable tool (the edge's point at `s` from `low` along
 ## `span`, plus law piece `j`'s radius times `q`) meets the plane n·x = h:
 ## Newton from `s`.
-func row_meets(low: Vector3, span: Vector3, q: Vector3, positions: const f64[], radii: const f64[], smooth: bool, j: usize, n: Vector3, h: f64, s: f64) -> f64!:
+func row_meets(low: Vector3, span: Vector3, q: Vector3, positions: const f64[], radii: const f64[], slopes: const f64[], j: usize, n: Vector3, h: f64, s: f64) -> f64!:
     var x = s
     let step = 1e-7
     for _ in 0..<50:
-        let f = n.dot(low.add(span.multiply_scalar(x)).add(q.multiply_scalar(piece_radius(positions, radii, smooth, j, x)))) - h
-        let g = n.dot(low.add(span.multiply_scalar(x + step)).add(q.multiply_scalar(piece_radius(positions, radii, smooth, j, x + step)))) - h
+        let f = n.dot(low.add(span.multiply_scalar(x)).add(q.multiply_scalar(piece_radius(positions, radii, slopes, j, x)))) - h
+        let g = n.dot(low.add(span.multiply_scalar(x + step)).add(q.multiply_scalar(piece_radius(positions, radii, slopes, j, x + step)))) - h
         let slope = (g - f) / step
         if math.abs(slope) < 1e-12: error(invalid, "a variable radius fillet's strip runs along its end face")
         let next = x - f / slope
@@ -209,7 +234,7 @@ func ends_square(w: const Shape*, v: i64, fa: usize, fb: usize, along: Vector3) 
 ## at different radii, still meet in a section of the cone (a row's part
 ## along the cone's rulings is then the same for every row: the surface
 ## stays on the cone).
-func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, reach: f64, weight: f64, positions: const f64[], radii: const f64[], smooth: bool, name: str, convex_edge: bool, continuity: i64, ends: const EndPlanes*, tangency: f64, cone: f64 = -1.0) -> interop.Reference[CadModel]!:
+func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, reach: f64, weight: f64, positions: const f64[], radii: const f64[], slopes: const f64[], name: str, convex_edge: bool, continuity: i64, ends: const EndPlanes*, tangency: f64, cone: f64 = -1.0) -> interop.Reference[CadModel]!:
     let pieces = positions.length - 1
     let count = 3 * pieces + 1
     # Along: a cubic Bezier per piece, knots thrice at each point.
@@ -254,8 +279,8 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
         let q = unit_section.items[u]
         var first_s = 0.0
         var last_s = 1.0
-        if ends.slanted0: first_s = try row_meets(start, length, q, positions, radii, smooth, 0, ends.n0, ends.h0, 0.0)
-        if ends.slanted1: last_s = try row_meets(start, length, q, positions, radii, smooth, pieces - 1, ends.n1, ends.h1, 1.0)
+        if ends.slanted0: first_s = try row_meets(start, length, q, positions, radii, slopes, 0, ends.n0, ends.h0, 0.0)
+        if ends.slanted1: last_s = try row_meets(start, length, q, positions, radii, slopes, pieces - 1, ends.n1, ends.h1, 1.0)
         if first_s >= (positions[1] if pieces > 1 else last_s) or last_s <= (positions[pieces - 1] if pieces > 1 else first_s):
             error(invalid, "a variable radius fillet's slanted end reaches past its next radius point: move the point along")
         for j in 0..<pieces:
@@ -263,10 +288,10 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
             let b = last_s if j == pieces - 1 else positions[j + 1]
             # The piece's cubic on [a, b] as a Bezier: its values at the
             # thirds, solved for the inner control values.
-            let v0 = piece_radius(positions, radii, smooth, j, a)
-            let v1 = piece_radius(positions, radii, smooth, j, a + (b - a) / 3.0)
-            let v2 = piece_radius(positions, radii, smooth, j, a + (b - a) * 2.0 / 3.0)
-            let v3 = piece_radius(positions, radii, smooth, j, b)
+            let v0 = piece_radius(positions, radii, slopes, j, a)
+            let v1 = piece_radius(positions, radii, slopes, j, a + (b - a) / 3.0)
+            let v2 = piece_radius(positions, radii, slopes, j, a + (b - a) * 2.0 / 3.0)
+            let v3 = piece_radius(positions, radii, slopes, j, b)
             let c1 = (-5.0 * v0 + 18.0 * v1 - 9.0 * v2 + 2.0 * v3) / 6.0
             let c2 = (2.0 * v0 - 9.0 * v1 + 18.0 * v2 - 5.0 * v3) / 6.0
             let values: f64[4] = [v0, c1, c2, v3]
@@ -286,18 +311,29 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
                     continue
                 try net.push(start.add(length.multiply_scalar(s)).add(q.multiply_scalar(values[m])))
                 try weights.push(section_weights.items[u])
-    let middle_r = radius_at(positions, radii, smooth, 0.5)
-    let last_row = (rows - 1) * count
     let size = length.length() + reach * radii[0] * 4.0
+    return try strip_solid(start, end, ua, ub, na, nb, net.view(), weights.view(), rows, count, degree, 3, section_knots.view(), knots.view(), size, name, convex_edge, ends)
+
+## A variable fillet's tool from its blend face's net (`rows` by `count`,
+## row-major, u across from contact a to contact b by v along, `degree`
+## across on `section_knots`, `along_degree` along on `knots`, with
+## `weights`): the face, the flat faces on the edge's faces `a` and `b`
+## (ways `ua`, `ub` into them, outward normals `na`, `nb`) from the edge
+## (`start` to `end`) to the contacts, and the ends (square, or the
+## slanted planes of `ends`). The face is outward toward the ball's
+## center, the bisector's way, the tool lying between the edge and it.
+func strip_solid(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, net: const Vector3[], weights: const f64[], rows: usize, count: usize, degree: i64, along_degree: i64, section_knots: const f64[], knots: const f64[], size: f64, name: str, convex_edge: bool, ends: const EndPlanes*) -> interop.Reference[CadModel]!:
+    let last_row = (rows - 1) * count
+    let length = end.subtract(start)
     let solid = try BrepModel.sized(size)
     defer solid.release()
     let b = solid.value()
     let e0 = try b.add_vertex(start)
     let e1 = try b.add_vertex(end)
-    let a0 = try b.add_vertex(net.items[0])
-    let a1 = try b.add_vertex(net.items[count - 1])
-    let b0 = try b.add_vertex(net.items[last_row])
-    let b1 = try b.add_vertex(net.items[last_row + count - 1])
+    let a0 = try b.add_vertex(net[0])
+    let a1 = try b.add_vertex(net[count - 1])
+    let b0 = try b.add_vertex(net[last_row])
+    let b1 = try b.add_vertex(net[last_row + count - 1])
     let ridge = try b.add_line(e0, e1)
     let to_a0 = try b.add_line(e0, a0)
     let to_b0 = try b.add_line(e0, b0)
@@ -305,8 +341,8 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
     let to_b1 = try b.add_line(e1, b1)
     # The edges: the first and last rows (the contacts) and columns (the
     # end sections), with the net's own weights.
-    let curve_a = try b.add_spline_edge(a0, a1, net.view()[0..<count], weights.view()[0..<count], 3, knots.view(), true)
-    let curve_b = try b.add_spline_edge(b0, b1, net.view()[last_row..<last_row + count], weights.view()[last_row..<last_row + count], 3, knots.view(), true)
+    let curve_a = try b.add_spline_edge(a0, a1, net[0..<count], weights[0..<count], along_degree, knots, true)
+    let curve_b = try b.add_spline_edge(b0, b1, net[last_row..<last_row + count], weights[last_row..<last_row + count], along_degree, knots, true)
     var first = Growing[Vector3]()
     defer first.close()
     var last = Growing[Vector3]()
@@ -316,23 +352,19 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
     var last_weights = Growing[f64]()
     defer last_weights.close()
     for u in 0..<rows:
-        try first.push(net.items[u * count])
-        try last.push(net.items[u * count + count - 1])
-        try first_weights.push(weights.items[u * count])
-        try last_weights.push(weights.items[u * count + count - 1])
-    let arc0 = try b.add_spline_edge(a0, b0, first.view(), first_weights.view(), degree, section_knots.view(), true)
-    let arc1 = try b.add_spline_edge(a1, b1, last.view(), last_weights.view(), degree, section_knots.view(), true)
+        try first.push(net[u * count])
+        try last.push(net[u * count + count - 1])
+        try first_weights.push(weights[u * count])
+        try last_weights.push(weights[u * count + count - 1])
+    let arc0 = try b.add_spline_edge(a0, b0, first.view(), first_weights.view(), degree, section_knots, true)
+    let arc1 = try b.add_spline_edge(a1, b1, last.view(), last_weights.view(), degree, section_knots, true)
     # The blend face: outward toward the ball's center (away from the edge,
     # the tool lying between the edge and the face, either way).
-    let surface = try b.add_spline_surface(net.view(), weights.view(), (i64)rows, (i64)count, degree, 3, section_knots.view(), knots.view())
-    let middle = start.add(length.multiply_scalar(0.5))
-    let bisector = try ua.add(ub).normalized()
-    let center = middle.add(bisector.multiply_scalar(middle_r / weight))
-    let arc_point = center.subtract(bisector.multiply_scalar(middle_r))
-    let toward = center.subtract(arc_point)
+    let surface = try b.add_spline_surface(net, weights, (i64)rows, (i64)count, degree, along_degree, section_knots, knots)
+    let toward = try ua.add(ub).normalized()
     let sizes: i64[1] = [4]
     # Counterclockwise in (u, v), unit_section (a to b) by along: about du x dv.
-    let du = net.items[last_row + count // 2].subtract(net.items[count // 2])
+    let du = net[last_row + count // 2].subtract(net[count // 2])
     let forward = du.cross(length).dot(toward) > 0.0
     let ahead: i64[4] = [arc0 + 1, curve_b + 1, -(arc1 + 1), -(curve_a + 1)]
     let back: i64[4] = [curve_a + 1, arc1 + 1, -(curve_b + 1), -(arc0 + 1)]
@@ -344,10 +376,10 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
     let normal_a = na if convex_edge else na.multiply_scalar(-1.0)
     let normal_b = nb if convex_edge else nb.multiply_scalar(-1.0)
     let on_a: i64[4] = [ridge + 1, to_a1 + 1, -(curve_a + 1), -(to_a0 + 1)]
-    let around_a: Vector3[4] = [start, end, net.items[count - 1], net.items[0]]
+    let around_a: Vector3[4] = [start, end, net[count - 1], net[0]]
     try flat_face(b, start, normal_a, on_a[..<4], around_a[..<4])
     let on_b: i64[4] = [to_b0 + 1, curve_b + 1, -(to_b1 + 1), -(ridge + 1)]
-    let around_b: Vector3[4] = [start, net.items[last_row], net.items[last_row + count - 1], end]
+    let around_b: Vector3[4] = [start, net[last_row], net[last_row + count - 1], end]
     try flat_face(b, start, normal_b, on_b[..<4], around_b[..<4])
     let way = try length.normalized()
     # The ends: square to the edge, or a slanted end's plane, facing away
@@ -357,9 +389,9 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
     var end_normal = way
     if ends.slanted1: end_normal = ends.n1.multiply_scalar(1.0 if ends.n1.dot(way) > 0.0 else -1.0)
     let at_start: i64[3] = [to_a0 + 1, arc0 + 1, -(to_b0 + 1)]
-    let around_start: Vector3[3] = [start, net.items[0], net.items[last_row]]
+    let around_start: Vector3[3] = [start, net[0], net[last_row]]
     try flat_face(b, start, start_normal, at_start[..<3], around_start[..<3])
     let at_end: i64[3] = [to_b1 + 1, -(arc1 + 1), -(to_a1 + 1)]
-    let around_end: Vector3[3] = [end, net.items[last_row + count - 1], net.items[count - 1]]
+    let around_end: Vector3[3] = [end, net[last_row + count - 1], net[count - 1]]
     try flat_face(b, end, end_normal, at_end[..<3], around_end[..<3])
     return try CadModel.of_brep(solid)

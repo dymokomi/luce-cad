@@ -83,6 +83,18 @@ its sizes), joins, filters by name as an object path and is saved in geometry fi
 are blended only when referenced. A rim is a circle, or an arc of one, between a flat face and a
 cylinder or cone about it: a hole's rim, a boss's edge, a countersink's rim.
 
+## Seams
+
+A periodic face here is bounded by a seam: an edge the face uses both ways (a cylinder's or a
+torus's closing line, a turned strip's section at its loop's vertex), or an edge between two faces
+on one surface (a sphere made of two hemispheres: its equator). Fusion's periodic faces have none
+(probe 7 of 2026-10-12: a cylinder has two edges, its circles; a sphere and a torus none). So seams
+stay in the B-rep (the tessellator, the booleans and the charts use them) but are **not drawn**
+(`overlay.lucb` `seam_edges`: the edges' lines and the preview's boundaries) **and not picked** (Edit
+CAD's pick mesh keeps no edge between a face and itself or two faces of one surface).
+`fusion_probe_tests` checks a dome's rim strip draws only its contact circles, a cylinder its rims,
+a sphere and a torus nothing.
+
 ## Names
 
 Edge numbers change whenever anything upstream changes, so a fillet can't remember its edges by
@@ -465,15 +477,35 @@ volume), at G1, G2 and G3 (bulging: G1), each closed with the round one face.
 tangent chain, positions 0 to 1 as fractions of the chain's length (Fusion's API: "the percentage
 along the curve"). The chain starts at an open end, the first named edge's chain followed back, or
 for a closed loop at the first named edge's start; a closed loop's start and end radii must agree.
-Between points the radius is held a moment at each (smooth: t²(3 − 2t) between) or straight. G1,
-G2 and G3, under a Tangency weight (each section the weight's at its radius: Tangency weight below).
-**Where Fusion rolls a ball** (probe 5 of 2026-10-12): at G1 under a Tangency weight of exactly 1
-(0.999 and 1.001 scale the section), along any law; every other weight and G2 scale the section.
-Along a straight law between two radii here (one straight edge between flat faces) the ball rolls
-too: its face is the cone Fusion makes (below). Fusion's law between radii given at mid points is its
-own (a smooth transition, flat at each extreme and beside equal neighbours, straight only where the
-points line up; probes 5 and 6 decode it from its faces' contact rows), not either of the laws here;
-with mid points, and along chains, G1 at weight 1 scales the section as the other weights do.
+G1, G2 and G3, under a Tangency weight (each section the weight's at its radius: Tangency weight
+below). **The law between points** (`radius_law.lucb`) is Fusion's by default (luced-3d's Smooth
+transition off), read back from its faces in probes 5 to 7 of 2026-10-12 (15 laws on a box's edge,
+`luce_work/cad/fusion/FINDINGS.md`): a cubic on each piece whose slopes are
+- straight between two radii, and where the points line up;
+- else a **natural cubic spline** through the radii (no curvature at the open ends), which is
+  Fusion's to 0.003 in radius wherever that spline keeps the radii's shape (`fusion_law_tests`:
+  Fusion's volumes within 0.12);
+- held flat at an interior extreme and beside an equal radius (equal radii hold between them), the
+  runs between such points natural splines held flat at those ends (Fusion's to 0.03 on alternating
+  extremes);
+- limited as Fritsch and Carlson's monotone cubic where a run's spline would still turn back.
+
+Where the spline would not keep the shape Fusion's own pieces are **not cubics and not decoded**: a
+piece from an open end to a flat run is one universal shape in Fusion (the same on four laws, its
+slope 1.72 times the chord at the open end, flatter than a cubic into the run), and a steep piece
+beside a shallow one runs straight at its far end. There ours differs by up to 0.4 in radius
+(volumes 0.3 to 5.5 on the 20 box's edge: L5, L7, L10, L12, L14 of probe 7). With **smooth** on,
+each radius is held a moment at its point (t²(3 − 2t) between: Inventor's Smooth radius transition;
+Fusion has no such option). **A closed loop's law** is Fusion's: through its mid radii only, round
+the loop (Fusion leaves its start and end radii unused: one mid radius holds all round, Fusion's
+cylinders and tori; `fusion_law_tests`).
+
+**Where Fusion rolls a ball** (probe 5): at G1 under a Tangency weight of exactly 1 (0.999 and
+1.001 scale the section), along any law; every other weight and G2 scale the section. Along one
+straight edge between flat faces the ball rolls here too: a straight law makes the cone Fusion makes
+(below), any other law the balls' envelope (`rolled_ball.lucb`, below), within 0.12 of Fusion's
+volumes where the law is Fusion's. Along chains (loops round a flat face, between curved faces) G1
+at weight 1 still scales the section: not built yet.
 - **Chains** are built as a constant fillet's are, the radius asked of the law at each section:
   loops round a flat face and their run-outs (`cap_blend.lucb`: a box's top past rounded uprights,
   an edge ending where an earlier fillet's edge goes on), loops between two curved faces
@@ -495,7 +527,19 @@ with mid points, and along chains, G1 at weight 1 scales the section as the othe
   is that cone (its apex, axis and half angle 0.19366 read back on a 20 box's edge, 2 to 6), and its
   volumes on edges of 90°, 120° and 60° are ours (`fusion_probe_tests`). Each row, a ruling of the
   cone, is rational, weighted inversely to the radius at its ends, so rows stopped at a slanted end at
-  different radii still meet in a section of the cone. Its tool is the region between the edge and that face,
+  different radii still meet in a section of the cone.
+- **The rolled ball along any other law** (`rolled_ball.lucb`): the envelope of the balls in planes
+  square to the edge, so its ends stop in square end faces as Fusion's trimmed face does. In each
+  section the envelope's points along rays from the edge between the faces (where a ray first
+  enters the balls about the section, the least of its distances to them over their places along
+  the edge: the ball touching the envelope there), the contacts exact (each ball touches a face at
+  the foot of its center); the section is a degree 5 Bezier through the contacts, its second and
+  fifth points along the faces (G1), the inner points fitted by least squares with each sample's
+  parameter moved to its foot: within 1e-5 of the envelope at radii of a few millimeters. The
+  sections' points are fitted along the edge (`row_fit.lucb`, knots four times at the law's points,
+  where its cubics meet C1). The law is carried on past the edge's ends. A slanted end, and a law
+  steep enough that the balls' envelope folds, are refused, saying so (Fusion builds the folded one;
+  probe 7's L11). Its tool is the region between the edge and that face,
   taken away (added for an inside edge); its net keeps to one side of each face's plane. Ends:
   - square to the edge: flush;
   - any other flat end face, leaning either way (a slanted end, a wall a convex edge runs into, an

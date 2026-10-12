@@ -1,0 +1,85 @@
+## Variable radius laws checked against Fusion 2705 itself (probes 5 to 7
+## of 2026-10-12, luce_work/cad/fusion/out5, out6b, out7): a 20 box's edge
+## filleted with radii at mid points, G1 under a Tangency weight of 0.5
+## (the section scaled: Fusion's law read back from its faces) and 1 (the
+## ball rolled: rolled_ball.lucb), and a rounded box's top loop (a closed
+## chain: Fusion's law through its mid radii only, round the loop).
+## Fusion's law is a natural cubic spline where that keeps the radii's
+## shape: these laws take Fusion's volumes within 0.12 (the spline's own
+## difference from Fusion's, at most 0.003 in radius). Where it would not
+## (a flat run's neighbours, steep beside shallow) Fusion's shape is its own
+## and ours differs (radius_law.lucb; MODELING.md, Variable radius).
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.sketch import CadSketch
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+pub func fusion_law_tests() -> unit!:
+    straight_laws()
+    loop_laws()
+    print("PASS Fusion laws: mid radii along a box's edge (natural spline: Fusion's volumes at G1 weight 0.5 and rolled at 1), a rounded box's top loop through its mid radii (G1 at 1 and 0.5)")
+
+## The volume of `model`'s mesh at 32 and 64 divisions, extrapolated.
+func refined(model: CadModel) -> float!:
+    let coarse = volume(model.tessellate(32))
+    let mesh = model.tessellate(64)
+    closed(mesh)
+    let fine = volume(mesh)
+    return fine + (fine - coarse) / 3.0
+
+## A 20 box (0 to 20 each way, z up).
+func box() -> CadModel!:
+    let s = CadSketch.parse("")
+    let ids = [s.add_point(0.0, 0.0), s.add_point(20.0, 0.0), s.add_point(20.0, 20.0), s.add_point(0.0, 20.0)]
+    for k in 0..<4:
+        _ = s.add_line(ids[k], ids[(k + 1) % 4])
+    return CadModeling.extruded_sides(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 20.0, 0.0, "p")
+
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 0.5)) and not (id in found):
+                found.append(id)
+    return found
+
+## The edge along z at (20, 20) with Fusion's laws: positions, radii, the
+## Tangency weight and Fusion's volume.
+func straight_laws() -> unit!:
+    let p = box()
+    let corner = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - 20.0) < 1e-6 and math.abs(a.y - 20.0) < 1e-6 and math.abs(b.x - 20.0) < 1e-6 and math.abs(b.y - 20.0) < 1e-6
+    let edge = CadModeling.edge_references(p, edges_where(p, corner))
+    let cases = [([0.0, 0.5, 1.0], [2.0, 3.0, 6.0], 0.5, 7920.435513640275),
+                 ([0.0, 0.75, 1.0], [2.0, 5.5, 6.0], 0.5, 7871.227955806745),
+                 ([0.0, 0.25, 0.5, 0.75, 1.0], [2.0, 3.0, 4.0, 6.0, 7.0], 0.5, 7864.974598459389),
+                 ([0.0, 0.4, 0.6, 1.0], [2.0, 3.0, 4.0, 5.0], 0.5, 7917.49996941163),
+                 ([0.0, 0.5, 1.0], [3.0, 5.0, 3.0], 0.5, 7885.653161124777),
+                 ([0.0, 0.25, 1.0], [2.0, 3.0, 6.0], 0.5, 7892.458309080715),
+                 ([0.0, 0.5, 1.0], [2.0, 3.0, 6.0], 1.0, 7946.358970495283),
+                 ([0.0, 0.25, 0.5, 0.75, 1.0], [2.0, 3.0, 4.0, 6.0, 7.0], 1.0, 7908.929420383812),
+                 ([0.0, 0.5, 1.0], [2.0, 6.0, 2.0], 1.0, 7910.612555932708)]
+    for (positions, radii, weight, fusion) in cases:
+        let v = refined(CadModeling.variable_filleted(p, edge, positions, radii, "v", false, 1, false, weight))
+        if math.abs(v - fusion) > 0.12: print(f"law {radii} weight {weight}: {v}, Fusion {fusion}")
+        assert(math.abs(v - fusion) <= 0.12)
+
+## The box's uprights rounded 4, its top loop filleted from its edge at
+## x = 0: one mid radius (2 at 0.5) holds all round, as Fusion's (its
+## start and end radii, 1, unused): G1 at weight 1 (Fusion's cylinders and
+## tori, 7664.941451) and 0.5 (7638.675320).
+func loop_laws() -> unit!:
+    let p = box()
+    let upright = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - b.x) < 1e-9 and math.abs(a.y - b.y) < 1e-9
+    let rounded = CadModeling.filleted(p, CadModeling.edge_references(p, edges_where(p, upright)), 4.0, "u", 1, false)
+    let first = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x) < 1e-9 and math.abs(b.x) < 1e-9 and math.abs(a.z - 20.0) < 1e-9 and math.abs(b.z - 20.0) < 1e-9
+    let edge = CadModeling.edge_references(rounded, edges_where(rounded, first))
+    for (weight, fusion) in [(1.0, 7664.9414512583935), (0.5, 7638.675320154487)]:
+        let v = refined(CadModeling.variable_filleted(rounded, edge, [0.0, 0.5, 1.0], [1.0, 2.0, 1.0], "v", false, 1, true, weight))
+        if math.abs(v - fusion) > 0.03: print(f"loop weight {weight}: {v}, Fusion {fusion}")
+        assert(math.abs(v - fusion) <= 0.03)

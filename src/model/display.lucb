@@ -76,7 +76,12 @@ extend CadModel:
     ## boundary polylines and a normal guide per face. Failed faces are
     ## counted and keep their boundaries.
     pub func preview(progress: interop.Callback[f64, unit]? = none) -> interop.Reference[CadPreviewSet]!:
-        var job = PreviewJob(model = &self, topology = self.topology())
+        var seams = try BitsBuilder.zeros(0)
+        if let boundary = self.topology():
+            seams.close()
+            seams = try seam_edges(boundary)
+        defer seams.close()
+        var job = PreviewJob(model = &self, topology = self.topology(), seams = seams.view())
         return try collect_preview((usize)self.face_count(), (usize)self.edge_count(), make_preview_part, (void*)&job, progress)
 
     func edge_count_in(topology: BrepModel*?, face: i64) -> i64!:
@@ -310,6 +315,8 @@ func scaled_curvature(mesh: interop.Reference[Mesh], matrix: Matrix4, directions
 struct PreviewJob:
     let model: const CadModel*
     let topology: BrepModel*?
+    ## The B-rep's seams (overlay.lucb's seam_edges): not drawn.
+    let seams: Bits
 
 ## One face's preview on a pool worker, as luced-3d's per-patch preview did:
 ## 8 divisions for faces with many edges, else 16; then 4; then 16 again.
@@ -344,7 +351,10 @@ func fill_boundaries(job: PreviewJob*, face: i64, part: PreviewPart*) -> !:
     try part.open_boundaries((usize)uses)
     for use in 0..<uses:
         let divisions = 1 if (try model.edge_linear_in(job.topology, face, use)) else 64
-        try part.begin_use(try model.edge_id_in(job.topology, face, use))
+        let id = try model.edge_id_in(job.topology, face, use)
+        try part.begin_use(id)
+        # A seam keeps its use, with no line.
+        if id >= 0 and (usize)id < job.seams.count and job.seams.get((usize)id): continue
         for step in 0..<divisions + 1:
             try part.boundary_point(try model.edge_point_in(job.topology, face, use, (f64)step / (f64)divisions))
 

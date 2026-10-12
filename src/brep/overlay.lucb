@@ -4,8 +4,9 @@
 ## columns), both as point pairs placed by `matrix` after the faces' own
 ## placements.
 
-## Every edge's polyline, placed by the first face that uses it, then by
-## `matrix`; made once per model (and passed to copies with moved cvs).
+## Every edge's polyline but the seams' (seam_edges), placed by the first
+## face that uses it, then by `matrix`; made once per model (and passed to
+## copies with moved cvs).
 pub func boundary_lines(model: const BrepModel*, matrix: Matrix4, out: Growing[Vector3]*) -> !:
     let derived = model.derived
     derived.lock.lock()
@@ -34,7 +35,7 @@ pub func boundary_lines(model: const BrepModel*, matrix: Matrix4, out: Growing[V
 func edge_polylines(model: const BrepModel*, out: Growing[Vector3]*) -> !:
     let matrix = Matrix4()
     let edges = (usize)model.edge_count()
-    var drawn = try BitsBuilder.zeros(edges)
+    var drawn = try seam_edges(model)
     defer drawn.close()
     let records = try model.tessellation_records()
     for face in 0..<(usize)model.face_count():
@@ -51,6 +52,31 @@ func edge_polylines(model: const BrepModel*, out: Growing[Vector3]*) -> !:
                 try out.push(previous)
                 try out.push(point)
                 previous = point
+
+## The model's seams, as bits by edge: an edge one face uses both ways (a
+## periodic face's closing edge: a cylinder's, a torus's, a turned strip's
+## at its loop's vertex), or between two faces on one surface (a sphere
+## made of two hemispheres: its equator). They stay in the B-rep but are
+## not drawn (edge_polylines, the preview's boundaries): Fusion's periodic
+## faces have none (a cylinder has its two circles, a sphere and a torus no
+## edge; probe 7 of 2026-10-12).
+pub func seam_edges(model: const BrepModel*) -> BitsBuilder!:
+    let edges = (usize)model.edge_count()
+    var seams = try BitsBuilder.zeros(edges)
+    errdefer seams.close()
+    var first = Growing[i64]()
+    defer first.close()
+    try first.fill(edges, -1)
+    for face in 0..<(usize)model.face_count():
+        let surface = try model.face_surface_id((i64)face)
+        for use in model.uses_of(face):
+            let edge = edge_index(use)
+            let seen = first.items[edge]
+            if seen < 0:
+                first.items[edge] = (i64)face
+            elif seen == (i64)face or (try model.face_surface_id(seen)) == surface:
+                seams.set(edge)
+    return seams
 
 ## What the edges' polylines depend on: the vertices, curves and faces'
 ## edge uses and placements (their columns' change ids). Equal keys draw
