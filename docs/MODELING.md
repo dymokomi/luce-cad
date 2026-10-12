@@ -949,6 +949,99 @@ edge becomes a cylinder band about the shrunk edge, and each corner becomes a sp
 by its edges' arcs. A box comes out with 26 faces. Each sphere patch's pole sits in its middle, which keeps its
 tessellation even.
 
+## Measuring (`measure/`)
+
+`luce_cad.measure` measures a model without changing it: how continuous its faces are across
+their edges, curvature combs on its edges, and how far it deviates from another model. It is
+Stage 0 of luced-3d's surfacing plan (luced-3d `docs/research/SURFACING-ALIAS-PLASTICITY.md`),
+after Alias's Evaluate tools. luced-3d's Check node draws what it returns.
+
+| `CadMeasure.` | What it does |
+|---|---|
+| `check(model, references, level, stations, distance, angle, curvature, rate, combs, samples, quills, scale)` | The edges `references` names (empty: every edge between two faces) checked for continuity `level` (0 to 3) at `stations` per edge. Returns a `CadCheck`: per edge (`edge(i)`, an `EdgeCheck`) its faces, its worst gap, angle and curvature and rate differences, and the highest order every station meets; per station (`station(i)`) the values behind them; the comb samples (`comb(i)`); `passed()`, `summary()`; and the lines to draw by group (`line_count`, `line_point`; Base readers `check_lines`). |
+| `deviation(model, reference, acceptable, ramp, segments)` | `model`'s tessellation with point attributes `deviation` (its signed distance from `reference`'s surfaces) and `Cd` (a color ramp), and its largest, smallest, mean and RMS deviation, and the share within `acceptable`. |
+
+**Jets** (`geometry/jets.lucb`). Continuity to G3 needs third derivatives. `basis_jet` extends
+The NURBS Book's A2.3 to the third order, and takes the limit from below (`left`) at an inner knot,
+where a B-spline's derivatives jump. `spline_jet` and `surface_jet` apply the quotient rule to
+rational curves and surfaces (A4.2 and A4.4) up to the third order; lines, circles, ellipses,
+planes, cylinders, cones, spheres and tori take their closed forms. `basis_derivatives` is the
+second-order view of `basis_jet`.
+
+**Continuity** (`measure/continuity.lucb`). At `stations` stations along an edge (the middles of
+equal parameter steps, so no station sits on a vertex), the station's point is dropped onto both
+faces' supports. Each face is then cut by the plane square to the edge, which is how Alias checks
+"relative to the boundary, square to it". That plane cuts each face in its normal section, a curve
+leaving the edge in the direction across it, `d = t × n₁`, where `t` is the edge's direction as
+face 1's loop runs it. Across the edge:
+
+- **G0** is the gap between the two surfaces' points.
+- **G1** is the angle between the oriented normals.
+- **G2** is the difference of the two sections' curvatures, relative to the larger, in percent.
+- **G3** is the difference of their curvatures' rates of change by arc length, relative in the same way.
+
+The section is `S(w(s))` with `|S'| = 1` in that plane. So `w'` solves the first fundamental
+form (`J w' = d`). The tangential part of `S'' = J w'' + H(w', w')` vanishes, which gives `w''`,
+and the curvature is `H(w', w') · n`. The rate is the normal part of
+`S''' = J w''' + 3 H(w', w'') + T(w', w', w')`, which does not need `w'''`.
+
+Each face's derivatives come from its own side of any knot line: face 1 lies behind `d` and face 2
+ahead of it, so a B-spline is evaluated from below in a parameter where moving into the face
+lowers it.
+
+Along the edge nothing more is needed. The edge is shared, so once the normals agree along it, the
+curvatures in its own direction and the twist agree too, and only the cross terms can break.
+Curvatures under a thousandth of `1/size` (and rates under a thousandth of `1/size²`) are flat:
+two flat sides agree, whatever their noise. Seams and open boundaries have no second face and are
+not checked.
+
+**What it draws** (`measure/check.lucb`):
+
+- **Edges by result.** Each checked edge is drawn in group 0 when it meets the level, 1 when it is
+  one order short (Alias's yellow), and 2 when it is further short (red). A mark at its middle
+  station has one tick across the edge per order met, or a cross where even G0 fails.
+- **Curvature combs** (group 3, `measure/combs.lucb`). Quills at `samples` along each curved edge
+  point away from the center of curvature, each `κ × scale` long, with an outline through their
+  tips. A circle's comb is a ring of equal quills.
+- **Cross quills** (group 4). Each side's curvature across the edge is a quill along the normal at
+  every station, just behind and just ahead of the edge. Equal quills mean G2; a jump shows as two
+  lengths.
+
+At scale 1, the longest quill is a tenth of the model's size.
+
+**Deviation** (`measure/deviation.lucb`). Each point of the measured model's tessellation is
+matched to the nearest face of the reference's tessellation (geocore's triangle BVH). The point is
+then dropped onto that face's exact support. The distance is signed by the reference's outward
+normal and computed in parallel. Colors:
+
+- green within `acceptable`;
+- yellow to red outside the reference, saturating at `ramp`;
+- cyan to blue inside it, saturating at `ramp`.
+
+The tessellation keeps its points in single precision, so the map resolves deviations down to
+about 1e-7 of the model's size.
+
+Tests (`tests/contracts/jets_contract.lucb`, `tests/regressions/measure_tests.luc`):
+
+- **Bases.** Third derivatives match differences of the second.
+- **One-sided limits.** A C1 quadratic's second derivative jumps at its knot, and each side's limit
+  is right.
+- **Rational ellipse.** A rational quadratic elliptic cylinder's section has the curvature
+  `ab/D^{3/2}` and the rate `-3ab(a²-b²) sin t cos t / D³`, to 1e-8.
+- **Analytic sections.** Spheres', tori's and cylinders' sections are circles, with no rate.
+- **Fillets.** A G1 fillet's contacts measure G1, with curvature 0 on the plane and 1/r on the
+  fillet. A G2 fillet's measure G2, with curvature 0 on both sides and a rate on the fillet's side;
+  asked for G3, they fail. A G3 fillet's measure G3.
+- **Split faces.** The pieces of a cylinder's side and of a G3 fillet's strip, cut by Split Face,
+  are equal at every order.
+- **Combs.** A cylinder's rims comb at exactly 1/r, pointing out from the axis.
+- **Deviation.** A sphere of 10 lies 0.5 inside one of 10.5 everywhere, and a model's deviation
+  from itself is zero.
+
+Not yet: combs on isoparms and on curves on surfaces (Stage 2 brings 3D curves), inflection
+marks and torsion quills, a radius band on combs, and checks between faces that share no edge
+(Stage 3's stitching).
+
 ## Sketches (`sketch/`)
 
 A sketch is points, lines, circles and arcs on a plane, and the constraints between them, as in

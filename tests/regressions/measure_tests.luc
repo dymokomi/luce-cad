@@ -1,0 +1,124 @@
+## Measuring (luce_cad.measure, CadMeasure): continuity across edges against
+## closed forms (a G1 fillet's curvature jumps from 0 to 1 / r, a G2
+## fillet's matches and its rate does not, a G3 fillet's rate matches too,
+## pieces of a split face agree at every order), curvature combs (a
+## cylinder's rim is uniform at 1 / r) and deviation maps (a sphere against
+## a larger one: the difference of their radii everywhere, inside, to the
+## single precision tessellations keep their points in).
+from luce_cad.measure import CadMeasure, CadCheck
+from luce_cad.modeling import CadModeling, CadDirect
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from luce_std import math
+
+pub func measure_tests() -> unit!:
+    fillet_continuity()
+    split_faces()
+    cylinder_combs()
+    deviation_map()
+    print("PASS measuring: fillet edges G1 (curvature 0 to 1/r), G2 (equal curvature, rate jumps) and G3 (equal rate); split faces equal at every order; uniform combs on a cylinder's rims; a sphere's deviation from a larger one is the radii's difference")
+
+## A box's front top edge filleted to `r` at `continuity`.
+func filleted_box(r: float, continuity: int) -> CadModel!:
+    let box = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0), "box")
+    var picked: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            let id = box.face_edge_id(face, use)
+            if a.y > 1.99 and b.y > 1.99 and a.z > 1.99 and b.z > 1.99 and not (id in picked): picked.append(id)
+    assert(picked.length == 1)
+    return CadModeling.filleted(box, CadModeling.edge_references(box, picked), r, "f", continuity)
+
+## The checked edges where the faces meet smoothly (the fillet's contacts).
+func smooth_edges(check: CadCheck) -> list[int]!:
+    let found: list[int] = []
+    for index in 0..<check.edge_count():
+        if check.edge(index).angle < 1.0: found.append(index)
+    return found
+
+func fillet_continuity() -> unit!:
+    let r = 0.75
+    for continuity in 1..<4:
+        let check = CadMeasure.check(filleted_box(r, continuity), level = continuity)
+        let contacts = smooth_edges(check)
+        assert(contacts.length == 2, f"G{continuity}: {contacts.length} smooth edges")
+        for index in contacts:
+            let edge = check.edge(index)
+            assert(edge.level == continuity, f"G{continuity} fillet edge measured G{edge.level}: {check.summary()}")
+            assert(edge.gap < 1e-9 and edge.angle < 1e-6, f"G{continuity}: gap {edge.gap}, angle {edge.angle}")
+            for at in edge.first..<edge.first + edge.count:
+                let s = check.station(at)
+                # One side the plane (flat), the other the fillet.
+                let flat = s.curvature1 if math.abs(s.curvature1) < math.abs(s.curvature2) else s.curvature2
+                let round = s.curvature2 if math.abs(s.curvature1) < math.abs(s.curvature2) else s.curvature1
+                assert(math.abs(flat) < 1e-9, f"a plane's curvature {flat}")
+                if continuity == 1:
+                    assert(math.abs(round - 1.0 / r) < 1e-9, f"G1 fillet curvature {round}, expected {1.0 / r}")
+                else:
+                    assert(math.abs(round) < 1e-6 / r, f"G{continuity} fillet curvature {round} at its contact")
+                    # Both sides flat here: the plane's rate is 0, the fillet's is the other.
+                    let rate = math.max(math.abs(s.rate1), math.abs(s.rate2))
+                    assert(math.min(math.abs(s.rate1), math.abs(s.rate2)) < 1e-9)
+                    if continuity == 2: assert(rate > 0.1 / (r * r), f"a G2 fillet's rate {rate} at its contact")
+                    else: assert(rate < 1e-6 / (r * r), f"a G3 fillet's rate {rate} at its contact")
+        # Asked one order more, every contact fails it (G3 is the most there is).
+        if continuity < 3:
+            let stricter = CadMeasure.check(filleted_box(r, continuity), level = continuity + 1)
+            for index in smooth_edges(stricter): assert(stricter.edge(index).level < continuity + 1)
+            assert(stricter.passed() < check.passed())
+        # The sharp edges: 90 degrees, G0.
+        for index in 0..<check.edge_count():
+            if not (index in contacts):
+                assert(check.edge(index).level == 0 and math.abs(check.edge(index).angle - 90.0) < 1e-6, f"a sharp edge at {check.edge(index).angle}")
+        assert(check.line_count(0) > 0 and check.line_count(1) + check.line_count(2) > 0 and check.line_count(3) > 0 and check.line_count(4) > 0)
+
+## A face split in two meets itself at every order: a cylinder's side and
+## a G3 fillet's B-spline strip, each cut across.
+func split_faces() -> unit!:
+    let can = CadModeling.tagged(CadSolids.cylinder(2.0, 6.0), "can")
+    let fillet = filleted_box(0.75, 3)
+    let cases = [(can, Vector3(0.0, 0.7, 0.0), Vector3(0.0, 1.0, 0.3)), (fillet, Vector3(0.3, 0.0, 0.0), Vector3(1.0, 0.0, 0.2))]
+    for (model, origin, normal) in cases:
+        var curved = ""
+        for face in 0..<model.face_count():
+            let kind = model.face_surface_kind(face)
+            if kind == 1 or kind == 3: curved = CadModeling.face_name_of(model, face)
+        let halves = CadDirect.split_faces_by_plane(model, curved, origin, normal, "k")
+        let check = CadMeasure.check(halves, level = 3)
+        var seams = 0
+        for index in 0..<check.edge_count():
+            let edge = check.edge(index)
+            if edge.angle > 1e-6: continue
+            # Only the cut pieces meet with no angle here besides the fillet's contacts.
+            if edge.curvature < 1e-6 and edge.rate < 1e-6:
+                seams += 1
+                assert(edge.level == 3)
+        assert(seams >= 1, f"no split edge measured equal: {check.summary()}")
+
+## Combs on a cylinder's rims: every sample curvature 1 / r, pointing
+## out from its axis.
+func cylinder_combs() -> unit!:
+    let can = CadSolids.cylinder(2.5, 3.0)
+    let check = CadMeasure.check(can, samples = 33)
+    assert(check.comb_count() >= 33)
+    for index in 0..<check.comb_count():
+        let s = check.comb(index)
+        assert(math.abs(s.curvature - 0.4) < 1e-12, f"rim curvature {s.curvature}")
+        let radial = Vector3(s.point.x, 0.0, s.point.z)
+        assert(math.abs(s.direction.dot(radial) / radial.length() - 1.0) < 1e-12)
+
+## A sphere of 10 against one of 10.5: every point of the smaller lies 0.5
+## inside the larger.
+func deviation_map() -> unit!:
+    let small = CadSolids.sphere(10.0)
+    let large = CadSolids.sphere(10.5)
+    let spread = CadMeasure.deviation(small, large, 0.1, 1.0)
+    assert(math.abs(spread.largest + 0.5) < 2e-6 and math.abs(spread.smallest + 0.5) < 2e-6, f"deviation {spread.smallest} to {spread.largest}")
+    assert(spread.within == 0.0)
+    let shown = spread.mesh()
+    assert(shown.find_attribute("deviation", 0) >= 0 and shown.find_attribute("Cd", 0) >= 0)
+    let itself = CadMeasure.deviation(small, small, 1e-6, 1e-3)
+    assert(math.abs(itself.largest) < 1e-6 and math.abs(itself.smallest) < 1e-6 and itself.within == 1.0)

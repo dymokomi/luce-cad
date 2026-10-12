@@ -1,0 +1,125 @@
+## Third-order jets and normal sections (geometry/jets.lucb,
+## measure/continuity.lucb) against closed forms: the bases' third
+## derivatives against differences of their second, one-sided bases at a
+## knot, a rational elliptic cylinder's section curvature and its rate
+## (the ellipse's), and analytic supports' sections.
+from luce_std import math
+from luce_geocore.geocore import Vector3, invalid
+from luce_geocore.core.growing import Growing
+from geometry import Surface, basis_jet, surface_jet, spline_jet, surface_spline, surface_cylinder, surface_sphere, surface_torus
+from measure import normal_section
+
+func near(actual: f64, expected: f64, tolerance: f64, what: str) -> !:
+    if not (math.abs(actual - expected) <= tolerance):
+        error(invalid, what)
+
+pub func jets_contracts() -> !:
+    try basis_orders()
+    try one_sided()
+    try elliptic_cylinder()
+    try analytic_sections()
+
+## Third derivatives are the second's differences (degree 5, inner knots).
+func basis_orders() -> !:
+    let knots: f64[12] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0]
+    let h = 1e-5
+    let t = 0.3
+    var at: f64[36]
+    var before: f64[36]
+    var after: f64[36]
+    let first = basis_jet(knots[..<12], 7, 5, t, false, &at)
+    if basis_jet(knots[..<12], 7, 5, t - h, false, &before) != first or basis_jet(knots[..<12], 7, 5, t + h, false, &after) != first: error(invalid, "nearby parameters left their span")
+    for j in 0..<(usize)6:
+        try near((after[18 + j] - before[18 + j]) / (2.0 * h), at[27 + j], 1e-3 * math.max(1.0, math.abs(at[27 + j])), "a basis's third derivative is off its difference")
+    var sum = 0.0
+    for j in 0..<(usize)6: sum += at[27 + j]
+    try near(sum, 0.0, 1e-8, "third derivatives of the bases do not sum to zero")
+
+## A quadratic with a simple inner knot is C1: its second derivative jumps
+## there, and `left` gives the limit from below.
+func one_sided() -> !:
+    let knots: f64[7] = [0.0, 0.0, 0.0, 1.0, 2.0, 2.0, 2.0]
+    let points: Vector3[4] = [Vector3(0.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.0), Vector3(2.0, -1.0, 0.0), Vector3(3.0, 0.0, 0.0)]
+    let weights: f64[4] = [1.0, 1.0, 1.0, 1.0]
+    let below = try spline_jet(points[..<4], weights[..<4], 2, knots[..<7], 1.0, true)
+    let above = try spline_jet(points[..<4], weights[..<4], 2, knots[..<7], 1.0, false)
+    let early = try spline_jet(points[..<4], weights[..<4], 2, knots[..<7], 1.0 - 1e-9, false)
+    let late = try spline_jet(points[..<4], weights[..<4], 2, knots[..<7], 1.0 + 1e-9, false)
+    try near(below.d2.subtract(early.d2).length(), 0.0, 1e-6, "the limit from below is not the second derivative before the knot")
+    try near(above.d2.subtract(late.d2).length(), 0.0, 1e-6, "the limit from above is not the second derivative after the knot")
+    if below.d2.subtract(above.d2).length() < 1.0: error(invalid, "a C1 quadratic's second derivative did not jump")
+    try near(below.p.subtract(above.p).length(), 0.0, 1e-12, "the sides disagree on the point")
+
+## x = a cos t, y = b sin t extruded along z as a rational quadratic: the
+## section across z is the ellipse, so its curvature is a b / D^(3/2) and
+## its rate -3 a b (a^2 - b^2) sin t cos t / D^3, D = a^2 sin^2 t +
+## b^2 cos^2 t.
+func elliptic_cylinder() -> !:
+    let a = 3.0
+    let b = 1.5
+    let r = math.sqrt(0.5)
+    let circle: Vector3[9] = [Vector3(1.0, 0.0, 0.0), Vector3(1.0, 1.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(-1.0, 1.0, 0.0), Vector3(-1.0, 0.0, 0.0), Vector3(-1.0, -1.0, 0.0), Vector3(0.0, -1.0, 0.0), Vector3(1.0, -1.0, 0.0), Vector3(1.0, 0.0, 0.0)]
+    let ring: f64[9] = [1.0, r, 1.0, r, 1.0, r, 1.0, r, 1.0]
+    var points = Growing[Vector3]()
+    defer points.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    for k in 0..<(usize)9:
+        for h in 0..<(usize)2:
+            try points.push(Vector3(a * circle[k].x, b * circle[k].y, (f64)h * 2.0))
+            try weights.push(ring[k])
+    let ku: f64[12] = [0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0]
+    let kv: f64[4] = [0.0, 0.0, 1.0, 1.0]
+    var s = try Surface(surface_spline, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, points.view(), weights.view(), ku[..<12], kv[..<4], 9, 2, 2, 1)
+    defer s.close()
+    let fractions: f64[4] = [0.03, 0.11, 0.2, 0.37]
+    for u in fractions:
+        let j = try surface_jet(&s, Vector3(u, 0.5, 0.0), false, false)
+        # The chart's own angle t of the point (the rational arcs do not
+        # run uniformly in t).
+        let t = math.atan2(j.p.y / b, j.p.x / a)
+        let outward = j.su.cross(j.sv)
+        let n = outward.multiply_scalar(1.0 / outward.length())
+        let along = j.su.multiply_scalar(1.0 / j.su.length())
+        let (curvature, rate, _) = normal_section(j, n, along)
+        let d = a * a * math.sin(t) * math.sin(t) + b * b * math.cos(t) * math.cos(t)
+        try near(curvature, a * b / (d * math.sqrt(d)), 1e-9, "a rational ellipse's section curvature is off")
+        try near(rate, -3.0 * a * b * (a * a - b * b) * math.sin(t) * math.cos(t) / (d * d * d), 1e-8, "a rational ellipse's curvature rate is off")
+        # Along the rulings: straight, and no rate.
+        let (straight, steady, _) = normal_section(j, n, j.sv.multiply_scalar(1.0 / j.sv.length()))
+        try near(straight, 0.0, 1e-12, "a ruling is not straight")
+        try near(steady, 0.0, 1e-12, "a ruling's curvature changes")
+        # The ellipse as a curve: the same curvature.
+        let bend = j.su.cross(j.suu).length() / (j.su.length() * j.su.length() * j.su.length())
+        try near(bend, a * b / (d * math.sqrt(d)), 1e-9, "an ellipse's curve curvature is off")
+
+## A sphere's sections are great circles (1 / r, no rate); a torus's across
+## its tube are circles of its minor radius; a cylinder's around it 1 / r.
+func analytic_sections() -> !:
+    var none_points: Vector3[]
+    var none_values: f64[]
+    var sphere = try Surface(surface_sphere, Vector3(1.0, 2.0, 3.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 2.5, 0.0, none_points, none_values, none_values, none_values, 0, 0, 0, 0)
+    defer sphere.close()
+    var torus = try Surface(surface_torus, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 5.0, 1.25, none_points, none_values, none_values, none_values, 0, 0, 0, 0)
+    defer torus.close()
+    var cylinder = try Surface(surface_cylinder, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 4.0, 0.0, none_points, none_values, none_values, none_values, 0, 0, 0, 0)
+    defer cylinder.close()
+    for at in 0..<(usize)5:
+        let uv = Vector3(0.4 + (f64)at * 0.9, -0.9 + (f64)at * 0.35, 0.0)
+        let j = try surface_jet(&sphere, uv, false, false)
+        let n = j.p.subtract(sphere.origin).multiply_scalar(1.0 / 2.5)
+        let d = n.cross(Vector3(0.3, 0.7, -0.2)).multiply_scalar(1.0 / n.cross(Vector3(0.3, 0.7, -0.2)).length())
+        let (k, rate, _) = normal_section(j, n, d)
+        try near(k, 1.0 / 2.5, 1e-12, "a sphere's section is not a great circle")
+        try near(rate, 0.0, 1e-12, "a great circle's curvature changes")
+        let t = try surface_jet(&torus, uv, false, false)
+        let tube = t.sv.multiply_scalar(1.0 / t.sv.length())
+        let outward = t.su.cross(t.sv)
+        let (bend, change, _) = normal_section(t, outward.multiply_scalar(1.0 / outward.length()), tube)
+        try near(bend, 1.0 / 1.25, 1e-12, "a torus's tube section is off")
+        try near(change, 0.0, 1e-12, "a torus's tube section changes")
+        let c = try surface_jet(&cylinder, uv, false, false)
+        let side = c.su.cross(c.sv)
+        let (round, constant, _) = normal_section(c, side.multiply_scalar(1.0 / side.length()), c.su.multiply_scalar(1.0 / c.su.length()))
+        try near(round, 0.25, 1e-12, "a cylinder's section is off")
+        try near(constant, 0.0, 1e-12, "a cylinder's section changes")

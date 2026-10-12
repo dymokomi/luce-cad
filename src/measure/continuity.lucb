@@ -1,0 +1,210 @@
+## Measuring a B-rep (luced-3d's Check node, Alias's Evaluate menu): how
+## continuous its faces are across their edges, curvature combs on its
+## edges, and how far one model's faces deviate from another's. Everything
+## is evaluated on the exact geometry (jets.lucb), then handed to Luce as
+## numbers and point pairs to draw.
+##
+## This file: continuity across an edge. At stations along the edge the
+## two faces are compared in the plane square to the edge, as Alias checks
+## them ("relative to the boundary, square to it"): that plane cuts each
+## face in a curve (its normal section), and across the edge
+##
+## - G0 is the gap between the two surfaces;
+## - G1 the angle between their normals;
+## - G2 the difference of the two sections' curvatures (the normal
+##   curvatures across the edge), relative to the larger, in percent;
+## - G3 the difference of their curvatures' rates of change by arc length,
+##   relative to the larger, in percent.
+##
+## Along the edge itself nothing more is needed: the edge is shared, so once
+## the normals agree along it, the curvatures in its own direction and the
+## twist do too, and only the cross terms can break.
+import interop
+import memory
+import strings
+import ownership
+from luce_std import math, parallel
+from luce_geocore.geocore import Vector3, Matrix4, Mesh, invalid
+from luce_geocore.core.growing import Growing
+from geometry import Surface, SurfaceJet, CurveJet, surface_jet, spline_jet, conic_jet, line_jet, chart_uv, nearest_parameters, edge_index, surface_spline, curve_line, curve_circle, curve_ellipse
+from model import CadModel
+from modeling import Shape, shape_of, resolve_edges
+
+## Thresholds of a pass at each order: a gap in model units, an angle in
+## degrees, and G2's and G3's relative differences in percent. Below the
+## floors (a millionth of a curvature of the model's size) a curvature or
+## its rate is flat: two flat sides agree whatever their noise.
+pub struct Limits:
+    pub var distance: f64
+    pub var angle: f64
+    pub var curvature: f64
+    pub var rate: f64
+    pub var curvature_floor: f64 = 0.0
+    pub var rate_floor: f64 = 0.0
+
+## One station's measures across an edge: where it is, side 1's oriented
+## normal and the direction across the edge into side 2, the gap, the angle
+## (degrees), each side's normal curvature across the edge (positive where
+## it bends away from its normal, convex) and its rate by arc length, and
+## the highest order met (-1: not even G0).
+pub struct Station:
+    pub var point: Vector3
+    pub var normal: Vector3
+    pub var across: Vector3
+    pub var gap: f64
+    pub var angle: f64
+    pub var curvature1: f64
+    pub var curvature2: f64
+    pub var rate1: f64
+    pub var rate2: f64
+    pub var level: i64
+
+## One edge's check: its B-rep edge and two faces, its stations
+## (stations[first..<first + count]), the worst of each measure over them
+## (G2 and G3 as relative percentages) and the highest order every station
+## meets.
+pub struct EdgeCheck:
+    pub var edge: i64
+    pub var face1: i64
+    pub var face2: i64
+    pub var first: i64
+    pub var count: i64
+    pub var gap: f64
+    pub var angle: f64
+    pub var curvature: f64
+    pub var rate: f64
+    pub var level: i64
+
+## A face's support and the station's parameters on it, with the side of
+## inner knot lines its derivatives come from.
+struct Side:
+    var uv: Vector3
+    var jet: SurfaceJet
+    var normal: Vector3
+
+## The normal section's curvature (convex positive) and its rate by arc
+## length, of a surface with jet `j` and oriented unit normal `n`, leaving
+## along unit tangent `d`; and the section's parameter velocity w' (by arc
+## length) in its chart. The section is S(w(s)) with S(w) . t constant (t
+## = n x d) and |S'| = 1: S' = J w' = d, so w' solves the first
+## fundamental form; S'' = J w'' + H(w', w') has no tangential part, which
+## gives w''; and the normal part of S''' = J w''' + 3 H(w', w'') +
+## T(w', w', w') is the curvature's rate, which needs no w'''.
+pub func normal_section(j: SurfaceJet, n: Vector3, d: Vector3) -> (f64, f64, Vector3):
+    let e = j.su.dot(j.su)
+    let f = j.su.dot(j.sv)
+    let g = j.sv.dot(j.sv)
+    let det = e * g - f * f
+    if not (det > 0.0): return (0.0, 0.0, Vector3())
+    let du = j.su.dot(d)
+    let dv = j.sv.dot(d)
+    let a = (g * du - f * dv) / det
+    let b = (e * dv - f * du) / det
+    let h = j.suu.multiply_scalar(a * a).add(j.suv.multiply_scalar(2.0 * a * b)).add(j.svv.multiply_scalar(b * b))
+    let c1 = -j.su.dot(h)
+    let c2 = -j.sv.dot(h)
+    let a2 = (g * c1 - f * c2) / det
+    let b2 = (e * c2 - f * c1) / det
+    let mixed = j.suu.multiply_scalar(a * a2).add(j.suv.multiply_scalar(a * b2 + b * a2)).add(j.svv.multiply_scalar(b * b2))
+    let third = j.suuu.multiply_scalar(a * a * a).add(j.suuv.multiply_scalar(3.0 * a * a * b)).add(j.suvv.multiply_scalar(3.0 * a * b * b)).add(j.svvv.multiply_scalar(b * b * b))
+    return (-h.dot(n), -mixed.multiply_scalar(3.0).add(third).dot(n), Vector3(a, b, 0.0))
+
+## Carrier `c`'s jet at `t` (by its own parameter).
+pub func carrier_jet(w: const Shape*, c: i64, t: f64) -> CurveJet!:
+    let carrier = w.carriers.items[(usize)c]
+    if carrier.kind == curve_line: return line_jet(carrier.origin, carrier.x, t)
+    if carrier.kind == curve_circle: return conic_jet(carrier.origin, carrier.x, carrier.y, carrier.a, carrier.a, t)
+    if carrier.kind == curve_ellipse: return conic_jet(carrier.origin, carrier.x, carrier.y, carrier.a, carrier.b, t)
+    let (points, weights, knots, degree) = w.spline_net(carrier.spline)
+    return try spline_jet(points, weights, degree, knots, math.clamp(t, knots[(usize)degree], knots[points.length]), false)
+
+## Face `f`'s chart coordinates of `p` (its foot when off it), from `seed`.
+func foot(w: const Shape*, f: usize, p: Vector3, seed: Vector3) -> Vector3!:
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    if s.kind == surface_spline: return try nearest_parameters(*s, p, seed, false)
+    return chart_uv(*s, p, seed, true)
+
+## Face `f`'s jet at chart coordinates `uv` from the side its interior lies
+## on: `inward` is the chart direction into the face. Its oriented normal
+## comes with it (zero where the chart is singular).
+func side_jet(w: const Shape*, f: usize, uv: Vector3, inward: Vector3) -> Side!:
+    let face = w.faces.items[f]
+    let s = &w.surfaces.items[(usize)face.surface]
+    let j = try surface_jet(s, uv, inward.x < 0.0, inward.y < 0.0)
+    let n = j.su.cross(j.sv)
+    let length = n.length()
+    var normal = Vector3()
+    if length > 0.0: normal = n.multiply_scalar((1.0 if face.sense else -1.0) / length)
+    return Side(uv, j, normal)
+
+## Whether face `f` runs edge `e` forward (its use is +(e + 1)).
+func runs_forward(w: const Shape*, f: usize, e: usize) -> bool:
+    for use in w.face_uses(f):
+        if edge_index(use) == e: return use > 0
+    return true
+
+## Edge `e` measured at `stations` stations between its faces `f1` and `f2`
+## into `out`, and its summary.
+pub func check_edge(w: const Shape*, e: usize, f1: usize, f2: usize, stations: usize, limits: Limits, out: Growing[Station]*) -> EdgeCheck!:
+    let edge = w.edges.items[e]
+    var result = EdgeCheck((i64)e, (i64)f1, (i64)f2, (i64)out.count, (i64)stations, 0.0, 0.0, 0.0, 0.0, 3)
+    # Face 1's loops run the edge one way, face 2's the other; face 1's
+    # interior lies left of its run about its outward normal.
+    let forward = runs_forward(w, f1, e) == (edge.t1 > edge.t0)
+    var seed1 = Vector3(0.5, 0.5, 0.0)
+    var seed2 = Vector3(0.5, 0.5, 0.0)
+    for k in 0..<stations:
+        let t = edge.t0 + (edge.t1 - edge.t0) * ((f64)k + 0.5) / (f64)stations
+        let curve = try carrier_jet(w, edge.carrier, t)
+        let run = try curve.d1.multiply_scalar(1.0 if forward else -1.0).normalized()
+        let uv1 = try foot(w, f1, curve.p, seed1)
+        let uv2 = try foot(w, f2, curve.p, seed2)
+        seed1 = uv1
+        seed2 = uv2
+        # First from above at any knot line, for the direction alone; then
+        # from the face's own side.
+        var one = try side_jet(w, f1, uv1, Vector3(1.0, 1.0, 0.0))
+        var two = try side_jet(w, f2, uv2, Vector3(1.0, 1.0, 0.0))
+        let across1 = try run.cross(one.normal).normalized()
+        let across2 = try run.cross(two.normal).normalized()
+        let (_, _, w1) = normal_section(one.jet, one.normal, across1)
+        let (_, _, w2) = normal_section(two.jet, two.normal, across2)
+        # Face 1 lies behind the direction across, face 2 ahead of it.
+        one = try side_jet(w, f1, uv1, w1.multiply_scalar(-1.0))
+        two = try side_jet(w, f2, uv2, w2)
+        let (k1, r1, _) = normal_section(one.jet, one.normal, across1)
+        let (k2, r2, _) = normal_section(two.jet, two.normal, across2)
+        var station = Station(curve.p, one.normal, across1, one.jet.p.subtract(two.jet.p).length(),
+                              math.acos(math.clamp(one.normal.dot(two.normal), -1.0, 1.0)) * 180.0 / math.pi, k1, k2, r1, r2, -1)
+        station.level = level_of(station, limits)
+        try out.push(station)
+        result.gap = math.max(result.gap, station.gap)
+        result.angle = math.max(result.angle, station.angle)
+        result.curvature = math.max(result.curvature, relative(k1, k2, limits.curvature_floor))
+        result.rate = math.max(result.rate, relative(r1, r2, limits.rate_floor))
+        if station.level < result.level: result.level = station.level
+    return result
+
+## |a - b| relative to the larger of |a|, |b| and `floor`, in percent.
+pub func relative(a: f64, b: f64, floor: f64) -> f64:
+    let scale = math.max(math.max(math.abs(a), math.abs(b)), floor)
+    if not (scale > 0.0): return 0.0
+    return math.abs(a - b) / scale * 100.0
+
+## The highest order a station meets within `limits` (-1: not G0).
+pub func level_of(s: Station, limits: Limits) -> i64:
+    if not (s.gap <= limits.distance): return -1
+    if not (s.angle <= limits.angle): return 0
+    if not (relative(s.curvature1, s.curvature2, limits.curvature_floor) <= limits.curvature): return 1
+    if not (relative(s.rate1, s.rate2, limits.rate_floor) <= limits.rate): return 2
+    return 3
+
+## The diagonal of `w`'s points' box: the model's size.
+pub func shape_size(w: const Shape*) -> f64:
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for p in w.points.view():
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    if w.points.count == 0: return 1.0
+    return math.max(high.subtract(low).length(), w.tolerance)

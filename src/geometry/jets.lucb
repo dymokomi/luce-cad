@@ -1,0 +1,156 @@
+## Jets: a curve's or surface's point with its derivatives to the third
+## order, exactly. Rational B-splines take the quotient rule on basis_jet's
+## bases (Piegl and Tiller's A4.2 and A4.4); lines, circles, ellipses and
+## the analytic supports take their closed forms. Continuity checks (G3
+## needs the third order) and curvature combs read them.
+
+## A curve's point and its first three derivatives by its own parameter.
+pub struct CurveJet:
+    pub var p: Vector3
+    pub var d1: Vector3
+    pub var d2: Vector3
+    pub var d3: Vector3
+
+## A surface's point and its partial derivatives to the third order in its
+## chart coordinates (charts.lucb: a B-spline's normalized domain).
+pub struct SurfaceJet:
+    pub var p: Vector3
+    pub var su: Vector3
+    pub var sv: Vector3
+    pub var suu: Vector3
+    pub var suv: Vector3
+    pub var svv: Vector3
+    pub var suuu: Vector3
+    pub var suuv: Vector3
+    pub var suvv: Vector3
+    pub var svvv: Vector3
+
+## The jet of a line through `origin` along `x` at `t`.
+pub func line_jet(origin: Vector3, x: Vector3, t: f64) -> CurveJet:
+    return CurveJet(origin.add(x.multiply_scalar(t)), x, Vector3(), Vector3())
+
+## The jet of origin + x a cos t + y b sin t (a circle when a = b).
+pub func conic_jet(origin: Vector3, x: Vector3, y: Vector3, a: f64, b: f64, t: f64) -> CurveJet:
+    let c = x.multiply_scalar(a * math.cos(t)).add(y.multiply_scalar(b * math.sin(t)))
+    let d1 = x.multiply_scalar(-a * math.sin(t)).add(y.multiply_scalar(b * math.cos(t)))
+    return CurveJet(origin.add(c), d1, c.multiply_scalar(-1.0), d1.multiply_scalar(-1.0))
+
+## The jet of a check()-validated rational B-spline curve at knot parameter
+## `t`; at an inner knot, the limit from below with `left`.
+pub func spline_jet(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[], t: f64, left: bool) -> CurveJet!:
+    let count = (i64)points.length
+    if not math.is_finite(t) or t < knots[(usize)degree] or t > knots[(usize)count]:
+        error(invalid, "curve parameter outside knot domain")
+    var ders: f64[36]
+    let first = basis_jet(knots, count, degree, t, left, &ders)
+    # Homogeneous sums in a local frame: derivatives are translation invariant.
+    let origin = points[first]
+    var a = [Vector3(), Vector3(), Vector3(), Vector3()]
+    var w: f64[4] = [0.0, 0.0, 0.0, 0.0]
+    for k in 0..<(usize)4:
+        for at in 0..<(usize)degree + 1:
+            let index = first + at
+            let weight = ders[k * 9 + at] * weights[index]
+            w[k] += weight
+            a[k] = a[k].add(points[index].subtract(origin).multiply_scalar(weight))
+    if not (w[0] > 0.0) or not math.is_finite(w[0]): error(invalid, "invalid rational curve denominator")
+    let inverse = 1.0 / w[0]
+    let p = a[0].multiply_scalar(inverse)
+    let d1 = a[1].subtract(p.multiply_scalar(w[1])).multiply_scalar(inverse)
+    let d2 = a[2].subtract(d1.multiply_scalar(2.0 * w[1])).subtract(p.multiply_scalar(w[2])).multiply_scalar(inverse)
+    let d3 = a[3].subtract(d2.multiply_scalar(3.0 * w[1])).subtract(d1.multiply_scalar(3.0 * w[2])).subtract(p.multiply_scalar(w[3])).multiply_scalar(inverse)
+    return CurveJet(p.add(origin), d1, d2, d3)
+
+## Support `s`'s jet at chart coordinates `uv`. A B-spline's derivatives are
+## by its normalized parameters; at an inner knot line its bases are the
+## limits from below in u with `left_u`, in v with `left_v`.
+pub func surface_jet(s: const Surface*, uv: Vector3, left_u: bool, left_v: bool) -> SurfaceJet!:
+    if s.kind == surface_spline: return try spline_surface_jet(s, uv, left_u, left_v)
+    var j = SurfaceJet(analytic_point(*s, uv.x, uv.y), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3())
+    if s.kind == surface_plane:
+        j.su = s.x
+        j.sv = s.y
+        return j
+    # R(u) = x cos u + y sin u turns about the axis; T = R' and R'' = -R.
+    let radial = s.x.multiply_scalar(math.cos(uv.x)).add(s.y.multiply_scalar(math.sin(uv.x)))
+    let tangent = s.x.multiply_scalar(-math.sin(uv.x)).add(s.y.multiply_scalar(math.cos(uv.x)))
+    if s.kind == surface_cylinder or s.kind == surface_cone:
+        # origin + R(u) (radius + v slope) + z v.
+        let slope = math.tan(s.angle) if s.kind == surface_cone else 0.0
+        let rho = s.radius + uv.y * slope
+        j.su = tangent.multiply_scalar(rho)
+        j.sv = radial.multiply_scalar(slope).add(s.z)
+        j.suu = radial.multiply_scalar(-rho)
+        j.suv = tangent.multiply_scalar(slope)
+        j.suuu = tangent.multiply_scalar(-rho)
+        j.suuv = radial.multiply_scalar(-slope)
+        return j
+    # Sphere and torus: origin + R(u) (major + minor cos v) + z minor sin v
+    # (a sphere's major radius is 0, its minor its radius).
+    let minor = s.radius if s.kind == surface_sphere else s.angle
+    let major = 0.0 if s.kind == surface_sphere else s.radius
+    let c = math.cos(uv.y)
+    let n = math.sin(uv.y)
+    let ring = major + minor * c
+    j.su = tangent.multiply_scalar(ring)
+    j.sv = radial.multiply_scalar(-minor * n).add(s.z.multiply_scalar(minor * c))
+    j.suu = radial.multiply_scalar(-ring)
+    j.suv = tangent.multiply_scalar(-minor * n)
+    j.svv = radial.multiply_scalar(-minor * c).add(s.z.multiply_scalar(-minor * n))
+    j.suuu = tangent.multiply_scalar(-ring)
+    j.suuv = radial.multiply_scalar(minor * n)
+    j.suvv = tangent.multiply_scalar(-minor * c)
+    j.svvv = radial.multiply_scalar(minor * n).add(s.z.multiply_scalar(-minor * c))
+    return j
+
+## Binomial coefficients to the third order.
+let binomials: f64[16] = [1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 2.0, 1.0, 0.0, 1.0, 3.0, 3.0, 1.0]
+
+## A rational B-spline surface's jet (A4.4): the homogeneous partials
+## A(k, l) and w(k, l) for k + l <= 3, then the quotient rule order by order.
+func spline_surface_jet(s: const Surface*, uv: Vector3, left_u: bool, left_v: bool) -> SurfaceJet!:
+    let u0 = s.ku[(usize)s.du]
+    let u1 = s.ku[(usize)s.nu]
+    let v0 = s.kv[(usize)s.dv]
+    let v1 = s.kv[(usize)s.nv]
+    if not math.is_finite(uv.x) or not math.is_finite(uv.y): error(invalid, "surface parameter outside knot domain")
+    let u = math.clamp(u0 + (u1 - u0) * uv.x, u0, u1)
+    let v = math.clamp(v0 + (v1 - v0) * uv.y, v0, v1)
+    var bu: f64[36]
+    var bv: f64[36]
+    let first_u = basis_jet(s.ku, s.nu, s.du, u, left_u, &bu)
+    let first_v = basis_jet(s.kv, s.nv, s.dv, v, left_v, &bv)
+    let origin = s.points[first_u * (usize)s.nv + first_v]
+    # Partial (k, l) at [k * 4 + l].
+    var a: Vector3[16] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    var w: f64[16]
+    for at in 0..<(usize)16: w[at] = 0.0
+    for iu in 0..<(usize)s.du + 1:
+        for iv in 0..<(usize)s.dv + 1:
+            let index = (first_u + iu) * (usize)s.nv + first_v + iv
+            let p = s.points[index].subtract(origin)
+            let weight = s.weights[index]
+            for k in 0..<(usize)4:
+                for l in 0..<(usize)4 - k:
+                    let scaled = bu[k * 9 + iu] * bv[l * 9 + iv] * weight
+                    a[k * 4 + l] = a[k * 4 + l].add(p.multiply_scalar(scaled))
+                    w[k * 4 + l] += scaled
+    if not (w[0] > 0.0) or not math.is_finite(w[0]): error(invalid, "invalid rational surface denominator")
+    var d: Vector3[16] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    for k in 0..<(usize)4:
+        for l in 0..<(usize)4 - k:
+            var value = a[k * 4 + l]
+            for jl in 1..<l + 1: value = value.subtract(d[k * 4 + l - jl].multiply_scalar(binomials[l * 4 + jl] * w[jl]))
+            for ik in 1..<k + 1:
+                value = value.subtract(d[(k - ik) * 4 + l].multiply_scalar(binomials[k * 4 + ik] * w[ik * 4]))
+                var mixed = Vector3()
+                for jl in 1..<l + 1: mixed = mixed.add(d[(k - ik) * 4 + l - jl].multiply_scalar(binomials[l * 4 + jl] * w[ik * 4 + jl]))
+                value = value.subtract(mixed.multiply_scalar(binomials[k * 4 + ik]))
+            d[k * 4 + l] = value.multiply_scalar(1.0 / w[0])
+    # By normalized parameters: each order in u scales by the u domain's
+    # length, each in v by v's.
+    let hu = u1 - u0
+    let hv = v1 - v0
+    return SurfaceJet(d[0].add(origin), d[4].multiply_scalar(hu), d[1].multiply_scalar(hv),
+                      d[8].multiply_scalar(hu * hu), d[5].multiply_scalar(hu * hv), d[2].multiply_scalar(hv * hv),
+                      d[12].multiply_scalar(hu * hu * hu), d[9].multiply_scalar(hu * hu * hv), d[6].multiply_scalar(hu * hv * hv), d[3].multiply_scalar(hv * hv * hv))

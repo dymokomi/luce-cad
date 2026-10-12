@@ -1,0 +1,127 @@
+## A deviation map (Alias's Deviation Map, Rhino's PointDeviation): how far
+## each point of one model's tessellation lies from another model's
+## surfaces, signed by the reference's outward normal. The reference's
+## tessellation finds the nearest face; the point is then dropped onto that
+## face's exact support. Colors: green within the acceptable distance, then
+## yellow to red outside the reference and cyan to blue inside, saturating
+## at the ramp distance.
+
+## A deviation map: the measured model's tessellation with point attributes
+## `deviation` (signed distance) and `Cd` (its color), and its statistics.
+pub struct CadDeviation:
+    var shown: interop.Reference[Mesh]?
+    pub var largest: f64
+    pub var smallest: f64
+    pub var mean: f64
+    pub var rms: f64
+    pub var within: f64
+
+    pub func init():
+        self.shown = none
+        self.largest = 0.0
+        self.smallest = 0.0
+        self.mean = 0.0
+        self.rms = 0.0
+        self.within = 1.0
+
+    ## The colored tessellation.
+    pub func mesh() -> interop.Reference[Mesh]!:
+        let shown = self.shown else error(invalid, "deviation map has no mesh")
+        return shown.clone()
+
+    pub func close():
+        if let shown = self.shown: shown.release()
+        self.shown = none
+
+pub let cad_deviation_type: interop.Type[CadDeviation] = interop.Type[CadDeviation]("CadDeviation", CadDeviation.close, closeable = true)
+
+struct DeviationJob:
+    let points: const Vector3[]
+    let target: const Mesh*
+    let faces: i64
+    let shape: const Shape*
+    let distances: f64[]
+
+let chunk: usize = 256
+
+func deviation_item(raw: void*, group: usize, worker: usize):
+    _ = worker
+    let job = (DeviationJob*)raw
+    let end = job.points.length if job.points.length < (group + 1) * chunk else (group + 1) * chunk
+    for at in group * chunk..<end:
+        job.distances[at] = signed_distance(job, job.points[at]) catch failure: recover math.nan
+
+## Point `p`'s signed distance to the reference: its nearest tessellated
+## face's support, exactly.
+func signed_distance(job: const DeviationJob*, p: Vector3) -> f64!:
+    let polygon = try job.target.closest_face(p)
+    if polygon < 0: error(invalid, "the reference has no faces")
+    let f = (usize)(try job.target.attribute_value(job.faces, polygon))
+    let face = job.shape.faces.items[f]
+    let s = &job.shape.surfaces.items[(usize)face.surface]
+    let uv = (try nearest_parameters(*s, p, Vector3(0.5, 0.5, 0.0), true)) if s.kind == surface_spline else chart_uv(*s, p, Vector3(), false)
+    let j = try surface_jet(s, uv, false, false)
+    let normal = j.su.cross(j.sv)
+    let offset = p.subtract(j.p)
+    let distance = offset.length()
+    let side = offset.dot(normal) * (1.0 if face.sense else -1.0)
+    return distance if side >= 0.0 else -distance
+
+## `model`'s tessellation (`segments`) colored by its deviation from
+## `reference`'s surfaces: within `acceptable` green, saturated at `ramp`.
+pub func deviation_map(model: const CadModel*, reference: const CadModel*, acceptable: f64, ramp: f64, segments: i64) -> interop.Reference[CadDeviation]!:
+    if not (acceptable >= 0.0) or not (ramp > acceptable) or not math.is_finite(ramp):
+        error(invalid, "a deviation map's ramp must exceed its acceptable distance")
+    var w = try shape_of(reference)
+    defer w.close()
+    let target = try reference.tessellate(segments)
+    defer target.release()
+    let faces = target.value().find_attribute("cad_face", 2)
+    if faces < 0: error(invalid, "the reference's tessellation has no CAD faces")
+    try target.value().prepare_queries()
+    let measured = try model.tessellate(segments)
+    defer measured.release()
+    let count = (usize)measured.value().point_count()
+    let points = try new Vector3[count] --- in memory.heap
+    defer free(points) in memory.heap
+    for at in 0..<count: points[at] = try measured.value().point((i64)at)
+    let distances = try new f64[count] --- in memory.heap
+    defer free(distances) in memory.heap
+    var job = DeviationJob(points = points, target = target.value(), faces = faces, shape = &w, distances = distances)
+    try parallel.for_each((count + chunk - 1) // chunk, (void*)&job, deviation_item)
+    let result = try interop.Reference[CadDeviation].adopt(new CadDeviation() in memory.heap, cad_deviation_type, memory.heap)
+    errdefer result.release()
+    let map = result.value()
+    let colors = try new f64[count * 3] --- in memory.heap
+    defer free(colors) in memory.heap
+    var sum = 0.0
+    var squares = 0.0
+    var inside: usize = 0
+    for at in 0..<count:
+        let d = distances[at]
+        if not math.is_finite(d): error(invalid, "a point's deviation could not be measured")
+        map.largest = d if at == 0 else math.max(map.largest, d)
+        map.smallest = d if at == 0 else math.min(map.smallest, d)
+        sum += d
+        squares += d * d
+        if math.abs(d) <= acceptable: inside += 1
+        let color = ramp_color(d, acceptable, ramp)
+        colors[at * 3] = color.x
+        colors[at * 3 + 1] = color.y
+        colors[at * 3 + 2] = color.z
+    if count > 0:
+        map.mean = sum / (f64)count
+        map.rms = math.sqrt(squares / (f64)count)
+        map.within = (f64)inside / (f64)count
+    let valued = try measured.value().with_attribute("deviation", 0, 1, distances)
+    defer valued.release()
+    map.shown = try valued.value().with_attribute("Cd", 0, 3, colors)
+    return result
+
+## The color of signed deviation `d` (see the file's header).
+pub func ramp_color(d: f64, acceptable: f64, ramp: f64) -> Vector3:
+    let size = math.abs(d)
+    if size <= acceptable: return Vector3(0.25, 0.75, 0.3)
+    let t = math.clamp((size - acceptable) / (ramp - acceptable), 0.0, 1.0)
+    if d > 0.0: return Vector3(0.95, 0.85 * (1.0 - t), 0.15 * (1.0 - t))
+    return Vector3(0.2 * (1.0 - t), 0.8 * (1.0 - t), 0.95)

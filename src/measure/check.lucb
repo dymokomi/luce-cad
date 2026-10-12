@@ -1,0 +1,229 @@
+## A continuity check of a model's edges with what it draws (Alias's
+## Surface Continuity and Curve Curvature locators): every chosen edge in
+## the color of how it did, with a level mark at its middle; curvature combs
+## on its curved edges; and at each station each side's curvature across the
+## edge as a quill, so a jump shows as two quills of different lengths.
+
+## What CadCheck's lines are (check_lines' `group`).
+pub let check_passed: i64 = 0
+## Edges one order short of the level asked for (Alias's yellow).
+pub let check_near: i64 = 1
+## Edges two or more orders short (red).
+pub let check_failed: i64 = 2
+pub let check_combs: i64 = 3
+pub let check_quills: i64 = 4
+let group_count: usize = 5
+
+## How a check is made and drawn: the order asked for (0 to 3), stations
+## per edge, the pass thresholds, combs (and samples per curved edge),
+## cross-curvature quills, and the combs' length scale (1: the largest
+## quill a tenth of the model).
+pub struct CheckOptions:
+    pub var level: i64 = 2
+    pub var stations: i64 = 12
+    pub var limits: Limits
+    pub var combs: bool = true
+    pub var samples: i64 = 48
+    pub var quills: bool = true
+    pub var scale: f64 = 1.0
+
+struct Group:
+    var points: Growing[Vector3]
+
+## A finished check (see the file's header): per edge its measures, per
+## station the values behind them, and the lines to draw by group.
+pub struct CadCheck:
+    var edges: Growing[EdgeCheck]
+    var stations: Growing[Station]
+    var combs: Growing[CombSample]
+    var groups: Group[5]
+    var level: i64
+    var text: Growing[u8]
+
+    pub func init():
+        self.edges = Growing[EdgeCheck]()
+        self.stations = Growing[Station]()
+        self.combs = Growing[CombSample]()
+        self.groups = [Group(Growing[Vector3]()), Group(Growing[Vector3]()), Group(Growing[Vector3]()), Group(Growing[Vector3]()), Group(Growing[Vector3]())]
+        self.level = 2
+        self.text = Growing[u8]()
+
+    ## How many edges were checked.
+    pub func edge_count() -> i64:
+        return (i64)self.edges.count
+
+    ## Edge check `index` (stations by `station`, first..<first + count).
+    pub func edge(index: i64) -> EdgeCheck!:
+        if index < 0 or (usize)index >= self.edges.count: error(invalid, "check edge out of range")
+        return self.edges.items[(usize)index]
+
+    pub func station_count() -> i64:
+        return (i64)self.stations.count
+
+    pub func station(index: i64) -> Station!:
+        if index < 0 or (usize)index >= self.stations.count: error(invalid, "check station out of range")
+        return self.stations.items[(usize)index]
+
+    ## The comb samples of every curved edge checked, edge by edge.
+    pub func comb_count() -> i64:
+        return (i64)self.combs.count
+
+    pub func comb(index: i64) -> CombSample!:
+        if index < 0 or (usize)index >= self.combs.count: error(invalid, "comb sample out of range")
+        return self.combs.items[(usize)index]
+
+    ## How many edges meet the level asked for.
+    pub func passed() -> i64:
+        var count: i64 = 0
+        for e in self.edges.view():
+            if e.level >= self.level: count += 1
+        return count
+
+    ## The points (pairs) of line group `group` (check_passed ...).
+    pub func line_count(group: i64) -> i64!:
+        return (i64)(try self.group(group)).count
+
+    pub func line_point(group: i64, index: i64) -> Vector3!:
+        let list = try self.group(group)
+        if index < 0 or (usize)index >= list.count: error(invalid, "check line point out of range")
+        return list.items[(usize)index]
+
+    ## One line: how many edges pass and the worst of each measure.
+    pub func summary() -> str:
+        return (str)self.text.view()
+
+    func group(group: i64) -> const Growing[Vector3]*!:
+        if group < 0 or (usize)group >= group_count: error(invalid, "check line group out of range")
+        return &self.groups[(usize)group].points
+
+    pub func close():
+        self.edges.close()
+        self.stations.close()
+        self.combs.close()
+        for at in 0..<group_count: self.groups[at].points.close()
+        self.text.close()
+
+pub let cad_check_type: interop.Type[CadCheck] = interop.Type[CadCheck]("CadCheck", CadCheck.close, closeable = true)
+
+## Line group `group`'s point pairs, for Base drawers (luced-3d's compute
+## bridge).
+pub func check_lines(check: const CadCheck*, group: i64) -> const Vector3[]:
+    if group < 0 or (usize)group >= group_count:
+        var none_points: Vector3[]
+        return none_points
+    return check.groups[(usize)group].points.view()
+
+## `model`'s edges `references` names (references.lucb; empty: every edge
+## between two faces) checked by `options` into a new CadCheck.
+pub func check_model(model: const CadModel*, references: str, options: CheckOptions) -> interop.Reference[CadCheck]!:
+    if options.level < 0 or options.level > 3: error(invalid, "a check's continuity is G0, G1, G2 or G3")
+    if options.stations < 1 or options.stations > 1000: error(invalid, "a check takes 1 to 1000 stations per edge")
+    if options.samples < 2 or options.samples > 1000: error(invalid, "a comb takes 2 to 1000 samples per edge")
+    let result = try interop.Reference[CadCheck].adopt(new CadCheck() in memory.heap, cad_check_type, memory.heap)
+    errdefer result.release()
+    let check = result.value()
+    check.level = options.level
+    var w = try shape_of(model)
+    defer w.close()
+    let size = shape_size(&w)
+    var limits = options.limits
+    # Flat below a curvature a thousand times the model's size (and its square).
+    limits.curvature_floor = 1e-3 / size
+    limits.rate_floor = 1e-3 / (size * size)
+    var chosen = Growing[usize]()
+    defer chosen.close()
+    if references == "":
+        for e in 0..<w.edges.count: try chosen.push(e)
+    else:
+        try resolve_edges(&w, references, &chosen)
+    let combs = &check.combs
+    var spans = Growing[usize]()
+    defer spans.close()
+    var largest = 0.0
+    for e in chosen.view():
+        let f1 = w.sides.items[e * 2]
+        let f2 = w.sides.items[e * 2 + 1]
+        # Seams and open boundaries have no second face to compare.
+        if f1 < 0 or f2 < 0: continue
+        let made = try check_edge(&w, e, (usize)f1, (usize)f2, (usize)options.stations, limits, &check.stations)
+        try check.edges.push(made)
+        if options.combs:
+            try spans.push(combs.count)
+            try edge_comb(&w, e, (usize)options.samples, combs)
+    try spans.push(combs.count)
+    for s in combs.view(): largest = math.max(largest, s.curvature)
+    for s in check.stations.view(): largest = math.max(largest, math.max(math.abs(s.curvature1), math.abs(s.curvature2)))
+    let scale = comb_scale(largest, 0.1 * size * options.scale)
+    for e in check.edges.view():
+        let group = check_passed if e.level >= options.level else (check_near if e.level == options.level - 1 else check_failed)
+        let out = &check.groups[(usize)group].points
+        try edge_polyline(&w, (usize)e.edge, out)
+        try level_mark(check.stations.view()[(usize)e.first..<(usize)(e.first + e.count)], e.level, size, out)
+        if options.quills and scale > 0.0:
+            for s in check.stations.view()[(usize)e.first..<(usize)(e.first + e.count)]:
+                try cross_quills(s, scale, size, &check.groups[(usize)check_quills].points)
+    if scale > 0.0:
+        for k in 0..<spans.count - 1:
+            try comb_lines(combs.view()[spans.items[k]..<spans.items[k + 1]], scale, &check.groups[(usize)check_combs].points)
+    try summarize(check, options.level)
+    return result
+
+## Edge `e` as point pairs: one for a line, 64 chords for a curve.
+func edge_polyline(w: const Shape*, e: usize, out: Growing[Vector3]*) -> !:
+    let edge = w.edges.items[e]
+    let chords: usize = 1 if w.carriers.items[(usize)edge.carrier].kind == curve_line else 64
+    var previous = (try carrier_jet(w, edge.carrier, edge.t0)).p
+    for k in 1..<chords + 1:
+        let point = (try carrier_jet(w, edge.carrier, edge.t0 + (edge.t1 - edge.t0) * (f64)k / (f64)chords)).p
+        try out.push(previous)
+        try out.push(point)
+        previous = point
+
+## The level an edge reached, marked at its middle station: one tick across
+## it per order met (G0 one, G3 four), a cross where even G0 fails.
+func level_mark(stations: const Station[], level: i64, size: f64, out: Growing[Vector3]*) -> !:
+    if stations.length == 0: return
+    let s = stations[stations.length // 2]
+    let run = s.normal.cross(s.across)
+    let half = size * 0.012
+    let gap = size * 0.008
+    if level < 0:
+        try out.push(s.point.add(s.across.add(run).multiply_scalar(half)))
+        try out.push(s.point.subtract(s.across.add(run).multiply_scalar(half)))
+        try out.push(s.point.add(s.across.subtract(run).multiply_scalar(half)))
+        try out.push(s.point.subtract(s.across.subtract(run).multiply_scalar(half)))
+        return
+    let ticks = level + 1
+    for k in 0..<ticks:
+        let middle = s.point.add(run.multiply_scalar(gap * ((f64)k - (f64)(ticks - 1) / 2.0)))
+        try out.push(middle.add(s.across.multiply_scalar(half)))
+        try out.push(middle.subtract(s.across.multiply_scalar(half)))
+
+## A station's curvature across the edge on each side, as quills along the
+## normal (away from the body where convex), side 1's just behind the edge
+## and side 2's just ahead of it.
+func cross_quills(s: Station, scale: f64, size: f64, out: Growing[Vector3]*) -> !:
+    let apart = s.across.multiply_scalar(size * 0.002)
+    let one = s.point.subtract(apart)
+    let two = s.point.add(apart)
+    try out.push(one)
+    try out.push(one.add(s.normal.multiply_scalar(s.curvature1 * scale)))
+    try out.push(two)
+    try out.push(two.add(s.normal.multiply_scalar(s.curvature2 * scale)))
+
+## The check's one-line summary: edges at the level, and the worst gap,
+## angle, curvature and rate differences.
+func summarize(check: CadCheck*, level: i64) -> !:
+    var gap = 0.0
+    var angle = 0.0
+    var curvature = 0.0
+    var rate = 0.0
+    for e in check.edges.view():
+        gap = math.max(gap, e.gap)
+        angle = math.max(angle, e.angle)
+        curvature = math.max(curvature, e.curvature)
+        rate = math.max(rate, e.rate)
+    var buffer: u8[512]
+    let line = try strings.format(buffer, f"{check.passed()} of {check.edges.count} edges G{level}; worst gap {gap:.6f}, angle {angle:.4f} deg, curvature {curvature:.3f}%, rate {rate:.3f}%")
+    check.text.clear()
+    for byte in line.bytes: try check.text.push(byte)

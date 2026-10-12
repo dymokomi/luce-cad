@@ -38,6 +38,11 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
   between planes, lines between a plane and a cylinder, and rims, with
   corners where they meet. How each works and what is not supported yet:
   [docs/MODELING.md](docs/MODELING.md).
+- `measure` (`luce_cad.measure`): `CadMeasure`, measuring without changing:
+  `check` (continuity G0 to G3 across edges at stations, from exact third
+  derivatives, with curvature combs and the lines that draw the result) and
+  `deviation` (a model's tessellation colored by its signed distance from
+  another's surfaces). See [docs/MODELING.md](docs/MODELING.md), Measuring.
 - `cad_exact` (`luce_cad.exact`, Base only): `FaceSupport`, the exact data
   exporters read (luce-usd writes CAD faces as USD NurbsPatch prims).
   `model.face_support(face)` copies a face's support out (kind, frame,
