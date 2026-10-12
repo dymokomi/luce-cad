@@ -23,7 +23,9 @@ pub func curve_tests() -> unit!:
     from_models()
     edits()
     objects()
-    print("PASS CAD curves: blends measure G0-G4 with §6.2's control points, edges and isoparms exact, curves on faces lie on them, Attach meets at its bias, Close and Stretch, curves as set objects")
+    combs()
+    picked_isoparms()
+    print("PASS CAD curves: blends measure G0-G4 with §6.2's control points, edges and isoparms exact, curves on faces lie on them, Attach meets at its bias, Close and Stretch, curves as set objects, combs on curves, isoparms through a clicked point")
 
 ## A quarter circle of radius 2 about the origin in XY, from (2, 0) to (0, 2).
 func quarter() -> CadSpline!:
@@ -227,3 +229,34 @@ func objects() -> unit!:
     assert(CadCurves.face(on, 0) == face and CadCurves.chart_curve(on, 0).count() == 2)
     held = CadCurves.without_curve(held, "Curve2")
     assert(CadCurves.count(held) == 1)
+
+## Curvature combs on curves (the Check node's): a quarter circle of radius
+## 2 combs at curvature 1/2 everywhere, its quills pointing out of its
+## center; a straight curve has none; with a body's check they add to it.
+func combs() -> unit!:
+    let curves = CadCurves.with_curve(CadCurves.with_curve(CadGeometry.of_model(CadSolids.box(1.0, 1.0, 1.0)), "arc", quarter()), "line", CadCurveTools.by_points([Vector3(5.0, 0.0, 0.0), Vector3(6.0, 1.0, 0.0)], 1))
+    let check = CadMeasure.curve_check(curves, 8)
+    assert(check.comb_count() == 9, f"{check.comb_count()} comb samples")
+    for k in 0..<check.comb_count():
+        let c = check.comb(k)
+        assert(math.abs(c.curvature - 0.5) < 1e-9 and c.direction.subtract(c.point.multiply_scalar(0.5)).length() < 1e-9)
+    assert(check.line_count(3) > 0 and check.summary() == "1 curve comb")
+    let body = CadMeasure.check(CadGeometry.model(curves, 0))
+    let edges = body.edge_count()
+    CadMeasure.with_curve_combs(body, curves, 8)
+    assert(body.edge_count() == edges and body.summary().ends_with("; 1 curve comb"))
+
+## Alias's isoparm picked by a click: through a point of a cylinder's side
+## the isoparm along v (a ruling) and along u (a circle) both pass through it.
+func picked_isoparms() -> unit!:
+    let body = CadModeling.tagged(CadSolids.cylinder(3.0, 10.0), "cyl")
+    var side = ""
+    for f in 0..<body.face_count():
+        if body.face_surface_kind(f) == 1:
+            side = CadModeling.face_name_of(body, f)
+    let p = Vector3(3.0 * math.cos(0.7), 1.5, -3.0 * math.sin(0.7))
+    for direction in 0..<2:
+        let fraction = CadCurveTools.isoparm_fraction(body, side, direction, p)
+        let iso = CadCurveTools.isoparm(body, side, direction, fraction)
+        let t = CadCurveTools.nearest(iso, p)
+        assert(iso.at(t).subtract(p).length() < 1e-6, f"direction {direction}: {iso.at(t).subtract(p).length()}")

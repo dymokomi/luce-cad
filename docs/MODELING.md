@@ -1107,6 +1107,7 @@ after Alias's Evaluate tools. luced-3d's Check node draws what it returns.
 | `CadMeasure.` | What it does |
 |---|---|
 | `check(model, references, level, stations, distance, angle, curvature, rate, combs, samples, quills, scale, sharp)` | The edges `references` names (empty: every edge between two faces) checked for continuity `level` (0 to 3) at `stations` per edge. Returns a `CadCheck`: per edge (`edge(i)`, an `EdgeCheck`) its faces, its worst gap, angle and curvature and rate differences, and the highest order every station meets; per station (`station(i)`) the values behind them; the comb samples (`comb(i)`); `passed()`, `summary()`; how many creases were left out (`creases_left_out()`; without `sharp`, edges whose faces meet at more than 10° all along them are not checked, though they keep their combs); the lines to draw by group (`line_count`, `line_point`; Base readers `check_lines`); and a label an edge (`label_count`, `label(i)`). |
+| `with_curve_combs(check, set, samples, scale)`, `curve_check(set, samples, scale)` | Curvature combs of a set's shown curves (free and on faces, `samples` a span) added to a check, or a check of the curves alone (Alias's Curve Curvature on curves). |
 | `deviation(model, reference, acceptable, ramp, segments)` | `model`'s tessellation with point attributes `deviation` (its signed distance from `reference`'s surfaces) and `Cd` (a color ramp), and its largest, smallest, mean and RMS deviation, and the share within `acceptable`. |
 
 **Jets** (`geometry/jets.lucb`). Continuity to G3 needs third derivatives. `basis_jet` extends
@@ -1302,6 +1303,7 @@ its 3D curve fitted again).
 | `through(points, degree)` | Alias's EP curve: global interpolation (A9.1) at chord-length parameters, knots averaged. |
 | `edge(model, reference)` | Duplicate Curve of an edge, exactly: a line (degree 1), a circle or ellipse arc (rational quadratics, A7.1), a B-spline edge's piece; from the edge's start to its end. |
 | `isoparm(model, face, direction, fraction)` | Duplicate Curve of an isoparm, exactly: the net's row combined at that parameter (an analytic face through its exact net). |
+| `isoparm_fraction(model, face, direction, p)` | Where along the face's net the isoparm through the point nearest `p` lies (luced-3d's isoparm picked by a double-click). |
 | `face_at(model, p, fraction)`, `face_uv(model, face, p)`, `face_point(model, face, uv)` | The face a clicked point lies on (within a fraction of its size, inside its edges' box), a point's chart coordinates on it, and back. |
 | `on_face(model, face, uv, tolerance)` | A curve on a face: the 3D curve along chart curve `uv`, fitted at degree 5 on equal spans, doubled until within `tolerance`, its ends on the surface. |
 | `blend(a, ta, sa, ga, b, tb, sb, gb, degree, shape, extra)` | Blend Curve (below). |

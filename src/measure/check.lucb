@@ -268,3 +268,48 @@ func summarize(check: CadCheck*, level: i64) -> !:
     let line = try strings.format(buffer, f"{check.passed()} of {check.edges.count} edges G{level}{note}; worst gap {gap:.6f}, angle {angle:.4f} deg, curvature {curvature:.3f}%, rate {rate:.3f}%")
     check.text.clear()
     for byte in line.bytes: try check.text.push(byte)
+
+## The curves of `set` (CadCurves, shown ones) combed onto `check` with
+## `samples` a span, at `scale` (1: the most curved quill a tenth of the
+## curves' size): their quills and outlines in the combs group, their
+## count onto the summary.
+pub func comb_curves(check: CadCheck*, set: interop.Reference[GeometrySet], samples: i64, scale: f64) -> !:
+    if samples < 2 or samples > 1000: error(invalid, "a comb takes 2 to 1000 samples a span")
+    let count = try CadCurves.count(set)
+    var samples_all = Growing[CombSample]()
+    defer samples_all.close()
+    var spans = Growing[usize]()
+    defer spans.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    var combed: i64 = 0
+    for index in 0..<count:
+        if not (try CadCurves.visible(set, index)): continue
+        let curve = try CadCurves.curve(set, index)
+        defer curve.release()
+        let s = spline_in(curve.value())
+        for q in s.points.view():
+            let p = q.point()
+            low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+            high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+        let before = samples_all.count
+        try spline_comb(s, (usize)samples, &samples_all)
+        if samples_all.count > before:
+            try spans.push(before)
+            combed += 1
+    try spans.push(samples_all.count)
+    var largest = 0.0
+    for c in samples_all.view(): largest = math.max(largest, c.curvature)
+    let size = math.max(1e-9, high.subtract(low).length())
+    let length = comb_scale(largest, 0.1 * size * scale)
+    if length > 0.0:
+        for k in 0..<spans.count - 1:
+            try comb_lines(samples_all.view()[spans.items[k]..<spans.items[k + 1]], length, &check.groups[(usize)check_combs].points)
+    for c in samples_all.view(): try check.combs.push(c)
+    var buffer: u8[64]
+    let note = try strings.format(buffer, f"; {combed} curve comb{"" if combed == 1 else "s"}")
+    if check.text.count == 0:
+        let alone = try strings.format(buffer, f"{combed} curve comb{"" if combed == 1 else "s"}")
+        for byte in alone.bytes: try check.text.push(byte)
+        return
+    for byte in note.bytes: try check.text.push(byte)
