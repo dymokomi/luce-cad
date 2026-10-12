@@ -20,6 +20,7 @@ does today.
 | `revolved(set, axis, tag, angle)` | Each region turned about the plane's u (`0`) or v (`1`) axis: a full turn, or `angle` radians closed by the profile at each end. |
 | `revolved_about(set, origin, direction, tag, angle)` | The same about any line in the sketch's plane: a sketch line, a body edge, a construction axis. |
 | `edge_axis(model, reference)` | A line edge's line, or a circular edge's axis, for Revolve. |
+| `edge_frame(model, reference)`, `face_point(model, name)` | Where a feature's viewport handle stands (`handles.lucb`): an edge's middle, its direction and the way out of the corner between its faces (a blend's radius arrow); a point near a face's middle and its outward normal (Press Pull's arrow). |
 | `profile_count(set)` | How many regions the sketch has. |
 | `profile_keys(set)`, `profile_at(set, point)` | The keys of the sketch's faces; the key of the face under a point (a click). `extruded` and `revolved` take keys to choose faces. |
 | `CadProfileMap.of(set)`, `key_at(point)` | The sketch's faces laid out once (`profile_map.lucb`), so the face under a moving pointer is a containment test, not an arrangement made again. |
