@@ -505,6 +505,35 @@ edge's offset folds (the edge's least radius of curvature toward the face: 0.341
 0.4). Each seam must keep some length (half its length when both its ends are blended). A drafted
 corner's contacts are farther than the radius; the sizes said allow for it.
 
+### Loops between two curved faces (`curved_blend.lucb`, `row_fit.lucb`)
+
+An edge between two curved faces (a hole's rim through a ball, a boss's foot on a pipe, two
+fillets' strips meeting) is blended by a ball rolling between the two surfaces, in the plane square
+to the edge at each point. Neither face may be flat; those go to the paths above.
+- **The spine.** The ball's center is where both surfaces, offset by the radius, meet in that plane:
+  Newton on their signed distances (a B-spline's along its normal at its nearest point), the plane's
+  equation the third. Inside the material on a convex edge, in the air on a concave one. When it no
+  longer touches both, the fillet is too large ("the ball no longer touches both").
+- **The section.** The contacts are the center's nearest points on each face; their tangents
+  across the edge meet at a corner. G1 is the circle's arc, rational, its middle weight sin(φ/2) for
+  the corner's angle φ; G2 and G3 are the fillet's B-spline on the same contacts and corner. A
+  chamfer joins the points its size along each face (a chord), square to the edge.
+- **The rows** are fitted along the edge (`row_fit.lucb`, shared with `cap_rows.lucb`): a
+  B-spline edge's degree and knots, else degree 5 over four spans, spans halved until every row
+  stays within the tolerance. A G1 strip's corner row is fitted homogeneous with its weight as a row
+  of its own, then divided back: its weights vary along the edge.
+
+Whole loops only. Every vertex of a picked edge is a joint of two picked edges meeting tangentially
+(traced edges' ends agree to a hair) or a closed edge's own. The faces' other edges there (a seam,
+an edge to a third face) must run on square to the loop. They are shortened to the contact on their
+face, and the section at the vertex lies along them, so that a periodic face's seam stays exactly
+on its chart's. A straight one a hair off is redrawn from the contact. Each loop lies between one
+pair of faces.
+
+Checked: a ball drilled along its axis, both rims filleted G1 and chamfered, against Pappus in the
+meridian plane; G2 and G3 take less; a boss's foot on a pipe (two cylinders meeting in a traced
+loop of two edges, concave) gains less from G1 to G3.
+
 ### Fillets meeting at corners (`corners.lucb`)
 
 - **Two fillets** of one radius meeting where the third edge stays sharp meet in a miter. Both
@@ -699,8 +728,9 @@ Roughly in order of usefulness:
 
 1. **Fillet corners beyond three edges,** and G1 setback corners (the same patch with one row:
    unequal radii, Fusion's other corner type).
-2. **Blends on other curved edges:** edges between two curved faces (beyond a flat face's loop);
-   open ends where the loop turns a sharp corner rather than going on tangentially.
+2. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
+   it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
+   the loop turns a sharp corner rather than going on tangentially.
 3. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
    analytic surfaces are recognized as coincident.
 4. **Sweep and loft;** Extrude's Thin option and a start offset by a face.

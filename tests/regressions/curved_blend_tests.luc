@@ -1,0 +1,118 @@
+## Blends between two curved faces (curved_blend.lucb): a ball drilled
+## through its axis, both hole rims (a sphere meeting a cylinder) filleted
+## G1, G2, G3 and chamfered, the G1 fillet and the chamfer checked by
+## Pappus against their sections in the meridian plane; a boss standing on
+## a pipe (two cylinders, the traced loop where they meet, concave), the
+## loop filleted and chamfered. Each result is closed.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+## The ids of `model`'s curved edges whose start and middle `keep` takes.
+func curved_edges(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if not model.face_edge_linear(face, use) and keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 0.5)) and not (id in found):
+                found.append(id)
+    return found
+
+func rims(a: Vector3, b: Vector3) -> bool:
+    return math.abs(a.y) > 0.8 and math.abs(math.hypot(b.x, b.z) - 0.5) < 1e-6
+
+func boss_foot(a: Vector3, b: Vector3) -> bool:
+    return b.y < 0.99 and b.y > 0.8
+
+## `model`'s edges `edges` blended (`continuity` 0: chamfered) by `size`:
+## closed; its volume.
+func blended(model: CadModel, edges: list[int], size: float, continuity: int, faces: int, divisions: int) -> float!:
+    let refs = CadModeling.edge_references(model, edges)
+    let made = CadModeling.chamfered(model, refs, size, "#c") if continuity == 0 else CadModeling.filleted(model, refs, size, "#c", continuity)
+    assert(made.face_count() == faces)
+    let mesh = made.tessellate(divisions)
+    closed(mesh)
+    return volume(mesh)
+
+## A region of the meridian plane (radius, height) as a closed polygon:
+## its area and its centroid's radius.
+func pappus(points: list[Vector3]) -> (float, float):
+    var area = 0.0
+    var moment = 0.0
+    for k in 0..<points.length:
+        let a = points[k]
+        let b = points[(k + 1) % points.length]
+        let cross = a.x * b.y - b.x * a.y
+        area += cross * 0.5
+        moment += (a.x + b.x) * cross / 6.0
+    return (math.abs(area), moment / area)
+
+pub func curved_blend_tests() -> unit!:
+    # A unit ball drilled by a hole of radius 0.5 along Y: rims at 0.866.
+    let ball = CadModeling.tagged(CadSolids.sphere(1.0), "ball")
+    let drilled = CadModeling.combined(ball, CadModeling.tagged(CadSolids.cylinder(0.5, 4.0), "hole"), 1)
+    let edges = curved_edges(drilled, rims)
+    assert(edges.length == 2)
+    let before = volume(drilled.tessellate(64))
+    let r = 0.1
+    let corner = Vector3(0.5, math.sqrt(0.75), 0.0)
+    # G1: the ball's center 0.6 out and 0.9 from the middle; the region
+    # between the corner, the hole's line, the arc and the sphere.
+    let cx = 0.5 + r
+    let cy = math.sqrt(0.81 - cx * cx)
+    let on_hole = Vector3(0.5, cy, 0.0)
+    let on_ball = Vector3(cx / 0.9, cy / 0.9, 0.0)
+    let region: list[Vector3] = [corner, on_hole]
+    let start = math.pi
+    let stop = math.atan2(on_ball.y - cy, on_ball.x - cx)
+    for k in 1..<2000:
+        let angle = start + (stop - start) * float(k) / 2000.0
+        region.append(Vector3(cx + r * math.cos(angle), cy + r * math.sin(angle), 0.0))
+    region.append(on_ball)
+    let ball_from = math.atan2(on_ball.y, on_ball.x)
+    let ball_to = math.atan2(corner.y, corner.x)
+    for k in 1..<2000:
+        let angle = ball_from + (ball_to - ball_from) * float(k) / 2000.0
+        region.append(Vector3(math.cos(angle), math.sin(angle), 0.0))
+    let (area, radius) = pappus(region)
+    let g1 = before - blended(drilled, edges, r, 1, 5, 64)
+    let expected = 2.0 * 2.0 * math.pi * radius * area
+    if math.abs(g1 - expected) > 0.0003: print(f"rims G1: removed {g1}, expected {expected}")
+    assert(math.abs(g1 - expected) <= 0.0003)
+    # The chamfer: the triangle of the corner and the points 0.1 along each
+    # (a chord on the sphere).
+    let down = Vector3(0.5, corner.y - r, 0.0)
+    let turn = 2.0 * math.asin(r * 0.5)
+    let along = math.atan2(corner.y, corner.x) - turn
+    let (triangle, centroid) = pappus([corner, down, Vector3(math.cos(along), math.sin(along), 0.0)])
+    let chamfer = before - blended(drilled, edges, r, 0, 5, 64)
+    # The chamfer's face is flat between its points; the sphere's sliver
+    # beyond its chord stays.
+    let sliver = 0.5 * (turn - math.sin(turn))
+    let sliver_radius = math.cos(along + turn * 0.5)
+    let chamfer_expected = 2.0 * 2.0 * math.pi * (centroid * triangle + sliver_radius * sliver)
+    if math.abs(chamfer - chamfer_expected) > 0.0003: print(f"rims chamfer: removed {chamfer}, expected {chamfer_expected}")
+    assert(math.abs(chamfer - chamfer_expected) <= 0.0003)
+    # G2 and G3 take less than G1.
+    let g2 = before - blended(drilled, edges, r, 2, 5, 64)
+    let g3 = before - blended(drilled, edges, r, 3, 5, 64)
+    assert(g2 < g1 and g3 < g2 and g3 > 0.0)
+    # A boss of radius 0.5 on a pipe of radius 1 (along X): the loop where
+    # they meet, two traced edges, concave: blends add, G1 more than G2,
+    # G2 than G3.
+    let pipe = CadModeling.tagged(CadSolids.cylinder(1.0, 4.0).transformed(Vector3(), Vector3(0.0, 0.0, math.pi * 0.5), Vector3(1.0, 1.0, 1.0)), "pipe")
+    let boss = CadModeling.tagged(CadSolids.cylinder(0.5, 2.0).transformed(Vector3(0.0, 1.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), "boss")
+    let joined = CadModeling.combined(pipe, boss, 0)
+    let foot = curved_edges(joined, boss_foot)
+    assert(foot.length == 2)
+    let plain = volume(joined.tessellate(32))
+    var previous = 1e300
+    for continuity in 1..<4:
+        let added = blended(joined, foot, 0.1, continuity, 7, 32) - plain
+        assert(added > 0.0 and added < previous)
+        previous = added
+    assert(blended(joined, foot, 0.1, 0, 7, 32) > plain)
+    print("PASS curved blends: a drilled ball's rims (sphere and cylinder) filleted G1, G2, G3 and chamfered, G1 and the chamfer by Pappus; a boss's foot on a pipe (two cylinders, a traced loop, concave) filleted and chamfered; closed")

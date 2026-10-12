@@ -1,0 +1,597 @@
+## Blends of edges between two curved faces (a boss on a pipe, a hole's rim
+## through a ball, two fillets' strips meeting), built directly as
+## cap_blend.lucb's are: a ball of the radius rolling between the two
+## surfaces, in the plane square to the edge at each point. Its center
+## (the spine) is where both surfaces offset by the radius meet in that
+## plane (Newton on their signed distances, the plane's equation the
+## third), its contacts the nearest points on each, and the section the
+## arc between them (a G1 circle, rational; the G2/G3 B-spline on the
+## same contacts and their tangents' corner) or, chamfered, the line
+## between the points the chamfer's size along each face. The strip's rows
+## of control points are fitted along the edge (row_fit.lucb), a G1
+## section's middle weight fitted with them (its rows homogeneous).
+##
+## Whole loops only: every vertex of a picked edge is a joint of two
+## picked edges meeting tangentially, or a closed edge's own; the faces'
+## other edges there (a seam, the edge where a face meets a third one)
+## run on in the section's plane and are shortened to the contact on
+## their face. Each loop lies between one pair of faces. Anything else is
+## declined.
+
+## A picked edge of a curved loop: its two faces, whether it is convex,
+## and what it becomes: its contact edges on face `a` (`outer`) and `b`
+## (`inner`), its strip's surface and sense.
+struct CurvedSide:
+    var edge: usize
+    var a: usize
+    var b: usize
+    var convex: bool
+    var outer: i64
+    var inner: i64
+    var surface: i64
+    var sense: bool
+
+## One section across a picked edge: the contacts on its faces, the
+## corner where their tangents in the section's plane meet, the ball's
+## center and (G1) the arc's middle weight.
+struct CurvedSection:
+    var on_a: Vector3
+    var corner: Vector3
+    var on_b: Vector3
+    var center: Vector3
+    var weight: f64
+
+## The builder: the body `w`, the result `out` (a copy of the body to
+## begin), the blend (`reach`: a fillet's radius, a chamfer's size), each
+## body edge's picked side (-1) and new edge when it is shortened at a
+## loop's vertex (-1), each body vertex's contacts and section (-1), and
+## a field per face (a B-spline's nearest point search starts where the
+## last one ended).
+struct Curved:
+    var w: const Shape*
+    var out: Shape
+    var reach: f64
+    var round: bool
+    var continuity: i64
+    var sides: Growing[CurvedSide]
+    var side_of: Growing[i64]
+    var shortened: Growing[i64]
+    var on_a: Growing[i64]
+    var on_b: Growing[i64]
+    var sections: Growing[i64]
+    var tangents: Growing[Vector3]
+    var fields: Growing[Field]
+    var name: Growing[u8]
+
+    func close():
+        self.out.close()
+        self.sides.close()
+        self.side_of.close()
+        self.shortened.close()
+        self.on_a.close()
+        self.on_b.close()
+        self.sections.close()
+        self.tangents.close()
+        self.fields.close()
+        self.name.close()
+
+## Edges `chosen` of `w` blended between their curved faces (see the
+## file's header): filleted to `size` (`continuity` 1 to 3) when `round`,
+## else chamfered; none when they are not such loops.
+pub func curved_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str) -> interop.Reference[CadModel]?!:
+    var made = try new_curved(w, size, round, continuity)
+    defer made.close()
+    let c = &made
+    if not try curved_eligible(c, chosen): return none
+    try curved_contacts(c)
+    for k in 0..<c.sides.count: try curved_strip(c, k)
+    try curved_sections(c)
+    return try curved_result(c, tag)
+
+func new_curved(w: const Shape*, size: f64, round: bool, continuity: i64) -> Curved!:
+    var out = try shape_copy(w)
+    errdefer out.close()
+    var made = Curved(w, out, size, round, continuity, Growing[CurvedSide](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[Vector3](), Growing[Field](), Growing[u8]())
+    errdefer made.close()
+    try made.side_of.fill(w.edges.count, -1)
+    try made.shortened.fill(w.edges.count, -1)
+    try made.on_a.fill(w.points.count, -1)
+    try made.on_b.fill(w.points.count, -1)
+    try made.sections.fill(w.points.count, -1)
+    try made.tangents.fill(w.points.count, Vector3())
+    for f in 0..<w.faces.count: try made.fields.push(field_of(&w.surfaces.items[(usize)w.faces.items[f].surface]))
+    return made
+
+## Whether the picked edges are such loops: each between two faces at
+## least one of them curved and neither flat, its vertices joints, the
+## faces' other edges there running on in the section's plane.
+func curved_eligible(c: Curved*, chosen: const usize[]) -> bool!:
+    let w = c.w
+    if chosen.length == 0: return false
+    for e in chosen:
+        let (fa, fb) = try edge_faces(w, e)
+        if w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_plane or w.surfaces.items[(usize)w.faces.items[fb].surface].kind == surface_plane: return false
+        if c.side_of.items[e] >= 0: return false
+        try c.sides.push(CurvedSide(e, fa, fb, try convex(w, e), -1, -1, -1, true))
+        c.side_of.items[e] = (i64)c.sides.count - 1
+    # Each vertex: two picked ends meeting tangentially (a closed edge's
+    # both), the sides' faces the same pair, the other edges on one of
+    # them, square to the edge there.
+    for side in c.sides.view():
+        let edge = w.edges.items[side.edge]
+        for end in 0..<(usize)2:
+            let v = edge.start if end == 0 else edge.end
+            let along = try w.leaving(side.edge, (i64)end)
+            var picked = 0
+            for g in 0..<w.edges.count:
+                let other = w.edges.items[g]
+                if other.start != v and other.end != v: continue
+                let k = c.side_of.items[g]
+                if k >= 0:
+                    picked += (2 if other.start == other.end else 1)
+                    let next = c.sides.items[(usize)k]
+                    if not ((next.a == side.a and next.b == side.b) or (next.a == side.b and next.b == side.a)) or next.convex != side.convex: return false
+                    # Tangent (traced edges' ends agree to a hair).
+                    if g != side.edge and (try w.leaving(g, 0 if other.start == v else 1)).dot(along) > -1.0 + 1e-6: return false
+                    continue
+                let (ga, gb) = edge_faces(w, g) catch failure:
+                    # A seam: one face's both ways.
+                    let only = w.sides.items[g * 2]
+                    recover ((usize)only, (usize)only)
+                let on_a = ga == side.a or gb == side.a
+                let on_b = ga == side.b or gb == side.b
+                if on_a == on_b: return false
+                # Square to the edge (a traced edge's end tangent is near).
+                let leaving = try w.leaving(g, 0 if other.start == v else 1)
+                if math.abs(leaving.dot(along)) > 1e-3: return false
+            if picked != 2: return false
+            # The loop's way at the vertex, both edges' averaged (the section
+            # there is square to it for both strips).
+            let arriving = along.multiply_scalar(-1.0 if end == 1 else 1.0)
+            c.tangents.items[(usize)v] = c.tangents.items[(usize)v].add(arriving.multiply_scalar(1.0 if c.tangents.items[(usize)v].dot(arriving) >= 0.0 else -1.0))
+    # The section at a vertex lies along the edges running on there, so its
+    # contacts fall exactly on them (a periodic face's seam must stay its
+    # chart's): its plane's normal is the loop's way made square to them.
+    var runs = Growing[Vector3]()
+    defer runs.close()
+    for v in 0..<w.points.count:
+        if c.tangents.items[v].length() == 0.0: continue
+        runs.clear()
+        for g in 0..<w.edges.count:
+            let other = w.edges.items[g]
+            if c.side_of.items[g] >= 0 or (other.start != (i64)v and other.end != (i64)v): continue
+            var way = try w.leaving(g, 0 if other.start == (i64)v else 1)
+            for done in runs.view(): way = way.subtract(done.multiply_scalar(way.dot(done)))
+            if way.length() > 1e-9: try runs.push(try way.normalized())
+        var normal = c.tangents.items[v]
+        for way in runs.view(): normal = normal.subtract(way.multiply_scalar(normal.dot(way)))
+        if normal.length() <= 1e-9: return false
+        c.tangents.items[v] = try normal.normalized()
+    return true
+
+## Face `f`'s outward signed distance at `p` (a B-spline's along its
+## normal at the nearest point), its outward unit normal there, and that
+## nearest point.
+func face_distance(c: Curved*, f: usize, p: Vector3) -> (f64, Vector3, Vector3)!:
+    let field = &c.fields.items[f]
+    let s = field.s
+    let sign = 1.0 if c.w.faces.items[f].sense else -1.0
+    var d = 0.0
+    var n = Vector3()
+    if s.kind == surface_spline:
+        let (value, normal) = try implicit(field, p)
+        d = value
+        n = normal
+    else:
+        let q = p.subtract(s.origin)
+        if s.kind == surface_plane:
+            d = q.dot(s.z)
+            n = s.z
+        elif s.kind == surface_sphere:
+            d = q.length() - s.radius
+            n = try q.normalized()
+        else:
+            let h = q.dot(s.z)
+            let radial = q.subtract(s.z.multiply_scalar(h))
+            let length = radial.length()
+            if s.kind == surface_cylinder:
+                d = length - s.radius
+                n = try radial.normalized()
+            elif s.kind == surface_cone:
+                d = (length - (s.radius + h * math.tan(s.angle))) * math.cos(s.angle)
+                n = try normal_at(s, p, c.w.tolerance)
+            else:
+                let ring = s.origin.add(radial.multiply_scalar(s.radius / math.max(length, 1e-300)))
+                let offset = p.subtract(ring)
+                d = offset.length() - s.angle
+                n = try offset.normalized()
+    return (d * sign, n.multiply_scalar(sign), p.subtract(n.multiply_scalar(d)))
+
+## The section across side `side` at its carrier's parameter `t` (see
+## CurvedSection): an error when the ball no longer fits there.
+func section_on(c: Curved*, side: const CurvedSide*, t: f64) -> CurvedSection!:
+    let w = c.w
+    let edge = w.edges.items[side.edge]
+    let (e, d1, _) = try w.derivatives(edge.carrier, t)
+    var tangent = try d1.normalized()
+    # At a vertex: the loop's way there, shared by both strips.
+    if t == edge.t0 or t == edge.t1:
+        let shared = c.tangents.items[(usize)(edge.start if t == edge.t0 else edge.end)]
+        if shared.length() > 0.0: tangent = (try shared.normalized()).multiply_scalar(1.0 if shared.dot(tangent) >= 0.0 else -1.0)
+    let r = c.reach
+    # Each section searches B-splines afresh (sections far apart along the
+    # edge would mislead the last nearest point).
+    unseed(&c.fields.items[side.a])
+    unseed(&c.fields.items[side.b])
+    # Where the ball's center is: inside the material on a convex edge, in
+    # the air on a concave one.
+    let s = -1.0 if side.convex else 1.0
+    let (_, na, _) = try face_distance(c, side.a, e)
+    let (_, nb, _) = try face_distance(c, side.b, e)
+    var center = e.add(na.add(nb).multiply_scalar(s * r))
+    var rows: f64[9]
+    var values: f64[3]
+    for _ in 0..<60:
+        let (da, ga, _) = try face_distance(c, side.a, center)
+        let (db, gb, _) = try face_distance(c, side.b, center)
+        values[0] = da - s * r
+        values[1] = db - s * r
+        values[2] = center.subtract(e).dot(tangent)
+        let worst = math.max(math.abs(values[0]), math.max(math.abs(values[1]), math.abs(values[2])))
+        if worst <= w.tolerance * 0.01: break
+        rows[0] = ga.x
+        rows[1] = ga.y
+        rows[2] = ga.z
+        rows[3] = gb.x
+        rows[4] = gb.y
+        rows[5] = gb.z
+        rows[6] = tangent.x
+        rows[7] = tangent.y
+        rows[8] = tangent.z
+        if not solve_small(rows[..<9], values[..<3], 3): try too_tight(c)
+        center = center.subtract(Vector3(values[0], values[1], values[2]))
+    let (da, _, on_a) = try face_distance(c, side.a, center)
+    let (db, _, on_b) = try face_distance(c, side.b, center)
+    if math.abs(da - s * r) > w.tolerance or math.abs(db - s * r) > w.tolerance: try too_tight(c)
+    if not c.round:
+        # A chamfer: the points its size along each face, square to the
+        # edge, found from the ball's contacts (which face the right way).
+        let qa = try chamfer_point(c, side.a, e, tangent, on_a, r)
+        let qb = try chamfer_point(c, side.b, e, tangent, on_b, r)
+        # Its "center" mirrors the corner across the chamfer's middle, so
+        # that the strip faces away from it as a ball's does.
+        return CurvedSection(qa, e, qb, qa.add(qb).subtract(e), 1.0)
+    # The corner: where the contacts' tangents across the edge meet.
+    let (_, normal_a, _) = try face_distance(c, side.a, on_a)
+    let (_, normal_b, _) = try face_distance(c, side.b, on_b)
+    let way_a = tangent.cross(normal_a).multiply_scalar(1.0 if tangent.cross(normal_a).dot(e.subtract(on_a)) > 0.0 else -1.0)
+    let way_b = tangent.cross(normal_b).multiply_scalar(1.0 if tangent.cross(normal_b).dot(e.subtract(on_b)) > 0.0 else -1.0)
+    let corner = try lines_meet(on_a, way_a, on_b, way_b)
+    let angle = math.acos(math.clamp((try on_a.subtract(corner).normalized()).dot(try on_b.subtract(corner).normalized()), -1.0, 1.0))
+    return CurvedSection(on_a, corner, on_b, center, math.sin(angle * 0.5))
+
+## The point face `f` reaches `size` from edge point `e` in the plane square
+## to `tangent`, heading toward `toward` (the ball's contact there): Newton
+## on its distance, the plane and the length.
+func chamfer_point(c: Curved*, f: usize, e: Vector3, tangent: Vector3, toward: Vector3, size: f64) -> Vector3!:
+    var q = e.add((try toward.subtract(e).normalized()).multiply_scalar(size))
+    var rows: f64[9]
+    var values: f64[3]
+    for _ in 0..<60:
+        let (d, n, _) = try face_distance(c, f, q)
+        let offset = q.subtract(e)
+        values[0] = d
+        values[1] = offset.dot(tangent)
+        values[2] = (offset.dot(offset) - size * size) * 0.5
+        if math.max(math.abs(values[0]), math.max(math.abs(values[1]), math.abs(values[2]) / size)) <= c.w.tolerance * 0.01: return q
+        rows[0] = n.x
+        rows[1] = n.y
+        rows[2] = n.z
+        rows[3] = tangent.x
+        rows[4] = tangent.y
+        rows[5] = tangent.z
+        rows[6] = offset.x
+        rows[7] = offset.y
+        rows[8] = offset.z
+        if not solve_small(rows[..<9], values[..<3], 3): try too_tight(c)
+        q = q.subtract(Vector3(values[0], values[1], values[2]))
+    try too_tight(c)
+    return q
+
+## An error: the blend is too large for its curved faces.
+func too_tight(c: const Curved*) -> !:
+    var buffer: u8[256]
+    let text = try strings.format(buffer, f"a fillet radius of {rounded_text(c.reach)} is too large for these curved faces: the ball no longer touches both") if c.round else try strings.format(buffer, f"a chamfer of {rounded_text(c.reach)} is too large for these curved faces")
+    let owned = try interop.copy_text(text)
+    if let owner = owned.owner: _ = ownership.pool_object(owner)
+    error(invalid, owned.value)
+
+## Where the lines through `a` along `da` and `b` along `db` come closest
+## (the middle of their nearest points).
+func lines_meet(a: Vector3, da: Vector3, b: Vector3, db: Vector3) -> Vector3!:
+    let r = a.subtract(b)
+    let aa = da.dot(da)
+    let ab = da.dot(db)
+    let bb = db.dot(db)
+    let det = aa * bb - ab * ab
+    if det <= 1e-24 * aa * bb: error(invalid, "a blend's faces meet tangentially here: nothing to blend")
+    let s = (ab * db.dot(r) - bb * da.dot(r)) / det
+    let u = (aa * db.dot(r) - ab * da.dot(r)) / det
+    return a.add(da.multiply_scalar(s)).add(b.add(db.multiply_scalar(u))).multiply_scalar(0.5)
+
+## A section's rows of control points: a chamfer's two contacts; G1 the
+## contacts and the corner, the corner weighted (homogeneous) and its
+## weight as a last row; G2/G3 the fillet's B-spline (fillet_section).
+func curved_section_rows(c: const Curved*, s: CurvedSection, out: Growing[Vector3]*) -> !:
+    out.clear()
+    if not c.round:
+        try out.push(s.on_a)
+        try out.push(s.on_b)
+        return
+    if c.continuity == 1:
+        try out.push(s.on_a)
+        try out.push(s.corner.multiply_scalar(s.weight))
+        try out.push(s.on_b)
+        try out.push(Vector3(s.weight, 0.0, 0.0))
+        return
+    var knots = Growing[f64]()
+    defer knots.close()
+    try fillet_section(s.on_a, s.on_b, s.corner, c.continuity, out, &knots)
+
+## A side's rows as a row source.
+struct CurvedRows:
+    var c: Curved*
+    var side: const CurvedSide*
+
+func curved_rows_at(context: void*, t: f64, out: Growing[Vector3]*) -> !:
+    let rows = (CurvedRows*)context
+    try curved_section_rows(rows.c, try section_on(rows.c, rows.side, t), out)
+
+## The section's knots, weights (a G1 corner's left 1: its own row holds
+## it) and degree across the strip, for `count` points.
+func curved_section_knots(c: const Curved*, knots: Growing[f64]*) -> i64!:
+    knots.clear()
+    if not c.round:
+        let k: f64[4] = [0.0, 0.0, 1.0, 1.0]
+        try knots.assign(k[..<4])
+        return 1
+    if c.continuity == 1:
+        let k: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+        try knots.assign(k[..<6])
+        return 2
+    var points = Growing[Vector3]()
+    defer points.close()
+    try fillet_section(Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(), c.continuity, &points, knots)
+    return 5
+
+## Each vertex's contacts (from the first side there) and the edges
+## running on from it shortened to the contact on their face.
+func curved_contacts(c: Curved*) -> !:
+    let w = c.w
+    for k in 0..<c.sides.count:
+        let side = c.sides.items[k]
+        let edge = w.edges.items[side.edge]
+        for end in 0..<(usize)2:
+            let v = (usize)(edge.start if end == 0 else edge.end)
+            if c.on_a.items[v] >= 0: continue
+            let s = try section_on(c, &c.sides.items[k], edge.t0 if end == 0 else edge.t1)
+            c.on_a.items[v] = try c.out.add_point(s.on_a)
+            c.on_b.items[v] = try c.out.add_point(s.on_b)
+            for g in 0..<w.edges.count:
+                let other = w.edges.items[g]
+                if c.side_of.items[g] >= 0 or (other.start != (i64)v and other.end != (i64)v): continue
+                let fa = w.sides.items[g * 2]
+                let fb = w.sides.items[g * 2 + 1]
+                let on_a = fa == (i64)side.a or fb == (i64)side.a
+                try shorten(c, g, (i64)v, c.on_a.items[v] if on_a else c.on_b.items[v])
+
+## Edge `g` running on from vertex `v` cut back to point `point` (on it):
+## its carrier kept, and its other end (cut at its own vertex when both
+## its ends are a loop's: a seam from rim to rim).
+func shorten(c: Curved*, g: usize, v: i64, point: i64) -> !:
+    let w = c.w
+    let edge = w.edges.items[g]
+    let p = c.out.points.items[(usize)point]
+    let t = try nearest_on(w, edge.carrier, p, edge.t0, edge.t1)
+    let off = (try w.at(edge.carrier, t)).subtract(p).length()
+    # Start from the edge as it is so far (shortened at its other end).
+    let so_far = c.out.edges.items[(usize)c.shortened.items[g]] if c.shortened.items[g] >= 0 else edge
+    if off > w.tolerance * 100.0:
+        # A straight edge a hair off the section's plane (a traced edge's
+        # end tangent is near square to it): the line from the contact to
+        # its other end, still on its face (a ruling, the cut a chord of
+        # the hair).
+        if w.carriers.items[(usize)edge.carrier].kind != curve_line or off > c.reach * 1e-3: error(invalid, "a blend's contact falls off the edge running on from its corner")
+        let other_end = so_far.end if edge.start == v else so_far.start
+        let far = c.out.points.items[(usize)other_end]
+        let span = far.subtract(p)
+        let length = span.length()
+        let carrier = try c.out.add_carrier(Carrier(curve_line, p, span.multiply_scalar(1.0 / length), Vector3(), 0.0, 0.0, -1))
+        let line = ShapeEdge(carrier, 0.0, length, point, other_end) if edge.start == v else ShapeEdge(carrier, length, 0.0, other_end, point)
+        if c.shortened.items[g] >= 0: c.out.edges.items[(usize)c.shortened.items[g]] = line
+        else: c.shortened.items[g] = try c.out.add_edge(line)
+        return
+    var made = so_far
+    if edge.start == v:
+        made.t0 = t
+        made.start = point
+    else:
+        made.t1 = t
+        made.end = point
+    if math.abs(made.t1 - made.t0) <= 1e-12 * math.max(1.0, math.abs(edge.t1 - edge.t0)) or (made.t1 - made.t0) * (edge.t1 - edge.t0) < 0.0:
+        error(invalid, "a blend takes the whole edge running on from its corner")
+    if c.shortened.items[g] >= 0:
+        c.out.edges.items[(usize)c.shortened.items[g]] = made
+        return
+    c.shortened.items[g] = try c.out.add_edge(made)
+
+## Side `k`'s strip: its rows fitted along the edge, its contact edges the
+## first and last rows, its surface (a G1 strip's corner row divided by
+## its fitted weight).
+func curved_strip(c: Curved*, k: usize) -> !:
+    let w = c.w
+    let side = c.sides.items[k]
+    let edge = w.edges.items[side.edge]
+    let carrier = w.carriers.items[(usize)edge.carrier]
+    let low = math.min(edge.t0, edge.t1)
+    let high = math.max(edge.t0, edge.t1)
+    var probe = Growing[Vector3]()
+    defer probe.close()
+    try curved_section_rows(c, try section_on(c, &c.sides.items[k], low), &probe)
+    let rows = probe.count
+    var knots = Growing[f64]()
+    defer knots.close()
+    var p: usize = 5
+    if carrier.kind == curve_spline:
+        let (_, _, ck, cd) = w.spline_net(carrier.spline)
+        p = (usize)math.max((f64)cd, 3.0)
+        for _ in 0..<p + 1: try knots.push(low)
+        var at: usize = 0
+        while at < ck.length:
+            let value = ck[at]
+            var multiplicity: usize = 0
+            while at + multiplicity < ck.length and ck[at + multiplicity] == value: multiplicity += 1
+            at += multiplicity
+            if value <= low or value >= high: continue
+            for _ in 0..<(usize)math.min((f64)p, (f64)(multiplicity + p - (usize)cd)): try knots.push(value)
+        for _ in 0..<p + 1: try knots.push(high)
+    else:
+        for _ in 0..<p + 1: try knots.push(low)
+        for q in 1..<4: try knots.push(low + (high - low) * (f64)q / 4.0)
+        for _ in 0..<p + 1: try knots.push(high)
+    var context = CurvedRows(c, &c.sides.items[k])
+    var source = RowSource((void*)&context, curved_rows_at, low, high, w.tolerance)
+    var net = Growing[Vector3]()
+    defer net.close()
+    try fit_rows(&source, rows, p, &knots, &net)
+    let nv = knots.count - p - 1
+    # The surface's rows and weights; a G1 corner row is homogeneous.
+    var points = Growing[Vector3]()
+    defer points.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    let surface_rows = rows - 1 if c.round and c.continuity == 1 else rows
+    for i in 0..<surface_rows:
+        for j in 0..<nv:
+            var point = net.items[i * nv + j]
+            var weight = 1.0
+            if c.round and c.continuity == 1 and i == 1:
+                weight = net.items[3 * nv + j].x
+                point = point.multiply_scalar(1.0 / weight)
+            try points.push(point)
+            try weights.push(weight)
+    var ku = Growing[f64]()
+    defer ku.close()
+    let du = try curved_section_knots(c, &ku)
+    let forward = edge.t1 > edge.t0
+    let start_a = c.on_a.items[(usize)edge.start]
+    let end_a = c.on_a.items[(usize)edge.end]
+    let start_b = c.on_b.items[(usize)edge.start]
+    let end_b = c.on_b.items[(usize)edge.end]
+    var ones = Growing[f64]()
+    defer ones.close()
+    try ones.fill(nv, 1.0)
+    c.sides.items[k].outer = try curved_spline_edge(&c.out, start_a, end_a, net.view()[..<nv], ones.view(), knots.view(), (i64)p, forward)
+    let last = surface_rows - 1
+    c.sides.items[k].inner = try curved_spline_edge(&c.out, start_b, end_b, net.view()[last * nv..<(last + 1) * nv], ones.view(), knots.view(), (i64)p, forward)
+    try c.out.surfaces.push(try Surface(surface_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, points.view(), weights.view(), ku.view(), knots.view(), (i64)surface_rows, (i64)nv, du, (i64)p))
+    let surface = (i64)c.out.surfaces.count - 1
+    c.sides.items[k].surface = surface
+    # Outward at the middle: away from the ball's center on a convex edge.
+    let middle = try section_on(c, &c.sides.items[k], (low + high) * 0.5)
+    let surf = &c.out.surfaces.items[(usize)surface]
+    let u_mid = (surf.ku[(usize)surf.du] + surf.ku[(usize)surf.nu]) * 0.5
+    let v_mid = (surf.kv[(usize)surf.dv] + surf.kv[(usize)surf.nv]) * 0.5
+    let normal = try surface_normal_checked(surf.points, surf.weights, surf.nu, surf.nv, surf.du, surf.dv, surf.ku, surf.kv, u_mid, v_mid)
+    let at = middle.on_a.add(middle.on_b).multiply_scalar(0.5)
+    let outward = at.subtract(middle.center) if side.convex else middle.center.subtract(at)
+    c.sides.items[k].sense = normal.dot(outward) > 0.0
+
+## A B-spline edge of `s` over its whole domain from point `a` to `b`:
+## from its first control point to its last (`forward`), or back.
+func curved_spline_edge(s: Shape*, a: i64, b: i64, net: const Vector3[], weights: const f64[], knots: const f64[], degree: i64, forward: bool) -> i64!:
+    let index = try s.store_spline(net, weights, knots, degree, Matrix4())
+    let carrier = try s.add_carrier(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, index))
+    let low = knots[(usize)degree]
+    let high = knots[net.length]
+    return try s.add_edge(ShapeEdge(carrier, low if forward else high, high if forward else low, a, b))
+
+## Each vertex's section, from its contact on the first face to the
+## second's, shared by the strips meeting there.
+func curved_sections(c: Curved*) -> !:
+    let w = c.w
+    var rows = Growing[Vector3]()
+    defer rows.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    for k in 0..<c.sides.count:
+        let side = c.sides.items[k]
+        let edge = w.edges.items[side.edge]
+        for end in 0..<(usize)2:
+            let v = (usize)(edge.start if end == 0 else edge.end)
+            if c.sections.items[v] >= 0: continue
+            let s = try section_on(c, &c.sides.items[k], edge.t0 if end == 0 else edge.t1)
+            try curved_section_rows(c, s, &rows)
+            let degree = try curved_section_knots(c, &knots)
+            var weights = Growing[f64]()
+            defer weights.close()
+            if c.round and c.continuity == 1:
+                # The corner back from homogeneous, its weight its own.
+                rows.items[1] = s.corner
+                rows.count = 3
+                try weights.push(1.0)
+                try weights.push(s.weight)
+                try weights.push(1.0)
+            else:
+                try weights.fill(rows.count, 1.0)
+            c.sections.items[v] = try curved_spline_edge(&c.out, c.on_a.items[v], c.on_b.items[v], rows.view(), weights.view(), knots.view(), degree, true)
+
+## The result: the body's faces with each picked edge on its contact and
+## the edges running on from the loops' vertices shortened, then the
+## strips; turned to agree and checked closed.
+func curved_result(c: Curved*, tag: str) -> interop.Reference[CadModel]!:
+    let w = c.w
+    var faces = Growing[ShapeFace]()
+    errdefer faces.close()
+    var uses = Growing[i64]()
+    errdefer uses.close()
+    var sizes = Growing[i64]()
+    errdefer sizes.close()
+    for f in 0..<w.faces.count:
+        let face = w.faces.items[f]
+        let first = uses.count
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            var id = (i64)e
+            let k = c.side_of.items[e]
+            if k >= 0:
+                let side = c.sides.items[(usize)k]
+                id = side.outer if side.a == f else side.inner
+            elif c.shortened.items[e] >= 0:
+                id = c.shortened.items[e]
+            try uses.push((id + 1) if use > 0 else -(id + 1))
+        let loop_first = sizes.count
+        for size in w.face_sizes(f): try sizes.push(size)
+        try faces.push(ShapeFace(face.surface, face.sense, first, uses.count - first, loop_first, sizes.count - loop_first, face.name))
+    let fixed = faces.count
+    for side in c.sides.view():
+        let edge = w.edges.items[side.edge]
+        let first = uses.count
+        for at in [side.outer + 1, c.sections.items[(usize)edge.end] + 1, -(side.inner + 1), -(c.sections.items[(usize)edge.start] + 1)]: try uses.push(at)
+        try blend_name(w, side.edge, tag, &c.name)
+        try sizes.push(4)
+        try faces.push(ShapeFace(side.surface, side.sense, first, 4, sizes.count - 1, 1, try c.out.add_name((str)c.name.view())))
+    c.out.faces.close()
+    c.out.uses.close()
+    c.out.sizes.close()
+    c.out.faces = faces
+    c.out.uses = uses
+    c.out.sizes = sizes
+    # Moved into the shape: the locals start again empty.
+    faces = Growing[ShapeFace]()
+    uses = Growing[i64]()
+    sizes = Growing[i64]()
+    try orient(&c.out, fixed)
+    let solid = try used_brep(&c.out)
+    defer solid.release()
+    return try CadModel.of_brep(solid)

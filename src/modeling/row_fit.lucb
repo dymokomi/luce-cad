@@ -1,0 +1,182 @@
+## Fitting a blend's rows of control points along its edge: each row a
+## B-spline on the edge's parameter, sharing knots, least squares between
+## exact ends and end tangents, spans halved where a row strays from where
+## its source puts it by more than the tolerance (cap_rows.lucb's strips,
+## curved_blend.lucb's).
+
+## Where rows come from: every row's point at a parameter in [low, high]
+## (`rows_at` with `context`), and how close a fit must stay to them.
+struct RowSource:
+    var context: void*
+    var rows_at: func(void*, f64, Growing[Vector3]*) -> unit!
+    var low: f64
+    var high: f64
+    var tolerance: f64
+
+## `rows` rows from `source` fitted at degree `p` on `knots` (clamped on
+## the source's interval; spans are added where needed) onto `net`
+## (row-major): an error when no fit within the tolerance is found.
+func fit_rows(source: const RowSource*, rows: usize, p: usize, knots: Growing[f64]*, net: Growing[Vector3]*) -> !:
+    var marked = Growing[bool]()
+    defer marked.close()
+    for _ in 0..<12:
+        let m = knots.count - p - 1
+        marked.clear()
+        try marked.fill(knots.count, m < 6)
+        if m >= 6:
+            try fit_once(source, rows, p, knots.view(), net)
+            if not try mark_strays(source, rows, p, knots.view(), net.view(), &marked): break
+        # Each marked span halved.
+        var k = knots.count - 1
+        while k > 0:
+            k -= 1
+            if marked.items[k] and knots.items[k + 1] > knots.items[k]: try knots.insert(k + 1, (knots.items[k] + knots.items[k + 1]) * 0.5)
+        if knots.count > 4096: error(invalid, "a blend along this curved edge could not be fitted within the tolerance")
+    if net.count != (knots.count - p - 1) * rows: error(invalid, "a blend along this curved edge could not be fitted within the tolerance")
+
+## Every row's derivative by `t` at `t`, an end of the source's interval
+## (a difference into the interval: rows may change shape along it, and a
+## B-spline carrier ends there) onto `out`.
+func rows_turning(source: const RowSource*, t: f64, out: Growing[Vector3]*) -> !:
+    let low = source.low
+    let high = source.high
+    let h = (high - low) * 1e-6
+    let a = t if t + h <= high else t - h
+    var ahead = Growing[Vector3]()
+    defer ahead.close()
+    try source.rows_at(source.context, a + h, &ahead)
+    try source.rows_at(source.context, a, out)
+    for k in 0..<out.count: out.items[k] = ahead.items[k].subtract(out.items[k]).multiply_scalar(1.0 / h)
+
+## Samples per knot span when fitting a row of degree `p`.
+func samples_per_span(p: usize) -> usize:
+    return 2 * p + 2
+
+## One least-squares fit of each row (as fit_rows) on `knots`, onto
+## `net` (row-major): the normal equations factored once, solved per row.
+func fit_once(source: const RowSource*, rows: usize, p: usize, knots: const f64[], net: Growing[Vector3]*) -> !:
+    let m = knots.length - p - 1
+    let unknowns = m - 4
+    let low = knots[p]
+    let high = knots[m]
+    net.clear()
+    try net.fill(m * rows, Vector3())
+    # The fixed ends: each row's end points and the next ones in, along
+    # its end tangents.
+    var at_low = Growing[Vector3]()
+    defer at_low.close()
+    var at_high = Growing[Vector3]()
+    defer at_high.close()
+    var turning_low = Growing[Vector3]()
+    defer turning_low.close()
+    var turning_high = Growing[Vector3]()
+    defer turning_high.close()
+    try source.rows_at(source.context, low, &at_low)
+    try source.rows_at(source.context, high, &at_high)
+    try rows_turning(source, low, &turning_low)
+    try rows_turning(source, high, &turning_high)
+    for r in 0..<rows:
+        net.items[r * m] = at_low.items[r]
+        net.items[r * m + 1] = at_low.items[r].add(turning_low.items[r].multiply_scalar((knots[p + 1] - low) / (f64)p))
+        net.items[r * m + m - 1] = at_high.items[r]
+        net.items[r * m + m - 2] = at_high.items[r].subtract(turning_high.items[r].multiply_scalar((high - knots[m - 1]) / (f64)p))
+    var exact = Growing[Vector3]()
+    defer exact.close()
+    var matrix = Growing[f64]()
+    defer matrix.close()
+    try matrix.fill(unknowns * unknowns, 0.0)
+    var rhs = Growing[f64]()
+    defer rhs.close()
+    try rhs.fill(unknowns * rows * 3, 0.0)
+    var values: f64[9]
+    let per = samples_per_span(p)
+    for span in p..<m:
+        let k0 = knots[span]
+        let k1 = knots[span + 1]
+        if k1 <= k0: continue
+        for j in 0..<per:
+            let t = k0 + (k1 - k0) * ((f64)j + 0.5) / (f64)per
+            let first = nurbs_basis(knots, (i64)m, (i64)p, t, &values)
+            for i in 0..<p + 1:
+                let row = first + i
+                if row < 2 or row >= m - 2: continue
+                for k in 0..<p + 1:
+                    let column = first + k
+                    if column < 2 or column >= m - 2: continue
+                    matrix.items[(row - 2) * unknowns + column - 2] += values[i] * values[k]
+            try source.rows_at(source.context, t, &exact)
+            for r in 0..<rows:
+                var target = exact.items[r]
+                for k in 0..<p + 1:
+                    let column = first + k
+                    if column < 2 or column >= m - 2: target = target.subtract(net.items[r * m + column].multiply_scalar(values[k]))
+                for i in 0..<p + 1:
+                    let row = first + i
+                    if row < 2 or row >= m - 2: continue
+                    let at = (r * unknowns + row - 2) * 3
+                    rhs.items[at] += values[i] * target.x
+                    rhs.items[at + 1] += values[i] * target.y
+                    rhs.items[at + 2] += values[i] * target.z
+    try cholesky_factor(matrix.items[..<unknowns * unknowns], unknowns)
+    var column = Growing[f64]()
+    defer column.close()
+    try column.fill(unknowns, 0.0)
+    for r in 0..<rows:
+        for axis in 0..<(usize)3:
+            for i in 0..<unknowns: column.items[i] = rhs.items[(r * unknowns + i) * 3 + axis]
+            cholesky_apply(matrix.items[..<unknowns * unknowns], column.items[..<unknowns], unknowns)
+            for i in 0..<unknowns:
+                let q = net.items[r * m + i + 2]
+                net.items[r * m + i + 2] = Vector3(column.items[i] if axis == 0 else q.x, column.items[i] if axis == 1 else q.y, column.items[i] if axis == 2 else q.z)
+
+## Marks onto `marked` (by knot index) the spans where a fitted row
+## strays from its exact place by more than the tolerance; whether any.
+func mark_strays(source: const RowSource*, rows: usize, p: usize, knots: const f64[], net: const Vector3[], marked: Growing[bool]*) -> bool!:
+    let m = knots.length - p - 1
+    let per = samples_per_span(p)
+    var values: f64[9]
+    var any = false
+    var exact = Growing[Vector3]()
+    defer exact.close()
+    for span in p..<m:
+        let k0 = knots[span]
+        let k1 = knots[span + 1]
+        if k1 <= k0: continue
+        for j in 0..<per + 1:
+            let t = k0 + (k1 - k0) * (f64)j / (f64)per
+            let first = nurbs_basis(knots, (i64)m, (i64)p, math.min(t, knots[m] - (k1 - k0) * 1e-12), &values)
+            try source.rows_at(source.context, t, &exact)
+            for r in 0..<rows:
+                var fitted = Vector3()
+                for k in 0..<p + 1: fitted = fitted.add(net[r * m + first + k].multiply_scalar(values[k]))
+                if fitted.subtract(exact.items[r]).length() > source.tolerance:
+                    marked.items[span] = true
+                    any = true
+    return any
+
+## Symmetric positive definite `matrix` (n x n) factored in place, L Lᵀ
+## (L in the lower triangle).
+func cholesky_factor(matrix: f64[], n: usize) -> !:
+    for j in 0..<n:
+        var d = matrix[j * n + j]
+        for k in 0..<j: d -= matrix[j * n + k] * matrix[j * n + k]
+        if d <= 0.0: error(invalid, "a blend's fit along its edge is singular")
+        let diagonal = math.sqrt(d)
+        matrix[j * n + j] = diagonal
+        for i in j + 1..<n:
+            var s = matrix[i * n + j]
+            for k in 0..<j: s -= matrix[i * n + k] * matrix[j * n + k]
+            matrix[i * n + j] = s / diagonal
+
+## `rhs` solved in place against a factored `matrix` (cholesky_factor).
+func cholesky_apply(matrix: const f64[], rhs: f64[], n: usize):
+    for i in 0..<n:
+        var s = rhs[i]
+        for k in 0..<i: s -= matrix[i * n + k] * rhs[k]
+        rhs[i] = s / matrix[i * n + i]
+    var i = n
+    while i > 0:
+        i -= 1
+        var s = rhs[i]
+        for k in i + 1..<n: s -= matrix[k * n + i] * rhs[k]
+        rhs[i] = s / matrix[i * n + i]

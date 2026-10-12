@@ -63,15 +63,21 @@ func blendable(w: const Shape*, e: usize) -> bool!:
         _ = failure
         return false
     let capped = cap_candidate(w, e, fa, fb) or cap_candidate(w, e, fb, fa)
+    let curved = curved_pair(w, fa, fb)
     if kind == curve_spline or kind == curve_ellipse:
-        if not capped: return false
+        if not capped and not curved: return false
     elif kind == curve_circle:
-        if not is_rim(w, e, fa, fb): return false
-    elif not flat_pair(w, fa, fb) and ruled_pair(w, e, fa, fb) < 0 and not capped: return false
+        if not is_rim(w, e, fa, fb) and not curved: return false
+    elif not flat_pair(w, fa, fb) and ruled_pair(w, e, fa, fb) < 0 and not capped and not curved: return false
     let along = try along_edge(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     return ua.cross(ub).length() > 1e-9
+
+## Whether faces fa and fb are both curved (neither flat): their edges
+## are blended by a ball rolling between them (curved_blend.lucb).
+func curved_pair(w: const Shape*, fa: usize, fb: usize) -> bool:
+    return w.surfaces.items[(usize)w.faces.items[fa].surface].kind != surface_plane and w.surfaces.items[(usize)w.faces.items[fb].surface].kind != surface_plane
 
 func flat_pair(w: const Shape*, fa: usize, fb: usize) -> bool:
     return w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_plane and w.surfaces.items[(usize)w.faces.items[fb].surface].kind == surface_plane
@@ -128,7 +134,7 @@ func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize
     else:
         try resolve_edges(w, references, chosen)
         for e in chosen.view():
-            if not try blendable(w, e): error(invalid, "only straight edges between flat faces, rims (a circle or arc between a flat face and a cylinder about it), and edges round a flat face whose walls stand square to it can be blended yet")
+            if not try blendable(w, e): error(invalid, "only straight edges between flat faces, rims (a circle or arc between a flat face and a cylinder about it), edges round a flat face whose walls are ruled away from it, and loops between two curved faces can be blended yet")
         if chain: try tangent_chains(w, chosen)
     if chosen.count == 0: error(invalid, "the body has no edges to blend")
 
@@ -148,6 +154,9 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
         if let made = try cap_blend(w, chosen, size, round, continuity, tag): return made
     if round and direct:
         if let made = try local_blend(w, chosen, size, continuity, tag, patches): return made
+    # Loops between two curved faces: a ball rolling between them.
+    if direct:
+        if let made = try curved_blend(w, chosen, size, round, continuity, tag): return made
     # The booleans' tools follow lines and rims only.
     for e in chosen:
         let kind = w.carriers.items[(usize)w.edges.items[e].carrier].kind
