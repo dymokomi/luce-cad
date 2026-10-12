@@ -1,7 +1,10 @@
-## Three G2 or G3 fillets meeting at a corner of three flat faces. No ball
-## is tangent to such fillets: their sections are not circles. So, as
+## Three G2 or G3 fillets meeting at a corner of three flat faces, or three
+## G1 fillets when Fusion's Setback corner type is asked for. No ball is
+## tangent to G2 and G3 fillets: their sections are not circles. So, as
 ## Fusion and SolidWorks do, each fillet stops short of the corner, at its
-## setback: a plane square to its edge. The hole between the fillets' end
+## setback: a plane square to its edge. A G1 corner's A curves are the
+## circles' arcs raised to degree 5, rational: the patch is fitted in
+## homogeneous space (patch_fit.lucb). The hole between the fillets' end
 ## sections and the faces is filled by a patch with the fillets'
 ## continuity (patch_fit.lucb). The corner tool is the region between the
 ## sharp corner and the patch, cut off by the setback planes. It is taken
@@ -100,12 +103,14 @@ func contacts_cross(p: Vector3, way_a: Vector3, into_a: Vector3, reach_a: f64, w
 func setback_tool(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, name: str) -> interop.Reference[CadModel]!:
     var quads = Growing[Vector3]()
     defer quads.close()
+    var quad_weights = Growing[f64]()
+    defer quad_weights.close()
     var quad_knots = Growing[f64]()
     defer quad_knots.close()
-    try setback_patch(w, corner, radius, continuity, &quads, &quad_knots)
+    try setback_patch(w, corner, radius, continuity, &quads, &quad_weights, &quad_knots)
     let p = w.points.items[(usize)corner.vertex]
     let cone = try corner_cone(w, corner, radius)
-    return try corner_solid(p, corner, quads.view(), cone[..<3], quad_knots.view(), quad_knots.count - 6, name)
+    return try corner_solid(p, corner, quads.view(), quad_weights.view(), cone[..<3], quad_knots.view(), quad_knots.count - 6, name)
 
 ## Each face's outward normal at a setback corner, turned to face away
 ## from the corner's inside (along the edge not on the face).
@@ -118,10 +123,10 @@ func corner_cone(w: const Shape*, corner: const Setback*, radius: f64) -> Vector
     return cone
 
 ## A setback corner's patch for fillets of `radius` and `continuity`: six
-## quads onto `quads` (patch_fit.lucb's order), their knots onto
-## `quad_knots`. Its control points must stay between the faces and the
+## quads onto `quads` (patch_fit.lucb's order), their weights onto
+## `quad_weights` (1 but at a G1 corner), their knots onto `quad_knots`. Its control points must stay between the faces and the
 ## setback planes (so it meets the body only along curves both carry).
-func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, quads: Growing[Vector3]*, quad_knots: Growing[f64]*) -> !:
+func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, quads: Growing[Vector3]*, quad_weights: Growing[f64]*, quad_knots: Growing[f64]*) -> !:
     let frame = try setback_frame(w, corner, radius)
     let reaches = frame.reaches
     let intos = frame.intos
@@ -133,35 +138,45 @@ func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continu
     # the fillet's section (fillet_section), so they share knots.
     var curves = Growing[Vector3]()
     defer curves.close()
+    var weights = Growing[f64]()
+    defer weights.close()
     var knots = Growing[f64]()
     defer knots.close()
     var sides = Growing[HoleSide]()
     defer sides.close()
+    # G1: the B curves on the faces are G2's sections (any smooth curve
+    # from contact to contact serves); the A curves the circles' arcs.
+    let face_continuity = 2 if continuity == 1 else continuity
     for i in 0..<(usize)3:
         let next = (i + 1) % 3
         let foot = p.add(corner.ways[i].multiply_scalar(corner.distances[i]))
         let ta = foot.add(intos[i * 2].multiply_scalar(reaches[i]))
         let tb = foot.add(intos[i * 2 + 1].multiply_scalar(reaches[i]))
         knots.clear()
-        try fillet_section(ta, tb, foot, continuity, &curves, &knots)
+        if continuity == 1:
+            try arc_section(ta, tb, foot, &curves, &weights, &knots)
+        else:
+            try fillet_section(ta, tb, foot, continuity, &curves, &knots)
+            while weights.count < curves.count: try weights.push(1.0)
         try sides.push(HoleSide(true, corner.ways[i]))
         let cross = try contacts_cross(p, corner.ways[i], intos[i * 2 + 1], reaches[i], corner.ways[next], intos[next * 2], reaches[next])
         let foot_next = p.add(corner.ways[next].multiply_scalar(corner.distances[next]))
         let tc = foot_next.add(intos[next * 2].multiply_scalar(reaches[next]))
         knots.clear()
-        try fillet_section(tb, tc, cross, continuity, &curves, &knots)
+        try fillet_section(tb, tc, cross, face_continuity, &curves, &knots)
+        while weights.count < curves.count: try weights.push(1.0)
         try sides.push(HoleSide(false, face_outward(w, faces[i])))
-    try corner_patch(curves.view(), knots.view(), sides.view(), continuity, quads, quad_knots)
+    try corner_patch(curves.view(), weights.view(), knots.view(), sides.view(), continuity, quads, quad_weights, quad_knots)
     let slack = radius * 1e-9
     let cone = try corner_cone(w, corner, radius)
     for q in quads.view():
         for i in 0..<(usize)3:
             if q.subtract(p).dot(cone[i]) < -slack or q.subtract(p).dot(corner.ways[i]) > corner.distances[i] + slack:
-                error(invalid, "the G2 corner patch would leave its corner: use G1 there")
+                error(invalid, "the corner patch would leave its corner: use a rolling ball (G1) there")
 
 ## The corner tool's B-rep: the six quads, a cap on each setback plane and
 ## a piece of each face, between corner `p` and the patch.
-func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], cone: const Vector3[], knots: const f64[], m: usize, name: str) -> interop.Reference[CadModel]!:
+func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], quad_weights: const f64[], cone: const Vector3[], knots: const f64[], m: usize, name: str) -> interop.Reference[CadModel]!:
     let size = (quads[0].subtract(p)).length() * 4.0
     let solid = try BrepModel.sized(size)
     defer solid.release()
@@ -193,25 +208,33 @@ func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], co
     while k_ > 0:
         k_ -= 1
         try reversed.push(1.0 - knots[k_])
-    var weights = Growing[f64]()
-    defer weights.close()
-    try weights.fill(mm, 1.0)
     var net = Growing[Vector3]()
     defer net.close()
+    var net_weights = Growing[f64]()
+    defer net_weights.close()
     var firsts: i64[6] = [0, 0, 0, 0, 0, 0]
     var seconds: i64[6] = [0, 0, 0, 0, 0, 0]
     var seams: i64[6] = [0, 0, 0, 0, 0, 0]
     for k in 0..<(usize)6:
         let next = (k + 1) % 6
         net.clear()
-        for a in 0..<m: try net.push(quads[k * mm + a * m])
-        firsts[k] = try b.add_spline_edge(corners[k], middles[k], net.view(), weights.view()[..<m], 5, knots, true)
+        net_weights.clear()
+        for a in 0..<m:
+            try net.push(quads[k * mm + a * m])
+            try net_weights.push(quad_weights[k * mm + a * m])
+        firsts[k] = try b.add_spline_edge(corners[k], middles[k], net.view(), net_weights.view(), 5, knots, true)
         net.clear()
-        for b_ in 0..<m: try net.push(quads[next * mm + m - 1 - b_])
-        seconds[k] = try b.add_spline_edge(middles[k], corners[next], net.view(), weights.view()[..<m], 5, reversed.view(), true)
+        net_weights.clear()
+        for b_ in 0..<m:
+            try net.push(quads[next * mm + m - 1 - b_])
+            try net_weights.push(quad_weights[next * mm + m - 1 - b_])
+        seconds[k] = try b.add_spline_edge(middles[k], corners[next], net.view(), net_weights.view(), 5, reversed.view(), true)
         net.clear()
-        for b_ in 0..<m: try net.push(quads[k * mm + (m - 1) * m + b_])
-        seams[k] = try b.add_spline_edge(middles[k], center, net.view(), weights.view()[..<m], 5, knots, true)
+        net_weights.clear()
+        for b_ in 0..<m:
+            try net.push(quads[k * mm + (m - 1) * m + b_])
+            try net_weights.push(quad_weights[k * mm + (m - 1) * m + b_])
+        seams[k] = try b.add_spline_edge(middles[k], center, net.view(), net_weights.view(), 5, knots, true)
     # The quads: outward (away from the corner) is du x dv or against it.
     var bu: f64[36]
     var bv: f64[36]
@@ -229,7 +252,7 @@ func corner_solid(p: Vector3, corner: const Setback*, quads: const Vector3[], co
                 du = du.add(q.multiply_scalar(bu[9 + a] * bv[b_]))
                 dv = dv.add(q.multiply_scalar(bu[a] * bv[9 + b_]))
                 at = at.add(q.multiply_scalar(bu[a] * bv[b_]))
-        let surface = try b.add_spline_surface(quads[k * mm..<(k + 1) * mm], weights.view(), (i64)m, (i64)m, 5, 5, knots, knots)
+        let surface = try b.add_spline_surface(quads[k * mm..<(k + 1) * mm], quad_weights[k * mm..<(k + 1) * mm], (i64)m, (i64)m, 5, 5, knots, knots)
         let outward = du.cross(dv).dot(at.subtract(p)) > 0.0
         let forward: i64[4] = [firsts[k] + 1, seams[k] + 1, -(seams[before] + 1), seconds[before] + 1]
         let backward: i64[4] = [-(seconds[before] + 1), seams[before] + 1, -(seams[k] + 1), -(firsts[k] + 1)]
@@ -274,3 +297,31 @@ func flat_face(b: BrepModel*, origin: Vector3, normal: Vector3, uses: const i64[
     let plane = try b.add_surface(0, origin, normal, try across(normal))
     let sizes: i64[1] = [(i64)uses.length]
     _ = try b.add_face(plane, loop.view(), sizes[..<1])
+
+## The circle's arc from `ta` to `tb` whose tangents meet at `p` (a G1
+## fillet's section), raised from a rational quadratic (middle weight
+## sin(θ/2) for legs θ apart) to degree 5, one span: its points onto
+## `points`, their weights onto `weights`, its knots onto `knots`.
+func arc_section(ta: Vector3, tb: Vector3, p: Vector3, points: Growing[Vector3]*, weights: Growing[f64]*, knots: Growing[f64]*) -> !:
+    let la = try ta.subtract(p).normalized()
+    let lb = try tb.subtract(p).normalized()
+    let middle = math.sin(math.acos(math.clamp(la.dot(lb), -1.0, 1.0)) * 0.5)
+    let arc_points: Vector3[3] = [ta, p.multiply_scalar(middle), tb]
+    let arc_weights: f64[3] = [1.0, middle, 1.0]
+    # Degree elevation by three in homogeneous space:
+    # H5_j = sum C(2, i) C(3, j - i) / C(5, j) H2_i.
+    let c2: f64[3] = [1.0, 2.0, 1.0]
+    let c3: f64[4] = [1.0, 3.0, 3.0, 1.0]
+    let c5: f64[6] = [1.0, 5.0, 10.0, 10.0, 5.0, 1.0]
+    for j in 0..<(usize)6:
+        var h = Vector3()
+        var weight = 0.0
+        for i in 0..<(usize)3:
+            if j < i or j - i > 3: continue
+            let f = c2[i] * c3[j - i] / c5[j]
+            h = h.add(arc_points[i].multiply_scalar(f))
+            weight += arc_weights[i] * f
+        try points.push(h.multiply_scalar(1.0 / weight))
+        try weights.push(weight)
+    for _ in 0..<(usize)6: try knots.push(0.0)
+    for _ in 0..<(usize)6: try knots.push(1.0)

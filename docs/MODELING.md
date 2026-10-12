@@ -39,7 +39,7 @@ does today.
 | `chord_radius(model, references, chord, chain)` | Fusion's Chord Length: the radius whose fillets leave the faces `chord` apart. |
 | `full_round(model, center, tag, continuity, side1, side2)` | Fusion's Full Round Fillet: the flat center face rounded away whole, tangent to it and its sides. |
 | `variable_filleted(model, reference, positions, radii, tag, smooth)` | Fusion's Variable radius: one straight edge between flat faces, radii at positions 0 to 1 along it, smooth or straight between. |
-| `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |
+| `filleted(model, references, radius, tag, continuity, chain, setback)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`); with `setback`, Fusion's Setback corner type for G1 corners too. |
 | `rule_edges(model, rounds, fillets, faces, others)` | Fusion's Rule Fillet (`rules.lucb`): references to the blendable edges a rule takes, convex ones (rounds), concave ones (fillets) or both; with `faces` named, only edges on those faces, and with `others` too, only edges between the two sets. Made again on every cook, the edges follow the body. |
 | `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Every edge Equal distance takes (loops round a flat face, rims, curved faces, inside edges); each distance runs straight from the edge to the chamfer's contact in the plane square to the edge (`chamfers.lucb`). |
 | `edge_references(model, edges)` | References to edges, given by their B-rep numbers (what a viewport pick gives). |
@@ -480,6 +480,16 @@ setbacks, and added at an inside corner. Its patch's control points stay between
 setback planes, which is checked. So it meets the body only along curves both carry: a B-spline
 whose control points a plane keeps apart from the other surface (kept_apart) adds no curves.
 
+**G1 setback corners** (Fusion's Corner type Setback for tangent fillets): the same corner, its
+A curves the fillets' circular arcs raised to degree 5 (rational: `arc_section`, the quadratic's
+weights elevated in homogeneous space), and the edges' tools then take that same rational arc as
+their section (`g1_spline`) so their ends are the curves the patch meets. The patch is fitted in
+homogeneous space (`patch_fit.lucb`): the weights first, as a field of their own under the same
+seam and fairness rows, fixed on the sides and along the sweeps; then the weighted points, a
+plane's rule holding n·X = h·w at each point's weight. The seams' G1 rows hold in every
+homogeneous coordinate, so they hold for the rational quads. One row beyond each side (G1). The
+direct build rounds G1 corners with balls, so G1 setbacks go to the booleans.
+
 **Too large.** Before any tool, each edge's blend must fit:
 - **Its faces:** samples along the edge step into each face by the contact distance, and must stay
   on it.
@@ -917,8 +927,7 @@ Not yet: ellipses, splines, slots and text; curvature (G2) constraints; Blend Cu
 
 Roughly in order of usefulness:
 
-1. **Fillet corners beyond three edges,** and G1 setback corners (the patch with one row, made
-   rational to meet the circular strips exactly).
+1. **Fillet corners beyond three edges.**
 2. **Variable radius fillets** beyond one straight edge between flat faces with square ends
    (chains, curved faces, edges meeting other fillets at corners), and G2/G3 variable radii.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from

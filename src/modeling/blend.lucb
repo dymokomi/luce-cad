@@ -116,13 +116,13 @@ func convex(w: const Shape*, e: usize) -> bool!:
 ## earlier fillet.
 ## `direct` false skips the direct build (local_blend.lucb), for tests
 ## that compare it with the booleans.
-pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true, direct: bool = true, corner_type: i64 = 1) -> interop.Reference[CadModel]!:
+pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true, direct: bool = true, corner_type: i64 = 1, setback: bool = false) -> interop.Reference[CadModel]!:
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
     defer chosen.close()
     try choose_edges(&w, references, chain, &chosen)
-    return try blend_chosen(model, &w, chosen.view(), trimmed(references) == "", size, round, tag, continuity, direct, none, none, corner_type)
+    return try blend_chosen(model, &w, chosen.view(), trimmed(references) == "", size, round, tag, continuity, direct, none, none, corner_type, setback)
 
 ## The edges of `w` that `references` names onto `chosen` (empty: every
 ## straight convex edge between flat faces; rims and inside corners only
@@ -143,8 +143,10 @@ func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize
 ## setback corners' patches between sizes (FilletPlan), when given. A
 ## chamfer's `sides` (chamfers.lucb) give it two legs; none: Equal distance.
 ## A chamfer's `corner_type` is Fusion's Corner Type where three chamfers meet
-## (chamfer_corners.lucb: corner_chamfer, corner_miter, corner_blend).
-func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1) -> interop.Reference[CadModel]!:
+## (chamfer_corners.lucb: corner_chamfer, corner_miter, corner_blend); a
+## fillet's `setback` is Fusion's Setback corner type, which G1 fillets
+## take only when asked (G2 and G3 corners are always setbacks).
+func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1, setback: bool = false) -> interop.Reference[CadModel]!:
     if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     # Each edge's blend must fit its faces: said precisely, before any tool.
@@ -157,7 +159,9 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
     # booleans below make.
     if direct:
         if let made = try cap_blend(w, chosen, size, round, continuity, tag, sides): return made
-    if round and direct:
+    # (G1 setback corners are the booleans'; the direct build rounds G1
+    # corners with balls.)
+    if round and direct and not (setback and continuity == 1):
         if let made = try local_blend(w, chosen, size, continuity, tag, patches): return made
     # Loops between two curved faces: a ball rolling between them.
     if direct:
@@ -189,7 +193,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             try references_of(w, second.view(), &text)
             return try blended(earlier.value(), (str)text.view(), size, round, tag, continuity, true, direct)
     # Every edge of a convex polyhedron rounded: built whole.
-    if round and every and continuity == 1:
+    if round and every and continuity == 1 and not setback:
         if let whole = try rounded_polyhedron(w, size, tag): return whole
     # Where three fillets meet, a ball rounds the corner.
     var balls = Growing[Ball]()
@@ -200,7 +204,10 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
     # Where chained edges meet tangentially, their tools end square.
     var joints = Growing[i64]()
     defer joints.close()
-    try fillet_corners(w, chosen, size, continuity, round, &balls, &setbacks, &joints)
+    try fillet_corners(w, chosen, size, continuity, round, &balls, &setbacks, &joints, setback)
+    # G1 setback corners: the edges' sections the circle's arc as a
+    # B-spline, so their ends are the curves the corner's patch meets.
+    let tool_continuity = g1_spline if round and continuity == 1 and setbacks.count > 0 else continuity
     # Chamfers meeting three at a corner with a Blend corner stop short of
     # it, at setbacks, as setback fillets do.
     var blends = Growing[Setback]()
@@ -249,7 +256,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             let edge = w.edges.items[e]
             let at_start = vertex_in(joints.view(), edge.start)
             let at_end = vertex_in(joints.view(), edge.end)
-            try tools.push(try edge_tool(w, e, leg_a, round, continuity, low, high, at_start, at_end, &body, (str)name.view(), leg_b))
+            try tools.push(try edge_tool(w, e, leg_a, round, tool_continuity, low, high, at_start, at_end, &body, (str)name.view(), leg_b))
             try adds.push(adding)
             continue
         let (fa, fb) = try edge_faces(w, e)
@@ -304,8 +311,8 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             let corner = w.points.items[(usize)v]
             if corner.subtract(low).length() <= w.tolerance * 10.0: exact_low = true
             elif corner.subtract(high).length() <= w.tolerance * 10.0: exact_high = true
-        if adding: try tools.push(try concave_tool(w, e, leg_a, round, continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b))
-        else: try tools.push(try edge_tool(w, e, leg_a, round, continuity, low, high, exact_low, exact_high, &body, (str)name.view(), leg_b))
+        if adding: try tools.push(try concave_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b))
+        else: try tools.push(try edge_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, &body, (str)name.view(), leg_b))
         try adds.push(adding)
     for ball in balls.view():
         try corner_name(w, (usize)ball.vertex, tag, &name)
