@@ -1,0 +1,82 @@
+## Fusion's Tangency weight (0.1 to 2, 1 the default) on G1, G2 and G3
+## fillets: a 20-box's edge filleted 4 keeps more of the corner as the
+## weight grows (the section drawn toward the corner) and less as it falls,
+## at every continuity; 1 is exactly the plain fillet (G1 the circle:
+## 8000 - 20 × 16 (1 - π/4)). Three edges at a corner close with weights
+## (G1's corner a setback, a conic having no ball); a box's top loop round
+## G2 uprights (the cap path) and an edge alone (the direct path) take it;
+## a weight outside 0.1 to 2 is refused.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+## The ids of `model`'s edges whose ends `keep` takes.
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return found
+
+func top_front(a: Vector3, b: Vector3) -> bool:
+    return a.y > 9.99 and b.y > 9.99 and a.z > 9.99 and b.z > 9.99
+
+func at_corner(a: Vector3, b: Vector3) -> bool:
+    let corner = Vector3(10.0, 10.0, 10.0)
+    return a.subtract(corner).length() < 1e-9 or b.subtract(corner).length() < 1e-9
+
+func upright(a: Vector3, b: Vector3) -> bool:
+    return math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9
+
+func top_ring(a: Vector3, b: Vector3) -> bool:
+    return a.y > 9.99 and b.y > 9.99
+
+func solid_volume(model: CadModel) -> float!:
+    let mesh = model.tessellate(32)
+    closed(mesh)
+    return volume(mesh)
+
+pub func tangency_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "box")
+    let edge = CadModeling.edge_references(box, edges_where(box, top_front))
+    for continuity in [1, 2, 3]:
+        let plain = CadModeling.filleted(box, edge, 4.0, "f", continuity)
+        let v_plain = solid_volume(plain)
+        let same = CadModeling.filleted(box, edge, 4.0, "f", continuity, tangency = 1.0)
+        assert(math.abs(solid_volume(same) - v_plain) < 1e-9 and same.face_count() == plain.face_count())
+        if continuity == 1:
+            assert(math.abs(v_plain - (8000.0 - 320.0 * (1.0 - math.pi / 4.0))) < 0.05, f"{v_plain}")
+        var previous = 0.0
+        for weight in [0.1, 0.5, 1.0, 1.5, 2.0]:
+            let made = CadModeling.filleted(box, edge, 4.0, "f", continuity, tangency = weight)
+
+            let v = solid_volume(made)
+            print(f"G{continuity} tangency {weight}: {v}")
+            assert(v > previous, f"G{continuity}: the volume grows with the weight")
+            assert(v > 8000.0 - 320.0 and v < 8000.0)
+            previous = v
+    # Three edges at a corner: closed with a weight at G1 (a setback
+    # corner) and G2.
+    let corner = CadModeling.edge_references(box, edges_where(box, at_corner))
+    let g1 = CadModeling.filleted(box, corner, 3.0, "f", 1, tangency = 1.5)
+    let g1_plain = CadModeling.filleted(box, corner, 3.0, "f", 1, setback = true)
+    assert(solid_volume(g1) > solid_volume(g1_plain))
+    let g2 = CadModeling.filleted(box, corner, 3.0, "f", 2, tangency = 0.5)
+    assert(solid_volume(g2) < solid_volume(CadModeling.filleted(box, corner, 3.0, "f", 2)))
+    # The cap path: the top loop round G2 uprights.
+    let rounded = CadModeling.filleted(box, CadModeling.edge_references(box, edges_where(box, upright)), 3.0, "u", 2)
+    let loop = CadModeling.edge_references(rounded, [edges_where(rounded, top_ring)[0]])
+    let looped = solid_volume(CadModeling.filleted(rounded, loop, 2.0, "f", 2))
+    let drawn = solid_volume(CadModeling.filleted(rounded, loop, 2.0, "f", 2, tangency = 2.0))
+    assert(drawn > looped)
+    # Outside 0.1 to 2: said.
+    var said = ""
+    _ = CadModeling.filleted(box, edge, 4.0, "f", 2, tangency = 3.0) catch failure:
+        said = failure.message
+    assert(said.contains("tangency"), said)
+    print("PASS tangency weight: a box edge's fillet keeps more of the corner as the weight grows from 0.1 to 2 at G1, G2 and G3, 1 the plain fillet exactly (G1 the circle); three edges at a corner with weights at G1 (a setback) and G2; the top loop round G2 uprights; a weight of 3 refused")

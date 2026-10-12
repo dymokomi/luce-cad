@@ -1,0 +1,64 @@
+## Chamfers of rims between a flat face and a sphere about the rim's axis
+## (a dome's edge, a ball cut flat): their tools' sections (rim_tool,
+## blend_tools.lucb, turns them about the axis). The meridian is a circle,
+## not a line, so the chamfer runs its distance along the flat face and its
+## distance straight from the edge to the sphere, a chord, as every
+## chamfer's distance on a curved face (chamfers.lucb). Fusion 2705's is
+## the same: a dome of 10 chamfered 3 meets its sphere on the circle of
+## 9.55, 2.96606 from the rim's plane (fusion_probe_tests). The section
+## closes back over the sphere's tangents at the edge and at the chamfer's
+## contact, so the sphere's sliver beyond the chord goes too. Fillets there
+## (a torus touching the sphere) are not built yet.
+
+## The sphere a rim of edge `e` (between faces `fa` and `fb`) lies on: its
+## face's surface index, or -1 when neither face is a sphere about the
+## rim's axis with the other flat across it.
+func sphere_rim(w: const Shape*, e: usize, fa: usize, fb: usize) -> i64:
+    let c = w.carriers.items[(usize)w.edges.items[e].carrier]
+    if c.kind != curve_circle: return -1
+    let axis = c.x.cross(c.y)
+    let sa = w.surfaces.items[(usize)w.faces.items[fa].surface]
+    let sb = w.surfaces.items[(usize)w.faces.items[fb].surface]
+    var ball: usize = fb
+    var flat = sa
+    if sa.kind == surface_sphere and sb.kind == surface_plane:
+        ball = fa
+        flat = sb
+    elif not (sb.kind == surface_sphere and sa.kind == surface_plane): return -1
+    if math.abs(math.abs(flat.z.dot(axis)) - 1.0) > 1e-9: return -1
+    let s = w.surfaces.items[(usize)w.faces.items[ball].surface]
+    let offset = s.origin.subtract(c.origin)
+    if offset.subtract(axis.multiply_scalar(offset.dot(axis))).length() > c.a * 1e-6: return -1
+    return (i64)ball
+
+## The section of a convex sphere rim's tool at `p` (on the rim, which runs
+## `along`): `ua` into the flat face, `ub` into the sphere (its tangent),
+## `center` and `radius` the sphere's; the chamfer `size` along the flat
+## face and `chord` straight to the sphere.
+func sphere_chamfer_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, center: Vector3, radius: f64, size: f64, chord: f64) -> Profiles!:
+    let ta = p.add(ua.multiply_scalar(size))
+    # The sphere's point `chord` straight from p, toward the material.
+    if chord >= radius * 2.0: error(invalid, "a chamfer this large passes the sphere's far side")
+    let to_center = center.subtract(p)
+    let d = to_center.length()
+    let along_center = chord * chord / (2.0 * d)
+    let side = math.sqrt(math.max(0.0, chord * chord - along_center * along_center))
+    let to_ball = to_center.multiply_scalar(1.0 / d)
+    let sideways = try ub.subtract(to_ball.multiply_scalar(ub.dot(to_ball))).normalized()
+    let tb = p.add(to_ball.multiply_scalar(along_center)).add(sideways.multiply_scalar(side))
+    # The sphere's tangents at p (along ub) and at tb meet at the corner
+    # beyond its sliver.
+    let normal_b = tb.subtract(center)
+    let t = tb.subtract(p).dot(normal_b) / ub.dot(normal_b)
+    let beyond = p.add(ub.multiply_scalar(t))
+    var profile = Profiles(p, along, ua, along.cross(ua), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+                           Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+    errdefer profile.close()
+    try profile.loop_offsets.push(0)
+    try profile.edges.push(line_edge(p, ta))
+    try profile.edges.push(line_edge(ta, tb))
+    try profile.edges.push(line_edge(tb, beyond))
+    try profile.edges.push(line_edge(beyond, p))
+    try profile.loop_offsets.push(profile.edges.count)
+    try single_region(&profile)
+    return profile

@@ -1,0 +1,127 @@
+## Cases run in Fusion 2705 itself (the probe of 2026-10-12) and here:
+## - A chamfer's distance on a curved face is a chord: a dome (a ball of 10
+##   cut at its middle) chamfered 3 at its rim has its sphere-side circle
+##   r 9.55 at 2.96606 above the rim's plane (3 straight from the rim, as
+##   Fusion's) and its plane-side circle r 7. Fusion's volume, 1833.0211,
+##   is what the chord gives (Pappus); the arc's would differ. A fillet
+##   there is refused (not built yet).
+## - A fillet's open end where the face going on does not turn away (a
+##   stadium plate, one arc's top edge alone, r 3): Fusion fails there
+##   (ASM_BL_END_TOO_CMPLX) at G1 and G2; here it ends flat (a deliberate
+##   superset), the half turn of the section taken exactly (Pappus) at G1,
+##   less at G2.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_cad.sketch import CadSketch
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+pub func fusion_probe_tests() -> unit!:
+    dome_chord()
+    open_end()
+    print("PASS Fusion probe cases: a dome's rim chamfered 3 (Fusion's circles r 9.55 at 2.96606 and r 7, its volume 1833.0211 by the chord), a fillet there refused; a stadium arc's top edge filleted alone at G1 and G2, ending flat where Fusion fails")
+
+## The ids of `model`'s edges whose start and middle `keep` takes.
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 0.5)) and not (id in found):
+                found.append(id)
+    return found
+
+## Whether some edge of `model` is a circle of `radius` about the y axis at
+## height `y` (its start, middle and end on it).
+func has_circle(model: CadModel, radius: float, y: float) -> bool!:
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            var on = true
+            for t in [0.0, 0.5, 1.0]:
+                let p = model.face_edge_point(face, use, t)
+                on = on and math.abs(p.y - y) < 1e-5 and math.abs(math.hypot(p.x, p.z) - radius) < 1e-5
+            if on: return true
+    return false
+
+func rim(a: Vector3, b: Vector3) -> bool:
+    return math.abs(a.y) < 1e-9 and math.abs(b.y) < 1e-9 and math.abs(math.hypot(a.x, a.z) - 10.0) < 1e-6
+
+func dome_chord() -> unit!:
+    let ball = CadModeling.tagged(CadSolids.sphere(10.0), "ball")
+    let below = CadModeling.tagged(CadSolids.box(30.0, 30.0, 30.0), "cut").transformed(Vector3(0.0, -15.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let dome = CadModeling.combined(ball, below, 1)
+    let edges = edges_where(dome, rim)
+    assert(edges.length > 0)
+    let made = CadModeling.chamfered(dome, CadModeling.edge_references(dome, edges), 3.0, "c")
+    let mesh = made.tessellate(64)
+    closed(mesh)
+    # The sphere-side contact: 3 straight from the rim (10, 0).
+    let x = (100.0 + 100.0 - 9.0) / 20.0
+    let h = math.sqrt(100.0 - x * x)
+    assert(math.abs(x - 9.55) < 1e-12 and math.abs(h - 2.96606) < 1e-5)
+    assert(has_circle(made, 9.55, h) and has_circle(made, 7.0, 0.0))
+    # Taken: the triangle (7, 0), (10, 0), (9.55, h) and the sphere's
+    # segment beyond its chord, turned about the axis (Pappus).
+    let triangle = 0.5 * 3.0 * h
+    let phi = 2.0 * math.asin(0.15)
+    let segment = 50.0 * (phi - math.sin(phi))
+    let from_center = 4000.0 * math.pow(math.sin(phi * 0.5), 3.0) / (3.0 * 100.0 * (phi - math.sin(phi)))
+    let taken = 2.0 * math.pi * (triangle * (7.0 + 10.0 + 9.55) / 3.0 + segment * from_center * math.cos(phi * 0.5))
+    let expected = 2000.0 * math.pi / 3.0 - taken
+    print(f"dome chamfered: {expected} by the chord, Fusion 1833.0211")
+    assert(math.abs(expected - 1833.0211) < 1e-3)
+    let got = volume(dome.tessellate(64)) - volume(mesh)
+    if math.abs(got - taken) > taken * 0.002: print(f"dome: taken {got}, expected {taken}")
+    assert(math.abs(got - taken) <= taken * 0.002)
+    # Fillets there are not built yet: said.
+    var said = ""
+    _ = CadModeling.filleted(dome, CadModeling.edge_references(dome, edges), 2.0, "f") catch failure:
+        said = failure.message
+    assert(said.contains("sphere"), said)
+
+## A stadium plate 10 high: lines (0, ±10) to (30, ±10), half circles of
+## 10 about (0, 0) and (30, 0); y up.
+func stadium() -> CadModel!:
+    let s = CadSketch.parse("")
+    let a = s.add_point(0.0, -10.0)
+    let b = s.add_point(30.0, -10.0)
+    let c = s.add_point(30.0, 10.0)
+    let d = s.add_point(0.0, 10.0)
+    _ = s.add_line(a, b)
+    _ = s.add_arc(s.add_point(30.0, 0.0), b, c)
+    _ = s.add_line(c, d)
+    _ = s.add_arc(s.add_point(0.0, 0.0), d, a)
+    return CadModeling.extruded_sides(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0)), 10.0, 0.0, "s")
+
+func far_arc_top(a: Vector3, b: Vector3) -> bool:
+    return math.abs(a.y - 10.0) < 1e-9 and math.abs(b.y - 10.0) < 1e-9 and b.x > 30.0 + 1e-6
+
+func open_end() -> unit!:
+    let plate = stadium()
+    let before = volume(plate.tessellate(64))
+    let edges = edges_where(plate, far_arc_top)
+    assert(edges.length == 1)
+    let references = CadModeling.edge_references(plate, edges)
+    # G1: the corner's region r²(1 - π/4), its centroid 0.2234 r in from
+    # both faces, turned half round at 10 less that.
+    let area = 9.0 * (1.0 - math.pi / 4.0)
+    let inward = 3.0 * (10.0 - 3.0 * math.pi) / (3.0 * (4.0 - math.pi))
+    let half_turn = math.pi * (10.0 - inward) * area
+    var g1_taken = 0.0
+    for continuity in [1, 2]:
+        let made = CadModeling.filleted(plate, references, 3.0, "f", continuity, false)
+        let mesh = made.tessellate(64)
+        closed(mesh)
+        var ends = 0
+        for face in 0..<made.face_count():
+            if CadModeling.face_name_of(made, face).starts_with("f/end["): ends += 1
+        assert(ends == 2, f"G{continuity}: {ends} flat ends")
+        let taken = before - volume(mesh)
+        print(f"stadium arc G{continuity}: {taken} taken, half turn {half_turn}")
+        if continuity == 1:
+            assert(math.abs(taken - half_turn) < half_turn * 0.002)
+            g1_taken = taken
+        else:
+            assert(taken > 0.0 and taken < g1_taken)

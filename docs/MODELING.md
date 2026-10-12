@@ -14,7 +14,7 @@ does today.
 | `CadModeling.` | What it does |
 |---|---|
 | `extruded(set, distance, start, tag)` | The sketch's closed curves in `set`, as profile regions, each swept `distance` along the plane's normal from `start` along it. |
-| `extruded_sides(set, distance, other, tag, taper, other_taper, start)` | Fusion's Extrude directions: `distance` along the normal and `other` against it (one side, two sides, or symmetric with both alike), each side leaning in by its taper angle. |
+| `extruded_sides(set, distance, other, tag, taper, other_taper, start)` | Fusion's Extrude directions: `distance` along the normal and `other` against it (one side, two sides, or symmetric with both alike), each side leaning in by its taper angle (Fusion's sign is the other way: luced-3d turns it over). |
 | `extruded_through(set, model, tag, direction, taper, profiles, start)` | Extent All: past the whole body along the normal (`1`), against it (`-1`) or both ways (`0`), from the plane moved `start` along the normal. |
 | `extruded_to(set, model, tag, face, offset, taper, profiles, start, extend)` | Extent To Object, from the plane moved `start`, as Fusion's Extend says: `0` until the extrusion meets the named face's surface (extended past the face), `offset` further; `1` until it meets that face and the faces next to it; `2` until it meets the body holding the face; `3` through that body. With no face, `2` and `3` take the whole model. |
 | `extruded_from(set, model, tag, face, offset, extent, distance, target, target_offset, taper, profiles)` | Start: Object. From the named face's surface (moved `offset` along the way), a `distance` (the end follows the face's shape moved on), to face `target`, or through all. A face parallel to the sketch is a start offset. |
@@ -35,11 +35,11 @@ does today.
 | `sliced(model, origin, normal, tag)` | Fusion's sketch Slice: what lies behind the plane (against its normal), the half-space in front taken away and the cut capped by faces named `<tag>/to/f<i>`; the model itself when nothing of it is in front; refused when all of it is. |
 | `lump_count(model)`, `lump(model, at)` | A model's separate pieces, each as a body of its own. |
 | `moved_body(model, by, origin, axis, angle, prefix)` | Move/Copy: turned about a line, then moved; a copy's faces take `prefix` so features tell it from the original. |
-| `chamfered(model, references, distance, tag, chain, corner)` | The referenced edges chamfered `distance` along each face; where three meet at a corner, Fusion's Corner Type: `0` Chamfer, `1` Miter, `2` Blend. |
+| `chamfered(model, references, distance, tag, chain, corner)` | The referenced edges chamfered `distance` along each face; where three meet at a corner, Fusion's Corner Type: `0` Chamfer, `1` Miter, `2` Blend (each checked against Fusion itself: Chamfer corners below). |
 | `chord_radius(model, references, chord, chain)` | Fusion's Chord Length: the radius whose fillets leave the faces `chord` apart. |
 | `full_round(model, center, tag, continuity, side1, side2)` | Fusion's Full Round Fillet: the flat center face rounded away whole, tangent to it and its sides. |
 | `variable_filleted(model, reference, positions, radii, tag, smooth)` | Fusion's Variable radius: one straight edge between flat faces, radii at positions 0 to 1 along it, smooth or straight between. |
-| `filleted(model, references, radius, tag, continuity, chain, setback)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`); with `setback`, Fusion's Setback corner type for G1 corners too. |
+| `filleted(model, references, radius, tag, continuity, chain, setback, tangency)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`); with `setback`, Fusion's Setback corner type for G1 corners too; `tangency`, Fusion's Tangency weight (0.1 to 2, 1 the default: Tangency weight below). |
 | `rule_edges(model, rounds, fillets, faces, others)` | Fusion's Rule Fillet (`rules.lucb`): references to the blendable edges a rule takes, convex ones (rounds), concave ones (fillets) or both; with `faces` named, only edges on those faces, and with `others` too, only edges between the two sets. Made again on every cook, the edges follow the body. |
 | `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Every edge Equal distance takes (loops round a flat face, rims, curved faces, inside edges); each distance runs straight from the edge to the chamfer's contact in the plane square to the edge (`chamfers.lucb`). |
 | `edge_references(model, edges)` | References to edges, given by their B-rep numbers (what a viewport pick gives). |
@@ -204,6 +204,11 @@ Extents that read a body:
 - **A start offset** moves the levels' start along the normal for every extent; a target behind
   the start is refused.
 
+**Taper's sign, verified against Fusion 2705** (probe of 2026-10-12): a positive taper leans the
+sides out, a 20 square extruded 10 at +10° spanning -1.7633 to 21.7633 (20 + 2 × 10 tan 10° = 23.53
+across at the top). The kernel's positive taper leans in; luced-3d's Extrude turns the sign over, and
+`cad_extent_tests` checks Fusion's numbers.
+
 **Start: Object** (`extent_starts.lucb`). A face parallel to the sketch is a start offset. Any
 other plane, cylinder, cone, sphere or torus bounds the extrusion: it is made long both ways, the
 part past the start surface (moved by the offset) is kept, and the far end is the start surface
@@ -220,7 +225,12 @@ refused when the turn comes round without meeting the surface.
 **Thin walls** (`sketch/thicken.lucb`, `CadSketch.thicken`). Thin Extrude's band round a chain:
 each side's boundary is the chain's offset copy (the chain itself at 0), a closed chain thickened
 inside and outside (by which way it turns), an open one to its left and right with its ends
-closed by lines; the chain becomes construction when both sides have a thickness.
+closed by lines; the chain becomes construction when both sides have a thickness. Fusion's wall
+locations, **verified against Fusion 2705** (probe of 2026-10-12), are luced-3d's mapping onto it:
+Side 1 is inside a closed profile and left of an open curve as it was drawn, Side 2 outside and
+right, Center half each way. A 20 × 10 rectangle, wall 2, 5 high: Side 1 spans 20 × 10 (520), Side 2
+24 × 14 (680), Center 22 × 12 (600); a line drawn (0, 0) to (20, 0) goes to y 0..2, -2..0 and
+-1..1. `cad_parity_tests` checks those numbers.
 
 ### Revolve (`revolve.lucb`)
 
@@ -351,7 +361,10 @@ whether the plane cuts it at all.
 ### Chamfer and fillet (`blend.lucb`)
 
 A rim's tool is its corner profile turned about the rim's axis: a cone for a chamfer, a torus for a
-fillet.
+fillet. A rim between a flat face and a sphere about its axis (a dome's edge) is chamfered by a
+section of its own (`sphere_rims.lucb`): the chamfer's second distance is a chord to the sphere's
+meridian circle, and the section closes back over the sphere's tangents at the edge and at the
+contact, so the sphere's sliver beyond the chord goes too. Fillets there are not built yet (refused).
 
 These are the first rows of OpenCASCADE's ChFiKPart table, made with booleans. Each edge (or chain
 of collinear pieces) between two flat faces gets a tool solid and has it subtracted:
@@ -371,10 +384,34 @@ a corner of three flat faces:
   and legs l_a, l_b on that face; the plane through the three points is the corner's face, and the
   tip beyond it is taken away by a box on that plane. At a square corner with equal chamfers d the
   tip is d³/12, which `chamfer_corner_tests` checks.
-- **Blend**: the chamfers stop short of the corner at setbacks, as setback fillets do, and the
-  setback patch (`patch_fit.lucb`) fills the hole: its A curves are the chamfers' straight ends,
-  its B curves G2 curves on the faces, so it meets the faces and the chamfers' planes with G2.
-  Unequal legs are refused.
+- **Blend**: the chamfers set back from the corner and one flat face, a hexagon, closing it. Its
+  plane is the Chamfer face's turned the same way, moved in until every contact line runs on past
+  its crossing by its chamfer's distance (the longer leg): at a square corner the chamfers end 2 d
+  from the vertex, the plane meeting the edges 3 d from it (x + y + z = 48 at the corner (20, 20,
+  20), d = 4). Its sides alternate: a
+  chamfer's end (where the plane cuts it), then a line across a face. A plane crossing an edge
+  beyond its far end is refused. Two distances take it too.
+
+**Verified against Fusion 2705** (probe of 2026-10-12, a 20 mm cube's corner, three chamfers of 4;
+`chamfer_corner_tests`): Miter 9 faces, 7568.0; Chamfer the triangle (16, 16, 20), (16, 20, 16),
+(20, 16, 16), 10 faces, 7562.6667; Blend Fusion's hexagon (12, 16, 20), (16, 12, 20), (20, 12, 16),
+(20, 16, 12), (16, 20, 12), (12, 20, 16), 10 faces all flat, 7456.0. Fusion's hexagon lies 0.0006
+further in (its corners at 12.0006, its volume 7456.029); that hair is its blend engine's setback
+tolerance, not a rule, so the corners here are the exact 2 d.
+
+**Blend corners with curved faces: the rule.** Fusion's Blend is a vertex blend: the chamfers set
+back and a surface fills the hole between their ends and the faces. Its own result on flat faces is
+that surface's plane, because every side of the hole (a chamfer's end is a line, a ruled chamfer's
+section; a flat face's side is a line) lies in one plane. The rule here follows: **the corner is one
+flat face wherever a plane closes it**, a plane cutting the corner's tip off in one loop that crosses
+each chamfer and each face once. On a curved face the plane's side is that face's section (an
+ellipse's arc on a cylinder, a conic on a cone), still one flat corner face, as long as the face
+bulges away from the plane (a convex corner: a pin's side, a boss's). Only where a face curves back
+across the plane (a hole's wall within the corner, a saddle) can no plane close it, and only there
+would a curved patch (the setback patch of `patch_fit.lucb`) be needed. The corner types act today
+where three straight chamfered edges meet (three lines at a vertex: their faces are flat, so a
+plane always closes it, and no patch is made); corners where a rim's arc meets straight edges take
+the edges' tools as they meet (a miter) for every corner type.
 
 **Chord Length** (`chord_length.lucb`): faces whose ways from the edge are θ apart take contacts
 r cot(θ/2) from it, 2r cos(θ/2) apart, so the radius is chord / (2 cos(θ/2)); G2 and G3 fillets
@@ -453,8 +490,10 @@ variable sets are one tangent chain each too.
 distances and Distance and angle. Each distance is measured from the original edge (what Autodesk's
 forum answers say), here in the plane square to the edge, straight to where the chamfer meets the
 face: along a flat face that is the distance along it, on a curved face a chord (Parasolid calls this
-an apex range). Fusion's documents do not say how it measures on curved faces, so that part is
-unverified. The first distance goes on the face more of the chosen edges lie on (a loop's own face),
+an apex range). **Verified against Fusion 2705** (probe of 2026-10-12, `fusion_probe_tests`): a dome
+of radius 10 chamfered 3 at its rim meets the sphere on the circle of 9.55, 2.96606 from the rim's
+plane, 3.000 straight from the rim (along the arc it would be 3.011), and the plane on the circle of
+7; Fusion's volume 1833.0211 is what the chord gives, to 1e-7. The first distance goes on the face more of the chosen edges lie on (a loop's own face),
 a tie by name, and Flip swaps. Distance and angle leaves the first face at the angle, so the second
 leg is d·sin θ / sin(φ + θ) for faces φ apart (d·tan θ when square); Autodesk staff have said
 Fusion's own Distance and angle misbehaves where the faces are not square, so this follows the
@@ -516,6 +555,21 @@ is theirs. Revolve turns sketch splines the same way.
 Two G2 or G3 fillets meeting where a third edge stays sharp meet in a miter. Their swept profiles
 meet in the plane bisecting their sweeps, through where their contact lines cross, as that plane's
 affine copy of either profile. It is checked to lie on the other.
+
+**Tangency weight** (Fusion's, 0.1 to 2, 1 the default; its API: "the influence of the
+continuity, G1 or G2, on the fillet"). It changes a section's inside and keeps its contacts and the
+lines its end control points lie on, so the continuity at the faces stays:
+- **G2, G3:** each leg's fraction f toward the corner becomes 1 − (1 − f)^w (`fillet_section`). Above
+  1 the points move toward the corner (the blend hugs the faces longer and turns tighter in the
+  middle), below toward the contacts (flatter). At w = 1 nothing moves: the plain fillet exactly.
+- **G1:** the circle's rational arc has its middle weight sin(θ/2) times w (`arc_section`): a conic,
+  a hyperbola above 1, an ellipse below. A conic has no ball tangent to three of them, so a weighted
+  G1 fillet takes the booleans' tools (straight edges and rims) with rational spline sections and
+  setback corners. A plane meeting a cylinder along its length, and a sphere rim, take no weight yet.
+Every path takes it: the direct strips, setback corners, loops round a flat face, loops between
+curved faces. `tangency_tests` checks that a box edge keeps more of its corner as the weight rises
+at G1, G2 and G3, that 1 is the plain fillet, corners and a cap loop. Fusion's variable radius
+fillets take the weight too; ours (`variable_filleted`) do not yet.
 
 **Setback corners.** Three G2 or G3 fillets meeting at a corner of three flat faces can't be rounded
 by a ball: no sphere is tangent to them, since their sections aren't circles. So each fillet stops
@@ -690,8 +744,11 @@ ends in the section's plane, and a flat end face (`<tag>/end[...]`) fills the co
 section and the sharp edge, bounded by the section, the seam's upper part and a line on the face
 back to the corner. The seam is split at the wall's contact. The end face touches the face and the
 wall in cusps, which the tessellator samples finely (opposite sides' sample counts are equalized up
-to 1024). What Fusion does in that case has not been checked against Fusion itself; concave chains'
-open ends stop flat too.
+to 1024). Concave chains' open ends stop flat too. **Checked against Fusion 2705** (probe of
+2026-10-12, `fusion_probe_tests`): a stadium plate's arc top edge filleted alone (r 3, Tangent chain
+off, G1 and G2) fails in Fusion ("ASM_BL_END_TOO_CMPLX ... at the ends of the selected edges"). The
+flat end here is a deliberate superset: it succeeds where Fusion fails, and the G1 half turn takes
+exactly the section's Pappus volume.
 
 **Reflections at a G3 corner.** Where a box's top loop is blended around an earlier G3 upright,
 zebra stripes on the corner's strip converge to one point on its contact with the top. That is the
