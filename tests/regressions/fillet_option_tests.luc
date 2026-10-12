@@ -1,0 +1,100 @@
+## Fusion's Fillet options beyond a constant radius: Chord Length (the
+## radius from the contacts' distance: c / √2 at a square corner, more
+## at an obtuse one; edges at different angles refused).
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_cad.sketch import CadSketch
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+## The ids of `model`'s edges whose ends `keep` takes.
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return found
+
+pub func fillet_option_tests() -> unit!:
+    chord_length()
+    full_round()
+    print("PASS fillet options: chord length (c / √2 at a square corner, c / (2 cos 67.5°) on a 135° one, edges at mixed angles refused); full round of a square rib (its top gone, one round of half its width) and a tapered one (the round touching the top), G1 and G2")
+
+func chord_length() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let front_top = func (a: Vector3, b: Vector3) -> bool:
+        return a.y > 0.99 and b.y > 0.99 and a.z > 0.99 and b.z > 0.99
+    let edge = CadModeling.edge_references(box, edges_where(box, front_top))
+    let r = CadModeling.chord_radius(box, edge, 0.5 * math.sqrt(2.0))
+    assert(math.abs(r - 0.5) < 1e-9, f"{r}")
+    # The fillet of that radius leaves the faces 0.5 from the edge: the
+    # contacts are the chord apart.
+    let made = CadModeling.filleted(box, edge, r, "f")
+    let mesh = made.tessellate(32)
+    manifold(mesh)
+    assert(math.abs(volume(mesh) - (8.0 - (0.25 - math.pi * 0.0625) * 2.0)) < 1e-3)
+    # A trapezoid prism: its top meets the slanted side at 135°, the
+    # left side at 90°.
+    let s = CadSketch.parse("")
+    let p = [s.add_point(0.0, 0.0), s.add_point(4.0, 0.0), s.add_point(3.0, 1.0), s.add_point(0.0, 1.0)]
+    for at in 0..<4:
+        _ = s.add_line(p[at], p[(at + 1) % 4])
+    let prism = CadModeling.extruded(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 2.0, 0.0, "t")
+    let ridge = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - 3.0) < 1e-9 and math.abs(b.x - 3.0) < 1e-9 and math.abs(a.y - 1.0) < 1e-9 and math.abs(b.y - 1.0) < 1e-9
+    let square = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x) < 1e-9 and math.abs(b.x) < 1e-9 and math.abs(a.y - 1.0) < 1e-9 and math.abs(b.y - 1.0) < 1e-9
+    let at_slant = CadModeling.edge_references(prism, edges_where(prism, ridge))
+    let obtuse = CadModeling.chord_radius(prism, at_slant, 1.0, false)
+    assert(math.abs(obtuse - 1.0 / (2.0 * math.cos(math.pi * 0.375))) < 1e-6, f"{obtuse}")
+    # The 135° edge and the 90° one together: refused.
+    let both = CadModeling.edge_references(prism, edges_where(prism, ridge) + edges_where(prism, square))
+    var said = ""
+    _ = CadModeling.chord_radius(prism, both, 1.0, false) catch failure:
+        said = failure.message
+    assert(said.contains("one angle"), said)
+
+## The name of the face of `model` facing `normal`.
+func facing(model: CadModel, normal: Vector3) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let at = CadModeling.face_point(model, name)
+        if at.found and at.normal.dot(normal) > 0.999:
+            return name
+    return ""
+
+## Whether a flat face of `model` faces up.
+func flat_top(model: CadModel) -> bool!:
+    for f in 0..<model.face_count():
+        if model.face_surface_kind(f) != 0:
+            continue
+        if CadModeling.face_point(model, CadModeling.face_name_of(model, f)).normal.y > 0.999:
+            return true
+    return false
+
+## A 4 x 10 x 20 rib: its top rounded whole, radius 2: two quarter
+## cylinders' worth taken, the top face gone. A tapered rib (6 wide at the
+## foot, 4 at the top, 10 high): the round reaches the top's height.
+func full_round() -> unit!:
+    let rib = CadModeling.tagged(CadSolids.box(4.0, 10.0, 20.0), "rib")
+    let top = facing(rib, Vector3(0.0, 1.0, 0.0))
+    for continuity in [1, 2]:
+        let round = CadModeling.full_round(rib, top, "r", continuity = continuity)
+        let mesh = round.tessellate(32)
+        manifold(mesh)
+        if continuity == 1:
+            assert(math.abs(volume(mesh) - (800.0 - 40.0 * 4.0 * (1.0 - math.pi * 0.25))) < 0.1)
+        assert(not flat_top(round) and math.abs(mesh.bounds().maximum.y - 5.0) < 1e-3)
+    let s = CadSketch.parse("")
+    let p = [s.add_point(-3.0, 0.0), s.add_point(3.0, 0.0), s.add_point(2.0, 10.0), s.add_point(-2.0, 10.0)]
+    for at in 0..<4:
+        _ = s.add_line(p[at], p[(at + 1) % 4])
+    let tapered = CadModeling.extruded(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 20.0, 0.0, "t")
+    let round = CadModeling.full_round(tapered, facing(tapered, Vector3(0.0, 1.0, 0.0)), "r")
+    let mesh = round.tessellate(32)
+    manifold(mesh)
+    assert(math.abs(mesh.bounds().maximum.y - 10.0) < 1e-3 and volume(mesh) < 100.0 * 20.0)

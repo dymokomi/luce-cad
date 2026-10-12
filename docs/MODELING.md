@@ -35,7 +35,9 @@ does today.
 | `sliced(model, origin, normal, tag)` | Fusion's sketch Slice: what lies behind the plane (against its normal), the half-space in front taken away and the cut capped by faces named `<tag>/to/f<i>`; the model itself when nothing of it is in front; refused when all of it is. |
 | `lump_count(model)`, `lump(model, at)` | A model's separate pieces, each as a body of its own. |
 | `moved_body(model, by, origin, axis, angle, prefix)` | Move/Copy: turned about a line, then moved; a copy's faces take `prefix` so features tell it from the original. |
-| `chamfered(model, references, distance, tag)` | The referenced edges chamfered `distance` along each face. |
+| `chamfered(model, references, distance, tag, chain, corner)` | The referenced edges chamfered `distance` along each face; where three meet at a corner, Fusion's Corner Type: `0` Chamfer, `1` Miter, `2` Blend. |
+| `chord_radius(model, references, chord, chain)` | Fusion's Chord Length: the radius whose fillets leave the faces `chord` apart. |
+| `full_round(model, center, tag, continuity, side1, side2)` | Fusion's Full Round Fillet: the flat center face rounded away whole, tangent to it and its sides. |
 | `filleted(model, references, radius, tag, continuity)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`). |
 | `rule_edges(model, rounds, fillets, faces, others)` | Fusion's Rule Fillet (`rules.lucb`): references to the blendable edges a rule takes, convex ones (rounds), concave ones (fillets) or both; with `faces` named, only edges on those faces, and with `others` too, only edges between the two sets. Made again on every cook, the edges follow the body. |
 | `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Every edge Equal distance takes (loops round a flat face, rims, curved faces, inside edges); each distance runs straight from the edge to the chamfer's contact in the plane square to the edge (`chamfers.lucb`). |
@@ -348,8 +350,29 @@ Each tool is swept along the edge. Past an end where the corner is empty (an out
 reaches a margin further. Where the solid continues past the end (a wall the edge runs into), it
 stops flush.
 
-Corners where chamfers meet come out of the booleans as three chamfer planes meeting at a point.
-Fusion's setback triangle is not made.
+**Chamfer corners** (`chamfer_corners.lucb`), Fusion's Corner Type where three chamfers meet at
+a corner of three flat faces:
+- **Miter**: the tools reach past the corner, and the chamfers meet in three planes and a point.
+- **Chamfer** (Fusion's default): on each face the two chamfers' contact lines meet at a point,
+  P = V + a·(l_b / sin θ) + b·(l_a / sin θ) for the edges' ways a, b from the vertex V, θ apart,
+  and legs l_a, l_b on that face; the plane through the three points is the corner's face, and the
+  tip beyond it is taken away by a box on that plane. At a square corner with equal chamfers d the
+  tip is d³/12, which `chamfer_corner_tests` checks.
+- **Blend**: the chamfers stop short of the corner at setbacks, as setback fillets do, and the
+  setback patch (`patch_fit.lucb`) fills the hole: its A curves are the chamfers' straight ends,
+  its B curves G2 curves on the faces, so it meets the faces and the chamfers' planes with G2.
+  Unequal legs are refused.
+
+**Chord Length** (`chord_length.lucb`): faces whose ways from the edge are θ apart take contacts
+r cot(θ/2) from it, 2r cos(θ/2) apart, so the radius is chord / (2 cos(θ/2)); G2 and G3 fillets
+touch where the circle does. Edges whose faces meet at different angles would need different
+radii: refused.
+
+**Full round** (`full_round.lucb`): for a flat center face between flat sides along it (a rib's
+top, square or tapered), the circle tangent to the three planes in the section (Cramer's rule on
+n·X + r = h for each) gives the radius, and both the center face's edges with the sides are
+filleted to it: the two strips touch the center face at the same line, so it goes and the strips
+are one cylinder (G2 and G3: two strips meeting with zero curvature).
 
 **Chamfer types and distances** (`chamfers.lucb`). Fusion's Chamfer has Equal distance, Two
 distances and Distance and angle. Each distance is measured from the original edge (what Autodesk's
@@ -882,10 +905,9 @@ Not yet: ellipses, splines, slots and text; curvature (G2) constraints; Blend Cu
 
 Roughly in order of usefulness:
 
-1. **Fillet corners beyond three edges,** and G1 setback corners (the same patch with one row:
-   unequal radii, Fusion's other corner type).
-2. **Fusion's chamfer corner types** (Chamfer, Miter, Blend) where chamfers of different sizes
-   meet at a sharp corner.
+1. **Fillet corners beyond three edges,** and G1 setback corners (the patch with one row, made
+   rational to meet the circular strips exactly).
+2. **Variable radius fillets** (radii at points along an edge).
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
    the loop turns a sharp corner rather than going on tangentially.

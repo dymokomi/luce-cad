@@ -1,0 +1,54 @@
+## Fusion's chamfer Corner Types where three chamfers of 2 meet at a corner
+## of a 20-box: Miter (three planes in a point: the box less the three
+## prisms, 3 × 40, their overlaps added back, 3 × 8/3 less 2: 7886);
+## Chamfer (a triangle joins them: the tip d³/12 more taken, the corner's
+## face a triangle on the plane through the contact lines' meeting
+## points); Blend (a patch blends them into the faces: closed, between the
+## two in volume); Two distances with a Chamfer corner closed too, and a
+## Blend corner of unequal legs refused.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+func solid(model: CadModel, what: str) -> float!:
+    let mesh = model.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    print(f"{what}: {model.face_count()} faces, volume {v}")
+    return v
+
+pub func chamfer_corner_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "box")
+    # The three edges at the corner (10, 10, 10).
+    let edges: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let id = box.face_edge_id(face, use)
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            let at_corner = a.subtract(Vector3(10.0, 10.0, 10.0)).length() < 1e-9 or b.subtract(Vector3(10.0, 10.0, 10.0)).length() < 1e-9
+            if at_corner and not (id in edges):
+                edges.append(id)
+    assert(edges.length == 3)
+    let references = CadModeling.edge_references(box, edges)
+    let miter = CadModeling.chamfered(box, references, 2.0, "c", corner = 1)
+    let v_miter = solid(miter, "miter")
+    assert(math.abs(v_miter - 7886.0) < 1e-6)
+    let chamfer = CadModeling.chamfered(box, references, 2.0, "c", corner = 0)
+    let v_chamfer = solid(chamfer, "chamfer")
+    assert(math.abs(v_chamfer - (7886.0 - 8.0 / 12.0)) < 1e-6)
+    assert(chamfer.face_count() == miter.face_count() + 1)
+    let blend = CadModeling.chamfered(box, references, 2.0, "c", corner = 2)
+    let v_blend = solid(blend, "blend")
+    assert(v_blend < v_miter and v_blend > 7886.0 - 20.0)
+    # Two distances, Chamfer corner: closed; a Blend corner refused.
+    let sided = CadModeling.chamfered_sides(box, references, 2.0, 1.0, 0.0, "c", corner = 0)
+    _ = solid(sided, "two distances")
+    var said = ""
+    _ = CadModeling.chamfered_sides(box, references, 2.0, 1.0, 0.0, "c", corner = 2) catch failure:
+        said = failure.message
+    assert(said.contains("equal"), said)
+    print("PASS chamfer corners: three chamfers at a box's corner as a Miter (7886), a Chamfer (the tip d³/12 more, one more face) and a Blend (a patch, between them); two distances with a Chamfer corner; a Blend of unequal legs refused")

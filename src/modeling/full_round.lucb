@@ -1,0 +1,104 @@
+## Fusion's Full Round Fillet: a center face rounded away whole, the round
+## tangent to it and to the side faces on each side. For a flat center face
+## between flat sides along it (a rib's top, square or tapered), the round
+## is the circle tangent to all three planes in the section across them:
+## it is the fillet, of that one radius, of both the center face's edges
+## with the sides, the two fillets touching the center face at the same
+## line, so the face goes and the two strips are one cylinder.
+## The sides, when not named, are the center face's neighbors across its
+## longest pair of parallel straight edges.
+
+## `model` with face `center` rounded fully between faces `side1` and
+## `side2` (empty: found as above), of `continuity` (1 G1, 2 G2, 3 G3), the
+## round named for feature `tag`.
+func full_rounded(model: const CadModel*, center: str, side1: str, side2: str, tag: str, continuity: i64) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model)
+    defer w.close()
+    let c = try named_face(&w, center)
+    if w.surfaces.items[(usize)w.faces.items[c].surface].kind != surface_plane: error(invalid, "a full round takes a flat center face")
+    var sides: usize[2] = [0, 0]
+    if side1 != "" and side2 != "":
+        sides[0] = try named_face(&w, side1)
+        sides[1] = try named_face(&w, side2)
+    else:
+        sides = try round_sides(&w, c)
+    # The edges between the center and each side, and the way along them.
+    var edges = Growing[i64]()
+    defer edges.close()
+    var along = Vector3()
+    for use in w.face_uses(c):
+        let e = edge_index(use)
+        let (fa, fb) = try edge_faces(&w, e)
+        let other = fb if fa == c else fa
+        if other != sides[0] and other != sides[1]: continue
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line: error(invalid, "a full round's center face meets its sides along straight edges")
+        let way = try along_edge(&w, e)
+        if along.length() == 0.0: along = way
+        elif math.abs(math.abs(way.dot(along)) - 1.0) > 1e-9: error(invalid, "a full round's sides run along the center face: its edges with them are parallel")
+        try edges.push((i64)e)
+    if edges.count < 2: error(invalid, "the center face does not meet both sides")
+    let radius = try inscribed_radius(&w, c, sides, along)
+    var text = Growing[u8]()
+    defer text.close()
+    try references_of(&w, edges.view(), &text)
+    return try blended(model, (str)text.view(), radius, true, tag, continuity, false)
+
+## The radius of the circle tangent to the planes of faces `c` and `sides`
+## inside the body, in the section square to `along`.
+func inscribed_radius(w: const Shape*, c: usize, sides: const usize[2], along: Vector3) -> f64!:
+    let faces: usize[3] = [c, sides[0], sides[1]]
+    let u = try across(along)
+    let v = along.cross(u)
+    # Each plane in the section: n . x = h (outward n); the center X is r in
+    # from each: nu X.u + nv X.v + r = h.
+    var m: f64[9]
+    var b: f64[3]
+    for k in 0..<(usize)3:
+        let s = &w.surfaces.items[(usize)w.faces.items[faces[k]].surface]
+        if s.kind != surface_plane: error(invalid, "a full round takes flat side faces")
+        let n = face_outward(w, faces[k])
+        if math.abs(n.dot(along)) > 1e-9: error(invalid, "a full round's faces must run along its edges")
+        m[k * 3] = n.dot(u)
+        m[k * 3 + 1] = n.dot(v)
+        m[k * 3 + 2] = 1.0
+        b[k] = n.dot(s.origin)
+    let det = determinant(m)
+    if math.abs(det) < 1e-12: error(invalid, "no circle touches the center face and both sides: they must close round the rib")
+    var mr: f64[9]
+    for k in 0..<(usize)9: mr[k] = m[k]
+    for k in 0..<(usize)3: mr[k * 3 + 2] = b[k]
+    let radius = determinant(mr) / det
+    if not (radius > 0.0): error(invalid, "the sides open away from the center face: no full round fits")
+    return radius
+
+func determinant(m: const f64[9]) -> f64:
+    return m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6])
+
+## The faces across the center face `c`'s longest pair of parallel
+## straight edges (a rib's sides).
+func round_sides(w: const Shape*, c: usize) -> usize[2]!:
+    var best = 0.0
+    var found: usize[2] = [0, 0]
+    var any = false
+    let uses = w.face_uses(c)
+    for i in 0..<uses.length:
+        let a = edge_index(uses[i])
+        if w.carriers.items[(usize)w.edges.items[a].carrier].kind != curve_line: continue
+        let way_a = try along_edge(w, a)
+        let length_a = (try w.edge_at(a, 1.0)).subtract(try w.edge_at(a, 0.0)).length()
+        for j in i + 1..<uses.length:
+            let b = edge_index(uses[j])
+            if w.carriers.items[(usize)w.edges.items[b].carrier].kind != curve_line: continue
+            if math.abs(math.abs((try along_edge(w, b)).dot(way_a)) - 1.0) > 1e-9: continue
+            let length_b = (try w.edge_at(b, 1.0)).subtract(try w.edge_at(b, 0.0)).length()
+            let (fa, fb) = try edge_faces(w, a)
+            let (ga, gb) = try edge_faces(w, b)
+            let side_a = fb if fa == c else fa
+            let side_b = gb if ga == c else ga
+            if side_a == side_b: continue
+            if length_a + length_b > best:
+                best = length_a + length_b
+                found = [side_a, side_b]
+                any = true
+    if not any: error(invalid, "the center face has no pair of parallel straight edges: pick its side faces")
+    return found

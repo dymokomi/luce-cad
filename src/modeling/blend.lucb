@@ -116,13 +116,13 @@ func convex(w: const Shape*, e: usize) -> bool!:
 ## earlier fillet.
 ## `direct` false skips the direct build (local_blend.lucb), for tests
 ## that compare it with the booleans.
-pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true, direct: bool = true) -> interop.Reference[CadModel]!:
+pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true, direct: bool = true, corner_type: i64 = 1) -> interop.Reference[CadModel]!:
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
     defer chosen.close()
     try choose_edges(&w, references, chain, &chosen)
-    return try blend_chosen(model, &w, chosen.view(), trimmed(references) == "", size, round, tag, continuity, direct, none)
+    return try blend_chosen(model, &w, chosen.view(), trimmed(references) == "", size, round, tag, continuity, direct, none, none, corner_type)
 
 ## The edges of `w` that `references` names onto `chosen` (empty: every
 ## straight convex edge between flat faces; rims and inside corners only
@@ -142,7 +142,9 @@ func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize
 ## they are every edge, as blended's empty references). `patches` keeps
 ## setback corners' patches between sizes (FilletPlan), when given. A
 ## chamfer's `sides` (chamfers.lucb) give it two legs; none: Equal distance.
-func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct: bool, patches: PatchCache*?, sides: const ChamferSides*? = none) -> interop.Reference[CadModel]!:
+## A chamfer's `corner_type` is Fusion's Corner Type where three chamfers meet
+## (chamfer_corners.lucb: corner_chamfer, corner_miter, corner_blend).
+func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1) -> interop.Reference[CadModel]!:
     if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     # Each edge's blend must fit its faces: said precisely, before any tool.
@@ -199,6 +201,23 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
     var joints = Growing[i64]()
     defer joints.close()
     try fillet_corners(w, chosen, size, continuity, round, &balls, &setbacks, &joints)
+    # Chamfers meeting three at a corner with a Blend corner stop short of
+    # it, at setbacks, as setback fillets do.
+    var blends = Growing[Setback]()
+    defer blends.close()
+    # Chamfer corners (Chamfer type): the tip taken off after the tools.
+    var tips = Growing[i64]()
+    defer tips.close()
+    if not round and corner_type != corner_miter:
+        try chamfer_corners(w, chosen, &tips)
+        if corner_type == corner_blend:
+            for v in tips.view(): try blends.push(try chamfer_setback(w, v, chosen, size, sides))
+            tips.clear()
+    # Where the edges' tools stop short of a corner.
+    var stops = Growing[Setback]()
+    defer stops.close()
+    for at in setbacks.view(): try stops.push(at)
+    for at in blends.view(): try stops.push(at)
     var body = try shape_rays(w)
     defer body.close()
     var tools = Growing[interop.Reference[CadModel]]()
@@ -258,8 +277,9 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             elif corner.subtract(high).length() <= w.tolerance * 10.0:
                 high = foot
                 exact_high = true
-        # An end at a setback corner stops at its setback.
-        for corner in setbacks.view():
+        # An end at a setback corner (a Blend chamfer corner's too) stops at
+        # its setback.
+        for corner in stops.view():
             let apex = w.points.items[(usize)corner.vertex]
             for k in 0..<(usize)3:
                 if math.abs(corner.ways[k].dot(along)) < 1.0 - 1e-9: continue
@@ -291,10 +311,20 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
         try corner_name(w, (usize)ball.vertex, tag, &name)
         try tools.push(try corner_tool(w, &ball, size, (str)name.view()))
         try adds.push(ball.inside)
-    for corner in setbacks.view():
-        try corner_name(w, (usize)corner.vertex, tag, &name)
-        try tools.push(try setback_tool(w, &corner, size, continuity, (str)name.view()))
-        try adds.push(corner.inside)
+    for at in setbacks.view():
+        try corner_name(w, (usize)at.vertex, tag, &name)
+        try tools.push(try setback_tool(w, &at, size, continuity, (str)name.view()))
+        try adds.push(at.inside)
+    # Chamfers meeting three at a corner: its own face (Chamfer), or a
+    # patch (Blend); Miter is the tools as they are.
+    for v in tips.view():
+        try corner_name(w, (usize)v, tag, &name)
+        try tools.push(try chamfer_corner_tool(w, v, chosen, size, sides, (str)name.view()))
+        try adds.push(false)
+    for at in blends.view():
+        try corner_name(w, (usize)at.vertex, tag, &name)
+        try tools.push(try chamfer_blend_tool(w, &at, size, (str)name.view()))
+        try adds.push(false)
     # Material taken away first, then added.
     var result = try copy_model(model)
     for pass in 0..<2:

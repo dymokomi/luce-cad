@@ -1,0 +1,176 @@
+## Fusion's chamfer Corner Type, where three chamfered edges meet at a
+## corner of three flat faces:
+## - Miter: the chamfers run on until they meet, three planes in a point.
+##   Each edge's tool reaching past the corner (blend.lucb) gives it.
+## - Chamfer (Fusion's default): a further flat face joins the chamfers.
+##   Each face at the corner holds two of the chamfers' contact lines,
+##   meeting at a point; the corner's face is the plane through those
+##   three points, and the tip beyond it is taken away (a box on that
+##   plane, as big as the corner, its inside toward the vertex). The
+##   chamfers then end on that face in lines.
+## - Blend: the chamfers blended into the faces round the corner by a
+##   patch (setback.lucb's, its sides the chamfers' ends and curves on the
+##   faces).
+
+pub let corner_chamfer: i64 = 0
+pub let corner_miter: i64 = 1
+pub let corner_blend: i64 = 2
+
+## The corners where three of `chosen` (straight, convex) meet at three
+## flat faces, each as a vertex onto `out`.
+func chamfer_corners(w: const Shape*, chosen: const usize[], out: Growing[i64]*) -> !:
+    out.clear()
+    for e in chosen:
+        let ends: i64[2] = [w.edges.items[e].start, w.edges.items[e].end]
+        for v in ends:
+            if vertex_in(out.view(), v): continue
+            var here = 0
+            var all = 0
+            for other in 0..<w.edges.count:
+                let o = w.edges.items[other]
+                if o.start != v and o.end != v: continue
+                all += 1
+                if edge_in(chosen, other) and w.carriers.items[(usize)o.carrier].kind == curve_line and try convex(w, other): here += 1
+            if here != 3 or all != 3: continue
+            var flat = true
+            for f in 0..<w.faces.count:
+                var at_corner = false
+                for use in w.face_uses(f):
+                    let o = w.edges.items[edge_index(use)]
+                    if o.start == v or o.end == v: at_corner = true
+                if at_corner and w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: flat = false
+            if flat: try out.push(v)
+
+## The tool taking the tip off chamfer corner `v` (chamfers of `size`, with
+## `sides`' legs), its faces named `name`: a box whose face toward the
+## body lies on the plane through the three points where the chamfers'
+## contact lines meet on each face.
+func chamfer_corner_tool(w: const Shape*, v: i64, chosen: const usize[], size: f64, sides: const ChamferSides*?, name: str) -> interop.Reference[CadModel]!:
+    let apex = w.points.items[(usize)v]
+    var edges: usize[3] = [0, 0, 0]
+    var ways: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+    var count: usize = 0
+    for e in chosen:
+        let o = w.edges.items[e]
+        if o.start != v and o.end != v: continue
+        edges[count] = e
+        ways[count] = try w.leaving(e, 0 if o.start == v else 1)
+        count += 1
+    if count != 3: error(invalid, "a chamfer corner needs three chamfered edges")
+    # On each face, the two edges it holds: their contact lines meet at
+    # apex + a (leg b / sin) + b (leg a / sin).
+    var points: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+    for i in 0..<(usize)3:
+        let j = (i + 1) % 3
+        let f = try shared_face(w, edges[i], edges[j])
+        if f < 0: error(invalid, "a chamfer corner's edges must pair up on its faces")
+        let leg_i = try leg_on(w, edges[i], (usize)f, size, sides)
+        let leg_j = try leg_on(w, edges[j], (usize)f, size, sides)
+        let sine = ways[i].cross(ways[j]).length()
+        if sine < 1e-9: error(invalid, "a chamfer corner's edges run together")
+        points[i] = apex.add(ways[i].multiply_scalar(leg_j / sine)).add(ways[j].multiply_scalar(leg_i / sine))
+    var normal = try points[1].subtract(points[0]).cross(points[2].subtract(points[0])).normalized()
+    if apex.subtract(points[0]).dot(normal) < 0.0: normal = normal.multiply_scalar(-1.0)
+    let depth = apex.subtract(points[0]).dot(normal)
+    if depth <= w.tolerance: error(invalid, "the chamfers leave no corner to cut")
+    # Where the plane meets each edge: the corner's face's corners.
+    var center = Vector3()
+    var meets: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+    for k in 0..<(usize)3:
+        let t = points[0].subtract(apex).dot(normal) / ways[k].dot(normal)
+        meets[k] = apex.add(ways[k].multiply_scalar(t))
+        center = center.add(meets[k].multiply_scalar(1.0 / 3.0))
+    var reach = 0.0
+    for k in 0..<(usize)3: reach = math.max(reach, meets[k].subtract(center).length())
+    let sideways = try meets[0].subtract(center).subtract(normal.multiply_scalar(meets[0].subtract(center).dot(normal))).normalized()
+    let side = reach * 2.4
+    let height = depth * 2.0 + w.tolerance * 100.0
+    let box = try CadSolids.box(side, side, height)
+    defer box.release()
+    let placed = try box.value().placed(Matrix4(sideways, normal.cross(sideways), normal, center.add(normal.multiply_scalar(height * 0.5))))
+    defer placed.release()
+    var shape = try shape_of(placed.value())
+    defer shape.close()
+    let named = try shape.add_name(name)
+    for f in 0..<shape.faces.count: shape.faces.items[f].name = named
+    return try shape_model(&shape)
+
+## Edge `e`'s chamfer leg along its face `f` (chamfer_legs').
+func leg_on(w: const Shape*, e: usize, f: usize, size: f64, sides: const ChamferSides*?) -> f64!:
+    let (fa, fb) = try edge_faces(w, e)
+    let (leg_a, leg_b) = try chamfer_legs(w, e, size, sides)
+    if f == fa: return leg_a
+    if f == fb: return leg_b
+    error(invalid, "a chamfer corner's face is not its edge's")
+
+## A Blend corner's setback: equal chamfers of `size` at corner `v` stop
+## short of it as setback fillets do (setback.lucb), past where the next
+## chamfers' contact lines cross on the faces, by half the contact
+## distance.
+func chamfer_setback(w: const Shape*, v: i64, chosen: const usize[], size: f64, sides: const ChamferSides*?) -> Setback!:
+    var edges = Growing[usize]()
+    defer edges.close()
+    for e in chosen:
+        let o = w.edges.items[e]
+        if o.start != v and o.end != v: continue
+        let (leg_a, leg_b) = try chamfer_legs(w, e, size, sides)
+        if math.abs(leg_a - leg_b) > size * 1e-9: error(invalid, "a Blend corner takes chamfers equal along both faces: choose Chamfer or Miter corners for these")
+        try edges.push(e)
+    if edges.count != 3: error(invalid, "a chamfer corner needs three chamfered edges")
+    var ordered: usize[3] = [edges.items[0], edges.items[1], edges.items[2]]
+    if try shared_face(w, ordered[0], ordered[1]) < 0:
+        ordered[1] = edges.items[2]
+        ordered[2] = edges.items[1]
+    var corner = Setback(v, ordered, [Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0], false)
+    for i in 0..<(usize)3:
+        let edge = w.edges.items[ordered[i]]
+        corner.ways[i] = try w.leaving(ordered[i], 0 if edge.start == v else 1)
+    let frame = try setback_frame(w, &corner, size)
+    let p = w.points.items[(usize)v]
+    for i in 0..<(usize)3:
+        let before = (i + 2) % 3
+        let next = (i + 1) % 3
+        let after = try contacts_cross(p, corner.ways[i], frame.intos[i * 2 + 1], size, corner.ways[next], frame.intos[next * 2], size)
+        let behind = try contacts_cross(p, corner.ways[before], frame.intos[before * 2 + 1], size, corner.ways[i], frame.intos[i * 2], size)
+        corner.distances[i] = math.max(after.subtract(p).dot(corner.ways[i]), behind.subtract(p).dot(corner.ways[i])) + size * 0.5
+    return corner
+
+## A Blend corner's tool, its patch named `name`: the hole between the
+## chamfers' ends (straight, from contact to contact) and curves on the
+## faces filled by setback.lucb's patch, G2 to the faces and the chamfers'
+## planes; the region between the sharp corner and the patch.
+func chamfer_blend_tool(w: const Shape*, corner: const Setback*, size: f64, name: str) -> interop.Reference[CadModel]!:
+    let frame = try setback_frame(w, corner, size)
+    let p = w.points.items[(usize)corner.vertex]
+    var curves = Growing[Vector3]()
+    defer curves.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var holes = Growing[HoleSide]()
+    defer holes.close()
+    for i in 0..<(usize)3:
+        let next = (i + 1) % 3
+        let foot = p.add(corner.ways[i].multiply_scalar(corner.distances[i]))
+        let ta = foot.add(frame.intos[i * 2].multiply_scalar(size))
+        let tb = foot.add(frame.intos[i * 2 + 1].multiply_scalar(size))
+        # The chamfer's end: its line, as a degree 5 curve of one span.
+        for k in 0..<6: try curves.push(ta.add(tb.subtract(ta).multiply_scalar((f64)k / 5.0)))
+        try holes.push(HoleSide(true, corner.ways[i]))
+        let cross = try contacts_cross(p, corner.ways[i], frame.intos[i * 2 + 1], size, corner.ways[next], frame.intos[next * 2], size)
+        let foot_next = p.add(corner.ways[next].multiply_scalar(corner.distances[next]))
+        let tc = foot_next.add(frame.intos[next * 2].multiply_scalar(size))
+        knots.clear()
+        try fillet_section(tb, tc, cross, 2, &curves, &knots)
+        try holes.push(HoleSide(false, face_outward(w, frame.faces[i])))
+    var quads = Growing[Vector3]()
+    defer quads.close()
+    var quad_knots = Growing[f64]()
+    defer quad_knots.close()
+    try corner_patch(curves.view(), knots.view(), holes.view(), 2, &quads, &quad_knots)
+    let slack = size * 1e-9
+    let cone = try corner_cone(w, corner, size)
+    for q in quads.view():
+        for i in 0..<(usize)3:
+            if q.subtract(p).dot(cone[i]) < -slack or q.subtract(p).dot(corner.ways[i]) > corner.distances[i] + slack:
+                error(invalid, "the Blend corner's patch would leave its corner: use a Chamfer corner there")
+    return try corner_solid(p, corner, quads.view(), cone[..<3], quad_knots.view(), quad_knots.count - 6, name)
