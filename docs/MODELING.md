@@ -1086,6 +1086,75 @@ Not yet: combs on isoparms and on curves on surfaces (Stage 2 brings 3D curves),
 marks and torsion quills, a radius band on combs, and checks between faces that share no edge
 (Stage 3's stitching).
 
+## The NURBS toolkit (`nurbs/`)
+
+Stage 1 of luced-3d's surfacing plan (`docs/research/SURFACING-ALIAS-PLASTICITY.md` there): The
+NURBS Book's structure algorithms (Piegl and Tiller, chapters 5 and 9), public, on curves and on
+B-spline faces with their trims. Everything works on homogeneous control points
+(`x w, y w, z w, w`), so a rational curve's algorithm is the polynomial one. The degree cap is 11
+(Rhino's rebuild bound; Alias builds to 9): the evaluators' bases are twelve wide.
+
+| Call | What it does |
+|---|---|
+| `CadSpline.make(points, weights, degree, knots)` | A rational B-spline curve; `at`, `curvature`, `point`, `weight`, `knot`, `low`, `high`. |
+| `inserted(t, times)` | Knot insertion (A5.1): the same curve, a control point more a knot. |
+| `knot_removed(t, times, tolerance)` | Knot removal (A5.8), as far as the curve stays within `tolerance` (eq. 5.30's bound). |
+| `elevated(by)` | Degree elevation: Bezier segments raised in closed form, then each inner knot taken back to its old continuity by exact removal. |
+| `lowered(tolerance)` | Degree reduction: a least-squares refit one degree lower, inner knots kept, ends held to tangents; refused beyond `tolerance`. |
+| `bezier()`, `piece(a, b)` | NURBS to Bezier (every inner knot to full multiplicity); a piece over `a..b` (split, extract). |
+| `rebuilt(degree, spans, keep, rational)` | A least-squares rebuild on uniform knots, its ends held to G`keep` (0–3); with `rational` false, weights 1. `deviation(other)` measures it. |
+| `CadNurbs.inserted(model, surface, direction, fraction, times)` | A knot inserted across a face's surface along u (0) or v (1). |
+| `knot_removed(model, surface, direction, fraction, times, tolerance)` | The inner knot nearest `fraction` removed from every row, if every row stays within `tolerance`. |
+| `degree_raised(model, surface, by_u, by_v)`, `degree_lowered(model, surface, direction, tolerance)` | Degree changes across the net. |
+| `rebuilt(model, surface, kind, degree_u, degree_v, spans_u, spans_v, keep_u, keep_v, tolerance, most)` | Alias's Rebuild Surface types (`rebuild_explicit` …): Explicit (degrees and spans, Explicit Control), Within tolerance (spans added where it is furthest off, Alias's Curvature), Reduce spans, Del multi knots, Non-rational, Bezier. |
+| `knots_matched(model, surface, other, other_surface, keep_u, keep_v)` | Match Knots: rebuilt on another surface's degrees and knots. |
+| `converted(model, surface)` | An analytic face (plane, cylinder, cone, sphere, torus) as an exact rational B-spline: a bilinear patch, or a surface of revolution (A8.1) of a line or arc profile through an arc (A7.1), over its faces' chart box. |
+| `structure`, `knot`, `knot_count`, `parameters_at`, `point_at`, `surface_of_face`, `surface_of_cv`, `first_cv` | What the UI reads: degrees, counts, spans, rational; knots as domain fractions; a point's parameters. |
+| `cloud_moved(cloud, ids, mode, amount, falloff, reach, exponent, curve)` | CV moves on a control vertex cloud (`cv_moves.lucb`): World, NUV, Slide, Project, Parallel and View, with Rows, Hull-distance or Radius falloff. `cloud_frame` and `cloud_row` give the gizmo's frame and a hull row's group. |
+
+Each surface edit returns a `CadNurbsEdit`: the model, how far the surface moved (0 for the exact
+edits) and how many control points or knots changed. The edited surface is marked edited, so its
+faces' trims take their nearest parameters on it (exact edits change nothing there); the B-rep's
+other edited marks now survive modeling operations too (`shape_of` and `brep_of` keep them).
+
+**Rebuilds hold continuity.** A fit (`fitting.lucb`) holds its first and last `keep + 1` control
+points so the result's derivatives up to `keep` at both ends are the source's: those control
+points follow from the end derivatives and the bases' derivatives there, one at a time. The rest
+is least squares on samples (twice degree + 1 a span), its normal equations a band factored by
+Cholesky. A surface is fitted along u for each v sample and for the v ends' cross derivatives (so
+the boundary's cross curvature fits too), then along v through those rows. So a G2 fillet rebuilt
+to two quintic spans held to G2 still measures G2 at its contacts. Explicit Control's single span
+of degree 7 holds G2 at both ends with its eight control points; G3 needs eight a direction.
+
+**Converting.** A face whose loops go round the axis with no seam edge (a sphere's caps from
+`CadSolids.sphere`) is refused: its trim would run off the B-spline's domain at the seam. Split
+it through the axis first. A sphere's or cone's face that caps the pole or apex runs to it.
+
+**CV clouds.** `CadGeometry.cv_cloud` points carry `cad_cv_model`, `cad_cv_surface`, `cad_cv_u`,
+`cad_cv_v`, `cad_cv_nu` and `cad_cv_nv`: a pick takes a hull row by them, and Rows falloff counts
+rows with them.
+
+Tests (`tests/regressions/nurbs_toolkit_tests.luc`), against closed forms:
+
+- **Exact edits.** Knot insertion (once, twice) and degree elevation (to 5 and to 11) leave a
+  circle of two rational quadratic arcs a circle to 1e-12; removal undoes an insertion; the
+  arcs' joint is no knot to remove within 1e-6; lowering a raised curve gives it back.
+- **Rebuilds.** A quarter circle rebuilt to four quintic spans held to G2 is within 1e-4, its end
+  curvature 1/3 to 1e-9; kept rational it is exact; a single span of degree 7 is within 1e-2.
+- **Surfaces.** On a G2 fillet's face: insertion and elevation keep the surface to 1e-12 and the
+  contacts G2; removal and lowering give them back; a two-span quintic rebuild held to G2 reports
+  its deviation and keeps the contacts G2, as does a single span of degree 7; Within tolerance
+  meets 1e-5; Bezier and Del multi knots are exact.
+- **Conversion.** A G1 fillet's cylinder becomes a rational B-spline within 1e-12 of radius r,
+  its contacts still G1; a cylinder's, a cone's and a torus's whole sides convert and mesh; a
+  sphere's cap is refused with the reason; a box face becomes a bilinear patch.
+- **CV moves.** On a 3 by 3 planar net: NUV moves the middle CV along the normal alone; Rows
+  falloff with one row moves a neighbor by 0.5^e and a corner by its square; hull distance 3
+  moves a neighbor two away by 1/3; Slide stops at the net's edge; Parallel moves two CVs alike.
+
+Not yet: knot vectors made compatible across a set of curves, reparameterization by chord
+length, extension (Stage 5), and Untrim (Stage 3).
+
 ## Sketches (`sketch/`)
 
 A sketch is points, lines, circles and arcs on a plane, and the constraints between them, as in

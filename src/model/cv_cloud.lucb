@@ -7,6 +7,12 @@
 ## keeps its exact f64 position and the per-face tessellation cache reuses
 ## every face they do not reach. A moved cv takes its exact old position
 ## plus the cloud point's change.
+##
+## Each point carries where it is in its net: `cad_cv_model` (the model's
+## index in the set), `cad_cv_surface` (its surface), `cad_cv_u` and
+## `cad_cv_v` (its row and column) and `cad_cv_nu` and `cad_cv_nv` (the
+## net's size), so a pick can take a whole row (Alias's hull picking) and
+## a falloff can count rows.
 
 ## The detail attribute that marks a cv cloud.
 let cloud_marker = ".cad_cvs"
@@ -21,10 +27,43 @@ pub func cloud_mesh(models: const interop.Reference[CadModel][]) -> interop.Refe
     for point in points.view(): _ = try builder.point(point)
     let bare = try builder.finish()
     defer bare.release()
+    var places = Growing[f64]()
+    defer places.close()
+    for at in 0..<models.length: try net_places(models[at].value(), at, &places)
+    var named = bare.clone()
+    let names: str[6] = ["cad_cv_model", "cad_cv_surface", "cad_cv_u", "cad_cv_v", "cad_cv_nu", "cad_cv_nv"]
+    var column = Growing[f64]()
+    defer column.close()
+    for k in 0..<(usize)6:
+        column.clear()
+        for at in 0..<points.count: try column.push(places.items[at * 6 + k])
+        let next = named.value().with_attribute(names[k], 0, 1, column.view()) catch failure:
+            named.release()
+            error(failure.code, failure.message)
+        named.release()
+        named = next
+    defer named.release()
     var marker = try Attribute.create(cloud_marker, Domain.detail, DataType.int32, 1, 1)
-    return bare.value().with_attribute_entry(marker) catch failure:
+    return named.value().with_attribute_entry(marker) catch failure:
         marker.release()
         error(failure.code, failure.message)
+
+## Model `index`'s cvs' places (model, surface, u, v, nu, nv), six numbers
+## a cv, in cv order, onto `out`.
+func net_places(model: const CadModel*, index: usize, out: Growing[f64]*) -> !:
+    let b = model.brep() else return
+    for surface in 0..<b.surface_count():
+        var record = try b.surface_record(surface)
+        defer record.close()
+        if record.kind != surface_spline: continue
+        for u in 0..<record.nu:
+            for v in 0..<record.nv:
+                try out.push((f64)index)
+                try out.push((f64)surface)
+                try out.push((f64)u)
+                try out.push((f64)v)
+                try out.push((f64)record.nu)
+                try out.push((f64)record.nv)
 
 ## Whether `mesh` is a cv cloud.
 pub func is_cloud(mesh: const Mesh*) -> bool:

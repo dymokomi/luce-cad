@@ -1,0 +1,254 @@
+## CV moves on a control vertex cloud (cv_cloud.lucb, whose points know
+## their net places), Alias's Transform CV modes with its Proportional
+## Modification and Plasticity's falloff along the hull:
+##   World and View: one displacement for every CV (View's in the screen
+##     plane, made by the caller);
+##   NUV: each CV along its own frame: amounts along the net's normal, its
+##     u and its v hull directions there;
+##   Slide: each CV along its own hull polyline, staying on it, by
+##     distances along u and v;
+##   Project: each CV along its own hull line (the straight line through
+##     its neighbors), off the polyline;
+##   Parallel: every CV along the first picked CV's hull lines.
+## A CV's frame comes from its hull: u from its neighbors along u (one
+## side at an end), v likewise, the normal their cross product. On a
+## planar net that is the plane's normal exactly.
+##
+## Falloff: the picked CVs move fully, others by a weight:
+##   Rows: within `reach` rows along u and v of a picked CV on its net,
+##     (1 - k / (reach + 1))^e along each (Alias's Preceding and Succeeding
+##     counts, its falloff exponent e from -5 to 5: 0 uniform, positive
+##     damping the far rows, negative moving them the other way);
+##   Hull: within a distance along the hull lines (Plasticity's), the same
+##     curve of the distance's fraction;
+##   Radius: within a straight distance, as the Edit node's soft radius,
+##     with its Linear, Quadratic, Cubic or Smooth curve.
+
+pub let cv_world: i64 = 0
+pub let cv_nuv: i64 = 1
+pub let cv_slide: i64 = 2
+pub let cv_project: i64 = 3
+pub let cv_parallel: i64 = 4
+pub let cv_view: i64 = 5
+
+pub let falloff_none: i64 = 0
+pub let falloff_rows: i64 = 1
+pub let falloff_hull: i64 = 2
+pub let falloff_radius: i64 = 3
+
+## A cloud's net places: per point, the model, surface, u, v, nu and nv.
+struct Places:
+    var model: Growing[i64]
+    var surface: Growing[i64]
+    var u: Growing[i64]
+    var v: Growing[i64]
+    var nu: Growing[i64]
+    var nv: Growing[i64]
+
+    func close():
+        self.model.close()
+        self.surface.close()
+        self.u.close()
+        self.v.close()
+        self.nu.close()
+        self.nv.close()
+
+    ## Point `i`'s neighbor `du`, `dv` rows away on its net (-1: off it).
+    func neighbor(i: usize, du: i64, dv: i64) -> i64:
+        let u = self.u.items[i] + du
+        let v = self.v.items[i] + dv
+        if u < 0 or v < 0 or u >= self.nu.items[i] or v >= self.nv.items[i]: return -1
+        return (i64)i + du * self.nv.items[i] + dv
+
+func places_of(cloud: const Mesh*) -> Places!:
+    var p = Places(Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64]())
+    errdefer p.close()
+    try read_place(cloud, "cad_cv_model", &p.model)
+    try read_place(cloud, "cad_cv_surface", &p.surface)
+    try read_place(cloud, "cad_cv_u", &p.u)
+    try read_place(cloud, "cad_cv_v", &p.v)
+    try read_place(cloud, "cad_cv_nu", &p.nu)
+    try read_place(cloud, "cad_cv_nv", &p.nv)
+    return p
+
+func read_place(cloud: const Mesh*, name: str, out: Growing[i64]*) -> !:
+    let column = cloud.find_attribute(name, 0)
+    if column < 0: error(invalid, "this control vertex cloud has no net places")
+    for i in 0..<(usize)cloud.point_count(): try out.push((i64)(try cloud.attribute_value(column, (i64)i)))
+
+## Point `i`'s hull direction along u (`along_u`) or v, unit (zero on a
+## net one CV wide that way).
+func hull_direction(points: const Vector3[], p: const Places*, i: usize, along_u: bool) -> Vector3:
+    let du: i64 = 1 if along_u else 0
+    let dv: i64 = 0 if along_u else 1
+    let ahead = p.neighbor(i, du, dv)
+    let behind = p.neighbor(i, -du, -dv)
+    let a = points[(usize)ahead] if ahead >= 0 else points[i]
+    let b = points[(usize)behind] if behind >= 0 else points[i]
+    return a.subtract(b).normalized() catch failure: recover Vector3()
+
+## Where point `i` ends up sliding `distance` along its hull polyline
+## (along u or v), past its neighbors onto the next segments; at the net's
+## end it stops.
+func slid(points: const Vector3[], p: const Places*, i: usize, along_u: bool, distance: f64) -> Vector3:
+    let sign: i64 = 1 if distance > 0.0 else -1
+    var left = math.abs(distance)
+    var at = points[i]
+    var k = (i64)i
+    while left > 0.0:
+        let next = p.neighbor((usize)k, sign if along_u else 0, 0 if along_u else sign)
+        if next < 0: return at
+        let target = points[(usize)next]
+        let gap = target.subtract(at).length()
+        if gap >= left: return at.add(target.subtract(at).multiply_scalar(left / gap))
+        left -= gap
+        at = target
+        k = next
+    return at
+
+## The falloff curve at fraction `x` of the reach: exponent `e`'s (see
+## the file's header).
+func falloff_curve(x: f64, e: f64) -> f64:
+    if x >= 1.0: return 0.0
+    let base = math.pow(1.0 - x, math.abs(e)) if e != 0.0 else 1.0
+    return base if e >= 0.0 or x == 0.0 else -base
+
+## The Edit node's soft radius curves: 0 linear, 1 quadratic, 2 cubic, 3
+## smooth.
+func radius_curve(x: f64, kind: i64) -> f64:
+    if x >= 1.0: return 0.0
+    let t = 1.0 - x
+    if kind == 0: return t
+    if kind == 1: return t * t
+    if kind == 2: return t * t * t
+    return t * t * (3.0 - 2.0 * t)
+
+## Each point's falloff weight from the picked `ids` into `weights`.
+func falloff_weights(points: const Vector3[], p: const Places*, ids: const i64[], falloff: i64, reach: Vector3, exponent: f64, curve_kind: i64, weights: Growing[f64]*) -> !:
+    let n = points.length
+    try weights.fill(n, 0.0)
+    for id in ids: weights.items[(usize)id] = 1.0
+    if falloff == falloff_rows:
+        let ru = (i64)math.max(0.0, math.round(reach.x))
+        let rv = (i64)math.max(0.0, math.round(reach.y))
+        for id in ids:
+            for du in -ru..<ru + 1:
+                for dv in -rv..<rv + 1:
+                    let k = p.neighbor((usize)id, du, dv)
+                    if k < 0: continue
+                    let w = falloff_curve((f64)(du if du >= 0 else -du) / (f64)(ru + 1), exponent) * falloff_curve((f64)(dv if dv >= 0 else -dv) / (f64)(rv + 1), exponent)
+                    if math.abs(w) > math.abs(weights.items[(usize)k]): weights.items[(usize)k] = w
+    elif falloff == falloff_hull:
+        # Distances along the hull lines from the picked CVs (Dijkstra on
+        # the nets, every edge its length).
+        var distance = Growing[f64]()
+        defer distance.close()
+        try distance.fill(n, math.infinity)
+        var done = Growing[bool]()
+        defer done.close()
+        try done.fill(n, false)
+        for id in ids: distance.items[(usize)id] = 0.0
+        while true:
+            var best: i64 = -1
+            for i in 0..<n:
+                if not done.items[i] and distance.items[i] < reach.z and (best < 0 or distance.items[i] < distance.items[(usize)best]): best = (i64)i
+            if best < 0: break
+            done.items[(usize)best] = true
+            for step in 0..<(usize)4:
+                let du: i64 = 1 if step == 0 else (-1 if step == 1 else 0)
+                let dv: i64 = 1 if step == 2 else (-1 if step == 3 else 0)
+                let k = p.neighbor((usize)best, du, dv)
+                if k < 0: continue
+                let through = distance.items[(usize)best] + points[(usize)k].subtract(points[(usize)best]).length()
+                if through < distance.items[(usize)k]: distance.items[(usize)k] = through
+        for i in 0..<n:
+            if weights.items[i] == 1.0 or not (distance.items[i] < reach.z): continue
+            weights.items[i] = falloff_curve(distance.items[i] / reach.z, exponent)
+    elif falloff == falloff_radius:
+        for i in 0..<n:
+            if weights.items[i] == 1.0: continue
+            var nearest = math.infinity
+            for id in ids: nearest = math.min(nearest, points[i].subtract(points[(usize)id]).length())
+            if nearest < reach.z: weights.items[i] = radius_curve(nearest / reach.z, curve_kind)
+
+## `cloud` with the CVs `ids` moved by `mode` (cv_world ...) by `amount`
+## (World and View: a displacement; NUV: along the normal, u and v; Slide,
+## Project and Parallel: along u and v), along `axis` for nothing yet
+## (reserved for a picked vector), their neighbors following by `falloff`
+## (reach: rows along u and v in x and y, a distance in z), its exponent or
+## the radius curve `curve_kind`.
+pub func moved_cvs(cloud: const Mesh*, ids: const i64[], mode: i64, amount: Vector3, falloff: i64, reach: Vector3, exponent: f64, curve_kind: i64) -> interop.Reference[Mesh]!:
+    if not amount.is_finite(): error(invalid, "a control vertex move must be finite")
+    let n = (usize)cloud.point_count()
+    for id in ids:
+        if id < 0 or (usize)id >= n: error(invalid, "a picked control vertex is not in the cloud")
+    if ids.length == 0: error(invalid, "pick control vertices to move")
+    var p = try places_of(cloud)
+    defer p.close()
+    var points = Growing[Vector3]()
+    defer points.close()
+    for i in 0..<n: try points.push(try cloud.point((i64)i))
+    var weights = Growing[f64]()
+    defer weights.close()
+    try falloff_weights(points.view(), &p, ids, falloff, reach, exponent, curve_kind, &weights)
+    # Parallel: the first picked CV's hull lines, for all.
+    let first = (usize)ids[0]
+    let shared_u = hull_direction(points.view(), &p, first, true)
+    let shared_v = hull_direction(points.view(), &p, first, false)
+    var moved = Growing[Vector3]()
+    defer moved.close()
+    for i in 0..<n:
+        let w = weights.items[i]
+        let at = points.items[i]
+        if w == 0.0:
+            try moved.push(at)
+            continue
+        var next = at
+        if mode == cv_world or mode == cv_view:
+            next = at.add(amount.multiply_scalar(w))
+        elif mode == cv_nuv:
+            let u = hull_direction(points.view(), &p, i, true)
+            let v = hull_direction(points.view(), &p, i, false)
+            let normal = u.cross(v).normalized() catch failure: recover Vector3()
+            next = at.add(normal.multiply_scalar(amount.x * w)).add(u.multiply_scalar(amount.y * w)).add(v.multiply_scalar(amount.z * w))
+        elif mode == cv_slide:
+            next = slid(points.view(), &p, i, true, amount.x * w)
+            next = next.add(slid(points.view(), &p, i, false, amount.y * w).subtract(at))
+        elif mode == cv_project:
+            next = at.add(hull_direction(points.view(), &p, i, true).multiply_scalar(amount.x * w)).add(hull_direction(points.view(), &p, i, false).multiply_scalar(amount.y * w))
+        elif mode == cv_parallel:
+            next = at.add(shared_u.multiply_scalar(amount.x * w)).add(shared_v.multiply_scalar(amount.y * w))
+        else: error(invalid, "unknown control vertex move mode")
+        try moved.push(next)
+    return try cloud.with_positions(moved.view())
+
+## The NUV frame (normal, u, v) at cloud point `id`, for the gizmo.
+pub func cv_hull_frame(cloud: const Mesh*, id: i64, which: i64) -> Vector3!:
+    let n = (usize)cloud.point_count()
+    if id < 0 or (usize)id >= n: error(invalid, "that control vertex is not in the cloud")
+    var p = try places_of(cloud)
+    defer p.close()
+    var points = Growing[Vector3]()
+    defer points.close()
+    for i in 0..<n: try points.push(try cloud.point((i64)i))
+    let u = hull_direction(points.view(), &p, (usize)id, true)
+    let v = hull_direction(points.view(), &p, (usize)id, false)
+    if which == 1: return u
+    if which == 2: return v
+    return u.cross(v).normalized() catch failure: recover Vector3(0.0, 0.0, 1.0)
+
+## The cloud points of the row through `id`: along v (its u fixed, `which`
+## 0), along u (its v fixed, 1) or its whole net (2), as a group
+## expression on the cloud.
+pub func cv_row(cloud: const Mesh*, id: i64, which: i64, out: Growing[u8]*) -> !:
+    var p = try places_of(cloud)
+    defer p.close()
+    if id < 0 or (usize)id >= p.u.count: error(invalid, "that control vertex is not in the cloud")
+    let i = (usize)id
+    var buffer: u8[200]
+    var text = try strings.format(buffer, f"@cad_cv_model={p.model.items[i]} &@cad_cv_surface={p.surface.items[i]}")
+    var more: u8[240]
+    if which == 0: text = try strings.format(more, f"{text} &@cad_cv_u={p.u.items[i]}")
+    elif which == 1: text = try strings.format(more, f"{text} &@cad_cv_v={p.v.items[i]}")
+    out.clear()
+    for byte in text.bytes: try out.push(byte)

@@ -28,7 +28,7 @@ pub struct NurbsCurve:
         let count = (i64)points.length
         if not math.is_finite(t) or t < knots[(usize)degree] or t > knots[(usize)count]:
             error(invalid, "curve parameter outside knot domain")
-        var values: f64[9]
+        var values: f64[12]
         let first = nurbs_basis(knots, count, degree, t, &values)
         var total: f64 = 0.0
         var position = Vector3()
@@ -48,14 +48,14 @@ pub struct NurbsCurve:
         let count = (i64)points.length
         if not math.is_finite(t) or t < knots[(usize)degree] or t > knots[(usize)count]:
             error(invalid, "curve parameter outside knot domain")
-        var ders: f64[27]
+        var ders: f64[36]
         let first = basis_derivatives(knots, count, degree, t, &ders)
         var a = [Vector3(), Vector3(), Vector3()]
         var w: f64[3] = [0.0, 0.0, 0.0]
         for k in 0..<(usize)3:
             for at in 0..<(usize)degree + 1:
                 let index = first + at
-                let weight = ders[k * 9 + at] * weights[index]
+                let weight = ders[k * 12 + at] * weights[index]
                 w[k] += weight
                 a[k] = a[k].add(points[index].multiply_scalar(weight))
         if w[0] <= 0.0 or not math.is_finite(w[0]):
@@ -112,7 +112,7 @@ func validate(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, d
             error(invalid, "NURBS requires finite control points and positive weights")
 
 func check_knots(knots: const f64[], count: i64, degree: i64) -> !:
-    if degree < 1 or degree > 8 or degree >= count or knots.length != (usize)(count + degree + 1):
+    if degree < 1 or degree > 11 or degree >= count or knots.length != (usize)(count + degree + 1):
         error(invalid, "invalid NURBS degree or knot count")
     for index in 0..<knots.length:
         if not math.is_finite(knots[index]) or (index > 0 and knots[index] < knots[index - 1]):
@@ -124,7 +124,7 @@ func check_knots(knots: const f64[], count: i64, degree: i64) -> !:
 ## `values`, and the first one's index: a bisected span, then local
 ## Cox-de Boor, so sampling does not grow with the net. Evaluators that
 ## share an isoparameter (Newton differences, line searches) reuse them.
-pub inline func nurbs_basis(knots: const f64[], count: i64, degree: i64, t: f64, values: f64[9]*) -> usize:
+pub inline func nurbs_basis(knots: const f64[], count: i64, degree: i64, t: f64, values: f64[12]*) -> usize:
     var low = (usize)degree
     var high = (usize)count
     while low + 1 < high:
@@ -132,8 +132,8 @@ pub inline func nurbs_basis(knots: const f64[], count: i64, degree: i64, t: f64,
         if t < knots[middle]: high = middle
         else: low = middle
     let span = low
-    var left: f64[9]
-    var right: f64[9]
+    var left: f64[12]
+    var right: f64[12]
     (*values)[0] = 1.0
     for level in 1..<(usize)degree + 1:
         left[level] = t - knots[span + 1 - level]
@@ -148,21 +148,21 @@ pub inline func nurbs_basis(knots: const f64[], count: i64, degree: i64, t: f64,
     return span - (usize)degree
 
 ## Nonzero basis functions and their first two derivatives at `t`:
-## basis_jet's first 27 values (orders 0 to 2), the right-hand limit at a
+## basis_jet's first 36 values (orders 0 to 2), the right-hand limit at a
 ## knot. Returns `first`.
-pub func basis_derivatives(knots: const f64[], count: i64, degree: i64, t: f64, ders: f64[27]*) -> usize:
-    var full: f64[36]
+pub func basis_derivatives(knots: const f64[], count: i64, degree: i64, t: f64, ders: f64[36]*) -> usize:
+    var full: f64[48]
     let first = basis_jet(knots, count, degree, t, false, &full)
-    for j in 0..<27: (*ders)[j] = full[j]
+    for j in 0..<36: (*ders)[j] = full[j]
     return first
 
 ## Nonzero basis functions and their first three derivatives at `t` (Piegl
-## and Tiller, The NURBS Book, A2.3): `ders[k * 9 + j]` is the k-th
+## and Tiller, The NURBS Book, A2.3): `ders[k * 12 + j]` is the k-th
 ## derivative of basis function first + j (zero beyond the degree). Returns
 ## `first`. At an inner knot the bases' derivatives jump: `left` takes the
 ## limit from below (the span ending at `t`), otherwise from above. A zero
 ## knot difference (repeated knots) divides to 0: that basis is zero there.
-pub func basis_jet(knots: const f64[], count: i64, degree: i64, t: f64, left: bool, ders: f64[36]*) -> usize:
+pub func basis_jet(knots: const f64[], count: i64, degree: i64, t: f64, left: bool, ders: f64[48]*) -> usize:
     var low = (usize)degree
     var high = (usize)count
     while low + 1 < high:
@@ -173,23 +173,23 @@ pub func basis_jet(knots: const f64[], count: i64, degree: i64, t: f64, left: bo
     if left:
         while span > (usize)degree and knots[span] >= t: span -= 1
     let p = (usize)degree
-    var ndu: f64[81]
-    var left_gap: f64[9]
-    var right_gap: f64[9]
+    var ndu: f64[144]
+    var left_gap: f64[12]
+    var right_gap: f64[12]
     ndu[0] = 1.0
     for j in 1..<p + 1:
         left_gap[j] = t - knots[span + 1 - j]
         right_gap[j] = knots[span + j] - t
         var saved: f64 = 0.0
         for r in 0..<j:
-            ndu[j * 9 + r] = right_gap[r + 1] + left_gap[j - r]
-            let temporary = ndu[r * 9 + j - 1] / ndu[j * 9 + r] if ndu[j * 9 + r] != 0.0 else 0.0
-            ndu[r * 9 + j] = saved + right_gap[r + 1] * temporary
+            ndu[j * 12 + r] = right_gap[r + 1] + left_gap[j - r]
+            let temporary = ndu[r * 12 + j - 1] / ndu[j * 12 + r] if ndu[j * 12 + r] != 0.0 else 0.0
+            ndu[r * 12 + j] = saved + right_gap[r + 1] * temporary
             saved = left_gap[j - r] * temporary
-        ndu[j * 9 + j] = saved
-    for j in 0..<36: (*ders)[j] = 0.0
-    for j in 0..<p + 1: (*ders)[j] = ndu[j * 9 + p]
-    var a: f64[18]
+        ndu[j * 12 + j] = saved
+    for j in 0..<48: (*ders)[j] = 0.0
+    for j in 0..<p + 1: (*ders)[j] = ndu[j * 12 + p]
+    var a: f64[24]
     for r in 0..<p + 1:
         var s1: usize = 0
         var s2: usize = 1
@@ -200,29 +200,29 @@ pub func basis_jet(knots: const f64[], count: i64, degree: i64, t: f64, left: bo
             let rk = (i64)r - (i64)k
             let pk = p - k
             if r >= k:
-                let denominator = ndu[(pk + 1) * 9 + (usize)rk]
-                a[s2 * 9] = a[s1 * 9] / denominator if denominator != 0.0 else 0.0
-                d = a[s2 * 9] * ndu[(usize)rk * 9 + pk]
+                let denominator = ndu[(pk + 1) * 12 + (usize)rk]
+                a[s2 * 12] = a[s1 * 12] / denominator if denominator != 0.0 else 0.0
+                d = a[s2 * 12] * ndu[(usize)rk * 12 + pk]
             let j1: i64 = 1 if rk >= -1 else -rk
             let j2: i64 = (i64)k - 1 if (i64)r - 1 <= (i64)pk else (i64)(p - r)
             var j = j1
             while j <= j2:
-                let denominator = ndu[(pk + 1) * 9 + (usize)(rk + j)]
-                a[s2 * 9 + (usize)j] = (a[s1 * 9 + (usize)j] - a[s1 * 9 + (usize)j - 1]) / denominator if denominator != 0.0 else 0.0
-                d += a[s2 * 9 + (usize)j] * ndu[(usize)(rk + j) * 9 + pk]
+                let denominator = ndu[(pk + 1) * 12 + (usize)(rk + j)]
+                a[s2 * 12 + (usize)j] = (a[s1 * 12 + (usize)j] - a[s1 * 12 + (usize)j - 1]) / denominator if denominator != 0.0 else 0.0
+                d += a[s2 * 12 + (usize)j] * ndu[(usize)(rk + j) * 12 + pk]
                 j += 1
             if r <= pk:
-                let denominator = ndu[(pk + 1) * 9 + r]
-                a[s2 * 9 + k] = -a[s1 * 9 + k - 1] / denominator if denominator != 0.0 else 0.0
-                d += a[s2 * 9 + k] * ndu[r * 9 + pk]
-            (*ders)[k * 9 + r] = d
+                let denominator = ndu[(pk + 1) * 12 + r]
+                a[s2 * 12 + k] = -a[s1 * 12 + k - 1] / denominator if denominator != 0.0 else 0.0
+                d += a[s2 * 12 + k] * ndu[r * 12 + pk]
+            (*ders)[k * 12 + r] = d
             let swap = s1
             s1 = s2
             s2 = swap
     var factor = (f64)p
     for k in 1..<(usize)4:
         if k > p: break
-        for j in 0..<p + 1: (*ders)[k * 9 + j] *= factor
+        for j in 0..<p + 1: (*ders)[k * 12 + j] *= factor
         factor *= (f64)(p - k)
     return span - p
 
@@ -230,14 +230,14 @@ pub func basis_jet(knots: const f64[], count: i64, degree: i64, t: f64, left: bo
 ## CAD import: scalar sums in the same order as the
 ## Vector3 form (fp contraction is off), so results are bit-identical.
 func net_point(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
-    var bu: f64[9]
-    var bv: f64[9]
+    var bu: f64[12]
+    var bv: f64[12]
     let first_u = nurbs_basis(ku, nu, du, u, &bu)
     let first_v = nurbs_basis(kv, nv, dv, v, &bv)
     return try nurbs_combine(points, weights, nv, du, dv, first_u, &bu, first_v, &bv)
 
 ## The rational point for two precomputed bases, summed exactly as evaluate().
-pub func nurbs_combine(points: const Vector3[], weights: const f64[], nv: i64, du: i64, dv: i64, first_u: usize, bu: f64[9]*, first_v: usize, bv: f64[9]*) -> Vector3!:
+pub func nurbs_combine(points: const Vector3[], weights: const f64[], nv: i64, du: i64, dv: i64, first_u: usize, bu: f64[12]*, first_v: usize, bv: f64[12]*) -> Vector3!:
     var x: f64 = 0.0
     var y: f64 = 0.0
     var z: f64 = 0.0
@@ -265,9 +265,9 @@ pub func nurbs_combine(points: const Vector3[], weights: const f64[], nv: i64, d
 pub func surface_normal_checked(points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], u: f64, v: f64) -> Vector3!:
     if not math.is_finite(u) or not math.is_finite(v) or u < ku[(usize)du] or u > ku[(usize)nu] or v < kv[(usize)dv] or v > kv[(usize)nv]:
         error(invalid, "normal parameter outside knot domain")
-    # Bases at [0..9], first derivatives at [9..18].
-    var bu: f64[27]
-    var bv: f64[27]
+    # Bases at [0..12], first derivatives at [12..24].
+    var bu: f64[36]
+    var bv: f64[36]
     let first_u = basis_derivatives(ku, nu, du, u, &bu)
     let first_v = basis_derivatives(kv, nv, dv, v, &bv)
     var px: f64 = 0.0
@@ -290,8 +290,8 @@ pub func surface_normal_checked(points: const Vector3[], weights: const f64[], n
         for iv in 0..<(usize)dv + 1:
             let index = (first_u + iu) * (usize)nv + first_v + iv
             let weight = bu[iu] * bv[iv] * weights[index]
-            let uweight = bu[9 + iu] * bv[iv] * weights[index]
-            let vweight = bu[iu] * bv[9 + iv] * weights[index]
+            let uweight = bu[12 + iu] * bv[iv] * weights[index]
+            let vweight = bu[iu] * bv[12 + iv] * weights[index]
             let q = points[index]
             let rx = q.x - origin.x
             let ry = q.y - origin.y
@@ -355,7 +355,7 @@ pub func interpolate_cubic(points: const Vector3[], net: Growing[Vector3]*, knot
     defer band.close()
     try band.fill(n * 7, 0.0)
     for k in 0..<n:
-        var values: f64[9]
+        var values: f64[12]
         let first = nurbs_basis(knots.view(), (i64)n, 3, u.items[k], &values)
         for c in 0..<(usize)4:
             let column = first + c

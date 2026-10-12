@@ -1,0 +1,485 @@
+## Luce's NURBS toolkit: CadNurbs edits a model's B-spline surfaces (knots,
+## degree, rebuilds, conversion of analytic faces) and returns the model
+## changed with how far it moved; CadSpline is a curve with the same
+## operations. Surfaces are named by index (the B-rep's order, as
+## CadModel.face_surface_id gives them; CadNurbs.surface_of_cv for a
+## control vertex).
+
+## What a structure edit made: the model, how far its surface moved (0 for
+## the exact edits) and how many knots went or came in.
+pub struct CadNurbsEdit:
+    var made: interop.Reference[CadModel]?
+    pub var deviation: f64
+    pub var changed: i64
+
+    pub func init():
+        self.made = none
+        self.deviation = 0.0
+        self.changed = 0
+
+    pub func model() -> interop.Reference[CadModel]!:
+        let made = self.made else error(invalid, "a NURBS edit has no model")
+        return made.clone()
+
+    pub func close():
+        if let made = self.made: made.release()
+        self.made = none
+
+pub let cad_nurbs_edit_type: interop.Type[CadNurbsEdit] = interop.Type[CadNurbsEdit]("CadNurbsEdit", CadNurbsEdit.close, closeable = true)
+
+## A surface's structure: its kind (geometry's surface kinds, 3 a
+## B-spline), and for a B-spline its degrees, control point counts, spans
+## and whether it is rational.
+pub struct NetShape:
+    pub var kind: i64
+    pub var du: i64
+    pub var dv: i64
+    pub var nu: i64
+    pub var nv: i64
+    pub var spans_u: i64
+    pub var spans_v: i64
+    pub var rational: bool
+
+## Rebuild kinds (CadNurbs.rebuilt), Alias's Rebuild Surface types.
+## Explicit: the degrees and spans asked for (Explicit Control).
+pub let rebuild_explicit: i64 = 0
+## Within tolerance: spans added where it is furthest off (Curvature).
+pub let rebuild_tolerance: i64 = 1
+## Reduce Spans: inner knots removed while it stays within tolerance.
+pub let rebuild_reduce: i64 = 2
+## Del Multi Knots: every inner knot down to one, within tolerance.
+pub let rebuild_single: i64 = 3
+## Non-rational: weights 1 on the same knots.
+pub let rebuild_polynomial: i64 = 4
+## NURBS to Bezier: every inner knot to full multiplicity.
+pub let rebuild_bezier: i64 = 5
+
+## The NURBS toolkit on a model's surfaces, as static functions.
+pub struct CadNurbs:
+    let reserved: u8 = 0
+
+    ## The surface of the face named `face` (CadModeling.face_name_of).
+    pub static func surface_of_face(model: interop.Reference[CadModel], face: str) -> i64!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        for f in 0..<w.faces.count:
+            if w.face_name(f) == face: return w.faces.items[f].surface
+        error(invalid, "a face this operation refers to is gone: pick it again")
+
+    ## The surface whose net holds control vertex `cv` (CadModel.cv_position's).
+    pub static func surface_of_cv(model: interop.Reference[CadModel], cv: i64) -> i64!:
+        let b = model.value().brep() else error(invalid, "this model has no B-rep")
+        return try b.cv_surface(cv)
+
+    ## The first control vertex of surface `surface`'s net, and (with
+    ## its NetShape) where each of the others is: first + u nv + v.
+    pub static func first_cv(model: interop.Reference[CadModel], surface: i64) -> i64!:
+        let b = model.value().brep() else error(invalid, "this model has no B-rep")
+        for cv in 0..<b.cv_count():
+            if (try b.cv_surface(cv)) == surface: return cv
+        error(invalid, "that surface has no control vertices")
+
+    ## Surface `surface`'s structure.
+    pub static func structure(model: interop.Reference[CadModel], surface: i64) -> NetShape!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        let s = try surface_in(&w, surface)
+        if s.kind != surface_spline: return NetShape(s.kind, 0, 0, 0, 0, 0, 0, false)
+        var net = try net_of(s)
+        defer net.close()
+        return NetShape(s.kind, s.du, s.dv, s.nu, s.nv, distinct_spans(&net.ku, s.du, s.nu), distinct_spans(&net.kv, s.dv, s.nv), net.rational())
+
+    ## Knot `index` of surface `surface` along `direction` (0 u, 1 v), as a
+    ## fraction of its domain; its knot count by knot_count.
+    pub static func knot(model: interop.Reference[CadModel], surface: i64, direction: i64, index: i64) -> f64!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        let s = try surface_in(&w, surface)
+        if s.kind != surface_spline: error(invalid, "this face is not a B-spline")
+        let knots = s.ku if direction == 0 else s.kv
+        let degree = s.du if direction == 0 else s.dv
+        let count = s.nu if direction == 0 else s.nv
+        if index < 0 or (usize)index >= knots.length: error(invalid, "knot out of range")
+        let low = knots[(usize)degree]
+        let high = knots[(usize)count]
+        return (knots[(usize)index] - low) / (high - low)
+
+    pub static func knot_count(model: interop.Reference[CadModel], surface: i64, direction: i64) -> i64!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        let s = try surface_in(&w, surface)
+        if s.kind != surface_spline: return 0
+        return (i64)(s.ku.length if direction == 0 else s.kv.length)
+
+    ## The fractions of surface `surface`'s domain (u, v) nearest `p`.
+    pub static func parameters_at(model: interop.Reference[CadModel], surface: i64, p: Vector3) -> Vector3!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        let s = try surface_in(&w, surface)
+        if s.kind != surface_spline: error(invalid, "this face is not a B-spline")
+        return try nearest_parameters(*s, p, Vector3(0.5, 0.5, 0.0), true)
+
+    ## The point of surface `surface` at domain fractions (u, v).
+    pub static func point_at(model: interop.Reference[CadModel], surface: i64, u: f64, v: f64) -> Vector3!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        let s = try surface_in(&w, surface)
+        if s.kind != surface_spline: error(invalid, "this face is not a B-spline")
+        var net = try net_of(s)
+        defer net.close()
+        return net.point_at(net.u_low() + (net.u_high() - net.u_low()) * u, net.v_low() + (net.v_high() - net.v_low()) * v)
+
+    ## The control vertices' frames for NUV moves (Alias's NUV, Rhino's
+    ## MoveUVN): at control vertex `cv`'s Greville point its surface's unit
+    ## normal (`which` 0), u tangent (1) or v tangent (2).
+    pub static func cv_frame(model: interop.Reference[CadModel], cv: i64, which: i64) -> Vector3!:
+        let b = model.value().brep() else error(invalid, "this model has no B-rep")
+        let surface = try b.cv_surface(cv)
+        var w = try shape_of(model.value())
+        defer w.close()
+        let s = try surface_in(&w, surface)
+        if s.kind != surface_spline: error(invalid, "this face is not a B-spline")
+        var first: i64 = 0
+        for k in 0..<b.cv_count():
+            if (try b.cv_surface(k)) == surface:
+                first = k
+                break
+        let at = cv - first
+        let iu = (usize)(at // s.nv)
+        let iv = (usize)(at % s.nv)
+        var net = try net_of(s)
+        defer net.close()
+        let u = greville(net.ku.view(), iu, net.du)
+        let v = greville(net.kv.view(), iv, net.dv)
+        var a: Weighted[16]
+        var e: Weighted[16]
+        net.partials(u, v, &a)
+        euclidean_partials(&a, &e)
+        let su = Vector3(e[4].x, e[4].y, e[4].z)
+        let sv = Vector3(e[1].x, e[1].y, e[1].z)
+        let chosen = su if which == 1 else (sv if which == 2 else su.cross(sv))
+        return chosen.normalized() catch failure: error(invalid, "this control vertex's surface is degenerate there")
+
+    ## Control vertex cloud `cloud` (CadGeometry.cv_cloud) with points `ids`
+    ## moved in `mode` (cv_world, cv_nuv, cv_slide, cv_project, cv_parallel,
+    ## cv_view) by `amount`, the others following by `falloff`
+    ## (falloff_none, falloff_rows, falloff_hull, falloff_radius) within
+    ## `reach` (rows along u and v in x and y, a distance in z) with
+    ## `exponent` (rows and hull) or the radius curve `curve_kind`
+    ## (cv_moves.lucb). CadGeometry.with_cv_cloud takes the moved cloud back.
+    pub static func cloud_moved(cloud: interop.Reference[Mesh], ids: const i64[], mode: i64, amount: Vector3, falloff: i64 = 0, reach: Vector3 = Vector3(), exponent: f64 = 1.0, curve_kind: i64 = 3) -> interop.Reference[Mesh]!:
+        if exponent < -5.0 or exponent > 5.0: error(invalid, "a falloff's exponent is -5 to 5")
+        return try moved_cvs(try cloud.get(), ids, mode, amount, falloff, reach, exponent, curve_kind)
+
+    ## Cloud point `id`'s hull frame: its net's normal there (`which` 0),
+    ## its u (1) or v (2) hull direction.
+    pub static func cloud_frame(cloud: interop.Reference[Mesh], id: i64, which: i64) -> Vector3!:
+        return try cv_hull_frame(try cloud.get(), id, which)
+
+    ## The group expression of the row through cloud point `id`: along v
+    ## (`which` 0, its u fixed), along u (1), or its whole net (2).
+    pub static func cloud_row(cloud: interop.Reference[Mesh], id: i64, which: i64) -> interop.Owned[str]!:
+        var text = Growing[u8]()
+        defer text.close()
+        try cv_row(try cloud.get(), id, which, &text)
+        return try interop.copy_text((str)text.view())
+
+    ## Knot `fraction` (of the domain) inserted `times` times along
+    ## `direction` (0 u, 1 v) in surface `surface`: the same surface, one
+    ## more row of control vertices a knot (Alias's Insert).
+    pub static func inserted(model: interop.Reference[CadModel], surface: i64, direction: i64, fraction: f64, times: i64 = 1) -> interop.Reference[CadNurbsEdit]!:
+        if not (fraction > 0.0 and fraction < 1.0): error(invalid, "a knot goes inside the surface, between 0 and 1")
+        if times < 1: error(invalid, "insert a knot at least once")
+        var w = try shape_of(model.value())
+        defer w.close()
+        var net = try net_of(try surface_in(&w, surface))
+        defer net.close()
+        let done = try net_insert(&net, direction, fraction, (usize)times)
+        if done == 0: error(invalid, "that knot is already there as often as the degree allows")
+        return try edit_of(&w, surface, &net, false, 0.0, (i64)done)
+
+    ## The inner knot nearest `fraction` along `direction` removed up to
+    ## `times` times, as far as the surface stays within `tolerance`.
+    pub static func knot_removed(model: interop.Reference[CadModel], surface: i64, direction: i64, fraction: f64, times: i64, tolerance: f64) -> interop.Reference[CadNurbsEdit]!:
+        if not (tolerance >= 0.0): error(invalid, "a tolerance cannot be negative")
+        var w = try shape_of(model.value())
+        defer w.close()
+        var net = try net_of(try surface_in(&w, surface))
+        defer net.close()
+        var before = try net.copy()
+        defer before.close()
+        let gone = try net_remove(&net, direction, fraction, (usize)times, tolerance)
+        if gone == 0:
+            var buffer: u8[160]
+            error(invalid, try strings.format(buffer, f"removing that knot would move the surface more than {tolerance}"))
+        return try edit_of(&w, surface, &net, true, net_deviation(&before, &net, 12), (i64)gone)
+
+    ## The degrees raised by `by_u` and `by_v` (the same surface).
+    pub static func degree_raised(model: interop.Reference[CadModel], surface: i64, by_u: i64, by_v: i64) -> interop.Reference[CadNurbsEdit]!:
+        if by_u < 0 or by_v < 0 or by_u + by_v == 0: error(invalid, "raise the degree by at least one")
+        var w = try shape_of(model.value())
+        defer w.close()
+        var net = try net_of(try surface_in(&w, surface))
+        defer net.close()
+        try net_elevate(&net, 0, (usize)by_u)
+        try net_elevate(&net, 1, (usize)by_v)
+        return try edit_of(&w, surface, &net, false, 0.0, by_u + by_v)
+
+    ## The degree along `direction` lowered by one, refused when the surface
+    ## would move more than `tolerance`.
+    pub static func degree_lowered(model: interop.Reference[CadModel], surface: i64, direction: i64, tolerance: f64) -> interop.Reference[CadNurbsEdit]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var net = try net_of(try surface_in(&w, surface))
+        defer net.close()
+        var deviation = 0.0
+        try net_reduce(&net, direction, tolerance, &deviation)
+        return try edit_of(&w, surface, &net, true, deviation, 1)
+
+    ## Rebuild (Alias's Rebuild Surface) of kind `kind` (rebuild_explicit
+    ## ...): degrees `degree_u`, `degree_v` (1 to 11) and `spans_u`,
+    ## `spans_v` for Explicit (and as the start of Within tolerance, up to
+    ## `most` spans a direction); its boundary held to G`keep_u` across its
+    ## u ends and G`keep_v` across its v ends; `tolerance` for the kinds
+    ## that keep within one. The edit's deviation is how far it moved.
+    pub static func rebuilt(model: interop.Reference[CadModel], surface: i64, kind: i64, degree_u: i64, degree_v: i64, spans_u: i64, spans_v: i64,
+                            keep_u: i64 = 0, keep_v: i64 = 0, tolerance: f64 = 0.01, most: i64 = 32) -> interop.Reference[CadNurbsEdit]!:
+        if degree_u < 1 or degree_u > most_degree or degree_v < 1 or degree_v > most_degree: error(invalid, "a rebuild's degrees are 1 to 11")
+        if spans_u < 1 or spans_v < 1 or spans_u > 256 or spans_v > 256: error(invalid, "a rebuild's spans are 1 to 256")
+        if keep_u < 0 or keep_u > 3 or keep_v < 0 or keep_v > 3: error(invalid, "a rebuild keeps G0 to G3 at its edges")
+        var w = try shape_of(model.value())
+        defer w.close()
+        var net = try net_of(try surface_in(&w, surface))
+        defer net.close()
+        var deviation = 0.0
+        var changed: i64 = 0
+        if kind == rebuild_explicit or kind == rebuild_tolerance:
+            let ceiling = (usize)math.max((f64)most, math.max((f64)spans_u, (f64)spans_v))
+            let start_u = (usize)spans_u
+            let start_v = (usize)spans_v
+            let tol = tolerance if kind == rebuild_tolerance else math.infinity
+            let made = try refit_within(&net, degree_u, degree_v, start_u, start_v, ceiling, (usize)keep_u, (usize)keep_v, true, tol, &deviation)
+            changed = (i64)(made.nu * made.nv) - (i64)(net.nu * net.nv)
+            net.close()
+            net = made
+        elif kind == rebuild_reduce or kind == rebuild_single:
+            var before = try net.copy()
+            defer before.close()
+            for direction in 0..<(i64)2: changed += (i64)(try net_reduce_spans(&net, direction, tolerance, kind == rebuild_single))
+            deviation = net_deviation(&before, &net, 12)
+        elif kind == rebuild_polynomial:
+            var before = try net.copy()
+            defer before.close()
+            let made = try refit_net(&net, net.du, net.ku.view(), net.dv, net.kv.view(), (usize)keep_u, (usize)keep_v, false)
+            net.close()
+            net = made
+            deviation = net_deviation(&before, &net, 12)
+        elif kind == rebuild_bezier:
+            let before = (i64)(net.nu * net.nv)
+            try net_bezier(&net, 0)
+            try net_bezier(&net, 1)
+            changed = (i64)(net.nu * net.nv) - before
+        else: error(invalid, "unknown rebuild kind")
+        return try edit_of(&w, surface, &net, kind != rebuild_bezier, deviation, changed)
+
+    ## Surface `surface` rebuilt on surface `other`'s degrees and knots
+    ## (Alias's Match Knots; `other`'s domain stretched onto this one's).
+    pub static func knots_matched(model: interop.Reference[CadModel], surface: i64, other: interop.Reference[CadModel], other_surface: i64, keep_u: i64 = 0, keep_v: i64 = 0) -> interop.Reference[CadNurbsEdit]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var o = try shape_of(other.value())
+        defer o.close()
+        var net = try net_of(try surface_in(&w, surface))
+        defer net.close()
+        var target = try net_of(try surface_in(&o, other_surface))
+        defer target.close()
+        var ku = Growing[f64]()
+        defer ku.close()
+        var kv = Growing[f64]()
+        defer kv.close()
+        for k in target.ku.view(): try ku.push(net.u_low() + (net.u_high() - net.u_low()) * (k - target.u_low()) / (target.u_high() - target.u_low()))
+        for k in target.kv.view(): try kv.push(net.v_low() + (net.v_high() - net.v_low()) * (k - target.v_low()) / (target.v_high() - target.v_low()))
+        let made = try refit_net(&net, target.du, ku.view(), target.dv, kv.view(), (usize)keep_u, (usize)keep_v, true)
+        let deviation = net_deviation(&net, &made, 12)
+        net.close()
+        net = made
+        return try edit_of(&w, surface, &net, true, deviation, 0)
+
+    ## Analytic surface `surface` (plane, cylinder, cone, sphere, torus) as
+    ## an exact rational B-spline over its faces.
+    pub static func converted(model: interop.Reference[CadModel], surface: i64) -> interop.Reference[CadNurbsEdit]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        _ = try surface_in(&w, surface)
+        var net = try analytic_net(&w, (usize)surface)
+        defer net.close()
+        # The spline's normal (du x dv) against the support's, at a point
+        # inside: where they disagree, its faces turn to keep facing out.
+        let old = w.surfaces.items[(usize)surface]
+        let p = net.point_at((net.u_low() + net.u_high()) * 0.5, (net.v_low() + net.v_high()) * 0.5)
+        var a: Weighted[16]
+        var e: Weighted[16]
+        net.partials((net.u_low() + net.u_high()) * 0.5, (net.v_low() + net.v_high()) * 0.5, &a)
+        euclidean_partials(&a, &e)
+        let made_normal = Vector3(e[4].x, e[4].y, e[4].z).cross(Vector3(e[1].x, e[1].y, e[1].z))
+        let support = try support_normal(old, chart_uv(old, p, Vector3(), false))
+        if made_normal.dot(support) < 0.0:
+            for f in 0..<w.faces.count:
+                if w.faces.items[f].surface == surface: w.faces.items[f].sense = not w.faces.items[f].sense
+        return try edit_of(&w, surface, &net, true, 0.0, 0)
+
+## Surface `index` of `w`, checked.
+func surface_in(w: const Shape*, index: i64) -> const Surface*!:
+    if index < 0 or (usize)index >= w.surfaces.count: error(invalid, "that surface is not in this model")
+    return &w.surfaces.items[(usize)index]
+
+## The spans between distinct knots of a knot vector.
+func distinct_spans(knots: const Growing[f64]*, degree: i64, count: i64) -> i64:
+    var spans: i64 = 0
+    for i in (usize)degree..<(usize)count:
+        if knots.items[i + 1] > knots.items[i]: spans += 1
+    return spans
+
+## The Greville abscissa of control point `i`: its knots' average.
+pub func greville(knots: const f64[], i: usize, degree: i64) -> f64:
+    var sum = 0.0
+    for k in 1..<(usize)degree + 1: sum += knots[i + k]
+    return sum / (f64)degree
+
+## `w` with surface `index` replaced by `net`, as a new model in an edit
+## (`moved`: its faces' trims are taken onto it, edited).
+func edit_of(w: Shape*, index: i64, net: const Net*, moved: bool, deviation: f64, changed: i64) -> interop.Reference[CadNurbsEdit]!:
+    let replaced = try surface_of(net)
+    var old = w.surfaces.items[(usize)index]
+    old.close()
+    w.surfaces.items[(usize)index] = replaced
+    w.surfaces.items[(usize)index].edited = true
+    let b = try brep_of(w)
+    defer b.release()
+    let model = try CadModel.of_brep(b)
+    errdefer model.release()
+    let result = try interop.Reference[CadNurbsEdit].adopt(new CadNurbsEdit() in memory.heap, cad_nurbs_edit_type, memory.heap)
+    let edit = result.value()
+    edit.made = model
+    edit.deviation = deviation
+    edit.changed = changed
+    _ = moved
+    return result
+
+## A rational B-spline curve with the toolkit's operations (Alias's curve
+## Insert, Rebuild Curve, degree changes, Detach): each returns a new curve.
+pub struct CadSpline:
+    var curve: Spline
+
+    pub func init():
+        self.curve = empty_spline(1)
+
+    pub func close():
+        self.curve.close()
+
+    ## The curve `points` (weights `weights`) of `degree` on `knots`.
+    pub static func make(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[]) -> interop.Reference[CadSpline]!:
+        return try held_spline(try spline_of(points, weights, degree, knots))
+
+    pub func degree() -> i64:
+        return self.curve.degree
+
+    pub func count() -> i64:
+        return (i64)self.curve.points.count
+
+    pub func knot_count() -> i64:
+        return (i64)self.curve.knots.count
+
+    pub func knot(index: i64) -> f64!:
+        if index < 0 or (usize)index >= self.curve.knots.count: error(invalid, "knot out of range")
+        return self.curve.knots.items[(usize)index]
+
+    ## Control point `index` and its weight.
+    pub func point(index: i64) -> Vector3!:
+        if index < 0 or (usize)index >= self.curve.points.count: error(invalid, "control point out of range")
+        return self.curve.points.items[(usize)index].point()
+
+    pub func weight(index: i64) -> f64!:
+        if index < 0 or (usize)index >= self.curve.points.count: error(invalid, "control point out of range")
+        return self.curve.points.items[(usize)index].w
+
+    pub func low() -> f64:
+        return self.curve.low()
+
+    pub func high() -> f64:
+        return self.curve.high()
+
+    ## Its point at knot parameter `t`.
+    pub func at(t: f64) -> Vector3:
+        return self.curve.point_at(t)
+
+    ## Its curvature at `t`.
+    pub func curvature(t: f64) -> f64:
+        var a: Weighted[4]
+        var e: Weighted[4]
+        self.curve.jet(t, 3, t >= self.curve.high(), &a)
+        euclidean_jet(&a, 3, &e)
+        let d1 = Vector3(e[1].x, e[1].y, e[1].z)
+        let d2 = Vector3(e[2].x, e[2].y, e[2].z)
+        let speed = d1.length()
+        return d1.cross(d2).length() / (speed * speed * speed)
+
+    ## Knot `t` inserted `times` times (no more than the degree allows).
+    pub func inserted(t: f64, times: i64 = 1) -> interop.Reference[CadSpline]!:
+        var made = try self.curve.copy()
+        errdefer made.close()
+        _ = try insert_knot(&made, t, (usize)math.max(1.0, (f64)times))
+        return try held_spline(made)
+
+    ## Knot `t` removed up to `times` times as far as the curve stays within
+    ## `tolerance` (count() tells how many went).
+    pub func knot_removed(t: f64, times: i64, tolerance: f64) -> interop.Reference[CadSpline]!:
+        var made = try self.curve.copy()
+        errdefer made.close()
+        _ = try remove_knot(&made, t, (usize)math.max(1.0, (f64)times), tolerance)
+        return try held_spline(made)
+
+    ## The degree raised by `by`: the same curve.
+    pub func elevated(by: i64) -> interop.Reference[CadSpline]!:
+        var made = try self.curve.copy()
+        errdefer made.close()
+        try elevate(&made, (usize)math.max(0.0, (f64)by))
+        return try held_spline(made)
+
+    ## The degree lowered by one, refused beyond `tolerance`.
+    pub func lowered(tolerance: f64) -> interop.Reference[CadSpline]!:
+        var deviation = 0.0
+        return try held_spline(try reduce_curve(&self.curve, tolerance, &deviation))
+
+    ## Every span a Bezier segment.
+    pub func bezier() -> interop.Reference[CadSpline]!:
+        var made = try self.curve.copy()
+        errdefer made.close()
+        try to_bezier(&made)
+        return try held_spline(made)
+
+    ## The piece over `a`..`b`.
+    pub func piece(a: f64, b: f64) -> interop.Reference[CadSpline]!:
+        return try held_spline(try extract(&self.curve, a, b))
+
+    ## Rebuilt with `degree` and `spans` equal spans, its ends held to
+    ## G`keep`; with `rational` false, weights 1.
+    pub func rebuilt(degree: i64, spans: i64, keep: i64 = 0, rational: bool = true) -> interop.Reference[CadSpline]!:
+        if degree < 1 or degree > most_degree or spans < 1 or keep < 0 or keep > 3: error(invalid, "a rebuild takes degree 1 to 11, a span or more and G0 to G3")
+        var knots = Growing[f64]()
+        defer knots.close()
+        try uniform_knots(degree, (usize)spans, self.curve.low(), self.curve.high(), &knots)
+        return try held_spline(try refit_curve(&self.curve, degree, knots.view(), (usize)keep, rational))
+
+    ## How far `other` (on the same domain) lies from this curve at most.
+    pub func deviation(other: interop.Reference[CadSpline], samples: i64 = 512) -> f64:
+        return curve_deviation(&self.curve, &other.value().curve, (usize)math.max(2.0, (f64)samples))
+
+pub let cad_spline_type: interop.Type[CadSpline] = interop.Type[CadSpline]("CadSpline", CadSpline.close, closeable = true)
+
+func held_spline(curve: Spline) -> interop.Reference[CadSpline]!:
+    let result = try interop.Reference[CadSpline].adopt(new CadSpline() in memory.heap, cad_spline_type, memory.heap)
+    var old = result.value().curve
+    old.close()
+    result.value().curve = curve
+    return result

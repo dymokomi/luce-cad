@@ -1,0 +1,280 @@
+## The NURBS toolkit (luce_cad.nurbs) against closed forms: knot insertion
+## and degree elevation leave a circle a circle to 1e-12; knot removal
+## gives back what insertion added and refuses what would move the curve;
+## a rebuild reports its deviation and holds its ends' curvature; on a
+## filleted box, surface edits keep the shape (exact ones) or the fillet's
+## G2 contacts (a rebuild held to G2), and a converted G1 fillet stays a
+## cylinder of radius r.
+from luce_cad.nurbs import CadNurbs, CadSpline, rebuild_explicit, rebuild_tolerance, rebuild_polynomial, rebuild_bezier, rebuild_single, cv_nuv, cv_slide, cv_parallel, cv_world, falloff_rows, falloff_hull
+from luce_cad.cad_geometry import CadGeometry
+from luce_geocore.geocore import Mesh
+from luce_cad.measure import CadMeasure
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from luce_std import math
+
+pub func nurbs_toolkit_tests() -> unit!:
+    curve_operations()
+    surface_operations()
+    cv_moves()
+    print("PASS NURBS toolkit: insertion and elevation keep a circle to 1e-12, removal undoes insertion and refuses a real knot, rebuilds report deviation and hold curvature, surface edits keep the shape or G2, a converted fillet stays a cylinder, CVs move along their normal, hull and rows with Alias's falloff")
+
+## A quarter circle of radius 3 as one rational quadratic, then a half
+## circle of two.
+func half_circle() -> CadSpline!:
+    let w = math.sqrt(0.5)
+    return CadSpline.make([Vector3(3.0, 0.0, 0.0), Vector3(3.0, 3.0, 0.0), Vector3(0.0, 3.0, 0.0), Vector3(-3.0, 3.0, 0.0), Vector3(-3.0, 0.0, 0.0)],
+                          [1.0, w, 1.0, w, 1.0], 2, [0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0])
+
+## The largest distance from radius 3 at 400 parameters.
+func off_circle(c: CadSpline) -> float:
+    var worst = 0.0
+    for k in 0..<401:
+        let t = c.low() + (c.high() - c.low()) * float(k) / 400.0
+        let p = c.at(t)
+        worst = math.max(worst, math.abs(math.hypot(p.x, p.y) - 3.0))
+    return worst
+
+func curve_operations() -> unit!:
+    let c = half_circle()
+    assert(off_circle(c) < 1e-12)
+    # Insertion: one more control point a knot, the same curve.
+    let once = c.inserted(0.3)
+    assert(once.count() == 6 and once.deviation(c) < 1e-12 and off_circle(once) < 1e-12)
+    let twice = c.inserted(0.7, 2)
+    assert(twice.count() == 7 and twice.deviation(c) < 1e-12)
+    # Elevation: to quintic, and to the cap of 11.
+    let quintic = c.elevated(3)
+    assert(quintic.degree() == 5 and quintic.deviation(c) < 1e-12 and off_circle(quintic) < 1e-12, f"{quintic.deviation(c)}")
+    let eleven = c.elevated(9)
+    assert(eleven.degree() == 11 and eleven.deviation(c) < 1e-11, f"degree 11: {eleven.deviation(c)}")
+    # Removal undoes insertion; the arcs' joint is no knot to remove.
+    let back = once.knot_removed(0.3, 1, 1e-9)
+    assert(back.count() == 5 and back.deviation(c) < 1e-12)
+    let kept = c.knot_removed(0.5, 1, 1e-6)
+    assert(kept.count() == 5)
+    let loose = c.knot_removed(0.5, 1, 20.0)
+    assert(loose.count() == 4 and loose.deviation(c) <= 20.0, f"{loose.count()} {loose.deviation(c)}")
+    # Lowering a raised curve gives it back.
+    let lowered = quintic.lowered(1e-9)
+    assert(lowered.degree() == 4 and lowered.deviation(c) < 1e-9)
+    # Bezier form: every span a segment of degree + 1 points sharing ends.
+    assert(quintic.bezier().count() == 11)
+    # A piece is the curve where it is.
+    let piece = c.piece(0.2, 0.9)
+    assert(piece.at(0.2).subtract(c.at(0.2)).length() < 1e-12 and piece.at(0.65).subtract(c.at(0.65)).length() < 1e-12 and piece.at(0.9).subtract(c.at(0.9)).length() < 1e-12)
+    # A rebuild of a quarter circle to a polynomial (weights 1),
+    # multi-span quintic, its ends held to curvature (1/3).
+    let quarter = c.piece(0.0, 0.5)
+    let rebuilt = quarter.rebuilt(5, 4, 2, false)
+    assert(rebuilt.degree() == 5 and rebuilt.count() == 9 and math.abs(rebuilt.weight(4) - 1.0) < 1e-12, f"{rebuilt.degree()} {rebuilt.count()} {rebuilt.weight(4)}")
+    let off = rebuilt.deviation(quarter)
+    assert(off > 0.0 and off < 1e-4, f"rebuild deviation {off}")
+    assert(math.abs(rebuilt.curvature(rebuilt.low()) - 1.0 / 3.0) < 1e-9 and math.abs(rebuilt.curvature(rebuilt.high()) - 1.0 / 3.0) < 1e-9, f"{rebuilt.curvature(rebuilt.low())}")
+    assert(rebuilt.at(rebuilt.low()).subtract(quarter.at(quarter.low())).length() < 1e-12)
+    # Kept rational, the quarter (a rational quadratic) is rebuilt exactly.
+    assert(quarter.rebuilt(5, 4, 2).deviation(quarter) < 1e-12)
+    # Single span degree 7 (Explicit Control's other choice).
+    let single = quarter.rebuilt(7, 1, 2, false)
+    assert(single.count() == 8 and single.deviation(quarter) < 1e-2, f"{single.deviation(quarter)}")
+
+## A box 4 a side, its front top edge filleted to 0.75 at `continuity`.
+func filleted_box(continuity: int) -> CadModel!:
+    let box = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0), "box")
+    var picked: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            let id = box.face_edge_id(face, use)
+            if a.y > 1.99 and b.y > 1.99 and a.z > 1.99 and b.z > 1.99 and not (id in picked): picked.append(id)
+    return CadModeling.filleted(box, CadModeling.edge_references(box, picked), 0.75, "f", continuity)
+
+## The surface of the first face of `model` of surface kind `kind`.
+func surface_of_kind(model: CadModel, kind: int) -> int!:
+    for face in 0..<model.face_count():
+        if model.face_surface_kind(face) == kind: return model.face_surface_id(face)
+    trap(f"no face of kind {kind}")
+
+## The largest distance between surfaces `a` and `b` of the two models at
+## equal domain fractions.
+func apart(one: CadModel, a: int, two: CadModel, b: int) -> float!:
+    var worst = 0.0
+    for i in 0..<21:
+        for j in 0..<21:
+            let u = float(i) / 20.0
+            let v = float(j) / 20.0
+            worst = math.max(worst, CadNurbs.point_at(one, a, u, v).subtract(CadNurbs.point_at(two, b, u, v)).length())
+    return worst
+
+## How many of the model's smooth edges measure `level` (the fillet's two
+## contacts), checked for `level`.
+func smooth_at(model: CadModel, level: int) -> int!:
+    let check = CadMeasure.check(model, level = level, sharp = false)
+    var count = 0
+    for index in 0..<check.edge_count():
+        if check.edge(index).level >= level: count += 1
+    return count
+
+## Whether every face of `model` meshes.
+func meshes(model: CadModel) -> bool!:
+    let preview = model.preview()
+    return preview.failed_faces() == 0 and model.tessellate(8).face_count() > 0
+
+func surface_operations() -> unit!:
+    let g2 = filleted_box(2)
+    let s = surface_of_kind(g2, 3)
+    let shape = CadNurbs.structure(g2, s)
+    assert(shape.kind == 3 and shape.du + shape.dv >= 6, f"{shape.du} {shape.dv}")
+    assert(smooth_at(g2, 2) == 2)
+    # Exact edits: the same surface, the contacts still G2.
+    let inserted = CadNurbs.inserted(g2, s, 0, 0.37).model()
+    let s1 = surface_of_kind(inserted, 3)
+    assert(CadNurbs.structure(inserted, s1).nu == shape.nu + 1)
+    assert(apart(g2, s, inserted, s1) < 1e-12)
+    assert(smooth_at(inserted, 2) == 2)
+    let raised = CadNurbs.degree_raised(g2, s, 1, 2).model()
+    let s2 = surface_of_kind(raised, 3)
+    assert(CadNurbs.structure(raised, s2).du == shape.du + 1 and CadNurbs.structure(raised, s2).dv == shape.dv + 2)
+    assert(apart(g2, s, raised, s2) < 1e-12, f"raised {apart(g2, s, raised, s2)}")
+    # Removal undoes the insertion.
+    let removed = CadNurbs.knot_removed(inserted, s1, 0, 0.37, 1, 1e-9)
+    assert(removed.changed == 1 and removed.deviation < 1e-9)
+    assert(CadNurbs.structure(removed.model(), surface_of_kind(removed.model(), 3)).nu == shape.nu)
+    # Lowering the raised degree gives it back.
+    let lowered = CadNurbs.degree_lowered(raised, s2, 0, 1e-9)
+    assert(lowered.deviation < 1e-9)
+    # A rebuild to two quintic spans each way, held to G2 across both
+    # ends: its deviation reported, the contacts still G2.
+    let rebuilt = CadNurbs.rebuilt(g2, s, rebuild_explicit, 5, 5, 2, 2, 2, 2)
+    let made = rebuilt.model()
+    let s3 = surface_of_kind(made, 3)
+    assert(CadNurbs.structure(made, s3).nu == 7 and CadNurbs.structure(made, s3).nv == 7)
+    assert(rebuilt.deviation > 0.0 and rebuilt.deviation < 0.01, f"rebuild deviation {rebuilt.deviation}")
+    assert(apart(g2, s, made, s3) <= rebuilt.deviation * 1.5 + 1e-12)
+    assert(smooth_at(made, 2) == 2, CadMeasure.check(made, level = 2, sharp = false).summary())
+    # Explicit Control's single span of degree 7.
+    let single = CadNurbs.rebuilt(g2, s, rebuild_explicit, 7, 7, 1, 1, 2, 2)
+    assert(CadNurbs.structure(single.model(), surface_of_kind(single.model(), 3)).nu == 8)
+    assert(smooth_at(single.model(), 2) == 2)
+    # Within a tolerance, from one span: spans added until it is.
+    let fitted = CadNurbs.rebuilt(g2, s, rebuild_tolerance, 3, 3, 1, 1, 0, 0, 1e-5)
+    assert(fitted.deviation <= 1e-5, f"within tolerance {fitted.deviation}")
+    # NURBS to Bezier keeps the shape.
+    let bezier = CadNurbs.rebuilt(g2, s, rebuild_bezier, 5, 5, 1, 1)
+    assert(apart(g2, s, bezier.model(), surface_of_kind(bezier.model(), 3)) < 1e-12)
+    # Del Multi Knots takes the Bezier form's knots back down, exactly.
+    let single_knots = CadNurbs.rebuilt(bezier.model(), surface_of_kind(bezier.model(), 3), rebuild_single, 5, 5, 1, 1, 0, 0, 1e-9)
+    assert(single_knots.changed > 0 and single_knots.deviation < 1e-9, f"{single_knots.changed} {single_knots.deviation}")
+    # A G1 fillet's cylinder converted: a rational B-spline, still radius
+    # 0.75 about its axis, its contacts still G1.
+    let g1 = filleted_box(1)
+    let cylinder = surface_of_kind(g1, 1)
+    let converted = CadNurbs.converted(g1, cylinder).model()
+    let c = surface_of_kind(converted, 3)
+    assert(CadNurbs.structure(converted, c).rational)
+    var worst = 0.0
+    for i in 0..<11:
+        for j in 0..<11:
+            let p = CadNurbs.point_at(converted, c, float(i) / 10.0, float(j) / 10.0)
+            # The fillet's axis runs along x through (y, z) = (1.25, 1.25).
+            worst = math.max(worst, math.abs(math.hypot(p.y - 1.25, p.z - 1.25) - 0.75))
+    assert(worst < 1e-12, f"converted cylinder off radius {worst}")
+    assert(smooth_at(converted, 1) == 2, CadMeasure.check(converted, level = 1, sharp = false).summary())
+    # Its polynomial rebuild: weights 1, close to it.
+    let plain = CadNurbs.rebuilt(converted, c, rebuild_polynomial, 2, 1, 1, 1)
+    assert(not CadNurbs.structure(plain.model(), surface_of_kind(plain.model(), 3)).rational and plain.deviation < 0.05, f"{plain.deviation}")
+    # A box face converted to a plane patch: degree 1 by 1.
+    let box = CadSolids.box(4.0, 4.0, 4.0)
+    let flat = CadNurbs.converted(box, box.face_surface_id(0)).model()
+    let shape_flat = CadNurbs.structure(flat, flat.face_surface_id(0))
+    assert(shape_flat.kind == 3 and shape_flat.du == 1 and shape_flat.nu == 2)
+    # Whole solids of revolution: each curved surface converted lies on
+    # the analytic one and meshes (a seam all the way round, poles).
+    # A sphere's caps go round with no seam: refused, the reason given.
+    let ball = CadSolids.sphere(2.0)
+    var refused = ""
+    _ = CadNurbs.converted(ball, ball.face_surface_id(0)) catch failure:
+        refused = failure.message
+        recover CadNurbs.inserted(g2, s, 0, 0.5)
+    assert(refused.contains("seam"), refused)
+    for (solid, kind) in [(CadSolids.cylinder(2.0, 3.0), 1), (CadSolids.cone(2.0, 3.0, 1.0), 2), (CadSolids.torus(3.0, 1.0), 5)]:
+        let curved = surface_of_kind(solid, kind)
+        let turned = CadNurbs.converted(solid, curved).model()
+        assert(meshes(turned), f"converted kind {kind}: {turned.preview().first_error()}")
+        let spline = surface_of_kind(turned, 3)
+        for i in 0..<9:
+            for j in 0..<9:
+                let p = CadNurbs.point_at(turned, spline, float(i) / 8.0, float(j) / 8.0)
+                let r = math.hypot(p.x, p.z)
+                var off = 0.0
+                if kind == 1: off = math.abs(r - 2.0)
+                elif kind == 5: off = math.abs(math.hypot(r - 3.0, p.y) - 1.0)
+                assert(off < 1e-9, f"kind {kind} off its surface by {off} at {p.x} {p.y} {p.z}")
+    # Every edited model still meshes.
+    for model in [inserted, raised, made, single.model(), fitted.model(), converted, plain.model(), flat]:
+        assert(meshes(model), model.preview().first_error())
+
+## The cloud point of `surface`'s CV (u, v).
+func cv_at(cloud: Mesh, surface: int, u: int, v: int) -> int!:
+    let s = cloud.find_attribute("cad_cv_surface", 0)
+    let us = cloud.find_attribute("cad_cv_u", 0)
+    let vs = cloud.find_attribute("cad_cv_v", 0)
+    for i in 0..<cloud.point_count():
+        if int(cloud.attribute_value(s, i)) == surface and int(cloud.attribute_value(us, i)) == u and int(cloud.attribute_value(vs, i)) == v: return i
+    trap("no such CV")
+
+## CV moves on a box's top face made a 3 by 3 planar net (converted, a
+## knot in the middle each way): NUV along the normal alone, Rows falloff
+## (Preceding 1: a neighbor by the exponent's weight, a corner by its
+## square), along the hull distance, Slide past a neighbor, Parallel.
+func cv_moves() -> unit!:
+    let box = CadSolids.box(4.0, 4.0, 4.0)
+    var top = -1
+    for face in 0..<box.face_count():
+        var high = true
+        for use in 0..<box.face_edge_count(face): high = high and box.face_edge_point(face, use, 0.0).z > 1.99
+        if high: top = face
+    let flat = CadNurbs.converted(box, box.face_surface_id(top)).model()
+    let s = flat.face_surface_id(top)
+    let net = CadNurbs.inserted(CadNurbs.inserted(flat, s, 0, 0.5).model(), s, 1, 0.5).model()
+    assert(CadNurbs.structure(net, s).nu == 3 and CadNurbs.structure(net, s).nv == 3)
+    let bodies = CadGeometry.of_model(net)
+    let cloud = CadGeometry.cv_cloud(bodies)
+    let middle = cv_at(cloud, s, 1, 1)
+    let side = cv_at(cloud, s, 0, 1)
+    let corner = cv_at(cloud, s, 0, 0)
+    let normal = CadNurbs.cloud_frame(cloud, middle, 0)
+    assert(math.abs(math.abs(normal.z) - 1.0) < 1e-12, f"normal {normal.x} {normal.y} {normal.z}")
+    # NUV: the middle CV along the normal, the others still.
+    let lifted = CadNurbs.cloud_moved(cloud, [middle], cv_nuv, Vector3(0.5, 0.0, 0.0))
+    for i in 0..<cloud.point_count():
+        let moved = lifted.point(i).subtract(cloud.point(i))
+        if i == middle: assert(moved.subtract(normal.multiply_scalar(0.5)).length() < 1e-6)
+        else: assert(moved.length() == 0.0)
+    # Rows falloff, one row each way, exponent 1: a neighbor half way, a
+    # corner a quarter; exponent 2: a quarter and a sixteenth.
+    for exponent in [1.0, 2.0]:
+        let rows = CadNurbs.cloud_moved(cloud, [middle], cv_world, Vector3(0.0, 0.0, 1.0), falloff_rows, Vector3(1.0, 1.0, 0.0), exponent)
+        let half = math.pow(0.5, exponent)
+        assert(math.abs(rows.point(side).z - cloud.point(side).z - half) < 1e-6 and math.abs(rows.point(corner).z - cloud.point(corner).z - half * half) < 1e-6)
+    # Hull distance 3 (the neighbors 2 away along the hull): (1 - 2/3).
+    let hull = CadNurbs.cloud_moved(cloud, [middle], cv_world, Vector3(0.0, 0.0, 1.0), falloff_hull, Vector3(0.0, 0.0, 3.0), 1.0)
+    assert(math.abs(hull.point(side).z - cloud.point(side).z - 1.0 / 3.0) < 1e-6 and hull.point(corner).z == cloud.point(corner).z)
+    # Slide 3 along u from the middle: past its neighbor (2 away) and 1
+    # beyond... the net ends there, so it stops on the edge row.
+    let slid = CadNurbs.cloud_moved(cloud, [middle], cv_slide, Vector3(1.5, 0.0, 0.0))
+    let edge_row = cv_at(cloud, s, 2, 1)
+    assert(slid.point(middle).subtract(cloud.point(middle)).length() - 1.5 < 1e-6 and slid.point(middle).subtract(cloud.point(edge_row)).length() < 0.5 + 1e-6)
+    let far = CadNurbs.cloud_moved(cloud, [middle], cv_slide, Vector3(5.0, 0.0, 0.0))
+    assert(far.point(middle).subtract(cloud.point(edge_row)).length() < 1e-6)
+    # Parallel: two CVs moved along the first one's u hull line, alike.
+    let both = CadNurbs.cloud_moved(cloud, [middle, corner], cv_parallel, Vector3(0.25, 0.0, 0.0))
+    assert(both.point(middle).subtract(cloud.point(middle)).subtract(both.point(corner).subtract(cloud.point(corner))).length() < 1e-6)
+    # A whole row as a group, and back into the model.
+    let row = CadNurbs.cloud_row(cloud, middle, 0)
+    assert(row.contains("cad_cv_u=1"), row)
+    let back = CadGeometry.model(CadGeometry.with_cv_cloud(bodies, cloud, lifted), 0)
+    assert(math.abs(back.cv_position(middle).z - net.cv_position(middle).z - 0.5 * normal.z) < 1e-6)

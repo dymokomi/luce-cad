@@ -562,7 +562,7 @@ Curved trim evaluation, cross-patch station planning, adaptive support checks,
 periodic bands and shared CAD-edge ownership live in the CAD model above. General
 field-aligned all-quad remeshing is not implemented.
 
-Limits: degree 1–8, 2–1,024 surface control points per direction (262,144 total), up to 4,096 curve
+Limits: degree 1–11, 2–1,024 surface control points per direction (262,144 total), up to 4,096 curve
 control points, divisions 1–64. Invalid
 weights, knot counts and collapsed surface polygons are checked errors.
 Planar trims are bounded to 64 loops and 16,384 vertices. Exact shared-vertex

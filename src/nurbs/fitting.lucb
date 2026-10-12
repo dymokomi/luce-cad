@@ -1,0 +1,243 @@
+## Fitting and rebuilding (The NURBS Book, 9.4): a least-squares fit of
+## samples by a B-spline on given knots, with its end control points held
+## so its derivatives at both ends, up to `keep`, are the source's. Held
+## that way a rebuild keeps the continuity an edge had: position (keep 0),
+## tangent (1), curvature (2) and its rate (3), as Alias's rebuilds keep an
+## Align's rows. The normal equations are banded (each sample touches
+## degree + 1 bases), so they are factored as a band.
+
+## Knots of `degree` with `spans` equal spans over `low`..`high`, clamped.
+pub func uniform_knots(degree: i64, spans: usize, low: f64, high: f64, out: Growing[f64]*) -> !:
+    out.clear()
+    for _ in 0..<(usize)degree + 1: try out.push(low)
+    for k in 1..<spans: try out.push(low + (high - low) * (f64)k / (f64)spans)
+    for _ in 0..<(usize)degree + 1: try out.push(high)
+
+## Parameters to fit at: `per` in every span of `knots` (none of zero
+## length), at their middles' spacing, and both ends.
+pub func fit_parameters(knots: const f64[], degree: i64, per: usize, out: Growing[f64]*) -> !:
+    out.clear()
+    let count = knots.length - (usize)degree - 1
+    try out.push(knots[(usize)degree])
+    for span in (usize)degree..<count:
+        let a = knots[span]
+        let b = knots[span + 1]
+        if not (b > a): continue
+        for k in 0..<per: try out.push(a + (b - a) * ((f64)k + 0.5) / (f64)per)
+    try out.push(knots[count])
+
+## A least-squares fit at fixed parameters (see the file's header): made
+## once, it fits any number of sample sets (a surface's rows).
+pub struct Fitter:
+    pub var degree: i64
+    pub var knots: Growing[f64]
+    pub var params: Growing[f64]
+    ## Each sample's degree + 1 bases, and the first's index.
+    var bases: Growing[f64]
+    var firsts: Growing[usize]
+    ## Control points held at each end (keep + 1).
+    pub var held: usize
+    ## The bases' derivatives at the start and the end (basis_jet).
+    var at_start: Growing[f64]
+    var at_end: Growing[f64]
+    ## The factored normal equations of the loose control points, a band
+    ## of degree + 1 below the diagonal: (i, i - d) at band[i (p + 1) + d].
+    var band: Growing[f64]
+
+    pub func close():
+        self.knots.close()
+        self.params.close()
+        self.bases.close()
+        self.firsts.close()
+        self.at_start.close()
+        self.at_end.close()
+        self.band.close()
+
+    pub func count() -> usize:
+        return self.knots.count - (usize)self.degree - 1
+
+    ## The control points fitting `values` (one per parameter), held at
+    ## the ends to derivatives `starts` and `ends` (0 to keep), onto `out`.
+    pub func fit(values: const Weighted[], starts: const Weighted[4]*, ends: const Weighted[4]*, out: Growing[Weighted]*) -> !:
+        if values.length != self.params.count: error(invalid, "a fit needs a value at every parameter")
+        let n = self.count()
+        let p = (usize)self.degree
+        let h = self.held
+        out.clear()
+        try out.fill(n, Weighted(0.0, 0.0, 0.0, 0.0))
+        for k in 0..<h:
+            var sum = (*starts)[k]
+            for j in 0..<k: sum = sum.minus(out.items[j].times(self.at_start.items[k * 12 + j]))
+            out.items[k] = sum.times(1.0 / self.at_start.items[k * 12 + k])
+        for k in 0..<h:
+            var sum = (*ends)[k]
+            for i in 0..<k: sum = sum.minus(out.items[n - 1 - i].times(self.at_end.items[k * 12 + p - i]))
+            out.items[n - 1 - k] = sum.times(1.0 / self.at_end.items[k * 12 + p - k])
+        let loose = n - 2 * h
+        if loose == 0: return
+        var rhs = Growing[Weighted]()
+        defer rhs.close()
+        try rhs.fill(loose, Weighted(0.0, 0.0, 0.0, 0.0))
+        for s in 0..<self.params.count:
+            let first = self.firsts.items[s]
+            var rest = values[s]
+            for j in 0..<p + 1:
+                let i = first + j
+                if i < h or i >= n - h: rest = rest.minus(out.items[i].times(self.bases.items[s * (p + 1) + j]))
+            for j in 0..<p + 1:
+                let i = first + j
+                if i >= h and i < n - h: rhs.items[i - h] = rhs.items[i - h].plus(rest.times(self.bases.items[s * (p + 1) + j]))
+        # L y = b, then Lᵀ x = y.
+        let width = p + 1
+        for i in 0..<loose:
+            var sum = rhs.items[i]
+            let low = i - fewer(i, p)
+            for k in low..<i: sum = sum.minus(rhs.items[k].times(self.band.items[i * width + i - k]))
+            rhs.items[i] = sum.times(1.0 / self.band.items[i * width])
+        var i = loose
+        while i > 0:
+            i -= 1
+            var sum = rhs.items[i]
+            for k in i + 1..<fewer(loose, i + p + 1): sum = sum.minus(rhs.items[k].times(self.band.items[k * width + k - i]))
+            rhs.items[i] = sum.times(1.0 / self.band.items[i * width])
+        for a in 0..<loose: out.items[h + a] = rhs.items[a]
+
+## A fitter of `degree` on `knots` at `params`, holding `keep` + 1 control
+## points at each end (keep 0 to 3).
+pub func make_fitter(degree: i64, knots: const f64[], params: const f64[], keep: usize) -> Fitter!:
+    if keep > 3: error(invalid, "a fit holds at most G3 at its ends")
+    var f = Fitter(degree, Growing[f64](), Growing[f64](), Growing[f64](), Growing[usize](), keep + 1, Growing[f64](), Growing[f64](), Growing[f64]())
+    errdefer f.close()
+    try f.knots.assign(knots)
+    try f.params.assign(params)
+    let n = f.count()
+    let p = (usize)degree
+    if n < 2 * (keep + 1):
+        var buffer: u8[160]
+        error(invalid, try strings.format(buffer, f"holding G{keep} at both ends needs {2 * (keep + 1)} control points across, this has {n}"))
+    var values: f64[12]
+    for t in params:
+        let first = nurbs_basis(knots, (i64)n, degree, t, &values)
+        try f.firsts.push(first)
+        for j in 0..<p + 1: try f.bases.push(values[j])
+    var ders: f64[48]
+    _ = basis_jet(knots, (i64)n, degree, knots[p], false, &ders)
+    for j in 0..<48: try f.at_start.push(ders[j])
+    _ = basis_jet(knots, (i64)n, degree, knots[n], true, &ders)
+    for j in 0..<48: try f.at_end.push(ders[j])
+    # The normal equations of the loose control points, as a band.
+    let h = keep + 1
+    let loose = n - 2 * h
+    let width = p + 1
+    try f.band.fill(loose * width, 0.0)
+    for s in 0..<params.length:
+        let first = f.firsts.items[s]
+        for a in 0..<width:
+            let i = first + a
+            if i < h or i >= n - h: continue
+            for b in 0..<a + 1:
+                let j = first + b
+                if j < h or j >= n - h: continue
+                f.band.items[(i - h) * width + a - b] += f.bases.items[s * width + a] * f.bases.items[s * width + b]
+    # Cholesky on the band.
+    for j in 0..<loose:
+        var d = f.band.items[j * width]
+        for k in j - fewer(j, p)..<j:
+            let l = f.band.items[j * width + j - k]
+            d -= l * l
+        if not (d > 1e-300): error(invalid, "too few samples to fit these control points")
+        let diagonal = math.sqrt(d)
+        f.band.items[j * width] = diagonal
+        for i in j + 1..<fewer(loose, j + p + 1):
+            var s = f.band.items[i * width + i - j]
+            let low = i - fewer(i, p)
+            for k in low..<j:
+                if i - k <= p and j - k <= p: s -= f.band.items[i * width + i - k] * f.band.items[j * width + j - k]
+            f.band.items[i * width + i - j] = s / diagonal
+    return f
+
+## Euclidean derivatives (as homogeneous points of weight 1, then 0) of
+## the curve whose homogeneous derivatives are `a` (orders 0 to `order`),
+## by the quotient rule.
+pub func euclidean_jet(a: const Weighted[4]*, order: usize, out: Weighted[4]*):
+    var c: Vector3[4] = [Vector3(), Vector3(), Vector3(), Vector3()]
+    let w0 = (*a)[0].w
+    for k in 0..<order + 1:
+        var v = Vector3((*a)[k].x, (*a)[k].y, (*a)[k].z)
+        for i in 1..<k + 1: v = v.subtract(c[k - i].multiply_scalar(choose(k, i) * (*a)[i].w))
+        c[k] = v.multiply_scalar(1.0 / w0)
+        (*out)[k] = Weighted(c[k].x, c[k].y, c[k].z, 1.0 if k == 0 else 0.0)
+
+## `s` rebuilt with `degree` and `knots` (its domain's), held to `keep` at
+## both ends; with `rational` false, weights 1 (the closest polynomial
+## curve).
+pub func refit_curve(s: const Spline*, degree: i64, knots: const f64[], keep: usize, rational: bool) -> Spline!:
+    var params = Growing[f64]()
+    defer params.close()
+    try fit_parameters(knots, degree, 2 * ((usize)degree + 1), &params)
+    var f = try make_fitter(degree, knots, params.view(), keep)
+    defer f.close()
+    var values = Growing[Weighted]()
+    defer values.close()
+    for t in params.view():
+        let q = s.at(t)
+        try values.push(q if rational else weighted(q.point(), 1.0))
+    var starts: Weighted[4]
+    var ends: Weighted[4]
+    try curve_ends(s, keep, rational, &starts, &ends)
+    var made = empty_spline(degree)
+    errdefer made.close()
+    try made.knots.assign(knots)
+    try f.fit(values.view(), &starts, &ends, &made.points)
+    return made
+
+## `s`'s derivatives 0..keep at its start and end, homogeneous or (not
+## `rational`) Euclidean.
+func curve_ends(s: const Spline*, keep: usize, rational: bool, starts: Weighted[4]*, ends: Weighted[4]*) -> !:
+    var a: Weighted[4]
+    s.jet(s.low(), 3, false, &a)
+    if rational:
+        for k in 0..<(usize)4: (*starts)[k] = a[k]
+    else: euclidean_jet(&a, 3, starts)
+    s.jet(s.high(), 3, true, &a)
+    if rational:
+        for k in 0..<(usize)4: (*ends)[k] = a[k]
+    else: euclidean_jet(&a, 3, ends)
+    _ = keep
+
+## The largest distance between `a` and `b` at `samples` parameters over
+## `a`'s domain (equal domains: a bound on how far one lies from the other).
+pub func curve_deviation(a: const Spline*, b: const Spline*, samples: usize) -> f64:
+    var most = 0.0
+    for k in 0..<samples + 1:
+        let t = a.low() + (a.high() - a.low()) * (f64)k / (f64)samples
+        most = math.max(most, a.point_at(t).subtract(b.point_at(t)).length())
+    return most
+
+## Degree `s` lowered by one (within `tolerance`), its inner knots kept at
+## the same multiplicity (at most the new degree), the ends held to
+## tangents; the deviation onto `deviation`. Refused when the curve would
+## move further.
+pub func reduce_curve(s: const Spline*, tolerance: f64, deviation: f64*) -> Spline!:
+    if s.degree < 2: error(invalid, "a degree 1 B-spline cannot be lowered")
+    let q = s.degree - 1
+    let eps = knot_eps(s)
+    var inner = Growing[f64]()
+    defer inner.close()
+    try distinct_inner(s, eps, &inner)
+    var knots = Growing[f64]()
+    defer knots.close()
+    for _ in 0..<(usize)q + 1: try knots.push(s.low())
+    for u in inner.view():
+        for _ in 0..<fewer(multiplicity(s.knots.view(), u, 0.0), (usize)q): try knots.push(u)
+    for _ in 0..<(usize)q + 1: try knots.push(s.high())
+    let count = knots.count - (usize)q - 1
+    let keep: usize = 1 if count >= 4 else 0
+    let made = try refit_curve(s, q, knots.view(), keep, true)
+    *deviation = curve_deviation(s, &made, 64 * (inner.count + 1))
+    if *deviation > tolerance:
+        var owned = made
+        owned.close()
+        var buffer: u8[200]
+        error(invalid, try strings.format(buffer, f"lowering the degree moves it {*deviation:.6f}, more than the tolerance {tolerance}"))
+    return made

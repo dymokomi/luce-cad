@@ -1,0 +1,438 @@
+## Surfaces: a rational tensor-product net in homogeneous form, and the
+## curve operations applied across it. Along u, every column of the net
+## (fixed v index) is a curve over the u knots; they all change alike, so
+## the result is a net again. Rebuilding fits rows, then columns, with the
+## boundary's cross derivatives held (fitting.lucb's header).
+
+## A net: degrees, counts, knots and the points u-major (index u nv + v).
+pub struct Net:
+    pub var du: i64
+    pub var dv: i64
+    pub var nu: usize
+    pub var nv: usize
+    pub var ku: Growing[f64]
+    pub var kv: Growing[f64]
+    pub var points: Growing[Weighted]
+
+    pub func close():
+        self.ku.close()
+        self.kv.close()
+        self.points.close()
+
+    pub func copy() -> Net!:
+        var made = empty_net()
+        errdefer made.close()
+        made.du = self.du
+        made.dv = self.dv
+        made.nu = self.nu
+        made.nv = self.nv
+        try made.ku.assign(self.ku.view())
+        try made.kv.assign(self.kv.view())
+        try made.points.assign(self.points.view())
+        return made
+
+    pub func u_low() -> f64:
+        return self.ku.items[(usize)self.du]
+
+    pub func u_high() -> f64:
+        return self.ku.items[self.nu]
+
+    pub func v_low() -> f64:
+        return self.kv.items[(usize)self.dv]
+
+    pub func v_high() -> f64:
+        return self.kv.items[self.nv]
+
+    ## Its homogeneous partial derivatives (a, b) for a, b to 3 at knot
+    ## parameters (u, v): out[a * 4 + b]; at the domain's high ends the
+    ## limit from below.
+    pub func partials(u: f64, v: f64, out: Weighted[16]*):
+        var bu: f64[48]
+        var bv: f64[48]
+        let fu = basis_jet(self.ku.view(), (i64)self.nu, self.du, u, u >= self.u_high(), &bu)
+        let fv = basis_jet(self.kv.view(), (i64)self.nv, self.dv, v, v >= self.v_high(), &bv)
+        for k in 0..<(usize)16: (*out)[k] = Weighted(0.0, 0.0, 0.0, 0.0)
+        for i in 0..<(usize)self.du + 1:
+            for j in 0..<(usize)self.dv + 1:
+                let q = self.points.items[(fu + i) * self.nv + fv + j]
+                for a in 0..<(usize)4:
+                    for b in 0..<(usize)4:
+                        (*out)[a * 4 + b] = (*out)[a * 4 + b].plus(q.times(bu[a * 12 + i] * bv[b * 12 + j]))
+
+    ## The point at knot parameters (u, v).
+    pub func point_at(u: f64, v: f64) -> Vector3:
+        var bu: f64[12]
+        var bv: f64[12]
+        let fu = nurbs_basis(self.ku.view(), (i64)self.nu, self.du, math.clamp(u, self.u_low(), self.u_high()), &bu)
+        let fv = nurbs_basis(self.kv.view(), (i64)self.nv, self.dv, math.clamp(v, self.v_low(), self.v_high()), &bv)
+        var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+        for i in 0..<(usize)self.du + 1:
+            for j in 0..<(usize)self.dv + 1:
+                sum = sum.plus(self.points.items[(fu + i) * self.nv + fv + j].times(bu[i] * bv[j]))
+        return sum.point()
+
+    ## Whether any weight differs from the first.
+    pub func rational() -> bool:
+        for q in self.points.view():
+            if math.abs(q.w - self.points.items[0].w) > 1e-12 * math.abs(self.points.items[0].w): return true
+        return false
+
+pub func empty_net() -> Net:
+    return Net(1, 1, 0, 0, Growing[f64](), Growing[f64](), Growing[Weighted]())
+
+## The net of B-spline surface `s`.
+pub func net_of(s: const Surface*) -> Net!:
+    if s.kind != surface_spline: error(invalid, "this face is not a B-spline: convert it first")
+    var made = empty_net()
+    errdefer made.close()
+    made.du = s.du
+    made.dv = s.dv
+    made.nu = (usize)s.nu
+    made.nv = (usize)s.nv
+    try made.ku.assign(s.ku)
+    try made.kv.assign(s.kv)
+    for at in 0..<s.points.length: try made.points.push(weighted(s.points[at], s.weights[at]))
+    return made
+
+## A B-spline surface record of `net`.
+pub func surface_of(net: const Net*) -> Surface!:
+    var points = Growing[Vector3]()
+    defer points.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    for q in net.points.view():
+        try points.push(q.point())
+        try weights.push(q.w)
+    return try Surface(surface_spline, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, points.view(), weights.view(),
+                       net.ku.view(), net.kv.view(), (i64)net.nu, (i64)net.nv, net.du, net.dv)
+
+## The net's curves along `direction` (0: u, each column; 1: v, each row).
+pub func curves_along(net: const Net*, direction: i64, out: Growing[Spline]*) -> !:
+    let along_u = direction == 0
+    let lines = net.nv if along_u else net.nu
+    let length = net.nu if along_u else net.nv
+    for line in 0..<lines:
+        var c = empty_spline(net.du if along_u else net.dv)
+        errdefer c.close()
+        try c.knots.assign(net.ku.view() if along_u else net.kv.view())
+        for k in 0..<length: try c.points.push(net.points.items[k * net.nv + line if along_u else line * net.nv + k])
+        try out.push(c)
+
+## A net from `curves` along `direction` (all on one knot vector), the
+## other direction's degree and knots taken from `like`.
+pub func net_from(curves: const Spline[], direction: i64, like: const Net*) -> Net!:
+    var made = empty_net()
+    errdefer made.close()
+    let along_u = direction == 0
+    let first = &curves[0]
+    made.du = first.degree if along_u else like.du
+    made.dv = like.dv if along_u else first.degree
+    try made.ku.assign(first.knots.view() if along_u else like.ku.view())
+    try made.kv.assign(like.kv.view() if along_u else first.knots.view())
+    made.nu = made.ku.count - (usize)made.du - 1
+    made.nv = made.kv.count - (usize)made.dv - 1
+    try made.points.fill(made.nu * made.nv, Weighted(0.0, 0.0, 0.0, 0.0))
+    for line in 0..<curves.length:
+        let c = &curves[line]
+        if c.knots.count != first.knots.count: error(invalid, "a net's curves came out on different knots")
+        for k in 0..<c.points.count:
+            if along_u: made.points.items[k * made.nv + line] = c.points.items[k]
+            else: made.points.items[line * made.nv + k] = c.points.items[k]
+    return made
+
+func close_curves(curves: Growing[Spline]*):
+    for c in curves.view():
+        var owned = c
+        owned.close()
+    curves.close()
+
+## Knot `t` (a fraction of the domain along `direction`) inserted `times`
+## times across the net; returns how many went in.
+pub func net_insert(net: Net*, direction: i64, fraction: f64, times: usize) -> usize!:
+    var curves = Growing[Spline]()
+    defer close_curves(&curves)
+    try curves_along(net, direction, &curves)
+    let low = net.u_low() if direction == 0 else net.v_low()
+    let high = net.u_high() if direction == 0 else net.v_high()
+    let t = low + (high - low) * fraction
+    var done: usize = 0
+    for at in 0..<curves.count: done = try insert_knot(&curves.items[at], t, times)
+    if done == 0: return 0
+    let made = try net_from(curves.view(), direction, net)
+    net.close()
+    *net = made
+    return done
+
+## Knot `t` (the inner knot nearest a fraction of the domain) removed up to
+## `times` times across the net, while every curve moves at most
+## `tolerance`; returns how many went.
+pub func net_remove(net: Net*, direction: i64, fraction: f64, times: usize, tolerance: f64) -> usize!:
+    let knots = net.ku.view() if direction == 0 else net.kv.view()
+    let degree = net.du if direction == 0 else net.dv
+    let count = net.nu if direction == 0 else net.nv
+    let low = knots[(usize)degree]
+    let high = knots[count]
+    let t = low + (high - low) * fraction
+    var u = math.nan
+    for k in knots:
+        if k > low and k < high and (math.is_nan(u) or math.abs(k - t) < math.abs(u - t)): u = k
+    if math.is_nan(u): error(invalid, "this surface has no inner knots that way to remove")
+    var k = times
+    while k > 0:
+        var curves = Growing[Spline]()
+        defer close_curves(&curves)
+        try curves_along(net, direction, &curves)
+        var all = true
+        for at in 0..<curves.count:
+            if (try remove_knot(&curves.items[at], u, k, tolerance)) != k: all = false
+        if all:
+            let made = try net_from(curves.view(), direction, net)
+            net.close()
+            *net = made
+            return k
+        k -= 1
+    return 0
+
+## The degree along `direction` raised by `by` (the same surface).
+pub func net_elevate(net: Net*, direction: i64, by: usize) -> !:
+    if by == 0: return
+    var curves = Growing[Spline]()
+    defer close_curves(&curves)
+    try curves_along(net, direction, &curves)
+    for at in 0..<curves.count: try elevate(&curves.items[at], by)
+    let made = try net_from(curves.view(), direction, net)
+    net.close()
+    *net = made
+
+## Every inner knot along `direction` to full multiplicity: Bezier patches.
+pub func net_bezier(net: Net*, direction: i64) -> !:
+    var curves = Growing[Spline]()
+    defer close_curves(&curves)
+    try curves_along(net, direction, &curves)
+    for at in 0..<curves.count: try to_bezier(&curves.items[at])
+    let made = try net_from(curves.view(), direction, net)
+    net.close()
+    *net = made
+
+## The degree along `direction` lowered by one within `tolerance` (its
+## deviation onto `deviation`; refused beyond it).
+pub func net_reduce(net: Net*, direction: i64, tolerance: f64, deviation: f64*) -> !:
+    var curves = Growing[Spline]()
+    defer close_curves(&curves)
+    try curves_along(net, direction, &curves)
+    var reduced = Growing[Spline]()
+    defer close_curves(&reduced)
+    var worst = 0.0
+    for at in 0..<curves.count:
+        var d = 0.0
+        try reduced.push(try reduce_curve(&curves.items[at], math.infinity, &d))
+    let made = try net_from(reduced.view(), direction, net)
+    worst = net_deviation(net, &made, 12)
+    *deviation = worst
+    if worst > tolerance:
+        var owned = made
+        owned.close()
+        var buffer: u8[200]
+        error(invalid, try strings.format(buffer, f"lowering the degree moves the surface {worst:.6f}, more than the tolerance {tolerance}"))
+    net.close()
+    *net = made
+
+## The largest distance between `a` and `b` (equal domains) at `per`
+## samples a span of `a`, both ways.
+pub func net_deviation(a: const Net*, b: const Net*, per: usize) -> f64:
+    let su = per * (a.nu - (usize)a.du) + 1
+    let sv = per * (a.nv - (usize)a.dv) + 1
+    var most = 0.0
+    for i in 0..<su + 1:
+        let u = a.u_low() + (a.u_high() - a.u_low()) * (f64)i / (f64)su
+        for j in 0..<sv + 1:
+            let v = a.v_low() + (a.v_high() - a.v_low()) * (f64)j / (f64)sv
+            most = math.max(most, a.point_at(u, v).subtract(b.point_at(u, v)).length())
+    return most
+
+## Euclidean partials of a surface from its homogeneous ones (The NURBS
+## Book, A4.4), as homogeneous points of weight 1 (then 0).
+pub func euclidean_partials(a: const Weighted[16]*, out: Weighted[16]*):
+    var s: Vector3[16] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    let w = (*a)[0].w
+    for k in 0..<(usize)4:
+        for l in 0..<(usize)4:
+            var v = Vector3((*a)[k * 4 + l].x, (*a)[k * 4 + l].y, (*a)[k * 4 + l].z)
+            for j in 1..<l + 1: v = v.subtract(s[k * 4 + l - j].multiply_scalar(choose(l, j) * (*a)[j].w))
+            for i in 1..<k + 1:
+                v = v.subtract(s[(k - i) * 4 + l].multiply_scalar(choose(k, i) * (*a)[i * 4].w))
+                for j in 1..<l + 1: v = v.subtract(s[(k - i) * 4 + l - j].multiply_scalar(choose(k, i) * choose(l, j) * (*a)[i * 4 + j].w))
+            s[k * 4 + l] = v.multiply_scalar(1.0 / w)
+            (*out)[k * 4 + l] = Weighted(v.x / w, v.y / w, v.z / w, 1.0 if k + l == 0 else 0.0)
+
+## `net` rebuilt on knots `ku` (degree `du`) and `kv` (degree `dv`), its
+## boundary held to G`keep_u` across its u ends and G`keep_v` across its
+## v ends; with `rational` false, weights 1.
+pub func refit_net(net: const Net*, du: i64, ku: const f64[], dv: i64, kv: const f64[], keep_u: usize, keep_v: usize, rational: bool) -> Net!:
+    var pu = Growing[f64]()
+    defer pu.close()
+    var pv = Growing[f64]()
+    defer pv.close()
+    try fit_parameters(ku, du, 2 * ((usize)du + 1), &pu)
+    try fit_parameters(kv, dv, 2 * ((usize)dv + 1), &pv)
+    var fu = try make_fitter(du, ku, pu.view(), keep_u)
+    defer fu.close()
+    var fv = try make_fitter(dv, kv, pv.view(), keep_v)
+    defer fv.close()
+    let nu = fu.count()
+    let nv = fv.count()
+    # Pass 1, along u: one line a v sample, then the v ends' cross
+    # derivatives 1..keep_v (lines of the partials (0, b)).
+    var lines = Growing[Weighted]()
+    defer lines.close()
+    var values = Growing[Weighted]()
+    defer values.close()
+    var fitted = Growing[Weighted]()
+    defer fitted.close()
+    var table: Weighted[16]
+    var shown: Weighted[16]
+    let v_ends: f64[2] = [net.v_low(), net.v_high()]
+    let rows = pv.count + 2 * keep_v
+    for row in 0..<rows:
+        var v = 0.0
+        var b: usize = 0
+        if row < pv.count: v = pv.items[row]
+        else:
+            let extra = row - pv.count
+            v = v_ends[extra // keep_v]
+            b = extra % keep_v + 1
+        values.clear()
+        for u in pu.view():
+            net.partials(u, v, &table)
+            if not rational: euclidean_partials(&table, &shown)
+            try values.push(table[b] if rational else shown[b])
+        var starts: Weighted[4]
+        var ends: Weighted[4]
+        net.partials(net.u_low(), v, &table)
+        if not rational: euclidean_partials(&table, &shown)
+        for a in 0..<(usize)4: starts[a] = table[a * 4 + b] if rational else shown[a * 4 + b]
+        net.partials(net.u_high(), v, &table)
+        if not rational: euclidean_partials(&table, &shown)
+        for a in 0..<(usize)4: ends[a] = table[a * 4 + b] if rational else shown[a * 4 + b]
+        try fu.fit(values.view(), &starts, &ends, &fitted)
+        for q in fitted.view(): try lines.push(q)
+    # Pass 2, along v: each control column through the lines.
+    var made = empty_net()
+    errdefer made.close()
+    made.du = du
+    made.dv = dv
+    made.nu = nu
+    made.nv = nv
+    try made.ku.assign(ku)
+    try made.kv.assign(kv)
+    try made.points.fill(nu * nv, Weighted(0.0, 0.0, 0.0, 0.0))
+    for i in 0..<nu:
+        values.clear()
+        for row in 0..<pv.count: try values.push(lines.items[row * nu + i])
+        var starts: Weighted[4]
+        var ends: Weighted[4]
+        for k in 0..<(usize)4:
+            starts[k] = Weighted(0.0, 0.0, 0.0, 0.0)
+            ends[k] = Weighted(0.0, 0.0, 0.0, 0.0)
+        starts[0] = lines.items[0 * nu + i]
+        ends[0] = lines.items[(pv.count - 1) * nu + i]
+        for b in 1..<keep_v + 1:
+            starts[b] = lines.items[(pv.count + b - 1) * nu + i]
+            ends[b] = lines.items[(pv.count + keep_v + b - 1) * nu + i]
+        try fv.fit(values.view(), &starts, &ends, &fitted)
+        for j in 0..<nv: made.points.items[i * nv + j] = fitted.items[j]
+    return made
+
+## `net` rebuilt within `tolerance`: from `spans_u` by `spans_v` uniform
+## spans, a knot added in the middle of every span still further off than
+## the tolerance, until it is within it or a direction has `most` spans.
+## Its deviation onto `deviation`.
+pub func refit_within(net: const Net*, du: i64, dv: i64, spans_u: usize, spans_v: usize, most: usize, keep_u: usize, keep_v: usize, rational: bool, tolerance: f64, deviation: f64*) -> Net!:
+    var ku = Growing[f64]()
+    defer ku.close()
+    var kv = Growing[f64]()
+    defer kv.close()
+    try uniform_knots(du, spans_u, net.u_low(), net.u_high(), &ku)
+    try uniform_knots(dv, spans_v, net.v_low(), net.v_high(), &kv)
+    while true:
+        var made = try refit_net(net, du, ku.view(), dv, kv.view(), keep_u, keep_v, rational)
+        var worst_u = Growing[f64]()
+        defer worst_u.close()
+        var worst_v = Growing[f64]()
+        defer worst_v.close()
+        let worst = try span_errors(net, &made, &worst_u, &worst_v)
+        *deviation = worst
+        let full = made.nu - (usize)du >= most and made.nv - (usize)dv >= most
+        if worst <= tolerance or full: return made
+        made.close()
+        try split_spans(&ku, du, worst_u.view(), tolerance, most)
+        try split_spans(&kv, dv, worst_v.view(), tolerance, most)
+    error(invalid, "unreachable")
+
+## The largest distance in each u span and each v span of `made` from
+## `net` (8 samples a span both ways), and over all.
+func span_errors(net: const Net*, made: const Net*, worst_u: Growing[f64]*, worst_v: Growing[f64]*) -> f64!:
+    let spans_u = made.nu - (usize)made.du
+    let spans_v = made.nv - (usize)made.dv
+    try worst_u.fill(spans_u, 0.0)
+    try worst_v.fill(spans_v, 0.0)
+    var most = 0.0
+    for su in 0..<spans_u:
+        let a = made.ku.items[(usize)made.du + su]
+        let b = made.ku.items[(usize)made.du + su + 1]
+        for sv in 0..<spans_v:
+            let c = made.kv.items[(usize)made.dv + sv]
+            let d = made.kv.items[(usize)made.dv + sv + 1]
+            for i in 0..<(usize)9:
+                for j in 0..<(usize)9:
+                    let u = a + (b - a) * (f64)i / 8.0
+                    let v = c + (d - c) * (f64)j / 8.0
+                    let e = net.point_at(u, v).subtract(made.point_at(u, v)).length()
+                    worst_u.items[su] = math.max(worst_u.items[su], e)
+                    worst_v.items[sv] = math.max(worst_v.items[sv], e)
+                    most = math.max(most, e)
+    return most
+
+## A knot in the middle of every span of `knots` whose error passed
+## `tolerance`, while there are fewer than `most` spans.
+func split_spans(knots: Growing[f64]*, degree: i64, errors: const f64[], tolerance: f64, most: usize) -> !:
+    var made = Growing[f64]()
+    defer made.close()
+    var spans = errors.length
+    let p = (usize)degree
+    for i in 0..<p + 1: try made.push(knots.items[i])
+    for span in 0..<errors.length:
+        if errors[span] > tolerance and spans < most:
+            try made.push((knots.items[p + span] + knots.items[p + span + 1]) * 0.5)
+            spans += 1
+        if span + 1 < errors.length: try made.push(knots.items[p + span + 1])
+    for i in knots.count - p - 1..<knots.count: try made.push(knots.items[i])
+    try knots.assign(made.view())
+
+## Every inner knot of `net` along `direction` removed as far as the
+## surface stays within `tolerance` (Alias's Reduce Spans): with `single`,
+## only down to one of each (Del Multi Knots). Returns how many went.
+pub func net_reduce_spans(net: Net*, direction: i64, tolerance: f64, single: bool) -> usize!:
+    var removed: usize = 0
+    var changed = true
+    while changed:
+        changed = false
+        let knots = net.ku.view() if direction == 0 else net.kv.view()
+        let degree = net.du if direction == 0 else net.dv
+        let count = net.nu if direction == 0 else net.nv
+        let low = knots[(usize)degree]
+        let high = knots[count]
+        var inner = Growing[f64]()
+        defer inner.close()
+        for k in knots:
+            if k > low and k < high and (inner.count == 0 or inner.items[inner.count - 1] != k): try inner.push(k)
+        for u in inner.view():
+            let m = multiplicity(knots, u, 0.0)
+            let times = m - 1 if single else m
+            if times == 0: continue
+            let gone = try net_remove(net, direction, (u - low) / (high - low), times, tolerance)
+            if gone > 0:
+                removed += gone
+                changed = true
+                break
+    return removed

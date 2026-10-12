@@ -1,0 +1,399 @@
+## The NURBS toolkit (Piegl and Tiller, The NURBS Book, chapter 5): knot
+## insertion and removal, degree elevation, splitting, Bezier form, on
+## rational B-spline curves kept in homogeneous form, (x w, y w, z w, w), so
+## each algorithm is the polynomial one. Surfaces apply them row by row
+## (nets.lucb); fitting.lucb fits and rebuilds; analytic.lucb converts
+## analytic faces; api.lucb is what Luce calls (CadNurbs, CadSpline).
+##
+## This file: the homogeneous curve and its exact operations. Insertion,
+## elevation and splitting leave the curve where it was (to rounding);
+## knot removal does only when the curve stays within a tolerance.
+import interop
+import memory
+import strings
+from luce_std import math
+from luce_geocore.geocore import Vector3, Matrix4, Mesh, invalid
+from luce_geocore.core.growing import Growing
+from geometry import Surface, SurfaceJet, nurbs_basis, basis_jet, surface_spline, surface_plane, surface_cylinder, surface_cone, surface_sphere, surface_torus, analytic_point, chart_uv, nearest_parameters, support_normal, nurbs_normal, edge_index, wrap
+from model import CadModel
+from modeling import Shape, shape_of, brep_of
+
+## The largest degree (the evaluators' bases are twelve long).
+pub let most_degree: i64 = 11
+
+## A control point in homogeneous form: (x w, y w, z w, w).
+pub struct Weighted:
+    pub var x: f64
+    pub var y: f64
+    pub var z: f64
+    pub var w: f64
+
+    pub func plus(o: Weighted) -> Weighted:
+        return Weighted(self.x + o.x, self.y + o.y, self.z + o.z, self.w + o.w)
+
+    pub func minus(o: Weighted) -> Weighted:
+        return Weighted(self.x - o.x, self.y - o.y, self.z - o.z, self.w - o.w)
+
+    pub func times(s: f64) -> Weighted:
+        return Weighted(self.x * s, self.y * s, self.z * s, self.w * s)
+
+    ## The point it stands for.
+    pub func point() -> Vector3:
+        return Vector3(self.x / self.w, self.y / self.w, self.z / self.w)
+
+    ## Its distance from `o` in four dimensions.
+    pub func distance(o: Weighted) -> f64:
+        let dx = self.x - o.x
+        let dy = self.y - o.y
+        let dz = self.z - o.z
+        let dw = self.w - o.w
+        return math.sqrt(dx * dx + dy * dy + dz * dz + dw * dw)
+
+## The smaller of two counts.
+pub func fewer(a: usize, b: usize) -> usize:
+    return a if a < b else b
+
+pub func weighted(p: Vector3, w: f64) -> Weighted:
+    return Weighted(p.x * w, p.y * w, p.z * w, w)
+
+## A rational B-spline curve in homogeneous form: its degree, clamped knots
+## (count + degree + 1 of them) and control points.
+pub struct Spline:
+    pub var degree: i64
+    pub var knots: Growing[f64]
+    pub var points: Growing[Weighted]
+
+    pub func close():
+        self.knots.close()
+        self.points.close()
+
+    pub func count() -> usize:
+        return self.points.count
+
+    ## The parameter domain.
+    pub func low() -> f64:
+        return self.knots.items[(usize)self.degree]
+
+    pub func high() -> f64:
+        return self.knots.items[self.points.count]
+
+    ## The homogeneous point at knot parameter `t` (clamped to the domain).
+    pub func at(t: f64) -> Weighted:
+        let u = math.clamp(t, self.low(), self.high())
+        var values: f64[12]
+        let first = nurbs_basis(self.knots.view(), (i64)self.points.count, self.degree, u, &values)
+        var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+        for j in 0..<(usize)self.degree + 1: sum = sum.plus(self.points.items[first + j].times(values[j]))
+        return sum
+
+    ## The point it stands for at `t`.
+    pub func point_at(t: f64) -> Vector3:
+        return self.at(t).point()
+
+    ## Its homogeneous derivatives 0..`order` (at most 3) at `t`, the limit
+    ## from below with `left`.
+    pub func jet(t: f64, order: usize, left: bool, out: Weighted[4]*):
+        var ders: f64[48]
+        let first = basis_jet(self.knots.view(), (i64)self.points.count, self.degree, t, left, &ders)
+        for k in 0..<order + 1:
+            var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+            for j in 0..<(usize)self.degree + 1: sum = sum.plus(self.points.items[first + j].times(ders[k * 12 + j]))
+            (*out)[k] = sum
+
+    ## A copy.
+    pub func copy() -> Spline!:
+        var made = empty_spline(self.degree)
+        errdefer made.close()
+        try made.knots.assign(self.knots.view())
+        try made.points.assign(self.points.view())
+        return made
+
+pub func empty_spline(degree: i64) -> Spline:
+    return Spline(degree, Growing[f64](), Growing[Weighted]())
+
+## The curve `points` (weights `weights`) of `degree` on `knots`, checked.
+pub func spline_of(points: const Vector3[], weights: const f64[], degree: i64, knots: const f64[]) -> Spline!:
+    try check_spline(points.length, weights, degree, knots)
+    var made = empty_spline(degree)
+    errdefer made.close()
+    try made.knots.assign(knots)
+    for at in 0..<points.length:
+        if not points[at].is_finite(): error(invalid, "a B-spline's control points must be finite")
+        try made.points.push(weighted(points[at], weights[at]))
+    return made
+
+func check_spline(count: usize, weights: const f64[], degree: i64, knots: const f64[]) -> !:
+    if degree < 1 or degree > most_degree: error(invalid, "a B-spline's degree must be 1 to 11")
+    if count < (usize)degree + 1 or weights.length != count: error(invalid, "a B-spline needs degree + 1 control points and a weight each")
+    if knots.length != count + (usize)degree + 1: error(invalid, "a B-spline needs count + degree + 1 knots")
+    for at in 0..<knots.length:
+        if not math.is_finite(knots[at]) or (at > 0 and knots[at] < knots[at - 1]): error(invalid, "a B-spline's knots must be finite and nondecreasing")
+    for w in weights:
+        if not (w > 0.0) or not math.is_finite(w): error(invalid, "a B-spline's weights must be positive")
+    if not (knots[count] > knots[(usize)degree]): error(invalid, "a B-spline's domain is empty")
+
+## The span holding `t`: knots[k] <= t < knots[k + 1], the last span at the
+## domain's end.
+pub func find_span(knots: const f64[], count: usize, degree: i64, t: f64) -> usize:
+    if t >= knots[count]: return count - 1
+    var low = (usize)degree
+    var high = count
+    while low + 1 < high:
+        let middle = (low + high) // 2
+        if t < knots[middle]: high = middle
+        else: low = middle
+    return low
+
+## How many knots equal `t` (within `eps`).
+pub func multiplicity(knots: const f64[], t: f64, eps: f64) -> usize:
+    var n: usize = 0
+    for k in knots:
+        if math.abs(k - t) <= eps: n += 1
+    return n
+
+## The knot spacing below which two knots count as one: a millionth of a
+## millionth of the domain.
+pub func knot_eps(s: const Spline*) -> f64:
+    return (s.high() - s.low()) * 1e-12
+
+## Insert knot `t` `times` times (A5.1); its multiplicity stays at most the
+## degree, so asking for more inserts what fits. Returns how many it did.
+pub func insert_knot(s: Spline*, t: f64, times: usize) -> usize!:
+    if not math.is_finite(t) or t <= s.low() or t >= s.high(): error(invalid, "a knot goes inside the domain")
+    let p = (usize)s.degree
+    let eps = knot_eps(s)
+    var u = t
+    # A knot this close to one already there joins it.
+    for k in s.knots.view():
+        if math.abs(k - t) <= eps: u = k
+    let had = multiplicity(s.knots.view(), u, 0.0)
+    let r = fewer(times, p - fewer(had, p))
+    if r == 0: return 0
+    let n = s.points.count
+    let k = find_span(s.knots.view(), n, s.degree, u)
+    var knots = Growing[f64]()
+    defer knots.close()
+    var points = Growing[Weighted]()
+    defer points.close()
+    for i in 0..<k + 1: try knots.push(s.knots.items[i])
+    for _ in 0..<r: try knots.push(u)
+    for i in k + 1..<s.knots.count: try knots.push(s.knots.items[i])
+    try points.fill(n + r, Weighted(0.0, 0.0, 0.0, 0.0))
+    for i in 0..<k - p + 1: points.items[i] = s.points.items[i]
+    for i in k - had..<n: points.items[i + r] = s.points.items[i]
+    var temp: Weighted[12]
+    for i in 0..<p - had + 1: temp[i] = s.points.items[k - p + i]
+    var last: usize = k - p
+    for j in 1..<r + 1:
+        last = k - p + j
+        for i in 0..<p - j - had + 1:
+            let alpha = (u - s.knots.items[last + i]) / (s.knots.items[i + k + 1] - s.knots.items[last + i])
+            temp[i] = temp[i + 1].times(alpha).plus(temp[i].times(1.0 - alpha))
+        points.items[last] = temp[0]
+        points.items[k + r - j - had] = temp[p - j - had]
+    for i in last + 1..<k - had: points.items[i] = temp[i - last]
+    try s.knots.assign(knots.view())
+    try s.points.assign(points.view())
+    return r
+
+## The distance in homogeneous space that keeps the curve within `d`
+## (The NURBS Book, eq. 5.30): d w_min / (1 + |P|_max).
+pub func removal_bound(s: const Spline*, d: f64) -> f64:
+    var least = math.infinity
+    var most = 0.0
+    for q in s.points.view():
+        least = math.min(least, q.w)
+        most = math.max(most, q.point().length())
+    return d * least / (1.0 + most)
+
+## Remove knot `u` (an inner knot) up to `times` times (A5.8) while the
+## curve moves at most `tolerance` (model units); returns how many went.
+pub func remove_knot(s: Spline*, u: f64, times: usize, tolerance: f64) -> usize!:
+    return try remove_knot_within(s, u, times, removal_bound(s, tolerance))
+
+## remove_knot against `bound`, a distance between homogeneous points.
+pub func remove_knot_within(s: Spline*, u: f64, times: usize, bound: f64) -> usize!:
+    let p = (usize)s.degree
+    let n = s.points.count - 1
+    let m = n + p + 1
+    var r: usize = 0
+    var found = false
+    for i in 0..<m + 1:
+        if s.knots.items[i] == u:
+            r = i
+            found = true
+    if not found or u <= s.low() or u >= s.high(): error(invalid, "that knot is not an inner knot of this B-spline")
+    let multiple = multiplicity(s.knots.view(), u, 0.0)
+    let num = fewer(times, multiple)
+    let ord = p + 1
+    let fout = (2 * r - multiple - p) // 2
+    var first = (i64)r - (i64)p
+    var last = (i64)r - (i64)multiple
+    var temp = Growing[Weighted]()
+    defer temp.close()
+    try temp.fill(2 * p + 3, Weighted(0.0, 0.0, 0.0, 0.0))
+    var t: usize = 0
+    while t < num:
+        let off = first - 1
+        temp.items[0] = s.points.items[(usize)off]
+        temp.items[(usize)(last + 1 - off)] = s.points.items[(usize)(last + 1)]
+        var i = first
+        var j = last
+        var ii: i64 = 1
+        var jj = last - off
+        var removable = false
+        while j - i > (i64)t:
+            let alfi = (u - s.knots.items[(usize)i]) / (s.knots.items[(usize)i + ord + t] - s.knots.items[(usize)i])
+            let alfj = (u - s.knots.items[(usize)j - t]) / (s.knots.items[(usize)j + ord] - s.knots.items[(usize)j - t])
+            temp.items[(usize)ii] = s.points.items[(usize)i].minus(temp.items[(usize)(ii - 1)].times(1.0 - alfi)).times(1.0 / alfi)
+            temp.items[(usize)jj] = s.points.items[(usize)j].minus(temp.items[(usize)(jj + 1)].times(alfj)).times(1.0 / (1.0 - alfj))
+            i += 1
+            ii += 1
+            j -= 1
+            jj -= 1
+        if j - i < (i64)t:
+            if temp.items[(usize)(ii - 1)].distance(temp.items[(usize)(jj + 1)]) <= bound: removable = true
+        else:
+            let alfi = (u - s.knots.items[(usize)i]) / (s.knots.items[(usize)i + ord + t] - s.knots.items[(usize)i])
+            let blend = temp.items[(usize)(ii + (i64)t + 1)].times(alfi).plus(temp.items[(usize)(ii - 1)].times(1.0 - alfi))
+            if s.points.items[(usize)i].distance(blend) <= bound: removable = true
+        if not removable: break
+        i = first
+        j = last
+        while j - i > (i64)t:
+            s.points.items[(usize)i] = temp.items[(usize)(i - off)]
+            s.points.items[(usize)j] = temp.items[(usize)(j - off)]
+            i += 1
+            j -= 1
+        first -= 1
+        last += 1
+        t += 1
+    if t == 0: return 0
+    for k in r + 1..<m + 1: s.knots.items[k - t] = s.knots.items[k]
+    var j = fout
+    var i = j
+    for k in 1..<t:
+        if k % 2 == 1: i += 1
+        else: j -= 1
+    for k in i + 1..<n + 1:
+        s.points.items[j] = s.points.items[k]
+        j += 1
+    s.knots.count -= t
+    s.points.count -= t
+    return t
+
+## Every inner knot raised to the degree's multiplicity: each span a
+## Bezier segment (Alias's NURBS to Bezier, A5.6's result).
+pub func to_bezier(s: Spline*) -> !:
+    let eps = knot_eps(s)
+    var inner = Growing[f64]()
+    defer inner.close()
+    try distinct_inner(s, eps, &inner)
+    for u in inner.view(): _ = try insert_knot(s, u, (usize)s.degree)
+
+## The distinct inner knots of `s` onto `out`.
+pub func distinct_inner(s: const Spline*, eps: f64, out: Growing[f64]*) -> !:
+    out.clear()
+    for k in s.knots.view():
+        if k <= s.low() + eps or k >= s.high() - eps: continue
+        if out.count > 0 and math.abs(out.items[out.count - 1] - k) <= eps: continue
+        try out.push(k)
+
+## Binomial coefficient C(n, k).
+pub func choose(n: usize, k: usize) -> f64:
+    if k > n: return 0.0
+    var c = 1.0
+    for i in 0..<k: c = c * (f64)(n - i) / (f64)(i + 1)
+    return c
+
+## The degree raised by `by` (Bezier segments elevated in closed form,
+## then the inner knots taken back to their old continuity): the same
+## curve. Each inner knot's multiplicity grows by `by`.
+pub func elevate(s: Spline*, by: usize) -> !:
+    if by == 0: return
+    let p = (usize)s.degree
+    let q = p + by
+    if q > (usize)most_degree: error(invalid, "a B-spline's degree goes to 11 at most")
+    let eps = knot_eps(s)
+    var inner = Growing[f64]()
+    defer inner.close()
+    try distinct_inner(s, eps, &inner)
+    var kept = Growing[usize]()
+    defer kept.close()
+    for u in inner.view(): try kept.push(multiplicity(s.knots.view(), u, 0.0))
+    try to_bezier(s)
+    # Bezier segment j: points j p ..= j p + p.
+    let segments = (s.points.count - 1) // p
+    var points = Growing[Weighted]()
+    defer points.close()
+    for seg in 0..<segments:
+        for i in 0..<q + 1:
+            if seg > 0 and i == 0: continue
+            var sum = Weighted(0.0, 0.0, 0.0, 0.0)
+            let low = i - fewer(i, by)
+            for j in low..<fewer(p, i) + 1:
+                sum = sum.plus(s.points.items[seg * p + j].times(choose(p, j) * choose(by, i - j) / choose(q, i)))
+            try points.push(sum)
+    var knots = Growing[f64]()
+    defer knots.close()
+    for _ in 0..<q + 1: try knots.push(s.low())
+    for u in inner.view():
+        for _ in 0..<q: try knots.push(u)
+    for _ in 0..<q + 1: try knots.push(s.high())
+    s.degree = (i64)q
+    try s.points.assign(points.view())
+    try s.knots.assign(knots.view())
+    # Back to each knot's continuity: multiplicity m + by, exactly.
+    let exact = removal_bound(s, 1e-9 * math.max(1.0, size_of(s)))
+    for at in 0..<inner.count:
+        let target = kept.items[at] + by
+        if target < q: _ = try remove_knot_within(s, inner.items[at], q - target, exact)
+
+## The size of `s`'s hull: its largest coordinate span.
+pub func size_of(s: const Spline*) -> f64:
+    var low = s.points.items[0].point()
+    var high = low
+    for q in s.points.view():
+        let p = q.point()
+        low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+        high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+    return high.subtract(low).length()
+
+## The piece of `s` over `a`..`b` (inside its domain): knots inserted to
+## the degree at both ends, the rest dropped.
+pub func extract(s: const Spline*, a: f64, b: f64) -> Spline!:
+    let low = s.low()
+    let high = s.high()
+    if not (a < b) or a < low or b > high: error(invalid, "a B-spline piece runs inside its domain, low to high")
+    var work = try s.copy()
+    defer work.close()
+    let eps = knot_eps(s)
+    let p = (usize)s.degree
+    var ua = a
+    var ub = b
+    if a > low + eps: _ = try insert_knot(&work, a, p)
+    else: ua = low
+    if b < high - eps: _ = try insert_knot(&work, b, p)
+    else: ub = high
+    for k in work.knots.view():
+        if math.abs(k - ua) <= eps: ua = k
+        if math.abs(k - ub) <= eps: ub = k
+    # The first control point of the piece: the last knot index equal to
+    # ua minus the degree; the last: the first index equal to ub - 1.
+    var first: usize = 0
+    for i in 0..<work.knots.count:
+        if work.knots.items[i] == ua: first = i
+    first -= p
+    var end: usize = 0
+    var seen = false
+    for i in 0..<work.knots.count:
+        if work.knots.items[i] == ub and not seen:
+            end = i
+            seen = true
+    var piece = empty_spline(s.degree)
+    errdefer piece.close()
+    for i in first..<end: try piece.points.push(work.points.items[i])
+    for _ in 0..<p + 1: try piece.knots.push(ua)
+    for i in first + p + 1..<end: try piece.knots.push(work.knots.items[i])
+    for _ in 0..<p + 1: try piece.knots.push(ub)
+    return piece

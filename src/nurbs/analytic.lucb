@@ -1,0 +1,175 @@
+## Analytic faces as B-splines (Alias's surfaces are all NURBS; Plasticity's
+## Raise Degree turns a plane or a cylinder into one), exactly: a plane is
+## a bilinear patch, and a cylinder, cone, sphere or torus is a surface of
+## revolution (The NURBS Book, A8.1): its profile (a line or a circular
+## arc, as rational quadratics) turned through an arc. The net covers the
+## chart box of every face on the surface, a whole turn where they go
+## round.
+
+## The unit arc from angle `a0` to `a1` as a rational quadratic (A7.1): at
+## most a quarter turn a segment, its points (x cos, y sin) onto `points`,
+## its weights and knots (over a0..a1).
+pub func arc_spline(a0: f64, a1: f64, points: Growing[Vector3]*, weights: Growing[f64]*, knots: Growing[f64]*) -> !:
+    let theta = a1 - a0
+    if not (theta > 0.0): error(invalid, "an arc needs an angle")
+    var arcs = (usize)math.ceil(theta / (math.pi / 2.0) - 1e-9)
+    if arcs < 1: arcs = 1
+    let step = theta / (f64)arcs
+    let middle = math.cos(step / 2.0)
+    points.clear()
+    weights.clear()
+    knots.clear()
+    try points.push(Vector3(math.cos(a0), math.sin(a0), 0.0))
+    try weights.push(1.0)
+    for i in 1..<arcs + 1:
+        let angle = a0 + step * (f64)i
+        let half = angle - step / 2.0
+        try points.push(Vector3(math.cos(half) / middle, math.sin(half) / middle, 0.0))
+        try weights.push(middle)
+        try points.push(Vector3(math.cos(angle), math.sin(angle), 0.0))
+        try weights.push(1.0)
+    for _ in 0..<(usize)3: try knots.push(a0)
+    for i in 1..<arcs:
+        let k = a0 + theta * (f64)i / (f64)arcs
+        try knots.push(k)
+        try knots.push(k)
+    for _ in 0..<(usize)3: try knots.push(a1)
+
+## The chart box of the faces on surface `s` of `w`: (u0, v0) and (u1, v1),
+## angles unwrapped along each loop and a whole turn where a loop goes round.
+## A sphere's or a cone's face whose loops wind round the axis on the whole
+## (a cap, not a band) runs to the pole or apex they enclose.
+func chart_box(w: const Shape*, s: usize) -> (Vector3, Vector3)!:
+    let surface = w.surfaces.items[s]
+    var low = Vector3(math.infinity, math.infinity, 0.0)
+    var high = Vector3(-math.infinity, -math.infinity, 0.0)
+    var reference = Vector3()
+    var started = false
+    var any = false
+    var north = false
+    var south = false
+    for f in 0..<w.faces.count:
+        if w.faces.items[f].surface != (i64)s: continue
+        any = true
+        var winding = 0.0
+        var at: usize = 0
+        let uses = w.face_uses(f)
+        for size in w.face_sizes(f):
+            var previous = Vector3()
+            var first = Vector3()
+            for use in uses[at..<at + (usize)size]:
+                let e = edge_index(use)
+                for k in 0..<(usize)17:
+                    let fraction = (f64)k / 16.0
+                    let p = try w.edge_at(e, fraction if use > 0 else 1.0 - fraction)
+                    let opening = use == uses[at] and k == 0
+                    var uv = chart_uv(surface, p, previous, not opening)
+                    if opening:
+                        if started:
+                            uv = Vector3(wrap(uv.x, reference.x) if surface.kind != surface_plane else uv.x, wrap(uv.y, reference.y) if surface.kind == surface_torus else uv.y, 0.0)
+                        else:
+                            reference = uv
+                            started = true
+                        first = uv
+                    previous = uv
+                    low = Vector3(math.min(low.x, uv.x), math.min(low.y, uv.y), 0.0)
+                    high = Vector3(math.max(high.x, uv.x), math.max(high.y, uv.y), 0.0)
+            winding += previous.x - first.x
+            at += (usize)size
+        # A loop round the axis with no seam edge (a sphere's cap) would run
+        # off the B-spline's domain at its seam: not converted.
+        if math.abs(winding) > math.pi and not seamed(w, f):
+            error(invalid, "this face goes round its axis without a seam edge; split it through the axis first")
+        # Counterclockwise about the outward normal round the north pole (or
+        # the apex) is u increasing.
+        if math.abs(winding) > math.pi:
+            if (winding > 0.0) == w.faces.items[f].sense: north = true
+            else: south = true
+    if not any: error(invalid, "no face uses this surface")
+    let turn = 2.0 * math.pi
+    if surface.kind != surface_plane and high.x - low.x > turn - 1e-6: high = Vector3(low.x + turn, high.y, 0.0)
+    if surface.kind == surface_torus and high.y - low.y > turn - 1e-6: high = Vector3(high.x, low.y + turn, 0.0)
+    if surface.kind == surface_sphere:
+        if north: high = Vector3(high.x, math.pi / 2.0, 0.0)
+        if south: low = Vector3(low.x, -math.pi / 2.0, 0.0)
+        low = Vector3(low.x, math.max(low.y, -math.pi / 2.0), 0.0)
+        high = Vector3(high.x, math.min(high.y, math.pi / 2.0), 0.0)
+    if surface.kind == surface_cone and (north or south) and math.abs(math.tan(surface.angle)) > 1e-12:
+        let apex = -surface.radius / math.tan(surface.angle)
+        low = Vector3(low.x, math.min(low.y, apex), 0.0)
+        high = Vector3(high.x, math.max(high.y, apex), 0.0)
+    if not (high.x > low.x) or not (high.y > low.y): error(invalid, "this face covers no area of its surface")
+    return (low, high)
+
+## Analytic surface `s` of `w` as a net over its faces' chart box.
+pub func analytic_net(w: const Shape*, s: usize) -> Net!:
+    let surface = w.surfaces.items[s]
+    if surface.kind == surface_spline: error(invalid, "this face is a B-spline already")
+    let (low, high) = try chart_box(w, s)
+    var made = empty_net()
+    errdefer made.close()
+    if surface.kind == surface_plane:
+        made.du = 1
+        made.dv = 1
+        made.nu = 2
+        made.nv = 2
+        try two_ends(low.x, high.x, &made.ku)
+        try two_ends(low.y, high.y, &made.kv)
+        try made.points.push(weighted(analytic_point(surface, low.x, low.y), 1.0))
+        try made.points.push(weighted(analytic_point(surface, low.x, high.y), 1.0))
+        try made.points.push(weighted(analytic_point(surface, high.x, low.y), 1.0))
+        try made.points.push(weighted(analytic_point(surface, high.x, high.y), 1.0))
+        return made
+    # The profile in (radial, height) and its spline.
+    var profile = Growing[Vector3]()
+    defer profile.close()
+    var profile_weights = Growing[f64]()
+    defer profile_weights.close()
+    if surface.kind == surface_cylinder or surface.kind == surface_cone:
+        let slope = math.tan(surface.angle) if surface.kind == surface_cone else 0.0
+        try profile.push(Vector3(surface.radius + low.y * slope, low.y, 0.0))
+        try profile.push(Vector3(surface.radius + high.y * slope, high.y, 0.0))
+        try profile_weights.fill(2, 1.0)
+        try two_ends(low.y, high.y, &made.kv)
+        made.dv = 1
+    else:
+        var arc = Growing[Vector3]()
+        defer arc.close()
+        try arc_spline(low.y, high.y, &arc, &profile_weights, &made.kv)
+        # A sphere's meridian is its radius about the center; a torus's tube
+        # (minor radius in `angle`) is centered at its major radius.
+        let center = 0.0 if surface.kind == surface_sphere else surface.radius
+        let tube = surface.radius if surface.kind == surface_sphere else surface.angle
+        for q in arc.view(): try profile.push(Vector3(center + tube * q.x, tube * q.y, 0.0))
+        made.dv = 2
+    var ring = Growing[Vector3]()
+    defer ring.close()
+    var ring_weights = Growing[f64]()
+    defer ring_weights.close()
+    try arc_spline(low.x, high.x, &ring, &ring_weights, &made.ku)
+    made.du = 2
+    made.nu = ring.count
+    made.nv = profile.count
+    for i in 0..<ring.count:
+        let c = ring.items[i]
+        for j in 0..<profile.count:
+            let r = profile.items[j]
+            let p = surface.origin.add(surface.x.multiply_scalar(r.x * c.x)).add(surface.y.multiply_scalar(r.x * c.y)).add(surface.z.multiply_scalar(r.y))
+            try made.points.push(weighted(p, ring_weights.items[i] * profile_weights.items[j]))
+    return made
+
+## Whether face `f` uses an edge twice (a seam).
+func seamed(w: const Shape*, f: usize) -> bool:
+    let uses = w.face_uses(f)
+    for a in 0..<uses.length:
+        for b in a + 1..<uses.length:
+            if edge_index(uses[a]) == edge_index(uses[b]): return true
+    return false
+
+## Degree 1 knots over `a`..`b`.
+func two_ends(a: f64, b: f64, out: Growing[f64]*) -> !:
+    out.clear()
+    try out.push(a)
+    try out.push(a)
+    try out.push(b)
+    try out.push(b)
