@@ -93,10 +93,38 @@ struct Work:
 
     ## The merged vertex at `p`.
     func vertex(p: Vector3) -> i64!:
+        return try self.vertex_within(p, 0.0)
+
+    ## The merged vertex at `p`, merging within `slack` too (a tolerant
+    ## edge's or vertex's precision: Parasolid's tolerant modeling).
+    func vertex_within(p: Vector3, slack: f64) -> i64!:
+        let reach = math.max(self.tol * 10.0, slack)
         for at in 0..<self.vertices.count:
-            if self.vertices.items[at].subtract(p).length() <= self.tol * 10.0: return (i64)at
+            if self.vertices.items[at].subtract(p).length() <= reach: return (i64)at
         try self.vertices.push(p)
         return (i64)self.vertices.count - 1
+
+    ## The merged vertex for a new edge's end at `p` across faces `fa` and
+    ## `fb`: on a tolerant edge of either it merges within the edge's
+    ## precision, so the sections either face makes there (each crossing
+    ## it where its own surface does) meet at one vertex.
+    func section_end(p: Vector3, fa: usize, fb: usize) -> i64!:
+        var slack = 0.0
+        for f in [fa, fb]:
+            for use in self.w.face_uses(f):
+                let e = edge_index(use)
+                let precision = self.w.edge_slack_of(e)
+                if precision <= 0.0: continue
+                let edge = self.w.edges.items[e]
+                let t = try nearest_on(&self.w, edge.carrier, p, edge.t0, edge.t1)
+                if (try self.w.at(edge.carrier, t)).subtract(p).length() <= precision: slack = math.max(slack, precision)
+        return try self.vertex_within(p, slack)
+
+    ## The tolerance to meet edge `e` by: the work's, or its precision
+    ## when it is tolerant (crossings and boundary tests compare within ten
+    ## of it).
+    func edge_tol(e: usize) -> f64:
+        return math.max(self.tol, self.w.edge_slack_of(e) * 0.1)
 
     ## The final edge for `edge` (vertices merged): an existing one with the
     ## same ends and middle, or a new one; and whether `edge` runs its way.
@@ -226,6 +254,11 @@ func append_shape(into: Shape*, source: const Shape*) -> !:
         if moved.spline >= 0: moved.spline += splines
         try into.carriers.push(moved)
     for e in source.edges.view(): try into.edges.push(ShapeEdge(e.carrier + carriers, e.t0, e.t1, e.start + points, e.end + points))
+    # Tolerant edges and points keep their slack (none listed: exact).
+    while into.edge_slack.count < (usize)edges: try into.edge_slack.push(0.0)
+    for e in 0..<source.edges.count: try into.edge_slack.push(source.edge_slack_of(e))
+    while into.point_slack.count < (usize)points: try into.point_slack.push(0.0)
+    for p in 0..<source.points.count: try into.point_slack.push(source.point_slack_of(p))
     for s in source.surfaces.view():
         try into.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
     var uses = Growing[i64]()
@@ -256,7 +289,7 @@ pub func combine(a: const CadModel*, b: const CadModel*, op: i64) -> interop.Ref
     # are inputs again, and their tolerance must not grow from one to the
     # next.
     work.tol = math.max(work.size * 1e-7, 1e-10)
-    for p in work.w.points.view(): try work.point_vertex.push(try work.vertex(p))
+    for at in 0..<work.w.points.count: try work.point_vertex.push(try work.vertex_within(work.w.points.items[at], work.w.point_slack_of(at)))
     try intersect_faces(&work)
     try vertex_cuts(&work)
     try cut_edges(&work)
@@ -341,7 +374,7 @@ func intersect_faces(work: Work*) -> !:
                     for use in w.face_uses(f):
                         let e = edge_index(use)
                         let before = hits.count
-                        try crossings(w, c, lowest, highest, e, work.size, work.tol, &hits)
+                        try crossings(w, c, lowest, highest, e, work.size, work.edge_tol(e), &hits)
                         # A crossing cuts the boundary edge only where the
                         # other face is: elsewhere no section ends there,
                         # and the cut would leave a stray vertex on the edge.
@@ -389,17 +422,17 @@ func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: co
             for use in w.face_uses(owner):
                 let e = edge_index(use)
                 let edge = w.edges.items[e]
-                if not try same_curve(w, c, e, work.tol): continue
+                if not try same_curve(w, c, e, work.edge_tol(e)): continue
                 let s_mid = try nearest_on(w, edge.carrier, middle, edge.t0, edge.t1)
-                if (try w.at(edge.carrier, s_mid)).subtract(middle).length() > work.tol * 10.0: continue
+                if (try w.at(edge.carrier, s_mid)).subtract(middle).length() > work.edge_tol(e) * 10.0: continue
                 try work.cuts.push(Cut(e, try nearest_on(w, edge.carrier, try w.at(c, t0), edge.t0, edge.t1)))
                 try work.cuts.push(Cut(e, try nearest_on(w, edge.carrier, try w.at(c, t1), edge.t0, edge.t1)))
                 try work.imprints.push(Imprint(other, e))
                 found = true
                 break
             if found: continue
-        let start = try work.vertex(try w.at(c, t0))
-        let end = try work.vertex(try w.at(c, t1))
+        let start = try work.section_end(try w.at(c, t0), fa, fb)
+        let end = try work.section_end(try w.at(c, t1), fa, fb)
         # Ends merged into one vertex: nothing between them (a closed curve
         # once around is its own loop).
         if start == end and not (closed and count == 2): continue
@@ -409,9 +442,9 @@ func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: co
 ## past its end to t1: two sections meeting at its ends' vertex.
 func add_wrapped(work: Work*, c: i64, t0: f64, t1: f64, low: f64, high: f64, fa: usize, fb: usize) -> !:
     let w = &work.w
-    let start = try work.vertex(try w.at(c, t0))
-    let seam = try work.vertex(try w.at(c, high))
-    let end = try work.vertex(try w.at(c, t1 - (high - low)))
+    let start = try work.section_end(try w.at(c, t0), fa, fb)
+    let seam = try work.section_end(try w.at(c, high), fa, fb)
+    let end = try work.section_end(try w.at(c, t1 - (high - low)), fa, fb)
     if start != seam: try work.sections.push(Section(ShapeEdge(c, t0, high, start, seam), (i64)fa, (i64)fb))
     if seam != end: try work.sections.push(Section(ShapeEdge(c, low, t1 - (high - low), seam, end), (i64)fa, (i64)fb))
 
@@ -427,7 +460,7 @@ func imprint(work: Work*, onto: usize, source: usize) -> !:
         for other in w.face_uses(onto):
             let o = edge_index(other)
             hits.clear()
-            try crossings(w, edge.carrier, edge.t0, edge.t1, o, work.size, work.tol, &hits)
+            try crossings(w, edge.carrier, edge.t0, edge.t1, o, work.size, math.max(work.edge_tol(e), work.edge_tol(o)), &hits)
             for hit in hits.view():
                 try work.cuts.push(Cut(e, hit.t))
                 try work.cuts.push(Cut(o, hit.s))
@@ -452,7 +485,7 @@ func vertex_cuts(work: Work*) -> !:
             low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
             high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
         # Arcs bulge between samples: a sixteenth of their reach more.
-        let bulge = high.subtract(low).length() * 0.02 + pad
+        let bulge = high.subtract(low).length() * 0.02 + math.max(pad, work.edge_tol(e) * 10.0)
         try lows.push(low.subtract(Vector3(bulge, bulge, bulge)))
         try highs.push(high.add(Vector3(bulge, bulge, bulge)))
     # The ends of new edges, and every vertex of both solids (one solid's
@@ -481,7 +514,7 @@ func vertex_cuts(work: Work*) -> !:
             if p.x < l.x or p.y < l.y or p.z < l.z or p.x > h.x or p.y > h.y or p.z > h.z: continue
             let edge = w.edges.items[e]
             let t = try nearest_on(w, edge.carrier, p, edge.t0, edge.t1)
-            if (try w.at(edge.carrier, t)).subtract(p).length() > pad: continue
+            if (try w.at(edge.carrier, t)).subtract(p).length() > math.max(pad, work.edge_tol(e) * 10.0): continue
             try work.cuts.push(Cut(e, t))
 
 ## Step 3: every original edge cut where it was crossed, into final edges.
@@ -504,7 +537,7 @@ func cut_edges(work: Work*) -> !:
         let last_vertex = work.point_vertex.items[(usize)edge.end]
         for at in 0..<ts.count + 1:
             let fraction = ts.items[at] if at < ts.count else 1.0
-            let vertex = (try work.vertex(try w.edge_at(e, fraction))) if at < ts.count else last_vertex
+            let vertex = (try work.vertex_within(try w.edge_at(e, fraction), w.edge_slack_of(e))) if at < ts.count else last_vertex
             # Cuts that merge into a vertex already there cut nothing.
             if at < ts.count and (vertex == previous_vertex or vertex == last_vertex): continue
             if vertex == previous_vertex and fraction - previous_fraction < 1e-9: continue

@@ -246,3 +246,157 @@ pub func unstitch_model(model: const CadModel*, out: Growing[interop.Reference[C
         out.push(piece) catch failure:
             piece.release()
             error(failure.code, failure.message)
+
+## Alias's Stitch options for CAD export (Detach periodic surfaces, Detach
+## single curve boundaries), on a stitched body: what it did.
+pub struct Detached:
+    pub var model: interop.Reference[CadModel]
+    ## Periodic faces split in two, and closed edges split in two.
+    pub var periodic: i64
+    pub var single: i64
+
+## `model` made ready for systems that refuse faces wrapping round their
+## surface and loops of one closed edge:
+##   - `wrapping` (periodic): a face going round its surface's axis (it uses a seam
+##     edge both ways: a cylinder's, a cone's or a sphere's side, a torus
+##     once each way round) is split in two by the plane through the axis
+##     and the seam, so each half meets the seam once; a torus is cut
+##     again by its equator plane (its other seam);
+##   - `single`: an edge closing on itself alone as a loop (a disc's circle,
+##     a hemisphere's equator) is split at its middle into two edges.
+## A periodic B-spline face (closed rows of its own) is refused: rebuild it
+## open first. A body with nothing to detach comes back as it is.
+pub func detached(model: interop.Reference[CadModel], wrapping: bool, single: bool) -> Detached!:
+    var current = model.clone()
+    errdefer current.release()
+    var splits: i64 = 0
+    if wrapping:
+        # Faces need names to be picked by: the unnamed ones get them.
+        let named = try CadModeling.tagged(current, "#detach")
+        current.release()
+        current = named
+        # One face at a time, its seams by the shape as it is now.
+        for _ in 0..<64:
+            var w = try shape_of(current.value())
+            defer w.close()
+            var found: i64 = -1
+            var seam: i64 = -1
+            for f in 0..<w.faces.count:
+                seam = seam_of(&w, f)
+                if seam >= 0:
+                    found = (i64)f
+                    break
+            if found < 0: break
+            let s = &w.surfaces.items[(usize)w.faces.items[(usize)found].surface]
+            if s.kind == surface_spline: error(invalid, "Detach periodic surfaces: a closed B-spline face is not split; rebuild it open first")
+            if s.kind == surface_plane: break
+            let edge = w.edges.items[(usize)seam]
+            let middle = try w.at(edge.carrier, (edge.t0 + edge.t1) * 0.5)
+            let off = middle.subtract(s.origin)
+            let radial = off.subtract(s.z.multiply_scalar(off.dot(s.z)))
+            # A torus's seam round its axis (the ring) is cut by the
+            # equator plane; one along its tube by the axis plane.
+            var normal = s.z
+            if s.kind != surface_torus or (try edge_axis_reach(&w, (usize)seam, s)) > 1e-9 * (s.radius + s.angle):
+                normal = s.z.cross(radial).normalized() catch failure: error(invalid, "Detach periodic surfaces: the seam lies on the axis")
+            let along = (try radial.normalized()) if radial.length() > 0.0 else s.x
+            var plane = try plane_surface(s.origin, along, normal)
+            defer plane.close()
+            var chosen = Growing[bool]()
+            defer chosen.close()
+            try chosen.fill(w.faces.count, false)
+            chosen.items[(usize)found] = true
+            let split = try split_faces_by(current.value(), chosen.view(), &plane, "#detach")
+            current.release()
+            current = split
+            splits += 1
+    var closed_edges: i64 = 0
+    if single:
+        var w = try shape_of(current.value())
+        defer w.close()
+        closed_edges = try split_closed_loops(&w)
+        if closed_edges > 0:
+            let b = try brep_of(&w)
+            defer b.release()
+            let made = try CadModel.of_brep(b)
+            current.release()
+            current = made
+    return Detached(current, splits, closed_edges)
+
+## An edge face `f` uses both ways in one loop (its seam), or -1.
+func seam_of(w: const Shape*, f: usize) -> i64:
+    let uses = w.face_uses(f)
+    for a in 0..<uses.length:
+        for b in a + 1..<uses.length:
+            if uses[a] == -uses[b]: return (i64)edge_index(uses[a])
+    return -1
+
+## How far a torus's seam edge `e` strays along its axis from the
+## equator plane (0 for the ring, which the equator plane cuts).
+func edge_axis_reach(w: const Shape*, e: usize, s: const Surface*) -> f64!:
+    var most = 0.0
+    for k in 0..<5:
+        let p = try w.edge_at(e, (f64)k / 4.0)
+        most = math.max(most, math.abs(p.subtract(s.origin).dot(s.z)))
+    return most
+
+## Every closed edge that alone makes a loop split at its middle into two
+## edges (each loop using it uses both halves); how many were split.
+func split_closed_loops(w: Shape*) -> i64!:
+    var second = Growing[i64]()
+    defer second.close()
+    try second.fill(w.edges.count, -1)
+    var count: i64 = 0
+    for f in 0..<w.faces.count:
+        let uses = w.face_uses(f)
+        var at: usize = 0
+        for size in w.face_sizes(f):
+            if size == 1:
+                let e = edge_index(uses[at])
+                let edge = w.edges.items[e]
+                if edge.start == edge.end and second.items[e] < 0:
+                    let mid = (edge.t0 + edge.t1) * 0.5
+                    let v = try w.add_point(try w.at(edge.carrier, mid))
+                    second.items[e] = try w.add_edge(ShapeEdge(edge.carrier, mid, edge.t1, v, edge.end))
+                    w.edges.items[e].t1 = mid
+                    w.edges.items[e].end = v
+                    while w.edge_slack.count < w.edges.count - 1: try w.edge_slack.push(0.0)
+                    try w.edge_slack.push(w.edge_slack_of(e))
+                    count += 1
+            at += (usize)size
+    if count == 0: return 0
+    # The loops again, each split edge's use followed (or, backwards,
+    # preceded) by its second half's.
+    var uses = Growing[i64]()
+    defer uses.close()
+    var sizes = Growing[i64]()
+    defer sizes.close()
+    for f in 0..<w.faces.count:
+        let first = uses.count
+        let loop_first = sizes.count
+        let old = w.face_uses(f)
+        var at: usize = 0
+        for size in w.face_sizes(f):
+            var made: i64 = 0
+            for use in old[at..<at + (usize)size]:
+                let other = second.items[edge_index(use)] if edge_index(use) < second.count else -1
+                if other < 0:
+                    try uses.push(use)
+                    made += 1
+                elif use > 0:
+                    try uses.push(use)
+                    try uses.push(other + 1)
+                    made += 2
+                else:
+                    try uses.push(-(other + 1))
+                    try uses.push(use)
+                    made += 2
+            try sizes.push(made)
+            at += (usize)size
+        w.faces.items[f].first = first
+        w.faces.items[f].count = uses.count - first
+        w.faces.items[f].loop_first = loop_first
+    try w.uses.assign(uses.view())
+    try w.sizes.assign(sizes.view())
+    try w.index_sides()
+    return count

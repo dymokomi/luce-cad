@@ -1,0 +1,168 @@
+## Trim's cutting curves (surfacing Stage 3 follow-ups; §4.3 of luced-3d's
+## docs/research/SURFACING-ALIAS-PLASTICITY.md): which curves cut a face,
+## as 3D curves lying on it.
+##
+## - **On the face** (Alias's Trim Surface as it was): the set's curves on
+##   the face.
+## - **3D Trimming** (Alias's option): curves off the face too, cast onto it
+##   as the trim runs, along a vector or along its normals (Project's
+##   casting), and faces of the set intersected with it (Intersect's
+##   meeting curves); nothing of them is kept on the face afterwards.
+## - **Extend** (Alias's Extend curves to the boundary): a curve end that
+##   stops short, inside the face, is carried on along the face, straight
+##   on in its chart from the end's own direction, until it reaches the
+##   face's boundary or another of the curves. Its extension is a curve on
+##   the face of its own, joining it end to end, so the region it closes
+##   off is cut where the curve alone would leave a loose end.
+
+## How a trim takes its curves: `cast` 0 only those on the face, 1 the
+## others cast along `direction` (both ways), 2 along the face's normals;
+## `cutters` the faces (names apart by `;`, of any body) intersected with
+## it; with `extend`, loose ends carried on to the boundary.
+pub struct TrimCurves:
+    pub var cast: i64
+    pub var direction: Vector3
+    pub var cutters: str
+    pub var extend: bool
+
+## The trims' casting modes (TrimCurves.cast).
+pub let trim_on_face: i64 = 0
+pub let trim_cast_vector: i64 = 1
+pub let trim_cast_normal: i64 = 2
+
+## Curve `c`'s parameter nearest `p`: the best of a sampling, refined by
+## Newton on (C(t) - p) . C'(t).
+func spline_nearest(c: const Spline*, p: Vector3) -> f64:
+    let low = c.low()
+    let high = c.high()
+    var best = low
+    var best_distance = 1.0e300
+    let samples = 64.0 * math.max(1.0, (f64)c.count())
+    let count = (usize)math.min(samples, 2048.0)
+    for k in 0..<count + 1:
+        let t = low + (high - low) * (f64)k / (f64)count
+        let d = c.point_at(t).subtract(p).length()
+        if d < best_distance:
+            best_distance = d
+            best = t
+    var t = best
+    for _ in 0..<24:
+        var jet: Weighted[4]
+        c.jet(t, 2, false, &jet)
+        var e: Weighted[4]
+        euclidean_jet(&jet, 2, &e)
+        let d1 = Vector3(e[1].x, e[1].y, e[1].z)
+        let d2 = Vector3(e[2].x, e[2].y, e[2].z)
+        let off = Vector3(e[0].x, e[0].y, e[0].z).subtract(p)
+        let f = off.dot(d1)
+        let g = d1.dot(d1) + off.dot(d2)
+        if not (math.abs(g) > 0.0): break
+        let next = math.clamp(t - f / g, low, high)
+        if math.abs(next - t) <= (high - low) * 1e-15:
+            t = next
+            break
+        t = next
+    return t
+
+## How far `p` lies from face `t`'s boundary edges.
+func boundary_distance(t: const Target*, p: Vector3) -> f64!:
+    var best = 1.0e300
+    for use in t.w.face_uses(t.f):
+        let edge = t.w.edges.items[edge_index(use)]
+        let q = try t.w.at(edge.carrier, try nearest_on(&t.w, edge.carrier, p, edge.t0, edge.t1))
+        best = math.min(best, q.subtract(p).length())
+    return best
+
+## Each loose end of `curves` (lying on face `t`) extended along the face
+## (see the file's header), the extensions added to `curves`; `fit` the
+## tolerance they are fitted to. How many were added.
+func extend_loose(t: const Target*, curves: Growing[Spline]*, fit: f64) -> i64!:
+    let count = curves.count
+    let anchor = math.max(fit * 10.0, t.size * 1e-6)
+    let pull = Casting(Vector3(), true, true)
+    let s = t.surface()
+    var added: i64 = 0
+    for k in 0..<count:
+        let low = curves.items[k].low()
+        let high = curves.items[k].high()
+        let start = curves.items[k].point_at(low)
+        let finish = curves.items[k].point_at(high)
+        # A closed curve has no ends.
+        if start.subtract(finish).length() <= anchor: continue
+        for end in 0..<2:
+            let at = high if end == 1 else low
+            let p = finish if end == 1 else start
+            if try boundary_distance(t, p) <= anchor: continue
+            var met = false
+            for j in 0..<count:
+                if j == k: continue
+                let other = &curves.items[j]
+                if other.point_at(spline_nearest(other, p)).subtract(p).length() <= anchor: met = true
+            if met: continue
+            # The end's chart point and its direction on out of the curve.
+            let inner = curves.items[k].point_at(at + (low - high) * 1e-3 if end == 1 else at + (high - low) * 1e-3)
+            let uv0 = try cast_point(t, &pull, p, none) else continue
+            let back = try cast_point(t, &pull, inner, uv0) else continue
+            if not t.holds(uv0): continue
+            let way = uv0.subtract(back)
+            let way_length = math.sqrt(way.x * way.x + way.y * way.y)
+            if not (way_length > 0.0): continue
+            let dir = Vector3(way.x / way_length, way.y / way_length, 0.0)
+            let reach = math.max(t.high.x - t.low.x, t.high.y - t.low.y)
+            let step = reach / 512.0
+            # March on until it leaves the face or comes to another curve.
+            var inside = uv0
+            var outside: Vector3? = none
+            var onto = Vector3()
+            var met_curve = false
+            var previous = p
+            for i in 1..<2049:
+                let q = uv0.add(dir.multiply_scalar(step * (f64)i))
+                if not t.holds(q):
+                    outside = q
+                    break
+                let point = try surface_point(*s, q)
+                let stride = point.subtract(previous).length()
+                previous = point
+                for j in 0..<count:
+                    if j == k: continue
+                    let other = &curves.items[j]
+                    let near = other.point_at(spline_nearest(other, point))
+                    if near.subtract(point).length() <= math.max(stride, anchor):
+                        onto = (try cast_point(t, &pull, near, q)) else q
+                        met_curve = true
+                        break
+                if met_curve: break
+                inside = q
+            var last = inside
+            if met_curve:
+                last = onto
+            elif let out = outside:
+                # Halving between the last point in and the first out, then
+                # onto the boundary edge exactly.
+                var a = inside
+                var b = out
+                for _ in 0..<48:
+                    let mid = a.add(b).multiply_scalar(0.5)
+                    if t.holds(mid): a = mid
+                    else: b = mid
+                last = try onto_boundary(t, a)
+            else:
+                continue
+            # The extension: the chart's straight line lifted onto the face,
+            # starting exactly at the curve's end.
+            var chart = empty_spline(1)
+            defer chart.close()
+            let knots: f64[4] = [0.0, 0.0, 1.0, 1.0]
+            try chart.knots.assign(knots[..<4])
+            try chart.points.push(Weighted(uv0.x, uv0.y, 0.0, 1.0))
+            try chart.points.push(Weighted(last.x, last.y, 0.0, 1.0))
+            var deviation = 0.0
+            var lifted = try face_curve(s, &chart, fit * 0.1, &deviation)
+            let w0 = lifted.points.items[0].w
+            lifted.points.items[0] = Weighted(p.x * w0, p.y * w0, p.z * w0, w0)
+            curves.push(lifted) catch failure:
+                lifted.close()
+                error(failure.code, failure.message)
+            added += 1
+    return added

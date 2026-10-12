@@ -1,0 +1,191 @@
+## Surfacing Stage 3's follow-ups (luce_cad.surfacing) against closed
+## forms: 3D Trimming keeps a disc of area π cast as the trim runs (a free
+## circle, or a cylinder cutting the face), leaving no curve behind; a
+## curve stopping short is extended to the boundary and cuts the face into
+## the strip it should; a pointed cone's side untrims through its apex to
+## the whole side (area π r l); Stitch's Detach options split a cylinder's
+## side in two and its caps' circles in two, the body closed with its
+## volume; a boolean through a stitched box's tolerant edges (gap 0.01)
+## closes, its pieces of those edges keeping their precision.
+from luce_cad.surfacing import CadSurfacing
+from luce_cad.cad_geometry import CadGeometry
+from luce_cad.cad_curves import CadCurves
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.nurbs import CadSpline
+from luce_cad.solids import CadSolids
+from luce_cad.curves import CadCurveTools
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+pub func trim_followup_tests() -> unit!:
+    three_d_trims()
+    extended_trims()
+    apex_untrim()
+    detached_stitch()
+    tolerant_booleans()
+    print("PASS trim follow-ups: 3D Trimming by a cast circle and by a cutting cylinder keeps a disc of area π; an extended curve cuts the 4 by 1.5 strip; a pointed cone untrims through its apex; Stitch detaches a cylinder's side and caps, closed; a boolean through tolerant edges closes and keeps their precision")
+
+## A full circle of `radius` about `center` in the plane of `x` and `y`.
+func circle(center: Vector3, x: Vector3, y: Vector3, radius: float) -> CadSpline!:
+    let w = math.sqrt(0.5)
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    let corners = [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (-1.0, 1.0), (-1.0, 0.0), (-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (1.0, 0.0)]
+    for at in 0..<corners.length:
+        let (a, b) = corners[at]
+        points.append(center.add(x.multiply_scalar(a * radius)).add(y.multiply_scalar(b * radius)))
+        weights.append(1.0 if at % 2 == 0 else w)
+    return CadSpline.make(points, weights, 2, [0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0])
+
+## The name of `model`'s flat face facing `normal`.
+func facing(model: CadModel, normal: Vector3) -> str!:
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let frame = CadModeling.face_frame(model, name)
+        if frame.found and frame.u.cross(frame.v).dot(normal) > 0.999:
+            return name
+    assert(false, "no such face")
+    return ""
+
+## The name of `model`'s first face of surface kind `kind`.
+func of_kind(model: CadModel, kind: int) -> str!:
+    for f in 0..<model.face_count():
+        if model.face_surface_kind(f) == kind:
+            return CadModeling.face_name_of(model, f)
+    assert(false, "no face of that kind")
+    return ""
+
+## The area of `model`'s faces named `name` (and their pieces), from its mesh.
+func area_of(model: CadModel, name: str) -> float!:
+    let mesh = model.tessellate(64)
+    let owners = mesh.find_attribute("cad_face", 2)
+    var total = 0.0
+    for face in 0..<mesh.face_count():
+        if model.face_name(int(mesh.attribute_value(owners, face))) != name:
+            continue
+        let a = mesh.point(mesh.face_point(face, 0))
+        for k in 1..<mesh.face_size(face) - 1:
+            let b = mesh.point(mesh.face_point(face, k))
+            let c = mesh.point(mesh.face_point(face, k + 1))
+            total += b.subtract(a).cross(c.subtract(a)).length() * 0.5
+    return total
+
+func about(area: float, expected: float) -> bool:
+    return math.abs(area - expected) < 1e-3 * expected
+
+func three_d_trims() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0), "box")
+    let top = facing(box, Vector3(0.0, 1.0, 0.0))
+    # A free circle above the top, cast down as the trim runs (Alias's 3D
+    # Trimming by Project): the disc kept, no curve left on the face.
+    let data = CadCurves.with_curve(CadGeometry.of_model(box), "c", circle(Vector3(0.0, 5.0, 0.0), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0), 1.0))
+    let regions = CadSurfacing.trim_regions(data, 0, top, curves = "c", cast = 1, direction = Vector3(0.0, -1.0, 0.0))
+    assert(regions.marker_count() == 2, f"{regions.marker_count()} regions")
+    let kept = CadSurfacing.trimmed(data, 0, top, [Vector3(0.0, 2.0, 0.0)], 0, curves = "c", cast = 1, direction = Vector3(0.0, -1.0, 0.0))
+    assert(about(area_of(CadGeometry.model(kept, 0), top), math.pi), f"cast disc {area_of(CadGeometry.model(kept, 0), top)}")
+    assert(CadCurves.count(kept) == 1)
+    # Without casting the free circle is no curve of the face: refused.
+    var refused = false
+    _ = CadSurfacing.trim_regions(data, 0, top, curves = "c") catch failure:
+        refused = failure.message.contains("another face")
+        recover regions
+    assert(refused)
+    # A cylinder of radius 1 through the top cuts it where they meet (3D
+    # Trimming by Intersect): the disc kept.
+    let rod = CadModeling.tagged(CadSolids.cylinder(1.0, 10.0), "rod")
+    let both = CadGeometry.of_model(box).merged(CadGeometry.of_model(rod))
+    let side = of_kind(rod, 1)
+    let cut = CadSurfacing.trimmed(both, 0, top, [Vector3(0.0, 2.0, 0.0)], 0, cutters = side)
+    assert(about(area_of(CadGeometry.model(cut, 0), top), math.pi), f"cut disc {area_of(CadGeometry.model(cut, 0), top)}")
+
+func extended_trims() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0), "box")
+    let top = facing(box, Vector3(0.0, 1.0, 0.0))
+    # A line from the edge x = -2 to the middle at z = 0.5: a loose end.
+    let stub = CadCurves.with_curve(CadGeometry.of_model(box), "line", CadCurveTools.by_points([Vector3(-3.0, 5.0, 0.5), Vector3(0.0, 5.0, 0.5)], 1))
+    let cast = CadSurfacing.projected(stub, 0, top, "line", Vector3(0.0, -1.0, 0.0)).geometry()
+    assert(CadSurfacing.trim_regions(cast, 0, top).marker_count() == 0)
+    # Extended, it runs on to x = 2: two regions, the strip z > 0.5 of
+    # area 4 x 1.5.
+    let regions = CadSurfacing.trim_regions(cast, 0, top, extend = true)
+    assert(regions.marker_count() == 2 and regions.loose_count() == 0, f"{regions.marker_count()} regions, {regions.loose_count()} loose")
+    let strip = CadSurfacing.trimmed(cast, 0, top, [Vector3(0.0, 2.0, 1.5)], 0, extend = true)
+    assert(about(area_of(CadGeometry.model(strip, 0), top), 6.0), f"strip {area_of(CadGeometry.model(strip, 0), top)}")
+    # Two lines stopping short of each other: the second runs on to meet
+    # the first (x = 0 from z = -2 to z = -0.5, below the first at z = 0.5).
+    let two = CadCurves.with_curve(cast, "down", CadCurveTools.by_points([Vector3(0.0, 5.0, -3.0), Vector3(0.0, 5.0, -0.5)], 1))
+    let both = CadSurfacing.projected(two, 0, top, "down", Vector3(0.0, -1.0, 0.0)).geometry()
+    let crossed = CadSurfacing.trimmed(both, 0, top, [Vector3(1.0, 2.0, -1.0)], 0, extend = true)
+    # The quarter x > 0, z < 0.5 bounded by the extended lines: 2 x 2.5.
+    assert(about(area_of(CadGeometry.model(crossed, 0), top), 5.0), f"quarter {area_of(CadGeometry.model(crossed, 0), top)}")
+
+func apex_untrim() -> unit!:
+    # A pointed cone of radius 2 and height 3: its side untrims to itself.
+    let cone = CadModeling.tagged(CadSolids.cone(2.0, 3.0), "cone")
+    let side = of_kind(cone, 2)
+    let natural = CadGeometry.model(CadSurfacing.untrimmed(CadGeometry.of_model(cone), 0, side), 0)
+    assert(CadSurfacing.is_closed(natural))
+    let slant = math.sqrt(4.0 + 9.0)
+    assert(math.abs(area_of(natural, side) - math.pi * 2.0 * slant) < 2e-3 * math.pi * 2.0 * slant, f"side {area_of(natural, side)}")
+    assert(math.abs(volume(natural.tessellate(32)) - math.pi * 4.0) < 1e-2, f"volume {volume(natural.tessellate(32))}")
+
+func detached_stitch() -> unit!:
+    let cylinder = CadModeling.tagged(CadSolids.cylinder(1.0, 2.0), "cyl")
+    let apart = CadSurfacing.unstitched(CadGeometry.of_model(cylinder), 0)
+    # Detach single curve boundaries: each cap's circle in two edges.
+    let single = CadSurfacing.stitched(apart, [], 0.0001, detach_single = true)
+    assert(single.closed and single.single == 2 and single.periodic == 0, f"single {single.single}")
+    let capped = CadGeometry.model(single.geometry(), 0)
+    for f in 0..<capped.face_count():
+        assert(capped.face_edge_count(f) >= 2)
+    let mesh = capped.tessellate(32)
+    closed(mesh)
+    assert(math.abs(volume(mesh) - volume(cylinder.tessellate(32))) < 1e-6)
+    # Detach periodic surfaces: the side in two halves, each meeting the
+    # seam once; the caps' circles are cut where the halves meet them.
+    let periodic = CadSurfacing.stitched(apart, [], 0.0001, detach_periodic = true)
+    assert(periodic.closed and periodic.periodic == 1, f"periodic {periodic.periodic}")
+    let halves = CadGeometry.model(periodic.geometry(), 0)
+    var sides = 0
+    for f in 0..<halves.face_count():
+        if halves.face_surface_kind(f) == 1:
+            sides += 1
+        for a in 0..<halves.face_edge_count(f):
+            for b in a + 1..<halves.face_edge_count(f):
+                assert(halves.face_edge_id(f, a) != halves.face_edge_id(f, b), "a face still meets an edge twice")
+    assert(sides == 2)
+    assert(math.abs(volume(halves.tessellate(32)) - volume(cylinder.tessellate(32))) < 1e-3)
+
+func tolerant_booleans() -> unit!:
+    # The six squares of a 2-box, the top lifted 0.01, stitched within 0.02:
+    # its top's edges are tolerant (precision 0.01).
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let apart = CadSurfacing.unstitched(CadGeometry.of_model(box), 0)
+    var top = -1
+    for k in 0..<6:
+        let m = CadGeometry.model(apart, k)
+        let frame = CadModeling.face_frame(m, m.face_name(0))
+        if frame.u.cross(frame.v).dot(Vector3(0.0, 1.0, 0.0)) > 0.999:
+            top = k
+    var gapped = CadGeometry.of_model(CadGeometry.model(apart, top).transformed(Vector3(0.0, 0.01, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)))
+    for k in 0..<6:
+        if k != top:
+            gapped = gapped.merged(CadGeometry.of_model(CadGeometry.model(apart, k)))
+    let sewn = CadSurfacing.stitched(gapped, [], 0.02)
+    assert(sewn.closed)
+    let tolerant = CadGeometry.model(sewn.geometry(), 0)
+    # A rod of radius 0.3 along Y through the edge x = 1, z = 0 cuts the
+    # top across its tolerant edge: the result closes, a half rod less.
+    let rod = CadSolids.cylinder(0.3, 6.0).transformed(Vector3(1.0, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let cut = CadModeling.combined(tolerant, rod, 1)
+    assert(CadSurfacing.is_closed(cut))
+    let mesh = cut.tessellate(32)
+    closed(mesh)
+    let expected = volume(tolerant.tessellate(32)) - math.pi * 0.09 * 0.5 * 2.0
+    assert(math.abs(volume(mesh) - expected) < 0.02, f"volume {volume(mesh)} against {expected}")
+    var widest = 0.0
+    for e in 0..<cut.edge_count():
+        widest = math.max(widest, CadSurfacing.edge_precision(cut, e))
+    assert(widest > 0.005 and widest < 0.02, f"precision {widest}")

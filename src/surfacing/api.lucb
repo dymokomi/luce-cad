@@ -13,6 +13,10 @@ pub struct CadSurfaceEdit:
     pub var count: i64
     pub var widest: f64
     pub var closed: bool
+    ## Stitch's Detach options: periodic faces split in two, closed edges
+    ## split in two.
+    pub var periodic: i64
+    pub var single: i64
 
     pub func init():
         self.made = none
@@ -21,6 +25,8 @@ pub struct CadSurfaceEdit:
         self.count = 0
         self.widest = 0.0
         self.closed = false
+        self.periodic = 0
+        self.single = 0
 
     pub func geometry() -> interop.Reference[GeometrySet]!:
         let made = self.made else error(invalid, "a surfacing edit has no geometry")
@@ -197,9 +203,16 @@ pub struct CadSurfacing:
     ## Face `face` of body `body` cut by its curves (`curves`, apart by `;`;
     ## empty: every curve on it): the regions' markers, the crossings and
     ## the loose ends (Trim's region markers, Show Intersections).
-    pub static func trim_regions(set: interop.Reference[GeometrySet], body: i64, face: str, curves: str = "") -> interop.Reference[CadTrimRegions]!:
+    ## With Alias's 3D Trimming, `cast` (trim_curves.lucb's: 1 along
+    ## `direction`, 2 along the normals) casts the curves off the face onto
+    ## it as the trim runs, and `cutters` (face names apart by `;`, of any
+    ## body) cut it where they meet it; `extend` carries curve ends that
+    ## stop short on to the boundary or the next curve.
+    pub static func trim_regions(set: interop.Reference[GeometrySet], body: i64, face: str, curves: str = "", cast: i64 = 0, direction: Vector3 = Vector3(),
+                                 cutters: str = "", extend: bool = false) -> interop.Reference[CadTrimRegions]!:
         let model = try body_of(set, body)
-        var cuts = try cutting_shape(set, model, face, curves)
+        let how = TrimCurves(cast, direction, cutters, extend)
+        var cuts = try cutting_shape(set, model, face, curves, &how)
         defer cuts.close()
         let cut = try trim_regions(model, face, &cuts)
         let result = interop.Reference[CadTrimRegions].adopt(new CadTrimRegions() in memory.heap, cad_trim_regions_type, memory.heap) catch failure:
@@ -214,9 +227,12 @@ pub struct CadSurfacing:
     ## the regions holding `picks` kept (`mode` 0), discarded (1), or every
     ## region its own face (2, Divide); the face before it kept as a trim
     ## stage. `tag` names Divide's new faces.
-    pub static func trimmed(set: interop.Reference[GeometrySet], body: i64, face: str, picks: const Vector3[], mode: i64 = 0, curves: str = "", tag: str = "trim") -> interop.Reference[GeometrySet]!:
+    ## `cast`, `direction`, `cutters` and `extend` as trim_regions's.
+    pub static func trimmed(set: interop.Reference[GeometrySet], body: i64, face: str, picks: const Vector3[], mode: i64 = 0, curves: str = "", tag: str = "trim",
+                            cast: i64 = 0, direction: Vector3 = Vector3(), cutters: str = "", extend: bool = false) -> interop.Reference[GeometrySet]!:
         let model = try body_of(set, body)
-        var cuts = try cutting_shape(set, model, face, curves)
+        let how = TrimCurves(cast, direction, cutters, extend)
+        var cuts = try cutting_shape(set, model, face, curves, &how)
         defer cuts.close()
         let precision = try fit_tolerance(model)
         let made = try trim_face(model, face, &cuts, picks, mode, tag, precision)
@@ -299,8 +315,11 @@ pub struct CadSurfacing:
     ## Stitch (stitch.lucb): the bodies `bodies` (empty: all of them) joined
     ## into one body where their boundary edges meet within `gap`, in the
     ## first's place; `count` the edges joined, `widest` the widest gap
-    ## closed, `closed` whether every edge is shared (a solid).
-    pub static func stitched(set: interop.Reference[GeometrySet], bodies: const i64[], gap: f64 = 0.001) -> interop.Reference[CadSurfaceEdit]!:
+    ## closed, `closed` whether every edge is shared (a solid). For export,
+    ## Alias's Detach options (stitch.lucb's detached): `detach_periodic`
+    ## splits each face wrapping round its surface in two, `detach_single`
+    ## each loop of one closed edge into two edges.
+    pub static func stitched(set: interop.Reference[GeometrySet], bodies: const i64[], gap: f64 = 0.001, detach_periodic: bool = false, detach_single: bool = false) -> interop.Reference[CadSurfaceEdit]!:
         let source = try set.get()
         let existing = set_models(source)
         var chosen = Growing[interop.Reference[CadModel]]()
@@ -316,6 +335,8 @@ pub struct CadSurfacing:
         if chosen.count < 1: error(invalid, "Stitch: pick the surfaces to join")
         let joined = try stitch_models(chosen.view(), gap)
         defer joined.model.release()
+        let ready = try detached(joined.model, detach_periodic, detach_single)
+        defer ready.model.release()
         var list = Growing[interop.Reference[CadModel]]()
         defer list.close()
         var placed = false
@@ -324,9 +345,11 @@ pub struct CadSurfacing:
                 try list.push(existing[at])
                 continue
             if not placed:
-                try list.push(joined.model)
+                try list.push(ready.model)
                 placed = true
         let edit = try edit_of(try with_models(source, list.view()))
+        edit.value().periodic = ready.periodic
+        edit.value().single = ready.single
         edit.value().count = joined.joined
         edit.value().widest = joined.widest
         edit.value().closed = joined.closed
@@ -421,34 +444,38 @@ func close_splines(list: Growing[Spline]*):
         owned.close()
     list.close()
 
-## The curves cutting face `face` of `model`: the set's curves on it (or
-## `names`), their 3D curves as a shape's B-spline carriers. Each must lie
-## on the face's surface within the fit tolerance (a curve left on a face
-## whose surface changed since is refused: project it again).
-func cutting_shape(set: interop.Reference[GeometrySet], model: const CadModel*, face: str, names: str) -> Shape!:
+## The curves cutting face `face` of `model` (trim_curves.lucb): the set's
+## curves on it (or those of `names`), and by `how` curves off it cast onto
+## it, faces meeting it, loose ends extended; their 3D curves as a shape's
+## B-spline carriers. A curve on the face must lie on its surface within
+## the fit tolerance (a curve left on a face whose surface changed since is
+## refused: project it again).
+func cutting_shape(set: interop.Reference[GeometrySet], model: const CadModel*, face: str, names: str, how: const TrimCurves*) -> Shape!:
     var chosen = Growing[i64]()
     defer chosen.close()
-    try chosen_curves(set, names, face, &chosen)
-    if chosen.count == 0: error(invalid, "Trim: the face has no curves on it to trim with (Project or Intersect first)")
-    var w = try shape_of(model)
-    defer w.close()
-    var support: i64 = -1
-    for f in 0..<w.faces.count:
-        if w.face_name(f) == face:
-            support = w.faces.items[f].surface
-            break
-    if support < 0: error(invalid, "the face to trim is not in the body: pick it again")
-    let s = &w.surfaces.items[(usize)support]
+    # Off the face (3D Trimming), named curves anywhere, or with no names
+    # every curve of the set; on it, those on the face.
+    try chosen_curves(set, names, face if how.cast == trim_on_face else "", &chosen)
+    var t = try target_of(model, face)
+    defer t.close()
+    let s = t.surface()
     let fit = try fit_tolerance(model)
-    var cuts = empty_shape(w.tolerance)
-    errdefer cuts.close()
+    var curves = Growing[Spline]()
+    defer close_splines(&curves)
     for index in chosen.view():
         let on = try CadCurves.face(set, index)
         defer on.release()
-        if on.value != face: error(invalid, "a curve to trim with lies on another face")
         let curve = try CadCurves.curve(set, index)
         defer curve.release()
         let c = spline_in(curve.value())
+        if on.value != face:
+            if how.cast == trim_on_face: error(invalid, "a curve to trim with lies on another face")
+            # 3D Trimming: cast onto the face as the trim runs.
+            var charts = Growing[Spline]()
+            defer close_splines(&charts)
+            let cast = Casting(how.direction, how.cast == trim_cast_normal, true)
+            _ = try project_curve(model, face, c, cast, fit, false, &charts, &curves)
+            continue
         var seed = Vector3(0.5, 0.5, 0.0)
         for k in 0..<33:
             let p = c.point_at(c.low() + (c.high() - c.low()) * (f64)k / 32.0)
@@ -459,6 +486,29 @@ func cutting_shape(set: interop.Reference[GeometrySet], model: const CadModel*, 
             else:
                 off = surface_distance(s, p)
             if off > fit * 10.0: error(invalid, "a curve to trim with no longer lies on the face (its surface changed): project it again")
+        try curves.push(try c.copy())
+    # 3D Trimming by faces: where each meets this one, pulled onto it.
+    var start: usize = 0
+    let bytes = how.cutters.bytes
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 59: continue
+        let other_face = (str)bytes[start..<at]
+        start = at + 1
+        if other_face.length == 0 or other_face == face: continue
+        let other = try body_named(set, other_face)
+        var meets = try face_meets(model, face, other, other_face)
+        defer meets.close()
+        for e in 0..<meets.edges.count:
+            var exact = try edge_spline(&meets, e)
+            defer exact.close()
+            var charts = Growing[Spline]()
+            defer close_splines(&charts)
+            _ = try project_curve(model, face, &exact, Casting(Vector3(), true, true), fit, false, &charts, &curves)
+    if curves.count == 0: error(invalid, "Trim: the face has no curves on it to trim with (Project or Intersect first, or cast curves onto it with 3D Trimming)")
+    if how.extend: _ = try extend_loose(&t, &curves, fit)
+    var cuts = empty_shape(t.w.tolerance)
+    errdefer cuts.close()
+    for c in curves.view():
         var points = Growing[Vector3]()
         defer points.close()
         var weights = Growing[f64]()
@@ -469,6 +519,15 @@ func cutting_shape(set: interop.Reference[GeometrySet], model: const CadModel*, 
         let stored = try cuts.add_spline(points.view(), weights.view(), c.knots.view(), c.degree)
         _ = try cuts.add_carrier(Carrier(curve_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, stored))
     return cuts
+
+## The body of `set` holding a face named `face`.
+func body_named(set: interop.Reference[GeometrySet], face: str) -> const CadModel*!:
+    let models = set_models(try set.get())
+    for m in models:
+        let model = m.value()
+        for f in 0..<model.face_count():
+            if (try model.face_name(f)) == face: return model
+    error(invalid, "a face to trim by is no longer in the model: pick it again")
 
 ## The faces of `model` named `face`, as a body (a trim's stage).
 func face_alone(model: const CadModel*, face: str) -> interop.Reference[CadModel]!:

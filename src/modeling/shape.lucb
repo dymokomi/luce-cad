@@ -67,6 +67,12 @@ pub struct Shape:
     ## Each edge's two faces, sides[2e] and sides[2e + 1] (-1 for none),
     ## indexed by index_sides (shape_of does): stale once faces change.
     pub var sides: Growing[i64]
+    ## How far beyond the tolerance each edge's faces and each point's
+    ## edges may lie from it (Stitch's tolerant edges and vertices,
+    ## Parasolid's): edge_slack[e], point_slack[p]; one not listed is exact.
+    ## The booleans merge and match by them (boolean.lucb).
+    pub var edge_slack: Growing[f64]
+    pub var point_slack: Growing[f64]
 
     pub func close():
         self.points.close()
@@ -86,6 +92,16 @@ pub struct Shape:
         self.name_bytes.close()
         self.name_offsets.close()
         self.sides.close()
+        self.edge_slack.close()
+        self.point_slack.close()
+
+    ## Edge `e`'s slack beyond the tolerance (0: exact).
+    pub func edge_slack_of(e: usize) -> f64:
+        return self.edge_slack.items[e] if e < self.edge_slack.count else 0.0
+
+    ## Point `p`'s slack beyond the tolerance (0: exact).
+    pub func point_slack_of(p: usize) -> f64:
+        return self.point_slack.items[p] if p < self.point_slack.count else 0.0
 
     ## Name `n` ("" for -1).
     pub func name(n: i64) -> str:
@@ -218,7 +234,7 @@ pub struct Shape:
 ## A shape with nothing in it, of tolerance `tolerance`.
 pub func empty_shape(tolerance: f64) -> Shape:
     return Shape(tolerance, Growing[Vector3](), Growing[Carrier](), Growing[ShapeEdge](), Growing[Surface](), Growing[ShapeFace](),
-                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize](), Growing[i64]())
+                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize](), Growing[i64](), Growing[f64](), Growing[f64]())
 
 ## Surface coordinates of `p` on `s`: a plane's (x, y); an angle about the
 ## axis and a height (cylinder, cone); longitude and latitude (sphere); a
@@ -252,6 +268,11 @@ pub func shape_of(model: const CadModel*) -> Shape!:
     let scale = placement.transform_direction(Vector3(1.0, 0.0, 0.0)).length()
     for v in 0..<b.vertex_count():
         _ = try shape.add_point(placement.transform_point(try b.vertex_at(v)))
+        let precision = try b.vertex_precision_of(v)
+        try shape.point_slack.push(precision * scale if precision > b.base_tolerance() else 0.0)
+    for e in 0..<b.edge_count():
+        let precision = try b.edge_precision_of(e)
+        try shape.edge_slack.push(precision * scale if precision > b.base_tolerance() else 0.0)
     for e in 0..<b.edge_count():
         var curve = try b.edge_record(e)
         defer curve.close()
@@ -317,19 +338,25 @@ pub func brep_of(shape: const Shape*) -> interop.Reference[BrepModel]!:
     let output = try BrepModel.held(math.max(shape.tolerance, least_tolerance))
     errdefer output.release()
     let b = output.value()
-    for p in shape.points.view(): _ = try b.add_vertex(p)
-    for edge in shape.edges.view():
+    for at in 0..<shape.points.count:
+        let v = try b.add_vertex(shape.points.items[at])
+        # Tolerant vertices and edges stay tolerant.
+        if shape.point_slack_of(at) > b.base_tolerance(): try b.set_vertex_precision(v, shape.point_slack_of(at))
+    for e in 0..<shape.edges.count:
+        let edge = shape.edges.items[e]
         let c = shape.carriers.items[(usize)edge.carrier]
         let forward = edge.t1 > edge.t0
+        var id: i64 = -1
         if c.kind == curve_line:
-            _ = try b.add_line(edge.start, edge.end)
+            id = try b.add_line(edge.start, edge.end)
         elif c.kind == curve_circle:
-            _ = try b.add_circle(edge.start, edge.end, c.origin, c.x.cross(c.y), c.x, c.a, forward)
+            id = try b.add_circle(edge.start, edge.end, c.origin, c.x.cross(c.y), c.x, c.a, forward)
         elif c.kind == curve_ellipse:
-            _ = try b.add_ellipse(edge.start, edge.end, c.origin, c.x.cross(c.y), c.x, c.a, c.b, forward)
+            id = try b.add_ellipse(edge.start, edge.end, c.origin, c.x.cross(c.y), c.x, c.a, c.b, forward)
         else:
             let (points, weights, knots, degree) = shape.spline_net(c.spline)
-            _ = try b.add_spline_edge(edge.start, edge.end, points, weights, degree, knots, forward)
+            id = try b.add_spline_edge(edge.start, edge.end, points, weights, degree, knots, forward)
+        if shape.edge_slack_of(e) > b.base_tolerance(): try b.set_edge_precision(id, shape.edge_slack_of(e))
     for s in shape.surfaces.view():
         let made = (try b.add_spline_surface(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv)) if s.kind == surface_spline else (try b.add_surface(s.kind, s.origin, s.z, s.x, s.radius, s.angle))
         # Edited surfaces stay edited (their trims keep taking nearest parameters).

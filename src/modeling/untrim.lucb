@@ -175,21 +175,36 @@ func untrim_band(b: BrepModel*, w: const Shape*, f: usize) -> !:
     let slope = math.tan(s.angle) if s.kind == surface_cone else 0.0
     let r0 = s.radius + h0 * slope
     let r1 = s.radius + h1 * slope
-    if r0 <= w.tolerance or r1 <= w.tolerance: error(invalid, "the cone's band reaches its apex: untrim it as a whole cone by hand")
+    # A band reaching the apex closes on it: a pointed cone's side (as
+    # CadSolids.cone makes it), the seam running from the circle to the
+    # apex vertex and no circle there.
+    let apex_low = r0 <= w.tolerance
+    let apex_high = r1 <= w.tolerance
+    if apex_low and apex_high: error(invalid, "the face spans no width to untrim over")
     let base_center = s.origin.add(s.z.multiply_scalar(h0))
     let top_center = s.origin.add(s.z.multiply_scalar(h1))
-    let bottom = try b.add_vertex(base_center.add(s.x.multiply_scalar(r0)))
-    let top = try b.add_vertex(top_center.add(s.x.multiply_scalar(r1)))
+    let bottom = try b.add_vertex(base_center if apex_low else base_center.add(s.x.multiply_scalar(r0)))
+    let top = try b.add_vertex(top_center if apex_high else top_center.add(s.x.multiply_scalar(r1)))
     let seam = try b.add_line(bottom, top)
-    let base = try b.add_circle(bottom, bottom, base_center, s.z, s.x, r0)
-    let rim = try b.add_circle(top, top, top_center, s.z, s.x, r1)
     let side = (try b.add_surface(surface_cylinder, s.origin, s.z, s.x, s.radius)) if s.kind == surface_cylinder else (try b.add_surface(surface_cone, s.origin, s.z, s.x, s.radius, s.angle))
-    var around: i64[4] = [base + 1, seam + 1, -(rim + 1), -(seam + 1)]
-    if not face.sense:
-        let turned: i64[4] = [seam + 1, rim + 1, -(seam + 1), -(base + 1)]
-        around = turned
-    let sizes: i64[1] = [4]
-    _ = try b.add_face(side, around[..<4], sizes[..<1], face.sense)
+    var around = Growing[i64]()
+    defer around.close()
+    # Counterclockwise in the chart (angle, height): the base forward, up
+    # the seam, the rim back, down the seam; turned when the face faces in.
+    let base = (try b.add_circle(bottom, bottom, base_center, s.z, s.x, r0)) if not apex_low else -1
+    let rim = (try b.add_circle(top, top, top_center, s.z, s.x, r1)) if not apex_high else -1
+    if face.sense:
+        if base >= 0: try around.push(base + 1)
+        try around.push(seam + 1)
+        if rim >= 0: try around.push(-(rim + 1))
+        try around.push(-(seam + 1))
+    else:
+        try around.push(seam + 1)
+        if rim >= 0: try around.push(rim + 1)
+        try around.push(-(seam + 1))
+        if base >= 0: try around.push(-(base + 1))
+    let sizes: i64[1] = [(i64)around.count]
+    _ = try b.add_face(side, around.view(), sizes[..<1], face.sense)
 
 ## Whether a face named `name` is face `face` or a piece Divide made of it
 ## (`<tag>/divide<k>[<face>]`).
