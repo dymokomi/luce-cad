@@ -2,8 +2,9 @@
 ## It reads and writes the sketch's text (what the node keeps), adds and
 ## removes entities and constraints, edits dimensions, solves (and drags),
 ## says what is fully constrained or conflicting (after a change, not per
-## drag frame), picks the entity nearest a point, and gives the curves
-## Extrude reads. Coordinates are on the sketch plane, in millimeters.
+## drag frame), picks the entity nearest a point or those a box holds, and
+## gives the curves Extrude reads. Coordinates are on the sketch plane, in
+## millimeters.
 
 pub struct CadSketch:
     var sketch: Sketch
@@ -11,9 +12,12 @@ pub struct CadSketch:
     var freedom: Freedom?
     ## The last snap (snap).
     var snapped: SnapHit
+    ## What the last box held (select_box).
+    var boxes: Growing[i64]
 
     pub func close():
         self.sketch.close()
+        self.boxes.close()
         self.forget()
 
     func trace(visit: func(ownership.Object*, void*) -> unit, context: void*):
@@ -25,7 +29,7 @@ pub struct CadSketch:
     pub static func parse(text: str) -> interop.Reference[CadSketch]!:
         var s = try read_sketch(text)
         errdefer s.close()
-        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1)) in memory.heap, cad_sketch_type, memory.heap)
+        return try interop.Reference[CadSketch].adopt(new CadSketch(s, none, SnapHit(0, 0.0, 0.0, -1, -1), Growing[i64]()) in memory.heap, cad_sketch_type, memory.heap)
 
     ## The sketch as text.
     pub func text() -> interop.Owned[str]!:
@@ -372,6 +376,20 @@ pub struct CadSketch:
     ## alone (a selection level's filter); 0 either.
     pub func pick(x: f64, y: f64, reach: f64, only: i64 = 0) -> i64:
         return nearest(&self.sketch, x, y, reach, only)
+
+    ## A box: the entities the convex polygon `corners` holds (x, y pairs on
+    ## the plane, in order round it; a screen box as the view casts it onto
+    ## the plane): points inside it and curves meeting it anywhere; `only` 1
+    ## points alone, 2 curves alone (a selection level's filter), 0 both.
+    ## How many there are; boxed reads them, ascending.
+    pub func select_box(corners: const f64[], only: i64 = 0) -> i64!:
+        try boxed_entities(&self.sketch, corners, only, &self.boxes)
+        return (i64)self.boxes.count
+
+    ## The `at`th entity the last box held, or -1.
+    pub func boxed(at: i64) -> i64:
+        if at < 0 or (usize)at >= self.boxes.count: return -1
+        return self.boxes.items[(usize)at]
 
     ## The curves Extrude and Revolve read, on the plane through `origin`
     ## with the sketch's x and y along `u` and `v`.
