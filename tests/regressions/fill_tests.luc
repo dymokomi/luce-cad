@@ -1,0 +1,330 @@
+## Fill (surfacing Stage 7, luce_cad.surfacing's CadSurfaceFill) against
+## closed forms, measured by the Check tools (CadMeasure.check across the
+## edges once stitched): a planar pentagon fills with its plane, and a
+## square hole in a tilted plane with the plane at G1 and G2, N-sided and
+## Quad (an untrimmed face); a hole in a smooth height field fills G0, G1
+## and G2 on every edge both ways; a cap cut from a ball fills G1 and G2
+## close to the sphere; a five-sided hole between three fillets and two
+## walls fills G1 on all five edges, and with circular fillets the
+## corners whose twists disagree are reported; a guide curve and a point
+## lie on the fill; a hole is found from one edge; Tension, Flatness, the
+## Quad flow and Explicit Control do what they say.
+from luce_cad.surfacing import CadSurfacing, CadSurfaceFill, CadSurfaceBlend
+from luce_cad.cad_geometry import CadGeometry
+from luce_cad.cad_curves import CadCurves
+from luce_cad.curves import CadCurveTools
+from luce_cad.measure import CadMeasure
+from luce_cad.model import BrepModel, CadModel
+from luce_cad.nurbs import CadNurbs
+from luce_geocore.geocore import Vector3, GeometrySet
+from luce_std import math
+
+pub func fill_tests() -> unit!:
+    fill_planar()
+    fill_plane_hole()
+    fill_square_hole()
+    fill_sphere_hole()
+    fill_hole_pick()
+    fill_corner()
+    fill_guides()
+    fill_options()
+    print("PASS fill: a planar pentagon and a hole in a plane fill with the plane (G1, G2, N-sided and Quad untrimmed); a height field's hole fills G0, G1 and G2 on every edge both ways; a ball's cap G1 and G2 near the sphere; a five-sided corner of three fillets and two walls G1 on all five edges, circular fillets' twist conflicts reported at their corners; guides and points on the fill; a hole found from one edge; Tension, Flatness, Normal flow and Explicit Control")
+
+# -- Shapes.
+
+## A smooth biquadratic height field (its x² y² term keeps a Coons patch of
+## its boundaries off it).
+func height(x: float, y: float) -> float:
+    return 0.2 * x * x + 0.1 * x * y - 0.15 * y * y + 0.3 * x * x * y * y - 0.1 * x * y * y
+
+## The biquadratic Bezier patch of `height` over [x0, x1] x [y0, y1].
+func piece(x0: float, x1: float, y0: float, y1: float, name: str) -> CadModel!:
+    let xs = [x0, (x0 + x1) * 0.5, x1]
+    let ys = [y0, (y0 + y1) * 0.5, y1]
+    let z: list[float] = []
+    for i in 0..<3:
+        let row = [height(xs[i], ys[0]), height(xs[i], ys[1]), height(xs[i], ys[2])]
+        z.extend([row[0], 2.0 * row[1] - 0.5 * (row[0] + row[2]), row[2]])
+    let points: list[Vector3] = []
+    let weights: list[float] = []
+    for i in 0..<3:
+        for j in 0..<3:
+            let b = 2.0 * z[3 + j] - 0.5 * (z[j] + z[6 + j]) if i == 1 else z[i * 3 + j]
+            points.append(Vector3(x0 + (x1 - x0) * float(i) / 2.0, y0 + (y1 - y0) * float(j) / 2.0, b))
+            weights.append(1.0)
+    return CadSurfacing.patch(points, weights, 3, 3, 2, 2, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], name)
+
+## The levels of the shared edges once `data`'s bodies are stitched, the
+## fill's own (`name`) only.
+func levels(data: GeometrySet, name: str) -> list[int]!:
+    let sewn = CadSurfacing.stitched(data, [], 0.0001)
+    let model = CadGeometry.model(sewn.geometry(), 0)
+    let check = CadMeasure.check(model, "", 3, 16, 0.0001, 0.1, 0.5, 1.0, false, 8, false, 1.0, true, faces = name)
+    let found: list[int] = []
+    for e in 0..<check.edge_count():
+        found.append(check.edge(e).level)
+    return found
+
+## The first face's surface of model `index` of `data`.
+func sheet_of(data: GeometrySet, index: int) -> (CadModel, int)!:
+    let model = CadGeometry.model(data, index)
+    return (model, CadNurbs.surface_of_face(model, model.face_name(0)))
+
+## A ball of radius `r` with a cap cut away above the circle at polar angle
+## `angle`: one sphere face named "ball" bounded by that circle.
+func holed_ball(r: float, angle: float) -> CadModel!:
+    let z = Vector3(0.0, 0.0, 1.0)
+    let x = Vector3(1.0, 0.0, 0.0)
+    let b = BrepModel()
+    let rim = r * math.sin(angle)
+    let level = r * math.cos(angle)
+    _ = b.add_vertex(Vector3(rim, 0.0, level))
+    _ = b.add_circle(0, 0, Vector3(0.0, 0.0, level), z, x, rim)
+    _ = b.add_surface(4, Vector3(), z, x, r)
+    let face = b.add_face(0, [-1], [1])
+    b.set_face_name(face, "ball")
+    let model = CadModel()
+    model.attach_brep(b)
+    return model
+
+## A flat patch (degree 1) through four corners, `a` to `b` along u and `a`
+## to `d` along v.
+func flat(a: Vector3, b: Vector3, d: Vector3, name: str) -> CadModel!:
+    let c = b.add(d).subtract(a)
+    return CadSurfacing.patch([a, d, b, c], [1.0, 1.0, 1.0, 1.0], 2, 2, 1, 1, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], name)
+
+## The fillet sheet named `name` of section `section` and radius `r`
+## between the flat patches `one` and `two`: the last body of the blend.
+func fillet_between(one: CadModel, two: CadModel, section: int, r: float, name: str) -> CadModel!:
+    let pair = CadGeometry.of_model(one).merged(CadGeometry.of_model(two))
+    let made = CadSurfaceBlend.fillet(pair, one.face_name(0), two.face_name(0), r, section = section, trim = 2, name = name)
+    let data = made.geometry()
+    return CadGeometry.model(data, CadGeometry.model_count(data) - 1)
+
+## A flat four-sided patch through corners `a`, `b` (along u), `d` (along v)
+## and `c` (opposite `a`), bilinear.
+func four(a: Vector3, b: Vector3, d: Vector3, c: Vector3, name: str) -> CadModel!:
+    return CadSurfacing.patch([a, d, b, c], [1.0, 1.0, 1.0, 1.0], 2, 2, 1, 1, [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0], name)
+
+## The five-sided hole in a room's corner (x, y, z >= 0) whose three
+## edges are filleted by `section`: the fillets along y and x (radius 1)
+## stop where their contacts on the floor meet, at (1, 1, 0); the one along
+## z (radius 1/2) stops at z = 2; between them a strip of each wall,
+## its edge on the hole running from one fillet's contact to the other's.
+## Three fillets and two planes, every corner a true corner.
+func five_sided(section: int) -> GeometrySet!:
+    let l = 4.0
+    # The fillets, each rolled between two patches as long as it runs.
+    let ftx = fillet_between(flat(Vector3(0.0, 1.0, 0.0), Vector3(l, 1.0, 0.0), Vector3(0.0, l, 0.0), "t1"), flat(Vector3(0.0, 1.0, 0.0), Vector3(0.0, 1.0, l), Vector3(0.0, l, 0.0), "x0"), section, 1.0, "FTX")
+    let fty = fillet_between(flat(Vector3(1.0, 0.0, 0.0), Vector3(l, 0.0, 0.0), Vector3(1.0, l, 0.0), "t2"), flat(Vector3(1.0, 0.0, 0.0), Vector3(l, 0.0, 0.0), Vector3(1.0, 0.0, l), "y0"), section, 1.0, "FTY")
+    let fxy = fillet_between(flat(Vector3(0.0, 0.0, 2.0), Vector3(0.0, l, 2.0), Vector3(0.0, 0.0, l), "x2"), flat(Vector3(0.0, 0.0, 2.0), Vector3(l, 0.0, 2.0), Vector3(0.0, 0.0, l), "y2"), section, 0.5, "FXY")
+    var data = CadGeometry.of_model(ftx).merged(CadGeometry.of_model(fty)).merged(CadGeometry.of_model(fxy))
+    # The walls' strips beside the hole.
+    data = data.merged(CadGeometry.of_model(four(Vector3(0.0, 1.0, 1.0), Vector3(0.0, l, 1.0), Vector3(0.0, 0.5, 2.0), Vector3(0.0, l, 2.0), "X1")))
+    data = data.merged(CadGeometry.of_model(four(Vector3(1.0, 0.0, 1.0), Vector3(l, 0.0, 1.0), Vector3(0.5, 0.0, 2.0), Vector3(l, 0.0, 2.0), "Y1")))
+    return data
+
+## The point (x, y) of the tilted plane of fill_plane_hole.
+func at(x: float, y: float) -> Vector3:
+    return Vector3(0.0, 0.0, 1.0).add(Vector3(1.0, 0.0, 0.2).multiply_scalar(x)).add(Vector3(0.0, 1.0, -0.1).multiply_scalar(y))
+
+
+func fill_planar() -> unit!:
+    # A pentagon of lines in a tilted plane: the fill is the plane.
+    var data = GeometrySet()
+    let corners: list[Vector3] = []
+    for k in 0..<5:
+        let a = 2.0 * math.pi * float(k) / 5.0
+        corners.append(Vector3(2.0 * math.cos(a), 1.5 * math.sin(a), 1.0 + 0.3 * math.cos(a)))
+    for k in 0..<5:
+        data = CadCurves.with_curve(data, f"c{k}", CadCurveTools.by_points([corners[k], corners[(k + 1) % 5]], 1))
+    # Picked in any order.
+    let made = CadSurfaceFill.fill(data, "curve c2;curve c0;curve c4;curve c3;curve c1", [1, 1, 1, 1, 1], [])
+    let (model, s) = sheet_of(made.geometry(), 0)
+    var off = 0.0
+    for i in 0..<11:
+        for j in 0..<11:
+            let p = CadNurbs.point_at(model, s, float(i) / 10.0, float(j) / 10.0)
+            off = math.max(off, math.abs(p.z - 1.0 - 0.15 * p.x))
+    assert(off < 1e-9, f"a planar pentagon's fill is {off} off its plane")
+    assert(made.trimmed and made.conflict_count() == 0, f"{made.conflict_count()} conflicts")
+
+func fill_plane_hole() -> unit!:
+    # A square hole in a tilted plane, four strips round it: G1 and G2,
+    # N-sided and Quad, give the plane, G3 to the strips (exactly flat).
+    let o = Vector3(0.0, 0.0, 1.0)
+    let normal = Vector3(1.0, 0.0, 0.2).cross(Vector3(0.0, 1.0, -0.1)).normalized()
+    var data = CadGeometry.of_model(flat(at(-1.0, 0.0), at(0.0, 0.0), at(-1.0, 1.0), "w"))
+    data = data.merged(CadGeometry.of_model(flat(at(1.0, 0.0), at(2.0, 0.0), at(1.0, 1.0), "e")))
+    data = data.merged(CadGeometry.of_model(flat(at(0.0, -1.0), at(1.0, -1.0), at(0.0, 0.0), "s")))
+    data = data.merged(CadGeometry.of_model(flat(at(0.0, 1.0), at(1.0, 1.0), at(0.0, 2.0), "n")))
+    let p1 = at(0.0, 0.5)
+    let p2 = at(1.0, 0.5)
+    let p3 = at(0.5, 0.0)
+    let p4 = at(0.5, 1.0)
+    let words = f"edge w {p1.x} {p1.y} {p1.z};edge e {p2.x} {p2.y} {p2.z};edge s {p3.x} {p3.y} {p3.z};edge n {p4.x} {p4.y} {p4.z}"
+    for quad in [false, true]:
+        for order in [1, 2]:
+            let made = CadSurfaceFill.fill(data, words, [order + 1, order + 1, order + 1, order + 1], [], quad = quad)
+            let (model, s) = sheet_of(made.geometry(), 4)
+            var off = 0.0
+            for i in 0..<11:
+                for j in 0..<11:
+                    off = math.max(off, math.abs(CadNurbs.point_at(model, s, float(i) / 10.0, float(j) / 10.0).subtract(o).dot(normal)))
+            assert(off < 1e-9, f"Quad {quad} G{order}: the fill is {off} off the plane")
+            let found = levels(made.geometry(), "Fill")
+            assert(found.length == 4, f"{found.length} edges shared")
+            for level in found:
+                assert(level >= order, f"Quad {quad} G{order} measured {found}")
+            # Quad: one untrimmed face of four edges, on the boundaries.
+            assert(made.trimmed != quad and (not quad or model.face_edge_count(0) == 4), f"Quad {quad}: trimmed {made.trimmed}, {model.face_edge_count(0)} edges")
+
+func fill_square_hole() -> unit!:
+    # A square hole in a smooth height field, its four neighbors around
+    # it: G0, G1 and G2 on every edge, N-sided (trimmed) and Quad.
+    var data = CadGeometry.of_model(piece(0.0, 1.0, 1.0, 2.0, "left"))
+    data = data.merged(CadGeometry.of_model(piece(2.0, 3.0, 1.0, 2.0, "right")))
+    data = data.merged(CadGeometry.of_model(piece(1.0, 2.0, 0.0, 1.0, "bottom")))
+    data = data.merged(CadGeometry.of_model(piece(1.0, 2.0, 2.0, 3.0, "top")))
+    let words = f"edge left 1 1.5 {height(1.0, 1.5)};edge bottom 1.5 1 {height(1.5, 1.0)};edge right 2 1.5 {height(2.0, 1.5)};edge top 1.5 2 {height(1.5, 2.0)}"
+    for quad in [false, true]:
+        for order in 0..<3:
+            let code = order + 1
+            let made = CadSurfaceFill.fill(data, words, [code, code, code, code], [], quad = quad)
+            assert(made.conflict_count() == 0, f"Quad {quad} G{order}: {made.conflict_count()} conflicts")
+            let found = levels(made.geometry(), "Fill")
+            assert(found.length == 4, f"G{order}: {found.length} shared edges")
+            for level in found:
+                assert(level >= order, f"Fill G{order} (Quad {quad}) measured G{level} on an edge: {found}")
+            # The multi-span quintic.
+            assert(made.degree_u == 5 and made.degree_v == 5, f"degrees {made.degree_u} {made.degree_v}")
+
+func fill_sphere_hole() -> unit!:
+    # A cap of 30 degrees cut from a ball of radius 2, filled G1 and G2 by
+    # its one edge: the fill lies within a thousandth of the radius of the
+    # sphere (the neighbors' own surface carried on is the fill's reference)
+    # and meets the ball at the order asked.
+    let r = 2.0
+    let angle = 30.0 * math.pi / 180.0
+    let data = CadGeometry.of_model(holed_ball(r, angle))
+    let rim = r * math.sin(angle)
+    let word = f"edge ball {rim} 0 {r * math.cos(angle)}"
+    for order in [1, 2]:
+        let made = CadSurfaceFill.fill(data, word, [order + 1], [])
+        let (model, s) = sheet_of(made.geometry(), 1)
+        var off = 0.0
+        for i in 0..<41:
+            for j in 0..<41:
+                let p = CadNurbs.point_at(model, s, float(i) / 40.0, float(j) / 40.0)
+                if p.x * p.x + p.y * p.y <= rim * rim:
+                    off = math.max(off, math.abs(p.length() - r))
+        assert(off < r * 1e-3, f"the G{order} fill of a ball's cap lies {off} off the sphere")
+        let found = levels(made.geometry(), "Fill")
+        assert(found.length == 1 and found[0] >= order, f"the cap's G{order} fill measured {found}")
+
+func fill_hole_pick() -> unit!:
+    # A hole picked by one of its edges: the ball's one rim; the height
+    # field's four edges, walked past the corners where two sheets touch.
+    let ball = CadGeometry.of_model(holed_ball(2.0, 0.5))
+    let rim = CadSurfaceFill.hole(ball, f"edge ball {2.0 * math.sin(0.5)} 0 {2.0 * math.cos(0.5)}")
+    assert(rim.split(";").length == 1 and rim.starts_with("edge ball "), f"the ball's hole: {rim}")
+    var data = CadGeometry.of_model(piece(0.0, 1.0, 1.0, 2.0, "left"))
+    data = data.merged(CadGeometry.of_model(piece(2.0, 3.0, 1.0, 2.0, "right")))
+    data = data.merged(CadGeometry.of_model(piece(1.0, 2.0, 0.0, 1.0, "bottom")))
+    data = data.merged(CadGeometry.of_model(piece(1.0, 2.0, 2.0, 3.0, "top")))
+    let loop = CadSurfaceFill.hole(data, f"edge left 1 1.5 {height(1.0, 1.5)}")
+    let words = loop.split(";")
+    assert(words.length == 4, f"the square hole: {loop}")
+    for name in ["left", "right", "bottom", "top"]:
+        var found = false
+        for w in words:
+            found = found or w.starts_with(f"edge {name} ")
+        assert(found, f"the square hole misses {name}: {loop}")
+    # And the loop fills.
+    let made = CadSurfaceFill.fill(data, loop, [2, 2, 2, 2], [])
+    assert(levels(made.geometry(), "Fill").length == 4)
+
+func fill_corner() -> unit!:
+    let h = math.sqrt(0.5)
+    let q = 0.5 - 0.5 * h
+    let words = f"edge FTX {1.0 - h} 1 {1.0 - h};edge X1 0 0.75 1.5;edge FXY {q} {q} 2;edge Y1 0.75 0 1.5;edge FTY 1 {1.0 - h} {1.0 - h}"
+    # G2 fillets (curvature zero at their walls): G1 on all five edges.
+    let data = five_sided(2)
+    let made = CadSurfaceFill.fill(data, words, [2, 2, 2, 2, 2], [])
+    let found = levels(made.geometry(), "Fill")
+    assert(found.length == 5, f"{found.length} of the corner's edges shared")
+    for level in found:
+        assert(level >= 1, f"the five-sided corner's G1 fill measured {found}")
+    # Circular fillets meet the walls with a curvature: where one meets a
+    # wall's strip at a corner, their twists disagree and no smooth fill is
+    # G1 to both there. Those corners are reported (the floor's, between
+    # two fillets, is consistent).
+    let circular = CadSurfaceFill.fill(five_sided(1), words, [2, 2, 2, 2, 2], [])
+    var corners = 0
+    for k in 0..<circular.conflict_count():
+        let c = circular.conflict(k)
+        if c.corner:
+            corners += 1
+            assert(c.order == 1 and c.start.z > 0.5, f"a corner conflict at {c.start}")
+    assert(corners >= 2, f"{corners} corner conflicts")
+
+func fill_guides() -> unit!:
+    # The tilted plane's hole with a guide curve bowed off it across the
+    # middle and a point near a corner: the fill passes both, still G1.
+    var data = CadGeometry.of_model(flat(at(-1.0, 0.0), at(0.0, 0.0), at(-1.0, 1.0), "w"))
+    data = data.merged(CadGeometry.of_model(flat(at(1.0, 0.0), at(2.0, 0.0), at(1.0, 1.0), "e")))
+    data = data.merged(CadGeometry.of_model(flat(at(0.0, -1.0), at(1.0, -1.0), at(0.0, 0.0), "s")))
+    data = data.merged(CadGeometry.of_model(flat(at(0.0, 1.0), at(1.0, 1.0), at(0.0, 2.0), "n")))
+    let lift = Vector3(1.0, 0.0, 0.2).cross(Vector3(0.0, 1.0, -0.1)).normalized().multiply_scalar(0.15)
+    data = CadCurves.with_curve(data, "guide", CadCurveTools.by_points([at(0.25, 0.5).add(lift.multiply_scalar(0.5)), at(0.5, 0.5).add(lift), at(0.75, 0.5).add(lift.multiply_scalar(0.5))], 2))
+    let point = at(0.2, 0.2).add(lift.multiply_scalar(0.3))
+    let p1 = at(0.0, 0.5)
+    let p2 = at(1.0, 0.5)
+    let p3 = at(0.5, 0.0)
+    let p4 = at(0.5, 1.0)
+    let words = f"edge w {p1.x} {p1.y} {p1.z};edge e {p2.x} {p2.y} {p2.z};edge s {p3.x} {p3.y} {p3.z};edge n {p4.x} {p4.y} {p4.z}"
+    for quad in [false, true]:
+        let made = CadSurfaceFill.fill(data, words, [2, 2, 2, 2], [point], guides = "curve guide", quad = quad)
+        assert(made.guide_miss < 1e-6, f"Quad {quad}: the guides are missed by {made.guide_miss}")
+        let found = levels(made.geometry(), "Fill")
+        for level in found:
+            assert(level >= 1, f"Quad {quad}: with guides the fill measured {found}")
+
+func fill_options() -> unit!:
+    # The ball's cap, G1: Flatness pulls the dome down toward the rim's
+    # plane, Tension tightens it (lower too); Explicit Control's degrees and
+    # spans as asked.
+    let r = 2.0
+    let angle = 30.0 * math.pi / 180.0
+    let data = CadGeometry.of_model(holed_ball(r, angle))
+    let word = f"edge ball {r * math.sin(angle)} 0 {r * math.cos(angle)}"
+    let top = [0.0, 0.0, 0.0]
+    let options = [(0.0, 0.0), (0.0, 1.0), (0.8, 0.0)]
+    for k in 0..<3:
+        let (tension, flatness) = options[k]
+        let made = CadSurfaceFill.fill(data, word, [2], [], tension = tension, flatness = flatness)
+        let (model, s) = sheet_of(made.geometry(), 1)
+        for i in 0..<21:
+            for j in 0..<21:
+                let p = CadNurbs.point_at(model, s, float(i) / 20.0, float(j) / 20.0)
+                if p.x * p.x + p.y * p.y < 0.01:
+                    top[k] = math.max(top[k], p.z)
+    assert(top[1] < top[0] - 1e-3 and top[2] < top[0] - 1e-3, f"the dome's top: {top}")
+    let explicit = CadSurfaceFill.fill(data, word, [2], [], explicit = true, degree_u = 7, spans_u = 3, degree_v = 6, spans_v = 2)
+    # Quad's Normal flow: the cross isoparms leave a side square to it.
+    var field = CadGeometry.of_model(piece(0.0, 1.0, 1.0, 2.0, "left"))
+    field = field.merged(CadGeometry.of_model(piece(2.0, 3.0, 1.0, 2.0, "right")))
+    field = field.merged(CadGeometry.of_model(piece(1.0, 2.0, 0.0, 1.0, "bottom")))
+    field = field.merged(CadGeometry.of_model(piece(1.0, 2.0, 2.0, 3.0, "top")))
+    let sides = f"edge left 1 1.5 {height(1.0, 1.5)};edge bottom 1.5 1 {height(1.5, 1.0)};edge right 2 1.5 {height(2.0, 1.5)};edge top 1.5 2 {height(1.5, 2.0)}"
+    let skew = [0.0, 0.0]
+    for flow in [0, 1]:
+        let made = CadSurfaceFill.fill(field, sides, [2, 2, 2, 2], [], quad = true, flow = flow)
+        let (model, s) = sheet_of(made.geometry(), 4)
+        for k in 1..<10:
+            let u = float(k) / 10.0
+            let along = CadNurbs.point_at(model, s, u + 1e-4, 0.0).subtract(CadNurbs.point_at(model, s, u - 1e-4, 0.0)).normalized()
+            let across = CadNurbs.point_at(model, s, u, 1e-4).subtract(CadNurbs.point_at(model, s, u, 0.0)).normalized()
+            skew[flow] = math.max(skew[flow], math.abs(along.dot(across)))
+    assert(skew[0] > 0.05 and skew[1] < 1e-3, f"Normal flow: the cross isoparms' skew {skew}")
+    assert(explicit.degree_u == 7 and explicit.degree_v == 6 and explicit.spans_u == 3 and explicit.spans_v == 2, f"Explicit Control: {explicit.degree_u} {explicit.degree_v} {explicit.spans_u} {explicit.spans_v}")

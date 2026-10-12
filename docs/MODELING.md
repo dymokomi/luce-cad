@@ -1871,6 +1871,85 @@ chord along the fillet, Flow Control Edge align, Interior Edge Align, Explicit C
 G3 Curvature's rate on faces whose curvature changes; Tube's variable radius and its trims; Round,
 Ball Corner, Corner Blend, Bridge Fillet; conic sections.
 
+## Fill (`surfacing/fill.lucb`, `fill_bounds`, `fill_net`, `fill_bands`, `fill_reference`, `fill_solve`, `fill_refine`, `fill_api`)
+
+Stage 7 of the surfacing plan (luced-3d `docs/research/SURFACING-ALIAS-PLASTICITY.md` §5.2, §6.8): xNURBS's
+fill (Plasticity's xNURBS and Patch, Alias's N-sided, Rhino 9's Patch), as `CadSurfaceFill.fill`, which
+returns a `CadFill`: the set with the fill added as a body of one sheet, each boundary's worst gap, angle
+and curvature difference, the guides' worst miss, and the conflicts (`FillConflict`: the boundary, the
+order that fails, where, how much, whether a corner). `CadSurfaceFill.hole` turns one edge of a hole into
+the words of all its edges.
+
+**Boundaries** (`fill_bounds.lucb`). Align's master words in any order, walked end to end into one closed
+loop (a single closed curve is one); a gap over a ten-thousandth of their size is refused with its size.
+Each has Free, G0, G1 or G2 (Square's codes; Free keeps the position and is not checked; G1 and G2 only
+beside a surface). The neighbor beside a boundary gives at a station its normal and its second
+fundamental form as a 3 by 3 quadratic form H (II(X, X) = Xᵀ H X on its tangent plane), so the fill can ask
+its own normal curvature across, whatever its parameterization. A hole picked by one edge: the open edges
+of every body walked end to end; where sheets touch at a corner, the edge whose face shows the same side
+and turns toward the hole.
+
+**The net and the energy** (`fill_net.lucb`, `fill_bands.lucb`). A polynomial net, quintic both ways on
+uniform spans (Explicit Control: degrees 2 to 9 and 1 to 64 spans each way, no refining). It minimizes
+w_b ∫|∇²(S − R)|² + w_t ∫|∇³(S − R)|² + w_s ∫|∇S|² + w_f ∫(n0 · S)²: bending, and with a G2 boundary also
+its rate (Moreton and Séquin; the order in which position, slope and curvature are well posed), both
+measured from the reference R; the membrane (Tension) and the pull toward the loop's best plane
+(Flatness) of S itself. The Gram matrices of the bases' derivatives are exact (eight Gauss points a span).
+The normal equations are banded (unknowns u-major, half-width 3 (du·nv + dv) + 2) and factored by band
+Cholesky, n h² work; the unknowns are the change from the reference (or a base plane), so a fill that
+is nearly its reference comes out to the last digits: a planar pentagon is its plane to 1e-12.
+
+**Constraints** (`fill_solve.lucb`). Rows at stations along the boundaries (four a span crossed, never on
+a corner but G0 at each corner): G0 S = B; G1 n · S_d = 0 (d the chart direction across); G2
+n · S_dd = II(S_d, S_d) (Pegna and Wolter), quadratic, by Gauss–Newton: each solve's rows linearized about
+the last answer (iterating the right side alone diverges: a larger S_d asks a larger S_dd); guide curves
+and points S = G (with Guide G1 also n · S_u = n · S_v = 0 on a face); Quad's flow (Normal: the cross
+derivative square to the boundary; Next: along the blend of the neighboring boundaries; Adjacent:
+along the neighbor's own cross direction) a hundredth as strong. The rows weigh a million times the
+energy's diagonal and the method of multipliers drives them to hold: penalties alone trade exactness
+for the system's condition (a weight of ten million left a planar fill 2e-8 off its plane).
+
+**The reference** (`fill_reference.lucb`). Bending alone makes a ball's cap a paraboloid's (the clamped
+plate's minimizer is a quadratic of the radius, 1% of the radius high on a 30° cap). So the energy is of
+S − R, R the neighbors carried on into the hole: each side's ribbon is its neighbor's own surface where
+the line through a chart point along the chart's normal meets it (a plane, sphere or cylinder in closed
+form, else Newton within a B-spline's domain, accepted near the side), else its tangent plane met by the
+same line; the ribbons are heights over the chart, blended by the inverse fourth power of the distance
+to each side (so the blend cannot fold), and fitted into the net on the spans' grid.
+
+**Domains.** N-sided: the loop projected onto its best plane (Newell's normal) gives the stations' chart
+points; the net covers the projection's box with a margin of a tenth, and is trimmed by the boundaries
+laid on it (their feet on the fill, fitted at degree 5 with breaks at each boundary's own inner knots to
+a billionth of the loop, by its own parameter so Stitch meets the middles), keeping the region holding a
+point a step inside the loop. Quad: four boundaries on the sides of an untrimmed patch (its domain their
+mean lengths), the boundary rows fitted on the net's knots by the curves' own parameters and fixed.
+
+**Refinement, measures, conflicts** (`fill_refine.lucb`). Between the solve's stations each one is measured
+as Stage 0 measures an edge (the gap, the angle between normals, the normal curvatures across relative to
+the larger with the Check tools' floor); while one fails (or a Quad row misses its side) the spans are
+halved the way it fails, to 32 each way. Corners whose neighbors disagree (normals apart, a boundary
+leaving the other's tangent plane, the twists II_a(t_a, t_b) and II_b(t_a, t_b) apart, G2 neighbors'
+curvatures apart) are found first: their G1 and G2 rows are eased to nothing within 3% of each side and
+they are reported; failures left at the end are reported as runs along the boundaries. Each boundary's
+worst gap is taken against the fill's nearest points, ends included.
+
+Tests (`tests/regressions/fill_tests.luc`), against closed forms and the Check tools: a planar pentagon
+fills with its plane to 1e-9 and a square hole in a tilted plane with the plane, G1 and G2, N-sided and
+Quad (one untrimmed face of four edges); a square hole in a smooth height field fills G0, G1 and G2 on all
+four edges, N-sided and Quad, quintic, with no conflicts; a 30° cap cut from a ball of radius 2 fills G1 and
+G2 within a thousandth of the radius of the sphere, measured G1 and G2 on its edge; the height field's
+hole is found from one edge; a five-sided corner between three G2 fillets and two walls fills G1 on all
+five edges, and with circular fillets the corners where a fillet meets a wall's strip are reported (their
+twists disagree); a guide curve and a point lie on the fill (N-sided and Quad) with G1 kept; Flatness and
+Tension lower a cap's dome, Explicit Control's degrees and spans are kept, and Normal flow leaves the
+cross isoparms square to the side.
+
+Not yet: Molded domains (a boundary folding over its best plane is refused, Quad is the way round);
+the reference's ribbons for B-spline neighbors beyond their domain are tangent planes (a natural
+extension would carry their curvature); G2 at corners whose neighbors' curvature rates disagree (a
+G2 fillet's end meeting a wall at an angle) is not detected before the solve: what fails is reported as
+runs.
+
 ## Sketches (`sketch/`)
 
 A sketch is points, lines, circles and arcs on a plane, and the constraints between them, as in

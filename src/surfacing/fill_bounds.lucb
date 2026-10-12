@@ -1,0 +1,293 @@
+## Fill's boundaries (surfacing Stage 7; fill.lucb has the plan): the
+## picked curves walked into one closed loop, the stations along it with
+## what each neighbor asks there, the corners where the neighbors' demands
+## disagree, and a hole's loop found from one of its edges.
+##
+## A boundary is one of Align's master words (an edge, an isoparm, a curve
+## on a face, a free curve). Beside an edge, an isoparm or a curve on a
+## face lies a surface, the neighbor: at a station it gives its unit normal
+## n (turned by its face's sense) and its second fundamental form as a
+## quadratic form H on 3D vectors, II(X, X) = Xᵀ H X for X in its tangent
+## plane: H = Jᵀ G⁻¹ B G⁻¹ J for J the chart partials su, sv as rows, G
+## their dot products and B the form's (n . suu, n . suv, n . svv), so the
+## fill can ask its own normal curvature across the boundary, n . S_dd =
+## II(S_d, S_d), whatever its own parameterization (Pegna and Wolter: once
+## G1 holds along the curve, normal curvatures equal in one transversal
+## direction make it G2). A free curve has no neighbor: G0 only.
+
+## Fill's per-boundary continuity codes (Square's: Free keeps the
+## boundary's position and is not checked).
+pub let fill_free: i64 = 0
+pub let fill_g0: i64 = 1
+pub let fill_g1: i64 = 2
+pub let fill_g2: i64 = 3
+
+## A boundary of the fill: its master, its curve on 0..1 run the loop's
+## way, that curve's arc table, the boundary's index in the picked order,
+## its code and its length.
+struct FillSide:
+    var master: Master
+    var curve: Spline
+    var arc: ArcTable
+    var picked: usize
+    var code: i64
+    var length: f64
+
+    func close():
+        self.master.close()
+        self.curve.close()
+        self.arc.close()
+
+    ## The order the side holds across (-1 Free, 0 G0, 1 G1, 2 G2): G1 and
+    ## G2 only beside a surface.
+    func order() -> i64:
+        if self.code == fill_free: return -1
+        if not self.master.has_face: return 0
+        return self.code - 1
+
+func close_fill_sides(list: Growing[FillSide]*):
+    for s in list.view():
+        var owned = s
+        owned.close()
+    list.close()
+
+## What a neighbor asks at a point: its oriented unit normal and its
+## normal curvature form H (xx, yy, zz, xy, xz, yz).
+struct NeighborForm:
+    var n: Vector3
+    var h: f64[6]
+
+    ## H X.
+    func times(x: Vector3) -> Vector3:
+        return Vector3(self.h[0] * x.x + self.h[3] * x.y + self.h[4] * x.z, self.h[3] * x.x + self.h[1] * x.y + self.h[5] * x.z, self.h[4] * x.x + self.h[5] * x.y + self.h[2] * x.z)
+
+    ## Xᵀ H X.
+    func curvature_of(x: Vector3) -> f64:
+        return self.h[0] * x.x * x.x + self.h[1] * x.y * x.y + self.h[2] * x.z * x.z + 2.0 * (self.h[3] * x.x * x.y + self.h[4] * x.x * x.z + self.h[5] * x.y * x.z)
+
+## The neighbor of `master` at `p` (world units; its form scaled by
+## `scale`, the fill's normalized units).
+func neighbor_at(master: Master*, p: Vector3, scale: f64) -> NeighborForm!:
+    let uv = try master.chart_of(p)
+    let j = try surface_jet(master.surface(), uv, false, false)
+    var normal = j.su.cross(j.sv)
+    if not master.w.faces.items[master.f].sense: normal = normal.multiply_scalar(-1.0)
+    let n = normal.normalized() catch failure: error(invalid, "Fill: a boundary's surface is singular there (a pole); pick another boundary")
+    let e = j.su.dot(j.su)
+    let f = j.su.dot(j.sv)
+    let g = j.sv.dot(j.sv)
+    let det = e * g - f * f
+    if not (det > 0.0): error(invalid, "Fill: a boundary's surface is singular there (a pole); pick another boundary")
+    # G⁻¹ B G⁻¹ as a 2x2 (a, b; b, c), then H = Jᵀ (that) J.
+    let l = n.dot(j.suu)
+    let m = n.dot(j.suv)
+    let nn = n.dot(j.svv)
+    let i11 = g / det
+    let i12 = -f / det
+    let i22 = e / det
+    let t11 = i11 * l + i12 * m
+    let t12 = i11 * m + i12 * nn
+    let t21 = i12 * l + i22 * m
+    let t22 = i12 * m + i22 * nn
+    let a = t11 * i11 + t12 * i12
+    let b = t11 * i12 + t12 * i22
+    let c = t21 * i12 + t22 * i22
+    let su = j.su
+    let sv = j.sv
+    var h: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    h[0] = a * su.x * su.x + 2.0 * b * su.x * sv.x + c * sv.x * sv.x
+    h[1] = a * su.y * su.y + 2.0 * b * su.y * sv.y + c * sv.y * sv.y
+    h[2] = a * su.z * su.z + 2.0 * b * su.z * sv.z + c * sv.z * sv.z
+    h[3] = a * su.x * su.y + b * (su.x * sv.y + sv.x * su.y) + c * sv.x * sv.y
+    h[4] = a * su.x * su.z + b * (su.x * sv.z + sv.x * su.z) + c * sv.x * sv.z
+    h[5] = a * su.y * su.z + b * (su.y * sv.z + sv.y * su.z) + c * sv.y * sv.z
+    for k in 0..<(usize)6: h[k] = h[k] * scale
+    return NeighborForm(n, h)
+
+## The picked boundaries `words` (Align's master words apart by `;`), each
+## with its code from `codes` (picked order; missing ones G0), walked end
+## to end into one closed loop onto `out`: the first as picked, each next
+## the one whose end lies nearest the last one's end, turned to run on. A
+## single closed curve is a loop of its own. Ends further apart than a
+## ten-thousandth of the boundaries' size are refused with the gap.
+func walk_loop(set: interop.Reference[GeometrySet], words: str, codes: const i64[], out: Growing[FillSide]*) -> !:
+    var masters = Growing[Master]()
+    defer close_masters(&masters)
+    try builder_masters(set, words, &masters)
+    if masters.count == 0: error(invalid, "Fill: pick the boundaries of the hole (edges, curves or isoparms)")
+    var curves = Growing[Spline]()
+    defer close_splines_of(&curves)
+    for m in masters.view():
+        if m.curve.points.count == 0: error(invalid, "Fill: a boundary is a face; pick edges, curves or isoparms")
+        var c = try m.curve.copy()
+        unit_domain(&c)
+        try curves.push(c)
+    let gap = curves_size(curves.view()) * 1e-4
+    var used = Growing[bool]()
+    defer used.close()
+    try used.fill(masters.count, false)
+    var order = Growing[usize]()
+    defer order.close()
+    var against = Growing[bool]()
+    defer against.close()
+    try order.push(0)
+    try against.push(false)
+    used.items[0] = true
+    let start = curves.items[0].point_at(0.0)
+    var end = curves.items[0].point_at(1.0)
+    while order.count < masters.count:
+        var best: i64 = -1
+        var best_gap = 1.0e300
+        var best_against = false
+        for k in 0..<masters.count:
+            if used.items[k]: continue
+            let a = curves.items[k].point_at(0.0).subtract(end).length()
+            let b = curves.items[k].point_at(1.0).subtract(end).length()
+            if a < best_gap:
+                best_gap = a
+                best = (i64)k
+                best_against = false
+            if b < best_gap:
+                best_gap = b
+                best = (i64)k
+                best_against = true
+        if best_gap > gap:
+            var buffer: u8[200]
+            error(invalid, try strings.format(buffer, f"Fill: the boundaries do not meet end to end (a gap of {best_gap:.6f} after boundary {order.items[order.count - 1] + 1}); pick a closed loop"))
+        used.items[(usize)best] = true
+        try order.push((usize)best)
+        try against.push(best_against)
+        end = curves.items[(usize)best].point_at(0.0 if best_against else 1.0)
+    let closing = end.subtract(start).length()
+    if closing > gap:
+        var buffer: u8[200]
+        error(invalid, try strings.format(buffer, f"Fill: the boundaries do not close (the loop's ends lie {closing:.6f} apart); pick every boundary of the hole"))
+    for k in 0..<order.count:
+        let at = order.items[k]
+        var curve = try curves.items[at].copy()
+        errdefer curve.close()
+        if against.items[k]:
+            let turned_round = try reversed_spline(&curve)
+            curve.close()
+            curve = turned_round
+        unit_domain(&curve)
+        var arc = try arc_table(&curve)
+        errdefer arc.close()
+        let code = codes[at] if at < codes.length else fill_g0
+        if code < fill_free or code > fill_g2: error(invalid, "Fill: a boundary's continuity is Free, G0, G1 or G2")
+        # The master moves into the side (its slot left empty to close).
+        var master = masters.items[at]
+        masters.items[at] = empty_master(-1, Vector3())
+        let length = arc.total()
+        try out.push(FillSide(master, curve, arc, at, code, length))
+
+# -- A hole's loop.
+
+## An open edge (one face beside it): its face's name, its ends and middle,
+## and its side: the face's normal at the middle, negated when the face's
+## loop runs the edge from its end to its start (so the faces round a hole
+## all show the same side when the hole is walked one way).
+struct OpenEdge:
+    var face: Growing[u8]
+    var a: Vector3
+    var b: Vector3
+    var middle: Vector3
+    var side: Vector3
+
+## The words of every edge round the hole that `word` (an edge's words)
+## lies on: the open edges (a face on one side only) of every body of
+## `set`, walked end to end from it until the loop closes (Alias's and
+## Plasticity's fill of a hole picked by one edge), apart by `;`. Where
+## several open edges meet at a corner (sheets touching there), the walk
+## takes the one whose face lies on the hole's side as the last one's did.
+func hole_words(set: interop.Reference[GeometrySet], word: str) -> interop.Owned[str]!:
+    var picked = try master_of(set, word, -1, Vector3())
+    defer picked.close()
+    if picked.curve.points.count == 0: error(invalid, "Fill: pick an edge of the hole")
+    let mark = picked.curve.point_at((picked.curve.low() + picked.curve.high()) * 0.5)
+    var edges = Growing[OpenEdge]()
+    defer close_open_edges(&edges)
+    var size = 0.0
+    for model in set_models(try set.get()):
+        var w = try shape_of(model.value())
+        defer w.close()
+        try w.index_sides()
+        for e in 0..<w.edges.count:
+            let one = w.sides.items[2 * e]
+            let two = w.sides.items[2 * e + 1]
+            if one >= 0 and two >= 0: continue
+            let f = (usize)(one if one >= 0 else two)
+            var face = Growing[u8]()
+            for byte in w.face_name(f).bytes: try face.push(byte)
+            let a = try w.edge_at(e, 0.0)
+            let b = try w.edge_at(e, 1.0)
+            let middle = try w.edge_at(e, 0.5)
+            var forward = true
+            for use in w.face_uses(f):
+                if edge_index(use) == e: forward = use > 0
+            let normal = try w.face_normal(f, middle)
+            try edges.push(OpenEdge(face, a, b, middle, normal if forward else normal.multiply_scalar(-1.0)))
+            size = math.max(size, a.subtract(b).length())
+    if edges.count == 0: error(invalid, "Fill: the bodies have no open edges (no hole to fill)")
+    # The picked one: the open edge whose middle lies nearest its middle.
+    var first: usize = 0
+    for k in 0..<edges.count:
+        if edges.items[k].middle.subtract(mark).length() < edges.items[first].middle.subtract(mark).length(): first = k
+    let gap = math.max(size * 1e-4, 1e-9)
+    var loop = Growing[usize]()
+    defer loop.close()
+    try loop.push(first)
+    let start = edges.items[first].a
+    var end = edges.items[first].b
+    var side = edges.items[first].side
+    var travel = edges.items[first].b.subtract(edges.items[first].a)
+    while end.subtract(start).length() > gap:
+        var next: i64 = -1
+        var next_side = Vector3()
+        var next_end = Vector3()
+        var best = -1.0e300
+        # Faces lie left of the walk about their sides; the hole, right:
+        # among edges whose face shows the same side, the one turning most
+        # toward the hole (a sheet's own next edge turns away from it).
+        let toward = (travel.cross(side)).normalized() catch failure: recover Vector3()
+        for k in 0..<edges.count:
+            var taken = false
+            for at in loop.view(): taken = taken or at == k
+            if taken: continue
+            let e = &edges.items[k]
+            for way in 0..<(usize)2:
+                let leaving = e.a if way == 0 else e.b
+                if leaving.subtract(end).length() > gap: continue
+                let shown = e.side if way == 0 else e.side.multiply_scalar(-1.0)
+                let arriving = e.b if way == 0 else e.a
+                let turn = (arriving.subtract(leaving).normalized() catch failure: recover Vector3()).dot(toward)
+                let score = shown.dot(side) + 0.5 * turn
+                if score > best:
+                    best = score
+                    next = (i64)k
+                    next_side = shown
+                    next_end = arriving
+                    travel = arriving.subtract(leaving)
+        if next < 0: error(invalid, "Fill: the hole's edges do not close into a loop (an open edge ends nowhere)")
+        try loop.push((usize)next)
+        end = next_end
+        side = next_side
+        if loop.count > edges.count: error(invalid, "Fill: the hole's edges do not close into a loop")
+    var out = Growing[u8]()
+    defer out.close()
+    for k in 0..<loop.count:
+        let e = &edges.items[loop.items[k]]
+        if k > 0: try out.push(59)
+        for byte in "edge ".bytes: try out.push(byte)
+        for byte in e.face.view(): try out.push(byte)
+        for value in [e.middle.x, e.middle.y, e.middle.z]:
+            try out.push(32)
+            var buffer: u8[64]
+            for byte in (try strings.format_f64(value, buffer[0..])).bytes: try out.push(byte)
+    return try interop.copy_text((str)out.view())
+
+func close_open_edges(list: Growing[OpenEdge]*):
+    for e in list.view():
+        var owned = e
+        owned.face.close()
+    list.close()

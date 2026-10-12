@@ -1,0 +1,164 @@
+## Fill (surfacing Stage 7; fill.lucb has the plan): what Luce calls,
+## CadSurfaceFill, and what it returns, CadFill: the set with the fill
+## added as a body of one sheet, each boundary's measures, and the
+## conflicts to draw on the model.
+
+## What Fill made: the set, each boundary's worst gap (model units), angle
+## between normals (degrees) and normal curvature difference across
+## (percent) in the picked order, the guides' worst miss, the conflicts
+## (FillConflict), the spans and whether the face is trimmed.
+pub struct CadFill:
+    var made: interop.Reference[GeometrySet]?
+    var gaps: Growing[f64]
+    var angles: Growing[f64]
+    var curvatures: Growing[f64]
+    var conflicts: Growing[FillConflict]
+    pub var guide_miss: f64
+    pub var passes: i64
+    pub var spans_u: i64
+    pub var spans_v: i64
+    pub var degree_u: i64
+    pub var degree_v: i64
+    pub var trimmed: bool
+
+    pub func init():
+        self.made = none
+        self.gaps = Growing[f64]()
+        self.angles = Growing[f64]()
+        self.curvatures = Growing[f64]()
+        self.conflicts = Growing[FillConflict]()
+        self.guide_miss = 0.0
+        self.passes = 0
+        self.spans_u = 0
+        self.spans_v = 0
+        self.degree_u = 0
+        self.degree_v = 0
+        self.trimmed = false
+
+    pub func geometry() -> interop.Reference[GeometrySet]!:
+        let made = self.made else error(invalid, "a fill has no geometry")
+        return made.clone()
+
+    ## How many boundaries were measured.
+    pub func boundary_count() -> i64:
+        return (i64)self.gaps.count
+
+    ## Boundary `index`'s (picked order) worst gap, angle and curvature
+    ## difference.
+    pub func gap(index: i64) -> f64!:
+        if index < 0 or (usize)index >= self.gaps.count: error(invalid, "a fill's boundary out of range")
+        return self.gaps.items[(usize)index]
+
+    pub func angle(index: i64) -> f64!:
+        if index < 0 or (usize)index >= self.angles.count: error(invalid, "a fill's boundary out of range")
+        return self.angles.items[(usize)index]
+
+    pub func curvature(index: i64) -> f64!:
+        if index < 0 or (usize)index >= self.curvatures.count: error(invalid, "a fill's boundary out of range")
+        return self.curvatures.items[(usize)index]
+
+    pub func conflict_count() -> i64:
+        return (i64)self.conflicts.count
+
+    pub func conflict(index: i64) -> FillConflict!:
+        if index < 0 or (usize)index >= self.conflicts.count: error(invalid, "a fill's conflict out of range")
+        return self.conflicts.items[(usize)index]
+
+    pub func close():
+        if let made = self.made: made.release()
+        self.made = none
+        self.gaps.close()
+        self.angles.close()
+        self.curvatures.close()
+        self.conflicts.close()
+
+pub let cad_fill_type: interop.Type[CadFill] = interop.Type[CadFill]("CadFill", CadFill.close, closeable = true)
+
+pub struct CadSurfaceFill:
+    let reserved: u8 = 0
+
+    ## Fill (fill.lucb): the hole bounded by `boundaries` (Align's master
+    ## words apart by `;`, a closed loop in any order), each picked one
+    ## `continuity` fill_free, fill_g0, fill_g1 or fill_g2 (missing: G0);
+    ## through the guide curves `guides` (words apart by `;`) and the
+    ## interior `points`, G0 or with `guide_order` 1 tangent to the face a
+    ## guide lies on; `quad` four boundaries as an untrimmed patch (else
+    ## N-sided, trimmed); `tension` 0 to 1, `flatness` 0 to 1, the Quad
+    ## `flow` (fill_flow_natural, _normal, _next, _adjacent); Explicit
+    ## Control (`explicit`: the degrees and spans as asked, no refining);
+    ## `refine` up to `most_spans` each way; the tolerances (`position` in
+    ## model units, 0: a millionth of the loop's size; `angle` degrees;
+    ## `curvature` percent). The fill is a body of one sheet named `name`.
+    pub static func fill(set: interop.Reference[GeometrySet], boundaries: str, continuity: const i64[], points: const Vector3[], guides: str = "", guide_order: i64 = 0,
+                         quad: bool = false, tension: f64 = 0.0, flatness: f64 = 0.0, flow: i64 = 0, explicit: bool = false, degree_u: i64 = 5, spans_u: i64 = 4,
+                         degree_v: i64 = 5, spans_v: i64 = 4, refine: bool = true, most_spans: i64 = 32, position: f64 = 0.0, angle: f64 = 0.05, curvature: f64 = 0.5,
+                         name: str = "Fill") -> interop.Reference[CadFill]!:
+        if not (tension >= 0.0 and tension <= 1.0): error(invalid, "Fill: Tension is 0 to 1")
+        if not (flatness >= 0.0 and flatness <= 1.0): error(invalid, "Fill: Flatness is 0 to 1")
+        if flow < fill_flow_natural or flow > fill_flow_adjacent: error(invalid, "Fill: the boundary flow is Natural, Normal, Next or Adjacent")
+        if guide_order < 0 or guide_order > 1: error(invalid, "Fill: guides are G0 or G1")
+        if explicit and (spans_u < 1 or spans_v < 1 or spans_u > 64 or spans_v > 64): error(invalid, "Fill: Explicit Control's spans are 1 to 64")
+        if not (angle > 0.0 and curvature > 0.0 and position >= 0.0): error(invalid, "Fill: the tolerances must be more than zero")
+        let opts = FillOptions(quad, tension, flatness, flow, guide_order, explicit, degree_u, spans_u, degree_v, spans_v, refine, most_spans, position, angle, curvature)
+        var w = FillWork(Growing[FillSide](), opts, Growing[Master](), Growing[Vector3](), Vector3(), 1.0, Vector3(), Vector3(), Vector3(), 0.0, 0.0, 0.0, Growing[FillConflict](), Growing[bool]())
+        defer w.close()
+        try walk_loop(set, boundaries, continuity, &w.sides)
+        if guides.length > 0: try builder_masters(set, guides, &w.guides)
+        for p in points: try w.points.push(p)
+        var made = try fill_made(&w)
+        defer made.close()
+        let body = try fill_body(&w, &made, name)
+        defer body.release()
+        let result = try interop.Reference[CadFill].adopt(new CadFill() in memory.heap, cad_fill_type, memory.heap)
+        errdefer result.release()
+        let fill = result.value()
+        fill.made = try with_body_added(set, body)
+        try fill.gaps.assign(made.gaps.view())
+        try fill.angles.assign(made.angles.view())
+        try fill.curvatures.assign(made.curvatures.view())
+        try fill.conflicts.assign(made.conflicts.view())
+        fill.guide_miss = made.guide_miss
+        fill.passes = made.passes
+        fill.spans_u = (i64)spans_of(made.net.ku.view(), made.net.du)
+        fill.spans_v = (i64)spans_of(made.net.kv.view(), made.net.dv)
+        fill.degree_u = made.net.du
+        fill.degree_v = made.net.dv
+        fill.trimmed = not quad
+        return result
+
+    ## The words of every edge round the hole the edge `word` lies on (the
+    ## bodies' open edges walked end to end), apart by `;`: a hole picked
+    ## by one of its edges.
+    pub static func hole(set: interop.Reference[GeometrySet], word: str) -> interop.Owned[str]!:
+        return try hole_words(set, word)
+
+## The fill's body: Quad its net's face; N-sided the net's face trimmed to
+## the loop (Set Planar's way: curves cut the face, the region inside the
+## loop's chart kept). The curves that cut are the boundaries laid on the
+## fill (laid_sides: their feet on it, fitted to a billionth of the loop),
+## so the trim's edges lie on the face and meet the neighbors' edges within
+## the fill's worst gap (Stitch's tolerant edges join them).
+func fill_body(w: const FillWork*, made: const FillMade*, name: str) -> interop.Reference[CadModel]!:
+    if w.opts.quad: return try net_body(&made.net, name, made.sense)
+    var worst = 0.0
+    for g in made.gaps.view(): worst = math.max(worst, g)
+    let precision = math.max(worst * 2.0, w.scale * 1e-7)
+    let sheet = try net_body_within(&made.net, name, made.sense, w.scale * 1e-9)
+    defer sheet.release()
+    var shape = try shape_of(sheet.value())
+    defer shape.close()
+    var cuts = empty_shape(shape.tolerance)
+    defer cuts.close()
+    for c in made.cuts.view():
+        var points = Growing[Vector3]()
+        defer points.close()
+        var weights = Growing[f64]()
+        defer weights.close()
+        for q in c.points.view():
+            try points.push(q.point())
+            try weights.push(q.w)
+        let stored = try cuts.add_spline(points.view(), weights.view(), c.knots.view(), c.degree)
+        _ = try cuts.add_carrier(Carrier(curve_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, stored))
+    # The region kept: the one holding a point just inside the loop.
+    let picks: Vector3[1] = [made.inside]
+    return try trim_face(sheet.value(), name, &cuts, picks[..<1], trim_keep, name, precision)

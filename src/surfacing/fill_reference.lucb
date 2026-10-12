@@ -1,0 +1,237 @@
+## Fill's reference surface (surfacing Stage 7; fill.lucb has the plan):
+## what the neighbors would do inside the hole if they went on, so the
+## fill's energy measures how far it bends away from them rather than from
+## a plane.
+##
+## A parametric bending energy alone makes a ball's cap a paraboloid's (its
+## minimizer with the rim's position and slope held is a quadratic of the
+## radius: 1% of the radius high on a 30 degree cap), whatever the spans.
+## So the energy is taken of S - R, R the neighbors' surfaces carried on
+## into the hole and blended (a transfinite patch of ribbons, as Rhino's
+## MultiSidedPatch and the Generalized Bezier patches build theirs; §6.8's
+## cross-check made the reference): the fill is the smoothest change of R
+## that meets the boundaries. Each side's ribbon at a chart point q is its
+## neighbor's own surface where the line through q along the chart's normal
+## meets it (a sphere, cylinder, cone, torus or plane goes on exactly; a
+## B-spline face within its domain, near the side), else its tangent plane
+## at the nearest point of the side (interpolated between stations), met by
+## the same line; a free curve's side the plane through it square to the
+## chart's normal. Every ribbon is a height over the chart. The ribbons blend by the inverse fourth
+## power of the chart distance to each side, so each side's ribbon rules
+## near it, and R is fitted into the net by least squares on a grid of the
+## spans' fit parameters (a tensor fit, rows then columns).
+
+## The ribbon of side `k` at chart point `q` (normalized units), from the
+## stations `stations` (the side's, in order along it).
+func ribbon_at(w: FillWork*, k: usize, q: Vector3, stations: const FillStation[], charts: const Vector3[], first: usize, count: usize) -> Vector3!:
+    let on_plane = w.ex.multiply_scalar(q.x).add(w.ey.multiply_scalar(q.y))
+    # The side's nearest point in the chart: the nearest station, then the
+    # foot on the segments to its neighbors along the side.
+    var best = first
+    var best_distance = 1.0e300
+    for at in first..<first + count:
+        let d = charts[at].subtract(q).length()
+        if d < best_distance:
+            best_distance = d
+            best = at
+    var a = best
+    var b = best
+    var f = 0.0
+    for other in [best - fewer(best - first, 1), fewer(best + 1, first + count - 1)]:
+        if other == best: continue
+        let seg = charts[other].subtract(charts[best])
+        let length = seg.dot(seg)
+        if not (length > 0.0): continue
+        let t = q.subtract(charts[best]).dot(seg) / length
+        if t > 0.0:
+            a = best
+            b = other
+            f = math.min(t, 1.0)
+    let sa = &stations[a]
+    let sb = &stations[b]
+    let p = sa.p.multiply_scalar(1.0 - f).add(sb.p.multiply_scalar(f))
+    let side = &w.sides.items[k]
+    if not side.master.has_face:
+        # A free curve: the plane through it square to the chart's normal.
+        return on_plane.add(w.ez.multiply_scalar(p.dot(w.ez)))
+    # The neighbor's own surface, where the chart's line through q meets it:
+    # a plane, sphere or cylinder in closed form (no pole to stall on), the
+    # rest by Newton on (u, v, t).
+    let s = side.master.surface()
+    let analytic = try line_meets(s, w.world(on_plane), w.ez, w.world(p).subtract(w.world(on_plane)).dot(w.ez))
+    if let t = analytic:
+        let hit = w.local(w.world(on_plane).add(w.ez.multiply_scalar(t)))
+        if hit.subtract(p).length() <= 2.0 * q.subtract(charts[a].multiply_scalar(1.0 - f).add(charts[b].multiply_scalar(f))).length() + 0.05: return hit
+    var uv = try side.master.chart_of(w.world(p))
+    var t = (w.world(p).subtract(w.world(on_plane))).dot(w.ez)
+    let line = w.world(on_plane)
+    var met = false
+    for _ in 0..<24:
+        let j = surface_jet(s, uv, false, false) catch failure: break
+        let r = j.p.subtract(line.add(w.ez.multiply_scalar(t)))
+        if r.length() <= w.scale * 1e-12:
+            met = true
+            break
+        # [su sv -ez] (du dv dt) = -r, by Cramer's rule.
+        let m = w.ez.multiply_scalar(-1.0)
+        let det = j.su.dot(j.sv.cross(m))
+        if not (math.abs(det) > 1e-300): break
+        let du = -r.dot(j.sv.cross(m)) / det
+        let dv = -j.su.dot(r.cross(m)) / det
+        let dt = -j.su.dot(j.sv.cross(r)) / det
+        uv = Vector3(uv.x + du, uv.y + dv, 0.0)
+        t += dt
+    if met and s.kind == surface_spline:
+        met = uv.x >= s.ku[(usize)s.du] and uv.x <= s.ku[(usize)s.nu] and uv.y >= s.kv[(usize)s.dv] and uv.y <= s.kv[(usize)s.nv]
+    # Only near the side: the line may meet the neighbor's face again far
+    # off (a fillet's own sheet beyond the corner).
+    let hit = w.local(line.add(w.ez.multiply_scalar(t)))
+    if met and hit.subtract(p).length() <= 2.0 * q.subtract(charts[a].multiply_scalar(1.0 - f).add(charts[b].multiply_scalar(f))).length() + 0.05: return hit
+    # Else its tangent plane there, carried on flat (a second-order
+    # paraboloid of a tight neighbor, a small fillet, bulges far across the
+    # hole; the plane does not, the curvature comes from the G2 rows), met
+    # by the same line: every ribbon is a height over the chart, so their
+    # blend is one too and cannot fold. A plane standing nearly along the
+    # line keeps the side's own height.
+    let n = sa.form.n.multiply_scalar(1.0 - f).add(sb.form.n.multiply_scalar(f)).normalized() catch failure: recover sa.form.n
+    let rise = n.dot(w.ez)
+    if math.abs(rise) < 0.2: return on_plane.add(w.ez.multiply_scalar(p.dot(w.ez)))
+    return on_plane.add(w.ez.multiply_scalar(n.dot(p.subtract(on_plane)) / rise))
+
+## Where the line through `o` along unit `e` meets a plane, sphere or
+## cylinder `s`: the parameter t nearest `near` (none for other kinds, or a
+## miss).
+func line_meets(s: const Surface*, o: Vector3, e: Vector3, near: f64) -> f64?!:
+    let d = o.subtract(s.origin)
+    if s.kind == surface_plane:
+        let rise = s.z.dot(e)
+        if not (math.abs(rise) > 1e-12): return none
+        return -s.z.dot(d) / rise
+    var a = 0.0
+    var b = 0.0
+    var c = 0.0
+    if s.kind == surface_sphere:
+        a = 1.0
+        b = 2.0 * d.dot(e)
+        c = d.dot(d) - s.radius * s.radius
+    elif s.kind == surface_cylinder:
+        let dp = d.subtract(s.z.multiply_scalar(d.dot(s.z)))
+        let ep = e.subtract(s.z.multiply_scalar(e.dot(s.z)))
+        a = ep.dot(ep)
+        b = 2.0 * dp.dot(ep)
+        c = dp.dot(dp) - s.radius * s.radius
+    else: return none
+    if not (a > 1e-12): return none
+    let disc = b * b - 4.0 * a * c
+    if disc < 0.0: return none
+    let root = math.sqrt(disc)
+    let t1 = (-b - root) / (2.0 * a)
+    let t2 = (-b + root) / (2.0 * a)
+    return t1 if math.abs(t1 - near) <= math.abs(t2 - near) else t2
+
+## The reference R at chart point `q`: the sides' ribbons blended by the
+## inverse fourth power of the chart distance to each side. `charts` are
+## the stations' chart points, `starts` each side's first station (and
+## the end).
+func reference_at(w: FillWork*, q: Vector3, stations: const FillStation[], charts: const Vector3[], starts: const usize[]) -> Vector3!:
+    var sum = Vector3()
+    var total = 0.0
+    for k in 0..<w.sides.count:
+        let first = starts[k]
+        let count = starts[k + 1] - first
+        if count == 0: continue
+        var d = 1.0e300
+        for at in first..<first + count: d = math.min(d, charts[at].subtract(q).length())
+        let weight = 1.0 / math.pow(math.max(d, 1e-6), 4.0)
+        sum = sum.add((try ribbon_at(w, k, q, stations, charts, first, count)).multiply_scalar(weight))
+        total += weight
+    return sum.multiply_scalar(1.0 / total)
+
+## The reference's control points on `fn`'s net onto `fn.reference`: R at
+## the grid of the spans' fit parameters (the chart point of a Quad's
+## parameter its base's projection), fitted along v then across u. Returns
+## how far the fit lies from R between the grid's points (normalized): the
+## spans the fill needs to follow its neighbors' shape.
+func fit_reference(w: FillWork*, fn: FillNet*, stations: const FillStation[]) -> f64!:
+    # Each side's stations, in order (stations come side by side).
+    var starts = Growing[usize]()
+    defer starts.close()
+    var at: usize = 0
+    for k in 0..<w.sides.count:
+        try starts.push(at)
+        while at < stations.length and stations[at].side == k: at += 1
+    try starts.push(at)
+    var charts = Growing[Vector3]()
+    defer charts.close()
+    for st in stations: try charts.push(w.chart(st.p))
+    let net = &fn.net
+    var pu = Growing[f64]()
+    defer pu.close()
+    var pv = Growing[f64]()
+    defer pv.close()
+    try fit_parameters(net.ku.view(), net.du, 4, &pu)
+    try fit_parameters(net.kv.view(), net.dv, 4, &pv)
+    var fit_v = try make_fitter(net.dv, net.kv.view(), pv.view(), 0)
+    defer fit_v.close()
+    var fit_u = try make_fitter(net.du, net.ku.view(), pu.view(), 0)
+    defer fit_u.close()
+    # Rows along v at each u sample, fitted.
+    var rows = Growing[Weighted]()
+    defer rows.close()
+    var values = Growing[Weighted]()
+    defer values.close()
+    var fitted = Growing[Weighted]()
+    defer fitted.close()
+    var no_ends: Weighted[4] = [Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+    for u in pu.view():
+        values.clear()
+        for v in pv.view():
+            var q = Vector3(u, v, 0.0)
+            if w.opts.quad: q = w.chart(fn.base_at(u, v))
+            try values.push(weighted(try reference_at(w, q, stations, charts.view(), starts.view()), 1.0))
+        var starts_v = no_ends
+        var ends_v = no_ends
+        starts_v[0] = values.items[0]
+        ends_v[0] = values.items[values.count - 1]
+        try fit_v.fit(values.view(), &starts_v, &ends_v, &fitted)
+        for q in fitted.view(): try rows.push(q)
+    # Across u, each v control point's column.
+    let nv = net.nv
+    try fn.reference.fill(net.nu * nv, Weighted(0.0, 0.0, 0.0, 1.0))
+    for j in 0..<nv:
+        values.clear()
+        for i in 0..<pu.count: try values.push(rows.items[i * nv + j])
+        var starts_u = no_ends
+        var ends_u = no_ends
+        starts_u[0] = values.items[0]
+        ends_u[0] = values.items[values.count - 1]
+        try fit_u.fit(values.view(), &starts_u, &ends_u, &fitted)
+        for i in 0..<net.nu: fn.reference.items[i * nv + j] = fitted.items[i]
+    # The unknowns measured from the reference too (fill_net's base: what
+    # the band solves for is then only the fill's change of it, and its
+    # rounding relative to that).
+    for k in 0..<fn.unknown.count:
+        if fn.unknown.items[k] < 0: continue
+        fn.base.items[k] = fn.reference.items[k]
+        fn.net.points.items[k] = fn.reference.items[k]
+    # Its miss between the grid's points (every other cell).
+    var worst = 0.0
+    var cell: usize = 0
+    for a in 0..<pu.count - 1:
+        for b in 0..<pv.count - 1:
+            cell += 1
+            if cell % 2 == 0: continue
+            let u = (pu.items[a] + pu.items[a + 1]) * 0.5
+            let v = (pv.items[b] + pv.items[b + 1]) * 0.5
+            var q = Vector3(u, v, 0.0)
+            if w.opts.quad: q = w.chart(fn.base_at(u, v))
+            let want = try reference_at(w, q, stations, charts.view(), starts.view())
+            var bu: f64[12]
+            var bv: f64[12]
+            let fu = nurbs_basis(net.ku.view(), (i64)net.nu, net.du, u, &bu)
+            let fv = nurbs_basis(net.kv.view(), (i64)net.nv, net.dv, v, &bv)
+            var have = Vector3()
+            for i in 0..<(usize)net.du + 1:
+                for j in 0..<(usize)net.dv + 1: have = have.add(fn.reference.items[(fu + i) * nv + fv + j].point().multiply_scalar(bu[i] * bv[j]))
+            worst = math.max(worst, have.subtract(want).length())
+    return worst

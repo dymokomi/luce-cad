@@ -1,0 +1,500 @@
+## Fill (surfacing Stage 7: xNURBS, Plasticity's xNURBS and Patch, Alias's
+## N-sided, Rhino 9's Patch; §5.2 and §6.8 of luced-3d's
+## docs/research/SURFACING-ALIAS-PLASTICITY.md): the smoothest surface that
+## meets a closed loop of boundaries, each Free, G0, G1 or G2 to the
+## surface beside it, through interior guide curves and points.
+##
+## The unknowns are the control points of a polynomial B-spline net,
+## quintic both ways on uniform spans by default (Explicit Control sets the
+## degrees and spans). The surface minimizes
+##   E = w_b ∫|∇²(S - R)|² + w_t ∫|∇³(S - R)|² + w_s ∫|∇S|² + w_f ∫(n0 . S)²
+## (∇² the second derivatives |S_uu|² + 2|S_uv|² + |S_vv|², ∇³ the third
+## |S_uuu|² + 3|S_uuv|² + 3|S_uvv|² + |S_vvv|²): bending, and with any G2
+## boundary its rate (Moreton and Séquin's minimum variation, the order a
+## curvature boundary condition is well posed in), both of S less a
+## reference R, the neighbors carried on into the hole (fill_reference.lucb:
+## a ball's cap fills with the ball, not a paraboloid); the membrane
+## (Tension, tightening) and the pull toward the boundary's best plane
+## (Flatness). The constraints are sampled at stations along the
+## boundaries, rows of a least-squares system weighted a million times the
+## energy's diagonal and driven to hold by the method of multipliers
+## (fill_net.lucb's HeldRows):
+##   G0: S(uv_k) = B_k;
+##   G1: n_k . S_d(uv_k) = 0, n_k the neighbor's normal and d the chart
+##     direction across the boundary: linear, as n_k is fixed;
+##   G2: n_k . S_dd(uv_k) = II_k(S_d, S_d), the neighbor's second
+##     fundamental form on the fill's own cross derivative (Pegna and
+##     Wolter: with G1, equal normal curvature in one transversal direction
+##     is G2): quadratic, solved by Gauss-Newton, each solve's rows
+##     linearized about the last answer;
+##   guides: S(uv) = G at points along each guide curve and at each
+##     interior point, and with Guide G1 n . S_u = n . S_v = 0 where a
+##     guide lies on a face;
+##   flow (Quad): the cross derivative square to the boundary (Normal),
+##     along the next boundaries' blend (Next), or along the neighbor's own
+##     cross direction (Adjacent), a preference a hundredth as strong.
+## The equations are banded (fill_bands.lucb): the energy's Gram matrices
+## are exact per span, and each station touches one block of the net. The
+## unknowns are the change from the reference (or a base plane), so the
+## band's rounding is relative to that change.
+##
+## Two domains (§6.8):
+##   N-sided: the boundary projected onto its best plane (Newell's normal)
+##     gives each station's chart point; the net covers the projection's box
+##     with a margin and is trimmed by the boundaries laid on it (their
+##     feet on the fill, fitted to a billionth of the loop; the trim keeps
+##     the region holding a point just inside): one trimmed face, as
+##     xNURBS's N-sided result is, its edges within the fill's worst gap of
+##     the neighbors' (Stitch's tolerant edges join them);
+##   Quad: four boundaries on the four sides of an untrimmed patch (its
+##     domain the sides' mean lengths, so the energy is near isotropic), the
+##     boundary rows fixed to the curves (fitted on the net's knots within
+##     the tolerance, by the curves' own parameters), the inner control
+##     points free.
+##
+## Refinement (Rhino's Refine, xNURBS's Quality): after a solve the
+## stations between the solve's are measured as Stage 0 measures an edge
+## (the gap, the angle between normals, the normal curvatures across
+## relative to the larger, in percent); while one fails, the spans are
+## halved the way it fails, until all pass or they reach the limit. Where
+## the neighbors' demands disagree (two G1 neighbors' normals apart at a
+## corner, a boundary leaving the other's tangent plane, the two twists
+## apart, G2 neighbors' curvatures apart) no surface meets both: the corner
+## is reported as a conflict (xNURBS 7 draws them on the model), its
+## stations' G1 and G2 rows eased to nothing at the corner within a zone,
+## and what fails at the end is reported as runs along the boundaries.
+
+## Boundary flows (Quad; Plasticity's xNURBS Boundary).
+pub let fill_flow_natural: i64 = 0
+pub let fill_flow_normal: i64 = 1
+pub let fill_flow_next: i64 = 2
+pub let fill_flow_adjacent: i64 = 3
+
+## Fill's options: Quad (else N-sided), Tension (0 to 1: bending to
+## membrane), Flatness (0 to 1: the pull toward the boundary's plane),
+## the Quad flow, the guides' continuity (0 G0, 1 G1), Explicit Control's
+## degrees and spans, Refine and its span limit, and the tolerances
+## (position in model units, 0: a millionth of the boundary's size; the
+## angle in degrees; the curvature in percent).
+pub struct FillOptions:
+    pub var quad: bool
+    pub var tension: f64
+    pub var flatness: f64
+    pub var flow: i64
+    pub var guide_order: i64
+    pub var explicit: bool
+    pub var degree_u: i64
+    pub var spans_u: i64
+    pub var degree_v: i64
+    pub var spans_v: i64
+    pub var refine: bool
+    pub var most_spans: i64
+    pub var position: f64
+    pub var angle: f64
+    pub var curvature: f64
+
+## A conflict: the boundary (picked index; -1 a guide), the order that
+## fails (0 G0, 1 G1, 2 G2), where it runs from and to (a corner: twice
+## the corner), the worst amount (model units, degrees, percent) and
+## whether it is a corner whose neighbors disagree.
+pub struct FillConflict:
+    pub var boundary: i64
+    pub var order: i64
+    pub var start: Vector3
+    pub var finish: Vector3
+    pub var amount: f64
+    pub var corner: bool
+
+## A station: its side and fraction along it, the point (normalized
+## units) and the unit tangent along the loop, its chart point and the
+## chart direction across into the patch, the order it holds (-1 Free),
+## the neighbor (none off a surface), the flow wanted across (zero none),
+## and the weight of its G1 and G2 rows (eased near a conflicting corner).
+struct FillStation:
+    var side: usize
+    var s: f64
+    var p: Vector3
+    var tangent: Vector3
+    var uv: Vector3
+    var d: Vector3
+    var order: i64
+    var has_face: bool
+    var form: NeighborForm
+    var flow: Vector3
+    var weight: f64
+
+## What a fill works with: its sides (loop order), options, guides, the
+## normalized frame (the loop's middle and size; the chart frame ex, ey
+## and the plane's normal ez), the tolerances in normalized units, and the
+## conflicts at corners.
+struct FillWork:
+    var sides: Growing[FillSide]
+    var opts: FillOptions
+    var guides: Growing[Master]
+    var points: Growing[Vector3]
+    var center: Vector3
+    var scale: f64
+    var ex: Vector3
+    var ey: Vector3
+    var ez: Vector3
+    var position: f64
+    var angle: f64
+    var curvature: f64
+    var corners: Growing[FillConflict]
+    ## Each corner's zone is eased (corner k: side k's end, side k + 1's start).
+    var eased: Growing[bool]
+
+    func close():
+        close_fill_sides(&self.sides)
+        close_masters(&self.guides)
+        self.points.close()
+        self.corners.close()
+        self.eased.close()
+
+    ## A world point in normalized units, and back.
+    func local(p: Vector3) -> Vector3:
+        return p.subtract(self.center).multiply_scalar(1.0 / self.scale)
+
+    func world(p: Vector3) -> Vector3:
+        return self.center.add(p.multiply_scalar(self.scale))
+
+    ## The N-sided chart point of a normalized point.
+    func chart(p: Vector3) -> Vector3:
+        return Vector3(p.dot(self.ex), p.dot(self.ey), 0.0)
+
+## What Fill made: the net (world units), whether it is trimmed to the
+## loop, its sense, the conflicts, each side's worst gap, angle and
+## curvature difference (picked order), the guides' worst miss, the spans
+## and the passes.
+struct FillMade:
+    var net: Net
+    var sense: bool
+    var conflicts: Growing[FillConflict]
+    var gaps: Growing[f64]
+    var angles: Growing[f64]
+    var curvatures: Growing[f64]
+    var guide_miss: f64
+    var passes: i64
+    ## N-sided: each side laid on the fill (world units), the trim's curves,
+    ## and a point of the fill just inside them (the trim keeps the region
+    ## holding it).
+    var cuts: Growing[Spline]
+    var inside: Vector3
+
+    func close():
+        self.net.close()
+        self.conflicts.close()
+        self.gaps.close()
+        self.angles.close()
+        self.curvatures.close()
+        close_splines_of(&self.cuts)
+
+# -- The frame and the stations.
+
+## The loop's frame: its middle, size, and best plane (Newell's normal of
+## its samples) with a chart frame in it.
+func set_frame(w: FillWork*) -> !:
+    var points = Growing[Vector3]()
+    defer points.close()
+    for s in w.sides.view():
+        for k in 0..<(usize)64: try points.push(s.curve.point_at((f64)k / 64.0))
+    var center = Vector3()
+    for p in points.view(): center = center.add(p)
+    center = center.multiply_scalar(1.0 / (f64)points.count)
+    var normal = Vector3()
+    for k in 0..<points.count:
+        let a = points.items[k].subtract(center)
+        let b = points.items[(k + 1) % points.count].subtract(center)
+        normal = normal.add(a.cross(b))
+    var size = 0.0
+    for p in points.view(): size = math.max(size, p.subtract(center).length())
+    if not (size > 0.0): error(invalid, "Fill: the boundaries are a point")
+    w.center = center
+    w.scale = size
+    w.ez = normal.normalized() catch failure: error(invalid, "Fill: the boundaries enclose no area (they double back on themselves)")
+    w.ex = try square_to(w.ez)
+    w.ey = w.ez.cross(w.ex)
+    w.position = (w.opts.position if w.opts.position > 0.0 else size * 1e-6) / size
+    w.angle = w.opts.angle * math.pi / 180.0
+    w.curvature = w.opts.curvature
+
+## Side `k`'s parameter at fraction `s` along it: N-sided by its length
+## (stations evenly spread), Quad its own parameter (the patch's rows then
+## run as the boundary curves do, as Square's: the joined edges' middles
+## meet where Stitch looks for them).
+func side_param(w: const FillWork*, k: usize, s: f64) -> f64!:
+    let side = &w.sides.items[k]
+    if w.opts.quad: return math.clamp(s, 0.0, 1.0)
+    return try arc_param(&side.curve, &side.arc, s)
+
+## A station on side `k` at fraction `s` with chart point `uv` and chart
+## direction across `d` (Quad: fixed by the side; N-sided: set from the
+## chart tangent by the caller).
+func make_station(w: FillWork*, k: usize, s: f64, uv: Vector3, d: Vector3) -> FillStation!:
+    let side = &w.sides.items[k]
+    let t = try side_param(w, k, s)
+    let j = try curve_jet(&side.curve, t, 1, t >= 1.0)
+    let p = j.d[0]
+    let tangent = j.d[1].normalized() catch failure: error(invalid, "Fill: a boundary stops (its tangent vanishes)")
+    var form = NeighborForm(Vector3(), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    let order = side.order()
+    var has_face = false
+    var flow = Vector3()
+    if side.master.has_face:
+        form = try neighbor_at(&side.master, p, w.scale)
+        has_face = true
+        if w.opts.quad and w.opts.flow == fill_flow_adjacent:
+            # The neighbor's own way across its edge, out of it.
+            let probe = Probe(p, tangent, w.world(Vector3()).subtract(p), empty_jet())
+            let m = &side.master
+            let goal = try m.target(spline_nearest(&m.curve, p), &probe, 0.0)
+            flow = goal.t.multiply_scalar(-1.0) if m.kind == master_edge else goal.t
+    return FillStation(k, s, w.local(p), tangent, uv, d, order, has_face, form, flow, 1.0)
+
+## The stations of the N-sided chart: `per` along each side by the side's
+## share of the loop's chart length, at the middles of equal steps (never
+## on a corner), each one's direction across into the loop's inside.
+func nsided_stations(w: FillWork*, per_length: f64, out: Growing[FillStation]*) -> !:
+    out.clear()
+    for k in 0..<w.sides.count:
+        # The side's chart length, by 64 chords.
+        let side = &w.sides.items[k]
+        var length = 0.0
+        var before = w.chart(w.local(side.curve.point_at(0.0)))
+        for q in 1..<(usize)65:
+            let now = w.chart(w.local(side.curve.point_at((f64)q / 64.0)))
+            length += now.subtract(before).length()
+            before = now
+        let count = (usize)math.clamp(math.ceil(length * per_length), 12.0, 600.0)
+        for q in 0..<count + 1:
+            # The side's start (a corner of the loop, G0 alone: its two
+            # neighbors' other demands are find_corners'), then the middles
+            # of equal steps.
+            let s = 0.0 if q == 0 else ((f64)q - 0.5) / (f64)count
+            var station = try make_station(w, k, s, Vector3(), Vector3())
+            if q == 0 and station.order > 0: station.order = 0
+            station.uv = w.chart(station.p)
+            let t = Vector3(station.tangent.dot(w.ex), station.tangent.dot(w.ey), 0.0).normalized() catch failure: error(invalid, "Fill: a boundary runs square to the hole's plane; use Quad, or pick a flatter loop")
+            # Inside lies to the left of a counterclockwise loop (the
+            # plane's normal is Newell's: the loop runs counterclockwise).
+            station.d = Vector3(-t.y, t.x, 0.0)
+            try out.push(station)
+
+## Quad's chart: side k's chart point at fraction s, and its direction
+## across (loop sides 0 to 3 are v = low, u = high, v = high run back,
+## u = low run back).
+func quad_place(net: const Net*, k: usize, s: f64) -> (Vector3, Vector3):
+    let u0 = net.u_low()
+    let u1 = net.u_high()
+    let v0 = net.v_low()
+    let v1 = net.v_high()
+    if k == 0: return (Vector3(u0 + (u1 - u0) * s, v0, 0.0), Vector3(0.0, 1.0, 0.0))
+    if k == 1: return (Vector3(u1, v0 + (v1 - v0) * s, 0.0), Vector3(-1.0, 0.0, 0.0))
+    if k == 2: return (Vector3(u1 - (u1 - u0) * s, v1, 0.0), Vector3(0.0, -1.0, 0.0))
+    return (Vector3(u0, v1 - (v1 - v0) * s, 0.0), Vector3(1.0, 0.0, 0.0))
+
+## Quad's stations: six in each span along each side.
+func quad_stations(w: FillWork*, net: const Net*, out: Growing[FillStation]*) -> !:
+    out.clear()
+    for k in 0..<(usize)4:
+        let knots = net.ku.view() if k % 2 == 0 else net.kv.view()
+        let degree = net.du if k % 2 == 0 else net.dv
+        var params = Growing[f64]()
+        defer params.close()
+        try fit_parameters(knots, degree, 6, &params)
+        let low = knots[(usize)degree]
+        let high = knots[knots.length - (usize)degree - 1]
+        for at in 1..<params.count - 1:
+            var s = (params.items[at] - low) / (high - low)
+            if k >= 2: s = 1.0 - s
+            let (uv, d) = quad_place(net, k, s)
+            try out.push(try make_station(w, k, s, uv, d))
+    if w.opts.flow == fill_flow_next or w.opts.flow == fill_flow_normal:
+        # Next: across each side, the blend of the two boundaries leaving
+        # its ends into the patch; Normal: square to the boundary.
+        for at in 0..<out.count:
+            let st = &out.items[at]
+            if w.opts.flow == fill_flow_normal:
+                st.flow = Vector3()
+                continue
+            let before = &w.sides.items[(st.side + 3) % 4]
+            let after = &w.sides.items[(st.side + 1) % 4]
+            let leaving_start = (try curve_jet(&before.curve, 1.0, 1, true)).d[1].multiply_scalar(-1.0).normalized() catch failure: recover Vector3()
+            let leaving_end = (try curve_jet(&after.curve, 0.0, 1, false)).d[1].normalized() catch failure: recover Vector3()
+            st.flow = leaving_start.multiply_scalar(1.0 - st.s).add(leaving_end.multiply_scalar(st.s))
+
+# -- Corners.
+
+## Each corner's disagreement (corner k between side k's end and side
+## k + 1's start) onto `w.corners`, the corner marked to ease: two G1
+## neighbors' normals apart (the amount in degrees), a boundary leaving the
+## other's tangent plane (degrees), two G1 neighbors' twists apart, or two
+## G2 neighbors' normal curvatures apart along the boundaries (percent).
+func find_corners(w: FillWork*) -> !:
+    w.corners.clear()
+    w.eased.clear()
+    let n = w.sides.count
+    for k in 0..<n:
+        try w.eased.push(false)
+        if n < 2: continue
+        let a = &w.sides.items[k]
+        let b = &w.sides.items[(k + 1) % n]
+        let p = a.curve.point_at(1.0)
+        let ta = (try curve_jet(&a.curve, 1.0, 1, true)).d[1].normalized() catch failure: recover Vector3()
+        let tb = (try curve_jet(&b.curve, 0.0, 1, false)).d[1].normalized() catch failure: recover Vector3()
+        var worst = 0.0
+        var order: i64 = -1
+        var fa = NeighborForm(Vector3(), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        var fb = fa
+        if a.order() >= 1: fa = try neighbor_at(&a.master, p, w.scale)
+        if b.order() >= 1: fb = try neighbor_at(&b.master, p, w.scale)
+        if a.order() >= 1 and b.order() >= 1:
+            let angle = math.acos(math.clamp(math.abs(fa.n.dot(fb.n)), -1.0, 1.0))
+            if angle > w.angle:
+                worst = angle * 180.0 / math.pi
+                order = 1
+        if a.order() >= 1 and order < 1:
+            let off = math.asin(math.clamp(math.abs(fa.n.dot(tb)), 0.0, 1.0))
+            if off > w.angle:
+                worst = off * 180.0 / math.pi
+                order = 1
+        if b.order() >= 1 and order < 1:
+            let off = math.asin(math.clamp(math.abs(fb.n.dot(ta)), 0.0, 1.0))
+            if off > w.angle:
+                worst = off * 180.0 / math.pi
+                order = 1
+        if a.order() >= 1 and b.order() >= 1 and order < 1:
+            # The vertex's twist (Gregory's compatibility): G1 along both
+            # boundaries fixes the fill's shape operator on each one's
+            # tangent, S(ta) = S_a(ta) and S(tb) = S_b(tb), and a smooth
+            # surface's is symmetric, so II_a(ta, tb) = II_b(ta, tb) (along a
+            # boundary running straight through, its normal curvature
+            # II(t, t) the same from both). Else no smooth fill is G1 to both
+            # there.
+            let flat = ta.cross(tb).length() < 1e-3
+            let ka = ta.dot(fa.times(ta)) if flat else ta.dot(fa.times(tb))
+            let kb = ta.dot(fb.times(ta)) if flat else ta.dot(fb.times(tb))
+            let rel = fill_relative(ka, kb)
+            if rel > w.curvature:
+                worst = rel
+                order = 1
+        if a.order() >= 2 and b.order() >= 2 and order < 1:
+            # Normal curvatures along both boundaries and between them.
+            let mid = ta.add(tb).normalized() catch failure: recover ta
+            for e in [ta, tb, mid]:
+                let x = e.subtract(fa.n.multiply_scalar(e.dot(fa.n)))
+                let ka = fa.curvature_of(x) / math.max(1e-300, x.dot(x))
+                let kb = fb.curvature_of(x) / math.max(1e-300, x.dot(x))
+                let rel = fill_relative(ka, kb)
+                if rel > w.curvature and rel > worst:
+                    worst = rel
+                    order = 2
+        if order < 0: continue
+        w.eased.items[k] = true
+        let corner = p
+        try w.corners.push(FillConflict((i64)a.picked, order, corner, corner, worst, true))
+
+## |a - b| relative to the larger magnitude, in percent, below a floor of
+## 5e-4 in normalized units (the Check tools' floor, a thousandth over the
+## model's size, the loop's diameter being about twice its normalized one)
+## curvatures being flat alike.
+func fill_relative(a: f64, b: f64) -> f64:
+    let larger = math.max(math.max(math.abs(a), math.abs(b)), 5e-4)
+    return math.abs(a - b) / larger * 100.0
+
+## The ease of station `st` near an eased corner: 1 off the zones, falling
+## as the square of the distance to the corner within a zone of 3% of the
+## side.
+func corner_ease(w: const FillWork*, st: const FillStation*) -> f64:
+    let n = w.sides.count
+    let zone = 0.03
+    var ease = 1.0
+    if w.eased.items[st.side] and st.s > 1.0 - zone: ease = math.min(ease, math.pow((1.0 - st.s) / zone, 2.0))
+    if w.eased.items[(st.side + n - 1) % n] and st.s < zone: ease = math.min(ease, math.pow(st.s / zone, 2.0))
+    return ease
+
+# -- The nets.
+
+## The Quad net on knots `ku`, `kv`: its boundary rows the sides fitted on
+## them (ends at the corners, the mean of the two sides meeting there),
+## the inner control points free; the worst miss of a row onto `missed`
+## and the spans it misses in onto `split_u`, `split_v`.
+func quad_net(w: FillWork*, du: i64, dv: i64, ku: const f64[], kv: const f64[], split_u: Growing[bool]*, split_v: Growing[bool]*) -> FillNet!:
+    let nu = ku.length - (usize)du - 1
+    let nv = kv.length - (usize)dv - 1
+    var fixed = Growing[bool]()
+    defer fixed.close()
+    try fixed.fill(nu * nv, false)
+    var corners: Vector3[4] = [Vector3(), Vector3(), Vector3(), Vector3()]
+    for k in 0..<(usize)4:
+        let before = &w.sides.items[(k + 3) % 4]
+        corners[k] = w.local(w.sides.items[k].curve.point_at(0.0).add(before.curve.point_at(1.0)).multiply_scalar(0.5))
+    # The base: the corners' bilinear patch (corner k at loop side k's
+    # start: (0, 0), (1, 0), (1, 1), (0, 1)), exact at the Greville points.
+    var start = Growing[Weighted]()
+    defer start.close()
+    for i in 0..<nu:
+        let a = (fill_greville(ku, du, i) - ku[(usize)du]) / (ku[nu] - ku[(usize)du])
+        for j in 0..<nv:
+            let b = (fill_greville(kv, dv, j) - kv[(usize)dv]) / (kv[nv] - kv[(usize)dv])
+            let p = corners[0].multiply_scalar((1.0 - a) * (1.0 - b)).add(corners[1].multiply_scalar(a * (1.0 - b))).add(corners[2].multiply_scalar(a * b)).add(corners[3].multiply_scalar((1.0 - a) * b))
+            try start.push(weighted(p, 1.0))
+    for k in 0..<(usize)4:
+        let along_u = k % 2 == 0
+        let knots = ku if along_u else kv
+        let degree = du if along_u else dv
+        let side = &w.sides.items[k]
+        var params = Growing[f64]()
+        defer params.close()
+        try fit_parameters(knots, degree, 12, &params)
+        var fitter = try make_fitter(degree, knots, params.view(), 0)
+        defer fitter.close()
+        let low = knots[(usize)degree]
+        let high = knots[knots.length - (usize)degree - 1]
+        let back = k >= 2
+        var values = Growing[Weighted]()
+        defer values.close()
+        for t in params.view():
+            var s = (t - low) / (high - low)
+            if back: s = 1.0 - s
+            try values.push(weighted(w.local(side.curve.point_at(try side_param(w, k, s))), 1.0))
+        # The row's ends: its corners (net order: low end first).
+        let first_corner = corners[(k + 1) % 4] if back else corners[k]
+        let last_corner = corners[k] if back else corners[(k + 1) % 4]
+        var starts: Weighted[4] = [weighted(first_corner, 1.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+        var ends: Weighted[4] = [weighted(last_corner, 1.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+        var row = Growing[Weighted]()
+        defer row.close()
+        try fitter.fit(values.view(), &starts, &ends, &row)
+        let count = row.count
+        for at in 0..<count:
+            var key: usize = 0
+            if k == 0: key = at * nv
+            elif k == 1: key = (nu - 1) * nv + at
+            elif k == 2: key = at * nv + nv - 1
+            else: key = at
+            start.items[key] = row.items[at]
+            fixed.items[key] = true
+        # How far the row misses its side, span by span.
+        var row_curve = empty_spline(degree)
+        defer row_curve.close()
+        try row_curve.knots.assign(knots)
+        try row_curve.points.assign(row.view())
+        let marks = split_u if along_u else split_v
+        for span in (usize)degree..<knots.length - (usize)degree - 1:
+            let a = knots[span]
+            let b = knots[span + 1]
+            if not (b > a): continue
+            for q in 0..<(usize)8:
+                let t = a + (b - a) * ((f64)q + 0.5) / 8.0
+                var s = (t - low) / (high - low)
+                if back: s = 1.0 - s
+                let want = w.local(side.curve.point_at(try side_param(w, k, s)))
+                if row_curve.point_at(t).subtract(want).length() > w.position * 0.5: marks.items[span - (usize)degree] = true
+    return try fill_net(du, dv, ku, kv, fixed.view(), start.view())
+
+## The Greville abscissa of control point `i` of `knots` (degree `degree`).
+func fill_greville(knots: const f64[], degree: i64, i: usize) -> f64:
+    var sum = 0.0
+    for k in 1..<(usize)degree + 1: sum += knots[i + k]
+    return sum / (f64)degree

@@ -1,0 +1,385 @@
+## Fill's measures and refinement (surfacing Stage 7; fill.lucb has the
+## plan): each station measured as Stage 0 measures an edge, the spans
+## halved while one fails, the result with its measures and conflicts, and
+## the boundaries laid on the fill for the trim.
+
+# -- Measuring.
+
+## Station `st` measured on `fn`: the gap (normalized), the angle between
+## normals (radians) and the normal curvatures' difference across
+## (percent), each zero where the station does not hold that order.
+func fill_measure(fn: const FillNet*, st: const FillStation*) -> (f64, f64, f64):
+    let j = net_jet(fn, st.uv)
+    let gap = j[0].subtract(st.p).length()
+    if st.order < 1 or not st.has_face: return (gap, 0.0, 0.0)
+    let normal = j[1].cross(j[2])
+    let nf = normal.normalized() catch failure: return (gap, math.pi * 0.5, 100.0)
+    let n = st.form.n
+    let angle = math.acos(math.clamp(math.abs(nf.dot(n)), -1.0, 1.0))
+    if st.order < 2: return (gap, angle, 0.0)
+    let sd = j[1].multiply_scalar(st.d.x).add(j[2].multiply_scalar(st.d.y))
+    let sdd = j[3].multiply_scalar(st.d.x * st.d.x).add(j[4].multiply_scalar(2.0 * st.d.x * st.d.y)).add(j[5].multiply_scalar(st.d.y * st.d.y))
+    let speed = sd.dot(sd)
+    if not (speed > 0.0): return (gap, angle, 100.0)
+    let oriented = nf if nf.dot(n) >= 0.0 else nf.multiply_scalar(-1.0)
+    let mine = oriented.dot(sdd) / speed
+    let flat = sd.subtract(n.multiply_scalar(sd.dot(n)))
+    let theirs = st.form.curvature_of(flat) / math.max(1e-300, flat.dot(flat))
+    return (gap, angle, fill_relative(mine, theirs))
+
+## Whether station `st` fails a tolerance on `fn` (eased ones do not
+## count: their corner is a conflict already).
+func station_fails(w: const FillWork*, fn: const FillNet*, st: const FillStation*) -> bool:
+    let (gap, angle, curvature) = fill_measure(fn, st)
+    if gap > w.position: return true
+    if st.weight < 1.0: return false
+    return angle > w.angle or curvature > w.curvature
+
+## The spans of `knots` (degree `degree`) holding `t`: its index among
+## the spans.
+func span_index(knots: const f64[], degree: i64, t: f64) -> usize:
+    let count = knots.length - (usize)degree - 1
+    let span = find_span(knots, count, degree, t)
+    return span - (usize)degree
+
+## `knots` with every marked span halved (degree `degree`), onto `out`;
+## whether any was.
+func halved(knots: const f64[], degree: i64, marks: const bool[], out: Growing[f64]*) -> bool!:
+    out.clear()
+    var any = false
+    let p = (usize)degree
+    for at in 0..<knots.length:
+        try out.push(knots[at])
+        if at >= p and at < knots.length - p - 1:
+            let span = at - p
+            if span < marks.length and marks[span] and knots[at + 1] > knots[at]:
+                try out.push((knots[at] + knots[at + 1]) * 0.5)
+                any = true
+    return any
+
+## The distinct spans of `knots`.
+func spans_of(knots: const f64[], degree: i64) -> usize:
+    var count: usize = 0
+    for at in (usize)degree..<knots.length - (usize)degree - 1:
+        if knots[at + 1] > knots[at]: count += 1
+    return count
+
+# -- The fill.
+
+## The fill of `w` (its sides walked, options set): the net, refined until
+## its stations pass or the spans reach the limit, and its measures.
+func fill_made(w: FillWork*) -> FillMade!:
+    try set_frame(w)
+    if w.opts.quad and w.sides.count != 4: error(invalid, "Fill: Quad takes four boundaries (a loop of four meeting end to end)")
+    try find_corners(w)
+    let du = w.opts.degree_u if w.opts.explicit else 5
+    let dv = w.opts.degree_v if w.opts.explicit else 5
+    if du < 2 or du > 9 or dv < 2 or dv > 9: error(invalid, "Fill: Explicit Control's degrees are 2 to 9")
+    let most = (usize)math.clamp((f64)w.opts.most_spans, 1.0, 64.0)
+    # The domain: Quad the sides' mean lengths; N-sided the chart box of
+    # the loop with a margin of a tenth.
+    var low = Vector3()
+    var high = Vector3()
+    if w.opts.quad:
+        let lu = (w.sides.items[0].length + w.sides.items[2].length) * 0.5 / w.scale
+        let lv = (w.sides.items[1].length + w.sides.items[3].length) * 0.5 / w.scale
+        high = Vector3(lu, lv, 0.0)
+    else:
+        low = Vector3(1.0e300, 1.0e300, 0.0)
+        high = Vector3(-1.0e300, -1.0e300, 0.0)
+        for s in w.sides.view():
+            for q in 0..<(usize)256:
+                let c = w.chart(w.local(s.curve.point_at((f64)q / 256.0)))
+                low = Vector3(math.min(low.x, c.x), math.min(low.y, c.y), 0.0)
+                high = Vector3(math.max(high.x, c.x), math.max(high.y, c.y), 0.0)
+        let margin = math.max(high.x - low.x, high.y - low.y) * 0.1
+        low = low.subtract(Vector3(margin, margin, 0.0))
+        high = high.add(Vector3(margin, margin, 0.0))
+    # The first spans: Explicit Control's, else four along the longer side
+    # and as many the other way as keep the spans near square.
+    var su = (usize)math.max(1.0, (f64)w.opts.spans_u)
+    var sv = (usize)math.max(1.0, (f64)w.opts.spans_v)
+    if not w.opts.explicit:
+        let wide = math.max(high.x - low.x, high.y - low.y)
+        su = (usize)math.max(2.0, math.round(4.0 * (high.x - low.x) / wide))
+        sv = (usize)math.max(2.0, math.round(4.0 * (high.y - low.y) / wide))
+    var ku = Growing[f64]()
+    defer ku.close()
+    var kv = Growing[f64]()
+    defer kv.close()
+    try uniform_knots(du, su, low.x, high.x, &ku)
+    try uniform_knots(dv, sv, low.y, high.y, &kv)
+    var stations = Growing[FillStation]()
+    defer stations.close()
+    var checks = Growing[FillStation]()
+    defer checks.close()
+    var guides = Growing[GuidePoint]()
+    defer guides.close()
+    var passes: i64 = 0
+    while true:
+        checks.clear()
+        var split_u = Growing[bool]()
+        defer split_u.close()
+        var split_v = Growing[bool]()
+        defer split_v.close()
+        try split_u.fill(ku.count, false)
+        try split_v.fill(kv.count, false)
+        var fn = FillNet(empty_net(), Growing[i64](), 0, 0, Growing[Weighted](), Growing[Weighted]())
+        defer fn.close()
+        if w.opts.quad:
+            fn = try quad_net(w, du, dv, ku.view(), kv.view(), &split_u, &split_v)
+            try quad_stations(w, &fn.net, &stations)
+        else:
+            # The base: the chart's plane itself (ex u + ey v), exact on
+            # the net at the bases' Greville points.
+            var none_fixed = Growing[bool]()
+            defer none_fixed.close()
+            var start = Growing[Weighted]()
+            defer start.close()
+            let nu = ku.count - (usize)du - 1
+            let nv = kv.count - (usize)dv - 1
+            for i in 0..<nu:
+                for j in 0..<nv:
+                    try start.push(weighted(w.ex.multiply_scalar(fill_greville(ku.view(), du, i)).add(w.ey.multiply_scalar(fill_greville(kv.view(), dv, j))), 1.0))
+            fn = try fill_net(du, dv, ku.view(), kv.view(), none_fixed.view(), start.view())
+            # Four stations a span crossed, at the finer spans' width.
+            let width = math.min((high.x - low.x) / (f64)spans_of(ku.view(), du), (high.y - low.y) / (f64)spans_of(kv.view(), dv))
+            try nsided_stations(w, 4.0 / width, &stations)
+        for at in 0..<stations.count: stations.items[at].weight = corner_ease(w, &stations.items[at])
+        if not w.opts.quad: _ = try fit_reference(w, &fn, stations.view())
+        let width = math.min((high.x - low.x) / (f64)spans_of(ku.view(), du), (high.y - low.y) / (f64)spans_of(kv.view(), dv))
+        try guide_points(w, 4.0 / width, &guides)
+        if w.opts.quad and guides.count > 0:
+            # The guides' chart points: the nearest of an answer without them.
+            var none_guides: GuidePoint[1] = [GuidePoint(Vector3(), Vector3(), Vector3())]
+            passes += try solve_fill(w, &fn, stations.view(), none_guides[..<0])
+            for at in 0..<guides.count: guides.items[at].uv = net_nearest(&fn, guides.items[at].p)
+        passes += try solve_fill(w, &fn, stations.view(), guides.view())
+        # The measures between the stations (N-sided: twice as dense).
+        if w.opts.quad:
+            for at in 0..<stations.count: try checks.push(stations.items[at])
+        else:
+            try nsided_stations(w, 8.0 / width, &checks)
+            for at in 0..<checks.count: checks.items[at].weight = corner_ease(w, &checks.items[at])
+        var failing = false
+        for at in 0..<checks.count:
+            let st = &checks.items[at]
+            if not station_fails(w, &fn, st): continue
+            failing = true
+            if w.opts.quad:
+                # Along the side, and the first span across from it.
+                let along_u = st.side % 2 == 0
+                let t = st.uv.x if along_u else st.uv.y
+                if along_u:
+                    split_u.items[span_index(ku.view(), du, t)] = true
+                    split_v.items[0 if st.side == 0 else spans_of(kv.view(), dv) - 1] = true
+                else:
+                    split_v.items[span_index(kv.view(), dv, t)] = true
+                    split_u.items[0 if st.side == 3 else spans_of(ku.view(), du) - 1] = true
+            else:
+                split_u.items[span_index(ku.view(), du, st.uv.x)] = true
+                split_v.items[span_index(kv.view(), dv, st.uv.y)] = true
+        for g in guides.view():
+            let miss = net_jet(&fn, g.uv)[0].subtract(g.p).length()
+            if miss > w.position:
+                failing = true
+                split_u.items[span_index(ku.view(), du, g.uv.x)] = true
+                split_v.items[span_index(kv.view(), dv, g.uv.y)] = true
+        var row_missed = false
+        for m in split_u.view(): row_missed = row_missed or m
+        for m in split_v.view(): row_missed = row_missed or m
+        let can_refine = w.opts.refine and not w.opts.explicit and (spans_of(ku.view(), du) < most or spans_of(kv.view(), dv) < most)
+        if (failing or row_missed) and can_refine:
+            # A direction with a marked span has every span halved (the net
+            # stays uniform: halving only the marked ones grades the spans,
+            # and graded nets met the boundaries worse, not better), within
+            # the limit each way.
+            var any_u = false
+            for m in split_u.view(): any_u = any_u or m
+            var any_v = false
+            for m in split_v.view(): any_v = any_v or m
+            for at in 0..<split_u.count: split_u.items[at] = any_u
+            for at in 0..<split_v.count: split_v.items[at] = any_v
+            var next_u = Growing[f64]()
+            defer next_u.close()
+            var next_v = Growing[f64]()
+            defer next_v.close()
+            var grew = false
+            if spans_of(ku.view(), du) < most: grew = try halved(ku.view(), du, split_u.view(), &next_u) or grew
+            if spans_of(kv.view(), dv) < most: grew = try halved(kv.view(), dv, split_v.view(), &next_v) or grew
+            if grew:
+                if next_u.count > 0: try ku.assign(next_u.view())
+                if next_v.count > 0: try kv.assign(next_v.view())
+                continue
+        var made = try fill_finished(w, &fn, checks.view(), guides.view(), passes)
+        errdefer made.close()
+        if not w.opts.quad:
+            try laid_sides(w, &fn, &made.cuts)
+            # A step of a hundredth of the chart box in from side 0's middle.
+            var middle = &stations.items[0]
+            for at in 0..<stations.count:
+                if stations.items[at].side == 0 and math.abs(stations.items[at].s - 0.5) < math.abs(middle.s - 0.5): middle = &stations.items[at]
+            let step = math.max(high.x - low.x, high.y - low.y) * 0.01
+            made.inside = w.world(net_jet(&fn, middle.uv.add(middle.d.multiply_scalar(step)))[0])
+        return made
+    error(invalid, "unreachable")
+
+## The fill's result from `fn`: the net in world units, its sense (the
+## neighbors' normals' side), each side's measures and the conflicts (the
+## corners', then runs of failing stations along each side, and guides
+## missed).
+func fill_finished(w: const FillWork*, fn: const FillNet*, checks: const FillStation[], guides: const GuidePoint[], passes: i64) -> FillMade!:
+    var net = try fn.net.copy()
+    errdefer net.close()
+    for at in 0..<net.points.count: net.points.items[at] = weighted(w.world(net.points.items[at].point()), 1.0)
+    # On 0..1 both ways, as the B-rep's faces are (the same surface).
+    let (u0, u1, v0, v1) = (net.u_low(), net.u_high(), net.v_low(), net.v_high())
+    for at in 0..<net.ku.count: net.ku.items[at] = (net.ku.items[at] - u0) / (u1 - u0)
+    for at in 0..<net.kv.count: net.kv.items[at] = (net.kv.items[at] - v0) / (v1 - v0)
+    var made = FillMade(net, true, Growing[FillConflict](), Growing[f64](), Growing[f64](), Growing[f64](), 0.0, passes, Growing[Spline](), Vector3())
+    errdefer made.close()
+    let count = w.sides.count
+    try made.gaps.fill(count, 0.0)
+    try made.angles.fill(count, 0.0)
+    try made.curvatures.fill(count, 0.0)
+    try made.conflicts.assign(w.corners.view())
+    var lean = 0.0
+    # Runs of failures per side and order.
+    var run_order: i64 = -1
+    var run_side: usize = 0
+    var run_from = Vector3()
+    var run_to = Vector3()
+    var run_worst = 0.0
+    for at in 0..<checks.length + 1:
+        var order: i64 = -1
+        var amount = 0.0
+        var here = Vector3()
+        var side: usize = 0
+        if at < checks.length:
+            let st = &checks[at]
+            side = st.side
+            let picked = w.sides.items[st.side].picked
+            here = w.world(st.p)
+            let (gap, angle, curvature) = fill_measure(fn, st)
+            made.gaps.items[picked] = math.max(made.gaps.items[picked], gap * w.scale)
+            made.angles.items[picked] = math.max(made.angles.items[picked], angle * 180.0 / math.pi)
+            made.curvatures.items[picked] = math.max(made.curvatures.items[picked], curvature)
+            if st.has_face and st.order >= 1:
+                let j = net_jet(fn, st.uv)
+                lean += j[1].cross(j[2]).dot(st.form.n)
+            if gap > w.position:
+                order = 0
+                amount = gap * w.scale
+            elif st.weight >= 1.0 and angle > w.angle:
+                order = 1
+                amount = angle * 180.0 / math.pi
+            elif st.weight >= 1.0 and curvature > w.curvature:
+                order = 2
+                amount = curvature
+        if run_order >= 0 and (order != run_order or side != run_side or at == checks.length):
+            try made.conflicts.push(FillConflict((i64)w.sides.items[run_side].picked, run_order, run_from, run_to, run_worst, false))
+            run_order = -1
+        if order >= 0:
+            if run_order < 0:
+                run_order = order
+                run_side = side
+                run_from = here
+                run_worst = 0.0
+            run_to = here
+            run_worst = math.max(run_worst, amount)
+    # The true gaps: each side against its nearest points of the net, ends
+    # included (the trim lays the curves on it within the worst).
+    for k in 0..<w.sides.count:
+        let side = &w.sides.items[k]
+        for q in 0..<(usize)129:
+            let s = (f64)q / 128.0
+            let p = w.local(side.curve.point_at(try side_param(w, k, s)))
+            var seed = w.chart(p)
+            if w.opts.quad:
+                let (uv, _) = quad_place(&fn.net, k, s)
+                seed = uv
+            let foot = net_foot(fn, p, seed)
+            let gap = net_jet(fn, foot)[0].subtract(p).length() * w.scale
+            made.gaps.items[side.picked] = math.max(made.gaps.items[side.picked], gap)
+    for g in guides:
+        let miss = net_jet(fn, g.uv)[0].subtract(g.p).length()
+        made.guide_miss = math.max(made.guide_miss, miss * w.scale)
+        if miss > w.position:
+            let p = w.world(g.p)
+            try made.conflicts.push(FillConflict(-1, 0, p, p, miss * w.scale, false))
+    # Facing the neighbors (else the plane's normal, Newell's way).
+    if lean != 0.0: made.sense = lean > 0.0
+    else:
+        let j = net_jet(fn, Vector3((fn.net.u_low() + fn.net.u_high()) * 0.5, (fn.net.v_low() + fn.net.v_high()) * 0.5, 0.0))
+        made.sense = j[1].cross(j[2]).dot(w.ez) >= 0.0
+    return made
+
+# -- The trim's curves.
+
+## Each side laid on `fn`'s surface onto `out` (world units): the feet of
+## the side's points on the net, by the side's own parameter (the curve and
+## the side run alike, so Stitch meets their middles), fitted at degree 5
+## with a knot of multiplicity four at each of the side's inner knots (a
+## rational circle's quarters join only C1 in their parameter) and uniform
+## spans between, doubled until the fit lies within a billionth of the loop
+## of the feet; its ends at each corner's foot (the mean of the two sides'
+## there, so the curves meet exactly and close the regions they cut).
+func laid_sides(w: const FillWork*, fn: const FillNet*, out: Growing[Spline]*) -> !:
+    let n = w.sides.count
+    var corners = Growing[Vector3]()
+    defer corners.close()
+    for k in 0..<n:
+        let before = &w.sides.items[(k + n - 1) % n]
+        let a = w.local(w.sides.items[k].curve.point_at(0.0))
+        let b = w.local(before.curve.point_at(1.0))
+        let fa = net_jet(fn, net_foot(fn, a, w.chart(a)))[0]
+        let fb = net_jet(fn, net_foot(fn, b, w.chart(b)))[0]
+        try corners.push(fa.add(fb).multiply_scalar(0.5))
+    for k in 0..<n:
+        let side = &w.sides.items[k]
+        var breaks = Growing[f64]()
+        defer breaks.close()
+        try distinct_inner(&side.curve, 1e-12, &breaks)
+        var per: usize = 1
+        while true:
+            # Uniform spans between the side's own breaks.
+            var knots = Growing[f64]()
+            defer knots.close()
+            for _ in 0..<(usize)6: try knots.push(0.0)
+            var low = 0.0
+            for at in 0..<breaks.count + 1:
+                let high = breaks.items[at] if at < breaks.count else 1.0
+                for q in 1..<per: try knots.push(low + (high - low) * (f64)q / (f64)per)
+                if at < breaks.count:
+                    for _ in 0..<(usize)4: try knots.push(high)
+                low = high
+            for _ in 0..<(usize)6: try knots.push(1.0)
+            var params = Growing[f64]()
+            defer params.close()
+            try fit_parameters(knots.view(), 5, 8, &params)
+            var fitter = try make_fitter(5, knots.view(), params.view(), 0)
+            defer fitter.close()
+            var values = Growing[Weighted]()
+            defer values.close()
+            for t in params.view():
+                let p = w.local(side.curve.point_at(t))
+                try values.push(weighted(net_jet(fn, net_foot(fn, p, w.chart(p)))[0], 1.0))
+            var starts: Weighted[4] = [weighted(corners.items[k], 1.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+            var ends: Weighted[4] = [weighted(corners.items[(k + 1) % n], 1.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
+            var made = empty_spline(5)
+            errdefer made.close()
+            try made.knots.assign(knots.view())
+            try fitter.fit(values.view(), &starts, &ends, &made.points)
+            # Between the fit's parameters, against the feet.
+            var worst = 0.0
+            for at in 0..<params.count - 1:
+                let t = (params.items[at] + params.items[at + 1]) * 0.5
+                let p = w.local(side.curve.point_at(t))
+                let foot = net_jet(fn, net_foot(fn, p, w.chart(p)))[0]
+                worst = math.max(worst, made.point_at(t).subtract(foot).length())
+            if worst <= 1e-9 or per >= 128:
+                for at in 0..<made.points.count: made.points.items[at] = weighted(w.world(made.points.items[at].point()), 1.0)
+                try out.push(made)
+                break
+            made.close()
+            per *= 2

@@ -1,0 +1,177 @@
+## The normal equations of a fill (surfacing Stage 7; fill.lucb has the
+## plan): a symmetric positive definite matrix over the free control
+## points' coordinates, kept as a band below its diagonal, with its
+## right-hand side, and the constraint rows that build it.
+##
+## The unknowns are ordered u-major (control point (i, j) before (i, j + 1),
+## its x, y and z together), so every pair of control points whose bases
+## overlap (the energy) or meet at one station (a constraint) lies within
+## half-bandwidth 3 (du nv + dv) + 2. Cholesky on that band costs n h²
+## (n unknowns, h the half-bandwidth) instead of n³: a 32 by 32 span
+## quintic net, four thousand unknowns, factors in about a second. The
+## matrix is factored once for a net and solved for as many right-hand
+## sides as the G2 passes ask, each answer refined by its residual against the
+## matrix kept unfactored (weights of a million make the equations stiff).
+
+## A symmetric positive definite band system: (i, i - d) at
+## band[i * (half + 1) + d], d to `half`; `kept` the matrix before
+## factoring.
+struct BandSystem:
+    var size: usize
+    var half: usize
+    var band: Growing[f64]
+    var kept: Growing[f64]
+    var rhs: Growing[f64]
+
+    func close():
+        self.band.close()
+        self.kept.close()
+        self.rhs.close()
+
+    ## Adds `value` to entries (i, j) and (j, i) (once on the diagonal).
+    func add(i: usize, j: usize, value: f64):
+        if i >= j: self.band.items[i * (self.half + 1) + i - j] += value
+        else: self.band.items[j * (self.half + 1) + j - i] += value
+
+    ## The mean of the diagonal (the scale constraint weights follow).
+    func diagonal_mean() -> f64:
+        if self.size == 0: return 1.0
+        var sum = 0.0
+        for i in 0..<self.size: sum += self.band.items[i * (self.half + 1)]
+        return sum / (f64)self.size
+
+    ## Factors the band in place (L Lᵀ), the matrix kept for refinement;
+    ## a tiny ridge keeps an energy's affine null space from a zero pivot
+    ## where constraints leave it loose.
+    func factor() -> !:
+        let n = self.size
+        let w = self.half + 1
+        let ridge = 1e-13 * self.diagonal_mean()
+        for i in 0..<n: self.band.items[i * w] += ridge
+        try self.kept.assign(self.band.view())
+        for j in 0..<n:
+            let low_j = j - fewer(j, self.half)
+            var d = self.band.items[j * w]
+            for k in low_j..<j:
+                let l = self.band.items[j * w + j - k]
+                d -= l * l
+            if not (d > 0.0): error(invalid, "Fill: the patch's equations have no single answer (the boundaries hold too little of it)")
+            let diagonal = math.sqrt(d)
+            self.band.items[j * w] = diagonal
+            for i in j + 1..<fewer(n, j + w):
+                let low_i = i - fewer(i, self.half)
+                var s = self.band.items[i * w + i - j]
+                var k = low_i if low_i > low_j else low_j
+                while k < j:
+                    s -= self.band.items[i * w + i - k] * self.band.items[j * w + j - k]
+                    k += 1
+                self.band.items[i * w + i - j] = s / diagonal
+
+    ## Solves L Lᵀ x = b in place (`b` becomes x).
+    func substitute(b: f64[]):
+        let n = self.size
+        let w = self.half + 1
+        for i in 0..<n:
+            var s = b[i]
+            for k in i - fewer(i, self.half)..<i: s -= self.band.items[i * w + i - k] * b[k]
+            b[i] = s / self.band.items[i * w]
+        var i = n
+        while i > 0:
+            i -= 1
+            var s = b[i]
+            for k in i + 1..<fewer(n, i + w): s -= self.band.items[k * w + k - i] * b[k]
+            b[i] = s / self.band.items[i * w]
+
+    ## The answer for the right-hand side `self.rhs` onto `out`, refined
+    ## three times by its residual against the kept matrix.
+    func solve(out: Growing[f64]*) -> !:
+        let n = self.size
+        let w = self.half + 1
+        try out.assign(self.rhs.view())
+        self.substitute(out.items[..<n])
+        var residual = Growing[f64]()
+        defer residual.close()
+        for _ in 0..<3:
+            try residual.assign(self.rhs.view())
+            for i in 0..<n:
+                for k in i - fewer(i, self.half)..<i + 1:
+                    let a = self.kept.items[i * w + i - k]
+                    residual.items[i] -= a * out.items[k]
+                    if k != i: residual.items[k] -= a * out.items[i]
+            self.substitute(residual.items[..<n])
+            for i in 0..<n: out.items[i] += residual.items[i]
+
+## A band system of `size` unknowns and half-bandwidth `half`, zero.
+func band_system(size: usize, half: usize) -> BandSystem!:
+    var s = BandSystem(size, half, Growing[f64](), Growing[f64](), Growing[f64]())
+    errdefer s.close()
+    try s.band.fill(size * (half + 1), 0.0)
+    try s.rhs.fill(size, 0.0)
+    return s
+
+## One constraint row, built a term at a time: a combination of control
+## point coordinates (the free ones by unknown, the fixed ones folded into
+## `constant`) that should equal a target.
+struct FillRow:
+    var index: Growing[usize]
+    var value: Growing[f64]
+    var constant: f64
+    ## Each unknown's place in `index` (-1 none), so a term met twice adds.
+    var place: Growing[i64]
+
+    func close():
+        self.index.close()
+        self.value.close()
+        self.place.close()
+
+    ## Unknown `at` times `coefficient`.
+    func term(at: usize, coefficient: f64) -> !:
+        if coefficient == 0.0: return
+        let k = self.place.items[at]
+        if k >= 0:
+            self.value.items[(usize)k] += coefficient
+            return
+        self.place.items[at] = (i64)self.index.count
+        try self.index.push(at)
+        try self.value.push(coefficient)
+
+    ## The row's coefficients' length (zero: the row holds nothing free).
+    func norm() -> f64:
+        var sum = 0.0
+        for v in self.value.view(): sum += v * v
+        return math.sqrt(sum)
+
+    ## The row into `system` as w (a·x + constant - target)², normalized to
+    ## a unit row, then cleared.
+    func commit(system: BandSystem*, target: f64, weight: f64):
+        let length = self.norm()
+        if length > 0.0:
+            let w = weight / (length * length)
+            let goal = target - self.constant
+            for p in 0..<self.index.count:
+                let ip = self.index.items[p]
+                let ap = self.value.items[p] * w
+                system.rhs.items[ip] += ap * goal
+                for q in 0..<self.index.count:
+                    let iq = self.index.items[q]
+                    if iq <= ip: system.add(ip, iq, ap * self.value.items[q])
+        self.clear()
+
+    ## The row's value at unknowns `x` (with its constant).
+    func evaluate(x: const f64[]) -> f64:
+        var sum = self.constant
+        for p in 0..<self.index.count: sum += self.value.items[p] * x[self.index.items[p]]
+        return sum
+
+    func clear():
+        for at in self.index.view(): self.place.items[at] = -1
+        self.index.clear()
+        self.value.clear()
+        self.constant = 0.0
+
+## An empty row over `size` unknowns.
+func fill_row(size: usize) -> FillRow!:
+    var row = FillRow(Growing[usize](), Growing[f64](), 0.0, Growing[i64]())
+    errdefer row.close()
+    try row.place.fill(size, -1)
+    return row

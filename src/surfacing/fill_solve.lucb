@@ -1,0 +1,154 @@
+## Fill's solve (surfacing Stage 7; fill.lucb has the plan): each
+## station's rows and the guides', the energy and rows factored once and
+## solved again with the multipliers' shifts, and G2's Gauss-Newton rounds.
+
+# -- The solve.
+
+## The rows of station `st`: G0 (N-sided: Quad's boundary rows are
+## fixed), G1, and with `cross` (the last answer's cross derivative there)
+## G2 linearized about it; the flow. Into `system` and kept in `held`.
+func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, held: HeldRows*, row: FillRow*, st: const FillStation*, cross: Vector3?, weight: f64) -> !:
+    let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+    if not w.opts.quad:
+        # G0 (Free too: the boundary's position holds the trim).
+        for c in 0..<(usize)3:
+            try put_derivative(fn, row, st.uv, st.d, 0, axes[c])
+            try held.hold(system, row, weight, st.p.dot(axes[c]), true)
+    let ease = st.weight
+    let exact = ease >= 1.0
+    if st.order >= 1 and st.has_face and ease > 0.0:
+        try put_derivative(fn, row, st.uv, st.d, 1, st.form.n)
+        try held.hold(system, row, weight * ease, 0.0, exact)
+    if st.order >= 2 and st.has_face and ease > 0.0:
+        if let l = cross:
+            # n . S_dd = II(S_d, S_d), linearized about the last answer's
+            # S_d = l (Gauss-Newton): II(S_d, S_d) ~ 2 II(l, S_d) - II(l, l).
+            try put_derivative(fn, row, st.uv, st.d, 2, st.form.n)
+            try put_derivative(fn, row, st.uv, st.d, 1, st.form.times(l).multiply_scalar(-2.0))
+            try held.hold(system, row, weight * ease, -st.form.curvature_of(l), exact)
+    if w.opts.quad and w.opts.flow != fill_flow_natural:
+        # The cross derivative's part square to the wanted way vanishes:
+        # Normal along the tangent; Next and Adjacent across the way. A
+        # preference, not a constraint: a hundredth of the weight, no
+        # multipliers.
+        var e = Vector3()
+        if w.opts.flow == fill_flow_normal: e = st.tangent
+        elif st.flow.length() > 0.0:
+            let n = st.form.n if st.has_face else st.tangent.cross(st.flow)
+            e = n.cross(st.flow).normalized() catch failure: recover Vector3()
+        if e.length() > 0.0:
+            try put_derivative(fn, row, st.uv, st.d, 1, e)
+            try held.hold(system, row, weight * 1e-2, 0.0, false)
+
+## A guide point: where (normalized), its chart point, and the guide
+## face's normal for G1 (zero none).
+struct GuidePoint:
+    var p: Vector3
+    var uv: Vector3
+    var n: Vector3
+
+## The guides' points onto `out` (normalized; chart points N-sided by the
+## projection, Quad later by the nearest point of a first answer).
+func guide_points(w: FillWork*, per_length: f64, out: Growing[GuidePoint]*) -> !:
+    out.clear()
+    for m in w.guides.items[..<w.guides.count]:
+        if m.curve.points.count == 0: error(invalid, "Fill: a guide is a face; pick curves, edges, isoparms or points")
+        let length = size_of(&m.curve) / w.scale
+        let count = (usize)math.clamp(math.ceil(length * per_length), 8.0, 400.0)
+        for q in 0..<count + 1:
+            let t = m.curve.low() + (m.curve.high() - m.curve.low()) * (f64)q / (f64)count
+            let p = m.curve.point_at(t)
+            var n = Vector3()
+            if m.has_face and w.opts.guide_order >= 1:
+                var held = m
+                n = (try neighbor_at(&held, p, w.scale)).n
+            let local = w.local(p)
+            try out.push(GuidePoint(local, w.chart(local), n))
+    for p in w.points.view():
+        let local = w.local(p)
+        try out.push(GuidePoint(local, w.chart(local), Vector3()))
+
+## The answer for `stations` and `guides` on `fn` (its free control points
+## set). G0 and G1 are linear: one factored system, solved again with the
+## multipliers' shifts (HeldRows) until they settle. G2 asks the normal
+## part of S_dd to be II(S_d, S_d), quadratic in the answer: Gauss-Newton,
+## each solve's G2 rows linearized about the last answer's cross
+## derivatives (iterating the right side alone diverges: a larger S_d asks
+## a larger S_dd, which stretches S_d further; the linearized row weighs
+## that), until the cross derivatives settle. Returns the passes.
+func solve_fill(w: const FillWork*, fn: FillNet*, stations: const FillStation[], guides: const GuidePoint[]) -> i64!:
+    var any_g2 = false
+    for st in stations: any_g2 = any_g2 or (st.order >= 2 and st.has_face)
+    var crosses = Growing[Vector3?]()
+    defer crosses.close()
+    var passes = try solve_once(w, fn, stations, guides, crosses.view())
+    if not any_g2: return passes
+    for round in 0..<8:
+        crosses.clear()
+        var change = 0.0
+        for st in stations:
+            if st.order < 2 or not st.has_face:
+                try crosses.push(none)
+                continue
+            let j = net_jet(fn, st.uv)
+            try crosses.push(j[1].multiply_scalar(st.d.x).add(j[2].multiply_scalar(st.d.y)))
+        var before = Growing[Weighted]()
+        defer before.close()
+        try before.assign(fn.net.points.view())
+        passes += try solve_once(w, fn, stations, guides, crosses.view())
+        for k in 0..<before.count: change = math.max(change, fn.net.points.items[k].point().subtract(before.items[k].point()).length())
+        if change < 1e-10 or round == 7: break
+    return passes
+
+## One factored solve of `stations` and `guides` on `fn`, G2 rows where
+## `crosses` gives a station's cross derivative (empty: none), repeated
+## with the multipliers' shifts until they settle. Returns the passes.
+func solve_once(w: const FillWork*, fn: FillNet*, stations: const FillStation[], guides: const GuidePoint[], crosses: const (Vector3?)[]) -> i64!:
+    let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+    var system = try band_system(fn.count, fn.half)
+    defer system.close()
+    let tension = math.clamp(w.opts.tension, 0.0, 1.0)
+    let flat = math.clamp(w.opts.flatness, 0.0, 1.0)
+    # G2 asks a third-order energy (the rate of bending, Moreton and
+    # Séquin's minimum variation): with position, slope and curvature held
+    # it is the well-posed one, as bending is for position and slope.
+    var higher = false
+    for st in stations: higher = higher or (st.order >= 2 and st.has_face)
+    let bend = 1.0 - 0.99 * tension
+    try add_energy(&system, fn, bend * (0.01 if higher else 1.0), bend if higher else 0.0, tension * 10.0, flat * 100.0, w.ez)
+    var base = Growing[f64]()
+    defer base.close()
+    try base.assign(system.rhs.view())
+    let weight = 1e6 * system.diagonal_mean()
+    var row = try fill_row(fn.count)
+    defer row.close()
+    var held = held_rows()
+    defer held.close()
+    for at in 0..<stations.length:
+        let cross: Vector3? = crosses[at] if at < crosses.length else none
+        try station_rows(w, fn, &system, &held, &row, &stations[at], cross, weight)
+    for g in guides:
+        for c in 0..<(usize)3:
+            try put_derivative(fn, &row, g.uv, Vector3(), 0, axes[c])
+            try held.hold(&system, &row, weight, g.p.dot(axes[c]), true)
+        if g.n.length() > 0.0:
+            try put_derivative(fn, &row, g.uv, Vector3(1.0, 0.0, 0.0), 1, g.n)
+            try held.hold(&system, &row, weight, 0.0, true)
+            try put_derivative(fn, &row, g.uv, Vector3(0.0, 1.0, 0.0), 1, g.n)
+            try held.hold(&system, &row, weight, 0.0, true)
+    try system.factor()
+    var x = Growing[f64]()
+    defer x.close()
+    var passes: i64 = 0
+    var last = 1.0e300
+    while passes < 40:
+        try held.right_side(base.view(), &system.rhs)
+        try system.solve(&x)
+        take_answer(fn, x.view())
+        passes += 1
+        let worst = held.settle(x.view())
+        # Settled, or stalled at the rounding of the system.
+        if worst < 1e-10: break
+        if passes > 3 and worst > last * 0.7: break
+        last = worst
+    return passes

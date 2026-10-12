@@ -1,0 +1,364 @@
+## Fill's net and its solve (surfacing Stage 7; fill.lucb has the plan):
+## a polynomial B-spline net in the fill's normalized units (the loop's
+## middle at the origin, its size one), some control points fixed (a Quad
+## fill's boundary rows), the rest unknowns of the band system
+## (fill_bands.lucb); the bending and membrane energy and the flatness
+## pull as exact Gram matrices of the bases; the constraint rows of the
+## stations and guides; and the G2 passes.
+
+## A fill's net: the net (normalized units, weights 1), each control
+## point's first unknown (its x; y and z follow) or -1 when fixed, the
+## unknowns' count and the band's half-width, and the base the unknowns
+## are measured from.
+##
+## The unknowns are corrections to a base surface (the chart's own plane
+## N-sided, the corners' bilinear patch Quad), not the control points
+## themselves: the band's rounding is relative to what it solves for, so a
+## fill that is nearly its base (a planar loop's: exactly) comes out to the
+## last digits rather than to the system's condition times them.
+struct FillNet:
+    var net: Net
+    var unknown: Growing[i64]
+    var count: usize
+    var half: usize
+    var base: Growing[Weighted]
+    ## The reference surface's control points (fill_reference.lucb; empty:
+    ## none, the energy of S itself).
+    var reference: Growing[Weighted]
+
+    func close():
+        self.net.close()
+        self.unknown.close()
+        self.base.close()
+        self.reference.close()
+
+    ## The base surface's point at (u, v).
+    func base_at(u: f64, v: f64) -> Vector3:
+        var bu: f64[12]
+        var bv: f64[12]
+        let fu = nurbs_basis(self.net.ku.view(), (i64)self.net.nu, self.net.du, math.clamp(u, self.net.u_low(), self.net.u_high()), &bu)
+        let fv = nurbs_basis(self.net.kv.view(), (i64)self.net.nv, self.net.dv, math.clamp(v, self.net.v_low(), self.net.v_high()), &bv)
+        var sum = Vector3()
+        for i in 0..<(usize)self.net.du + 1:
+            for j in 0..<(usize)self.net.dv + 1: sum = sum.add(self.base.items[(fu + i) * self.net.nv + fv + j].point().multiply_scalar(bu[i] * bv[j]))
+        return sum
+
+    ## What the energy measures control point (i, j) from: its base less
+    ## the reference's (the base alone without one).
+    func energy_offset(i: usize, j: usize) -> Vector3:
+        let q = self.base_point(i, j)
+        if self.reference.count == 0: return q
+        return q.subtract(self.reference.items[i * self.net.nv + j].point())
+
+    ## Control point (i, j).
+    func point(i: usize, j: usize) -> Vector3:
+        return self.net.points.items[i * self.net.nv + j].point()
+
+    ## Control point (i, j) of the base (a fixed one's own).
+    func base_point(i: usize, j: usize) -> Vector3:
+        return self.base.items[i * self.net.nv + j].point()
+
+## A net of degrees `du`, `dv` on knots `ku`, `kv` with control points
+## `fixed` (true: held where `start` puts them; empty: all free), the rest
+## starting from `start` (their base), its unknowns numbered u-major.
+func fill_net(du: i64, dv: i64, ku: const f64[], kv: const f64[], fixed: const bool[], start: const Weighted[]) -> FillNet!:
+    var net = empty_net()
+    errdefer net.close()
+    net.du = du
+    net.dv = dv
+    net.nu = ku.length - (usize)du - 1
+    net.nv = kv.length - (usize)dv - 1
+    try net.ku.assign(ku)
+    try net.kv.assign(kv)
+    if start.length == net.nu * net.nv: try net.points.assign(start)
+    else: try net.points.fill(net.nu * net.nv, Weighted(0.0, 0.0, 0.0, 1.0))
+    var unknown = Growing[i64]()
+    errdefer unknown.close()
+    var count: usize = 0
+    for k in 0..<net.nu * net.nv:
+        if fixed.length > 0 and fixed[k]:
+            try unknown.push(-1)
+            continue
+        try unknown.push((i64)count)
+        count += 3
+    # The half-width: the furthest pair of unknowns whose bases overlap.
+    var half: usize = 2
+    for i in 0..<net.nu:
+        for j in 0..<net.nv:
+            let a = unknown.items[i * net.nv + j]
+            if a < 0: continue
+            for k in i..<fewer(net.nu, i + (usize)du + 1):
+                for l in 0..<net.nv:
+                    if (l + (usize)dv < j) or (l > j + (usize)dv): continue
+                    let b = unknown.items[k * net.nv + l]
+                    if b < 0: continue
+                    let gap = (usize)math.abs((f64)(b - a)) + 2
+                    if gap > half: half = gap
+    var base = Growing[Weighted]()
+    errdefer base.close()
+    try base.assign(net.points.view())
+    return FillNet(net, unknown, count, half, base, Growing[Weighted]())
+
+## The Gram matrix of `knots`' bases' derivatives of order `r` (0 to 3):
+## G[i k] = ∫ N_i^(r) N_k^(r), exact by eight Gauss points a span, onto
+## `out` (count by count).
+func gram(knots: const f64[], degree: i64, r: usize, out: Growing[f64]*) -> !:
+    let nodes: f64[8] = [0.019855071751231856, 0.10166676129318664, 0.2372337950418355, 0.4082826787521751, 0.5917173212478249, 0.7627662049581645, 0.8983332387068134, 0.9801449282487681]
+    let weights: f64[8] = [0.05061426814518813, 0.11119051722668724, 0.15685332293894364, 0.18134189168918100, 0.18134189168918100, 0.15685332293894364, 0.11119051722668724, 0.05061426814518813]
+    let p = (usize)degree
+    let count = knots.length - p - 1
+    out.clear()
+    try out.fill(count * count, 0.0)
+    var ders: f64[48]
+    for span in p..<count:
+        let a = knots[span]
+        let b = knots[span + 1]
+        if not (b > a): continue
+        for q in 0..<(usize)8:
+            let first = basis_jet(knots, (i64)count, degree, a + (b - a) * nodes[q], false, &ders)
+            let w = (b - a) * weights[q]
+            for x in 0..<p + 1:
+                for y in 0..<p + 1: out.items[(first + x) * count + first + y] += w * ders[r * 12 + x] * ders[r * 12 + y]
+
+## The energy into `system`: w_b ∫(|S_uu|² + 2|S_uv|² + |S_vv|²) +
+## w_t ∫(|S_uuu|² + 3|S_uuv|² + 3|S_uvv|² + |S_vvv|²) + w_s ∫(|S_u|² +
+## |S_v|²) + w_f ∫(n0 . S)² (bending, its rate, membrane, and flatness: the
+## pull toward the plane through the origin square to `plane`), each
+## coordinate alike but the flatness; the base's share and fixed control
+## points' on the right-hand side.
+func add_energy(system: BandSystem*, fn: const FillNet*, bending: f64, third: f64, membrane: f64, flatness: f64, plane: Vector3) -> !:
+    let net = &fn.net
+    var gu: Growing[f64][4] = [Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64]()]
+    var gv: Growing[f64][4] = [Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64]()]
+    defer gu[0].close()
+    defer gu[1].close()
+    defer gu[2].close()
+    defer gu[3].close()
+    defer gv[0].close()
+    defer gv[1].close()
+    defer gv[2].close()
+    defer gv[3].close()
+    for r in 0..<(usize)4:
+        try gram(net.ku.view(), net.du, r, &gu[r])
+        try gram(net.kv.view(), net.dv, r, &gv[r])
+    let nu = net.nu
+    let nv = net.nv
+    let du = (usize)net.du
+    let dv = (usize)net.dv
+    let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+    let n0: f64[3] = [plane.x, plane.y, plane.z]
+    for i in 0..<nu:
+        for j in 0..<nv:
+            let a = fn.unknown.items[i * nv + j]
+            if a < 0: continue
+            for k in i - fewer(i, du)..<fewer(nu, i + du + 1):
+                for l in j - fewer(j, dv)..<fewer(nv, j + dv + 1):
+                    let uu = gu[0].items[i * nu + k]
+                    let u1 = gu[1].items[i * nu + k]
+                    let u2 = gu[2].items[i * nu + k]
+                    let u3 = gu[3].items[i * nu + k]
+                    let vv = gv[0].items[j * nv + l]
+                    let v1 = gv[1].items[j * nv + l]
+                    let v2 = gv[2].items[j * nv + l]
+                    let v3 = gv[3].items[j * nv + l]
+                    # Bending and its rate measure S from the reference,
+                    # the membrane (Tension: tightening) and the flatness S
+                    # itself.
+                    var shape = bending * (u2 * vv + 2.0 * u1 * v1 + uu * v2)
+                    if third != 0.0: shape += third * (u3 * vv + 3.0 * u2 * v1 + 3.0 * u1 * v2 + uu * v3)
+                    let tight = membrane * (u1 * vv + uu * v1)
+                    let m = shape + tight
+                    let f = flatness * uu * vv
+                    # The base's share moves to the right (a fixed
+                    # neighbor's whole value), the reference's taken off
+                    # for the bending.
+                    let q = fn.energy_offset(k, l)
+                    let own = fn.base_point(k, l)
+                    let along = own.dot(plane)
+                    for c in 0..<(usize)3:
+                        system.rhs.items[(usize)a + c] -= shape * q.dot(axes[c]) + tight * own.dot(axes[c]) + f * n0[c] * along
+                    let b = fn.unknown.items[k * nv + l]
+                    if b < 0: continue
+                    for c in 0..<(usize)3:
+                        let row = (usize)a + c
+                        if (usize)b + c <= row: system.add(row, (usize)b + c, m)
+                        if f != 0.0:
+                            for e in 0..<(usize)3:
+                                if (usize)b + e <= row: system.add(row, (usize)b + e, f * n0[c] * n0[e])
+
+## The bases of `fn`'s net at chart point `uv` to the second derivative:
+## (first u, first v) and the values (k-th derivative at k * 12 + i).
+func bases_of(fn: const FillNet*, uv: Vector3, bu: f64[48]*, bv: f64[48]*) -> (usize, usize):
+    let net = &fn.net
+    let u = math.clamp(uv.x, net.u_low(), net.u_high())
+    let v = math.clamp(uv.y, net.v_low(), net.v_high())
+    let fu = basis_jet(net.ku.view(), (i64)net.nu, net.du, u, u >= net.u_high(), bu)
+    let fv = basis_jet(net.kv.view(), (i64)net.nv, net.dv, v, v >= net.v_high(), bv)
+    return (fu, fv)
+
+## Control point (i, j) times `k` dotted with `axis` into `row`: its base
+## into the constant, a free one's correction as unknowns.
+func fill_put(fn: const FillNet*, row: FillRow*, i: usize, j: usize, axis: Vector3, k: f64) -> !:
+    if k == 0.0: return
+    row.constant += k * fn.base_point(i, j).dot(axis)
+    let at = fn.unknown.items[i * fn.net.nv + j]
+    if at < 0: return
+    try row.term((usize)at, k * axis.x)
+    try row.term((usize)at + 1, k * axis.y)
+    try row.term((usize)at + 2, k * axis.z)
+
+## `row` as the derivative of S at `uv` along chart direction `d` of order
+## `order` (0 the point, 1 S_d, 2 S_dd) dotted with `axis`.
+func put_derivative(fn: const FillNet*, row: FillRow*, uv: Vector3, d: Vector3, order: usize, axis: Vector3) -> !:
+    var bu: f64[48]
+    var bv: f64[48]
+    let (fu, fv) = bases_of(fn, uv, &bu, &bv)
+    let du = (usize)fn.net.du
+    let dv = (usize)fn.net.dv
+    for a in 0..<du + 1:
+        for b in 0..<dv + 1:
+            var k = 0.0
+            if order == 0: k = bu[a] * bv[b]
+            elif order == 1: k = d.x * bu[12 + a] * bv[b] + d.y * bu[a] * bv[12 + b]
+            else: k = d.x * d.x * bu[24 + a] * bv[b] + 2.0 * d.x * d.y * bu[12 + a] * bv[12 + b] + d.y * d.y * bu[a] * bv[24 + b]
+            try fill_put(fn, row, fu + a, fv + b, axis, k)
+
+## The derivatives of `fn`'s net at `uv`: S, S_u, S_v, S_uu, S_uv, S_vv.
+func net_jet(fn: const FillNet*, uv: Vector3) -> Vector3[6]:
+    var bu: f64[48]
+    var bv: f64[48]
+    let (fu, fv) = bases_of(fn, uv, &bu, &bv)
+    var out: Vector3[6] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+    let pairs: usize[12] = [0, 0, 1, 0, 0, 1, 2, 0, 1, 1, 0, 2]
+    for a in 0..<(usize)fn.net.du + 1:
+        for b in 0..<(usize)fn.net.dv + 1:
+            let q = fn.point(fu + a, fv + b)
+            for k in 0..<(usize)6: out[k] = out[k].add(q.multiply_scalar(bu[pairs[2 * k] * 12 + a] * bv[pairs[2 * k + 1] * 12 + b]))
+    return out
+
+## The constraint rows of a solve, kept after their matrix share went into
+## the system: each row's unknowns and coefficients, its scale (weight over
+## its length squared), constant and target, the shift the multipliers have
+## added to its target, and whether the multipliers drive it to hold
+## exactly.
+##
+## Penalties alone trade the constraints' exactness for the system's
+## condition: a weight of ten million left a planar fill 2e-8 off its plane,
+## one of a hundred thousand 2e-10. So the weight stays at a hundred
+## thousand and the method of multipliers (Hestenes, Powell) takes the rest:
+## after each answer every exact row's target is shifted by its residual,
+## and the same factored system solved again, so the rows converge to hold
+## while the matrix never stiffens. Eased rows (a conflicting corner's) stay
+## plain penalties: a conflict has no answer to converge to.
+struct HeldRows:
+    var index: Growing[usize]
+    var value: Growing[f64]
+    var offsets: Growing[usize]
+    var scale: Growing[f64]
+    var constant: Growing[f64]
+    var target: Growing[f64]
+    var shift: Growing[f64]
+    var exact: Growing[bool]
+
+    func close():
+        self.index.close()
+        self.value.close()
+        self.offsets.close()
+        self.scale.close()
+        self.constant.close()
+        self.target.close()
+        self.shift.close()
+        self.exact.close()
+
+    ## `row` (to equal `target`, weighted `weight`) into `system`'s matrix
+    ## and kept. Cleared.
+    func hold(system: BandSystem*, row: FillRow*, weight: f64, target: f64, exact: bool) -> !:
+        let length = row.norm()
+        if not (length > 0.0):
+            row.clear()
+            return
+        let w = weight / (length * length)
+        for p in 0..<row.index.count:
+            let ip = row.index.items[p]
+            for q in 0..<row.index.count:
+                let iq = row.index.items[q]
+                if iq <= ip: system.add(ip, iq, w * row.value.items[p] * row.value.items[q])
+            try self.index.push(ip)
+            try self.value.push(row.value.items[p])
+        try self.offsets.push(self.index.count)
+        try self.scale.push(w)
+        try self.constant.push(row.constant)
+        try self.target.push(target)
+        try self.shift.push(0.0)
+        try self.exact.push(exact)
+        row.clear()
+
+    ## The right-hand side: `base` plus each row's share at its target and
+    ## shift.
+    func right_side(base: const f64[], out: Growing[f64]*) -> !:
+        try out.assign(base)
+        var start: usize = 0
+        for r in 0..<self.offsets.count:
+            let goal = (self.target.items[r] + self.shift.items[r] - self.constant.items[r]) * self.scale.items[r]
+            for k in start..<self.offsets.items[r]: out.items[self.index.items[k]] += self.value.items[k] * goal
+            start = self.offsets.items[r]
+
+    ## Each exact row's target shifted by its residual at `x` (the
+    ## multipliers' step); the largest residual of an exact row.
+    func settle(x: const f64[]) -> f64:
+        var worst = 0.0
+        var start: usize = 0
+        for r in 0..<self.offsets.count:
+            var sum = self.constant.items[r] - self.target.items[r]
+            for k in start..<self.offsets.items[r]: sum += self.value.items[k] * x[self.index.items[k]]
+            start = self.offsets.items[r]
+            if not self.exact.items[r]: continue
+            self.shift.items[r] -= sum
+            worst = math.max(worst, math.abs(sum))
+        return worst
+
+func held_rows() -> HeldRows:
+    return HeldRows(Growing[usize](), Growing[f64](), Growing[usize](), Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64](), Growing[bool]())
+
+## The corrections `x` added to the base of `fn`'s free control points.
+func take_answer(fn: FillNet*, x: const f64[]):
+    for k in 0..<fn.unknown.count:
+        let a = fn.unknown.items[k]
+        if a < 0: continue
+        let q = fn.base.items[k]
+        fn.net.points.items[k] = Weighted(q.x + x[(usize)a], q.y + x[(usize)a + 1], q.z + x[(usize)a + 2], 1.0)
+
+## The chart point of `fn`'s net nearest `p`: the best of a 24 by 24
+## sampling, then Newton (net_foot).
+func net_nearest(fn: const FillNet*, p: Vector3) -> Vector3:
+    let net = &fn.net
+    var best = Vector3(net.u_low(), net.v_low(), 0.0)
+    var best_distance = 1.0e300
+    for i in 0..<(usize)25:
+        for j in 0..<(usize)25:
+            let uv = Vector3(net.u_low() + (net.u_high() - net.u_low()) * (f64)i / 24.0, net.v_low() + (net.v_high() - net.v_low()) * (f64)j / 24.0, 0.0)
+            let d = net.point_at(uv.x, uv.y).subtract(p).length()
+            if d < best_distance:
+                best_distance = d
+                best = uv
+    return net_foot(fn, p, best)
+
+## The chart point of `fn`'s net nearest `p` from `seed`: Newton on the
+## squared distance, clamped to the domain.
+func net_foot(fn: const FillNet*, p: Vector3, seed: Vector3) -> Vector3:
+    let net = &fn.net
+    var uv = seed
+    for _ in 0..<30:
+        let j = net_jet(fn, uv)
+        let r = j[0].subtract(p)
+        let gu = r.dot(j[1])
+        let gv = r.dot(j[2])
+        let huu = j[1].dot(j[1]) + r.dot(j[3])
+        let huv = j[1].dot(j[2]) + r.dot(j[4])
+        let hvv = j[2].dot(j[2]) + r.dot(j[5])
+        let det = huu * hvv - huv * huv
+        if not (math.abs(det) > 1e-300): break
+        let step = Vector3((hvv * gu - huv * gv) / det, (huu * gv - huv * gu) / det, 0.0)
+        uv = Vector3(math.clamp(uv.x - step.x, net.u_low(), net.u_high()), math.clamp(uv.y - step.y, net.v_low(), net.v_high()), 0.0)
+        if step.length() < 1e-14: break
+    return uv
