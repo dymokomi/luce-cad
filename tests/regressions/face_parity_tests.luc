@@ -6,6 +6,7 @@
 from luce_cad.modeling import CadModeling, CadDirect
 from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
+from luce_cad.sketch import CadSketch
 from luce_geocore.geocore import Vector3
 from checks import manifold, volume
 from luce_std import math
@@ -52,7 +53,9 @@ pub func face_parity_tests() -> unit!:
     chains()
     copies()
     splits()
-    print("PASS direct modeling parity: a side's tangent chain over a rounded upright, a shell opened along it; faces copied as a surface body; a box's top split by a plane and by a pin's wall into pieces named apart, split again; a tool that misses or lies on the face refused")
+    deletes()
+    replaces()
+    print("PASS direct modeling parity: a box's top replaced by a taller box's split top (two faces, one plane) and by a tilted block's two under faces (a valley); a can's wall onto a wider one with its tangent chain; a box's rounded top chain deleted whole, two chamfers at once, an inside fillet and an outside chamfer of an L-bracket together, all healed back; a top and a bottom refused; a side's tangent chain over a rounded upright, a shell opened along it; faces copied as a surface body; a box's top split by a plane and by a pin's wall into pieces named apart, split again; a tool that misses or lies on the face refused")
 
 ## A 2-box with one upright (x = 1, z = 1) rounded 0.3: the +X side's
 ## tangent chain is it, the strip and the +Z side. Shell with Tangent chain
@@ -139,3 +142,101 @@ func splits() -> unit!:
     _ = CadDirect.split_faces_by_plane(box, top, Vector3(0.0, 1.0, 0.0), Vector3(0.0, 1.0, 0.0), "k") catch failure:
         lying = failure.message.contains("lies on")
     assert(lying)
+
+## Delete of several faces at once: a 2-box's four top edges rounded 0.3
+## (the strips and where they meet) deleted together heal back to the box;
+## two of its chamfered uprights (0.2) at once; an L-bracket's inside
+## fillet (material added) with a chamfered outside edge. A box's top and
+## bottom together have nothing to close them: refused.
+func deletes() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let tops = edges_where(box, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.y - 1.0) < 1e-9 and math.abs(b.y - 1.0) < 1e-9)
+    let rounded = CadModeling.filleted(box, tops, 0.3, "t")
+    let chain = named(rounded, "t/")
+    assert(chain.split(";").length >= 4)
+    let healed = CadDirect.deleted_faces(rounded, chain)
+    solid(healed, 8.0, 1e-5, "rounded top chain deleted")
+    assert(healed.face_count() == 6)
+    let uprights = edges_where(box, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.x - b.x) < 1e-9 and math.abs(a.z - b.z) < 1e-9 and math.abs(a.y - b.y) > 1.0)
+    let d = 0.2
+    let chamfered = CadModeling.chamfered(box, uprights, d, "c")
+    let strips = named(chamfered, "c/blend").split(";")
+    assert(strips.length == 4)
+    solid(CadDirect.deleted_faces(chamfered, f"{strips[0]};{strips[2]}"), 8.0 - 2.0 * d * d, 1e-5, "two chamfers deleted")
+    # An L-bracket (legs 2 thick, 10 by 8, 5 deep): its inside upright edge
+    # filleted 0.5, its outside corner at the origin chamfered 0.5.
+    let s = CadSketch.parse("")
+    let corners = [[0.0, 0.0], [10.0, 0.0], [10.0, 2.0], [2.0, 2.0], [2.0, 8.0], [0.0, 8.0]]
+    let points: list[int] = []
+    for c in corners:
+        points.append(s.add_point(c[0], c[1]))
+    for at in 0..<6:
+        _ = s.add_line(points[at], points[(at + 1) % 6])
+    let bracket = CadModeling.extruded(s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0)), 5.0, 0.0, "l")
+    let inner = edges_where(bracket, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.x - 2.0) < 1e-9 and math.abs(b.x - 2.0) < 1e-9 and math.abs(a.y - 2.0) < 1e-9 and math.abs(b.y - 2.0) < 1e-9)
+    let outer = edges_where(bracket, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.x) < 1e-9 and math.abs(b.x) < 1e-9 and math.abs(a.y) < 1e-9 and math.abs(b.y) < 1e-9)
+    let filleted = CadModeling.filleted(bracket, inner, 0.5, "fi")
+    let both = CadModeling.chamfered(filleted, CadModeling.edge_references(filleted, ids_where(filleted, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.x) < 1e-9 and math.abs(b.x) < 1e-9 and math.abs(a.y) < 1e-9 and math.abs(b.y) < 1e-9)), 0.5, "ch")
+    assert(outer != "")
+    let pair = f"{named(both, "fi/blend")};{named(both, "ch/blend")}"
+    solid(CadDirect.deleted_faces(both, pair), 160.0, 1e-5, "inside fillet and outside chamfer deleted")
+    var refused = false
+    _ = CadDirect.deleted_faces(box, f"{flat(box, Vector3(0.0, 1.0, 0.0))};{flat(box, Vector3(0.0, -1.0, 0.0))}") catch failure:
+        refused = failure.message.contains("cannot")
+    assert(refused)
+
+## The B-rep numbers of `model`'s edges whose ends both satisfy `keep`.
+func ids_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return found
+
+## Replace Face onto several targets: a 2-box's top onto both halves of a
+## taller box's split top (one plane: the local move), 3 high; onto the
+## two under faces of a 4-block turned 45° whose lowest edge is 0.5 over
+## the top (a valley: 1.5 + |x| over the middle), 12 in all; a can's wall
+## (and what meets it tangentially) onto a wider can's.
+func replaces() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let top = flat(box, Vector3(0.0, 1.0, 0.0))
+    let tall = CadModeling.tagged(CadSolids.box(2.0, 4.0, 2.0), "tall")
+    let tall_top = flat(tall, Vector3(0.0, 1.0, 0.0))
+    let halves = CadDirect.split_faces_by_plane(tall, tall_top, Vector3(), Vector3(1.0, 0.0, 0.0), "k")
+    solid(CadDirect.replaced_faces(box, top, halves, f"{tall_top};k/split[{tall_top}]"), 12.0, 1e-5, "top onto two coplanar faces")
+    let block = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0).transformed(Vector3(0.0, 1.5 + 2.0 * math.sqrt(2.0), 0.0), Vector3(0.0, 0.0, math.pi * 0.25), Vector3(1.0, 1.0, 1.0)), "block")
+    let under: list[str] = []
+    for f in 0..<block.face_count():
+        let name = CadModeling.face_name_of(block, f)
+        let frame = CadModeling.face_frame(block, name)
+        if frame.found and frame.u.cross(frame.v).y < -0.5:
+            under.append(name)
+    assert(under.length == 2)
+    let valley = CadDirect.replaced_faces(box, top, block, under.join(";"))
+    solid(valley, 12.0, 1e-4, "top onto a valley")
+    let can = CadModeling.tagged(CadSolids.cylinder(1.0, 2.0), "can")
+    let wide = CadModeling.tagged(CadSolids.cylinder(1.5, 4.0), "wide")
+    var wall = ""
+    var wide_wall = ""
+    for f in 0..<can.face_count():
+        if can.face_surface_kind(f) == 1:
+            wall = CadModeling.face_name_of(can, f)
+    for f in 0..<wide.face_count():
+        if wide.face_surface_kind(f) == 1:
+            wide_wall = CadModeling.face_name_of(wide, f)
+    solid(CadDirect.replaced_faces(can, wall, wide, wide_wall, chain = true), math.pi * 2.25 * 2.0, 0.02, "wall onto a wider one")
+    # A quilt the body would have to pass beside: a block too narrow.
+    let narrow = CadModeling.tagged(CadSolids.box(1.0, 1.0, 1.0).transformed(Vector3(0.0, 3.0, 0.0), Vector3(0.0, 0.0, math.pi * 0.25), Vector3(1.0, 1.0, 1.0)), "narrow")
+    let narrow_under: list[str] = []
+    for f in 0..<narrow.face_count():
+        let name = CadModeling.face_name_of(narrow, f)
+        let frame = CadModeling.face_frame(narrow, name)
+        if frame.found and frame.u.cross(frame.v).y < -0.5:
+            narrow_under.append(name)
+    var refused = false
+    _ = CadDirect.replaced_faces(box, top, narrow, narrow_under.join(";")) catch failure:
+        refused = failure.message.contains("reach")
+    assert(refused)

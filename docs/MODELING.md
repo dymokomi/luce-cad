@@ -51,8 +51,8 @@ takes them, several apart by `;`:
 |---|---|
 | `offset_faces(model, faces, distance, chain)` | Offset Face, Press Pull on a face: each face moved along its outward normal (a plane moved, a cylinder's, cone's, sphere's or torus's radius changed). With `chain` (the default) the faces meeting them tangentially move too. |
 | `moved_faces(model, faces, by)`, `rotated_faces(model, faces, origin, axis, angle)` | Move Face: translated, or turned about a line. |
-| `replaced_faces(model, faces, target, target_face)` | Replace Face: the faces on another face's surface instead. |
-| `deleted_faces(model, faces)` | Delete with healing: holes and bosses whole, or one fillet, chamfer or corner face. |
+| `replaced_faces(model, faces, target, target_faces, chain)` | Replace Face: the faces (with `chain`, their tangent chain too) on the target faces instead (names apart by `;`; empty: the whole target body). Targets on one surface move the faces onto it; targets on several surfaces, faces of a solid, trim or extend the body to them (`face_replace.lucb`). |
+| `deleted_faces(model, faces)` | Delete with healing: holes and bosses whole, one fillet, chamfer or corner face, or between flat faces any number of them at once (a rounded chain and its corners, strips apart). |
 | `split_faces(model, faces, tool, tool_face, tag)`, `split_faces_by_plane(model, faces, origin, normal, tag)` | Fusion's Split Face: the faces split where a face's surface (extended) or a plane crosses them; one closed solid with the new edges. The pieces on the surface's outer side (a plane's normal side, the side a tool face faces; outside a curved surface) are named `<tag>/split[<name>]`, the others keep the face's name, so each can be picked apart. |
 | `tangent_chain(model, faces)` | Fusion's Tangent chain: the faces and every face meeting them tangentially, and so on, by name. |
 | `copied_faces(model, faces, prefix)` | Move/Copy of faces with Create copy: an open surface body of copies of the faces, their names with `prefix` before them. |
@@ -696,9 +696,24 @@ body (a self-intersection), which needs the booleans' face pairs.
   whose surfaces cross into a proper edge is taken (parallel end faces never meet).
 - **A corner** (one face with three neighbors): the three surfaces' point.
 
-The edges running into the gap keep their carriers, lengthened to the new corners. Anything else is
-refused, saying what Delete heals. A box's top, say, has four parallel-sided neighbors that cannot
-close over it.
+The edges running into the gap keep their carriers, lengthened to the new corners.
+
+**Several faces at once** (`face_heal.lucb`), where the local healing above refuses (a chain of
+fillets and its corners, strips apart, a face with more than four neighbors), are closed by caps when
+every face around them is flat. Each deleted face's cap is the box round its boundary cut by every
+neighbor's half-space on the side the face lies: the space between the face and the sharp edge or
+corner the extended neighbors make. A face on every neighbor's material side (a round, a chamfer) has
+its cap joined to the body; one outside some (a fillet in an inside corner) has it taken away. The
+caps' faces on a neighbor's plane merge into it, and their own names are dropped. A deleted face left
+over, or a cap face standing on its own (a cap reaching past the body), is refused, as are curved
+faces round the gap. A box's top, say, has four parallel-sided neighbors that cannot close over it.
+
+**Replace Face onto several targets** (`face_replace.lucb`). Targets on one surface (coplanar faces,
+a split face's pieces) take the local operation. Targets on several surfaces must be faces of a solid:
+the replaced faces are pushed far past them (Offset Face), the target solid is taken away where it lies
+beyond them (its faces facing the body) or kept where it lies behind, and the piece holding no replaced
+face and most of the body's other faces is kept. A quilt that does not reach across the faces, or a
+target solid cutting into the body elsewhere, is refused.
 
 **Split Face** (`face_split.lucb`) runs the booleans' first steps: the surface, as the faces of
 its solid lying on it (a plane's large square, a curved surface's long wall), meets only the chosen
@@ -878,5 +893,6 @@ Roughly in order of usefulness:
    analytic surfaces are recognized as coincident.
 5. **Sweep and loft.**
 6. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
-7. **Shell of B-spline faces** and draft; Delete healing more than one strip or corner at a time (a chain of
-   fillets), and faces with more than four neighbors.
+7. **Shell of B-spline faces** and draft; Delete healing several faces at once where curved faces
+   border them (a top chain next to rounded uprights); Replace Face onto several surfaces of an open
+   surface body.

@@ -65,10 +65,15 @@ pub struct CadDirect:
         defer distances.close()
         return try substitute(&w, picked.view(), &m, targets.view(), senses.view(), distances.view())
 
-    ## `model` with faces `faces` on the surface of `target`'s face
-    ## `target_face` instead (Replace Face): the faces around extended or
-    ## trimmed to it. The surface's outside is the side the faces faced.
-    pub static func replaced_faces(model: interop.Reference[CadModel], faces: str, target: interop.Reference[CadModel], target_face: str) -> interop.Reference[CadModel]!:
+    ## Replace Face: `model` with faces `faces` on the surface of
+    ## `target`'s faces `target_faces` instead (names apart by `;`; empty:
+    ## every face of `target`, a whole surface body), the faces around
+    ## extended or trimmed to it. With `chain` (Fusion's Tangent chain) the
+    ## faces meeting the replaced ones tangentially are replaced too.
+    ## Targets on one surface move the faces onto it (the surface's outside
+    ## is the side the faces faced); targets on several surfaces, faces of a
+    ## solid, trim the body to them (face_replace.lucb).
+    pub static func replaced_faces(model: interop.Reference[CadModel], faces: str, target: interop.Reference[CadModel], target_faces: str, chain: bool = false) -> interop.Reference[CadModel]!:
         var w = try shape_of(model.value())
         defer w.close()
         var t = try shape_of(target.value())
@@ -76,9 +81,16 @@ pub struct CadDirect:
         var picked = Growing[usize]()
         defer picked.close()
         try faces_named(&w, faces, &picked)
+        if chain: try grow_tangent(&w, &picked)
         var found = Growing[usize]()
         defer found.close()
-        try faces_named(&t, target_face, &found)
+        if trimmed(target_faces) == "":
+            for f in 0..<t.faces.count: try found.push(f)
+            if found.count == 0: error(invalid, "the target body has no faces")
+        else:
+            try faces_named(&t, target_faces, &found)
+        if not (try on_one_surface(&t, found.view())):
+            return try replaced_by_quilt(model, &w, picked.view(), target, &t, found.view())
         let s = &t.surfaces.items[(usize)t.faces.items[found.items[0]].surface]
         if s.kind == surface_spline: error(invalid, "Replace Face takes a plane, cylinder, cone, sphere or torus face")
         var surfaces = Growing[Surface]()
@@ -92,8 +104,8 @@ pub struct CadDirect:
         for f in picked.view():
             try surfaces.push(try surface_copy(s))
             # Facing the way the face did, at its middle.
-            let middle = try face_middle(&w, f)
-            let outward = try w.face_normal(f, try nearest_on_surface(&w, f, middle))
+            let middle = try point_on_face(&w, f)
+            let outward = try w.face_normal(f, middle)
             let (_, n) = try signed_gap(s, middle, w.tolerance)
             try senses.push(n.dot(outward) > 0.0)
         let m = FaceMove(move_replace, Vector3(), Vector3(), Vector3(), 0.0, 0.0)
@@ -103,7 +115,9 @@ pub struct CadDirect:
 
     ## `model` without faces `faces`, healed (Fusion's Delete): holes and
     ## bosses whole, or one fillet, chamfer or corner face, the faces around
-    ## extended to close the gap. An error says when they cannot.
+    ## extended to close the gap; between flat faces, any number of fillet,
+    ## chamfer and corner faces at once (a rounded chain with its corners,
+    ## strips apart). An error says when they cannot.
     pub static func deleted_faces(model: interop.Reference[CadModel], faces: str) -> interop.Reference[CadModel]!:
         var w = try shape_of(model.value())
         defer w.close()
@@ -114,7 +128,13 @@ pub struct CadDirect:
         defer deleted.close()
         try deleted.fill(w.faces.count, false)
         for f in picked.view(): deleted.items[f] = true
-        return try healed(&w, deleted.view())
+        let local = healed(&w, deleted.view()) catch failure:
+            # Not holes or bosses whole, nor one strip or corner: caps
+            # between flat faces (face_heal.lucb), several at once.
+            let more = healed_by_caps(model, deleted.view()) catch second:
+                error(invalid, failure.message if picked.count == 1 else second.message)
+            return more
+        return local
 
     ## Fusion's Split Face: `model` with faces `faces` split where the
     ## surface of `tool`'s face `tool_face` (a plane, cylinder, cone,
@@ -237,6 +257,15 @@ func grow_tangent(w: const Shape*, faces: Growing[usize]*) -> !:
             taken.items[other] = true
             try faces.push(other)
             grew = true
+
+## A point of face `f`: its boundary's middle brought onto its surface,
+## or, where that has no nearest point (a whole cylinder's wall, whose
+## middle is on its axis), the middle of its first edge.
+pub func point_on_face(w: const Shape*, f: usize) -> Vector3!:
+    let on = nearest_on_surface(w, f, try face_middle(w, f)) catch failure:
+        _ = failure
+        return try w.edge_at(edge_index(w.face_uses(f)[0]), 0.5)
+    return on
 
 ## The point of face `f`'s surface nearest `p`.
 pub func nearest_on_surface(w: const Shape*, f: usize, p: Vector3) -> Vector3!:

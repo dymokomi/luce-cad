@@ -1,0 +1,103 @@
+## Replace Face onto several target faces (Fusion's: the source faces
+## removed, the body trimmed or extended to the target quilt).
+##
+## Targets lying on one surface (coplanar faces, a split face's pieces, a
+## whole surface body of one surface) take the local operation
+## (face_moves.lucb): the faces move onto that surface. Targets on several
+## surfaces must be faces of a closed solid, and go through the booleans:
+## the source faces are pushed out far past the quilt (Offset Face, the
+## faces around following), then the target solid is taken away where it
+## lies beyond the quilt (its faces facing the body), or kept where it lies
+## behind it (its faces facing the way the source faces do). Of the pieces,
+## the one holding no source face and most of the body's other faces is
+## the result. Checked: no source face may be left (the quilt must reach
+## across them) and every other face of the body must still be there (the
+## target solid must not cut into the body elsewhere); otherwise refused.
+
+## Whether faces `found` of `t` all lie on the surface of the first: the
+## same kind, their boundaries on it.
+func on_one_surface(t: const Shape*, found: const usize[]) -> bool!:
+    let s = &t.surfaces.items[(usize)t.faces.items[found[0]].surface]
+    for f in found:
+        if t.surfaces.items[(usize)t.faces.items[f].surface].kind != s.kind: return false
+        for use in t.face_uses(f):
+            for step in 0..<5:
+                let (gap, _) = try signed_gap(s, try t.edge_at(edge_index(use), (f64)step / 4.0), t.tolerance)
+                if math.abs(gap) > t.tolerance * 100.0: return false
+    return true
+
+## `model` (as `w`) with faces `picked` replaced by `target`'s faces
+## `found` (as `t`), lying on several surfaces (see above).
+func replaced_by_quilt(model: interop.Reference[CadModel], w: const Shape*, picked: const usize[], target: interop.Reference[CadModel], t: const Shape*, found: const usize[]) -> interop.Reference[CadModel]!:
+    for e in 0..<t.edges.count:
+        if t.sides.items[e * 2] < 0 or t.sides.items[e * 2 + 1] < 0:
+            error(invalid, "Replace Face onto faces on several surfaces takes them on a solid body; a surface body's faces must lie on one surface")
+    # Which way the targets face against the source faces.
+    var source_way = Vector3()
+    for f in picked: source_way = source_way.add(try w.face_normal(f, try point_on_face(w, f)))
+    var target_way = Vector3()
+    for f in found: target_way = target_way.add(try t.face_normal(f, try point_on_face(t, f)))
+    let facing = source_way.dot(target_way) < 0.0
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    for f in 0..<t.faces.count:
+        let (l, h) = try face_box(t, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    let reach = high.subtract(low).length() * 2.0
+    var names = Growing[u8]()
+    defer names.close()
+    for f in picked:
+        if names.count > 0: try names.push(59)
+        for byte in w.face_name(f).bytes: try names.push(byte)
+    let pushed = CadDirect.offset_faces(model, (str)names.view(), reach, false) catch failure:
+        _ = failure
+        error(invalid, "Replace Face cannot reach the target faces: the faces around the ones replaced cannot be extended that far")
+    defer pushed.release()
+    let cut = combine(pushed.value(), target.value(), op_subtract if facing else op_intersect) catch failure:
+        _ = failure
+        error(invalid, "Replace Face could not trim the body to the target faces")
+    defer cut.release()
+    var c = try shape_of(cut.value())
+    defer c.close()
+    var lumps = Growing[usize]()
+    defer lumps.close()
+    let count = try lumps_of(&c, &lumps)
+    # The piece with no source face and the most of the body's others.
+    var best: i64 = -1
+    var best_score: i64 = -1
+    for lump in 0..<count:
+        var score: i64 = 0
+        var spoiled = false
+        for f in 0..<c.faces.count:
+            if lumps.items[f] != lump: continue
+            for g in 0..<w.faces.count:
+                if not (try names_meet(c.face_name(f), w.face_name(g))): continue
+                var source = false
+                for p in picked:
+                    if p == g: source = true
+                if source: spoiled = true
+                else: score += 1
+        if not spoiled and score > best_score:
+            best = (i64)lump
+            best_score = score
+    if best < 0: error(invalid, "the target faces do not reach across the faces to replace")
+    let result = try lump_model(&c, lumps.view(), (usize)best)
+    errdefer result.release()
+    # Every other face of the body still there.
+    var r = try shape_of(result.value())
+    defer r.close()
+    for g in 0..<w.faces.count:
+        var source = false
+        for p in picked:
+            if p == g: source = true
+        if source: continue
+        var kept = false
+        for f in 0..<r.faces.count:
+            if try names_meet(r.face_name(f), w.face_name(g)): kept = true
+        if not kept: error(invalid, "Replace Face would cut the body elsewhere: the target body reaches into it")
+    return result

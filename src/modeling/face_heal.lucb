@@ -1,0 +1,130 @@
+## Delete of several faces at once, healed by caps (Fusion's Delete of a
+## chain of fillets or chamfers and their corners, or of strips apart):
+## what face_delete.lucb's local healing does not take, where the faces
+## around the deleted ones are flat.
+##
+## Each deleted face's neighbors (the kept faces sharing an edge with any
+## deleted face) are planes; the deleted face lies on one side of each.
+## The cap is the box round the face's boundary cut by every neighbor's
+## half-space on the side the face lies: the space between the face and
+## the sharp edge or corner the neighbors make when extended. Where the
+## face lies on every neighbor's material side (a round or a chamfer,
+## material taken away), the cap is joined to the body; otherwise (a
+## fillet in an inside corner, material added) it is taken away. The caps'
+## faces lying on a neighbor's plane merge into it in the booleans, and
+## their own names are dropped.
+##
+## The result is checked: no deleted face may be left, and no cap face may
+## stand on its own (a cap reaching past the body: a box across a hole, a
+## neighbor that does not bound the gap). Either is refused, never a broken
+## or a changed solid. Curved faces around the gap are refused too.
+
+## The name the caps' faces carry until they merge into the neighbors.
+let cap_tag = "#heal"
+
+## `model` with faces `deleted` (marked) taken away and the gap closed by
+## caps (see above).
+func healed_by_caps(model: interop.Reference[CadModel], deleted: const bool[]) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model.value())
+    defer w.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(&w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    let size = math.max(1e-6, high.subtract(low).length())
+    let tol = size * 1e-7
+    # The neighbors: kept faces sharing an edge with a deleted one.
+    var near = Growing[bool]()
+    defer near.close()
+    try near.fill(w.faces.count, false)
+    for e in 0..<w.edges.count:
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0 or deleted[(usize)fa] == deleted[(usize)fb]: continue
+        near.items[(usize)(fb if deleted[(usize)fa] else fa)] = true
+    for f in 0..<w.faces.count:
+        if near.items[f] and w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane:
+            error(invalid, "Delete cannot heal these faces together: it closes several faces at once only between flat faces, and a curved face borders them")
+    var result = model.clone()
+    defer result.release()
+    for f in 0..<w.faces.count:
+        if not deleted[f]: continue
+        let (box_low, box_high) = try boundary_box(&w, f)
+        let extent = box_high.subtract(box_low)
+        if extent.x <= tol or extent.y <= tol or extent.z <= tol: continue
+        let point = try nearest_on_surface(&w, f, try face_middle(&w, f))
+        var cap = try box_between(box_low, box_high)
+        defer cap.release()
+        var adds = true
+        for n in 0..<w.faces.count:
+            if not near.items[n]: continue
+            let s = &w.surfaces.items[(usize)w.faces.items[n].surface]
+            let outward = try w.face_normal(n, s.origin)
+            # The side of the neighbor's plane the face lies on (on it: the
+            # material side).
+            let beyond = point.subtract(s.origin).dot(outward) > tol
+            if beyond: adds = false
+            let (_, half) = try surface_side(s, s.origin, 1.0, outward if beyond else outward.multiply_scalar(-1.0), 0.0, size * 4.0, cap_tag)
+            defer half.release()
+            let cut = combine(cap.value(), half.value(), op_intersect) catch failure:
+                _ = failure
+                error(invalid, "Delete cannot heal these faces: the faces around them do not close over them")
+            cap.release()
+            cap = cut
+            if cap.value().face_count() == 0: break
+        if cap.value().face_count() == 0: continue
+        let joined = combine(result.value(), cap.value(), op_union if adds else op_subtract) catch failure:
+            _ = failure
+            error(invalid, "Delete cannot heal these faces: the faces around them do not close over them")
+        result.release()
+        result = joined
+    return try uncapped(result, &w, deleted)
+
+## The box from `low` to `high`, its faces named for the caps.
+func box_between(low: Vector3, high: Vector3) -> interop.Reference[CadModel]!:
+    let extent = high.subtract(low)
+    let box = try CadSolids.box(extent.x, extent.y, extent.z)
+    defer box.release()
+    let placed = try box.value().placed(Matrix4(Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0), low.add(extent.multiply_scalar(0.5))))
+    defer placed.release()
+    return try CadModeling.tagged(placed, cap_tag)
+
+## The box round face `f`'s boundary, by samples along its edges (a
+## fillet's or chamfer's face, or a corner's, lies within it).
+func boundary_box(w: const Shape*, f: usize) -> (Vector3, Vector3)!:
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for use in w.face_uses(f):
+        for step in 0..<33:
+            let p = try w.edge_at(edge_index(use), (f64)step / 32.0)
+            low = lower(low, p)
+            high = upper(high, p)
+    return (low, high)
+
+## `model` (the healed body) with the caps' names dropped from every face;
+## refused when a deleted face of `before` (`deleted`) is still there or a
+## face has only a cap's name (the caps reached past the gap).
+func uncapped(model: interop.Reference[CadModel], before: const Shape*, deleted: const bool[]) -> interop.Reference[CadModel]!:
+    var w = try shape_of(model.value())
+    defer w.close()
+    var parts = Growing[(usize, usize)]()
+    defer parts.close()
+    var name = Growing[u8]()
+    defer name.close()
+    for f in 0..<w.faces.count:
+        let full = w.face_name(f)
+        for g in 0..<before.faces.count:
+            if deleted[g] and (try names_meet(full, before.face_name(g))):
+                error(invalid, "Delete cannot heal these faces: the faces around them do not close over them")
+        try top_parts(full, alias_separator, &parts)
+        name.clear()
+        for part in parts.view():
+            let alias = part_of(full, part)
+            if alias_starts(alias, cap_tag): continue
+            if name.count > 0: try name.push(alias_separator)
+            for byte in alias.bytes: try name.push(byte)
+        if name.count == 0: error(invalid, "Delete cannot heal these faces: closing them would change the body beyond them")
+        w.faces.items[f].name = try w.add_name((str)name.view())
+    return try shape_model(&w)
