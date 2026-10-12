@@ -53,6 +53,23 @@ takes them, several apart by `;`:
 | `deleted_faces(model, faces)` | Delete with healing: holes and bosses whole, or one fillet, chamfer or corner face. |
 | `face_names(model, faces)` | The names of B-rep face numbers (a pick's), apart by `;`. |
 
+Edit CAD (luced-3d's direct modeling) reaches these through the viewport's pick mesh, with
+`CadEdits` (`cad_edits.lucb`):
+
+| `CadEdits.` | What it does |
+|---|---|
+| `model_faces(pick, group, model)` | The names of the B-rep faces of one model a face group names, apart by `;`: what the face operations take. |
+| `model_share(pick, group, model)` | How much of a model a group names: nothing, some faces, or all of it (a whole body). |
+| `transformed_faces(set, pick, group, numbers)` | Transform Components' numbers on what a group names: whole models placed, faces of the others turned about the pivot and moved (`rotated_faces`, `moved_faces`); faces never scale. |
+| `named_models(set, prefix)` | Models with unnamed faces (a STEP import's) named `<prefix><i>/f<n>`, so they can be referred to; the same set when all have names. |
+| `carried(before, selection, now)` | A face or edge selection on one pick mesh carried onto another of the same B-rep faces and edges (meshed again after a face moved), as a group. |
+
+A set's sketches, Fusion's sketches in direct modeling, are objects too: `CadSketches`
+(`cad_sketches.lucb`), a component holding each sketch's name, CadSketch text, plane and
+visibility (`with_sketch`, `with_visible`, `without_sketch`, `count`, `find`, `name`, `text`,
+`origin`, `u`, `v`, `visible`). It places with the set (the plane moves and turns; the sketch keeps
+its sizes), joins, filters by name as an object path and is saved in geometry files.
+
 `tag` names the feature (luced-3d passes the node). Edges may be outside (convex) or inside
 (concave) corners. Empty `references` mean every straight convex edge between two flat faces. Rims
 are blended only when referenced. A rim is a circle, or an arc of one, between a flat face and a

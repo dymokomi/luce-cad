@@ -308,6 +308,59 @@ pub struct CadEdits:
                 error(failure.code, failure.message)
         return try with_models(source, result.view())
 
+    ## The elements of pick mesh `now` that are the B-rep faces (domain 2)
+    ## or edges (domain 4) `chosen` selects on pick mesh `before`, as a
+    ## group expression of their numbers: a selection carried across a step
+    ## that keeps the model's faces and edges but meshes them again (a face
+    ## moved). Elements whose B-rep face or edge is gone are left out.
+    pub static func carried(before: interop.Reference[Mesh], chosen: interop.Reference[Selection], now: interop.Reference[Mesh]) -> interop.Owned[str]!:
+        let prior = try before.get()
+        let after = try now.get()
+        let selection = try chosen.get()
+        let domain = selection.domain()
+        if domain != 2 and domain != 4: return try interop.copy_text("")
+        let owner_name = "cad_model" if domain == 2 else "cad_edge_model"
+        let id_name = "cad_face" if domain == 2 else "cad_edge"
+        let old_owner = prior.find_attribute(owner_name, domain)
+        let old_id = prior.find_attribute(id_name, domain)
+        let new_owner = after.find_attribute(owner_name, domain)
+        let new_id = after.find_attribute(id_name, domain)
+        if old_owner < 0 or old_id < 0 or new_owner < 0 or new_id < 0: return try interop.copy_text("")
+        var keys = Growing[i64]()
+        defer keys.close()
+        var at: i64 = -1
+        while true:
+            at = selection.next(at)
+            if at < 0: break
+            let id = (i64)(try prior.attribute_value(old_id, at))
+            if id >= 0: try keys.push((i64)(try prior.attribute_value(old_owner, at)) * 4294967296 + id)
+        sort.sort(keys.items[..<keys.count])
+        let count = (try after.edge_count()) if domain == 4 else after.face_count()
+        var out = Growing[u8]()
+        defer out.close()
+        var run_start: i64 = -1
+        var run_end: i64 = -1
+        for element in 0..<count:
+            let id = (i64)(try after.attribute_value(new_id, element))
+            var taken = false
+            if id >= 0:
+                let key = (i64)(try after.attribute_value(new_owner, element)) * 4294967296 + id
+                var low: usize = 0
+                var high = keys.count
+                while low < high:
+                    let middle = (low + high) // 2
+                    if keys.items[middle] < key: low = middle + 1
+                    else: high = middle
+                taken = low < keys.count and keys.items[low] == key
+            if taken and run_end == element - 1 and run_start >= 0:
+                run_end = element
+                continue
+            if run_start >= 0: try push_run(&out, run_start, run_end)
+            run_start = element if taken else -1
+            run_end = element if taken else -1
+        if run_start >= 0: try push_run(&out, run_start, run_end)
+        return try interop.copy_text((str)out.view())
+
     ## `set` with model `index` replaced by `model`.
     pub static func replaced(set: interop.Reference[GeometrySet], index: i64, model: interop.Reference[CadModel]) -> interop.Reference[GeometrySet]!:
         let source = try set.get()
@@ -651,3 +704,12 @@ func rotation_of(linear: Matrix4) -> (Vector3, f64):
     else:
         axis = Vector3(z.x / (2.0 * axis.z), z.y / (2.0 * axis.z), axis.z)
     return (axis.multiply_scalar(1.0 / axis.length()), angle)
+
+## A run of element numbers `first`..`last` onto group text `out` ("3",
+## "3-9"), apart from what is there by a space.
+func push_run(out: Growing[u8]*, first: i64, last: i64) -> !:
+    if out.count > 0: try out.push(32)
+    try push_decimal(out, first)
+    if last > first:
+        try out.push(45)
+        try push_decimal(out, last)
