@@ -821,6 +821,15 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   boolean. A ball with six holes along the axes (through both poles) is closed at every division
   from 4 to 64 and extrapolates to 3743.952 (exact 3743.992); T2 unchanged.
 
+- **4, contact (part).** Curves of one face pair are cut where they cross each other, at one vertex
+  (`mutual_crossings` in `boolean.lucb`): B4, two equal pipes crossing, now joins closed with 8
+  faces (SMLib's count) in 7 ms; its mesh volume at 32 divisions is 4045.637 (exact 4045.722).
+  Tangent contact sections are noted, and the results that would be non-manifold are refused
+  with a message naming it: B1, B2 and B6 (B2 meshed open before, silently), with a check that
+  no kept face passes through an edge of the result. B3 and B5 are unchanged. Regression:
+  `touching_tests`. Still open: tangency classified from the surfaces' curvatures, gap repair,
+  zones as sums of tolerances.
+
 ## 12. What not to take
 
 - **Its surfaces.** Cubic approximations of circles by default, G1-within-an-angle corners, Coons

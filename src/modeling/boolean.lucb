@@ -48,6 +48,14 @@ struct Imprint:
     var face: usize
     var edge: usize
 
+## Faces of the two solids touching along a curve (tangent there, as a
+## cylinder lying on a face); `same` when their outward normals agree (one
+## body inside the other there), else they touch from outside.
+struct Tangency:
+    var fa: usize
+    var fb: usize
+    var same: bool
+
 ## Two faces on one surface; `same` when their normals agree.
 struct Coincident:
     var fa: usize
@@ -76,6 +84,8 @@ struct Work:
     ## The first solid's faces the second meets (Split Face's chosen
     ## faces); empty: all of them.
     var chosen: Growing[bool]
+    ## Faces touching along sections (note_tangency).
+    var tangencies: Growing[Tangency] = Growing[Tangency]()
 
     func close():
         self.w.close()
@@ -85,6 +95,7 @@ struct Work:
         self.sections.close()
         self.imprints.close()
         self.coincident.close()
+        self.tangencies.close()
         self.finals.close()
         self.piece_ids.close()
         self.piece_starts.close()
@@ -344,8 +355,17 @@ func intersect_faces(work: Work*) -> !:
                 try imprint(work, fa, fb)
                 try imprint(work, fb, fa)
                 continue
-            for carrier in curves.view():
-                let c = try w.add_carrier(carrier)
+            # Where curves of this pair cross each other (two ellipses where
+            # equal pipes cross, at the points the pipes touch): one vertex
+            # each, which both curves are cut at.
+            let first_carrier = w.carriers.count
+            for carrier in curves.view(): _ = try w.add_carrier(carrier)
+            var crossing_points = Growing[Vector3]()
+            defer crossing_points.close()
+            try mutual_crossings(work, (i64)first_carrier, curves.count, &crossing_points)
+            for index in 0..<curves.count:
+                let carrier = curves.items[index]
+                let c = (i64)(first_carrier + index)
                 var lowest = 0.0
                 var highest = 2.0 * math.pi
                 var closed = carrier.kind != curve_line
@@ -382,8 +402,68 @@ func intersect_faces(work: Work*) -> !:
                         for at in before..<hits.count:
                             if try face_contains(w, other, try w.at(c, hits.items[at].t), work.tol) != outside: try work.cuts.push(Cut(e, hits.items[at].s))
                 for hit in hits.view(): try ts.push(hit.t)
+                for p in crossing_points.view():
+                    let t = try nearest_on(w, c, p, lowest, highest)
+                    if (try w.at(c, t)).subtract(p).length() <= work.tol * 10.0: try ts.push(t)
                 sort.sort(ts.items[..<ts.count])
                 try add_sections(work, c, closed, lowest, highest, ts.view(), fa, fb)
+
+## The points where the `count` curves from carrier `first` on cross one
+## another, onto `out`: each curve sampled, the other's nearest point found,
+## and the sample stretches where that distance falls to a minimum narrowed
+## by golden section. Lines are left out (their crossings are boundary
+## crossings already).
+func mutual_crossings(work: Work*, first: i64, count: usize, out: Growing[Vector3]*) -> !:
+    let w = &work.w
+    if count < 2: return
+    let samples = 128
+    for i in 0..<count:
+        let a = first + (i64)i
+        let ka = w.carriers.items[(usize)a].kind
+        if ka == curve_line: continue
+        let high_a = 1.0 if ka == curve_spline else 2.0 * math.pi
+        for j in i + 1..<count:
+            let b = first + (i64)j
+            let kb = w.carriers.items[(usize)b].kind
+            if kb == curve_line: continue
+            let high_b = 1.0 if kb == curve_spline else 2.0 * math.pi
+            var previous = 1e300
+            var before = 1e300
+            for k in 0..<samples + 2:
+                let t = high_a * (f64)k / (f64)samples
+                let p = try w.at(a, math.min(t, high_a))
+                let d = (try w.at(b, try nearest_on(w, b, p, 0.0, high_b))).subtract(p).length()
+                # A minimum at the previous sample: narrow its stretch.
+                if k >= 2 and previous <= before and previous <= d and previous < work.size * 0.05:
+                    let found = try narrowed(w, a, b, high_a * (f64)(k - 2) / (f64)samples, math.min(t, high_a), high_b)
+                    if found.y <= work.tol * 10.0:
+                        var known = false
+                        for q in out.view(): known = known or q.subtract(found_point(w, a, found.x)).length() <= work.tol * 10.0
+                        if not known: try out.push(try w.at(a, found.x))
+                before = previous
+                previous = d
+
+func found_point(w: const Shape*, c: i64, t: f64) -> Vector3:
+    return w.at(c, t) catch failure: recover Vector3(1e300, 1e300, 1e300)
+
+## The parameter of curve `a` in [low, high] nearest curve `b` (x) and that
+## distance (y), by golden section.
+func narrowed(w: const Shape*, a: i64, b: i64, low: f64, high: f64, high_b: f64) -> Vector3!:
+    var l = low
+    var h = high
+    let ratio = 0.6180339887498949
+    for _ in 0..<80:
+        let m1 = h - (h - l) * ratio
+        let m2 = l + (h - l) * ratio
+        let p1 = try w.at(a, m1)
+        let p2 = try w.at(a, m2)
+        let d1 = (try w.at(b, try nearest_on(w, b, p1, 0.0, high_b))).subtract(p1).length()
+        let d2 = (try w.at(b, try nearest_on(w, b, p2, 0.0, high_b))).subtract(p2).length()
+        if d1 < d2: h = m2
+        else: l = m1
+    let t = (l + h) * 0.5
+    let p = try w.at(a, t)
+    return Vector3(t, (try w.at(b, try nearest_on(w, b, p, 0.0, high_b))).subtract(p).length(), 0.0)
 
 ## The stretches of carrier `c` between consecutive crossings `ts` that lie
 ## inside both faces, as sections.
@@ -429,6 +509,7 @@ func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: co
                 try work.cuts.push(Cut(e, try nearest_on(w, edge.carrier, try w.at(c, t0), edge.t0, edge.t1)))
                 try work.cuts.push(Cut(e, try nearest_on(w, edge.carrier, try w.at(c, t1), edge.t0, edge.t1)))
                 try work.imprints.push(Imprint(other, e))
+                try note_tangency(work, fa, fb, c, t0, t1)
                 found = true
                 break
             if found: continue
@@ -438,6 +519,21 @@ func add_sections(work: Work*, c: i64, closed: bool, low: f64, high: f64, ts: co
         # once around is its own loop).
         if start == end and not (closed and count == 2): continue
         try work.sections.push(Section(ShapeEdge(c, t0, t1, start, end), (i64)fa, (i64)fb))
+        try note_tangency(work, fa, fb, c, t0, t1)
+
+## The faces' normals parallel along section `c` (t0..t1, at a quarter,
+## half and three quarters): they touch there, not cross.
+func note_tangency(work: Work*, fa: usize, fb: usize, c: i64, t0: f64, t1: f64) -> !:
+    let w = &work.w
+    var agree: f64 = 0.0
+    for fraction in [0.25, 0.5, 0.75]:
+        let p = try w.at(c, t0 + (t1 - t0) * fraction)
+        let na = try w.face_normal(fa, p)
+        let nb = try w.face_normal(fb, p)
+        let dot = na.dot(nb)
+        if math.abs(dot) < 1.0 - 1e-9: return
+        agree = dot
+    try work.tangencies.push(Tangency(fa, fb, agree > 0.0))
 
 ## A stretch of closed traced curve `c` (parameters low..high) from t0
 ## past its end to t1: two sections meeting at its ends' vertex.

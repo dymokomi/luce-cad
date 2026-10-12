@@ -2,6 +2,12 @@
 ## operation keeps, merged where they lie on one surface, written as a new
 ## B-rep; an edge not used exactly twice, once each way, is an error.
 
+## The refusal of a result whose edges are not each used twice.
+let not_closed = "the result is not a closed solid (some edges are not shared by two faces); this operation is not supported for these shapes yet"
+
+## The refusal of a result that is not a manifold solid.
+let non_manifold = "the result would be non-manifold: the bodies touch along an edge or a face, where four faces meet; non-manifold bodies are not supported yet"
+
 ## Steps 4 to 7: split, classify, select and write.
 func assemble(work: Work*, op: i64, others: Others*) -> interop.Reference[CadModel]!:
     let w = &work.w
@@ -39,8 +45,20 @@ func assemble(work: Work*, op: i64, others: Others*) -> interop.Reference[CadMod
         try keep.push(take)
         try turn.push(flip)
     try merge_pieces(work, &traced, &pieces, &piece_face, &piece_name, &keep, &turn)
+    # Every edge used twice, but a face passing through one of them (before
+    # the zones' seams, which the traced shape does not hold).
+    if (try pieces_closed(work, &pieces, keep.view(), turn.view())) and (try touches_itself(work, &traced, &pieces, piece_face.view(), keep.view())): error(invalid, non_manifold)
     try seam_zones(work, &traced, &pieces, piece_face.view(), keep.view())
-    return try write_result(work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view())
+    # A result that does not close where the bodies touch along a curve
+    # (from outside, joined; one inside the other at its face, subtracted)
+    # leaves edges four faces meet at: named so. (A fillet's tool touches
+    # the body the same way and closes.)
+    var touching = false
+    for touch in work.tangencies.view():
+        touching = touching or (op == op_union and not touch.same) or (op == op_subtract and touch.same)
+    return write_result(work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view()) catch failure:
+        if touching and failure.code == invalid and failure.message.compare(not_closed) == 0: error(invalid, non_manifold)
+        error(failure.code, failure.message)
 
 ## Step 4: the first `faces` faces of the work shape split along the new
 ## edges into `pieces` on `traced`, each piece's face and name noted.
@@ -148,13 +166,19 @@ func write_pieces(work: Work*, pieces: const Pieces*, piece_face: const usize[],
                 uses_count.items[e] += 1
                 direction.items[e] += (1 if use > 0 else -1) * (-1 if turn[p] else 1)
     var open_edges = 0
+    # Edges four (six, …) faces meet at, as many each way: the bodies touch
+    # along them, and the answer is a non-manifold body.
+    var crowded = 0
     for e in 0..<work.finals.count:
         let used = uses_count.items[e]
-        if closed and used != 0 and (used != 2 or direction.items[e] != 0): open_edges += 1
+        if closed and used != 0 and (used != 2 or direction.items[e] != 0):
+            open_edges += 1
+            if used >= 4 and used % 2 == 0 and direction.items[e] == 0: crowded += 1
         # Open, an edge is a boundary (once) or shared each way (twice).
         if not closed and used > 1 and (used != 2 or direction.items[e] != 0): open_edges += 1
     if open_edges > 0:
-        if closed: error(invalid, "the result is not a closed solid (some edges are not shared by two faces); this operation is not supported for these shapes yet")
+        if closed and crowded == open_edges: error(invalid, non_manifold)
+        if closed: error(invalid, not_closed)
         error(invalid, "the result's faces do not meet edge to edge")
     # Merged vertices sit within ten tolerances of their curves.
     let tolerance = exact if exact > 0.0 else math.min(1.0, math.max(math.max(work.tol * 20.0, precision * 2.0), least_tolerance))
@@ -232,3 +256,58 @@ func write_pieces(work: Work*, pieces: const Pieces*, piece_face: const usize[],
         try b.set_face_name(made, w.name(piece_name[p]))
     return try CadModel.of_brep(output)
 
+
+## Whether every edge of the kept pieces is used twice, once each way.
+func pieces_closed(work: Work*, pieces: const Pieces*, keep: const bool[], turn: const bool[]) -> bool!:
+    var uses_count = Growing[i64]()
+    defer uses_count.close()
+    var direction = Growing[i64]()
+    defer direction.close()
+    try uses_count.fill(work.finals.count, 0)
+    try direction.fill(work.finals.count, 0)
+    for p in 0..<pieces.piece_count():
+        if not keep[p]: continue
+        for c in pieces.piece_cycles(p):
+            for use in pieces.cycle(c):
+                let e = edge_index(use)
+                uses_count.items[e] += 1
+                direction.items[e] += (1 if use > 0 else -1) * (-1 if turn[p] else 1)
+    for e in 0..<work.finals.count:
+        if uses_count.items[e] != 0 and (uses_count.items[e] != 2 or direction.items[e] != 0): return false
+    return true
+
+## Whether an edge of the kept pieces lies inside another kept piece's face
+## (a hole's wall tangent to a face from inside: the face passes through
+## the edge, the solid has no thickness there). Analytic faces whose
+## surface the edge lies on, at a quarter, half and three quarters of its
+## length, are checked (an edge touching a face at one point, as a ball
+## touching a box, is no such edge).
+func touches_itself(work: Work*, traced: const Shape*, pieces: const Pieces*, piece_face: const usize[], keep: const bool[]) -> bool!:
+    let w = &work.w
+    var used = Growing[bool]()
+    defer used.close()
+    try used.fill(work.finals.count, false)
+    for p in 0..<pieces.piece_count():
+        if not keep[p]: continue
+        for c in pieces.piece_cycles(p):
+            for use in pieces.cycle(c): used.items[edge_index(use)] = true
+    for e in 0..<work.finals.count:
+        if not used.items[e]: continue
+        let edge = work.finals.items[e]
+        let middle = try w.at(edge.carrier, (edge.t0 + edge.t1) * 0.5)
+        let quarter = try w.at(edge.carrier, edge.t0 * 0.75 + edge.t1 * 0.25)
+        let three = try w.at(edge.carrier, edge.t0 * 0.25 + edge.t1 * 0.75)
+        for q in 0..<pieces.piece_count():
+            if not keep[q]: continue
+            let f = piece_face[q]
+            let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+            if s.kind == surface_spline: continue
+            if surface_distance(s, middle) > work.tol * 10.0 or surface_distance(s, quarter) > work.tol * 10.0 or surface_distance(s, three) > work.tol * 10.0: continue
+            # Not one of its own edges.
+            var bounds = false
+            for c in pieces.piece_cycles(q):
+                for use in pieces.cycle(c):
+                    if edge_index(use) == e: bounds = true
+            if bounds: continue
+            if (try piece_holds(work, traced, f, pieces, q, middle)) and (try piece_holds(work, traced, f, pieces, q, quarter)) and (try piece_holds(work, traced, f, pieces, q, three)): return true
+    return false

@@ -320,6 +320,15 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    new edges.
 
    A curve lying along an existing edge is that edge: it is cut and imprinted, never doubled.
+   Curves of one face pair crossing each other are cut where they cross, at one vertex: two equal
+   pipes crossing meet in two ellipses that cross where the pipes touch.
+
+   A section along which the two faces are tangent (normals parallel at a quarter, half and three
+   quarters of it) is a touching contact. Joined where they touch from outside, or subtracted where
+   one lies inside the other touching its face, the bodies would leave an edge four faces meet at:
+   the operation refuses, naming the result non-manifold. So does a result whose edges are each
+   used twice but where a kept face passes through one of them (no thickness there), and one whose
+   only open edges are such four-face edges.
    Coincident faces imprint each other's boundaries.
 4. **Shared edges.** Edges are cut at every crossing. Pieces with the same ends and middle are one
    edge, so the faces on both sides share it.
@@ -1881,5 +1890,7 @@ Roughly in order of usefulness:
 6. **Sweep and loft as solid features** (their sheets are Stage 5's Rail and Skin; capped into
    solids, and Fusion's Sweep and Loft dialogs on sketches).
 7. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
-8. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
+8. **Non-manifold results:** bodies touching along a line or a face (a box and a pipe lying on
+   it, joined; a pipe inside a box touching its wall, subtracted) are refused as non-manifold.
+9. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face (strips apart, inside corners).
