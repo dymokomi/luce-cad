@@ -1,0 +1,384 @@
+## A sphere face no other chart takes (holes spread all round a ball and
+## through its poles; half a ball whose rim runs round such holes): it is
+## meshed in a latitude-longitude chart about an axis of its own.
+##
+## - The axis is the direction farthest from every trim sample: of a few
+##   hundred directions, the one whose nearer pole is farthest from them.
+## - Each loop either goes once round the axis (it bounds the face from
+##   below or above: the face's side of it, by the loop's direction, holds
+##   a pole or the other such loop) or not (then it must be a hole). So the
+##   chart is a band from a lower boundary to an upper one, each a loop
+##   going round or a latitude circle near a pole the face holds, closed
+##   there by a fan.
+## - The seam joins the two boundaries: a meridian through the widest gap
+##   between the trims' longitudes when both are circles, else a straight
+##   chart segment from a sample of the lower loop (to a sample of the
+##   upper), crossing no trim. Its samples serve both sides of the chart.
+##
+## The band is meshed as analytic_trim meshes a chart (lift_chart). The
+## B-rep is not touched: the seam, the circles and the poles are the face's
+## own mesh points.
+
+## The directions tried for the axis (over a hemisphere: an axis and its
+## opposite are one), and how many of the best are tried in turn.
+let axis_candidates: usize = 400
+let axes_tried: usize = 8
+
+pub func sphere_axis(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    let directions = try new Vector3[ids.length] --- in memory.heap
+    defer free(directions) in memory.heap
+    for at in 0..<ids.length: directions[at] = try mesh.points[(usize)ids[at]].subtract(s.origin).normalized()
+    # Each candidate's score: how far (1 - |cos|) the trims come to its
+    # nearer pole.
+    let scores = try new f64[axis_candidates] --- in memory.heap
+    defer free(scores) in memory.heap
+    let order = try new usize[axis_candidates] --- in memory.heap
+    defer free(order) in memory.heap
+    for k in 0..<axis_candidates:
+        let a = axis_candidate(k)
+        var nearest: f64 = 1.0
+        for d in directions: nearest = math.min(nearest, 1.0 - math.abs(d.dot(a)))
+        scores[k] = nearest
+        order[k] = k
+    for tried in 0..<axes_tried:
+        var best = tried
+        for k in tried..<axis_candidates:
+            if scores[order[k]] > scores[order[best]]: best = k
+        let swap = order[tried]
+        order[tried] = order[best]
+        order[best] = swap
+        let np = mesh.np
+        let nf = mesh.nf
+        let nc = mesh.nc
+        let meshed = about_axis(mesh, ids, sizes, directions, s, axis_candidate(order[tried]), sense, divisions, tolerance, edge_size) catch failure:
+            if failure.code != invalid: error(failure.code, failure.message)
+            mesh.np = np
+            mesh.nf = nf
+            mesh.nc = nc
+            recover false
+        if meshed: return
+    error(invalid, "a sphere face's trims leave no latitude-longitude chart")
+
+## Direction `k` of a Fibonacci lattice over the upper hemisphere.
+func axis_candidate(k: usize) -> Vector3:
+    let z = 1.0 - ((f64)k + 0.5) / (f64)axis_candidates
+    let ring = math.sqrt(math.max(0.0, 1.0 - z * z))
+    let turn = (f64)k * math.pi * (3.0 - math.sqrt(5.0))
+    return Vector3(ring * math.cos(turn), ring * math.sin(turn), z)
+
+## One boundary of the band: a loop going round the axis (its index), or a
+## latitude circle (loop -1) near the pole at `latitude`'s sign.
+struct Side:
+    var loop: i64
+    var latitude: f64
+
+## Where the seam runs: from sample `lower` of the lower loop to sample
+## `upper` of the upper one (either 0 on a circle), starting at longitude
+## `start`; `found` false when no seam clears the trims.
+struct Seam:
+    var lower: usize
+    var upper: usize
+    var start: f64
+    var found: bool
+
+## Mesh the face about `axis`; false when its loops do not make a band
+## about it, or no seam clears the trims.
+func about_axis(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], directions: const Vector3[], s: Surface, axis: Vector3, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> bool!:
+    let reference = Vector3(1.0, 0.0, 0.0) if math.abs(axis.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+    let x0 = try reference.subtract(axis.multiply_scalar(reference.dot(axis))).normalized()
+    let y0 = axis.cross(x0)
+    let lon = try new f64[ids.length] --- in memory.heap
+    defer free(lon) in memory.heap
+    let lat = try new f64[ids.length] --- in memory.heap
+    defer free(lat) in memory.heap
+    for at in 0..<ids.length:
+        lon[at] = math.atan2(directions[at].dot(y0), directions[at].dot(x0))
+        lat[at] = math.asin(math.clamp(directions[at].dot(axis), -1.0, 1.0))
+    let starts = try new usize[sizes.length + 1] --- in memory.heap
+    defer free(starts) in memory.heap
+    starts[0] = 0
+    for loop in 0..<sizes.length: starts[loop + 1] = starts[loop] + (usize)sizes[loop]
+    # The face lies left of its loops seen from outside when `sense`; east
+    # then north is counterclockwise there.
+    var lower = Side(-1, -0.5 * math.pi)
+    var upper = Side(-1, 0.5 * math.pi)
+    var winding = 0
+    for loop in 0..<sizes.length:
+        var turn: f64 = 0.0
+        var area: f64 = 0.0
+        var u = lon[starts[loop]]
+        for at in starts[loop]..<starts[loop + 1]:
+            let next = starts[loop] if at + 1 == starts[loop + 1] else at + 1
+            let step = wrap(lon[next], lon[at]) - lon[at]
+            turn += step
+            area += (u + step * 0.5) * (lat[next] - lat[at])
+            u += step
+        if math.abs(turn) > 3.0 * math.pi: return false
+        if math.abs(turn) > math.pi:
+            # Going round: the face lies north of it when it runs east and
+            # the face is on the left (or west and on the right).
+            winding += 1
+            if winding > 2: return false
+            if (turn > 0.0) == sense:
+                if lower.loop >= 0: return false
+                lower = Side((i64)loop, 0.0)
+            else:
+                if upper.loop >= 0: return false
+                upper = Side((i64)loop, 0.0)
+            continue
+        # A loop not going round is a hole: clockwise seen from outside
+        # when the face is on its left. (`area` is the chart's -∮u dv.)
+        if (area > 0.0) == sense: return false
+    # A loop bounding the face from above must lie above the one below.
+    let step = seam_step(s, divisions, tolerance, edge_size)
+    let caps = pole_caps(lat)
+    if lower.loop < 0: lower.latitude = -0.5 * math.pi + caps.x
+    if upper.loop < 0: upper.latitude = 0.5 * math.pi - caps.y
+    # The seam's ends: samples of the loops (or 0 on a circle) and their
+    # chart longitude, relative to the seam's start.
+    let seam = try seam_ends(lon, lat, starts, lower, upper)
+    if not seam.found: return false
+    try mesh_band(mesh, ids, sizes, starts, lon, lat, s, axis, x0, y0, lower, upper, seam, sense, step, divisions, tolerance)
+    return true
+
+## The chart step: a quarter turn over `divisions`, or finer to keep the
+## sphere's target (or the edge size).
+func seam_step(s: Surface, divisions: i64, tolerance: f64, edge_size: f64) -> f64:
+    var step = math.min(math.pi / (2.0 * (f64)divisions), sag_step(s.radius, analytic_target(s, 0.0, divisions, tolerance)))
+    if edge_size > 0.0: step = math.min(step, edge_size / s.radius)
+    return step
+
+## How far the polar circles stand from the south (x) and north (y) pole:
+## halfway to the nearest trim, at most a sixth of a turn.
+func pole_caps(lat: const f64[]) -> Vector3:
+    var south: f64 = math.pi
+    var north: f64 = math.pi
+    for value in lat:
+        south = math.min(south, value + 0.5 * math.pi)
+        north = math.min(north, 0.5 * math.pi - value)
+    return Vector3(math.min(south * 0.5, math.pi / 6.0), math.min(north * 0.5, math.pi / 6.0), 0.0)
+
+## The seam: a meridian through the widest gap between longitudes that
+## clears the trims when both sides are circles; else the shortest chart
+## segment from a sample of the side that is a loop to the other side (a
+## meridian to its circle, or its nearest sample) that crosses no trim.
+func seam_ends(lon: const f64[], lat: const f64[], starts: const usize[], lower: Side, upper: Side) -> Seam!:
+    if lower.loop < 0 and upper.loop < 0:
+        let sorted = try new f64[lon.length] --- in memory.heap
+        defer free(sorted) in memory.heap
+        for at in 0..<lon.length: sorted[at] = lon[at]
+        sort.sort(sorted)
+        # The gaps, widest first.
+        let tried = try new bool[lon.length] --- in memory.heap
+        defer free(tried) in memory.heap
+        for at in 0..<tried.length: tried[at] = false
+        for attempt in 0..<(usize)16:
+            var gap: f64 = -1.0
+            var middle: f64 = 0.0
+            var chosen: usize = 0
+            for at in 0..<sorted.length:
+                if tried[at]: continue
+                let width = (sorted[at] - sorted[at - 1]) if at > 0 else (sorted[0] + 2.0 * math.pi - sorted[sorted.length - 1])
+                if width > gap:
+                    gap = width
+                    middle = sorted[at] - width * 0.5
+                    chosen = at
+            if gap < 1e-9: break
+            tried[chosen] = true
+            if try clear(lon, lat, starts, middle, lower.latitude, 0.0, upper.latitude, -1, -1): return Seam(0, 0, middle, true)
+        return Seam(0, 0, 0.0, false)
+    let own = lower if lower.loop >= 0 else upper
+    let other = upper if lower.loop >= 0 else lower
+    let first = starts[(usize)own.loop]
+    let end = starts[(usize)own.loop + 1]
+    var best = Seam(0, 0, 0.0, false)
+    var shortest: f64 = 1e300
+    let stride = (usize)math.max(1.0, math.floor((f64)(end - first) / 256.0))
+    var at = first
+    while at < end:
+        var target: usize = 0
+        var reach: f64 = 0.0
+        var target_lat = other.latitude
+        if other.loop >= 0:
+            # The other loop's sample nearest in the chart.
+            var nearest: f64 = 1e300
+            for k in starts[(usize)other.loop]..<starts[(usize)other.loop + 1]:
+                let du = wrap(lon[k], lon[at]) - lon[at]
+                let dv = lat[k] - lat[at]
+                if du * du + dv * dv < nearest:
+                    nearest = du * du + dv * dv
+                    target = k
+                    reach = du
+            target_lat = lat[target]
+        let length = reach * reach + (target_lat - lat[at]) * (target_lat - lat[at])
+        if length < shortest and (try clear(lon, lat, starts, lon[at], lat[at], reach, target_lat, (i64)at, (i64)target if other.loop >= 0 else -1)):
+            shortest = length
+            best = Seam(at, target, lon[at], true) if lower.loop >= 0 else Seam(target, at, lon[target] if other.loop >= 0 else lon[at], true)
+        at += stride
+    return best
+
+## Whether the chart segment from (`start`, `low`) to (`start` + `reach`,
+## `high`) crosses no trim segment (those at samples `skip_a`, `skip_b`
+## aside).
+func clear(lon: const f64[], lat: const f64[], starts: const usize[], start: f64, low: f64, reach: f64, high: f64, skip_a: i64, skip_b: i64) -> bool!:
+    let a = Vector3(0.0, low, 0.0)
+    let b = Vector3(reach, high, 0.0)
+    for loop in 0..<starts.length - 1:
+        for at in starts[loop]..<starts[loop + 1]:
+            let next = starts[loop] if at + 1 == starts[loop + 1] else at + 1
+            if (i64)at == skip_a or (i64)next == skip_a or (i64)at == skip_b or (i64)next == skip_b: continue
+            let p = Vector3(wrap(lon[at], start) - start, lat[at], 0.0)
+            let q = Vector3(wrap(lon[next], start) - start, lat[next], 0.0)
+            # A segment across the far meridian is nowhere near the seam.
+            if math.abs(q.x - p.x) > math.pi: continue
+            if crosses(a, b, p, q): return false
+    return true
+
+func crosses(a: Vector3, b: Vector3, p: Vector3, q: Vector3) -> bool:
+    let d1 = turn_side(p, q, a)
+    let d2 = turn_side(p, q, b)
+    let d3 = turn_side(a, b, p)
+    let d4 = turn_side(a, b, q)
+    return d1 * d2 <= 0.0 and d3 * d4 <= 0.0
+
+func turn_side(a: Vector3, b: Vector3, c: Vector3) -> f64:
+    return b.subtract(a).cross(c.subtract(a)).z
+
+## Mesh the band from `lower` to `upper` along `seam`.
+func mesh_band(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], starts: const usize[], lon: const f64[], lat: const f64[], s: Surface, axis: Vector3, x0: Vector3, y0: Vector3, lower: Side, upper: Side, seam: Seam, sense: bool, step: f64, divisions: i64, tolerance: f64) -> !:
+    let r = s.radius
+    let start_lon = seam.start
+    let from_at = seam.lower
+    let to_at = seam.upper
+    # The chart's own sphere: x along the seam's start meridian.
+    let x = x0.multiply_scalar(math.cos(start_lon)).add(y0.multiply_scalar(math.sin(start_lon)))
+    var none_points: Vector3[]
+    var none_numbers: f64[]
+    let chart = try Surface(surface_sphere, s.origin, x, axis, r, 0.0, none_points, none_numbers, none_numbers, none_numbers, 0, 0, 0, 0)
+    defer chart.close()
+    # The seam's ends in the chart (longitude relative to its start).
+    let low = lat[from_at] if lower.loop >= 0 else lower.latitude
+    let high = lat[to_at] if upper.loop >= 0 else upper.latitude
+    let reach = (wrap(lon[to_at], start_lon) - start_lon) if upper.loop >= 0 else 0.0
+    let ring_count = (usize)math.max(8.0, math.ceil(2.0 * math.pi / step))
+    let seam_count = (usize)math.max(1.0, math.ceil(math.sqrt(reach * reach + (high - low) * (high - low)) / step))
+    var points = Growing[Vector3]()
+    defer points.close()
+    var chain = Growing[i64]()
+    defer chain.close()
+    # Lower side, east from the seam (0 to 2π), its start not repeated.
+    let south_ring = try polar_ring(mesh, chart, lower, ring_count)
+    defer free(south_ring) in memory.heap
+    try side_points(&points, &chain, ids, starts, lon, lat, lower, from_at, start_lon, south_ring, true, r)
+    # The seam's right copy, up.
+    let seam_ids = try new i64[seam_count + 1] --- in memory.heap
+    defer free(seam_ids) in memory.heap
+    for j in 1..<seam_count:
+        let t = (f64)j / (f64)seam_count
+        seam_ids[j] = try mesh.point(analytic_point(chart, reach * t, low + (high - low) * t))
+    try points.push(Vector3(2.0 * math.pi * r, low * r, 0.0))
+    try chain.push(chain.items[0])
+    for j in 1..<seam_count:
+        let t = (f64)j / (f64)seam_count
+        try points.push(Vector3((2.0 * math.pi + reach * t) * r, (low + (high - low) * t) * r, 0.0))
+        try chain.push(seam_ids[j])
+    # Upper side, west from the seam's right end (2π + reach to reach).
+    let north_ring = try polar_ring(mesh, chart, upper, ring_count)
+    defer free(north_ring) in memory.heap
+    let upper_first = points.count
+    try side_points(&points, &chain, ids, starts, lon, lat, upper, to_at, start_lon, north_ring, false, r)
+    # The seam's left copy, down.
+    try points.push(Vector3(reach * r, high * r, 0.0))
+    try chain.push(chain.items[upper_first])
+    for j in 1..<seam_count:
+        let t = (f64)(seam_count - j) / (f64)seam_count
+        try points.push(Vector3(reach * t * r, (low + (high - low) * t) * r, 0.0))
+        try chain.push(seam_ids[seam_count - j])
+    # The holes, their longitudes east of the seam's start.
+    var loop_sizes = Growing[i64]()
+    defer loop_sizes.close()
+    try loop_sizes.push((i64)points.count)
+    for loop in 0..<sizes.length:
+        if (i64)loop == lower.loop or (i64)loop == upper.loop: continue
+        var u = lon[starts[loop]] - start_lon
+        while u < 0.0: u += 2.0 * math.pi
+        while u >= 2.0 * math.pi: u -= 2.0 * math.pi
+        for at in starts[loop]..<starts[loop + 1]:
+            if at > starts[loop]: u += wrap(lon[at], lon[at - 1]) - lon[at - 1]
+            try points.push(Vector3(u * r, lat[at] * r, 0.0))
+            try chain.push(ids[at])
+        try loop_sizes.push(sizes[loop])
+    let deviation = analytic_target(s, 0.0, divisions, tolerance)
+    try lift_chart(mesh, chain.view(), loop_sizes.view(), points.view(), chart, r, r, sense, step * r, step * r, deviation)
+    # Rows from each circle to the pole the face holds, closed by a fan.
+    if upper.loop < 0: try pole_cap(mesh, chart, north_ring, upper.latitude, step, sense)
+    if lower.loop < 0: try pole_cap(mesh, chart, south_ring, lower.latitude, step, sense)
+
+## The cap from circle `circle` at `latitude` to its pole: rows of the
+## circle's columns a `step` apart, then a fan. East round the north pole
+## is counterclockwise seen from outside, round the south pole clockwise.
+func pole_cap(mesh: MeshBuilder*, chart: Surface, circle: const i64[], latitude: f64, step: f64, sense: bool) -> !:
+    let pole_lat = 0.5 * math.pi if latitude > 0.0 else -0.5 * math.pi
+    let count = circle.length
+    let rows = (usize)math.max(1.0, math.ceil(math.abs(pole_lat - latitude) / step))
+    let previous = try new i64[count] --- in memory.heap
+    defer free(previous) in memory.heap
+    let next = try new i64[count] --- in memory.heap
+    defer free(next) in memory.heap
+    for k in 0..<count: previous[k] = circle[k]
+    let north = latitude > 0.0
+    for row in 1..<rows:
+        let v = latitude + (pole_lat - latitude) * (f64)row / (f64)rows
+        for k in 0..<count: next[k] = try mesh.point(analytic_point(chart, 2.0 * math.pi * (f64)k / (f64)count, v))
+        for k in 0..<count:
+            let after = (k + 1) % count
+            let corners = [previous[k], previous[after], next[after], next[k]] if north else [previous[after], previous[k], next[k], next[after]]
+            try mesh.face(4)
+            for at in 0..<(usize)4: try mesh.corner(corners[at if sense else 3 - at])
+        for k in 0..<count: previous[k] = next[k]
+    let pole = try mesh.point(analytic_point(chart, 0.0, pole_lat))
+    for k in 0..<count:
+        let after = (k + 1) % count
+        if north: try fan(mesh, previous[k], previous[after], pole, sense)
+        else: try fan(mesh, previous[after], previous[k], pole, sense)
+
+## A circle side's points, east from the seam (empty for a loop).
+func polar_ring(mesh: MeshBuilder*, chart: Surface, side: Side, count: usize) -> i64[]!:
+    if side.loop >= 0: return try new i64[0] --- in memory.heap
+    let made = try new i64[count] --- in memory.heap
+    errdefer free(made) in memory.heap
+    for k in 0..<count: made[k] = try mesh.point(analytic_point(chart, 2.0 * math.pi * (f64)k / (f64)count, side.latitude))
+    return made
+
+## A side's chart points onto `points` (ids onto `chain`), from the seam:
+## east from 0 on the lower side, west from 2π (plus the seam's reach) on
+## the upper one; a loop is walked the way that goes, starting at sample
+## `seam`, its start not repeated at the far end.
+func side_points(points: Growing[Vector3]*, chain: Growing[i64]*, ids: const i64[], starts: const usize[], lon: const f64[], lat: const f64[], side: Side, seam: usize, start_lon: f64, circle: const i64[], east: bool, r: f64) -> !:
+    if side.loop < 0:
+        let count = circle.length
+        for k in 0..<count:
+            let column = k if east else (count - k) % count
+            let u = 2.0 * math.pi * (f64)(k if east else count - k) / (f64)count
+            try points.push(Vector3(u * r, side.latitude * r, 0.0))
+            try chain.push(circle[column])
+        return
+    let first = starts[(usize)side.loop]
+    let count = starts[(usize)side.loop + 1] - first
+    let offset = seam - first
+    # Which way round the loop runs east.
+    let ahead = first + (offset + 1) % count
+    let forward = (wrap(lon[ahead], lon[seam]) - lon[seam] > 0.0) == east
+    var u = wrap(lon[seam], start_lon) - start_lon
+    if not east: u += 2.0 * math.pi
+    var previous = seam
+    for k in 0..<count:
+        let at = first + ((offset + k) % count if forward else (offset + count - k) % count)
+        if k > 0: u += wrap(lon[at], lon[previous]) - lon[previous]
+        try points.push(Vector3(u * r, lat[at] * r, 0.0))
+        try chain.push(ids[at])
+        previous = at
+
+func fan(mesh: MeshBuilder*, a: i64, b: i64, pole: i64, sense: bool) -> !:
+    try mesh.face(3)
+    for id in ([a, b, pole] if sense else [b, a, pole]): try mesh.corner(id)

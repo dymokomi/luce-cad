@@ -357,9 +357,11 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
 8. **Merging and output.** Kept pieces of one face, or of flush faces, that share an edge nobody
    else uses and end up facing the same way are merged. That includes a subtracted solid's turned
    face lying flush on the other's. Flush pieces on B-spline faces stay separate faces sharing an
-   edge: neither surface need reach over the other's part. A sphere zone gets a seam meridian, because the tessellator meshes a band
-   on a sphere only with a seam. The result is written as a new B-rep. If any edge isn't used
-   exactly twice, the operation fails rather than producing a broken solid.
+   edge: neither surface need reach over the other's part. A sphere zone gets a seam meridian where
+   both its circles have a vertex on the chart's seam (else the tessellator meshes it about an axis
+   of its own), because the tessellator meshes a band on a sphere only with a seam. The result is
+   written as a new B-rep. If any edge isn't used exactly twice, the operation fails rather than
+   producing a broken solid.
 
 The tolerance comes from the model's size (1e-7 of it). Results are inputs again, so it must not
 grow from one operation to the next.
@@ -1765,10 +1767,10 @@ Roughly in order of usefulness:
    the loop's own curvature (refused with that reason). Whether Fusion measures a single edge's or a
    closed loop's law along the balls' path too, as it does an open chain's, is not checked (the
    laws read back on a box's edge fit its edge's length).
-5. **Sphere faces no one chart holds**: neither one loop round a pole (the cap's rows, or the
-   azimuthal disk with holes: a ball drilled through at a slant) nor an open hemisphere (a
-   latitude-longitude chart about the trims' middle), such as a ball with holes spread all round it
-   and no loop round a pole; such a face is skipped and named on the node.
+5. **Sphere faces with more than two loops going round every axis** away from the trims (a
+   face whose loops do not make one band about any direction): skipped and named on the node.
+   Every other sphere face meshes: holes all round a ball and through its poles, half a ball
+   whose rim runs round them (`meshing/sphere_axis.lucb`).
 6. **Sweep and loft.**
 7. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
 8. **Shell of B-spline faces** and draft; Delete healing several faces at once beside curved faces

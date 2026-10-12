@@ -813,6 +813,14 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   SMLib's 20. B8 unchanged (36 ms). Regression: `spline_boolean_tests`, with a box flush with the
   rounded box's side.
 
+- **3, a sphere chart for any trims (done).** `meshing/sphere_axis.lucb`: an axis of the face's
+  own (the farthest of 400 directions from every trim), a band between a loop round it or a polar
+  circle below and above (rows and a fan close each pole the face holds), holes inside, a seam
+  crossing no trim; a fallback after the sphere's own chart and a local hemisphere. A sphere zone
+  whose circles have no vertex on the seam meridian is now left for it instead of refused by the
+  boolean. A ball with six holes along the axes (through both poles) is closed at every division
+  from 4 to 64 and extrapolates to 3743.952 (exact 3743.992); T2 unchanged.
+
 ## 12. What not to take
 
 - **Its surfaces.** Cubic approximations of circles by default, G1-within-an-angle corners, Coons

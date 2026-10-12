@@ -2,9 +2,7 @@
 
 pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
     if s.kind == surface_sphere and touches_pole(s, mesh.points[..<mesh.np], ids):
-        let chart = try local_sphere(s, mesh.points[..<mesh.np], ids)
-        defer chart.close()
-        try mesh_in_chart(mesh, ids, sizes, chart, sense, divisions, tolerance, edge_size)
+        try local_or_holes(mesh, ids, sizes, s, sense, divisions, tolerance, edge_size)
         return
     let np = mesh.np
     let nf = mesh.nf
@@ -14,12 +12,31 @@ pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[],
         mesh.np = np
         mesh.nf = nf
         mesh.nc = nc
-        # Retry a failed angular chart away from an authored pole too.
-        # Canonical trim positions/IDs never move.
-        let chart = try local_sphere(s, mesh.points[..<mesh.np], ids)
-        defer chart.close()
-        try mesh_in_chart(mesh, ids, sizes, chart, sense, divisions, tolerance, edge_size)
+        # Retry a failed angular chart away from an authored pole too, and
+        # then a chart of the face's own about an axis away from every trim
+        # (sphere_axis). Canonical trim positions/IDs never move.
+        try local_or_holes(mesh, ids, sizes, s, sense, divisions, tolerance, edge_size)
         recover ()
+
+## A sphere face in a local hemisphere's chart, or else sphere_axis's.
+func local_or_holes(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    let np = mesh.np
+    let nf = mesh.nf
+    let nc = mesh.nc
+    var meshed = true
+    local_chart(mesh, ids, sizes, s, sense, divisions, tolerance, edge_size) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        mesh.np = np
+        mesh.nf = nf
+        mesh.nc = nc
+        meshed = false
+        recover ()
+    if not meshed: try sphere_axis(mesh, ids, sizes, s, sense, divisions, tolerance, edge_size)
+
+func local_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+    let chart = try local_sphere(s, mesh.points[..<mesh.np], ids)
+    defer chart.close()
+    try mesh_in_chart(mesh, ids, sizes, chart, sense, divisions, tolerance, edge_size)
 
 func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
     let uv = try new Vector3[ids.length] --- in memory.heap
@@ -94,6 +111,13 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
         spacing = math.min(spacing, uscale * sag_step(s.radius + s.angle, deviation))
         vertical = math.min(vertical, vscale * sag_step(s.angle, deviation))
     if s.kind == surface_sphere: vertical = math.min(vertical, vscale * sag_step(s.radius, deviation))
+    try lift_chart(mesh, ids, sizes, uv, s, uscale, vscale, sense, spacing, vertical, deviation)
+
+## The trim loops `ids` (by `sizes`; their chart points `uv`, scaled by
+## `uscale` and `vscale`) of a face on analytic surface `s` meshed in that
+## chart: a lattice of `spacing` by `vertical` quadrangulated, refined to
+## `deviation`, lifted onto `s`; the polygons face its way (`sense`).
+func lift_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], uv: const Vector3[], s: Surface, uscale: f64, vscale: f64, sense: bool, spacing: f64, vertical: f64, deviation: f64) -> !:
     let initial = try TrimPolygon.quadrangulate_seams(uv, sizes, Vector3(0.0, 0.0, 1.0), ids, spacing, vertical)
     defer initial.release()
     let constraints = try TrimConstraints.build(uv, ids, sizes)
