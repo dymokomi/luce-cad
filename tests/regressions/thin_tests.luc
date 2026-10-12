@@ -1,0 +1,71 @@
+## Thin Extrude's walls (CadSketch.thicken): a closed rectangle inside,
+## outside and centered on it, whichever way it was drawn; an open L to
+## its left and right (its ends closed); a circle inside; each extruded,
+## its volume the band's area times the height.
+from luce_cad.sketch import CadSketch
+from luce_cad.modeling import CadModeling
+from luce_geocore.geocore import Vector3, GeometrySet
+from checks import manifold, volume
+from luce_std import math
+
+func ground(s: CadSketch) -> GeometrySet!:
+    return s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0))
+
+## The band's volume, extruded 2 high, against `area` times 2.
+func band(s: CadSketch, area: float, what: str) -> unit!:
+    let solid = CadModeling.extruded_sides(ground(s), 2.0, 0.0, "t")
+    let mesh = solid.tessellate(32)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - area * 2.0) > 0.02:
+        print(f"{what}: volume {v}, expected {area * 2.0}")
+    assert(math.abs(v - area * 2.0) <= 0.02)
+
+## A 20 x 10 rectangle with its lines, drawn counterclockwise or clockwise.
+func rectangle(clockwise: bool) -> (CadSketch, list[int])!:
+    let s = CadSketch.parse("")
+    let xs = [0.0, 20.0, 20.0, 0.0]
+    let ys = [0.0, 0.0, 10.0, 10.0]
+    let points: list[int] = []
+    for at in 0..<4:
+        let k = 3 - at if clockwise else at
+        points.append(s.add_point(xs[k], ys[k]))
+    let lines: list[int] = []
+    for at in 0..<4:
+        lines.append(s.add_line(points[at], points[(at + 1) % 4]))
+    return (s, lines)
+
+pub func thin_tests() -> unit!:
+    for clockwise in [false, true]:
+        # Inside 1: the rectangle less 18 x 8.
+        let (a, lines_a) = rectangle(clockwise)
+        assert(a.thicken(lines_a, 1.0, 0.0) == 4)
+        band(a, 200.0 - 144.0, "inside")
+        # Outside 1: 22 x 12 less the rectangle.
+        let (b, lines_b) = rectangle(clockwise)
+        _ = b.thicken(lines_b, 0.0, 1.0)
+        band(b, 264.0 - 200.0, "outside")
+        # Centered, 0.5 each way: 21 x 11 less 19 x 9; the rectangle itself
+        # is construction.
+        let (c, lines_c) = rectangle(clockwise)
+        _ = c.thicken(lines_c, 0.5, 0.5)
+        assert(c.construction(lines_c[0]))
+        band(c, 231.0 - 171.0, "centered")
+    # An open L from (0, 0) to (10, 0) to (10, 5): to its left, a band 1
+    # wide inside the corner (10 + 4); to its right, outside it (10 + 6).
+    for left in [true, false]:
+        let s = CadSketch.parse("")
+        let p = [s.add_point(0.0, 0.0), s.add_point(10.0, 0.0), s.add_point(10.0, 5.0)]
+        let chain = [s.add_line(p[0], p[1]), s.add_line(p[1], p[2])]
+        _ = s.thicken(chain, 1.0 if left else 0.0, 0.0 if left else 1.0)
+        band(s, 14.0 if left else 16.0, "open L")
+    # A circle of radius 5, 1 inside: an annulus.
+    let ring = CadSketch.parse("")
+    let circle = ring.add_circle(ring.add_point(0.0, 0.0), 5.0)
+    _ = ring.thicken([circle], 1.0, 0.0)
+    band(ring, math.pi * 9.0, "circle")
+    var said = ""
+    _ = ring.thicken([circle], 6.0, 0.0) catch failure:
+        said = failure.message
+    assert(said.contains("radius"), said)
+    print("PASS thin walls: a rectangle thickened inside, outside and centered, drawn either way round; an open L to its left and right, its ends closed; a circle inside; too thick a wall in a circle refused")

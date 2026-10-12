@@ -15,8 +15,10 @@ does today.
 |---|---|
 | `extruded(set, distance, start, tag)` | The sketch's closed curves in `set`, as profile regions, each swept `distance` along the plane's normal from `start` along it. |
 | `extruded_sides(set, distance, other, tag, taper, other_taper, start)` | Fusion's Extrude directions: `distance` along the normal and `other` against it (one side, two sides, or symmetric with both alike), each side leaning in by its taper angle. |
-| `extruded_through(set, model, tag, direction, taper)` | Extent All: past the whole body along the normal (`1`), against it (`-1`) or both ways (`0`). |
-| `extruded_to(set, model, tag, face, offset, taper)` | Extent To Object: until the extrusion meets the named face's surface (extended past the face), `offset` further; with no face, until it meets the body. |
+| `extruded_through(set, model, tag, direction, taper, profiles, start)` | Extent All: past the whole body along the normal (`1`), against it (`-1`) or both ways (`0`), from the plane moved `start` along the normal. |
+| `extruded_to(set, model, tag, face, offset, taper, profiles, start, extend)` | Extent To Object, from the plane moved `start`, as Fusion's Extend says: `0` until the extrusion meets the named face's surface (extended past the face), `offset` further; `1` until it meets that face and the faces next to it; `2` until it meets the body holding the face; `3` through that body. With no face, `2` and `3` take the whole model. |
+| `extruded_from(set, model, tag, face, offset, extent, distance, target, target_offset, taper, profiles)` | Start: Object. From the named face's surface (moved `offset` along the way), a `distance` (the end follows the face's shape moved on), to face `target`, or through all. A face parallel to the sketch is a start offset. |
+| `revolved_to(set, origin, direction, tag, model, face, way, profiles)` | Revolve's To extent: turned about the axis, toward the plane's normal (`way` 1) or against it (-1), until the turn meets the named face's surface. |
 | `revolved(set, axis, tag, angle)` | Each region turned about the plane's u (`0`) or v (`1`) axis: a full turn, or `angle` radians closed by the profile at each end. |
 | `revolved_about(set, origin, direction, tag, angle)` | The same about any line in the sketch's plane: a sketch line, a body edge, a construction axis. |
 | `edge_axis(model, reference)` | A line edge's line, or a circular edge's axis, for Revolve. |
@@ -183,6 +185,31 @@ Extents that read a body:
   the surface is dropped. Offsets move the surface along the way the extrusion runs. B-spline faces
   are refused.
 - **To a body**: the long extrusion less the body, the lump at the profile.
+- **Through a body**: the long extrusion less the pieces of it past the body's last face (those
+  holding its far cap); refused when the extrusion passes beside the body.
+- **To adjacent faces**: as to a body, then checked: the piece kept may stop only on the face and
+  the faces sharing an edge with it, and must not run on past them (its far cap left). Otherwise it
+  is refused, naming To body and To selected face.
+- **A start offset** moves the levels' start along the normal for every extent; a target behind
+  the start is refused.
+
+**Start: Object** (`extent_starts.lucb`). A face parallel to the sketch is a start offset. Any
+other plane, cylinder, cone, sphere or torus bounds the extrusion: it is made long both ways, the
+part past the start surface (moved by the offset) is kept, and the far end is the start surface
+moved the distance along the normal, the target face's surface, or a plane past the body (All).
+Which side of a curved surface is past it is judged where the profiles' line meets it. A taper
+needs a parallel start. From a slanted or curved face, the volume is the profile's area times the
+distance, which `extent_start_tests` checks.
+
+**Revolve To** (`revolve_to.lucb`). The profiles are turned almost a whole turn the chosen way,
+the side of the face's surface away from them is taken away, and the piece holding the profile
+is kept (the turn's start cap, or its end cap when it was turned back to run the other way);
+refused when the turn comes round without meeting the surface.
+
+**Thin walls** (`sketch/thicken.lucb`, `CadSketch.thicken`). Thin Extrude's band round a chain:
+each side's boundary is the chain's offset copy (the chain itself at 0), a closed chain thickened
+inside and outside (by which way it turns), an open one to its left and right with its ends
+closed by lines; the chain becomes construction when both sides have a thickness.
 
 ### Revolve (`revolve.lucb`)
 
@@ -840,8 +867,7 @@ Roughly in order of usefulness:
    the loop turns a sharp corner rather than going on tangentially.
 4. **Coincident B-spline faces in booleans** (a B-spline face lying on another's surface): only
    analytic surfaces are recognized as coincident.
-5. **Sweep and loft;** Extrude's Thin option, a start offset by a face, and a start offset with the
-   To object and All extents; Revolve's To object extent.
+5. **Sweep and loft.**
 6. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
 7. **Shell of B-spline faces** and draft; Delete healing more than one strip or corner at a time (a chain of
    fillets), and faces with more than four neighbors.

@@ -1,0 +1,84 @@
+## Revolve's To extent (Fusion's Revolve, Type: To): the profiles turned
+## about their axis until they meet a face of the body, its surface
+## extended past the face as Extrude's To Object does. The profiles are
+## turned almost a whole turn the chosen way, the side of the face's
+## surface away from them is taken away, and the piece holding the profile
+## (the cap on it) is kept. Refused when the turn never meets the
+## surface before coming round (its end cap still on the kept piece).
+
+## How far the long turn goes: short of a whole turn, so its start and end
+## caps stay apart.
+let almost_whole = 2.0 * math.pi * 0.995
+
+## The profiles of `set` (keys `profiles`) turned about the line through
+## `origin` along `direction` (in the sketch's plane), toward the plane's
+## normal (`way` 1) or against it (-1), until they meet face `face` of
+## `model` (a plane, cylinder, cone, sphere or torus).
+func revolved_to_face(set: interop.Reference[GeometrySet], origin: Vector3, direction: Vector3, tag: str, model: const CadModel*, face: str, way: f64, profiles: str) -> interop.Reference[CadModel]!:
+    if face == "": error(invalid, "Revolve To: pick the face to turn to")
+    let axis = direction.normalized() catch failure: error(invalid, "a revolve's axis needs a direction")
+    let source = try set.get()
+    let size = try sketch_size(source)
+    let anchor = (try anchor_of(source, profiles)).point
+    # The kernel turns toward the plane's normal: about the axis by the sign
+    # of (axis x radial) . normal. The other way, the turn is turned back
+    # by its whole angle, so its end cap lies on the profile.
+    let offset = anchor.subtract(origin)
+    let radial = offset.subtract(axis.multiply_scalar(offset.dot(axis)))
+    let normal = (try sketch_plane_of(source)).normal
+    let sense = 1.0 if axis.cross(radial).dot(normal) >= 0.0 else -1.0
+    let turned = try CadModeling.revolved_about(set, origin, axis, tag, almost_whole, profiles)
+    defer turned.release()
+    let long = try CadModeling.moved_body(turned, Vector3(), origin, axis, 0.0 if way > 0.0 else -sense * almost_whole)
+    defer long.release()
+    var w = try shape_of(model)
+    defer w.close()
+    let target = try named_face(&w, face)
+    let s = &w.surfaces.items[(usize)w.faces.items[target].surface]
+    if s.kind == surface_spline: error(invalid, "Revolve To stops at a plane, cylinder, cone, sphere or torus face")
+    # Big enough to hold the body and the whole turn.
+    var reach = size + anchor.subtract(origin).length() * 2.0
+    for p in w.points.view(): reach = math.max(reach, p.subtract(origin).length() * 2.0)
+    let span = reach * 4.0
+    var name = Growing[u8]()
+    defer name.close()
+    try role_name(&name, tag, "to")
+    let cut = try kept_side(long.value(), s, anchor, span, (str)name.view())
+    defer cut.release()
+    # The cap on the profile: the turn's start, or its end when it was
+    # turned back to run the other way.
+    var start = Growing[u8]()
+    defer start.close()
+    try role_name(&start, tag, "start" if way > 0.0 else "end")
+    let kept = try lumps_named(cut.value(), (str)start.view(), "the revolve does not reach the face")
+    errdefer kept.release()
+    var end = Growing[u8]()
+    defer end.close()
+    try role_name(&end, tag, "end" if way > 0.0 else "start")
+    var check = try shape_of(kept.value())
+    defer check.close()
+    for f in 0..<check.faces.count:
+        if alias_starts(check.face_name(f), (str)end.view()): error(invalid, "the revolve comes round without meeting the face: turn the other way, or pick another face")
+    return kept
+
+## `solid` cut by surface `s`: the side holding `anchor` kept, the cut's
+## faces named `name`.
+func kept_side(solid: const CadModel*, s: const Surface*, anchor: Vector3, span: f64, name: str) -> interop.Reference[CadModel]!:
+    if s.kind == surface_plane:
+        let toward = s.origin.subtract(anchor).dot(s.z)
+        if math.abs(toward) <= span * 1e-9: error(invalid, "the profile lies on the face's plane: there is nothing to turn to")
+        # The plane's side away from the profile is taken away.
+        return try plane_bounded(solid, s.origin, s.z, s.x, s.z.multiply_scalar(1.0 if toward > 0.0 else -1.0), false, span, name)
+    let made = try surface_solid(s, 0.0, span)
+    defer made.release()
+    let placed = try made.value().placed(Matrix4(s.x, s.z, s.x.cross(s.z), s.origin))
+    defer placed.release()
+    let tool = try CadModeling.tagged(placed, name)
+    defer tool.release()
+    var w = try shape_of(tool.value())
+    defer w.close()
+    var rays = try shape_rays(&w)
+    defer rays.close()
+    let holds = try rays.inside(&w, anchor, span)
+    return try combine(solid, tool.value(), op_intersect if holds else op_subtract)
+

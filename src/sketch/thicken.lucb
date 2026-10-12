@@ -1,0 +1,91 @@
+## Thin Extrude's wall (Fusion's): a chain of curves made into the outline
+## of a band. Each side's boundary is the chain's offset copy (offset.lucb),
+## or the chain itself where that side's thickness is 0; an open chain's
+## ends are closed by lines between the two boundaries' ends. The chain's
+## own curves become construction when both sides have a thickness, so the
+## band's outline alone bounds a profile.
+
+## How many samples each curve gives a closed chain's turning.
+let turn_samples: usize = 24
+
+## The chain `curves` (end to end, in order) thickened `inner` and `outer`:
+## for a closed chain inside it and outside it, for an open one to its left
+## and its right as it runs. The new curves onto `out`.
+pub func thicken_chain(sketch: Sketch*, curves: const i64[], inner: f64, outer: f64, out: Growing[i64]*) -> !:
+    if curves.length == 0: error(invalid, "a thin wall needs curves")
+    if not math.is_finite(inner) or not math.is_finite(outer) or inner < 0.0 or outer < 0.0 or inner + outer <= 0.0: error(invalid, "a thin wall needs a positive thickness")
+    for c in curves:
+        if c < 0 or c >= (i64)sketch.entities.count or sketch.entity(c).kind == EntityKind.point or sketch.entity(c).kind == EntityKind.text:
+            error(invalid, "a thin wall follows curves (not points or text)")
+    out.clear()
+    # A lone circle: two concentric ones, or one beside it.
+    if curves.length == 1 and sketch.entity(curves[0]).kind == EntityKind.circle:
+        let e = sketch.entity(curves[0])
+        let r = sketch.radius_of(curves[0])
+        if inner >= r: error(invalid, "the wall is thicker than the circle's radius")
+        if inner > 0.0: try out.push(try sketch.add_circle(e.first, r - inner))
+        if outer > 0.0: try out.push(try sketch.add_circle(e.first, r + outer))
+        if inner > 0.0 and outer > 0.0: sketch.entities.items[(usize)curves[0]].construction = true
+        return
+    var reversed = Growing[bool]()
+    defer reversed.close()
+    try orient(sketch, curves, &reversed)
+    let ends_meet = try chain_closed(sketch, curves, reversed.view())
+    let closed = ends_meet or (curves.length == 1 and end_point(sketch, sketch.entity(curves[0]), true) < 0)
+    # The left of a closed chain is its inside when it turns counterclockwise.
+    var left = inner
+    var right = outer
+    let turn = try chain_turn(sketch, curves, reversed.view()) if closed else 0.0
+    if turn < 0.0:
+        left = outer
+        right = inner
+    # Each side's boundary ends (in the chain's order): its copy's, or the
+    # chain's own.
+    let first = sketch.entity(curves[0])
+    let last = sketch.entity(curves[curves.length - 1])
+    var bounds: i64[4] = [end_point(sketch, first, not reversed.items[0]), end_point(sketch, last, reversed.items[curves.length - 1]), 0, 0]
+    bounds[2] = bounds[0]
+    bounds[3] = bounds[1]
+    var made = Growing[i64]()
+    defer made.close()
+    if left > 0.0:
+        made.clear()
+        let (a, b) = try offset_side(sketch, curves, reversed.view(), left, 1.0, &made, false)
+        bounds[0] = a
+        bounds[1] = b
+        for c in made.view(): try out.push(c)
+    if right > 0.0:
+        made.clear()
+        let (a, b) = try offset_side(sketch, curves, reversed.view(), right, -1.0, &made, false)
+        bounds[2] = a
+        bounds[3] = b
+        for c in made.view(): try out.push(c)
+    if not closed:
+        try out.push(try sketch.add_line(bounds[0], bounds[2]))
+        try out.push(try sketch.add_line(bounds[1], bounds[3]))
+    if left > 0.0 and right > 0.0:
+        for c in curves: sketch.entities.items[(usize)c].construction = true
+
+## Twice the signed area a closed chain holds (positive: counterclockwise),
+## from its curves' samples in the chain's order.
+func chain_turn(sketch: const Sketch*, curves: const i64[], reversed: const bool[]) -> f64!:
+    var samples = Growing[f64]()
+    defer samples.close()
+    var xs = Growing[f64]()
+    defer xs.close()
+    var ys = Growing[f64]()
+    defer ys.close()
+    for at in 0..<curves.length:
+        try sample_curve(sketch, sketch.entity(curves[at]), turn_samples, &samples)
+        let count = samples.count // 2
+        for k in 0..<count:
+            let i = count - 1 - k if reversed[at] else k
+            let x = samples.items[2 * i]
+            if math.is_nan(x): continue
+            try xs.push(x)
+            try ys.push(samples.items[2 * i + 1])
+    var twice = 0.0
+    for k in 0..<xs.count:
+        let next = (k + 1) % xs.count
+        twice += xs.items[k] * ys.items[next] - xs.items[next] * ys.items[k]
+    return twice

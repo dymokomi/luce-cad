@@ -1,0 +1,149 @@
+## Extrude's Start: Object (Fusion's): the extrusion starts on a face of the
+## body rather than on the sketch's plane, `offset` further along the way it
+## runs.
+##
+## - A plane parallel to the sketch is a start offset: the levels start
+##   there (extents.lucb), and every extent and taper works as from the
+##   sketch's plane.
+## - Any other plane, or a cylinder, cone, sphere or torus, bounds the
+##   extrusion: the profiles are extruded long both ways, the part past the
+##   start surface is kept, and its far end is that surface moved the
+##   distance along the normal (Distance: the end face follows the start
+##   face's shape), the target face's surface (To object), or a plane past
+##   the whole body (All). A taper needs a start parallel to the sketch.
+##   The start face is named `<tag>/from/f<i>`, the end `<tag>/to/f<i>`.
+
+## Extent kinds of extruded_from: Distance, To object (a face), All.
+pub let from_distance: i64 = 0
+pub let from_to_face: i64 = 1
+pub let from_all: i64 = 2
+
+## The profiles of `set` extruded from face `face` of `model` (its surface
+## moved `offset` along the way the extrusion runs) by `extent`: `distance`
+## along the normal (its sign the way; All: only its sign), or to face
+## `target` moved `target_offset` on. `taper` (radians, positive in) only
+## from a start parallel to the sketch.
+func extruded_from_face(set: const GeometrySet*, model: const CadModel*, tag: str, face: str, offset: f64, extent: i64, distance: f64, target: str, target_offset: f64, taper: f64, profiles: str) -> interop.Reference[CadModel]!:
+    if extent < from_distance or extent > from_all: error(invalid, "an extrusion from an object runs a distance (0), to a face (1) or through all (2)")
+    if not math.is_finite(distance) or not math.is_finite(offset) or not math.is_finite(target_offset): error(invalid, "an extrusion's distances must be finite")
+    let size = try sketch_size(set)
+    let plane = try sketch_plane_of(set)
+    let n = plane.normal
+    var w = try shape_of(model)
+    defer w.close()
+    let start_face = try named_face(&w, face)
+    let s = &w.surfaces.items[(usize)w.faces.items[start_face].surface]
+    if s.kind == surface_spline: error(invalid, "Start from an object takes a plane, cylinder, cone, sphere or torus face")
+    # Which way the extrusion runs: the distance's sign, or toward the
+    # target face.
+    # Where the profiles' line meets the start face (the surface's point
+    # nearest the profiles' anchor): which side of a curved surface is past
+    # it is judged there.
+    let anchor = try anchor_of(set, profiles)
+    let at = try nearest_on_surface(&w, start_face, anchor.point)
+    var way = 1.0 if distance >= 0.0 else -1.0
+    if extent == from_to_face:
+        let toward = try face_middle(&w, try named_face(&w, target)).subtract(at).dot(n)
+        if math.abs(toward) <= size * 1e-6: error(invalid, "the face to extrude to is level with the start face")
+        way = 1.0 if toward > 0.0 else -1.0
+    elif extent == from_distance and math.abs(distance) < 1e-9:
+        error(invalid, "an extrusion needs a nonzero distance")
+    if s.kind == surface_plane and math.abs(math.abs(s.z.dot(n)) - 1.0) <= 1e-9:
+        # A parallel plane: a start offset.
+        let start = s.origin.subtract(plane.origin).dot(n) + way * offset
+        if extent == from_to_face:
+            return try extruded_to_target(set, model, tag, target, target_offset, taper, profiles, start, extend_face)
+        if extent == from_all:
+            return try extruded_through_body(set, model, tag, (i64)way, taper, profiles, start)
+        var levels = Growing[Level]()
+        defer levels.close()
+        try side_levels(distance, 0.0, taper, 0.0, start, &levels)
+        return try extruded_levels(set, profiles, levels.view(), tag)
+    if taper != 0.0: error(invalid, "a taper needs a start parallel to the sketch: set the taper to 0, or start from the profile plane")
+    let along = n.multiply_scalar(way)
+    let (low, high) = try reach_along(&w, plane.origin, n)
+    let reach = math.max(math.abs(low), math.abs(high)) * 2.0 + size * 4.0 + math.abs(distance) + math.abs(offset) + math.abs(target_offset)
+    var levels = Growing[Level]()
+    defer levels.close()
+    try side_levels(reach, reach, 0.0, 0.0, 0.0, &levels)
+    let long = try extruded_levels(set, profiles, levels.view(), tag)
+    defer long.release()
+    let span = reach * 4.0 + (high - low)
+    # Past the start surface (moved by the offset).
+    let started = try bounded(long.value(), s, along.multiply_scalar(offset), along, true, span, at.add(along.multiply_scalar(offset)), tag, "from")
+    defer started.release()
+    if extent == from_all:
+        # A plane square to the normal past the whole body.
+        let far = plane.origin.add(n.multiply_scalar((high if way > 0.0 else low) + way * ((high - low) * 0.01 + size * 0.001)))
+        var name = Growing[u8]()
+        defer name.close()
+        try role_name(&name, tag, "to")
+        let through = try plane_bounded(started.value(), far, n, plane.u, along, false, span, (str)name.view())
+        return try something_left(through)
+    # Distance: the start surface moved the distance on; To object: the
+    # target face's surface moved its offset on.
+    var end = s
+    var shift = along.multiply_scalar(offset + math.abs(distance))
+    var on = at.add(shift)
+    if extent == from_to_face:
+        let t = try named_face(&w, target)
+        end = &w.surfaces.items[(usize)w.faces.items[t].surface]
+        if end.kind == surface_spline: error(invalid, "To Object stops at a plane, cylinder, cone, sphere or torus face")
+        shift = along.multiply_scalar(target_offset)
+        on = try nearest_on_surface(&w, t, anchor.point).add(shift)
+    let ended = try bounded(started.value(), end, shift, along, false, span, on, tag, "to")
+    return try something_left(ended)
+
+## `made` itself, or an error when nothing of the profiles was left between
+## the start and the end.
+func something_left(made: interop.Reference[CadModel]) -> interop.Reference[CadModel]!:
+    errdefer made.release()
+    var w = try shape_of(made.value())
+    defer w.close()
+    if w.faces.count == 0: error(invalid, "nothing of the profiles lies between the start face and the end")
+    return made
+
+## `solid` cut by surface `s` moved by `shift`: what lies past it along
+## `along` (`past`), or before it. `on` is a point of the moved surface, to
+## tell which side of it a curved surface's solid holds. The cut's faces
+## are named `<tag>/<role>/f<i>`.
+func bounded(solid: const CadModel*, s: const Surface*, shift: Vector3, along: Vector3, past: bool, span: f64, on: Vector3, tag: str, role: str) -> interop.Reference[CadModel]!:
+    var name = Growing[u8]()
+    defer name.close()
+    try role_name(&name, tag, role)
+    if s.kind == surface_plane:
+        return try plane_bounded(solid, s.origin.add(shift), s.z, s.x, along, past, span, (str)name.view())
+    let made = try surface_solid(s, 0.0, span)
+    defer made.release()
+    let placed = try made.value().placed(Matrix4(s.x, s.z, s.x.cross(s.z), s.origin.add(shift)))
+    defer placed.release()
+    let tool = try CadModeling.tagged(placed, (str)name.view())
+    defer tool.release()
+    # Whether the solid's inside is the far side: a point just past the
+    # surface along the way.
+    var w = try shape_of(tool.value())
+    defer w.close()
+    var rays = try shape_rays(&w)
+    defer rays.close()
+    let step = span * 1e-5
+    let inside_far = try rays.inside(&w, on.add(along.multiply_scalar(step)), span)
+    let keep_inside = inside_far == past
+    return try combine(solid, tool.value(), op_intersect if keep_inside else op_subtract)
+
+## `solid` cut by the plane through `origin` facing `z` (`x` along it): what
+## lies past it along `along` (`past`), or before it; the cut's faces named
+## `name`.
+func plane_bounded(solid: const CadModel*, origin: Vector3, z: Vector3, x: Vector3, along: Vector3, past: bool, span: f64, name: str) -> interop.Reference[CadModel]!:
+    let facing = z.dot(along)
+    if math.abs(facing) < 1e-9: error(invalid, "the face runs along the extrusion: it cannot start or end it")
+    # A box past the plane: its inside is the far side.
+    let away = z.multiply_scalar(1.0 if facing > 0.0 else -1.0)
+    let sideways = x.subtract(away.multiply_scalar(x.dot(away))).normalized() catch failure: error(invalid, "a plane needs an axis across it")
+    let center = origin.add(away.multiply_scalar(span * 0.5))
+    let box = try CadSolids.box(span, span, span)
+    defer box.release()
+    let placed = try box.value().placed(Matrix4(sideways, away.cross(sideways), away, center))
+    defer placed.release()
+    let tool = try CadModeling.tagged(placed, name)
+    defer tool.release()
+    return try combine(solid, tool.value(), op_intersect if past else op_subtract)

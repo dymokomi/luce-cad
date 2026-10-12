@@ -1,0 +1,146 @@
+## Fusion's Extrude starts and To Object's Extend options, checked against
+## closed forms: a start offset with To object and All; To body, Through
+## body and To adjacent faces (refused where the extrusion meets other faces
+## first or runs past them); Start from an object: a parallel face (a start
+## offset), a slanted face and a cylinder's underside (the end follows the
+## start face moved on, so the volume is the profile's area times the
+## distance); Revolve To a face.
+from luce_cad.sketch import CadSketch
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3, GeometrySet
+from checks import manifold, volume
+from luce_std import math
+
+func solid(model: CadModel, expected: float, tolerance: float, what: str) -> unit!:
+    let mesh = model.tessellate(64)
+    manifold(mesh)
+    let v = volume(mesh)
+    if math.abs(v - expected) > tolerance:
+        print(f"{what}: volume {v}, expected {expected}")
+    assert(math.abs(v - expected) <= tolerance)
+
+## A sketch on the ground (XZ, normal +Y).
+func ground(s: CadSketch) -> GeometrySet!:
+    return s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0))
+
+## The name of the face of `model` whose outward normal is nearest `way`.
+func facing(model: CadModel, way: Vector3) -> str!:
+    var best = ""
+    var most = -2.0
+    for f in 0..<model.face_count():
+        let name = CadModeling.face_name_of(model, f)
+        let at = CadModeling.face_point(model, name)
+        if at.found and at.normal.dot(way) > most:
+            most = at.normal.dot(way)
+            best = name
+    return best
+
+pub func extent_start_tests() -> unit!:
+    let disc = CadSketch.parse("")
+    _ = disc.add_circle(disc.add_point(0.0, 0.0), 0.5)
+    let area = math.pi * 0.25
+    var said = ""
+    # A 2 x 2 x 2 box standing on y 1..3 over the disc.
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0).transformed(Vector3(0.0, 2.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), "box")
+    let bottom = facing(box, Vector3(0.0, -1.0, 0.0))
+    let top = facing(box, Vector3(0.0, 1.0, 0.0))
+    # Start offset 0.25 with To object: from y 0.25 to the bottom at 1.
+    solid(CadModeling.extruded_to(ground(disc), box, "e", bottom, start = 0.25), area * 0.75, 1e-3, "start offset to a face")
+    # With All: from 0.25 past the top; cut from the box, the same hole.
+    let through = CadModeling.extruded_through(ground(disc), box, "e", start = 0.25)
+    solid(CadModeling.combined(box, through, 1), 8.0 - area * 2.0, 0.01, "start offset through all")
+    # The start past the body is refused.
+    said = ""
+    _ = CadModeling.extruded_through(ground(disc), box, "e", start = 4.0) catch failure:
+        said = failure.message
+    assert(said.contains("other way"), said)
+    # To body (the box, picked by its top face): up to its bottom.
+    solid(CadModeling.extruded_to(ground(disc), box, "e", top, extend = 2), area, 1e-3, "to body")
+    # Through body: up to where it comes out, the top at 3.
+    solid(CadModeling.extruded_to(ground(disc), box, "e", top, extend = 3), area * 3.0, 1e-3, "through body")
+    # To adjacent faces: the bottom, which the disc meets first.
+    solid(CadModeling.extruded_to(ground(disc), box, "e", bottom, extend = 1), area, 1e-3, "to adjacent faces")
+    # The top's neighbors are the sides: the bottom, met first, is not one.
+    said = ""
+    _ = CadModeling.extruded_to(ground(disc), box, "e", top, extend = 1) catch failure:
+        said = failure.message
+    assert(said.contains("other faces"), said)
+    # A disc wider than the box runs on past the faces round its bottom.
+    let wide = CadSketch.parse("")
+    _ = wide.add_circle(wide.add_point(0.0, 0.0), 1.5)
+    said = ""
+    _ = CadModeling.extruded_to(ground(wide), box, "e", bottom, extend = 1) catch failure:
+        said = failure.message
+    assert(said.contains("runs past"), said)
+    # Through body beside the body: nothing of it is left.
+    let beside = CadSketch.parse("")
+    _ = beside.add_circle(beside.add_point(5.0, 0.0), 0.5)
+    said = ""
+    _ = CadModeling.extruded_to(ground(beside), box, "e", top, extend = 3) catch failure:
+        said = failure.message
+    assert(said.contains("beside"), said)
+    starts(disc)
+    revolve_to()
+    print("PASS extent starts: a start offset with To object and All; To body, Through body and To adjacent faces (other faces met first, and running past them, refused); Start from a parallel face, a slanted face and a cylinder's underside, by a distance, to a face and through all; Revolve To a wall's face either way (a quarter tube), refused when it comes round without meeting it")
+
+## Start from an object.
+func starts(disc: CadSketch) -> unit!:
+    let area = math.pi * 0.25
+    var said = ""
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0).transformed(Vector3(0.0, 2.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), "box")
+    let bottom = facing(box, Vector3(0.0, -1.0, 0.0))
+    let top = facing(box, Vector3(0.0, 1.0, 0.0))
+    # From the box's bottom (parallel: y = 1), 1 up; 0.5 further (an
+    # offset); to the top face; through all.
+    solid(CadModeling.extruded_from(ground(disc), box, "e", bottom, distance = 1.0), area, 1e-3, "from a parallel face")
+    solid(CadModeling.extruded_from(ground(disc), box, "e", bottom, offset = 0.5, distance = 1.0), area, 1e-3, "from a parallel face, offset")
+    solid(CadModeling.extruded_from(ground(disc), box, "e", bottom, extent = 1, target = top), area * 2.0, 1e-3, "from a face to a face")
+    let all = CadModeling.extruded_from(ground(disc), box, "e", bottom, extent = 2)
+    solid(CadModeling.combined(box, all, 1), 8.0 - area * 2.0, 0.01, "from a face through all")
+    # From a slanted face: a 4-box tilted 0.3 about Z, 5 up; from its
+    # underside 1 on, the unit square's prism between the face and its copy
+    # 1 higher: volume 1.
+    let square = CadSketch.parse("")
+    let p = [square.add_point(-0.5, -0.5), square.add_point(0.5, -0.5), square.add_point(0.5, 0.5), square.add_point(-0.5, 0.5)]
+    for at in 0..<4:
+        _ = square.add_line(p[at], p[(at + 1) % 4])
+    let tilted = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0).transformed(Vector3(0.0, 5.0, 0.0), Vector3(0.0, 0.0, 0.3), Vector3(1.0, 1.0, 1.0)), "tilted")
+    let under = facing(tilted, Vector3(0.0, -1.0, 0.0))
+    solid(CadModeling.extruded_from(ground(square), tilted, "e", under, distance = 1.0), 1.0, 1e-6, "from a slanted face")
+    # Downward from it, to the ground's height 0 would be through the
+    # sketch: 2 down instead, volume 2.
+    solid(CadModeling.extruded_from(ground(square), tilted, "e", under, distance = -2.0), 2.0, 1e-6, "from a slanted face, down")
+    # A taper from it is refused.
+    said = ""
+    _ = CadModeling.extruded_from(ground(square), tilted, "e", under, distance = 1.0, taper = 0.1) catch failure:
+        said = failure.message
+    assert(said.contains("parallel"), said)
+    # From a pipe's underside (radius 1 along Z, 3 up), 0.5 down: the
+    # square's prism between the curved face and its copy 0.5 lower.
+    let pipe = CadModeling.tagged(CadSolids.cylinder(1.0, 6.0).transformed(Vector3(0.0, 3.0, 0.0), Vector3(math.pi * 0.5, 0.0, 0.0), Vector3(1.0, 1.0, 1.0)), "pipe")
+    var side = ""
+    for f in 0..<pipe.face_count():
+        if pipe.face_surface_kind(f) == 1:
+            side = CadModeling.face_name_of(pipe, f)
+    solid(CadModeling.extruded_from(ground(square), pipe, "e", side, distance = -0.5), 0.5, 2e-3, "from a cylinder")
+
+## Revolve To: a 1 x 1 square at x 1..2 (on the XY plane) about the Y axis,
+## to the face x = 0 of a wall standing at x -4..0: a quarter tube,
+## 3 pi / 4, whichever way it turns; to the wall's underside (y = -1),
+## which the turn never crosses: refused.
+func revolve_to() -> unit!:
+    let s = CadSketch.parse("")
+    let p = [s.add_point(1.0, 0.0), s.add_point(2.0, 0.0), s.add_point(2.0, 1.0), s.add_point(1.0, 1.0)]
+    for at in 0..<4:
+        _ = s.add_line(p[at], p[(at + 1) % 4])
+    let xy = s.curves(Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0))
+    let wall = CadModeling.tagged(CadSolids.box(4.0, 3.0, 8.0).transformed(Vector3(-2.0, 0.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), "wall")
+    let face = facing(wall, Vector3(1.0, 0.0, 0.0))
+    for way in [1.0, -1.0]:
+        solid(CadModeling.revolved_to(xy, Vector3(), Vector3(0.0, 1.0, 0.0), "r", wall, face, way = way), math.pi * 0.75, 0.01, "revolve to a face")
+    var said = ""
+    _ = CadModeling.revolved_to(xy, Vector3(), Vector3(0.0, 1.0, 0.0), "r", wall, facing(wall, Vector3(0.0, -1.0, 0.0))) catch failure:
+        said = failure.message
+    assert(said.contains("comes round"), said)
