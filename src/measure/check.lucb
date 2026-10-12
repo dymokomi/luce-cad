@@ -16,8 +16,12 @@ let group_count: usize = 5
 
 ## How a check is made and drawn: the order asked for (0 to 3), stations
 ## per edge, the pass thresholds, combs (and samples per curved edge),
-## cross-curvature quills, and the combs' length scale (1: the largest
-## quill a tenth of the model).
+## cross-curvature quills, the combs' length scale (1: the largest quill a
+## tenth of the model), and whether sharp edges (creases: their faces at
+## more than crease_angle everywhere along them) are checked too; left out,
+## they still get combs.
+pub let crease_angle: f64 = 10.0
+
 pub struct CheckOptions:
     pub var level: i64 = 2
     pub var stations: i64 = 12
@@ -26,6 +30,7 @@ pub struct CheckOptions:
     pub var samples: i64 = 48
     pub var quills: bool = true
     pub var scale: f64 = 1.0
+    pub var sharp: bool = true
 
 struct Group:
     var points: Growing[Vector3]
@@ -38,6 +43,7 @@ pub struct CadCheck:
     var combs: Growing[CombSample]
     var groups: Group[5]
     var level: i64
+    var creases: i64
     var text: Growing[u8]
 
     pub func init():
@@ -46,6 +52,7 @@ pub struct CadCheck:
         self.combs = Growing[CombSample]()
         self.groups = [Group(Growing[Vector3]()), Group(Growing[Vector3]()), Group(Growing[Vector3]()), Group(Growing[Vector3]()), Group(Growing[Vector3]())]
         self.level = 2
+        self.creases = 0
         self.text = Growing[u8]()
 
     ## How many edges were checked.
@@ -71,6 +78,10 @@ pub struct CadCheck:
     pub func comb(index: i64) -> CombSample!:
         if index < 0 or (usize)index >= self.combs.count: error(invalid, "comb sample out of range")
         return self.combs.items[(usize)index]
+
+    ## How many sharp edges were left out (CheckOptions.sharp off).
+    pub func creases_left_out() -> i64:
+        return self.creases
 
     ## How many edges meet the level asked for.
     pub func passed() -> i64:
@@ -146,14 +157,19 @@ pub func check_model(model: const CadModel*, references: str, options: CheckOpti
         # Seams and open boundaries have no second face to compare.
         if f1 < 0 or f2 < 0: continue
         let made = try check_edge(&w, e, (usize)f1, (usize)f2, (usize)options.stations, limits, &check.stations)
-        try check.edges.push(made)
+        if not options.sharp and creased(check.stations.view()[(usize)made.first..]):
+            check.stations.count = (usize)made.first
+            check.creases += 1
+        else:
+            try check.edges.push(made)
         if options.combs:
             try spans.push(combs.count)
             try edge_comb(&w, e, (usize)options.samples, combs)
     try spans.push(combs.count)
     for s in combs.view(): largest = math.max(largest, s.curvature)
     for s in check.stations.view(): largest = math.max(largest, math.max(math.abs(s.curvature1), math.abs(s.curvature2)))
-    let scale = comb_scale(largest, 0.1 * size * options.scale)
+    # All flat (under the floor): nothing to draw, not noise blown up.
+    let scale = comb_scale(largest, 0.1 * size * options.scale) if largest > limits.curvature_floor else 0.0
     for e in check.edges.view():
         let group = check_passed if e.level >= options.level else (check_near if e.level == options.level - 1 else check_failed)
         let out = &check.groups[(usize)group].points
@@ -167,6 +183,12 @@ pub func check_model(model: const CadModel*, references: str, options: CheckOpti
             try comb_lines(combs.view()[spans.items[k]..<spans.items[k + 1]], scale, &check.groups[(usize)check_combs].points)
     try summarize(check, options.level)
     return result
+
+## Whether an edge's stations all meet at more than crease_angle.
+func creased(stations: const Station[]) -> bool:
+    for s in stations:
+        if s.angle <= crease_angle: return false
+    return true
 
 ## Edge `e` as point pairs: one for a line, 64 chords for a curve.
 func edge_polyline(w: const Shape*, e: usize, out: Growing[Vector3]*) -> !:
@@ -185,8 +207,8 @@ func level_mark(stations: const Station[], level: i64, size: f64, out: Growing[V
     if stations.length == 0: return
     let s = stations[stations.length // 2]
     let run = s.normal.cross(s.across)
-    let half = size * 0.012
-    let gap = size * 0.008
+    let half = size * 0.02
+    let gap = size * 0.012
     if level < 0:
         try out.push(s.point.add(s.across.add(run).multiply_scalar(half)))
         try out.push(s.point.subtract(s.across.add(run).multiply_scalar(half)))
@@ -224,6 +246,8 @@ func summarize(check: CadCheck*, level: i64) -> !:
         curvature = math.max(curvature, e.curvature)
         rate = math.max(rate, e.rate)
     var buffer: u8[512]
-    let line = try strings.format(buffer, f"{check.passed()} of {check.edges.count} edges G{level}; worst gap {gap:.6f}, angle {angle:.4f} deg, curvature {curvature:.3f}%, rate {rate:.3f}%")
+    var more: u8[64]
+    let note = (try strings.format(more, f" ({check.creases} sharp left out)")) if check.creases > 0 else ""
+    let line = try strings.format(buffer, f"{check.passed()} of {check.edges.count} edges G{level}{note}; worst gap {gap:.6f}, angle {angle:.4f} deg, curvature {curvature:.3f}%, rate {rate:.3f}%")
     check.text.clear()
     for byte in line.bytes: try check.text.push(byte)

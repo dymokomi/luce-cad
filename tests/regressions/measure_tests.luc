@@ -4,7 +4,8 @@
 ## pieces of a split face agree at every order), curvature combs (a
 ## cylinder's rim is uniform at 1 / r) and deviation maps (a sphere against
 ## a larger one: the difference of their radii everywhere, inside, to the
-## single precision tessellations keep their points in).
+## single precision tessellations keep their points in; a G1 fillet against
+## its box: r (1 - 1/√2) deep at its middle).
 from luce_cad.measure import CadMeasure, CadCheck
 from luce_cad.modeling import CadModeling, CadDirect
 from luce_cad.model import CadModel
@@ -17,7 +18,7 @@ pub func measure_tests() -> unit!:
     split_faces()
     cylinder_combs()
     deviation_map()
-    print("PASS measuring: fillet edges G1 (curvature 0 to 1/r), G2 (equal curvature, rate jumps) and G3 (equal rate); split faces equal at every order; uniform combs on a cylinder's rims; a sphere's deviation from a larger one is the radii's difference")
+    print("PASS measuring: fillet edges G1 (curvature 0 to 1/r, creases left out on request), G2 (equal curvature, rate jumps) and G3 (equal rate); split faces equal at every order; uniform combs on a cylinder's rims; a sphere's deviation from a larger one is the radii's difference, a G1 fillet's from its box r (1 - 1/√2)")
 
 ## A box's front top edge filleted to `r` at `continuity`.
 func filleted_box(r: float, continuity: int) -> CadModel!:
@@ -31,6 +32,18 @@ func filleted_box(r: float, continuity: int) -> CadModel!:
             if a.y > 1.99 and b.y > 1.99 and a.z > 1.99 and b.z > 1.99 and not (id in picked): picked.append(id)
     assert(picked.length == 1)
     return CadModeling.filleted(box, CadModeling.edge_references(box, picked), r, "f", continuity)
+
+## The B-rep edges of `model` along X off the box's own (a front top
+## fillet's contacts).
+func contact_edges(model: CadModel) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let a = model.face_edge_point(face, use, 0.0)
+            let b = model.face_edge_point(face, use, 1.0)
+            let id = model.face_edge_id(face, use)
+            if math.abs(a.x - b.x) > 1.0 and a.y > 0.0 and a.z > 0.0 and not (a.y > 1.99 and a.z > 1.99) and not (id in found): found.append(id)
+    return found
 
 ## The checked edges where the faces meet smoothly (the fillet's contacts).
 func smooth_edges(check: CadCheck) -> list[int]!:
@@ -73,6 +86,13 @@ func fillet_continuity() -> unit!:
         for index in 0..<check.edge_count():
             if not (index in contacts):
                 assert(check.edge(index).level == 0 and math.abs(check.edge(index).angle - 90.0) < 1e-6, f"a sharp edge at {check.edge(index).angle}")
+        # Creases left out: only the two contacts, the end arcs' combs kept.
+        let smooth_only = CadMeasure.check(filleted_box(r, continuity), level = continuity, sharp = false)
+        assert(smooth_only.edge_count() == 2 and smooth_only.creases_left_out() == check.edge_count() - 2 and smooth_only.comb_count() == check.comb_count(), smooth_only.summary())
+        # A G3 fillet's contacts alone are flat on both sides: no quills
+        # (noise is not drawn at a scale blown up to show it).
+        if continuity == 3:
+            assert(CadMeasure.check(filleted_box(r, continuity), CadModeling.edge_references(filleted_box(r, continuity), contact_edges(filleted_box(r, continuity))), level = 3).line_count(4) == 0)
         assert(check.line_count(0) > 0 and check.line_count(1) + check.line_count(2) > 0 and check.line_count(3) > 0 and check.line_count(4) > 0)
 
 ## A face split in two meets itself at every order: a cylinder's side and
@@ -120,5 +140,9 @@ func deviation_map() -> unit!:
     assert(spread.within == 0.0)
     let shown = spread.mesh()
     assert(shown.find_attribute("deviation", 0) >= 0 and shown.find_attribute("Cd", 0) >= 0)
+    let plain = CadModeling.tagged(CadSolids.box(4.0, 4.0, 4.0), "box")
+    let rounded = CadMeasure.deviation(filleted_box(0.75, 1), plain, 0.001, 0.1)
+    # A G1 fillet of 0.75 on the box: at its middle, 0.75 (1 - 1/√2) inside.
+    assert(math.abs(rounded.smallest + 0.75 * (1.0 - 1.0 / math.sqrt(2.0))) < 0.01 and math.abs(rounded.largest) < 1e-6, f"{rounded.smallest} to {rounded.largest}")
     let itself = CadMeasure.deviation(small, small, 1e-6, 1e-3)
     assert(math.abs(itself.largest) < 1e-6 and math.abs(itself.smallest) < 1e-6 and itself.within == 1.0)

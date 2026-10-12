@@ -958,7 +958,7 @@ after Alias's Evaluate tools. luced-3d's Check node draws what it returns.
 
 | `CadMeasure.` | What it does |
 |---|---|
-| `check(model, references, level, stations, distance, angle, curvature, rate, combs, samples, quills, scale)` | The edges `references` names (empty: every edge between two faces) checked for continuity `level` (0 to 3) at `stations` per edge. Returns a `CadCheck`: per edge (`edge(i)`, an `EdgeCheck`) its faces, its worst gap, angle and curvature and rate differences, and the highest order every station meets; per station (`station(i)`) the values behind them; the comb samples (`comb(i)`); `passed()`, `summary()`; and the lines to draw by group (`line_count`, `line_point`; Base readers `check_lines`). |
+| `check(model, references, level, stations, distance, angle, curvature, rate, combs, samples, quills, scale, sharp)` | The edges `references` names (empty: every edge between two faces) checked for continuity `level` (0 to 3) at `stations` per edge. Returns a `CadCheck`: per edge (`edge(i)`, an `EdgeCheck`) its faces, its worst gap, angle and curvature and rate differences, and the highest order every station meets; per station (`station(i)`) the values behind them; the comb samples (`comb(i)`); `passed()`, `summary()`; how many creases were left out (`creases_left_out()`; without `sharp`, edges whose faces meet at more than 10° all along them are not checked, though they keep their combs); and the lines to draw by group (`line_count`, `line_point`; Base readers `check_lines`). |
 | `deviation(model, reference, acceptable, ramp, segments)` | `model`'s tessellation with point attributes `deviation` (its signed distance from `reference`'s surfaces) and `Cd` (a color ramp), and its largest, smallest, mean and RMS deviation, and the share within `acceptable`. |
 
 **Jets** (`geometry/jets.lucb`). Continuity to G3 needs third derivatives. `basis_jet` extends
@@ -1007,10 +1007,12 @@ not checked.
   every station, just behind and just ahead of the edge. Equal quills mean G2; a jump shows as two
   lengths.
 
-At scale 1, the longest quill is a tenth of the model's size.
+At scale 1, the longest quill is a tenth of the model's size. When every curvature is under the
+flat floor, nothing is drawn: a scale fitted to rounding noise would draw it as quills.
 
-**Deviation** (`measure/deviation.lucb`). Each point of the measured model's tessellation is
-matched to the nearest face of the reference's tessellation (geocore's triangle BVH). The point is
+**Deviation** (`measure/deviation.lucb`). Each point of the measured model's tessellation (its
+edges at most an eightieth of its size: the display tessellation leaves ruled faces without inner
+points) is matched to the nearest face of the reference's tessellation (geocore's triangle BVH). The point is
 then dropped onto that face's exact support. The distance is signed by the reference's outward
 normal and computed in parallel. Colors:
 
@@ -1035,8 +1037,8 @@ Tests (`tests/contracts/jets_contract.lucb`, `tests/regressions/measure_tests.lu
 - **Split faces.** The pieces of a cylinder's side and of a G3 fillet's strip, cut by Split Face,
   are equal at every order.
 - **Combs.** A cylinder's rims comb at exactly 1/r, pointing out from the axis.
-- **Deviation.** A sphere of 10 lies 0.5 inside one of 10.5 everywhere, and a model's deviation
-  from itself is zero.
+- **Deviation.** A sphere of 10 lies 0.5 inside one of 10.5 everywhere; a box's G1 fillet of r
+  lies r (1 - 1/√2) inside the box at its middle; a model's deviation from itself is zero.
 
 Not yet: combs on isoparms and on curves on surfaces (Stage 2 brings 3D curves), inflection
 marks and torsion quills, a radius band on combs, and checks between faces that share no edge
