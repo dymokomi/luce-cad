@@ -116,9 +116,35 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
     var name = Growing[u8]()
     defer name.close()
     try blend_name(w, e, tag, &name)
-    let tool = try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), law.smooth, (str)name.view(), convex_edge, continuity, &ends, tangency)
+    # Fusion rolls a ball at G1 under the weight of 1 (exactly; 0.999 and
+    # 1.001 scale the section): one straight piece of the law makes a cone.
+    var cone = -1.0
+    if continuity == 1 and tangency == 1.0 and kept_at.count == 2 and not law.smooth:
+        cone = rolling_weight(theta, (kept_sizes.items[1] - kept_sizes.items[0]) / (length * (kept_at.items[1] - kept_at.items[0])))
+    let tool = try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), law.smooth, (str)name.view(), convex_edge, continuity, &ends, tangency, cone)
     defer tool.release()
     return try combine(model, tool.value(), op_subtract if convex_edge else op_union)
+
+## The middle weight of the section square to the edge of the cone a ball
+## rolls out between flat faces `theta` apart, its radius growing `slope`
+## per length along the edge (Fusion's G1 at a Tangency weight of 1 along a
+## straight law): the section is the conic tangent to both faces at the
+## contacts (the ball touches each face at the foot of its center, r cot
+## (θ/2) from the edge), its middle control point the edge's own point, and
+## one weight all along (every section is the first scaled about the
+## cone's apex, on the edge where the radius would be 0). Along the
+## bisector, at d from the edge, the cone (its axis the centers' line, its
+## half angle sin α = m / |c'| for c' = (1, m / sin(θ/2)) along and across)
+## meets the plane square to the edge at
+##   d / r = (1 / sin(θ/2) - √(1 + m² / sin²(θ/2) - m²)) / (1 - m²),
+## and the conic's shoulder there gives w = r cos²(θ/2) / (sin(θ/2) d) - 1:
+## sin(θ/2), the circle's, when the radius holds (m = 0).
+func rolling_weight(theta: f64, slope: f64) -> f64:
+    let half = math.sin(theta * 0.5)
+    let m2 = slope * slope
+    let reach = (1.0 / half - math.sqrt(1.0 + m2 / (half * half) - m2)) / (1.0 - m2)
+    let c = math.cos(theta * 0.5)
+    return c * c / (half * reach) - 1.0
 
 ## The planes a variable radius tool ends in, at its start and end
 ## (outward normals, offsets), where `slanted` (else it ends square).
@@ -176,7 +202,14 @@ func ends_square(w: const Shape*, v: i64, fa: usize, fb: usize, along: Vector3) 
 ## `ends` says an end is slanted, each row of the net stops in that end's
 ## plane: its first (last) piece runs from there, the same polynomial, so
 ## every row keeps the knots and the end's section lies in the plane.
-func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, reach: f64, weight: f64, positions: const f64[], radii: const f64[], smooth: bool, name: str, convex_edge: bool, continuity: i64, ends: const EndPlanes*, tangency: f64) -> interop.Reference[CadModel]!:
+## With `cone` 0 or more (a G1 ball rolling, one straight piece:
+## rolling_weight) the section's middle weight is that, and each row, a
+## line through the cone's apex, is rational: weighted inversely to the
+## radius where it starts and ends, so the rows at a slanted end, stopped
+## at different radii, still meet in a section of the cone (a row's part
+## along the cone's rulings is then the same for every row: the surface
+## stays on the cone).
+func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, reach: f64, weight: f64, positions: const f64[], radii: const f64[], smooth: bool, name: str, convex_edge: bool, continuity: i64, ends: const EndPlanes*, tangency: f64, cone: f64 = -1.0) -> interop.Reference[CadModel]!:
     let pieces = positions.length - 1
     let count = 3 * pieces + 1
     # Along: a cubic Bezier per piece, knots thrice at each point.
@@ -201,7 +234,7 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
         try unit_section.push(ub.multiply_scalar(reach))
         let k6: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
         try section_knots.assign(k6[..<6])
-        let x3: f64[3] = [1.0, weight * tangency, 1.0]
+        let x3: f64[3] = [1.0, cone if cone >= 0.0 else weight * tangency, 1.0]
         try section_weights.assign(x3[..<3])
     else:
         try fillet_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), continuity, &unit_section, &section_knots, tangency)
@@ -240,6 +273,17 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
             for m in 0..<(usize)4:
                 if j > 0 and m == 0: continue
                 let s = a + (b - a) * (f64)m / 3.0
+                if cone >= 0.0:
+                    # The line's ends weighted by the first radius over
+                    # theirs, raised to a cubic.
+                    let w0 = section_weights.items[u] * radii[0] / v0
+                    let w1 = section_weights.items[u] * radii[0] / v3
+                    let f = (f64)m / 3.0
+                    let h = start.add(length.multiply_scalar(a)).add(q.multiply_scalar(v0)).multiply_scalar(w0 * (1.0 - f)).add(start.add(length.multiply_scalar(b)).add(q.multiply_scalar(v3)).multiply_scalar(w1 * f))
+                    let hw = w0 * (1.0 - f) + w1 * f
+                    try net.push(h.multiply_scalar(1.0 / hw))
+                    try weights.push(hw)
+                    continue
                 try net.push(start.add(length.multiply_scalar(s)).add(q.multiply_scalar(values[m])))
                 try weights.push(section_weights.items[u])
     let middle_r = radius_at(positions, radii, smooth, 0.5)
@@ -259,24 +303,25 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
     let to_b0 = try b.add_line(e0, b0)
     let to_a1 = try b.add_line(e1, a1)
     let to_b1 = try b.add_line(e1, b1)
-    var row = Growing[Vector3]()
-    defer row.close()
-    var ones = Growing[f64]()
-    defer ones.close()
-    try ones.fill(count, 1.0)
-    try row.assign(net.view()[0..<count])
-    let curve_a = try b.add_spline_edge(a0, a1, row.view(), ones.view(), 3, knots.view(), true)
-    try row.assign(net.view()[last_row..<last_row + count])
-    let curve_b = try b.add_spline_edge(b0, b1, row.view(), ones.view(), 3, knots.view(), true)
+    # The edges: the first and last rows (the contacts) and columns (the
+    # end sections), with the net's own weights.
+    let curve_a = try b.add_spline_edge(a0, a1, net.view()[0..<count], weights.view()[0..<count], 3, knots.view(), true)
+    let curve_b = try b.add_spline_edge(b0, b1, net.view()[last_row..<last_row + count], weights.view()[last_row..<last_row + count], 3, knots.view(), true)
     var first = Growing[Vector3]()
     defer first.close()
     var last = Growing[Vector3]()
     defer last.close()
+    var first_weights = Growing[f64]()
+    defer first_weights.close()
+    var last_weights = Growing[f64]()
+    defer last_weights.close()
     for u in 0..<rows:
         try first.push(net.items[u * count])
         try last.push(net.items[u * count + count - 1])
-    let arc0 = try b.add_spline_edge(a0, b0, first.view(), section_weights.view(), degree, section_knots.view(), true)
-    let arc1 = try b.add_spline_edge(a1, b1, last.view(), section_weights.view(), degree, section_knots.view(), true)
+        try first_weights.push(weights.items[u * count])
+        try last_weights.push(weights.items[u * count + count - 1])
+    let arc0 = try b.add_spline_edge(a0, b0, first.view(), first_weights.view(), degree, section_knots.view(), true)
+    let arc1 = try b.add_spline_edge(a1, b1, last.view(), last_weights.view(), degree, section_knots.view(), true)
     # The blend face: outward toward the ball's center (away from the edge,
     # the tool lying between the edge and the face, either way).
     let surface = try b.add_spline_surface(net.view(), weights.view(), (i64)rows, (i64)count, degree, 3, section_knots.view(), knots.view())

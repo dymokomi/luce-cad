@@ -361,12 +361,17 @@ whether the plane cuts it at all.
 ### Chamfer and fillet (`blend.lucb`)
 
 A rim's tool is its corner profile turned about the rim's axis: a cone for a chamfer, a torus for a
-fillet. A rim between a flat face and a sphere about its axis (a dome's edge) is chamfered by a
-section of its own (`sphere_rims.lucb`): the chamfer's second distance is a chord to the sphere's
-meridian circle, and the section closes back over the sphere's tangents at the edge and at the
-contact, so the sphere's sliver beyond the chord goes too. A fillet there, along the whole rim, is a
-ball rolling between the plane and the sphere (`curved_blend.lucb`, its rows exact arcs:
-`curved_turned.lucb`), G1 a torus as Fusion's; an arc of such a rim alone is refused.
+fillet. A rim between a flat face and a sphere about its axis (a dome's edge), along its whole loop,
+is blended directly, with no booleans (`curved_blend.lucb`, its rows turned exactly:
+`curved_turned.lucb`): a fillet is a ball rolling between the plane and the sphere (G1 a torus, as
+Fusion's), a chamfer the line between its contacts turned, an exact cone from the plane's circle to
+the sphere's (the distance on the sphere a chord to its meridian circle), the sphere's sliver beyond
+the chord gone with the face trimmed at the contact. **Verified against Fusion 2705** (probe 5 of
+2026-10-12, `fusion_chamfer_tests`): domes cut at their middle, 4 above it and 4 below it, chamfered
+Equal distance, Two distances and Distance and angle each way, Fusion's circles to 1e-5 and its
+volumes. (The cone tool these took before, through the booleans, could not cut the dome cut above its
+middle.) An arc of such a rim alone is chamfered by that tool still (`sphere_rims.lucb`: the section
+closes back over the sphere's tangents at the edge and at the contact); filleting it is refused.
 
 These are the first rows of OpenCASCADE's ChFiKPart table, made with booleans. Each edge (or chain
 of collinear pieces) between two flat faces gets a tool solid and has it subtracted:
@@ -462,6 +467,13 @@ along the curve"). The chain starts at an open end, the first named edge's chain
 for a closed loop at the first named edge's start; a closed loop's start and end radii must agree.
 Between points the radius is held a moment at each (smooth: t²(3 − 2t) between) or straight. G1,
 G2 and G3, under a Tangency weight (each section the weight's at its radius: Tangency weight below).
+**Where Fusion rolls a ball** (probe 5 of 2026-10-12): at G1 under a Tangency weight of exactly 1
+(0.999 and 1.001 scale the section), along any law; every other weight and G2 scale the section.
+Along a straight law between two radii here (one straight edge between flat faces) the ball rolls
+too: its face is the cone Fusion makes (below). Fusion's law between radii given at mid points is its
+own (a smooth transition, flat at each extreme and beside equal neighbours, straight only where the
+points line up; probes 5 and 6 decode it from its faces' contact rows), not either of the laws here;
+with mid points, and along chains, G1 at weight 1 scales the section as the other weights do.
 - **Chains** are built as a constant fillet's are, the radius asked of the law at each section:
   loops round a flat face and their run-outs (`cap_blend.lucb`: a box's top past rounded uprights,
   an edge ending where an earlier fillet's edge goes on), loops between two curved faces
@@ -471,7 +483,19 @@ G2 and G3, under a Tangency weight (each section the weight's at its radius: Tan
   edge's point plus r(s) times a fixed vector (G1: the rational quadratic arc whose middle control
   point is the edge's own point, weight sin(θ/2), contacts r cot(θ/2) along each face; G2, G3: the
   fillet's B-spline on those contacts), so with r(s) a piecewise cubic the face is a B-spline, cubic
-  along with a knot thrice at each point. Its tool is the region between the edge and that face,
+  along with a knot thrice at each point.
+- **The rolled ball** (G1 at weight 1, a straight law: `rolling_weight`): the balls' envelope is a
+  cone, its apex on the edge where the radius would be 0, its axis the centers' line, its half angle
+  sin α = m / |c'| for the radius' slope m along the edge (c' = (1, m / sin(θ/2)) along and across).
+  Its section square to the edge is the conic tangent to both faces at the same contacts (each ball
+  touches a face at the foot of its center), its middle control point the edge's own point, and one
+  weight w all along (each section is the first scaled about the apex): at the bisector the cone lies
+  d / r = (1 / sin(θ/2) − √(1 + m² / sin²(θ/2) − m²)) / (1 − m²) from the edge, so
+  w = r cos²(θ/2) / (sin(θ/2) d) − 1 (sin(θ/2), the circle's, when m = 0). Fusion 2705's face there
+  is that cone (its apex, axis and half angle 0.19366 read back on a 20 box's edge, 2 to 6), and its
+  volumes on edges of 90°, 120° and 60° are ours (`fusion_probe_tests`). Each row, a ruling of the
+  cone, is rational, weighted inversely to the radius at its ends, so rows stopped at a slanted end at
+  different radii still meet in a section of the cone. Its tool is the region between the edge and that face,
   taken away (added for an inside edge); its net keeps to one side of each face's plane. Ends:
   - square to the edge: flush;
   - any other flat end face, leaning either way (a slanted end, a wall a convex edge runs into, an
@@ -481,7 +505,8 @@ G2 and G3, under a Tangency weight (each section the weight's at its radius: Tan
     Reaching past and letting the end face trim the strip was tried first: a G2 strip's marched
     crossing with a slanted face, tangent to the cap's edge at the contact, could not be split.
 
-`fillet_option_tests` checks the volume taken along a box's edge against (1 − π/4) × ∫ r² ds;
+`fillet_option_tests` checks the volume taken along a box's edge against the cone's corner area × ∫ r² ds
+(straight) and (1 − π/4) × ∫ r² ds (smooth);
 `variable_chain_tests` checks G2 and G3 against their sections' areas, a slanted end exactly in its
 face's plane (by the classifier; the sheared strip's mesh volume is within 0.3% of the constant
 fillet's), an edge running into a leaning wall against the flush tool less the wedge
@@ -491,31 +516,47 @@ fillet meets other fillets in one feature (three edges at a vertex) are not buil
 variable sets are one tangent chain each too.
 
 **Chamfer types and distances** (`chamfers.lucb`). Fusion's Chamfer has Equal distance, Two
-distances and Distance and angle. Each distance is measured from the original edge (what Autodesk's
-forum answers say), here in the plane square to the edge, straight to where the chamfer meets the
-face: along a flat face that is the distance along it, on a curved face a chord (Parasolid calls this
-an apex range). **Verified against Fusion 2705** (probe of 2026-10-12, `fusion_probe_tests`): a dome
-of radius 10 chamfered 3 at its rim meets the sphere on the circle of 9.55, 2.96606 from the rim's
-plane, 3.000 straight from the rim (along the arc it would be 3.011), and the plane on the circle of
-7; Fusion's volume 1833.0211 is what the chord gives, to 1e-7. The first distance goes on the face more of the chosen edges lie on (a loop's own face),
-a tie by name, and Flip swaps. Distance and angle leaves the first face at the angle, so the second
-leg is d·sin θ / sin(φ + θ) for faces φ apart (d·tan θ when square); Autodesk staff have said
-Fusion's own Distance and angle misbehaves where the faces are not square, so this follows the
-geometry rather than that. All three take the same paths as Equal distance: loops round a flat face
-(`cap_blend.lucb`, its legs per corner, so a drafted wall's second leg follows the draft), loops
-between curved faces (`curved_blend.lucb`, the corner from the faces' tangent planes at each
-section), and the booleans' tools (straight edges, rims, a plane on a cylinder, inside edges).
+distances and Distance and angle. Each distance is measured from the original edge, in the plane
+square to the edge, straight to where the chamfer meets the face: along a flat face that is the
+distance along it, on a curved face a chord (Parasolid calls this an apex range). A dome of radius 10
+chamfered 3 at its rim meets the sphere on the circle of 9.55, 2.96606 from the rim's plane, 3.000
+straight from the rim (along the arc it would be 3.011), and the plane on the circle of 7.
+- **Which face takes the first distance**: the one more of the chosen edges lie on (a loop's own
+  face); on a tie a curved face over a flat one (Fusion's on a dome's sphere and a D-shaft's
+  cylinder), then by name; Flip swaps.
+- **Distance and angle** leaves the first face at the angle from that face's own tangent at its
+  contact, in the plane square to the edge, and runs on until it meets the other face (`angle_leg`;
+  `angled_point` between curved faces). Between flat faces φ apart the second leg is
+  d·sin θ / sin(φ + θ) (d·tan θ when square). On a curved first face the tangent is the contact's,
+  not the edge's: a dome's rim chamfered 3 on the sphere at 30° meets the plane on the circle of
+  8.879, the cone's half angle 12.75°, as Fusion's (the edge's tangent would give 1930.76, not
+  Fusion's 1981.44).
+- **Verified against Fusion 2705** (probes 5 and 6 of 2026-10-12, `fusion_chamfer_tests`): the
+  domes cut at 0, 4 and −4 and a D-shaft's flat edge, each type and way: Fusion's contacts and
+  volumes (its volume is the dome less the triangle and the sphere's segment beyond the chord
+  turned about the axis, to 1e-4).
+
+All three take the same paths as Equal distance: loops round a flat face (`cap_blend.lucb`, its legs
+per corner, so a drafted wall's second leg follows the draft), loops between curved faces or a flat
+face and a sphere (`curved_blend.lucb`), and the booleans' tools (straight edges, rims, a plane on a
+cylinder, inside edges).
 
 **A plane meeting a cylinder along its length** (a D-shaft's flat, a slot's side) is blended by a
 cylinder parallel to the axis. A fillet's center is where the plane moved by the radius meets the
 cylinder moved by it: a radius of R − r or R + r, by which sides the material and the corner are on.
 Its section closes back along the cylinder's own circle, not a chord, so it takes no material the
-fillet keeps. At G2 the section is Fusion's (below) on the corner where the plane meets the
-cylinder's tangent at the contact, its inner point there moved so its curvature is the cylinder's,
-under any Tangency weight: Fusion's volumes at 0.5, 1 and 2 (`fusion_probe_tests`). A weighted G1
-(a conic) and G3 touch the cylinder only tangentially, and the booleans can't trace that crossing
-yet: refused. A chamfer runs `size` along the plane and reaches the circle `size` straight from the
-edge (a chord, as every chamfer's distance on a curved face: `chamfers.lucb`).
+fillet keeps. Under a Tangency weight G1 is Fusion's conic, and G2 Fusion's section (below), each on
+the corner where the plane meets the cylinder's tangent at the contact, G2's inner point there moved
+so its curvature is the cylinder's; G3 matches the cylinder's curvature and its change (below).
+**Verified against Fusion 2705** (`fusion_probe_tests`): G1 and G2 at weights 0.5, 1 and 2 take
+Fusion's volumes; G3 (not in Fusion) is measured G3 at both contacts. Each of these sections touches
+the cylinder only tangentially, so the booleans meet the swept section with the cylinder along it in
+closed form (`splines.lucb`, `along_sweep`: lines along the sweep through the profile's points on
+the cylinder, its touching ends found exactly), as they meet a plane along it. A G3 section weighted
+heavily (2 here) would cross the cylinder between its contacts (its inner points lie along the
+cylinder's tangent): refused, naming the weight. A chamfer runs `size` along the plane and reaches
+the circle `size` straight from the edge (a chord, as every chamfer's distance on a curved face:
+`chamfers.lucb`; Fusion's contacts and volumes for each type, `fusion_chamfer_tests`).
 
 **Inside corners** (concave edges, where faces meet at more than 180° through the solid) take
 material rather than losing it. The corner profile is the same shape, lying in the air between the
@@ -543,7 +584,14 @@ fillet's contact points. Degree 5 is the element every freeform curve and patch 
   the section, so the curvature matches the face's at the contact, as Fusion's does (its dome and
   D-shaft sections show it).
 - **G3** (not in Fusion): three spans (knots at the thirds), eight control points. The first four on
-  each side lie along that face, at 0, 0.1, 0.2 and 0.6.
+  each side lie along that face, at 0, 0.1, 0.2 and 0.6. On a curved face the third and fourth move
+  off the leg toward the face's center of curvature, so the section's curvature and its change at the
+  contact are the face's (`g3_leg`): with the knots at the thirds the start's first three
+  derivatives are 15 D0, 90 D1 − 180 D0 and 270 D2 − 1215 D1 + 1620 D0 (D_i the legs between the
+  points), so for the first leg a1 the curvature 0.4 h2 / a1² gives the third point's offset
+  h2 = 2.5 κ a1², and the change of curvature the fourth's (the face's change along the section,
+  `curvature_turn`; nil on a sphere or a cylinder's circle). A dome's rim and a D-shaft's flat edge at
+  G3 measure G3 at both contacts (`fusion_probe_tests`, `CadMeasure.check`).
 
 The curvature is then zero where the curve meets a flat face, and for G3 so is its rate of change.
 For a square corner with contacts a unit from it, the middles are 0.366 (G2) and 0.360 (G3) from the
@@ -555,7 +603,9 @@ corner itself, and its curvature would peak at 3 to 6.5 times the circle's.
 The blend face is that curve swept along the edge, a B-spline surface. `splines.lucb` lets booleans
 meet a plane with such a swept profile in closed form:
 - **A plane crossing the sweep** cuts it in an affine copy of the profile.
-- **A plane along the sweep** cuts it in lines through the profile's points on the plane.
+- **A plane along the sweep** cuts it in lines through the profile's points on the plane, and so
+  does **a cylinder along it** (its axis the sweep's way: a D-shaft's cylinder, which a weighted G1,
+  G2 or G3 section touches only tangentially at its end).
 
 At a G2 contact, curves stay within tolerance of the face they touch over a stretch, so two rules
 keep that stretch from producing false crossings:
@@ -593,11 +643,10 @@ lines its end control points lie on, so the continuity at the faces stays. **Ver
   points' speed so nearly w times, as Fusion's G2's, its inner ones never past the corner.
 Every path takes it: the direct strips, setback corners, loops round a flat face, loops between
 curved faces (a dome's rim: Fusion's volumes at G1 and G2, 0.5 to 2), a plane meeting a cylinder
-along it (G2 only), and variable radius (`variable_filleted`): along a box's edge, 2 to 6 straight,
-G2 at 0.5, 1, 2 and G1 at 0.5 and 2 take Fusion's volumes. G1 at weight 1 there differs: Fusion
-rolls a ball (its face a cone, 7926.5667), ours scales the circle in planes square to the edge
-(7925.6047); Fusion's own weighted G1 scales the conic as ours does. Full round takes no weight (Fusion's
-Full Round has none). `tangency_tests` checks that a box edge keeps more of its corner as the weight
+along it (Fusion's volumes at G1 and G2, 0.5 to 2), and variable radius (`variable_filleted`):
+along a box's edge, 2 to 6 straight, G2 at 0.5, 1, 2 and G1 at 0.5, 0.9, 0.99, 0.999, 1.001,
+1.01, 1.1 and 2 scale the section with the radius, and G1 at exactly 1 rolls a ball (Variable
+radius below), all Fusion's volumes. Full round takes no weight (Fusion's Full Round has none). `tangency_tests` checks that a box edge keeps more of its corner as the weight
 rises at G1, G2 and G3, that 1 is the plain fillet, corners and a cap loop.
 
 **Setback corners.** Three G2 or G3 fillets meeting at a corner of three flat faces can't be rounded

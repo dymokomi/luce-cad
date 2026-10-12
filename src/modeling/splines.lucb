@@ -1,7 +1,8 @@
 ## B-spline surfaces in modeling: their chart (the surface's own parameters,
-## found by inversion), normals, and where a plane cuts a profile swept
-## straight (a surface of linear extrusion: two rows of control points, the
-## second the first moved by one vector), in closed form. Blends of G2 and
+## found by inversion), normals, and where a plane or a cylinder along the
+## sweep cuts a profile swept straight (a surface of linear extrusion: two
+## rows of control points, the second the first moved by one vector), in
+## closed form. Blends of G2 and
 ## G3 continuity are such surfaces (blend.lucb), as are extruded splines.
 ## Other pairs with B-spline surfaces are not supported yet.
 
@@ -52,26 +53,32 @@ func plane_extrusion(w: Shape*, p: const Surface*, s: const Surface*, sweep: Vec
         let spline = try w.store_spline(moved.view(), weights.view(), knots.view(), s.du, Matrix4())
         try out.push(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline))
         return
-    # Along the sweep: where the profile (v = 0) meets the plane.
-    let samples = 64 * nu
+    try along_sweep(p, s, along, tol, out)
+
+## Where `other`, a plane or a cylinder lying along profile surface `s`'s
+## sweep (its axis that way), meets it, onto `out`: lines along the sweep
+## through the profile's points on `other`. A blend's section touches its
+## faces at its ends, tangentially (a G1 conic, a G2 or G3 section on a
+## cylinder: no sign change there), so an end within `tol` of `other` is a
+## meeting; inside, a curve hugging it (touching it, G2) stays within reach
+## over a stretch, so only crossings count there, each found by bisection.
+func along_sweep(other: const Surface*, s: const Surface*, along: Vector3, tol: f64, out: Growing[Carrier]*) -> !:
+    let samples = 64 * (usize)s.nu
     var previous = 0.0
     for k in 0..<samples + 1:
         let u = (f64)k / (f64)samples
         let point = try evaluate(*s, Vector3(u, 0.0, 0.0))
-        let value = n.dot(point) - h
+        let value = sweep_gap(other, point)
         var hit = false
         var at = u
         if math.abs(value) <= tol:
-            # On the plane at an end (a blend's contact). Inside, a curve
-            # hugging the plane (touching it, G2) stays within reach over a
-            # stretch: only crossings count there.
             hit = k == 0 or k == samples
         elif k > 0 and math.abs(previous) > tol and (previous < 0.0) != (value < 0.0):
             var low = u - 1.0 / (f64)samples
             var high = u
             for _ in 0..<60:
                 let middle = (low + high) * 0.5
-                let m = n.dot(try evaluate(*s, Vector3(middle, 0.0, 0.0))) - h
+                let m = sweep_gap(other, try evaluate(*s, Vector3(middle, 0.0, 0.0)))
                 if (m < 0.0) == (previous < 0.0): low = middle
                 else: high = middle
             at = (low + high) * 0.5
@@ -79,9 +86,16 @@ func plane_extrusion(w: Shape*, p: const Surface*, s: const Surface*, sweep: Vec
         if hit: try out.push(Carrier(0, try evaluate(*s, Vector3(at, 0.0, 0.0)), along, Vector3(), 0.0, 0.0, -1))
         previous = value
 
+## How far `p` is from `other` (along_sweep's plane: along its normal; its
+## cylinder: from the axis less the radius), signed.
+func sweep_gap(other: const Surface*, p: Vector3) -> f64:
+    let d = p.subtract(other.origin)
+    if other.kind == surface_plane: return d.dot(other.z)
+    return d.subtract(other.z.multiply_scalar(d.dot(other.z))).length() - other.radius
+
 ## Where faces `fa` and `fb` of `w` meet when one lies on a B-spline
 ## surface, onto `out`: a plane and a profile swept straight, in closed
-## form (plane_extrusion); a profile turned about an axis and a plane
+## form (plane_extrusion), and a cylinder along its sweep (along_sweep); a profile turned about an axis and a plane
 ## across it, or a cylinder or cone about it, in circles (coaxial_spline);
 ## whether it did (anything else is traced: march.lucb).
 func spline_meet(w: Shape*, fa: usize, fb: usize, tol: f64, out: Growing[Carrier]*) -> bool!:
@@ -93,6 +107,13 @@ func spline_meet(w: Shape*, fa: usize, fb: usize, tol: f64, out: Growing[Carrier
         let (swept, sweep) = extrusion_of(spline)
         if swept:
             try plane_extrusion(w, other, spline, sweep, tol, out)
+            return true
+    # A cylinder along a profile's sweep (a D-shaft's, where a plane meets
+    # it along its length): lines through the profile's points on it.
+    if other.kind == surface_cylinder:
+        let (swept, sweep) = extrusion_of(spline)
+        if swept and math.abs(math.abs(other.z.dot(try sweep.normalized())) - 1.0) <= 1e-9:
+            try along_sweep(other, spline, try sweep.normalized(), tol, out)
             return true
     # Two profiles swept straight along different ways (two G2 fillets
     # meeting at a corner): their curve lies in a plane bisecting the

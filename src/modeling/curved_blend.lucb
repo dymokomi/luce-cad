@@ -35,8 +35,9 @@ struct CurvedSide:
 
 ## One section across a picked edge: the contacts on its faces, the
 ## corner where their tangents in the section's plane meet, the ball's
-## center, (G1) the arc's middle weight and (G2) each face's curvature
-## along the section at its contact (curvature_toward).
+## center, (G1) the arc's middle weight and (G2, G3) each face's curvature
+## along the section at its contact (curvature_toward) and (G3) its change
+## toward the edge (curvature_turn).
 struct CurvedSection:
     var on_a: Vector3
     var corner: Vector3
@@ -45,6 +46,8 @@ struct CurvedSection:
     var weight: f64
     var bend_a: Vector3
     var bend_b: Vector3
+    var turn_a: f64
+    var turn_b: f64
 
 ## The builder: the body `w`, the result `out` (a copy of the body to
 ## begin), the blend (`reach`: a fillet's radius, a chamfer's size; a
@@ -125,11 +128,12 @@ func curved_eligible(c: Curved*, chosen: const usize[]) -> bool!:
     if chosen.length == 0: return false
     for e in chosen:
         let (fa, fb) = try edge_faces(w, e)
-        # Two curved faces, or a fillet of a flat face and a sphere about
-        # the rim (a dome's; its chamfer is a cone, sphere_rims.lucb, and
-        # cap_blend.lucb takes walls ruled away from a flat face).
+        # Two curved faces, or a flat face and a sphere about the rim (a
+        # dome's: a fillet's torus, a chamfer's cone, both turned exactly:
+        # curved_turned.lucb; cap_blend.lucb takes walls ruled away from a
+        # flat face).
         let flat = w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_plane or w.surfaces.items[(usize)w.faces.items[fb].surface].kind == surface_plane
-        if flat and (not c.round or sphere_rim(w, e, fa, fb) < 0): return false
+        if flat and sphere_rim(w, e, fa, fb) < 0: return false
         if c.side_of.items[e] >= 0: return false
         try c.sides.push(CurvedSide(e, fa, fb, try convex(w, e), -1, -1, -1, true))
         c.side_of.items[e] = (i64)c.sides.count - 1
@@ -275,22 +279,27 @@ func section_on(c: Curved*, side: const CurvedSide*, t: f64) -> CurvedSection!:
     if math.abs(da - s * r) > w.tolerance or math.abs(db - s * r) > w.tolerance: try too_tight(c)
     if not c.round:
         # A chamfer: the points its legs from the edge on each face, square
-        # to it, found from the ball's contacts (which face the right way).
-        # Distance and angle's second leg takes the faces' ways from the
-        # edge there.
-        let (_, normal_a, _) = try face_distance(c, side.a, e)
-        let (_, normal_b, _) = try face_distance(c, side.b, e)
-        let way_a = try tangent.cross(normal_a).normalized()
-        let way_b = try tangent.cross(normal_b).normalized()
-        let ua = way_a.multiply_scalar(1.0 if way_a.dot(on_a.subtract(e)) > 0.0 else -1.0)
-        let ub = way_b.multiply_scalar(1.0 if way_b.dot(on_b.subtract(e)) > 0.0 else -1.0)
-        let other = try second_leg(c.chamfer, r, math.acos(math.clamp(ua.dot(ub), -1.0, 1.0)))
+        # to it, found from the ball's contacts (which face the right way);
+        # Distance and angle's second where its line meets the other face
+        # (angled_point).
         let a_first = first_face(c.chamfer, side.edge, side.a)
+        var other = r
+        if let given = c.chamfer:
+            other = given.second
+            if given.second <= 0.0:
+                # Distance and angle: from the first face's point, at the
+                # angle from its tangent there, to the other face.
+                let first = side.a if a_first else side.b
+                let q = try chamfer_point(c, first, e, tangent, on_a if a_first else on_b, r)
+                let hit = try angled_point(c, side.b if a_first else side.a, q, e, tangent, given.angle, side.convex, first, on_b if a_first else on_a)
+                let qa = q if a_first else hit
+                let qb = hit if a_first else q
+                return CurvedSection(qa, e, qb, qa.add(qb).subtract(e), 1.0, Vector3(), Vector3(), 0.0, 0.0)
         let qa = try chamfer_point(c, side.a, e, tangent, on_a, r if a_first else other)
         let qb = try chamfer_point(c, side.b, e, tangent, on_b, other if a_first else r)
         # Its "center" mirrors the corner across the chamfer's middle, so
         # that the strip faces away from it as a ball's does.
-        return CurvedSection(qa, e, qb, qa.add(qb).subtract(e), 1.0, Vector3(), Vector3())
+        return CurvedSection(qa, e, qb, qa.add(qb).subtract(e), 1.0, Vector3(), Vector3(), 0.0, 0.0)
     # The corner: where the contacts' tangents across the edge meet.
     let (_, normal_a, _) = try face_distance(c, side.a, on_a)
     let (_, normal_b, _) = try face_distance(c, side.b, on_b)
@@ -299,13 +308,18 @@ func section_on(c: Curved*, side: const CurvedSide*, t: f64) -> CurvedSection!:
     let corner = try lines_meet(on_a, way_a, on_b, way_b)
     let angle = math.acos(math.clamp((try on_a.subtract(corner).normalized()).dot(try on_b.subtract(corner).normalized()), -1.0, 1.0))
     # G1's middle weight (times Fusion's Tangency weight: a conic); G2's
-    # inner points follow the faces' curvature.
+    # and G3's inner points follow the faces' curvature, G3's its change.
     var bend_a = Vector3()
     var bend_b = Vector3()
-    if c.continuity == 2:
+    var turn_a = 0.0
+    var turn_b = 0.0
+    if c.continuity >= 2:
         bend_a = try curvature_toward(c, side.a, on_a, try way_a.normalized())
         bend_b = try curvature_toward(c, side.b, on_b, try way_b.normalized())
-    return CurvedSection(on_a, corner, on_b, center, math.sin(angle * 0.5) * c.tangency, bend_a, bend_b)
+    if c.continuity == 3:
+        turn_a = try curvature_turn(c, side.a, on_a, try way_a.normalized(), bend_a)
+        turn_b = try curvature_turn(c, side.b, on_b, try way_b.normalized(), bend_b)
+    return CurvedSection(on_a, corner, on_b, center, math.sin(angle * 0.5) * c.tangency, bend_a, bend_b, turn_a, turn_b)
 
 ## Face `f`'s curvature at its point `q` along its tangent `way`: the
 ## curvature times the unit direction toward its center of curvature (the
@@ -317,6 +331,21 @@ func curvature_toward(c: Curved*, f: usize, q: Vector3, way: Vector3) -> Vector3
     let (_, ahead, _) = try face_distance(c, f, q.add(way.multiply_scalar(h)))
     let (_, behind, _) = try face_distance(c, f, q.subtract(way.multiply_scalar(h)))
     return n.multiply_scalar(-ahead.subtract(behind).dot(way) / (2.0 * h))
+
+## How face `f`'s curvature at its point `q` (`bend`, curvature_toward's
+## there) changes per length along its tangent `way`: its curvature at the
+## nearest points a step either way, along `bend`'s direction (zero on a
+## face flat there, and on a sphere or a cylinder's circle).
+func curvature_turn(c: Curved*, f: usize, q: Vector3, way: Vector3, bend: Vector3) -> f64!:
+    let kappa = bend.length()
+    if kappa * c.reach <= 1e-12: return 0.0
+    let toward = bend.multiply_scalar(1.0 / kappa)
+    let h = c.reach * 1e-3
+    let (_, _, ahead) = try face_distance(c, f, q.add(way.multiply_scalar(h)))
+    let (_, _, behind) = try face_distance(c, f, q.subtract(way.multiply_scalar(h)))
+    let k_ahead = (try curvature_toward(c, f, ahead, way)).dot(toward)
+    let k_behind = (try curvature_toward(c, f, behind, way)).dot(toward)
+    return (k_ahead - k_behind) / ahead.subtract(behind).length()
 
 ## The point face `f` reaches `size` from edge point `e` in the plane square
 ## to `tangent`, heading toward `toward` (the ball's contact there): Newton
@@ -343,6 +372,29 @@ func chamfer_point(c: Curved*, f: usize, e: Vector3, tangent: Vector3, toward: V
         rows[8] = offset.z
         if not solve_small(rows[..<9], values[..<3], 3): try too_tight(c)
         q = q.subtract(Vector3(values[0], values[1], values[2]))
+    try too_tight(c)
+    return q
+
+## Distance and angle's second contact (chamfers.lucb): from `q` on face
+## `first`, in the plane square to `tangent` through edge point `e`, the
+## line at `angle` from that face's tangent at `q` (back toward the edge,
+## turned into the corner a convex edge's chamfer takes, the air beside a
+## concave one), to where it meets face `f` (Newton on its distance from
+## the ball's contact `toward`'s side).
+func angled_point(c: Curved*, f: usize, q: Vector3, e: Vector3, tangent: Vector3, angle: f64, convex_edge: bool, first: usize, toward: Vector3) -> Vector3!:
+    let (_, normal, _) = try face_distance(c, first, q)
+    let sideways = try tangent.cross(normal).normalized()
+    let back = sideways.multiply_scalar(1.0 if sideways.dot(e.subtract(q)) > 0.0 else -1.0)
+    let way = back.multiply_scalar(math.cos(angle)).add(normal.multiply_scalar(-math.sin(angle) if convex_edge else math.sin(angle)))
+    # From the flat corner's reach toward the other face's contact.
+    var reach = toward.subtract(q).dot(way)
+    for _ in 0..<60:
+        let (d, n, _) = try face_distance(c, f, q.add(way.multiply_scalar(reach)))
+        let rate = n.dot(way)
+        if math.abs(rate) < 1e-12: break
+        let step = d / rate
+        reach -= step
+        if math.abs(step) <= c.w.tolerance * 0.01: return q.add(way.multiply_scalar(reach))
     try too_tight(c)
     return q
 
@@ -384,7 +436,7 @@ func curved_section_rows(c: const Curved*, s: CurvedSection, out: Growing[Vector
         return
     var knots = Growing[f64]()
     defer knots.close()
-    try fillet_section(s.on_a, s.on_b, s.corner, c.continuity, out, &knots, c.tangency, s.bend_a, s.bend_b)
+    try fillet_section(s.on_a, s.on_b, s.corner, c.continuity, out, &knots, c.tangency, s.bend_a, s.bend_b, s.turn_a, s.turn_b)
 
 ## A side's rows as a row source.
 struct CurvedRows:

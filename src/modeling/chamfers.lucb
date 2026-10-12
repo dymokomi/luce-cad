@@ -8,18 +8,21 @@
 ## Distances are measured from the edge, in the plane square to it, to
 ## where the chamfer meets each face: along a flat face that is the
 ## distance along it; on a curved face the straight distance to that point
-## (Parasolid's apex range). Fusion's forum answers say only that the
-## values are measured from the original edge; on curved faces this has
-## not been checked against Fusion itself.
+## (Parasolid's apex range). **Verified against Fusion 2705** (probes of
+## 2026-10-12, domes cut at their middle, 4 above and 4 below it: the
+## chamfer's circles on the sphere lie these chords from the rim).
 ##
 ## Which face takes the first distance: of each chosen edge's two faces,
 ## the one more of the chosen edges lie on (a loop's own face: a box's top
-## round its rim), a tie going to the name first in byte order; `flip`
-## turns every edge round. Distance and angle's second leg is
-## distance × sin(angle) / sin(corner + angle) for the angle between the
-## faces' ways from the edge (90°: distance × tan(angle)). Fusion's own
-## Distance and angle is known to misbehave where the faces are not square
-## (Autodesk's forum); this is the plane triangle's exact leg.
+## round its rim); on a tie a curved face over a flat one (Fusion's, on a
+## dome's sphere and a D-shaft's cylinder, probes of 2026-10-12), then the
+## name first in byte order; `flip` turns every edge round. Distance and angle leaves the first face at
+## the angle from that face's own tangent at its contact (the distance
+## straight from the edge), in the plane square to the edge, and runs on
+## until it meets the other face (Fusion's, verified on those domes: a
+## sphere's tangent at the contact, not at the edge). Between flat faces
+## the second leg is distance × sin(angle) / sin(corner + angle) for the
+## angle between the faces' ways from the edge (90°: distance × tan(angle)).
 
 ## A chamfer's sides: Two distances (`second` along each edge's other
 ## face) or Distance and angle (`second` 0: leaving the first face at
@@ -49,15 +52,74 @@ func first_face(sides: const ChamferSides*?, e: usize, f: usize) -> bool:
     return given.first_of.items[e] == (i64)f
 
 ## Edge `e`'s chamfer legs `size` along its faces (edge_faces' order):
-## (along fa, along fb), the faces' ways from the edge measured at its
-## middle (a straight edge's and a rim's corner is the same all along).
+## (along fa, along fb), measured at its middle (a straight edge's and a
+## rim's section is the same all along); Distance and angle's second by
+## angle_leg.
 func chamfer_legs(w: const Shape*, e: usize, size: f64, sides: const ChamferSides*?) -> (f64, f64)!:
-    if sides == none: return (size, size)
+    let given = sides else return (size, size)
     let (fa, fb) = try edge_faces(w, e)
+    let a_first = first_face(sides, e, fa)
+    var other = given.second
+    if other <= 0.0: other = try angle_leg(w, e, size, given.angle, fa if a_first else fb)
+    return (size, other) if a_first else (other, size)
+
+## Distance and angle's second leg on edge `e` (see the header): in the
+## plane square to the edge at its middle, the first face `first`'s point
+## `size` straight from the edge, the line leaving it at `angle` from the
+## face's tangent there (into the corner the chamfer takes, or adds), and
+## where that meets the other face: its straight distance from the edge. A
+## face's section is its circle where it is one (a cylinder along the edge,
+## a sphere about a rim: section_circle), else the line along it.
+func angle_leg(w: const Shape*, e: usize, size: f64, angle: f64, first: usize) -> f64!:
+    let (fa, fb) = try edge_faces(w, e)
+    let second = fb if first == fa else fa
     let along = try along_edge(w, e)
-    let corner = math.acos(math.clamp((try into_face(w, fa, e, along)).dot(try into_face(w, fb, e, along)), -1.0, 1.0))
-    let other = try second_leg(sides, size, corner)
-    return (size, other) if first_face(sides, e, fa) else (other, size)
+    let p = try w.edge_at(e, 0.5)
+    let outward = try convex(w, e)
+    # The first contact, its tangent back toward the edge and the face's
+    # outward normal there.
+    let into_first = try into_face(w, first, e, along)
+    let (round_first, center_first, radius_first) = section_circle(w, first, p, along)
+    var q = p.add(into_first.multiply_scalar(size))
+    var back = into_first.multiply_scalar(-1.0)
+    if round_first:
+        if size >= 2.0 * radius_first: error(invalid, "a chamfer this large reaches across the curved face it meets")
+        let r0 = p.subtract(center_first)
+        let turn = 1.0 if along.cross(r0).dot(into_first) > 0.0 else -1.0
+        q = center_first.add(turned_direction(r0, along, turn * 2.0 * math.asin(size / (2.0 * radius_first))))
+        let tangent = along.cross(q.subtract(center_first))
+        back = try tangent.multiply_scalar(1.0 if tangent.dot(p.subtract(q)) > 0.0 else -1.0).normalized()
+    let normal = try w.face_normal(first, q)
+    let way = back.multiply_scalar(math.cos(angle)).add(normal.multiply_scalar(-math.sin(angle) if outward else math.sin(angle)))
+    # Where the line meets the other face's section, nearest past q.
+    let (round_second, center_second, radius_second) = section_circle(w, second, p, along)
+    var reach = -1.0
+    if round_second:
+        let d = q.subtract(center_second)
+        let b = way.dot(d)
+        let disc = b * b - (d.dot(d) - radius_second * radius_second)
+        if disc >= 0.0:
+            let root = math.sqrt(disc)
+            reach = -b - root
+            if reach <= size * 1e-12: reach = -b + root
+    else:
+        let n = try w.face_normal(second, p)
+        let rate = n.dot(way)
+        if math.abs(rate) > 1e-12: reach = n.dot(p.subtract(q)) / rate
+    if reach <= size * 1e-12: error(invalid, "the chamfer's angle is too steep for this corner: it never meets the other face")
+    return q.add(way.multiply_scalar(reach)).subtract(p).length()
+
+## Face `f`'s section in the plane square to an edge at its point `p`
+## (the edge running `along` there) where it is a circle: whether it is,
+## its center and radius. A cylinder along the edge, and a sphere whose
+## center lies on a rim's axis (the plane then holds its center).
+func section_circle(w: const Shape*, f: usize, p: Vector3, along: Vector3) -> (bool, Vector3, f64):
+    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+    if s.kind == surface_cylinder and s.z.cross(along).length() <= 1e-9:
+        return (true, s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z))), s.radius)
+    if s.kind == surface_sphere and math.abs(s.origin.subtract(p).dot(along)) <= s.radius * 1e-9:
+        return (true, s.origin, s.radius)
+    return (false, Vector3(), 0.0)
 
 ## `model` with the edges `references` names (with their tangent chains
 ## when `chain`) chamfered `distance` along the first face and, when
@@ -86,7 +148,11 @@ func sided_chamfer(model: const CadModel*, references: str, distance: f64, secon
     try sides.first_of.fill(w.edges.count, -1)
     for e in chosen.view():
         let (fa, fb) = try edge_faces(&w, e)
-        var a_first = counts.items[fa] > counts.items[fb] or (counts.items[fa] == counts.items[fb] and text_before(w.face_name(fa), w.face_name(fb)))
+        # More chosen edges, then the curved face over a flat one, then by name.
+        let flat_a = w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_plane
+        let flat_b = w.surfaces.items[(usize)w.faces.items[fb].surface].kind == surface_plane
+        var a_first = counts.items[fa] > counts.items[fb]
+        if counts.items[fa] == counts.items[fb]: a_first = flat_b and not flat_a if flat_a != flat_b else text_before(w.face_name(fa), w.face_name(fb))
         if flip: a_first = not a_first
         sides.first_of.items[e] = (i64)(fa if a_first else fb)
     return try blend_chosen(model, &w, chosen.view(), false, distance, false, tag, 1, true, none, &sides, corner_type)

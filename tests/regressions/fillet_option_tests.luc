@@ -124,8 +124,12 @@ func full_round() -> unit!:
     assert(math.abs(mesh.bounds().maximum.y - 10.0) < 1e-3 and volume(mesh) < 100.0 * 20.0)
 
 ## A 20 box's front top edge, radius 1 at its start to 3 at its end,
-## straight: (1 − π/4) × 20 × ∫ r² ds taken; smooth with 1 in the middle and
-## 2 at the ends: the same integral, of the smooth r.
+## straight: a ball rolled (Fusion's G1 at weight 1), a cone whose sections
+## square to the edge are conics of one middle weight w (rolling_weight:
+## r cos²(θ/2) / (sin(θ/2) d) - 1 for its depth d at the bisector), so
+## their corner area at unit radius times 20 × ∫ r² ds = 20 × 13/3 is
+## taken; smooth with 1 in the middle and 2 at the ends: the circle's
+## (1 − π/4) times that integral of the smooth r (its sections scaled).
 func variable_radius() -> unit!:
     let box = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "box")
     let front_top = func (a: Vector3, b: Vector3) -> bool:
@@ -135,10 +139,15 @@ func variable_radius() -> unit!:
     let mesh = straight.tessellate(32)
     manifold(mesh)
     let corner = 1.0 - math.pi * 0.25
+    # The cone's slope 0.1 per length: its depth at the bisector and weight.
+    let half = math.sqrt(0.5)
+    let depth = (1.0 / half - math.sqrt(1.0 + 0.01 / 0.5 - 0.01)) / 0.99
+    let cone = conic_corner(0.5 / (half * depth) - 1.0)
     let taken = 8000.0 - volume(mesh)
-    if math.abs(taken - corner * 20.0 * 13.0 / 3.0) > 0.05:
-        print(f"straight: taken {taken}, expected {corner * 20.0 * 13.0 / 3.0}")
-    assert(math.abs(taken - corner * 20.0 * 13.0 / 3.0) < 0.05)
+    if math.abs(taken - cone * 20.0 * 13.0 / 3.0) > 0.05:
+        print(f"straight: taken {taken}, expected {cone * 20.0 * 13.0 / 3.0}")
+    assert(math.abs(taken - cone * 20.0 * 13.0 / 3.0) < 0.05)
+    assert(cone > 0.0 and cone < corner)
     assert(straight.face_count() == 7)
     let smooth = CadModeling.variable_filleted(box, edge, [0.0, 0.5, 1.0], [2.0, 1.0, 2.0], "v")
     let smooth_mesh = smooth.tessellate(32)
@@ -179,3 +188,22 @@ func setback_g1() -> unit!:
     let every = CadModeling.filleted(box, "", 3.0, "f", setback = true)
     let every_mesh = every.tessellate(32)
     manifold(every_mesh)
+
+## The corner region between unit legs along x and y and the rational
+## quadratic from (1, 0) to (0, 1) whose middle control point is the corner,
+## weighted `w` (a conic: the circle at √½): by the shoelace over its points.
+func conic_corner(w: float) -> float:
+    var area = 0.0
+    var previous = Vector3(0.0, 0.0, 0.0)
+    let steps = 4000
+    for k in 0..<steps + 2:
+        var p = Vector3(0.0, 0.0, 0.0)
+        if k <= steps:
+            let t = float(k) / float(steps)
+            let a = (1.0 - t) * (1.0 - t)
+            let c = t * t
+            let total = a + 2.0 * t * (1.0 - t) * w + c
+            p = Vector3(a / total, c / total, 0.0)
+        area += previous.x * p.y - p.x * previous.y
+        previous = p
+    return area * 0.5
