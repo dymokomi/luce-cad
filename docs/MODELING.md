@@ -997,7 +997,7 @@ after Alias's Evaluate tools. luced-3d's Check node draws what it returns.
 
 | `CadMeasure.` | What it does |
 |---|---|
-| `check(model, references, level, stations, distance, angle, curvature, rate, combs, samples, quills, scale, sharp)` | The edges `references` names (empty: every edge between two faces) checked for continuity `level` (0 to 3) at `stations` per edge. Returns a `CadCheck`: per edge (`edge(i)`, an `EdgeCheck`) its faces, its worst gap, angle and curvature and rate differences, and the highest order every station meets; per station (`station(i)`) the values behind them; the comb samples (`comb(i)`); `passed()`, `summary()`; how many creases were left out (`creases_left_out()`; without `sharp`, edges whose faces meet at more than 10° all along them are not checked, though they keep their combs); and the lines to draw by group (`line_count`, `line_point`; Base readers `check_lines`). |
+| `check(model, references, level, stations, distance, angle, curvature, rate, combs, samples, quills, scale, sharp)` | The edges `references` names (empty: every edge between two faces) checked for continuity `level` (0 to 3) at `stations` per edge. Returns a `CadCheck`: per edge (`edge(i)`, an `EdgeCheck`) its faces, its worst gap, angle and curvature and rate differences, and the highest order every station meets; per station (`station(i)`) the values behind them; the comb samples (`comb(i)`); `passed()`, `summary()`; how many creases were left out (`creases_left_out()`; without `sharp`, edges whose faces meet at more than 10° all along them are not checked, though they keep their combs); the lines to draw by group (`line_count`, `line_point`; Base readers `check_lines`); and a label an edge (`label_count`, `label(i)`). |
 | `deviation(model, reference, acceptable, ramp, segments)` | `model`'s tessellation with point attributes `deviation` (its signed distance from `reference`'s surfaces) and `Cd` (a color ramp), and its largest, smallest, mean and RMS deviation, and the share within `acceptable`. |
 
 **Jets** (`geometry/jets.lucb`). Continuity to G3 needs third derivatives. `basis_jet` extends
@@ -1037,8 +1037,11 @@ not checked.
 **What it draws** (`measure/check.lucb`):
 
 - **Edges by result.** Each checked edge is drawn in group 0 when it meets the level, 1 when it is
-  one order short (Alias's yellow), and 2 when it is further short (red). A mark at its middle
-  station has one tick across the edge per order met, or a cross where even G0 fails.
+  one order short (Alias's yellow), and 2 when it is further short (red).
+- **Labels** (`label_count`, `label(i)`, a `CheckLabel`; Base readers `check_labels`). One an
+  edge, at its middle station: its line group, the order it reached (-1 where even G0 fails), and
+  `value`, its worst measure of `order`, the first order it misses or the order asked for when it
+  passed. luced-3d draws them as Alias's on-model labels ("G2  κ 0.00%").
 - **Curvature combs** (group 3, `measure/combs.lucb`). Quills at `samples` along each curved edge
   point away from the center of curvature, each `κ × scale` long, with an outline through their
   tips. A circle's comb is a ring of equal quills.

@@ -1,8 +1,10 @@
 ## A continuity check of a model's edges with what it draws (Alias's
 ## Surface Continuity and Curve Curvature locators): every chosen edge in
-## the color of how it did, with a level mark at its middle; curvature combs
-## on its curved edges; and at each station each side's curvature across the
-## edge as a quill, so a jump shows as two quills of different lengths.
+## the color of how it did, with a label at its middle (Alias's on-model
+## G0-G3 labels: the order reached and the measure that decided it);
+## curvature combs on its curved edges; and at each station each side's
+## curvature across the edge as a quill, so a jump shows as two quills of
+## different lengths.
 
 ## What CadCheck's lines are (check_lines' `group`).
 pub let check_passed: i64 = 0
@@ -35,6 +37,19 @@ pub struct CheckOptions:
 struct Group:
     var points: Growing[Vector3]
 
+## An edge's label: drawn at `point` (its middle station), it reads the order
+## the edge reached (`level`, -1 where even G0 fails) and `value`, the edge's
+## worst measure of order `order`: the first order it misses, or the order
+## asked for when it passed. Gap in model units, angle in degrees, curvature
+## and rate differences in percent (continuity.lucb). `group` is the line
+## group its edge draws in (check_passed, check_near or check_failed).
+pub struct CheckLabel:
+    pub var point: Vector3
+    pub var group: i64
+    pub var level: i64
+    pub var order: i64
+    pub var value: f64
+
 ## A finished check (see the file's header): per edge its measures, per
 ## station the values behind them, and the lines to draw by group.
 pub struct CadCheck:
@@ -42,6 +57,7 @@ pub struct CadCheck:
     var stations: Growing[Station]
     var combs: Growing[CombSample]
     var groups: Group[5]
+    var labels: Growing[CheckLabel]
     var level: i64
     var creases: i64
     var text: Growing[u8]
@@ -51,6 +67,7 @@ pub struct CadCheck:
         self.stations = Growing[Station]()
         self.combs = Growing[CombSample]()
         self.groups = [Group(Growing[Vector3]()), Group(Growing[Vector3]()), Group(Growing[Vector3]()), Group(Growing[Vector3]()), Group(Growing[Vector3]())]
+        self.labels = Growing[CheckLabel]()
         self.level = 2
         self.creases = 0
         self.text = Growing[u8]()
@@ -78,6 +95,14 @@ pub struct CadCheck:
     pub func comb(index: i64) -> CombSample!:
         if index < 0 or (usize)index >= self.combs.count: error(invalid, "comb sample out of range")
         return self.combs.items[(usize)index]
+
+    ## The edges' labels, one an edge checked, in edge order.
+    pub func label_count() -> i64:
+        return (i64)self.labels.count
+
+    pub func label(index: i64) -> CheckLabel!:
+        if index < 0 or (usize)index >= self.labels.count: error(invalid, "check label out of range")
+        return self.labels.items[(usize)index]
 
     ## How many sharp edges were left out (CheckOptions.sharp off).
     pub func creases_left_out() -> i64:
@@ -112,9 +137,14 @@ pub struct CadCheck:
         self.stations.close()
         self.combs.close()
         for at in 0..<group_count: self.groups[at].points.close()
+        self.labels.close()
         self.text.close()
 
 pub let cad_check_type: interop.Type[CadCheck] = interop.Type[CadCheck]("CadCheck", CadCheck.close, closeable = true)
+
+## The labels, for Base readers (luced-3d's compute bridge).
+pub func check_labels(check: const CadCheck*) -> const CheckLabel[]:
+    return check.labels.view()
 
 ## Line group `group`'s point pairs, for Base drawers (luced-3d's compute
 ## bridge).
@@ -171,10 +201,9 @@ pub func check_model(model: const CadModel*, references: str, options: CheckOpti
     # All flat (under the floor): nothing to draw, not noise blown up.
     let scale = comb_scale(largest, 0.1 * size * options.scale) if largest > limits.curvature_floor else 0.0
     for e in check.edges.view():
-        let group = check_passed if e.level >= options.level else (check_near if e.level == options.level - 1 else check_failed)
-        let out = &check.groups[(usize)group].points
-        try edge_polyline(&w, (usize)e.edge, out)
-        try level_mark(check.stations.view()[(usize)e.first..<(usize)(e.first + e.count)], e.level, size, out)
+        let label = label_of(e, check.stations.view()[(usize)e.first..<(usize)(e.first + e.count)], options.level)
+        try edge_polyline(&w, (usize)e.edge, &check.groups[(usize)label.group].points)
+        try check.labels.push(label)
         if options.quills and scale > 0.0:
             for s in check.stations.view()[(usize)e.first..<(usize)(e.first + e.count)]:
                 try cross_quills(s, scale, size, &check.groups[(usize)check_quills].points)
@@ -201,25 +230,13 @@ func edge_polyline(w: const Shape*, e: usize, out: Growing[Vector3]*) -> !:
         try out.push(point)
         previous = point
 
-## The level an edge reached, marked at its middle station: one tick across
-## it per order met (G0 one, G3 four), a cross where even G0 fails.
-func level_mark(stations: const Station[], level: i64, size: f64, out: Growing[Vector3]*) -> !:
-    if stations.length == 0: return
-    let s = stations[stations.length // 2]
-    let run = s.normal.cross(s.across)
-    let half = size * 0.02
-    let gap = size * 0.012
-    if level < 0:
-        try out.push(s.point.add(s.across.add(run).multiply_scalar(half)))
-        try out.push(s.point.subtract(s.across.add(run).multiply_scalar(half)))
-        try out.push(s.point.add(s.across.subtract(run).multiply_scalar(half)))
-        try out.push(s.point.subtract(s.across.subtract(run).multiply_scalar(half)))
-        return
-    let ticks = level + 1
-    for k in 0..<ticks:
-        let middle = s.point.add(run.multiply_scalar(gap * ((f64)k - (f64)(ticks - 1) / 2.0)))
-        try out.push(middle.add(s.across.multiply_scalar(half)))
-        try out.push(middle.subtract(s.across.multiply_scalar(half)))
+## Edge `e`'s label (CheckLabel) at its middle station, for level `asked`.
+func label_of(e: EdgeCheck, stations: const Station[], asked: i64) -> CheckLabel:
+    let middle = stations[stations.length // 2].point if stations.length > 0 else Vector3()
+    let order = asked if e.level >= asked else e.level + 1
+    let measures: f64[4] = [e.gap, e.angle, e.curvature, e.rate]
+    let group = check_passed if e.level >= asked else (check_near if e.level == asked - 1 else check_failed)
+    return CheckLabel(point = middle, group = group, level = e.level, order = order, value = measures[(usize)order])
 
 ## A station's curvature across the edge on each side, as quills along the
 ## normal (away from the body where convex), side 1's just behind the edge
