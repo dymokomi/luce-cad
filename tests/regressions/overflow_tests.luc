@@ -77,6 +77,7 @@ pub func overflow_tests() -> unit!:
     closed(mesh)
     near(volume(mesh) + (volume(mesh) - coarse) / 3.0, 1600.0 - 20.0 * 9.0 * (1.0 - math.pi / 4.0), 1e-3, "split side rounded 3")
     cliff_edges(plate, ledge, top_edge)
+    inside_cliff(plate)
     rolled_on(plate, top_edge)
     print("PASS fillet overflow: a plate 4 thick, its top edge rounded 5 and 4.5, trimmed by its bottom (the side face gone; the volumes to 1e-3); over a cliff onto a ledge, stopped at its plane (to 2e-3); rolling on over a line splitting the side face; cliff-edge blends on the plate and the ledge; rolling on onto a round below the side face")
 
@@ -151,3 +152,26 @@ func rolled_on(plate: CadModel, top_edge: func(Vector3, Vector3) -> bool) -> uni
         said = failure.message
         recover rounded
     assert(said.contains("must be less than"), f"notch alone: {said}")
+
+## An inside corner whose wall (2 high) is lower than its fillet (3): the
+## cliff-edge blend, tangent to the floor and through the wall's top edge,
+## adds the triangle between the corner, the floor contact and that edge
+## less the circle's segment on that chord.
+func inside_cliff(plate: CadModel) -> unit!:
+    let wall = CadModeling.tagged(CadSolids.box(4.0, 2.0, 20.0), "w").transformed(Vector3(-8.0, 3.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let body = CadModeling.combined(plate, wall, 0)
+    let inside = CadModeling.edge_references(body, edges_where(body, func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x + 6.0) < 1e-9 and math.abs(b.x + 6.0) < 1e-9 and math.abs(a.y - 2.0) < 1e-9 and math.abs(b.y - 2.0) < 1e-9))
+    let r = 3.0
+    let h = 2.0
+    let sc = math.sqrt(r * r - (h - r) * (h - r))
+    let added = sc * h * 0.5 - segment(r, math.sqrt(sc * sc + h * h))
+    let made = CadModeling.filleted(body, inside, r, "f", 1)
+    near(extrapolated(made), 1760.0 + 20.0 * added, 1e-3, "an inside corner's cliff-edge blend")
+    # Fusion's (probe 13): 1790.6350087.
+    near(1760.0 + 20.0 * added, 1790.6350087, 1e-6, "Fusion's inside cliff")
+    var said = ""
+    _ = CadModeling.filleted(body, inside, r, "f", 1, overflow = 5) catch failure:
+        said = failure.message
+        recover body
+    assert(said.contains("must be less than"), f"inside corner, no cliff: {said}")

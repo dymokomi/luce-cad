@@ -14,7 +14,7 @@ from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import ComponentTransform, MeshPart, concatenated, group_bits_of, Domain, TableBuilder, text_attribute, append_text
 from model import CadModel
 from cad_geometry import set_models, with_models
-from modeling import reference_lines, shape_of, CadDirect, CadModeling
+from modeling import reference_lines, shape_of, CadDirect, CadModeling, found_blends, FoundBlend
 from geometry import push_decimal
 from luce_std import sort
 
@@ -68,7 +68,8 @@ pub struct CadEdits:
         let owned = try numbered.value().with_attribute("cad_edge_model", 4, 1, owners_of_edges.view(), true)
         let chained = try with_chains(owned, models, edges.view(), edge_models.view())
         let referenced = try with_references(chained, models, edges.view(), edge_models.view())
-        return try with_face_names(referenced, models, owning.view())
+        let named = try with_face_names(referenced, models, owning.view())
+        return try with_blend_radii(named, models, owning.view())
 
     ## Count authored CAD entities, independent of display tessellation density.
     ## Level 0 models, 1 CVs, 2 edges, 3 faces, 5 support patches.
@@ -558,6 +559,45 @@ func with_face_names(mesh: interop.Reference[Mesh], models: const interop.Refere
         let face = (usize)faces.number(at, 0)
         values[at] = ids.items[firsts.items[model] + face] if model < models.length and firsts.items[model] + face < ids.count else -1
     return try mesh.value().with_attribute_entry(try text_attribute("cad_face_name", Domain.face, count, &strings, values))
+
+## Takes `mesh`: with each polygon's B-rep face's blend radius in attribute
+## `cad_blend_radius` (modeling's identify blends; 0 for a face that is no
+## constant rolling-ball blend), so the editor tells fillets apart (Select
+## blends, Press Pull on them a Reblend) without the B-rep at hand.
+## `owning` is each polygon's model.
+func with_blend_radii(mesh: interop.Reference[Mesh], models: const interop.Reference[CadModel][], owning: const f64[]) -> interop.Reference[Mesh]!:
+    let source = mesh.value().find_attribute("cad_face", 2)
+    if source < 0: return mesh
+    defer mesh.release()
+    # Each model's faces' radii, after the earlier models'.
+    var radii = Growing[f64]()
+    defer radii.close()
+    var firsts = Growing[usize]()
+    defer firsts.close()
+    var found = Growing[FoundBlend]()
+    defer found.close()
+    for model in models:
+        try firsts.push(radii.count)
+        let first = radii.count
+        for _ in 0..<model.value().face_count(): try radii.push(0.0)
+        if model.value().brep() == none or model.value().independent_faces() > 0: continue
+        var w = try shape_of(model.value())
+        defer w.close()
+        found.clear()
+        try found_blends(&w, &found)
+        # The shape's faces are the model's, in order.
+        for blend in found.view():
+            if first + blend.face < radii.count: radii.items[first + blend.face] = blend.radius
+    let faces = try mesh.value().attribute_entry(source)
+    let count = (usize)mesh.value().face_count()
+    var values = Growing[f64]()
+    defer values.close()
+    for at in 0..<count:
+        let model = (usize)owning[at]
+        let face = (usize)faces.number(at, 0)
+        let index = firsts.items[model] + face if model < models.length else radii.count
+        try values.push(radii.items[index] if index < radii.count else 0.0)
+    return try mesh.value().with_attribute("cad_blend_radius", 2, 1, values.view(), false)
 
 ## A model's B-rep edges by the pair of faces using them: sorted keys
 ## (low face * 2^20 + high face) and their edges.

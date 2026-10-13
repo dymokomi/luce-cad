@@ -892,8 +892,10 @@ and the cliff edge less the circle's segment on that chord (1501.45 and 2301.45)
 side edge rounded 3, its top edge rounded 1.5 rolls onto that round (the polygon of the contacts and
 the side's ends, less the fillet's segment, with the round's), G2 fuller; notch alone refuses it.
 Not yet: cliff-end overflow (a chain's end over a cliff), cliff-edge blends along curved cliffs,
-rolling onto curved faces other than a cylinder along the edge, and concave edges' cliff and rolled
-overflows.
+rolling onto curved faces other than a cylinder along the edge, and concave edges' rolled overflow.
+An inside corner whose wall is lower than its fillet takes the cliff-edge blend too (tangent to the
+floor, through the wall's top edge: a 2 high wall rounded 3 adds the triangle less the segment,
+`overflow_tests`).
 
 `blend_shape_tests` checks against closed forms: rho relative 0.5 is the circle (volume and its
 middle (√2 − 1) r in from the edge); rho absolute 0.5 the parabola (r² / 6 per length, its middle
@@ -916,7 +918,9 @@ from the geometry alone:
   outward normal leaves the axis;
 - **a corner ball**: a sphere met tangentially on every edge, only by strips of its radius.
 
-G2 and G3 strips (B-splines) have no radius of their own and are not found. `CadDirect.reblended`
+Edit CAD's pick mesh carries each polygon's face's blend radius (`cad_blend_radius`, 0 for no blend),
+so the editor's Select blends and Press Pull on fillets work without the B-rep at hand (on the compute
+worker too). G2 and G3 strips (B-splines) have no radius of their own and are not found. `CadDirect.reblended`
 gives picked blends another radius: the picked ones and every blend meeting them tangentially (a
 chain and its corners go together; a picked ball brings its strips) are deleted with healing, the
 healed edges' pieces joined whole again (`join_straight_pieces`, now dropping the pieces' unused
