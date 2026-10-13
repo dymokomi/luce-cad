@@ -1011,8 +1011,16 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   extrapolated, against 3853.8348 and 3341.8348 (the rounded cube less the sharp 16 box, and less
   16 × 18 × 16); refused before (SMLib fails the closed one, status 1001). The rounded uprights 0.3
   of the 2 box shelled 0.5 likewise.
-  Regression: `shell_tests`. Still open: G2/G3 strips and flat faces swallowed by an inset (the
-  face soup and winding numbers), and outward offsets that reconnect.
+  Regression: `shell_tests`. Then G2/G3 strips and flat faces swallowed by an inset, still without
+  the arrangement: a G2 or G3 strip between flat faces whose radius the wall passes, lying between
+  its circle and the corner, is healed with the rounds (exact by the same argument), and when
+  Delete cannot heal a G2 setback corner's quads, a convex body's inner body is the cell of its flat
+  faces' planes moved in (which drops a swallowed chamfer too). A 20 cube's uprights rounded 3 G2
+  and G3 shelled 4 (closed and open), every edge G2 shelled 4, a chamfer of 1 swallowed at 3: the
+  sharp hollows exactly. Still open: the face soup and winding numbers for bodies that are not
+  convex where faces vanish, and outward offsets that reconnect. Also: a body rounded on every edge
+  shelled open at its top with a wall thinner than the rounds (their inner offsets never reach the
+  top's plane) is the closed shell opened by the top swept in, its rim square to it.
 
 - **12, stitch passes and edge refinement (done in part).** Vertices within the gap merge closest
   pair first (the limit of SMLib's doubling passes) and never two of one face, the orientation
@@ -1024,9 +1032,12 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   (2e-5, from 1.4e-3) and the moved box's volume to 3e-4 at 8 divisions. `tolerant` keeps the joins
   (a boolean through tolerant edges is still tested). Regression: `surfacing_tests`
   (`stitch_passes`). Then open results' joins: rebuilt alike, their boundary edges keeping
-  their curves (five of the box's faces moved apart: precision back to 2e-5 from 1.4e-3). Still open:
-  short-edge and sliver removal (a face thinner than the gap is kept whole by design: a thin
-  plate's sides; telling a sliver from such a side needs the faces either side).
+  their curves (five of the box's faces moved apart: precision back to 2e-5 from 1.4e-3). Then
+  short-edge and sliver removal (`stitch_heal.lucb`): a face thinner than the gap is told by the
+  faces across its two long edges: square to both, which face opposite ways, a plate's side (kept);
+  else a sliver, taken out before the merges. Open edges shorter than the gap collapse unless a
+  plate's side holds them. A cube's top split 0.001 from itself or from its front edge stitches
+  back into 7 and 6 faces; the 0.002 plate still closes. (12 done.)
 
 - **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
   plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was

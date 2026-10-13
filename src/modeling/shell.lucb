@@ -77,11 +77,15 @@ func shell_of(model: interop.Reference[CadModel], removed: const bool[], thickne
     if reason.count > 0:
         # Convex rounds thinner than the wall vanish from the inner body
         # (vanishing_inner): it is the inner body of the body without them.
-        let past = try vanishing_inner(model, removed, wall_in, wall_out, &m)
+        var past = try vanishing_inner(model, removed, wall_in, wall_out, &m)
+        if past == none: past = try convex_inner(model, removed, wall_in, wall_out)
         if let made = past:
             inner.release()
             inner = made
         else:
+            # Opened at faces met tangentially all round (a body rounded on
+            # every edge): the closed shell, opened square to them.
+            if let opened = try tangent_opening(model, removed, thickness, side, tag, outside_thickness, wall_in, wall_out): return opened
             var buffer: u8[640]
             error(invalid, try strings.format(buffer, f"the shell's thickness is too large for this body: {(str)reason.view()}"))
     var name = Growing[u8]()
@@ -99,6 +103,54 @@ func shell_of(model: interop.Reference[CadModel], removed: const bool[], thickne
     for f in 0..<faces: opened = opened or removed[f]
     if not opened: return try with_void(outer.value(), named.value())
     return try combine(outer.value(), named.value(), op_subtract)
+
+## A shell opened at faces that every neighbor meets tangentially (a body
+## rounded on every edge, opened at its top: Limits 9). The neighbors'
+## inner offsets never reach those faces' planes (a round's offset stays
+## tangent below them), so the inner body cannot poke through there; Fusion
+## takes the whole tangent chain instead, which is every face. Here the
+## closed shell (a void) is opened by each removed face swept in by the
+## wall (closed_quilt), so the opening's rim stands square to the face, the
+## wall cut through between the outer face and the inner one's offset. Flat
+## removed faces, the wall inside only; none otherwise.
+func tangent_opening(model: interop.Reference[CadModel], removed: const bool[], thickness: f64, side: i64, tag: str, outside_thickness: f64, wall_in: f64, wall_out: f64) -> interop.Reference[CadModel]?!:
+    if wall_out > 0.0 or not (wall_in > 0.0): return none
+    var w = try shape_of(model.value())
+    defer w.close()
+    var any = false
+    for f in 0..<w.faces.count:
+        if not removed[f]: continue
+        any = true
+        if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: return none
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            let fa = w.sides.items[e * 2]
+            let fb = w.sides.items[e * 2 + 1]
+            if fa < 0 or fb < 0 or removed[(usize)fa] == removed[(usize)fb]: continue
+            if not try tangent_edge(&w, e): return none
+    if not any: return none
+    var none_removed = Growing[bool]()
+    defer none_removed.close()
+    try none_removed.fill(removed.length, false)
+    var current = try shell_of(model, none_removed.view(), thickness, side, tag, outside_thickness)
+    var rim = Growing[u8]()
+    defer rim.close()
+    for byte in tag.bytes: try rim.push(byte)
+    for byte in "/rim".bytes: try rim.push(byte)
+    for f in 0..<w.faces.count:
+        if not removed[f]: continue
+        let one: usize[1] = [f]
+        let inward = face_outward(&w, f).multiply_scalar(-1.0)
+        let cut = closed_quilt(&w, one[..<1], inward, wall_in, "", (str)rim.view()) catch failure:
+            current.release()
+            error(failure.code, failure.message)
+        defer cut.release()
+        let next = combine(current.value(), cut.value(), op_subtract) catch failure:
+            current.release()
+            error(failure.code, failure.message)
+        current.release()
+        current = next
+    return current
 
 ## `outer` with the void `inner` (wholly inside it, meeting none of its
 ## faces): their faces as two shells of one body, the inner's turned.
@@ -133,7 +185,8 @@ func with_void(outer: const CadModel*, inner: const CadModel*) -> interop.Refere
 
 ## The inner body of a shell whose wall (`wall_in` inside, nothing
 ## outside) is thicker than some convex rounds' radii (cylinders, spheres
-## and tori turned outward, a fillet's strip or ball corner): their offsets
+## and tori turned outward, a fillet's strip or ball corner; G2 and G3
+## strips between flat faces and their setback corners: swallowed_strips): their offsets
 ## vanish, and the faces round them meet past them. For a convex round that
 ## is exact: the body's inner parallel body at a distance beyond a round's
 ## radius is the one of the body with the round healed sharp (its tangent
@@ -163,6 +216,9 @@ func vanishing_inner(model: interop.Reference[CadModel], removed: const bool[], 
         if (try w.face_normal(f, p)).dot(p.subtract(core)) <= 0.0: continue
         if names.count > 0: try names.push(59)
         for byte in w.face_name(f).bytes: try names.push(byte)
+    # G2 and G3 strips between flat faces whose radius the wall passes, and
+    # the setback corners between them (swallowed_strips).
+    try swallowed_strips(&w, removed, wall_in, &names)
     if names.count == 0: return none
     let sharp = CadDirect.deleted_faces(model, (str)names.view()) catch failure:
         if failure.code != invalid: error(failure.code, failure.message)
@@ -305,3 +361,195 @@ func compact_unused(w: Shape*) -> !:
     try w.edge_slack.assign(slack.view())
     try w.points.assign(points.view())
     try w.point_slack.assign(point_slack.view())
+
+## Onto `names` (apart by `;`), the B-spline strips of `w` the wall
+## `wall` swallows, and the setback corners between them: a G2 or G3
+## fillet's strip between two flat faces it meets tangentially along its
+## long edges, round a convex edge, of a radius (its contacts' distance
+## from the faces' meeting line over tan(φ/2), φ their turn) no more than
+## the wall, and lying between its circle of that radius and the corner
+## (as Fusion's G2 and G3 sections do), so a ball of the wall's radius at
+## the corner's inner parallel stays clear of it: the inner parallel body is
+## the sharp body's. A corner patch goes with them when every face it
+## meets is a strip that goes, a flat face, or another such patch.
+func swallowed_strips(w: const Shape*, removed: const bool[], wall: f64, names: Growing[u8]*) -> !:
+    var gone = Growing[bool]()
+    defer gone.close()
+    try gone.fill(w.faces.count, false)
+    var any = false
+    for f in 0..<w.faces.count:
+        if removed[f] or w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_spline: continue
+        if try swallowed_strip(w, f, wall):
+            gone.items[f] = true
+            any = true
+    if not any: return
+    # Corner patches: spline faces meeting only gone strips, flat faces and
+    # each other, tangentially.
+    var patch = Growing[bool]()
+    defer patch.close()
+    try patch.fill(w.faces.count, false)
+    for f in 0..<w.faces.count:
+        patch.items[f] = not removed[f] and not gone.items[f] and w.surfaces.items[(usize)w.faces.items[f].surface].kind == surface_spline
+    var changed = true
+    while changed:
+        changed = false
+        for f in 0..<w.faces.count:
+            if not patch.items[f]: continue
+            var keeps = true
+            var touches = false
+            for use in w.face_uses(f):
+                let e = edge_index(use)
+                let fa = w.sides.items[e * 2]
+                let fb = w.sides.items[e * 2 + 1]
+                if fa < 0 or fb < 0: continue
+                let other = (usize)(fb if (usize)fa == f else fa)
+                if other == f: continue
+                if gone.items[other]: touches = true
+                let flat = w.surfaces.items[(usize)w.faces.items[other].surface].kind == surface_plane
+                if not (gone.items[other] or flat or patch.items[other]) or not try tangent_edge(w, e): keeps = false
+            if not keeps or not touches:
+                if not keeps:
+                    patch.items[f] = false
+                    changed = true
+    for f in 0..<w.faces.count:
+        if not gone.items[f] and not patch.items[f]: continue
+        if patch.items[f] and not gone.items[f]:
+            # Only patches reached from a gone strip.
+            var reached = false
+            for use in w.face_uses(f):
+                let e = edge_index(use)
+                let fa = w.sides.items[e * 2]
+                let fb = w.sides.items[e * 2 + 1]
+                if fa < 0 or fb < 0: continue
+                let other = (usize)(fb if (usize)fa == f else fa)
+                reached = reached or gone.items[other] or (patch.items[other] and other != f)
+            if not reached: continue
+        if names.count > 0: try names.push(59)
+        for byte in w.face_name(f).bytes: try names.push(byte)
+
+## Whether B-spline face `f` is a strip swallowed_strips takes at `wall`.
+func swallowed_strip(w: const Shape*, f: usize, wall: f64) -> bool!:
+    # Its flat walls, met tangentially along straight edges.
+    var walls = Growing[usize]()
+    defer walls.close()
+    var contacts = Growing[Vector3]()
+    defer contacts.close()
+    for use in w.face_uses(f):
+        let e = edge_index(use)
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0: continue
+        let other = (usize)(fb if (usize)fa == f else fa)
+        if w.surfaces.items[(usize)w.faces.items[other].surface].kind != surface_plane: continue
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line: continue
+        if not try tangent_edge(w, e): continue
+        var known = false
+        for k in walls.view(): known = known or k == other
+        if known: continue
+        try walls.push(other)
+        try contacts.push(try w.edge_at(e, 0.5))
+    if walls.count != 2: return false
+    let na = face_outward(w, walls.items[0])
+    let nb = face_outward(w, walls.items[1])
+    let turn = math.acos(math.clamp(na.dot(nb), -1.0, 1.0))
+    if turn < 1e-6 or turn > math.pi - 1e-6: return false
+    # The walls' meeting line, and the contact's distance from it in its wall.
+    let line = try na.cross(nb).normalized()
+    let ca = contacts.items[0]
+    let sa = &w.surfaces.items[(usize)w.faces.items[walls.items[0]].surface]
+    let sb = &w.surfaces.items[(usize)w.faces.items[walls.items[1]].surface]
+    let ha = na.dot(sa.origin)
+    let hb = nb.dot(sb.origin)
+    # The point of the meeting line nearest the contact: on both planes.
+    let into_a = line.cross(na)
+    let step = (hb - nb.dot(ca)) / nb.dot(into_a)
+    let apex = ca.add(into_a.multiply_scalar(step))
+    if math.abs(na.dot(apex) - ha) > w.tolerance * 100.0: return false
+    let leg = apex.subtract(ca).length()
+    let radius = leg / math.tan(turn * 0.5)
+    if radius > wall + w.tolerance * 10.0: return false
+    # Round a convex edge: the meeting line outside, in front of the strip.
+    let middle = try point_on_face(w, f)
+    if (try w.face_normal(f, middle)).dot(apex.subtract(middle)) <= 0.0: return false
+    # Between its circle and the corner: its points across the section (the
+    # nearest to the chord between its contacts) no nearer the circle's
+    # center than the radius.
+    let center = ca.subtract(na.multiply_scalar(radius))
+    let other = contacts.items[1]
+    let cb = other.subtract(line.multiply_scalar(other.subtract(ca).dot(line)))
+    if math.abs(cb.subtract(center).length() - radius) > radius * 1e-6 + w.tolerance * 10.0: return false
+    for k in 1..<8:
+        let q = ca.add(cb.subtract(ca).multiply_scalar((f64)k / 8.0))
+        let p = try nearest_on_surface(w, f, q)
+        if p.subtract(center).length() < radius * (1.0 - 1e-6) - w.tolerance * 10.0: return false
+    return true
+
+## The inner body of a convex body whose curved faces the wall all swallows
+## (convex rounds of no more than its radius, G2 and G3 strips and their
+## corners: vanishing_inner's), when Delete cannot heal them all (a G2
+## setback corner's quads): the cell of its flat faces' planes, each moved
+## in by the wall (a removed face's out past the outer body), every face
+## named after its plane's face. For a convex body that is its inner
+## parallel body: the rounds lie between their circles and their corners,
+## clear of a ball of the wall's radius. None when the body is not convex
+## or a curved face stays.
+func convex_inner(model: interop.Reference[CadModel], removed: const bool[], wall_in: f64, wall_out: f64) -> interop.Reference[CadModel]?!:
+    if wall_out > 0.0 or not (wall_in > 0.0): return none
+    var w = try shape_of(model.value())
+    defer w.close()
+    for e in 0..<w.edges.count:
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0 or fa == fb: continue
+        if not try tangent_edge(&w, e) and not try convex(&w, e): return none
+    # Every curved face swallowed.
+    var swallowed = Growing[u8]()
+    defer swallowed.close()
+    try swallowed_strips(&w, removed, wall_in, &swallowed)
+    var gone = Growing[usize]()
+    defer gone.close()
+    if swallowed.count > 0: try faces_named(&w, (str)swallowed.view(), &gone)
+    var normals = Growing[Vector3]()
+    defer normals.close()
+    var offsets = Growing[f64]()
+    defer offsets.close()
+    var sources = Growing[usize]()
+    defer sources.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(&w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind != surface_plane:
+            var taken = false
+            for g in gone.view(): taken = taken or g == f
+            let radius = s.angle if s.kind == surface_torus else s.radius
+            let round = (s.kind == surface_cylinder or s.kind == surface_sphere or s.kind == surface_torus) and radius <= wall_in + w.tolerance * 10.0
+            if not taken and not round: return none
+            continue
+        let n = face_outward(&w, f)
+        let offset = n.dot(s.origin) + (wall_in if removed[f] else -wall_in)
+        # One plane once (a face split in pieces).
+        var known = false
+        for k in 0..<normals.count:
+            if normals.items[k].dot(n) > 1.0 - 1e-9 and math.abs(offsets.items[k] - offset) <= w.tolerance * 10.0: known = true
+        if known: continue
+        try normals.push(n)
+        try offsets.push(offset)
+        try sources.push(f)
+    let cell = try convex_cell(normals.view(), offsets.view(), high.subtract(low).length())
+    defer cell.release()
+    # Each cell face named after the face whose plane it lies on.
+    var c = try shape_of(cell.value())
+    defer c.close()
+    for f in 0..<c.faces.count:
+        let n = face_outward(&c, f)
+        let o = n.dot(c.surfaces.items[(usize)c.faces.items[f].surface].origin)
+        for k in 0..<normals.count:
+            if normals.items[k].dot(n) > 1.0 - 1e-9 and math.abs(offsets.items[k] - o) <= w.tolerance * 100.0:
+                c.faces.items[f].name = try c.add_name(w.face_name(sources.items[k]))
+    let b = try brep_of(&c)
+    defer b.release()
+    return try CadModel.of_brep(b)

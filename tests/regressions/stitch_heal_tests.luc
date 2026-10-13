@@ -1,0 +1,54 @@
+## Stitch's sliver and short-edge removal (the SMLib study's item 12,
+## stitch_heal.lucb): a 20 cube's top split along z = ±0.0005 (a sliver
+## 0.001 wide between two halves) and unstitched, stitched within 0.003:
+## the sliver goes and the halves join along one edge (7 faces, closed,
+## 8000); the top split at z = 9.999 (a sliver along the front edge, the
+## sides' top edges cut 0.001 from their corners) likewise: the sliver goes,
+## the short edges collapse, the top meets the front again (6 faces, 8000).
+## A plate 0.002 thin keeps its sides (stitch_passes, surfacing_tests).
+from luce_cad.surfacing import CadSurfacing
+from luce_cad.cad_geometry import CadGeometry
+from luce_cad.modeling import CadModeling, CadDirect
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+pub func stitch_heal_tests() -> unit!:
+    let box = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "b")
+    var top = ""
+    for f in 0..<box.face_count():
+        let name = CadModeling.face_name_of(box, f)
+        let at = CadModeling.face_point(box, name)
+        if at.found and at.normal.y > 0.999: top = name
+    # A sliver between two halves of the top.
+    let once = CadDirect.split_faces_by_plane(box, top, Vector3(0.0, 0.0, -0.0005), Vector3(0.0, 0.0, 1.0), "s")
+    var upper = ""
+    for f in 0..<once.face_count():
+        let name = CadModeling.face_name_of(once, f)
+        let at = CadModeling.face_point(once, name)
+        if at.found and at.normal.y > 0.999 and at.point.z > 0.0: upper = name
+    let twice = CadDirect.split_faces_by_plane(once, upper, Vector3(0.0, 0.0, 0.0005), Vector3(0.0, 0.0, 1.0), "t")
+    assert(twice.face_count() == 8, f"{twice.face_count()} faces split")
+    let middle = CadSurfacing.stitched(CadSurfacing.unstitched(CadGeometry.of_model(twice), 0), [], 0.003)
+    let joined = CadGeometry.model(middle.geometry(), 0)
+    assert(middle.closed and joined.face_count() == 7, f"sliver between halves: {joined.face_count()} faces, closed {middle.closed}")
+    solid(joined, "sliver between halves")
+    # A sliver along the front edge, the sides' top edges cut near it.
+    let edged = CadDirect.split_faces_by_plane(box, top, Vector3(0.0, 0.0, 9.999), Vector3(0.0, 0.0, 1.0), "e")
+    let front = CadSurfacing.stitched(CadSurfacing.unstitched(CadGeometry.of_model(edged), 0), [], 0.003)
+    let healed = CadGeometry.model(front.geometry(), 0)
+    assert(front.closed and healed.face_count() == 6, f"sliver along an edge: {healed.face_count()} faces, closed {front.closed}")
+    solid(healed, "sliver along an edge")
+    var shortest = 1.0e300
+    for f in 0..<healed.face_count():
+        for use in 0..<healed.face_edge_count(f):
+            shortest = math.min(shortest, healed.face_edge_point(f, use, 0.0).subtract(healed.face_edge_point(f, use, 1.0)).length())
+    assert(shortest > 1.0, f"a short edge stayed: {shortest}")
+    print("PASS stitch heal: a sliver 0.001 wide between a top's halves taken out (7 faces, closed, 8000), one along the front edge with the sides' short edges collapsed (6 faces, every edge 20); a plate thinner than the gap keeps its sides")
+
+func solid(model: CadModel, what: str) -> unit!:
+    let mesh = model.tessellate(8)
+    closed(mesh)
+    assert(math.abs(volume(mesh) - 8000.0) < 1e-2, f"{what}: volume {volume(mesh)}")

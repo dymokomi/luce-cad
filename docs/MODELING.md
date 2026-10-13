@@ -40,6 +40,7 @@ does today.
 | `full_round(model, center, tag, continuity, side1, side2)` | Fusion's Full Round Fillet: the flat center face rounded away whole, tangent to it and its sides. |
 | `variable_filleted(model, reference, positions, radii, tag, smooth, continuity, chain, tangency)` | Fusion's Variable radius: one straight edge between flat faces, a tangent chain round a flat face or a loop between curved faces, radii at positions 0 to 1 along it, smooth or straight between, G1 to G3, under a Tangency weight. |
 | `variable_filleted_edges(model, references, radius, variable, positions, radii, counts, tag, continuity, smooth, tangency)` | Constant fillets of `radius` and, in the same feature, variable radius ones on the `variable` edges (one straight edge between flat faces each, edge k's law the next `counts[k]` points), meeting at setback corners at `radius`; a variable edge reaches `radius` at a corner, its law held flat there. |
+| `capped_fillet(model, references, radius, tag, cap, cap_face, flip, continuity, chain)` | Parasolid's caps by faces or sheets: the fillets stop where they meet the surface of `cap`'s face `cap_face`, the part behind it kept (Parasolid's sections, limits and setbacks below). |
 | `filleted_sets(model, sets, radii, tag, continuity, chain)` | Fusion's selection sets in one Fillet: `sets` the sets' edge references apart by `\|`, set k filleted to `radii[k]`; where radii differ at a corner, a setback corner (straight edges between flat faces, built directly; two radii in a miter refused). |
 | `filleted(model, references, radius, tag, continuity, chain, setback, tangency, ..., overflow)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`); with `setback`, Fusion's Setback corner type for G1 corners too; `tangency`, Fusion's Tangency weight (0.1 to 2, 1 the default: Tangency weight below); Parasolid's sections, limits, setbacks and overflow behaviours (below). |
 | `identified_blends(model)`, `blend_radius(model, face)` | Parasolid's identify blends: the faces that are constant rolling-ball blends (a cylinder or torus met tangentially by its two walls, turning less than half a turn; the corner balls between them), found from the geometry alone; a blend face's radius (Identify blends below). |
@@ -852,6 +853,14 @@ loops between curved faces, variable radius):
 - **Limits** (`limit_from`, `limit_to`, `BlendLimits`): the fillet runs only between two fractions
   of one straight edge (or its collinear pieces), its tool stopping square at each limit, so the
   booleans leave the plane there as the blend's cap (`<tag>/cap`). The direct builds are skipped.
+- **Caps by faces or sheets** (`CadModeling.capped_fillet`, `BlendCap`): every blend of the feature
+  stops where it meets the surface of a face (of the body itself, or of another body or sheet),
+  the part behind the face kept (against its normal; `flip`: in front), its tool cut by the
+  surface's side (`cap_cut`): the cut is the blend's cap (`<blend>/cap/...`), the edge sharp beyond.
+  The direct builds are skipped. `blend_cap_tests`: a 20 cube's top edge rounded 2 capped by a face
+  at x = 0 takes half the spandrel prism (10 r² (1 − π/4)) either side; by a plane at 45° the prism
+  cut slanted, the spandrel's area times the length to the plane at its centroid (r (5/6 − π/4) /
+  (1 − π/4) below the edge); G2 capped at x = 0 half the whole edge's.
 - **Setbacks** (`setback_ratio`): where fillets meet at a corner each stops at least that many radii
   from it (by default as far as the corner needs: the contacts' crossing and half a reach, 1.5 r at
   a square corner), and the corner's setback patch fills the larger gap; G1 corners become setback
@@ -873,9 +882,11 @@ loops between curved faces, variable radius):
 - **notch**: the fillet unchanged, the next face trimming it over a convex edge, or (over a concave
   edge, a ledge below) the ledge's plane covering its end.
 
-The default is smooth and notch. With none (`overflow` 0) the fillet must fit its faces, else the
+The default is all three, cliff before notch: Fusion's own (probe 12 of 2026-10-12: F6 rounded 5 and
+4.5 is 1501.45145 and 1515.40814, the ledge plate 2301.45145 and 2315.40814, our cliff-edge blends to
+1e-10; the rolled-on plate 1549.13093, ours to 1e-4). With none (`overflow` 0) the fillet must fit its faces, else the
 size that does is said (`blend_shape_tests`: a plate 4 thick rounded 5 is refused, "less than 4").
-`overflow_tests` checks the choices against closed forms: the plate 20 × 4 × 20 and the ledge plate
+`overflow_tests` checks the choices against closed forms and Fusion's numbers: the plate 20 × 4 × 20 and the ledge plate
 rounded 5 with Cliff take away the triangle between the edge, the top contact (√(r² − (4 − r)²) in)
 and the cliff edge less the circle's segment on that chord (1501.45 and 2301.45); the plate's bottom
 side edge rounded 3, its top edge rounded 1.5 rolls onto that round (the polygon of the contacts and
@@ -1297,7 +1308,15 @@ for a wall of 0.1. A wall inside thicker than convex rounds' radii (cylinders, s
 turned outward: fillets, corner balls) makes them vanish from the hollow; the inner body is then the
 one of the body with those rounds deleted (Delete's healing, its sharp edges' pieces joined), which
 for convex rounds is exact (the rounds' tangent planes in between are implied by their neighbors'):
-a 20 cube rounded 1 all over, shelled 2, has the sharp 16 box for its hollow. Any other wall that
+a 20 cube rounded 1 all over, shelled 2, has the sharp 16 box for its hollow. G2 and G3 strips
+between flat faces go the same way (`swallowed_strips`) when their radius (the contacts' distance
+from the faces' meeting line over tan(φ/2)) is no more than the wall and they lie between their
+circle and the corner (Fusion's sections do), with the setback corners between them. When Delete
+cannot heal them all (a G2 setback corner's quads), a convex body's inner body is the cell of its
+flat faces' planes moved in by the wall (`convex_inner`, each face named after its plane's), which
+also drops flat faces the inset swallows (a small chamfer). `shell_tests`: a 20 cube's uprights
+rounded 3 G2 and G3, shelled 4 closed and open, hollow the sharp 12 box (12 × 16 × 12 open); every
+edge G2, shelled 4 closed; a cube chamfered 1 on one edge shelled 3, its hollow the 14 cube (5246). Any other wall that
 would change the body's topology is refused: "the shell's thickness is too large for this body",
 with the inner wall's own reason after it. The inner wall's faces are named `<tag>/` and the face's own name. B-spline faces are offset as
 Offset Face's are: a box rounded G2 shells closed or opened at its top, and one rounded G2 on every
@@ -1307,7 +1326,12 @@ edges stray up to a few: such vertices and edges keep how far (tolerant, as Stit
 B-rep keeps those precisions, and the booleans' charts take an input's points within ten of their
 own tolerance (the model's size × 1e-7, tighter than an input's own). Removing a face of a body
 smooth all over with Tangent chain takes every face, and is refused ("Tangent chain takes every
-face here").
+face here"). Without it, a flat removed face met tangentially all round (a body rounded on every
+edge, opened at its top) cannot be poked through: its neighbors' inner offsets stay tangent below
+its plane. The closed shell is then opened by the face swept in by the wall (`tangent_opening`,
+`closed_quilt`), the opening's rim square to the face (`<tag>/rim`): a 20 cube rounded 3, shelled 1
+open at its top, is the rounded cube less the 18 cube rounded 2 less the 14 × 14 slab, Steiner's
+volumes to 1e-3 (`shell_tests`; refused before).
 
 ### Every edge rounded whole (`rounded.lucb`)
 
@@ -1658,6 +1682,17 @@ their precision falls back under the tolerance (a box's faces moved 1e-3 apart s
 box exactly); an open result's boundary edges keep their curves, ending at the rebuilt vertices (five
 of the box's faces: precision 2e-5 again). `tolerant` keeps them as they are, and so does a rebuild
 that would change the shape.
+First, **slivers and short edges** (`stitch_heal.lucb`, the SMLib study's item 12): a face with exactly
+two edges longer than the gap, each within the gap of the other, is thin; the faces across those two
+edges (other bodies' open edges within the gap) tell what it is. Square to both, which face opposite
+ways: a thin plate's side, kept, its short edges its width. Otherwise (lying along them, or turning
+between them as a tiny chamfer does) a sliver: taken out before the merges, so its neighbors join
+directly. A face's open edge shorter than the gap (not a plate side's) collapses: its ends merge
+though one face holds both, and the edge goes from the loops. `stitch_heal_tests`: a 20 cube's top
+split along z = ±0.0005 and unstitched stitches within 0.003 into 7 faces (the sliver gone, the halves
+joined, 8000); split at z = 9.999, the sliver along the front edge goes and the sides' 0.001 edges
+collapse (6 faces, no edge under 20); the plate 0.002 thin still closes with its sides
+(`stitch_passes`).
 Unstitch makes every face its own open body.
 
 Tests (`tests/regressions/surfacing_tests.luc`), against closed forms:
@@ -2436,10 +2471,10 @@ Roughly in order of usefulness:
    it, joined; a pipe inside a box touching its wall, subtracted; a pipe grazing a box's top and
    bottom, taken from it; a box laid against a B-spline strip, found by `modeling/contact.lucb`
    since no curve follows a touch) are refused as non-manifold.
-9. **Offsets where faces vanish or reconnect** beyond convex analytic rounds (a G2 strip or a flat
-   face swallowed by an inset; the face soup's arrangement by winding number), a body rounded on
-   every edge shelled open at a face (the offsets of its tangent neighbors never reach the opening's
-   plane: Fusion takes the whole tangent chain, which is every face), and draft; Delete healing several faces at once beside curved faces
+9. **Offsets where faces vanish or reconnect** beyond convex bodies and convex rounds (G2 strips and
+   flat faces an inset swallows on a body that is not convex: the face soup's arrangement by
+   winding number), outward offsets that reconnect, a body rounded on every edge shelled open at a
+   curved face (a flat one opens square to it: Shell above), and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face and strips apart (adjacent strips of a curved chain, healing by
    extended neighbors' arrangement).
 10. **Long cells on a strip cut at a slant:** a rectangular pyramid's apex edges alone rounded G1

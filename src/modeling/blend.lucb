@@ -116,13 +116,15 @@ func convex(w: const Shape*, e: usize) -> bool!:
 ## earlier fillet.
 ## `direct` false skips the direct build (local_blend.lucb), for tests
 ## that compare it with the booleans.
-pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true, direct: bool = true, corner_type: i64 = 1, setback: bool = false, blend_shape: BlendShape = plain_blend, limits: BlendLimits = no_limits) -> interop.Reference[CadModel]!:
+## With `cap` (Parasolid's caps by faces or sheets) every edge's blend
+## stops at that surface (cap_cut).
+pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true, direct: bool = true, corner_type: i64 = 1, setback: bool = false, blend_shape: BlendShape = plain_blend, limits: BlendLimits = no_limits, cap: const BlendCap*? = none) -> interop.Reference[CadModel]!:
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
     defer chosen.close()
     try choose_edges(&w, references, chain, &chosen)
-    return try blend_chosen(model, &w, chosen.view(), trimmed(references) == "", size, round, tag, continuity, direct, none, none, corner_type, setback, blend_shape, none, limits)
+    return try blend_chosen(model, &w, chosen.view(), trimmed(references) == "", size, round, tag, continuity, direct, none, none, corner_type, setback, blend_shape, none, limits, cap)
 
 ## The edges of `w` that `references` names onto `chosen` (empty: every
 ## straight convex edge between flat faces; rims and inside corners only
@@ -155,16 +157,16 @@ func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize
 ## fit the conic's weight directly.
 ## With `laws`, the edges they hold are rounded by their radius laws
 ## between where the corners stop them (variable_corners.lucb).
-func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct_asked: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1, setback_asked: bool = false, blend_shape: BlendShape = plain_blend, laws: const EdgeLaws*? = none, limits: BlendLimits = no_limits) -> interop.Reference[CadModel]!:
+func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct_asked: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1, setback_asked: bool = false, blend_shape: BlendShape = plain_blend, laws: const EdgeLaws*? = none, limits: BlendLimits = no_limits, cap: const BlendCap*? = none) -> interop.Reference[CadModel]!:
     if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     if round: try check_shape(blend_shape)
     let conic = round and continuity == 1 and not blend_shape.plain()
     # Limits (BlendLimits) take one straight edge, or its collinear pieces,
     # by the booleans: the tool stops square at each limit, and the cut
-    # leaves the cap.
-    let limited = limits.limited()
-    if limited: try check_limits(w, chosen, limits)
+    # leaves the cap. A cap by a face or sheet likewise (cap_cut).
+    let limited = limits.limited() or cap != none
+    if limits.limited(): try check_limits(w, chosen, limits)
     if not (limits.setback >= 0.0 and limits.setback < 100.0): error(invalid, "a fillet's setback is a share of its radius from 0 (as the corner needs) to 100")
     let direct = direct_asked and not conic and not limited and not (limits.setback > 0.0)
     let setback = setback_asked or conic or limits.setback > 0.0
@@ -274,7 +276,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             let edge = w.edges.items[e]
             let at_start = vertex_in(joints.view(), edge.start)
             let at_end = vertex_in(joints.view(), edge.end)
-            try tools.push(try edge_tool(w, e, leg_a, round, tool_continuity, low, high, at_start, at_end, &body, (str)name.view(), leg_b, blend_shape))
+            try tools.push(try cap_cut(try edge_tool(w, e, leg_a, round, tool_continuity, low, high, at_start, at_end, &body, (str)name.view(), leg_b, blend_shape), cap, (str)name.view()))
             try adds.push(adding)
             continue
         let (fa, fb) = try edge_faces(w, e)
@@ -354,7 +356,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
                 if round and continuity == 1 and blend_shape.plain(): try give_sections(w, e, &held.laws.items[(usize)at], start, end, setbacks.view(), &given)
                 lawed = true
         if not lawed:
-            if adding: try tools.push(try concave_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b, blend_shape))
+            if adding: try tools.push(try cap_cut(try concave_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b, blend_shape), cap, (str)name.view()))
             else:
                 # Running off a face (fits_plan): rolled on or ending on a
                 # cliff edge, its own section; over a ledge, stopped at its
@@ -367,7 +369,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
                     let cut = try cliff_cut(w, tool, side.face, (str)name.view())
                     tool.release()
                     tool = cut
-                try tools.push(tool)
+                try tools.push(try cap_cut(tool, cap, (str)name.view()))
         try adds.push(adding)
     for ball in balls.view():
         try corner_name(w, (usize)ball.vertex, tag, &name)
@@ -528,3 +530,40 @@ func give_sections(w: const Shape*, e: usize, law: const RadiusLaw*, start: Vect
         var points: Vector3[6] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
         for k in 0..<(usize)6: points[k] = section.items[k]
         try given.push(GivenSection(corner.vertex, e, points))
+
+## A cap (Parasolid's caps by faces or sheets): a blend stops where it meets
+## surface `surface` (a face's of the body or of a sheet), the cut face left
+## as the blend's cap (`<name>/cap/to/f<i>`). `away`: the side the surface
+## bounds (a plane's normal side, a curved surface's inside) is taken
+## away; else only it is kept.
+pub struct BlendCap:
+    pub var surface: Surface
+    pub var away: bool
+
+## Edge tool `tool` stopped at cap `cap` (none: the tool itself).
+func cap_cut(tool: interop.Reference[CadModel], cap: const BlendCap*?, name: str) -> interop.Reference[CadModel]!:
+    let held = cap else return tool
+    defer tool.release()
+    var w = try shape_of(tool.value())
+    defer w.close()
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(&w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+    let s = &held.surface
+    let span = high.subtract(low).length() * 4.0 + s.origin.subtract(low).length() * 2.0
+    var label = Growing[u8]()
+    defer label.close()
+    for byte in name.bytes: try label.push(byte)
+    for byte in "/cap".bytes: try label.push(byte)
+    let (_, side) = try surface_side(s, s.origin, 1.0, s.z, 0.0, span, (str)label.view())
+    defer side.release()
+    let kept = combine(tool.value(), side.value(), op_subtract if held.away else op_intersect) catch failure:
+        _ = failure
+        error(invalid, "a fillet's cap does not cross its edge")
+    if kept.value().face_count() == 0:
+        kept.release()
+        error(invalid, "a fillet's cap leaves nothing of it: flip the cap")
+    return kept

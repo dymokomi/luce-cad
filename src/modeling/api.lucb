@@ -106,10 +106,32 @@ pub struct CadModeling:
     ## overflow_smooth (1), overflow_cliff (2) and overflow_notch (4),
     ## tried in that order (blend_fits.lucb); 0 refuses a blend that does
     ## not fit its faces with the size that would (Parasolid's overflow
-    ## off). The default is smooth and notch.
+    ## off). The default is all three (Fusion's takes the cliff).
     pub static func filleted(model: interop.Reference[CadModel], references: str, radius: f64, tag: str, continuity: i64 = 1, chain: bool = true, setback: bool = false, tangency: f64 = 1.0, conic: i64 = 0, rho: f64 = 0.5, depth: f64 = -1.0, skew: f64 = 0.5, softness: f64 = -1.0,
                                 limit_from: f64 = 0.0, limit_to: f64 = 1.0, setback_ratio: f64 = 0.0, overflow: i64 = overflow_default) -> interop.Reference[CadModel]!:
         return try blended(model.value(), references, radius, true, tag, continuity, chain, true, 1, setback, BlendShape(tangency, conic, rho, depth, skew, softness), BlendLimits(limit_from, limit_to, setback_ratio, overflow))
+
+    ## Parasolid's caps by faces or sheets: `model`'s edges `references`
+    ## filleted to `radius` (as filleted's, at `continuity`), each blend
+    ## stopping where it meets the surface of `cap`'s face `cap_face` (a
+    ## face of the body itself or of a sheet), the part behind the face
+    ## (against its normal; `flip`: in front of it) kept; the cut is the
+    ## blend's cap (`<blend>/cap/...`), the edge sharp beyond it.
+    pub static func capped_fillet(model: interop.Reference[CadModel], references: str, radius: f64, tag: str, cap: interop.Reference[CadModel], cap_face: str, flip: bool = false, continuity: i64 = 1, chain: bool = true) -> interop.Reference[CadModel]!:
+        var t = try shape_of(cap.value())
+        defer t.close()
+        var found = Growing[usize]()
+        defer found.close()
+        try faces_named(&t, cap_face, &found)
+        let face = t.faces.items[found.items[0]]
+        let s = &t.surfaces.items[(usize)face.surface]
+        # Behind the face: a plane's normal side taken away, a curved
+        # surface's inside kept (its outward face's back), turned over by
+        # the face's sense and `flip`.
+        let behind = face.sense != flip
+        var held = BlendCap(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv), behind if s.kind == surface_plane else not behind)
+        defer held.surface.close()
+        return try blended(model.value(), references, radius, true, tag, continuity, chain, true, 1, false, plain_blend, no_limits, &held)
 
     ## A fillet of several edge sets, each its own radius (Fusion's
     ## selection sets): `sets` the sets' edge references apart by `|`,

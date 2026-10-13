@@ -1,0 +1,124 @@
+## Stitch's short-edge and sliver removal (the SMLib study's item 12, its
+## healing part; Parasolid's sewing with sliver faces and short edges):
+## before the boundary vertices merge (stitch.lucb), faces thinner than the
+## gap that only fill it are taken out, and boundary edges shorter than the
+## gap collapse to one vertex, so their faces' neighbors join directly.
+##
+## A face is thin when it has exactly two edges longer than the gap and
+## every point of each lies within the gap of the other. Whether it is a
+## sliver or a thin plate's side is told by the faces either side, across
+## those long edges (the faces of other bodies whose open edges lie within
+## the gap of them): a plate's side stands square to them, and they face
+## opposite ways (its top and bottom); a sliver lies along them, or turns
+## between them as a tiny chamfer does. A plate's side stays, and its short
+## edges (its width) keep their length.
+
+## Thin faces of `w` that are slivers taken out of it (their uses gone, their
+## edges left unused), and onto `collapse` the endpoints (point pairs) of
+## the boundary edges shorter than `gap` on faces that are no plate's side.
+func heal_slivers(w: Shape*, gap: f64, collapse: Growing[i64]*) -> !:
+    try w.index_sides()
+    var drop = Growing[bool]()
+    defer drop.close()
+    try drop.fill(w.faces.count, false)
+    var sides = Growing[bool]()
+    defer sides.close()
+    try sides.fill(w.faces.count, false)
+    for f in 0..<w.faces.count:
+        let kind = try thin_kind(w, f, gap)
+        if kind == thin_sliver: drop.items[f] = true
+        elif kind == thin_side: sides.items[f] = true
+    for f in 0..<w.faces.count:
+        if drop.items[f] or sides.items[f]: continue
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            let edge = w.edges.items[e]
+            if edge.start == edge.end: continue
+            # An open edge (one use: a sheet's boundary) shorter than the gap.
+            let fa = w.sides.items[e * 2]
+            let fb = w.sides.items[e * 2 + 1]
+            if fa >= 0 and fb >= 0: continue
+            if (try edge_length(w, e)) >= gap: continue
+            try collapse.push(edge.start)
+            try collapse.push(edge.end)
+    var any = false
+    for d in drop.view(): any = any or d
+    if not any: return
+    # The slivers' uses gone.
+    var uses = Growing[i64]()
+    defer uses.close()
+    var sizes = Growing[i64]()
+    defer sizes.close()
+    var faces = Growing[ShapeFace]()
+    defer faces.close()
+    for f in 0..<w.faces.count:
+        if drop.items[f]: continue
+        let face = w.faces.items[f]
+        let first_use = uses.count
+        let first_size = sizes.count
+        for use in w.face_uses(f): try uses.push(use)
+        for size in w.face_sizes(f): try sizes.push(size)
+        try faces.push(ShapeFace(face.surface, face.sense, first_use, uses.count - first_use, first_size, sizes.count - first_size, face.name))
+    try w.uses.assign(uses.view())
+    try w.sizes.assign(sizes.view())
+    try w.faces.assign(faces.view())
+    try w.index_sides()
+
+## What thin_kind finds a face to be.
+let thin_none: i64 = 0
+let thin_sliver: i64 = 1
+let thin_side: i64 = 2
+
+## Face `f` of `w` as thin_kind sees it (see the file's header).
+func thin_kind(w: const Shape*, f: usize, gap: f64) -> i64!:
+    var long = Growing[usize]()
+    defer long.close()
+    for use in w.face_uses(f):
+        let e = edge_index(use)
+        if (try edge_length(w, e)) >= gap:
+            var known = false
+            for k in long.view(): known = known or k == e
+            if not known: try long.push(e)
+    if long.count != 2: return thin_none
+    let a = long.items[0]
+    let b = long.items[1]
+    if not (try within_of(w, a, b, gap)) or not (try within_of(w, b, a, gap)): return thin_none
+    # The faces across each long edge, and the normals there.
+    let ma = try w.edge_at(a, 0.5)
+    let mb = try w.edge_at(b, 0.5)
+    let na = try neighbor_across(w, f, a, gap)
+    let nb = try neighbor_across(w, f, b, gap)
+    if na < 0 or nb < 0: return thin_none
+    let own = try w.face_normal(f, ma.add(mb).multiply_scalar(0.5))
+    let across_a = try w.face_normal((usize)na, ma)
+    let across_b = try w.face_normal((usize)nb, mb)
+    # Square to both, which face opposite ways: a plate's side.
+    if math.abs(own.dot(across_a)) < 0.5 and math.abs(own.dot(across_b)) < 0.5 and math.abs(across_a.dot(across_b)) > 0.9: return thin_side
+    return thin_sliver
+
+## Whether every point of edge `a` (sampled) lies within `gap` of edge `b`.
+func within_of(w: const Shape*, a: usize, b: usize, gap: f64) -> bool!:
+    let other = w.edges.items[b]
+    for k in 0..<9:
+        let p = try w.edge_at(a, (f64)k / 8.0)
+        let t = try nearest_on(w, other.carrier, p, other.t0, other.t1)
+        if (try w.at(other.carrier, t)).subtract(p).length() > gap: return false
+    return true
+
+## The face other than `f` with an open edge within `gap` of edge `e`'s
+## middle (a neighbor across it, before the stitch joins them); -1 none.
+func neighbor_across(w: const Shape*, f: usize, e: usize, gap: f64) -> i64!:
+    let middle = try w.edge_at(e, 0.5)
+    var best: i64 = -1
+    var nearest = gap
+    for g in 0..<w.faces.count:
+        if g == f: continue
+        for use in w.face_uses(g):
+            let k = edge_index(use)
+            let other = w.edges.items[k]
+            let t = try nearest_on(w, other.carrier, middle, other.t0, other.t1)
+            let d = (try w.at(other.carrier, t)).subtract(middle).length()
+            if d <= nearest:
+                nearest = d
+                best = (i64)g
+    return best

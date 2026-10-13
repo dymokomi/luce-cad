@@ -50,6 +50,13 @@ pub func stitch_models(models: const interop.Reference[CadModel][], gap: f64, to
         append_shape(&w, &other) catch failure:
             w.close()
             error(failure.code, failure.message)
+    # Slivers out and short edges collapsing (stitch_heal.lucb), before
+    # the vertices merge.
+    var collapse = Growing[i64]()
+    defer collapse.close()
+    heal_slivers(&w, gap, &collapse) catch failure:
+        w.close()
+        error(failure.code, failure.message)
     let faces = w.faces.count
     var work = Work(w, faces, 1.0, gap * 0.1, Growing[Vector3](), Growing[i64](), Growing[Cut](), Growing[Section](), Growing[Imprint](),
                     Growing[Coincident](), Growing[ShapeEdge](), Growing[i64](), Growing[usize](), Growing[i64](), Growing[bool]())
@@ -63,7 +70,7 @@ pub func stitch_models(models: const interop.Reference[CadModel][], gap: f64, to
     # Edges used once (each face's boundary), before: what may join.
     var before = try stitch_open_edges(&work.w)
     # Vertices within the gap merge, the closest first (closest_merges).
-    try closest_merges(&work, gap)
+    try closest_merges(&work, gap, collapse.view())
     try vertex_cuts(&work)
     try cut_edges(&work)
     # Each face's loops in final edges: each use replaced by its pieces.
@@ -83,6 +90,8 @@ pub func stitch_models(models: const interop.Reference[CadModel][], gap: f64, to
                 let last = work.piece_starts.items[e + 1]
                 for k in 0..<last - first:
                     let id = work.piece_ids.items[first + k if use > 0 else last - 1 - k]
+                    # A short edge collapsed to one vertex is gone.
+                    if try collapsed_piece(&work, id, gap): continue
                     try pieces.uses.push(id if use > 0 else -id)
             at += (usize)size
             try pieces.cycle_starts.push(pieces.uses.count)
@@ -484,11 +493,21 @@ func rebuilt_joins(model: const CadModel*, base: f64, open: bool = false) -> int
         return none
     return made
 
+## Whether final edge piece `id` (signed) runs from a vertex back to it
+## within `gap` (a short edge whose ends merged): no edge at all.
+func collapsed_piece(work: const Work*, id: i64, gap: f64) -> bool!:
+    let final = work.finals.items[edge_index(id)]
+    if final.start != final.end: return false
+    let middle = try work.w.at(final.carrier, (final.t0 + final.t1) * 0.5)
+    return middle.subtract(work.vertices.items[(usize)final.start]).length() <= gap
+
 ## Each point of `work`'s shape its merged vertex (`work.point_vertex`):
 ## pairs within `gap` merged closest first, unless the two groups hold a
-## point of one face between them (that face would lose an edge). Each
-## vertex sits at its group's first point, its zone reaching its farthest.
-func closest_merges(work: Work*, gap: f64) -> !:
+## point of one face between them (that face would lose an edge). The
+## point pairs `collapse` (short edges' ends, stitch_heal.lucb) merge
+## before any, though one face holds both. Each vertex sits at its
+## group's first point, its zone reaching its farthest.
+func closest_merges(work: Work*, gap: f64, collapse: const i64[]) -> !:
     let w = &work.w
     let n = w.points.count
     # The faces at each point (by its edges), as pairs (point, face).
@@ -528,6 +547,12 @@ func closest_merges(work: Work*, gap: f64) -> !:
     var group = Growing[usize]()
     defer group.close()
     for i in 0..<n: try group.push(i)
+    var at_pair: usize = 0
+    while at_pair + 1 < collapse.length:
+        let a = union_root(group.items, (usize)collapse[at_pair])
+        let b = union_root(group.items, (usize)collapse[at_pair + 1])
+        if a != b: group.items[b if a < b else a] = a if a < b else b
+        at_pair += 2
     for k in order.view():
         let a = union_root(group.items, (usize)pairs.items[k * 2])
         let b = union_root(group.items, (usize)pairs.items[k * 2 + 1])
