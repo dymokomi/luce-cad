@@ -99,6 +99,28 @@ func signed_gap(s: const Surface*, p: Vector3, tol: f64) -> (f64, Vector3)!:
     let ring = radial - s.radius
     return (math.sqrt(ring * ring + h * h) - s.angle, n)
 
+## `signed_gap` along a run of nearby points: a B-spline's nearest point
+## searched from `seed` (the last one's parameters, updated) first.
+func gap_along(s: const Surface*, p: Vector3, tol: f64, seed: Vector3*) -> (f64, Vector3)!:
+    if s.kind != surface_spline: return try signed_gap(s, p, tol)
+    var uv = try nearest_parameters(*s, p, *seed, false)
+    var q = try evaluate(*s, uv)
+    var n = try normal_at(s, q, tol)
+    # Not a foot point (the start slid to a domain edge, a fold): the
+    # whole search.
+    let off = p.subtract(q)
+    if off.subtract(n.multiply_scalar(off.dot(n))).length() > tol * 10.0:
+        uv = try nearest_uv(s, p, tol)
+        q = try evaluate(*s, uv)
+        n = try normal_at(s, q, tol)
+    *seed = uv
+    return (p.subtract(q).dot(n), n)
+
+## The start of gap_along's run at `p`: a B-spline's nearest parameters
+## (searched whole), anything for another surface.
+func seed_of(s: const Surface*, p: Vector3, tol: f64) -> Vector3!:
+    return (try nearest_uv(s, p, tol)) if s.kind == surface_spline else Vector3()
+
 ## Where the surfaces `surfaces` of `w` meet nearest `seed`: Gauss-Newton
 ## on their signed distances, each step the least move that zeroes them to
 ## first order (so with two surfaces the point slides along their curve),
@@ -136,6 +158,14 @@ func corner_point(w: const Shape*, surfaces: const i64[], seed: Vector3) -> Vect
         worst = math.max(worst, math.abs(gap))
     if worst > w.tolerance * 10.0: error(invalid, "the faces at a corner no longer meet in one point: the move changes the body's shape too much")
     return x
+
+## How far point `x` lies from the farthest of the surfaces `surfaces`.
+func corner_gap(w: const Shape*, surfaces: const i64[], x: Vector3) -> f64!:
+    var worst = 0.0
+    for s in surfaces:
+        let (gap, _) = try signed_gap(&w.surfaces.items[(usize)s], x, w.tolerance)
+        worst = math.max(worst, math.abs(gap))
+    return worst
 
 ## `seed` projected onto the surfaces `surfaces` of `w` one after another,
 ## round after round, until they nearly all pass through it: surfaces that
@@ -238,6 +268,13 @@ func substitute(w: Shape*, faces: const usize[], m: const FaceMove*, targets: co
                 w.points.items[v] = m.point(w.points.items[v])
                 continue
         w.points.items[v] = try corner_point(w, surfaces.view(), w.points.items[v])
+        # A corner where offsets fitted to the tolerance meet nearly
+        # tangentially (a G2 corner patch and its strips) is found within
+        # ten tolerances: it keeps how far it strays, as a tolerant vertex.
+        let strays = try corner_gap(w, surfaces.view(), w.points.items[v])
+        if strays > w.tolerance:
+            while w.point_slack.count <= v: try w.point_slack.push(0.0)
+            w.point_slack.items[v] = math.max(w.point_slack.items[v], strays * 1.5)
     # Edges on moved faces: carriers again; the rest: their intervals.
     for e in 0..<w.edges.count:
         let edge = w.edges.items[e]
@@ -423,13 +460,17 @@ func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, ol
             carrier = try w.add_carrier(try seam_carrier(w, &old, start, end, m))
         else:
             let middle = try w.edge_at(e, 0.5)
-            let met = meeting_carrier(w, (usize)fa, (usize)fb, start, end, middle) catch failure:
-                # Faces meeting tangentially (a fillet's rim on a torus
-                # corner) offset alike stay tangent, so they touch rather
-                # than cross: the edge is the old one moved along their
-                # shared normal.
-                recover try tangent_carrier(w, (usize)fa, (usize)fb, &old, e, start, end, middle, failure.message)
-            carrier = try w.add_carrier(met)
+            # Faces meeting tangentially (a fillet's rim on a torus corner,
+            # a G2 strip and its corner patch) offset alike stay tangent, so
+            # they touch rather than cross: the edge is the old one moved
+            # along their shared normal (not traced: tracing touching
+            # surfaces finds nothing, slowly).
+            if try tangent_there(w, (usize)fa, (usize)fb, middle):
+                carrier = try w.add_carrier(try tangent_carrier(w, (usize)fa, (usize)fb, &old, e, start, end, middle, "a moved face no longer meets its tangent neighbor along a curve this can follow"))
+            else:
+                let met = meeting_carrier(w, (usize)fa, (usize)fb, start, end, middle) catch failure:
+                    recover try tangent_carrier(w, (usize)fa, (usize)fb, &old, e, start, end, middle, failure.message)
+                carrier = try w.add_carrier(met)
     let c = w.carriers.items[(usize)carrier]
     var t0 = 0.0
     var t1 = 0.0
@@ -463,7 +504,27 @@ func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, ol
         t1 = try nearest_on(w, carrier, end, low, high)
         if (try w.at(carrier, t0)).subtract(start).length() > w.tolerance * 100.0 or (try w.at(carrier, t1)).subtract(end).length() > w.tolerance * 100.0:
             error(invalid, "a B-spline edge cannot reach its moved corner: the move changes the body's shape too much")
+        # A curve traced between faces fitted to the tolerance (offsets
+        # meeting nearly tangentially) keeps how far it strays from them.
+        if on_moved and fa >= 0 and fb >= 0: try note_strays(w, e, carrier, t0, t1, (usize)fa, (usize)fb)
     w.edges.items[e] = ShapeEdge(carrier, t0, t1, edge.start, edge.end)
+
+## Edge `e`'s precision (its slack) from how far carrier `carrier` strays
+## from faces `fa` and `fb` between `t0` and `t1`, when over half the
+## tolerance: half again over it, as a tolerant edge.
+func note_strays(w: Shape*, e: usize, carrier: i64, t0: f64, t1: f64, fa: usize, fb: usize) -> !:
+    var strays = 0.0
+    let first = try w.at(carrier, t0)
+    var seeds: Vector3[2] = [try seed_of(&w.surfaces.items[(usize)w.faces.items[fa].surface], first, w.tolerance), try seed_of(&w.surfaces.items[(usize)w.faces.items[fb].surface], first, w.tolerance)]
+    for k in 0..<129:
+        let q = try w.at(carrier, t0 + (t1 - t0) * (f64)k / 128.0)
+        for side in 0..<(usize)2:
+            let f = fa if side == 0 else fb
+            let (off, _) = try gap_along(&w.surfaces.items[(usize)w.faces.items[f].surface], q, w.tolerance, &seeds[side])
+            strays = math.max(strays, math.abs(off))
+    if strays <= w.tolerance * 0.5: return
+    while w.edge_slack.count <= e: try w.edge_slack.push(0.0)
+    w.edge_slack.items[e] = math.max(w.edge_slack.items[e], strays * 1.5)
 
 ## The carrier of a tangent edge between faces `fa` and `fb` of `w`, both
 ## offset alike: the old carrier `old` (of old edge `edge`) moved onto
@@ -503,6 +564,14 @@ func tangent_carrier(w: Shape*, fa: usize, fb: usize, old: const Carrier*, e: us
     let x = try start.subtract(center).normalized()
     return Carrier(curve_circle, center, x, z.cross(x), radius, radius, -1)
 
+## Whether faces `fa` and `fb` of `w` are tangent at `p` (their normals
+## parallel to a millionth).
+func tangent_there(w: const Shape*, fa: usize, fb: usize, p: Vector3) -> bool!:
+    # (Their surfaces moved off `p`: the normals at its nearest points.)
+    let (_, na) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[fa].surface], p, w.tolerance)
+    let (_, nb) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[fb].surface], p, w.tolerance)
+    return math.abs(na.dot(nb)) >= 1.0 - 1e-6
+
 ## A B-spline carrier through edge `e`'s old points (33 along it) each
 ## moved onto face `fa`'s surface along its normal, from `start` to `end`:
 ## faces offset alike and tangent along the edge share the moved points.
@@ -514,12 +583,13 @@ func moved_spline_carrier(w: Shape*, fa: usize, fb: usize, e: usize, start: Vect
     var points = Growing[Vector3]()
     defer points.close()
     let count = 32
+    var seed = try seed_of(&w.surfaces.items[(usize)w.faces.items[fa].surface], start, w.tolerance)
     for k in 0..<count + 1:
         if k == 0: try points.push(start)
         elif k == count: try points.push(end)
         else:
             let p = try w.at(edge.carrier, edge.t0 + (edge.t1 - edge.t0) * (f64)k / (f64)count)
-            let (gap, n) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[fa].surface], p, w.tolerance)
+            let (gap, n) = try gap_along(&w.surfaces.items[(usize)w.faces.items[fa].surface], p, w.tolerance, &seed)
             try points.push(p.subtract(n.multiply_scalar(gap)))
     var net = Growing[Vector3]()
     defer net.close()
@@ -532,15 +602,19 @@ func moved_spline_carrier(w: Shape*, fa: usize, fb: usize, e: usize, start: Vect
     let spline = try w.store_spline(net.view(), weights.view(), knots.view(), 3, Matrix4())
     let carrier = Carrier(curve_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline)
     let index = try w.add_carrier(carrier)
+    # How far it strays, sampled four times between the points it passes
+    # through: the charts later find its points on both faces within it.
     var strays = 0.0
-    for k in 0..<count * 2 + 1:
-        let q = try w.at(index, (f64)k / (f64)(count * 2))
-        for f in [fa, fb]:
-            let (off, _) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[f].surface], q, w.tolerance)
+    var seeds: Vector3[2] = [try seed_of(&w.surfaces.items[(usize)w.faces.items[fa].surface], start, w.tolerance), try seed_of(&w.surfaces.items[(usize)w.faces.items[fb].surface], start, w.tolerance)]
+    for k in 0..<count * 4 + 1:
+        let q = try w.at(index, (f64)k / (f64)(count * 4))
+        for side in 0..<(usize)2:
+            let f = fa if side == 0 else fb
+            let (off, _) = try gap_along(&w.surfaces.items[(usize)w.faces.items[f].surface], q, w.tolerance, &seeds[side])
             strays = math.max(strays, math.abs(off))
     if strays > w.tolerance * 10.0: error(invalid, reason)
     while w.edge_slack.count <= e: try w.edge_slack.push(0.0)
-    if strays > w.tolerance: w.edge_slack.items[e] = math.max(w.edge_slack.items[e], strays * 1.5)
+    if strays > w.tolerance * 0.5: w.edge_slack.items[e] = math.max(w.edge_slack.items[e], strays * 1.5)
     return carrier
 
 ## Circle or ellipse `c`'s parameter at `p` (on it).

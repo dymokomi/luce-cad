@@ -910,8 +910,13 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   the strips ended at their old top), and now gives the whole times (20 + up) / 20 to 1e-6. Two
   offset B-spline faces tangent along an edge (a G2 corner patch and its strip) take the old
   edge moved along the normal: a box rounded G2 on every edge offset 1 in now closes (refused
-  before); its shell still fails in the boolean, whose tolerance (size × 1e-7) is tighter than
-  the offset body's corners. Still open: offsets of rational bases kept rational, and extending
+  before); its shell then failed in the boolean, whose tolerance (size × 1e-7) is tighter than
+  the offset body's corners. Now the offset body's corners and tangent edges keep how far they stray
+  as their precision (lost before when the body was written), the booleans' charts take an input's
+  points within ten of their tolerance, and a closed shell is the outer body with the inner one as a
+  void, without booleans: a 20 cube rounded 3 G2 on every edge shelled 1 closed in 0.7 s (the
+  offset 2.9 s before, tangent edges now moved rather than traced), its volume the rounded cube's
+  less its offset body's to 1e-8 (1926.3827; `offset_spline_tests`). Still open: offsets of rational bases kept rational, and extending
   offsets themselves beyond profiles (tried naturally: the shell's boolean then marched on and
   on over the extended patches).
 

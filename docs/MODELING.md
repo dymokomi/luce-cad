@@ -1228,7 +1228,9 @@ Two offset bodies are made with the local face operations above. The outer one h
 out by the outside thickness; the removed faces stay where they are. The inner one has every face
 moved in by the inside thickness, while the removed faces move out past the outer body, so the inner
 body pokes through where the hollow opens. The shell is the outer body less the inner one. Without
-removed faces the inner body lies wholly inside: a closed void, a second shell.
+removed faces the inner body lies wholly inside: a closed void, a second shell, joined to the outer
+one directly (`with_void`), without the booleans, which had nothing to cut there and took 11 s
+comparing a G2-rounded box's face pairs.
 
 Faces offset as Offset Face's do, so a box's rounded uprights of 0.3 give a hollow rounded by 0.2
 for a wall of 0.1. A wall inside thicker than convex rounds' radii (cylinders, spheres and tori
@@ -1238,7 +1240,14 @@ for convex rounds is exact (the rounds' tangent planes in between are implied by
 a 20 cube rounded 1 all over, shelled 2, has the sharp 16 box for its hollow. Any other wall that
 would change the body's topology is refused: "the shell's thickness is too large for this body",
 with the inner wall's own reason after it. The inner wall's faces are named `<tag>/` and the face's own name. B-spline faces are offset as
-Offset Face's are: a box rounded G2 shells closed or opened at its top.
+Offset Face's are: a box rounded G2 shells closed or opened at its top, and one rounded G2 on every
+edge shells closed in 0.7 s. Its offsets are each fitted to the tolerance and meet nearly
+tangentially at its corner patches, so their corners are found within ten tolerances and their
+edges stray up to a few: such vertices and edges keep how far (tolerant, as Stitch's joins), the
+B-rep keeps those precisions, and the booleans' charts take an input's points within ten of their
+own tolerance (the model's size × 1e-7, tighter than an input's own). Removing a face of a body
+smooth all over with Tangent chain takes every face, and is refused ("Tangent chain takes every
+face here").
 
 ### Every edge rounded whole (`rounded.lucb`)
 
@@ -2312,9 +2321,9 @@ Roughly in order of usefulness:
    bottom, taken from it; a box laid against a B-spline strip, found by `modeling/contact.lucb`
    since no curve follows a touch) are refused as non-manifold.
 9. **Offsets where faces vanish or reconnect** beyond convex analytic rounds (a G2 strip or a flat
-   face swallowed by an inset; the face soup's arrangement by winding number), a shell of
-   a box rounded G2 on every edge (its offset body closes, but the booleans' tolerance is tighter
-   than the corners it finds), and draft; Delete healing several faces at once beside curved faces
+   face swallowed by an inset; the face soup's arrangement by winding number), a body rounded on
+   every edge shelled open at a face (the offsets of its tangent neighbors never reach the opening's
+   plane: Fusion takes the whole tangent chain, which is every face), and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face and strips apart (adjacent strips of a curved chain, healing by
    extended neighbors' arrangement).
 10. **Long cells on a strip cut at a slant:** a rectangular pyramid's apex edges alone rounded G1

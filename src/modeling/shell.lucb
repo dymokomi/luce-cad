@@ -90,7 +90,46 @@ func shell_of(model: interop.Reference[CadModel], removed: const bool[], thickne
     try name.push(47)
     let named = try CadModeling.prefixed(inner, (str)name.view())
     defer named.release()
+    # Nothing removed: the inner body lies wholly inside the outer one (its
+    # faces moved in, theirs out), a void. No face meets another, so the
+    # shell is the two, the inner turned inside out, without the booleans
+    # (their work there is every face pair's boxes overlapping for nothing:
+    # 11 s for a box rounded G2 on every edge).
+    var opened = false
+    for f in 0..<faces: opened = opened or removed[f]
+    if not opened: return try with_void(outer.value(), named.value())
     return try combine(outer.value(), named.value(), op_subtract)
+
+## `outer` with the void `inner` (wholly inside it, meeting none of its
+## faces): their faces as two shells of one body, the inner's turned.
+func with_void(outer: const CadModel*, inner: const CadModel*) -> interop.Reference[CadModel]!:
+    var w = try shape_of(outer)
+    defer w.close()
+    let first = w.faces.count
+    var hollow = try shape_of(inner)
+    defer hollow.close()
+    try append_shape(&w, &hollow)
+    for f in first..<w.faces.count:
+        let face = &w.faces.items[f]
+        face.sense = not face.sense
+        var at = face.first
+        for k in 0..<face.loops:
+            let size = (usize)w.sizes.items[face.loop_first + k]
+            # The loop run backwards: each use turned, in reverse order.
+            var low = at
+            var high = at + size - 1
+            while low < high:
+                let swap = w.uses.items[low]
+                w.uses.items[low] = -w.uses.items[high]
+                w.uses.items[high] = -swap
+                low += 1
+                high -= 1
+            if low == high: w.uses.items[low] = -w.uses.items[low]
+            at += size
+    try w.index_sides()
+    let b = try brep_of(&w)
+    defer b.release()
+    return try CadModel.of_brep(b)
 
 ## The inner body of a shell whose wall (`wall_in` inside, nothing
 ## outside) is thicker than some convex rounds' radii (cylinders, spheres
