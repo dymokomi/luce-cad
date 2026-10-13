@@ -1921,8 +1921,13 @@ to each side (so the blend cannot fold), and fitted into the net on the spans' g
 points; the net covers the projection's box with a margin of a tenth, and is trimmed by the boundaries
 laid on it (their feet on the fill, fitted at degree 5 with breaks at each boundary's own inner knots to
 a billionth of the loop, by its own parameter so Stitch meets the middles), keeping the region holding a
-point a step inside the loop. Quad: four boundaries on the sides of an untrimmed patch (its domain their
-mean lengths), the boundary rows fitted on the net's knots by the curves' own parameters and fixed.
+point a step inside the loop; a neighbor standing square to the chart's plane (an N-sided fill would
+rise straight up from it) is refused, pointing to Quad. Quad: four boundaries on the sides of an
+untrimmed patch (its domain their mean lengths), the boundary rows fitted on the net's knots by the
+curves' own parameters and fixed; where G1 must turn the base's slope square (a lid on vertical walls)
+a weak row asks the cross derivative to leave the neighbor its own way with the base's length, or G1
+alone is met by a cross derivative shrunk to nothing. A hole picked by one edge passes over seams:
+open edges lying on each other (sheets that touch) bound no hole.
 
 **Refinement, measures, conflicts** (`fill_refine.lucb`). Between the solve's stations each one is measured
 as Stage 0 measures an edge (the gap, the angle between normals, the normal curvatures across relative to

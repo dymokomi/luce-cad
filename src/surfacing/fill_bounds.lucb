@@ -197,9 +197,11 @@ struct OpenEdge:
 ## The words of every edge round the hole that `word` (an edge's words)
 ## lies on: the open edges (a face on one side only) of every body of
 ## `set`, walked end to end from it until the loop closes (Alias's and
-## Plasticity's fill of a hole picked by one edge), apart by `;`. Where
-## several open edges meet at a corner (sheets touching there), the walk
-## takes the one whose face lies on the hole's side as the last one's did.
+## Plasticity's fill of a hole picked by one edge), apart by `;`. Open
+## edges lying on each other (seams between sheets that touch) bound no
+## hole and are passed over; where several others meet at a corner (sheets
+## touching at a point), the walk takes the one whose face lies on the
+## hole's side as the last one's did, turning toward the hole.
 func hole_words(set: interop.Reference[GeometrySet], word: str) -> interop.Owned[str]!:
     var picked = try master_of(set, word, -1, Vector3())
     defer picked.close()
@@ -229,11 +231,27 @@ func hole_words(set: interop.Reference[GeometrySet], word: str) -> interop.Owned
             try edges.push(OpenEdge(face, a, b, middle, normal if forward else normal.multiply_scalar(-1.0)))
             size = math.max(size, a.subtract(b).length())
     if edges.count == 0: error(invalid, "Fill: the bodies have no open edges (no hole to fill)")
+    let gap = math.max(size * 1e-4, 1e-9)
+    # Seams: an open edge lying on another (sheets apart but touching along
+    # it, as an unstitched box's walls) bounds no hole.
+    var seam = Growing[bool]()
+    defer seam.close()
+    try seam.fill(edges.count, false)
+    for k in 0..<edges.count:
+        for l in k + 1..<edges.count:
+            let a = &edges.items[k]
+            let b = &edges.items[l]
+            if a.middle.subtract(b.middle).length() > gap: continue
+            let same = a.a.subtract(b.a).length() <= gap and a.b.subtract(b.b).length() <= gap
+            let reversed = a.a.subtract(b.b).length() <= gap and a.b.subtract(b.a).length() <= gap
+            if same or reversed:
+                seam.items[k] = true
+                seam.items[l] = true
     # The picked one: the open edge whose middle lies nearest its middle.
     var first: usize = 0
     for k in 0..<edges.count:
         if edges.items[k].middle.subtract(mark).length() < edges.items[first].middle.subtract(mark).length(): first = k
-    let gap = math.max(size * 1e-4, 1e-9)
+    if seam.items[first]: error(invalid, "Fill: the edge picked joins two sheets, it bounds no hole")
     var loop = Growing[usize]()
     defer loop.close()
     try loop.push(first)
@@ -251,7 +269,7 @@ func hole_words(set: interop.Reference[GeometrySet], word: str) -> interop.Owned
         # toward the hole (a sheet's own next edge turns away from it).
         let toward = (travel.cross(side)).normalized() catch failure: recover Vector3()
         for k in 0..<edges.count:
-            var taken = false
+            var taken = seam.items[k]
             for at in loop.view(): taken = taken or at == k
             if taken: continue
             let e = &edges.items[k]
