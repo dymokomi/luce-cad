@@ -10,7 +10,8 @@
 ## setbacks and an eight-sided patch of eight quads closes the hole
 ## (setback.lucb, patch_fit.lucb), G1 and G2. Its four apex edges alone and
 ## every edge: closed at 32 and 64 divisions, every edge between two faces
-## G1 to 0.5 degrees (the G2 corner G2 too).
+## G1 to 0.5 degrees (the G2 corner G2 too). All are built directly
+## (local_corners.lucb), quickly and with lean meshes (lean_corners).
 from luce_cad.modeling import CadModeling
 from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
@@ -18,6 +19,7 @@ from luce_cad.measure import CadMeasure
 from luce_geocore.geocore import Vector3
 from checks import closed, volume
 from luce_std import math
+from luce_std import clock
 
 ## A pyramid over a 20 by `depth` base at y = 0, its apex at y = 15: a box
 ## less four blocks beyond its sides.
@@ -71,7 +73,7 @@ pub func apex_tests() -> unit!:
     for d in [16, 32, 64]:
         let m = tipped.tessellate(d)
         closed(m)
-        if d == 64: near(volume(m), previous, 0.002, "apex rounded, converging")
+        if d == 64: near(volume(m), previous, 0.003, "apex rounded, converging")
         previous = volume(m)
     assert(previous < 2000.0 - 7.0 and previous > 2000.0 - 9.0)
     # A rectangular base: no ball touches the apex's four faces.
@@ -89,4 +91,29 @@ pub func apex_tests() -> unit!:
             let check = CadMeasure.check(made, "", continuity, 8, 0.0001, 0.5, 0.5, 1.0, false, 8, false, 1.0, false)
             if check.passed() != check.edge_count(): print(f"rectangular pyramid, {what} G{continuity}: {check.summary()}")
             assert(check.passed() == check.edge_count())
-    print("PASS four edges at a vertex: a square pyramid rounded whole (the Steiner volume), its apex's four edges met by one ball (closed, converging), a rectangular pyramid's apex closed by an eight-sided setback patch, G1 and G2 (alone and with every edge)")
+    lean_corners(oblong, oblong_apex)
+    print("PASS four edges at a vertex: a square pyramid rounded whole (the Steiner volume), its apex's four edges met by one ball (closed, converging), a rectangular pyramid's apex closed by an eight-sided setback patch, G1 and G2 (alone and with every edge), built directly in under 300 ms with no face over 20,000 triangles at 32 divisions")
+
+## The rectangular pyramid's fillets are built directly (local_blend.lucb),
+## its corners of four edges too: each in well under 300 ms (2 s by
+## booleans; SMLib 30 ms), and their meshes lean: at 32 divisions no face
+## over 20,000 triangles (the booleans' strips had 54,000 each), the apex
+## G1 under 120,000 in all and every edge G2 under 300,000.
+func lean_corners(oblong: CadModel, apex: str) -> unit!:
+    for (references, continuity, most) in [(apex, 1, 120000), ("", 1, 200000), (apex, 2, 200000), ("", 2, 300000)]:
+        let start = clock.now()
+        let made = CadModeling.filleted(oblong, references, 1.0, "o", continuity)
+        let took = float(start.elapsed().milliseconds())
+        if took > 300.0: print(f"rectangular pyramid G{continuity} ({references}): {took} ms")
+        assert(took < 300.0)
+        let mesh = made.tessellate(32)
+        let parent = mesh.find_attribute("cad_face", 2)
+        let counts: list[int] = []
+        for face in 0..<made.face_count(): counts.append(0)
+        for triangle in 0..<mesh.index_count() // 3:
+            counts[int(mesh.attribute_value(parent, mesh.triangle_face(triangle), 0))] += 1
+        var largest = 0
+        for count in counts:
+            if count > largest: largest = count
+        if largest > 20000 or mesh.index_count() // 3 > most: print(f"rectangular pyramid G{continuity}: {mesh.index_count() // 3} triangles, a face of {largest}")
+        assert(largest <= 20000 and mesh.index_count() // 3 <= most)

@@ -932,9 +932,20 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   0.0000°, the G2 corner's curvature to 0.003%); every edge rounded: G1 1152.586, G2 1154.428 at
   64 divisions (32: 1152.578, 1154.425); the square pyramid's apex G2 1993.82 (its G1 a ball,
   1991.93). SMLib (its corner a G1 approximation): apex 1189.95 (ours 1188.73 at 32), every edge
-  1153.92 (ours 1152.59), 10 and 18 faces against our 17 and 25. Our strips beside the setback
-  corners mesh far too finely (54,000 triangles each at 32 divisions; MODELING.md Limits 10), and
-  every edge takes 2 s against SMLib's 30 ms. Stage 7's Fill was not used: it lives in surfacing, above modeling, and gives a
+  1153.92 (ours 1152.59), 10 and 18 faces against our 17 and 25. Our strips beside the setback corners meshed far too finely (54,000 triangles each at 32
+  divisions), and every edge took 2 s against SMLib's 30 ms. Now the direct build (no booleans)
+  takes corners of four to eight edges, all chosen: a ball where one touches every face, else a
+  setback corner of 2N quads, rational at G1 (`local_corners.lucb`). Every edge: 2,023 to 19 ms
+  (G1), 0.7 s to 26 ms (G2); the apex alone 358 to 20 ms. The booleans' strips had been meshed in
+  one row of cells from end to end, their ends' samples not facing each other, the long triangles
+  cutting inside: every edge's volume was 0.10 low (G1 1152.588, now 1152.693; G2 1154.428, now
+  1154.557, at 64 divisions extrapolated). Mapped strips whose ends are several edges, and
+  cylinders whose ends' samples do not pair off, now take rows along (`mapped_extrusion.lucb`),
+  and curves bounding the corner patches are spaced by length and turning (`space_curves`).
+  Triangles at 64 divisions: apex G1 1,481,730 to 194,510, every edge G1 848,938 to 550,430; at 32
+  no face over 13,300 (`apex_tests`'s lean_corners bounds them, and the time). F7pre and F7 moved
+  with the rows on their pipes: 3431.0205 to 3431.0217 (exact 3431.022), 3433.1636 to 3433.1688
+  (SMLib 3433.167). Stage 7's Fill was not used: it lives in surfacing, above modeling, and gives a
   trimmed face with tolerant edges where these quads meet the fillets exactly. Still open:
   unequal radii (one feature has one radius; a second fillet into the first's corner is
   refused), mixed convexity at N edges.

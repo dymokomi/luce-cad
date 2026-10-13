@@ -346,8 +346,13 @@ Supported face meshing:
   40–60% of an existing interval; the exact shared cut remains a boundary corner.
   It does not spread hard-edge samples through the interior or resample curved
   directions merely to improve aspect ratios.
-- Four-edge mapped affine strips can resolve competing straight-rail phases
-  into one evenly distributed row family, with the same mean-pitch target.
+- Mapped affine strips (and cylinders) can resolve competing straight-rail
+  phases into one evenly distributed row family, with the same mean-pitch
+  target. Their ends may be one edge each or several (a setback corner's
+  halves). A cylinder, or ends of several edges, takes rows only where its
+  ends' samples do not pair off along the strip: one row of cells from end
+  to end would join samples that do not face each other, its long triangles
+  cutting across the surface (0.13 of volume on a pyramid's G2 strips).
   The complete control net proves affine translation using Greville positions,
   including degree-elevated and knot-inserted representations; warped nets and
   changing rail weights are excluded. Exact parallel line rails must cover the
@@ -355,6 +360,13 @@ Supported face meshing:
   retained as a boundary corner, and over-budget proposals are skipped. The
   broader recognition does not opt higher-degree charts into the separate
   clipped endpoint/pitch policies before their neighboring phases are handled.
+- B-spline edges whose every face is a B-spline patch bounded by curves
+  alone (a setback corner's quads) are spaced by length and turning together
+  (`layout/curve_spacing.space_curves`): their curves bend hard in short
+  stretches, and spacing by length alone crowds the quads (a rectangular
+  pyramid's apex corner: quads of 8,000 to 33,000 triangles at 32 divisions,
+  now 2,000 to 8,000). Every other edge keeps even length, so the two sides
+  of a strip's rows still face each other.
 - Planar circle/ellipse trim envelopes include analytic projected extrema within
   the trimmed sweep. A sampled arc plus a percentage guard is insufficient for
   thin segments: later grid intersections can otherwise escape that envelope.

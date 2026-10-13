@@ -2,37 +2,58 @@
 ## These tables guide spacing only; exact curves still own every output point.
 
 ## Sampled cumulative arc length and the distribution accepted for one curve.
+## A B-spline's stations follow `spacing` when it has one: a cumulative
+## measure of length and turning (spline_spacing), so samples gather where
+## the curve bends and thin where it runs straight. `at` stays the
+## physical length either way.
 pub struct ArcMetric:
     pub var lengths: f64[]
     pub var uniform: bool = true
+    pub var spacing: f64[]
 
-    ## An even physical station, or the original parameter station when its
-    ## curvature check could not accept physical spacing within the budget.
+    ## An even station in the spacing measure (physical length, or length
+    ## and turning on a B-spline), or the original parameter station when
+    ## its curvature check could not accept that spacing within the budget.
     pub func station(fraction: f64) -> f64:
-        return self.parameter(fraction * self.at(1.0)) if self.uniform else fraction
+        if not self.uniform: return fraction
+        if self.spacing.length > 1: return inverse(self.spacing, fraction * self.spacing[self.spacing.length - 1])
+        return self.parameter(fraction * self.at(1.0))
 
     ## Invert station() to recognize baseline stations after new cuts arrive.
     pub func fraction(parameter: f64) -> f64:
+        if not self.uniform: return parameter
+        if self.spacing.length > 1:
+            let total = self.spacing[self.spacing.length - 1]
+            return interpolated(self.spacing, parameter) / total if total > 1e-30 else parameter
         let length = self.at(1.0)
-        return self.at(parameter) / length if self.uniform and length > 1e-30 else parameter
+        return self.at(parameter) / length if length > 1e-30 else parameter
 
     ## Interpolated physical distance at a normalized exact-curve parameter.
     pub func at(t: f64) -> f64:
-        let position = math.clamp(t, 0.0, 1.0) * (f64)(self.lengths.length - 1)
-        let index = (usize)math.min((f64)(self.lengths.length - 2), math.floor(position))
-        return self.lengths[index] + (self.lengths[index + 1] - self.lengths[index]) * (position - (f64)index)
+        return interpolated(self.lengths, t)
 
     ## Invert cumulative distance; output geometry still evaluates the curve.
     pub func parameter(distance: f64) -> f64:
-        var low: usize = 0
-        var high = self.lengths.length - 1
-        while high - low > 1:
-            let mid = (low + high) // 2
-            if self.lengths[mid] < distance: low = mid
-            else: high = mid
-        let span = self.lengths[high] - self.lengths[low]
-        let fraction = math.clamp((distance - self.lengths[low]) / span, 0.0, 1.0) if span > 1e-30 else 0.5
-        return ((f64)low + fraction) / (f64)(self.lengths.length - 1)
+        return inverse(self.lengths, distance)
+
+## A cumulative table's value at normalized parameter `t` (its entries at
+## even parameter steps), interpolated.
+func interpolated(table: const f64[], t: f64) -> f64:
+    let position = math.clamp(t, 0.0, 1.0) * (f64)(table.length - 1)
+    let index = (usize)math.min((f64)(table.length - 2), math.floor(position))
+    return table[index] + (table[index + 1] - table[index]) * (position - (f64)index)
+
+## The normalized parameter where cumulative table `table` reaches `value`.
+func inverse(table: const f64[], value: f64) -> f64:
+    var low: usize = 0
+    var high = table.length - 1
+    while high - low > 1:
+        let mid = (low + high) // 2
+        if table[mid] < value: low = mid
+        else: high = mid
+    let span = table[high] - table[low]
+    let fraction = math.clamp((value - table[low]) / span, 0.0, 1.0) if span > 1e-30 else 0.5
+    return ((f64)low + fraction) / (f64)(table.length - 1)
 
 ## Bounded sampled arc length; shared once by all planning passes and faces.
 pub func measure_curves(edges: const Curve[]) -> ArcMetric[]!:
@@ -47,7 +68,7 @@ pub func measure_curves(edges: const Curve[]) -> ArcMetric[]!:
     var sampling = Sampling(edges, result, 0)
     try parallel.for_each_range(edges.length, 32, (void*)&sampling, sample_lengths)
     if sampling.failed.load(.acquire) != 0:
-        for at in 0..<edges.length: try sample_curve_lengths(edges[at], result[at].lengths)
+        for at in 0..<edges.length: try sample_curve(edges[at], &result[at])
     return result
 
 struct Sampling:
@@ -58,13 +79,14 @@ struct Sampling:
 func sample_lengths(context: void*, first: usize, end: usize, worker: usize):
     let work = (Sampling*)context
     for at in first..<end:
-        sample_curve_lengths(work.edges[at], work.metrics[at].lengths) catch failure:
+        sample_curve(work.edges[at], &work.metrics[at]) catch failure:
             _ = failure
             work.failed.store(1, .relaxed)
             return
 
-## Cumulative chord lengths at even parameter steps.
-func sample_curve_lengths(edge: Curve, values: f64[]) -> !:
+## A curve's cumulative chord lengths at even parameter steps.
+func sample_curve(edge: Curve, metric: ArcMetric*) -> !:
+    let values = metric.lengths
     values[0] = 0.0
     var previous = try edge.at(0.0)
     for step in 1..<values.length:
@@ -72,10 +94,70 @@ func sample_curve_lengths(edge: Curve, values: f64[]) -> !:
         values[step] = values[step - 1] + current.subtract(previous).length()
         previous = current
 
+## Spacing measures (spline_spacing) for the B-spline edges whose every
+## face is a B-spline patch bounded by curves alone, as a setback corner's
+## quads are: their curves bend hard in short stretches, and samples spaced
+## by length alone crowd their quads. A face with a straight side (a strip
+## between contact lines, its rows end to end) and the faces of planes and
+## other analytic supports keep length, so each side's samples face the
+## opposite side's as they did.
+pub func space_curves(metrics: ArcMetric[], edges: const Curve[], faces: const BrepFace[], surfaces: const Surface[]) -> !:
+    let spaced = try new bool[edges.length] --- in memory.heap
+    defer free(spaced) in memory.heap
+    for at in 0..<edges.length: spaced[at] = edges[at].kind == curve_spline
+    for face in faces:
+        var patch = surfaces[(usize)face.surface].kind == surface_spline
+        for use in face.uses: patch = patch and edges[edge_index(use)].kind != curve_line
+        if patch: continue
+        for use in face.uses: spaced[edge_index(use)] = false
+    for at in 0..<edges.length:
+        if not spaced[at] or metrics[at].spacing.length > 0: continue
+        metrics[at].spacing = try new f64[metrics[at].lengths.length] --- in memory.heap
+        try spline_spacing(edges[at], metrics[at].lengths, metrics[at].spacing)
+
+## A B-spline's spacing measure at the length samples' steps: its length
+## scaled by its mean turning per unit length, plus its turning (the angle
+## between its tangents at each step's ends). A curve bending evenly (an
+## arc) is spaced as by length; one whose bending gathers in a stretch, or
+## at an end, takes more of its samples there (each interval turning at
+## most twice its share), and its straight stretches keep half of theirs.
+## A kinked curve (C0) keeps length.
+func spline_spacing(edge: Curve, lengths: const f64[], spacing: f64[]) -> !:
+    let n = lengths.length
+    let turns = try new f64[n] --- in memory.heap
+    defer free(turns) in memory.heap
+    var before = try tangent(edge, 0.0)
+    turns[0] = 0.0
+    var total = 0.0
+    for step in 1..<n:
+        let after = try tangent(edge, (f64)step / (f64)(n - 1))
+        let la = before.length()
+        let lb = after.length()
+        turns[step] = math.acos(math.clamp(before.dot(after) / (la * lb), -1.0, 1.0)) if la > 1e-300 and lb > 1e-300 else 0.0
+        total += turns[step]
+        before = after
+    let length = lengths[n - 1]
+    let scale = total / length if length > 1e-30 else 0.0
+    spacing[0] = 0.0
+    for step in 1..<n: spacing[step] = spacing[step - 1] + (lengths[step] - lengths[step - 1]) * scale + turns[step]
+    # A straight curve, or one with a kink (a step turning over 20 degrees
+    # where it bends smoothly at most a few): by length alone.
+    var kinked = false
+    for step in 1..<n: kinked = kinked or turns[step] > 0.35
+    if total < 1e-9 or kinked:
+        for step in 0..<n: spacing[step] = lengths[step]
+
+## A curve's direction at `t` (a difference across a short step, one-sided
+## at its ends).
+func tangent(edge: Curve, t: f64) -> Vector3!:
+    let step = 1e-6
+    return (try edge.at(math.min(1.0, t + step))).subtract(try edge.at(math.max(0.0, t - step)))
+
 ## Release a metric array returned by measure.
 pub func close_metrics(metrics: const ArcMetric[]):
     for metric in metrics:
         if metric.lengths.length > 0: free(metric.lengths) in memory.heap
+        if metric.spacing.length > 0: free(metric.spacing) in memory.heap
     free(metrics) in memory.heap
 
 ## Allocate extra intervals to the largest physical pitch, never lowering any

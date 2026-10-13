@@ -1,4 +1,8 @@
-## One physical row phase for a mapped affine extrusion. Late clipped neighbors
+## One physical row phase for a mapped affine extrusion (or cylinder), its
+## ends one edge each or several (a setback corner's halves), so its rows
+## along it follow its pitch across: a single row of cells from end to end
+## connects stations of the two ends that need not face each other, and
+## its long triangles cut across the surface. Late clipped neighbors
 ## may contribute incompatible phases on its two straight rails. Preserve those
 ## canonical vertices as trim corners instead of bending the entire strip.
 
@@ -10,13 +14,20 @@ pub func regularize_extrusions(faces: const BrepFace[], surfaces: const Surface[
         let face = faces[at]
         let side = sides[at]
         let plan = &plans[at]
-        if plan.valid or not side.valid or face.uses.length != 4: continue
+        if plan.valid or not side.valid: continue
         let s = surfaces[(usize)face.surface]
         for axis in 0..<(usize)2:
-            if not affine_axis(s, (i64)axis): continue
-            let stride = (usize)s.nv if axis == 0 else 1
-            let along = (usize)(s.nu if axis == 0 else s.nv)
-            let translation = s.points[(along - 1) * stride].subtract(s.points[0])
+            # The way the support runs straight: an affine extrusion's, or a
+            # cylinder's axis (its chart's v).
+            var translation = Vector3()
+            if s.kind == surface_cylinder:
+                if axis != 1: continue
+                translation = s.z
+            else:
+                if not affine_axis(s, (i64)axis): continue
+                let stride = (usize)s.nv if axis == 0 else 1
+                let along = (usize)(s.nu if axis == 0 else s.nv)
+                translation = s.points[(along - 1) * stride].subtract(s.points[0])
             for pair in 0..<(usize)2:
                 if side.lengths[pair] != 1 or side.lengths[pair + 2] != 1: continue
                 let a = side.starts[pair]
@@ -25,14 +36,17 @@ pub func regularize_extrusions(faces: const BrepFace[], surfaces: const Surface[
                 let bi = edge_index(face.uses[b])
                 if edges[ai].kind != curve_line or edges[bi].kind != curve_line: continue
                 if not rails(edges[ai], edges[bi], translation, tolerance): continue
-                let cross_a = side.starts[(pair + 1) % 4]
-                let cross_b = side.starts[(pair + 3) % 4]
-                let cross_count = plan.rows[cross_a].count - 1
+                # The ends (each one edge, or a setback corner's halves).
+                let cross_count = row_count(face, side, (pair + 1) % 4, plan)
                 # A single transverse span is valid on flat/low-curvature
                 # profiles too. Its two boundary rails still define physical
                 # pitch; it must not disable correction of a crowded phase.
-                if cross_count < 1 or cross_count != plan.rows[cross_b].count - 1: continue
-                let cross_length = math.min(metrics[edge_index(face.uses[cross_a])].at(1.0), metrics[edge_index(face.uses[cross_b])].at(1.0))
+                if cross_count < 1 or cross_count != row_count(face, side, (pair + 3) % 4, plan): continue
+                # A cylinder, or ends of several edges: rows only where the
+                # ends' samples do not face each other along the way.
+                if s.kind == surface_cylinder or side.lengths[(pair + 1) % 4] > 1 or side.lengths[(pair + 3) % 4] > 1:
+                    if try ends_face(face, side, (pair + 1) % 4, (pair + 3) % 4, plan, edges, translation, tolerance): continue
+                let cross_length = math.min(side_length(face, side, (pair + 1) % 4, metrics), side_length(face, side, (pair + 3) % 4, metrics))
                 let length = metrics[ai].at(1.0)
                 let pitch = cross_length / (f64)cross_count
                 if pitch <= 1e-20: continue
@@ -53,6 +67,48 @@ pub func regularize_extrusions(faces: const BrepFace[], surfaces: const Surface[
                         let t = (f64)step / (f64)count
                         _ = try row.insert(t, 1e-12)
                         _ = try cuts[index].insert(t, 1e-9)
+
+## Whether the row samples of sides `a` and `b` (opposite, run the other
+## way round the face) pair off along `translation`: each of a's against
+## b's from its far end, their difference along it within the tolerance.
+func ends_face(face: BrepFace, side: PatchSides, a: usize, b: usize, plan: const GridLayout*, edges: const Curve[], translation: Vector3, tolerance: f64) -> bool!:
+    var first = Growing[Vector3]()
+    defer first.close()
+    var second = Growing[Vector3]()
+    defer second.close()
+    try side_points(face, side, a, plan, edges, &first)
+    try side_points(face, side, b, plan, edges, &second)
+    if first.count != second.count: return false
+    let way = try translation.normalized()
+    for at in 0..<first.count:
+        let gap = second.items[second.count - 1 - at].subtract(first.items[at])
+        if gap.subtract(way.multiply_scalar(gap.dot(way))).length() > tolerance * 10.0: return false
+    return true
+
+## Side `at`'s row samples in the face's loop order onto `out` (each
+## joint between its edges once).
+func side_points(face: BrepFace, side: PatchSides, at: usize, plan: const GridLayout*, edges: const Curve[], out: Growing[Vector3]*) -> !:
+    for segment in 0..<side.lengths[at]:
+        let use = (side.starts[at] + segment) % face.uses.length
+        let row = plan.rows[use]
+        let edge = edges[edge_index(face.uses[use])]
+        let forward = face.uses[use] > 0
+        for k in 0..<row.count:
+            if segment > 0 and k == 0: continue
+            let value = row.values[k if forward else row.count - 1 - k]
+            try out.push(try edge.at(value))
+
+## The intervals of side `side`'s rows (over its edges).
+func row_count(face: BrepFace, side: PatchSides, at: usize, plan: const GridLayout*) -> usize:
+    var count: usize = 0
+    for segment in 0..<side.lengths[at]: count += plan.rows[(side.starts[at] + segment) % face.uses.length].count - 1
+    return count
+
+## The length of side `side` (over its edges).
+func side_length(face: BrepFace, sides: PatchSides, side: usize, metrics: const ArcMetric[]) -> f64:
+    var length = 0.0
+    for at in 0..<sides.lengths[side]: length += metrics[edge_index(face.uses[(sides.starts[side] + at) % face.uses.length])].at(1.0)
+    return length
 
 func crowded(row: Stations) -> bool:
     if row.count < 3: return false

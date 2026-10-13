@@ -10,8 +10,9 @@
 ## and curve is made once and shared by the faces meeting there, so the
 ## result is closed by construction; it is still checked (each edge used
 ## twice, once each way), and faces are turned to agree.
-## What it does not cover (curved faces at a corner, more than three edges
-## at a vertex, chamfers, rims, mixed corners, an unsymmetric miter) it
+## What it does not cover (curved faces at a corner, a vertex of four or
+## more edges not all chosen, chamfers, rims, mixed corners, an
+## unsymmetric miter) it
 ## declines, and the booleans (blend.lucb) take over. Its cost is the
 ## touched faces', with no intersection, splitting or classification.
 
@@ -187,7 +188,11 @@ struct Local:
         var weights = Growing[f64]()
         defer weights.close()
         try weights.fill(net.length, 1.0)
-        let index = try self.out.store_spline(net, weights.view(), knots, 5, Matrix4())
+        return try self.rational(a, b, net, weights.view(), knots)
+
+    ## The same, rational: `weights` one per control point.
+    func rational(a: i64, b: i64, net: const Vector3[], weights: const f64[], knots: const f64[]) -> i64!:
+        let index = try self.out.store_spline(net, weights, knots, 5, Matrix4())
         let c = try self.out.add_carrier(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, index))
         return try self.out.add_edge(ShapeEdge(c, knots[5], knots[knots.length - 6], a, b))
 
@@ -295,7 +300,9 @@ func faces_of(b: const Local*, e: usize) -> (usize, usize):
     return ((usize)first, (usize)(second if second >= 0 else first))
 
 ## Whether this builds `chosen`: straight edges between two planes, and at
-## each of their ends exactly three edges and three flat faces.
+## each of their ends three edges and three flat faces, or four to eight
+## edges, all chosen, between as many flat faces (a setback corner, or a
+## ball where one touches every face).
 func eligible(b: Local*, chosen: const usize[]) -> bool!:
     let w = b.w
     for e in chosen:
@@ -305,19 +312,29 @@ func eligible(b: Local*, chosen: const usize[]) -> bool!:
         if w.surfaces.items[(usize)w.faces.items[fa].surface].kind != surface_plane or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != surface_plane: return false
         if b.strip_of.items[e] >= 0: return false
         b.strip_of.items[e] = 0
+    defer:
+        for e in chosen: b.strip_of.items[e] = -1
+    var faces = Growing[usize]()
+    defer faces.close()
+    for e in chosen:
         let edge = w.edges.items[e]
         let ends: i64[2] = [edge.start, edge.end]
         for v in ends:
-            if edge_degree(w, v) != 3: return false
-            for f in try vertex_faces(b, v):
+            let degree = edge_degree(w, v)
+            if degree < 3 or degree > (i64)most_setback_edges: return false
+            if degree > 3:
+                for other in 0..<w.edges.count:
+                    let o = w.edges.items[other]
+                    if (o.start == v or o.end == v) and b.strip_of.items[other] < 0: return false
+            try corner_faces(b, v, &faces)
+            if (i64)faces.count != degree: return false
+            for f in faces.view():
                 if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: return false
-    for e in chosen: b.strip_of.items[e] = -1
     return true
 
-## The three faces at vertex `v` (of three edges).
-func vertex_faces(b: const Local*, v: i64) -> usize[3]!:
-    var faces: usize[3] = [0, 0, 0]
-    var count: usize = 0
+## The faces at vertex `v` onto `faces` (cleared first), each once.
+func corner_faces(b: const Local*, v: i64, faces: Growing[usize]*) -> !:
+    faces.clear()
     let w = b.w
     for e in 0..<w.edges.count:
         let edge = w.edges.items[e]
@@ -326,14 +343,17 @@ func vertex_faces(b: const Local*, v: i64) -> usize[3]!:
         let sides: usize[2] = [fa, fb]
         for f in sides:
             var known = false
-            for k in 0..<count:
-                if faces[k] == f: known = true
-            if known: continue
-            if count == 3: error(invalid, "a corner has more than three faces")
-            faces[count] = f
-            count += 1
-    if count != 3: error(invalid, "a corner needs three faces")
-    return faces
+            for g in faces.view():
+                if g == f: known = true
+            if not known: try faces.push(f)
+
+## The three faces at vertex `v` (of three edges).
+func vertex_faces(b: const Local*, v: i64) -> usize[3]!:
+    var faces = Growing[usize]()
+    defer faces.close()
+    try corner_faces(b, v, &faces)
+    if faces.count != 3: error(invalid, "a corner needs three faces")
+    return [faces.items[0], faces.items[1], faces.items[2]]
 
 ## Edge `e`'s strip: its frame, its ends still open.
 func begin_strip(b: Local*, e: usize) -> !:

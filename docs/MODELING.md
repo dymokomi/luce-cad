@@ -876,36 +876,43 @@ body's:
 - **Each face touched** keeps its plane. Its loops are rebuilt: a chosen edge becomes its contact
   line, a sharp edge at a rounded corner is shortened, and at a corner the face gains the curves the
   corner leaves on it.
-- **Each corner** (a vertex where a chosen edge ends, with three edges and three flat faces) ends
-  its strips there and adds its own faces:
+- **Each corner** (a vertex where a chosen edge ends, with three edges and three flat faces, or four
+  to eight edges, all chosen, and as many flat faces) ends its strips there and adds its own faces:
   - one chosen edge: its strip runs to the third face's plane and is cut by it, and that face gains
     the cut;
   - two: a miter, both strips cut by the plane bisecting their edges;
   - three, G1: a ball, the strips stopping square to their edges through its center;
-  - three, G2 or G3: a setback corner, its six quads.
+  - three, G2 or G3: a setback corner, its six quads;
+  - four to eight, G1: a ball where one touches every face (a regular pyramid's apex), its sphere
+    patch bounded by N arcs; else, and G2 and G3, a setback corner of 2N quads (a G1 one's rational,
+    its strips' ends the circles' arcs in two halves).
 
 Every point and curve is made once and shared by the faces that meet there, so the result is
 closed by construction. It is still checked: each edge used twice, once each way, with the new
 faces turned to agree with the body's.
 
 What it declines falls to the booleans:
-- curved faces at a corner, more than three edges at a vertex, chamfers and rims;
+- curved faces at a corner, a vertex of four or more edges not all chosen, chamfers and rims;
 - an inside fillet meeting an outside one;
 - a miter that isn't symmetric about its plane. The two strips' sections are one curve only when
   the sharp edge lies in the plane.
 
-A contract (`src/tests/direct_fillet_contract.lucb`) requires nine cases to be built directly at
-G1, G2 and G3:
+A contract (`tests/contracts/direct_fillet_contract.lucb`) requires nine cases to be built directly
+at G1, G2 and G3:
 - an edge alone, a ring of miters, a corner of three, every edge;
 - an L's inside edge, a pocket's floor alone and with its walls;
-- a slanted box's oblique ends and corner.
+- a slanted box's oblique ends and corner;
+
+and a rectangular pyramid's apex edges and every edge at G1 and G2 (compared at 64 divisions within
+0.01: the booleans' strips there converge more slowly).
 
 It also builds them by booleans and requires the same faces and volume. That runs at G1 for every
 case, at G2 for all but the two heaviest, and at G3 for four of them. `fillet_tests` checks the
 heaviest ones' volumes against exact values instead.
 
 The cost is the touched faces', with no intersection, splitting or classification. Every edge of a
-box at G2 takes 44 ms, against 1 s by booleans. A corner patch's thin-plate energy is one quadratic
+box at G2 takes 44 ms, against 1 s by booleans; every edge of a rectangular pyramid (its apex a
+setback corner of eight quads) 20 ms at G1 and 26 ms at G2, against 1.3 s and 0.7 s. A corner patch's thin-plate energy is one quadratic
 form, the same for every quad, so it is made once per fit.
 
 **Kept between radii** (`fillet_plan.lucb`). `CadModeling.fillet_plan` works out once what does
@@ -1066,7 +1073,8 @@ within 0.01 (`fusion_probe_tests`); G3 closes too.
 - **Four or more fillets** meeting at a corner of as many flat faces, all its edges, G1: a ball too,
   where one touches every face there (its planes moved in by the radius meet in one point: a regular
   pyramid's apex). The corner tool is the convex cell beyond each edge's plane and past each face
-  (`convex_cell`), minus the ball. Where no ball touches them all (a rectangular pyramid's apex),
+  (`convex_cell`), minus the ball (or built directly, local_corners.lucb). Where no ball touches
+  them all (a rectangular pyramid's apex),
   and for G2 and G3 fillets, the corner is a setback corner of 2N sides (`setback.lucb`): each
   fillet stops at its setback, and the hole between the N end sections and the N curves on the faces
   is filled by 2N quads about a center (`patch_fit.lucb`; G1 across their seams with a vertex's
@@ -2309,10 +2317,12 @@ Roughly in order of usefulness:
    than the corners it finds), and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face and strips apart (adjacent strips of a curved chain, healing by
    extended neighbors' arrangement).
-10. **Dense meshes on B-spline fillet strips of setback corners at slanted edges:** a rectangular
-   pyramid's apex edges rounded 1 (G1, setback corners) mesh each strip with 3,477 triangles at 8
-   divisions and 216,000 at 64 (a cube's setback strips: 5,376 at 32); its patch quads 8,000 to
-   33,000 at 32.
+10. **Long cells on a strip cut at a slant:** a rectangular pyramid's apex edges alone rounded G1
+   end at the base in ellipses; each strip (a cylinder cut at a slant, a clipped chart) is meshed
+   as one row of cells from end to end (aspects to 500,000, the volume right). Its corner patch's
+   quads still take 2,000 to 8,000 triangles each at 32 divisions (their curves bend hard in short
+   stretches). Setback corners the direct build declines (curved faces, edges not all chosen) are
+   the booleans', whose strips mesh densely (54,000 triangles each at 32 divisions).
 11. **Long strips and narrow corners in meshes:** a hole's wall meshed as one row of strips from
    its floor to its rim, and a floor as strips across it, are long by design (aspects in the
    hundreds to thousands); an extremum of a trim between two crossings keeps both crossings; a

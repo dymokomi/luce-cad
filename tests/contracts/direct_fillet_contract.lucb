@@ -13,7 +13,10 @@
 ## - a pocket's floor (inside miters), and its floor and walls (inside
 ##   corners of three; the walls' edges ending at the top),
 ## - a box cut by a slanted plane: its top front and back edges (ending at
-##   the slanted face), and three edges at a slanted corner.
+##   the slanted face), and three edges at a slanted corner;
+## - a rectangular pyramid (G1 and G2, no ball touching its apex's four
+##   faces): its four apex edges (a setback corner of eight quads), and
+##   every edge (with balls, or setbacks, at its base's corners).
 import interop
 from luce_std import math
 from luce_geocore.geocore import Vector3, Mesh, invalid
@@ -52,9 +55,33 @@ pub func direct_fillet_contracts() -> !:
         try compare(pocket, 6, 0.3, continuity)
         try compare(slanted, 7, 0.2, continuity)
         try compare(slanted, 8, 0.2, continuity)
+    let pyramid = try oblong_pyramid()
+    defer pyramid.release()
+    # The booleans' strips there converge more slowly: both at 64 divisions.
+    for continuity in 1..<(i64)3:
+        try compare(pyramid, 9, 1.0, continuity, 64, 0.01)
+        try compare(pyramid, 3, 1.0, continuity, 64, 0.01)
 
-## Case `case`'s edges of `model` filleted to `radius` both ways.
-func compare(model: interop.Reference[CadModel], case: i64, radius: f64, continuity: i64) -> !:
+## A pyramid over a 20 by 12 base at y = 0, its apex at y = 15: a box less
+## four blocks beyond its sides.
+func oblong_pyramid() -> interop.Reference[CadModel]!:
+    var made = try (try CadModeling.tagged(try CadSolids.box(20.0, 15.0, 12.0), "#p")).value().transformed(Vector3(0.0, 7.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let alpha = math.atan2(10.0, 15.0)
+    let beta = math.atan2(6.0, 15.0)
+    let ats: Vector3[4] = [Vector3(10.0, 0.0, 0.0), Vector3(-10.0, 0.0, 0.0), Vector3(0.0, 0.0, 6.0), Vector3(0.0, 0.0, -6.0)]
+    let outs: Vector3[4] = [Vector3(math.cos(alpha), math.sin(alpha), 0.0), Vector3(-math.cos(alpha), math.sin(alpha), 0.0), Vector3(0.0, math.sin(beta), math.cos(beta)), Vector3(0.0, math.sin(beta), -math.cos(beta))]
+    let turns: Vector3[4] = [Vector3(0.0, 0.0, alpha), Vector3(0.0, 0.0, -alpha), Vector3(-beta, 0.0, 0.0), Vector3(beta, 0.0, 0.0)]
+    for k in 0..<(usize)4:
+        let block = try (try CadModeling.tagged(try CadSolids.box(60.0, 60.0, 60.0), "#c")).value().transformed(ats[k].add(outs[k].multiply_scalar(30.0)), turns[k], Vector3(1.0, 1.0, 1.0))
+        defer block.release()
+        let next = try CadModeling.combined(made, block, 1)
+        made.release()
+        made = next
+    return made
+
+## Case `case`'s edges of `model` filleted to `radius` both ways, their
+## volumes at `divisions` within `within` (2e-4 of the radius by default).
+func compare(model: interop.Reference[CadModel], case: i64, radius: f64, continuity: i64, divisions: i64 = 32, within: f64 = -1.0) -> !:
     var w = try shape_of(model.value())
     defer w.close()
     # The corner of cases 2 and 8: the box's, or the slanted top front one
@@ -86,14 +113,14 @@ func compare(model: interop.Reference[CadModel], case: i64, radius: f64, continu
     let reference = try blended(model.value(), text, radius, true, "#f", continuity, true, false)
     defer reference.release()
     if made.value().face_count() != reference.value().face_count(): error(invalid, "a direct fillet has other faces than the booleans'")
-    let a = try volume(made.value())
-    let b = try volume(reference.value())
-    if math.abs(a - b) > 2e-4 * radius: error(invalid, "a direct fillet's volume is not the booleans'")
+    let a = try volume(made.value(), divisions)
+    let b = try volume(reference.value(), divisions)
+    if math.abs(a - b) > (within if within > 0.0 else 2e-4 * radius): error(invalid, "a direct fillet's volume is not the booleans'")
 
 ## Whether case `case` at `continuity` is also built by booleans.
 func compared(case: i64, continuity: i64) -> bool:
     if continuity == 1: return true
-    if continuity == 2: return case != 3 and case != 5
+    if continuity == 2: return case != 3 and case != 5 and case != 9
     return case == 1 or case == 2 or case == 7 or case == 8
 
 ## Whether case `case` takes the edge from `a` to `b` (`corner`: its
@@ -109,10 +136,11 @@ func picked(case: i64, a: Vector3, b: Vector3, corner: Vector3) -> bool:
     if case == 4: return math.abs(a.x) < 1e-6 and math.abs(a.y) < 1e-6 and math.abs(b.x) < 1e-6 and math.abs(b.y) < 1e-6
     if case == 5: return floor or upright
     if case == 6: return floor
+    if case == 9: return a.y > 14.99 or b.y > 14.99
     return a.y > 0.99 and b.y > 0.99 and math.abs(a.z) > 0.99 and math.abs(b.z) > 0.99
 
-func volume(model: const CadModel*) -> f64!:
-    let mesh = try model.tessellate(32)
+func volume(model: const CadModel*, divisions: i64) -> f64!:
+    let mesh = try model.tessellate(divisions)
     defer mesh.release()
     let m = mesh.value()
     var total = 0.0
