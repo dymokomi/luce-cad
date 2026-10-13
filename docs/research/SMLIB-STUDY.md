@@ -947,6 +947,17 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   tangent next face in its plane (a side face split along a line): rounded 3, 1561.37 (1600 less
   20 r² (1 - π/4)), refused before. Still open: rolling onto a curved tangent face, curved faces.
 
+- **9, delete healing (part).** Two G2 strips apart on the rounded box deleted: already healed
+  group by group, 7831.675 at 32 divisions (8000 less the other two strips' 7831.675). The inside
+  corner between a boss and a curved wall (a pipe with a box boss on its side, the boss's upright
+  inside edges rounded 1, the rounds deleted) was refused: the strip's end corner fell on the
+  existing vertex where the boss's side met the pipe, but was added as a second vertex there, so the
+  arc on the pipe from that corner to the round's contact could not shrink away ("an arc would turn
+  round"). Corners already vertices are now those vertices, and edges whose ends merge go: it heals
+  to the sharp body exactly (`heal_replace_tests`). Still open: the extended-neighbors arrangement
+  (intersecting extended patches with the booleans' face/face step) for gaps the local, cap and
+  band healings refuse.
+
 - **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
   plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was
   finding a point well inside a piece (`piece_point`), asked even of the plate's face with all its

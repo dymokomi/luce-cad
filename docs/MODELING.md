@@ -1100,7 +1100,10 @@ body (a self-intersection), which needs the booleans' face pairs.
   whose surfaces cross into a proper edge is taken (parallel end faces never meet).
 - **A corner** (one face with three neighbors): the three surfaces' point.
 
-The edges running into the gap keep their carriers, lengthened to the new corners.
+The edges running into the gap keep their carriers, lengthened to the new corners. A new corner
+already a vertex (a strip's end at an inside corner: a boss's foot round against a curved wall) is
+that vertex, and an edge whose two ends so become one (the arc on the wall from the corner to the
+round's contact) goes.
 
 **Several faces at once** (`face_heal.lucb`), where the local healing above refuses (a chain of
 fillets and its corners, strips apart, a face with more than four neighbors), are closed by caps when
@@ -2177,7 +2180,8 @@ Roughly in order of usefulness:
 9. **Offsets where faces vanish or reconnect** (a shell thicker than a fillet's radius), a shell of
    a box rounded G2 on every edge (its offset body closes, but the booleans' tolerance is tighter
    than the corners it finds), and draft; Delete healing several faces at once beside curved faces
-   beyond a band round one face (strips apart, inside corners).
+   beyond a band round one face and strips apart (adjacent strips of a curved chain, healing by
+   extended neighbors' arrangement).
 10. **Long strips and narrow corners in meshes:** a hole's wall meshed as one row of strips from
    its floor to its rim, and a floor as strips across it, are long by design (aspects in the
    hundreds to thousands); an extremum of a trim between two crossings keeps both crossings; a
