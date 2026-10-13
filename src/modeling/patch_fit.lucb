@@ -197,7 +197,7 @@ pub let basis_stride: usize = 17
 ## is the first half of curve k; its side u = 0 is the second half of
 ## curve k - 1, from that corner back. Its corner (1, 1) is the center.
 ## Its m^2 control points are u-major (point (a, b) at a * m + b).
-func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f64[], sides: const HoleSide[], continuity: i64, out: Growing[Vector3]*, out_weights: Growing[f64]*, quad_knots: Growing[f64]*) -> !:
+func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f64[], sides: const HoleSide[], continuity: i64, out: Growing[Vector3]*, out_weights: Growing[f64]*, quad_knots: Growing[f64]*, fullness: f64 = 1.0) -> !:
     let n = knots.length - 6
     let h = (usize)continuity + 1
     let count = sides.length
@@ -296,6 +296,25 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
     for key in 0..<center + 1:
         if kinds.items[key] == 2: ways.items[key] = ways.items[key].multiply_scalar(point_weights.items[key])
         if kinds.items[key] == 3: bases.items[key] = bases.items[key].multiply_scalar(point_weights.items[key] / known.items[key])
+    # Fullness other than 1: the fit made once, then again with its center
+    # held where its bulge from the curves' middle (the origin) is scaled by
+    # it (Alias's Pivot Curve Length Ratio, a Ball Corner's fullness).
+    for pass in 0..<(2 if fullness != 1.0 else 1):
+        if pass == 1:
+            let bulge = out.items[out.count - 1].subtract(origin).multiply_scalar(1.0 / scale)
+            out.clear()
+            out_weights.clear()
+            kinds.items[center] = 1
+            bases.items[center] = bulge.multiply_scalar(fullness * point_weights.items[center])
+        try fit_points(&kinds, &bases, &ways, &used, &point_weights, m, qk, count, origin, scale, out, out_weights)
+    # (fit_points ends with the center: not a quad's point.)
+    out.count -= 1
+
+## The quads' points for corner_patch (its kinds of control points, their
+## bases and ways, the weights fitted), onto `out` and `out_weights` keyed as
+## corner_patch's, the center last; `origin` and `scale` its unit frame.
+func fit_points(kinds: const Growing[i64]*, bases: const Growing[Vector3]*, ways: const Growing[Vector3]*, used: const Growing[bool]*, point_weights: const Growing[f64]*, m: usize, qk: const f64[], count: usize, origin: Vector3, scale: f64, out: Growing[Vector3]*, out_weights: Growing[f64]*) -> !:
+    let center = count * m * m
     var slots = Growing[Slot]()
     defer slots.close()
     var size: usize = 0
@@ -334,6 +353,11 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
                 let weight = point_weights.items[key]
                 try out.push(origin.add(p.multiply_scalar(scale / weight)))
                 try out_weights.push(weight)
+    # The center (the quads' shared corner), last, for a second pass.
+    let slot = slots.items[center]
+    var p = slot.base
+    for j in 0..<slot.count: p = p.add(slot.axes[j].multiply_scalar(rows.rhs.items[slot.first + j]))
+    try out.push(origin.add(p.multiply_scalar(scale / point_weights.items[center])))
 
 ## The quads' weights onto `out` (keyed as corner_patch's points): fixed
 ## where `kinds` says a side or a sweep fixes them (`known`), else fitted

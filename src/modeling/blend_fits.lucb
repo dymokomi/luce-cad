@@ -19,38 +19,42 @@ func reach_of(w: const Shape*, e: usize, size: f64, round: bool) -> f64!:
 ## On a cylinder along the edge (`around`), the step goes around its
 ## circle.
 func room(w: const Shape*, e: usize, f: usize, limit: f64, around: bool = false) -> f64!:
-    let edge = w.edges.items[e]
     var least = limit
-    for k in 1..<8:
-        let fraction = (f64)k / 8.0
-        let p = try w.edge_at(e, fraction)
-        let t = edge.t0 + (edge.t1 - edge.t0) * fraction
-        let along = (try w.tangent(edge.carrier, t)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
-        let n = try w.face_normal(f, p)
-        var side = try n.cross(try along.normalized()).normalized()
-        # Which way is into the face: a quarter of the reach in, clear of
-        # where a curved boundary's chart (its chords) is off the edge,
-        # else (a face narrower than that) a hair in.
-        let quarter = least * 0.25
-        let ahead = try face_contains(w, f, try stepped(w, f, p, side, quarter, around), w.tolerance) == inside_face
-        let behind = try face_contains(w, f, try stepped(w, f, p, side.multiply_scalar(-1.0), quarter, around), w.tolerance) == inside_face
-        if behind and not ahead: side = side.multiply_scalar(-1.0)
-        elif ahead == behind:
-            let probe = try stepped(w, f, p, side, least * 1e-3 + w.tolerance * 100.0, around)
-            if try face_contains(w, f, probe, w.tolerance) != inside_face: side = side.multiply_scalar(-1.0)
-        # On a rim's cylinder the straight step runs along the axis, on the
-        # face; one leaving the surface has left the face.
-        let far = try stepped(w, f, p, side, least, around)
-        if try face_contains(w, f, far, w.tolerance) != outside and try on_face_surface(w, f, far): continue
-        var inside_at = 0.0
-        var outside_at = least
-        for _ in 0..<40:
-            let middle = (inside_at + outside_at) * 0.5
-            let q = try stepped(w, f, p, side, middle, around)
-            if try on_face_surface(w, f, q) and try face_contains(w, f, q, w.tolerance) != outside: inside_at = middle
-            else: outside_at = middle
-        least = inside_at
+    for k in 1..<8: least = try room_at(w, e, f, least, (f64)k / 8.0, around)
     return least
+
+## room at one `fraction` of the way along edge `e`: how far in face `f`
+## goes from there, up to `limit`.
+func room_at(w: const Shape*, e: usize, f: usize, limit: f64, fraction: f64, around: bool = false) -> f64!:
+    let edge = w.edges.items[e]
+    let least = limit
+    let p = try w.edge_at(e, fraction)
+    let t = edge.t0 + (edge.t1 - edge.t0) * fraction
+    let along = (try w.tangent(edge.carrier, t)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
+    let n = try w.face_normal(f, p)
+    var side = try n.cross(try along.normalized()).normalized()
+    # Which way is into the face: a quarter of the reach in, clear of
+    # where a curved boundary's chart (its chords) is off the edge,
+    # else (a face narrower than that) a hair in.
+    let quarter = least * 0.25
+    let ahead = try face_contains(w, f, try stepped(w, f, p, side, quarter, around), w.tolerance) == inside_face
+    let behind = try face_contains(w, f, try stepped(w, f, p, side.multiply_scalar(-1.0), quarter, around), w.tolerance) == inside_face
+    if behind and not ahead: side = side.multiply_scalar(-1.0)
+    elif ahead == behind:
+        let probe = try stepped(w, f, p, side, least * 1e-3 + w.tolerance * 100.0, around)
+        if try face_contains(w, f, probe, w.tolerance) != inside_face: side = side.multiply_scalar(-1.0)
+    # On a rim's cylinder the straight step runs along the axis, on the
+    # face; one leaving the surface has left the face.
+    let far = try stepped(w, f, p, side, least, around)
+    if try face_contains(w, f, far, w.tolerance) != outside and try on_face_surface(w, f, far): return least
+    var inside_at = 0.0
+    var outside_at = least
+    for _ in 0..<40:
+        let middle = (inside_at + outside_at) * 0.5
+        let q = try stepped(w, f, p, side, middle, around)
+        if try on_face_surface(w, f, q) and try face_contains(w, f, q, w.tolerance) != outside: inside_at = middle
+        else: outside_at = middle
+    return inside_at
 
 ## `p` moved `distance` along `side` on face `f`: straight, or (around)
 ## that far around its cylinder's circle or its sphere's great circle.
@@ -69,6 +73,63 @@ func on_face_surface(w: const Shape*, f: usize, p: Vector3) -> bool!:
     let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
     if s.kind == surface_spline: return true
     return surface_distance(s, p) <= w.tolerance * 10.0
+
+## Parasolid's overlap limit for a fillet of `size` on straight edge `e`
+## between flat faces: the longest stretch of the edge along which it fits
+## both faces, as fractions along it (start, finish); (0, 1) when it fits
+## all along, an error when nowhere.
+func overlap_limits(w: const Shape*, e: usize, size: f64, round: bool) -> (f64, f64)!:
+    let (fa, fb) = try edge_faces(w, e)
+    let reach = try reach_of(w, e, size, round)
+    let samples: usize = 64
+    var best_start: i64 = -1
+    var best_count: usize = 0
+    var run_start: i64 = -1
+    for k in 0..<samples + 1:
+        let fraction = math.clamp((f64)k / (f64)samples, 1e-3, 1.0 - 1e-3)
+        let fits = try fits_at(w, e, fa, fb, reach, fraction)
+        if fits and run_start < 0: run_start = (i64)k
+        if (not fits or k == samples) and run_start >= 0:
+            let end = k + 1 if fits else k
+            if end - (usize)run_start > best_count:
+                best_count = end - (usize)run_start
+                best_start = run_start
+            run_start = -1
+    if best_count == 0: error(invalid, "an overlap limit leaves this fillet nowhere it fits its faces")
+    let first = (usize)best_start
+    let last = first + best_count - 1
+    var start = 0.0
+    var finish = 1.0
+    if first > 0: start = try fit_boundary(w, e, fa, fb, reach, (f64)(first - 1) / (f64)samples, (f64)first / (f64)samples)
+    if last < samples: finish = try fit_boundary(w, e, fa, fb, reach, (f64)(last + 1) / (f64)samples, (f64)last / (f64)samples)
+    # The faces' boundaries are found within their charts' tolerance: a
+    # limit that near a body vertex (the corner where the face narrows) is
+    # moved onto it, so no sliver of cap is left beside it.
+    let a = try w.edge_at(e, 0.0)
+    let span = (try w.edge_at(e, 1.0)).subtract(a)
+    let length = span.length()
+    for q in w.points.view():
+        let at = q.subtract(a).dot(span) / (length * length)
+        if start > 0.0 and math.abs(at - start) * length < reach * 1e-3: start = at
+        if finish < 1.0 and math.abs(at - finish) * length < reach * 1e-3: finish = at
+    return (start, finish)
+
+## Whether a blend reaching `reach` into faces `fa` and `fb` fits both at
+## `fraction` along edge `e`.
+func fits_at(w: const Shape*, e: usize, fa: usize, fb: usize, reach: f64, fraction: f64) -> bool!:
+    let limit = reach * 1.01 + w.tolerance * 100.0
+    return (try room_at(w, e, fa, limit, fraction)) > reach + w.tolerance * 10.0 and (try room_at(w, e, fb, limit, fraction)) > reach + w.tolerance * 10.0
+
+## Where between fractions `misfit` (no fit) and `fit` (a fit) the blend
+## starts to fit, by bisection.
+func fit_boundary(w: const Shape*, e: usize, fa: usize, fb: usize, reach: f64, misfit: f64, fit: f64) -> f64!:
+    var bad = misfit
+    var good = fit
+    for _ in 0..<40:
+        let middle = (bad + good) * 0.5
+        if try fits_at(w, e, fa, fb, reach, middle): good = middle
+        else: bad = middle
+    return good
 
 ## How a blend runs off one of its edge's faces (fits_plan): `how` one of
 ## the spill kinds, `off` the face it runs off, `far` that face's edge
@@ -174,6 +235,7 @@ func fits_plan(w: const Shape*, e: usize, size: f64, round: bool, overflow: i64 
         let (ledge, ledge_edge) = try face_across(w, e, off, depth, beyond_concave)
         if ledge >= 0: spill = Spill(spill_ledge, (i64)off, (i64)ledge_edge, ledge, depth)
         elif try overflows(w, e, off, depth): spill = Spill(spill_notch, (i64)off, -1, -1, depth)
+        elif try notched_end(w, e, off, depth): spill = Spill(spill_notch, (i64)off, -1, -1, depth)
     if spill.how == spill_fits:
         if cliffs and not (continuity == 1 and blend_shape.plain()) and (try far_edge(w, e, off, depth)) >= 0: error(invalid, "a cliff-edge overflow takes a circular (G1) fillet: turn Cliff off or use G1")
         return try spill_too_large(size, round, depth / (reach_a if not fits_a else reach_b))
@@ -209,6 +271,25 @@ func rounded_text(value: f64) -> f64:
 func overflows(w: const Shape*, e: usize, f: usize, depth: f64) -> bool!:
     return (try face_beyond(w, e, f, depth, beyond_convex)) >= 0
 
+## Whether face `f` of convex straight edge `e` between flat faces narrows
+## to `depth` along only part of the edge, there ending in a straight convex
+## edge parallel to `e` whose other face is flat and turns the same way (a
+## notch cut into the face beside one end: Fusion's notch there, the
+## fillet unchanged and the notch's faces trimming it, probe 14's cube).
+func notched_end(w: const Shape*, e: usize, f: usize, depth: f64) -> bool!:
+    let (fa, fb) = try edge_faces(w, e)
+    if not flat_pair(w, fa, fb) or not try convex(w, e): return false
+    for k in 1..<16:
+        let found = try far_edge(w, e, f, depth, (f64)k / 16.0)
+        if found < 0: continue
+        let far = (usize)found
+        let (ga, gb) = try edge_faces(w, far)
+        let next = gb if ga == f else ga
+        if w.surfaces.items[(usize)w.faces.items[next].surface].kind != surface_plane: continue
+        if face_outward(w, next).dot(face_outward(w, f)) > 1.0 - 1e-9: continue
+        if try convex(w, far): return true
+    return false
+
 ## Edges face_beyond looks for: convex, concave, or flat (the faces each
 ## side in one plane: a face split along a line).
 let beyond_convex: i64 = 0
@@ -236,14 +317,15 @@ func face_across(w: const Shape*, e: usize, f: usize, depth: f64, kind: i64) -> 
     return ((i64)next, far)
 
 ## Of straight edge `e` and flat face `f` beside it, the straight edge of
-## `f` parallel to `e` where a step `depth` into `f` square to `e` leaves
-## the face; -1 when it leaves elsewhere.
-func far_edge(w: const Shape*, e: usize, f: usize, depth: f64) -> i64!:
+## `f` parallel to `e` where a step `depth` into `f` square to `e` (from
+## `fraction` of the way along `e`, its middle by default) leaves the face;
+## -1 when it leaves elsewhere.
+func far_edge(w: const Shape*, e: usize, f: usize, depth: f64, fraction: f64 = 0.5) -> i64!:
     let edge = w.edges.items[e]
     if w.carriers.items[(usize)edge.carrier].kind != curve_line: return -1
     if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: return -1
     let along = try along_edge(w, e)
-    let p = try w.edge_at(e, 0.5)
+    let p = try w.edge_at(e, fraction)
     let side = try into_face(w, f, e, along)
     let q = p.add(side.multiply_scalar(depth))
     # The edge of `f` where the step leaves it.
@@ -265,14 +347,17 @@ func far_edge(w: const Shape*, e: usize, f: usize, depth: f64) -> i64!:
     return nearest
 
 ## Smooth overflow onto a curved face: where face `off` (flat, `depth` in
-## from straight convex edge `e` between flat faces) ends in a straight
-## edge parallel to `e` with a cylinder about a parallel axis beyond it,
-## tangent to `off` there (an earlier round of the face's far edge), the
-## ball touching the edge's other face and that cylinder (ruled_contacts),
-## when its contacts lie on both faces.
+## from straight edge `e` between flat faces) ends in a straight edge
+## parallel to `e` with a cylinder about a parallel axis beyond it, tangent
+## to `off` there (an earlier round of the face's far edge), the ball
+## touching the edge's other face and that cylinder (ruled_contacts), when
+## its contacts lie on both faces. At an inside edge the ball rolls in the
+## air, onto a wall's rounded top (Fusion's, probe 14: a wall 2 high, its
+## top rounded 1.5, its foot filleted 3).
 func rolled_spill(w: const Shape*, e: usize, off: usize, depth: f64, size: f64) -> Spill!:
     let (fa, fb) = try edge_faces(w, e)
-    if not flat_pair(w, fa, fb) or not try convex(w, e): return no_spill
+    if not flat_pair(w, fa, fb): return no_spill
+    let outer = try convex(w, e)
     let found = try far_edge(w, e, off, depth)
     if found < 0: return no_spill
     let far = (usize)found
@@ -287,7 +372,7 @@ func rolled_spill(w: const Shape*, e: usize, off: usize, depth: f64, size: f64) 
     if math.abs((try w.face_normal(next, m)).dot(face_outward(w, off)) - 1.0) > 1e-6: return no_spill
     let rest = fb if off == fa else fa
     let p = try w.edge_at(e, 0.5)
-    let (ta, tb, _) = ruled_contacts(w, rest, next, p, try into_face(w, rest, e, along), Vector3(), size, true, true, size) catch failure:
+    let (ta, tb, _) = ruled_contacts(w, rest, next, p, try into_face(w, rest, e, along), Vector3(), size, true, outer, size) catch failure:
         if failure.code != invalid: error(failure.code, failure.message)
         recover (Vector3(), Vector3(1e300, 0.0, 0.0), Vector3())
     if tb.x > 1e299: return no_spill

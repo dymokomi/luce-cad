@@ -157,7 +157,15 @@ func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize
 ## fit the conic's weight directly.
 ## With `laws`, the edges they hold are rounded by their radius laws
 ## between where the corners stop them (variable_corners.lucb).
-func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct_asked: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1, setback_asked: bool = false, blend_shape: BlendShape = plain_blend, laws: const EdgeLaws*? = none, limits: BlendLimits = no_limits, cap: const BlendCap*? = none) -> interop.Reference[CadModel]!:
+func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct_asked: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1, setback_asked: bool = false, blend_shape: BlendShape = plain_blend, laws: const EdgeLaws*? = none, asked_limits: BlendLimits = no_limits, cap: const BlendCap*? = none) -> interop.Reference[CadModel]!:
+    # Parasolid's overlap limit: the limits where the blend fits.
+    var limits = asked_limits
+    if limits.overlap:
+        try check_limits(w, chosen, limits)
+        let (start, finish) = try overlap_limits(w, chosen[0], size, round)
+        limits.start = math.max(limits.start, start)
+        limits.finish = math.min(limits.finish, finish)
+        limits.overlap = false
     if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     if round: try check_shape(blend_shape)
@@ -168,27 +176,31 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
     let limited = limits.limited() or cap != none
     if limits.limited(): try check_limits(w, chosen, limits)
     if not (limits.setback >= 0.0 and limits.setback < 100.0): error(invalid, "a fillet's setback is a share of its radius from 0 (as the corner needs) to 100")
-    let direct = direct_asked and not conic and not limited and not (limits.setback > 0.0)
+    let direct = direct_asked and not conic and not limited
     let setback = setback_asked or conic or limits.setback > 0.0
     # Each edge's blend must fit its faces: said precisely, before any tool.
+    # One that runs off a face (overflow) is the booleans' (their tools
+    # carry its spill; the direct builds follow the faces as they are).
+    var spills = false
     for e in chosen:
+        # (Overlap limits keep it where it fits.)
+        if asked_limits.overlap: break
         let (leg_a, leg_b) = try chamfer_legs(w, e, size, sides)
-        try check_fits(w, e, math.max(leg_a, leg_b), round, limits.overflow, continuity, blend_shape)
+        let (spill_a, spill_b) = try fits_plan(w, e, math.max(leg_a, leg_b), round, limits.overflow, continuity, blend_shape)
+        spills = spills or spill_a.how != spill_fits or spill_b.how != spill_fits
     # Tangent loops round a flat face (its walls square to it) and
     # straight edges between flat faces are built directly; what those
     # decline (curved faces at a corner, mixed corners, chamfers...) the
     # booleans below make.
     # (Under a Tangency weight a G1 section is a conic, which a cap loop's
     # strip carries as well; only the corner balls below need circles.)
-    if direct_asked and not limited:
+    if direct_asked and not limited and not spills:
         if let made = try cap_blend(w, chosen, size, round, continuity, tag, sides, none, blend_shape): return made
-    # (G1 setback corners are the booleans'; the direct build rounds G1
-    # corners with balls.)
-    if round and direct and not (setback and continuity == 1):
-        if let made = try local_blend(w, chosen, size, continuity, tag, patches, blend_shape): return made
+    if round and direct and not spills:
+        if let made = try local_blend(w, chosen, size, continuity, tag, patches, blend_shape, none, setback, limits): return made
     # Loops between two curved faces (or a flat face and a sphere): a ball
     # rolling between them, its G1 section a conic under a weight too.
-    if direct_asked and not limited:
+    if direct_asked and not limited and not spills:
         if let made = try curved_blend(w, chosen, size, round, continuity, tag, sides, none, blend_shape): return made
     # The booleans' tools follow lines and rims only.
     for e in chosen:
@@ -229,11 +241,32 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
     var joints = Growing[i64]()
     defer joints.close()
     try fillet_corners(w, chosen, size, continuity, round, &balls, &setbacks, &joints, setback)
-    # Setbacks asked: no fillet stops nearer its corner than that.
-    if limits.setback > 0.0:
+    # A variable edge's law ending at another radius than the feature's at
+    # a corner: that corner's setbacks and patch take each edge's own radius
+    # there (an unequal-radius setback corner, fillet_sets.lucb's).
+    if let held = laws:
         for at in 0..<setbacks.count:
-            let corner = &setbacks.items[at]
-            for i in 0..<corner.count: corner.distances[i] = math.max(corner.distances[i], limits.setback * size)
+            let corner = setbacks.items[at]
+            var radii: f64[8] = [size, size, size, size, size, size, size, size]
+            var differs = false
+            for i in 0..<corner.count:
+                let k = held.find(corner.edges[i])
+                if k < 0: continue
+                let law = &held.laws.items[(usize)k]
+                let edge = w.edges.items[corner.edges[i]]
+                let starts = law.forward.items[corner.edges[i]] == (edge.start == corner.vertex)
+                radii[i] = law.radii.items[0] if starts else law.radii.items[law.radii.count - 1]
+                differs = differs or math.abs(radii[i] - size) > size * 1e-9
+            if not differs: continue
+            var remade = try setback_at(w, corner.vertex, corner.edges[..<corner.count], size, corner.inside, radii[..<corner.count])
+            try roomy_setback(w, &remade, size, continuity)
+            setbacks.items[at] = remade
+    # Setbacks asked: no fillet stops nearer its corner than that.
+    for at in 0..<setbacks.count:
+        let corner = &setbacks.items[at]
+        corner.edge_shape = limits.corner_shape
+        corner.fullness = limits.corner_fullness
+        for i in 0..<corner.count: corner.distances[i] = math.max(corner.distances[i], limits.setback * size)
     # G1 setback corners: the edges' sections the circle's arc as a
     # B-spline, so their ends are the curves the corner's patch meets.
     let tool_continuity = g1_spline if round and continuity == 1 and (setbacks.count > 0 or conic) else continuity
@@ -357,16 +390,17 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
                 lawed = true
         if not lawed:
             if adding:
-                # An inside corner's wall lower than the fillet: its
-                # cliff-edge blend (fits_plan).
-                let (spill_a, spill_b) = try fits_plan(w, e, math.max(leg_a, leg_b), round, limits.overflow, continuity, blend_shape)
-                let spill = spill_a if spill_a.how == spill_cliff else spill_b
+                # An inside corner's wall lower than the fillet: the ball
+                # rolled onto its rounded top, or its cliff-edge blend
+                # (fits_plan).
+                let (spill_a, spill_b) = (no_spill, no_spill) if asked_limits.overlap else try fits_plan(w, e, math.max(leg_a, leg_b), round, limits.overflow, continuity, blend_shape)
+                let spill = spill_a if spill_a.how == spill_cliff or spill_a.how == spill_rolled else spill_b
                 try tools.push(try cap_cut(try concave_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b, blend_shape, spill), cap, (str)name.view()))
             else:
                 # Running off a face (fits_plan): rolled on or ending on a
                 # cliff edge, its own section; over a ledge, stopped at its
                 # plane.
-                let (spill_a, spill_b) = try fits_plan(w, e, math.max(leg_a, leg_b), round, limits.overflow, continuity, blend_shape)
+                let (spill_a, spill_b) = (no_spill, no_spill) if asked_limits.overlap else try fits_plan(w, e, math.max(leg_a, leg_b), round, limits.overflow, continuity, blend_shape)
                 let spill = spill_a if spill_a.how == spill_rolled or spill_a.how == spill_cliff else spill_b
                 var tool = try edge_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, &body, (str)name.view(), leg_b, blend_shape, spill)
                 for side in [spill_a, spill_b]:
@@ -431,8 +465,10 @@ func mixed_order(w: const Shape*, chosen: const usize[], later: Growing[usize]*)
                 try here.push(other)
                 if not try convex(w, other): concaves += 1
             if concaves == 0 or concaves == (i64)here.count: continue
+            if here.count == 2:
+                error(invalid, "an inside and an outside fillet meeting where the corner's third edge stays sharp (a Y corner) are built between flat faces, the two edges square to each other and to the third face: fillet them one at a time")
             if here.count != 3:
-                error(invalid, "an inside-corner fillet meeting an outside one at a corner is supported where three edges meet: fillet them one at a time")
+                error(invalid, "an inside-corner fillet meeting an outside one at a corner is supported where two or three edges meet: fillet them one at a time")
             # The lone kind goes first; the pair after.
             let lone_inside = concaves == 1
             for other in here.view():

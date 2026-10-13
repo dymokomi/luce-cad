@@ -1,0 +1,483 @@
+## Y corners of a direct fillet (local_corners.lucb's kind 5): an inside and
+## an outside fillet meeting where the corner's third edge stays sharp, as
+## Fusion 2705 makes them (probe 14 of 2026-10-13: a boss's upright and one
+## foot edge; an L's inside upright and one top edge). The chosen edge of
+## the sharp edge's kind (E1) runs on to the corner; the other (E2) then
+## rolls its section round E1's end, a ball rolling between E2's own face
+## (F3, square to E1) and E1's strip, along E1's section in F3's plane (the
+## rim). At G1 that is a torus: its axis E1's ball line, its tube E2's
+## radius, its ring E1's and E2's radii added (Fusion's torus exactly). At
+## G2 and G3 the same: E2's section in the planes through E1's way and the
+## rim's normal, swept round the rim (fitted), G2 or G3 to E1's strip and
+## to F3 since its rows next to each lie along them. E1's other face (P)
+## cuts the corner: the cut is a curve on P from where E1's contact line
+## stops to where the corner's contact on F3 meets P, the sharp edge
+## shortened to there.
+## E1 stops at F3's plane moved E2's radius along it; E2 stops square to
+## its edge where E1's contact on their shared face meets F3. Both strips'
+## contacts on that face end at one point. Built where E1 is square to F3
+## and to E2 (a boss's foot, an L's inside upright: E2 then a square edge).
+
+## What a Y corner's edges and faces are: E1 (strip `first`, the sharp
+## edge's kind) and E2 (`second`), their ends there, the face they share,
+## E1's other face P and E2's other face F3, the sharp edge, and the ways
+## along E1 and E2 from the corner.
+## Of three edges (`third` E3's strip, else -1), E1's other face is E3's
+## too, and F3 the pair's other face.
+struct YRoles:
+    var first: usize
+    var second: usize
+    var end_first: usize
+    var end_second: usize
+    var shared: usize
+    var own: usize
+    var wall: usize
+    var sharp: usize
+    var way_first: Vector3
+    var way_second: Vector3
+    var third: i64
+    var end_third: usize
+    var way_third: Vector3
+
+## E1's section in F3's plane, from its contact on the shared face (t 0)
+## to its contact on P (t 1): a circle's arc at G1 (`center`, `x`, `y`,
+## `radius`, `sweep`), else its fillet section (`points`, `knots`,
+## degree 5, its parameter turned when `turned`). `side` turns F3's normal
+## x the rim's tangent to the way away from it on F3 (the rim's normal).
+struct YRim:
+    var round: bool
+    var center: Vector3
+    var x: Vector3
+    var y: Vector3
+    var radius: f64
+    var sweep: f64
+    var points: Growing[Vector3]
+    var knots: Growing[f64]
+    var turned: bool
+    var normal: Vector3
+    var side: f64
+
+    func close():
+        self.points.close()
+        self.knots.close()
+
+    ## The rim's point and its tangent (by t) at `t`.
+    func at(t: f64) -> (Vector3, Vector3)!:
+        if self.round:
+            let angle = self.sweep * t
+            let radial = self.x.multiply_scalar(math.cos(angle)).add(self.y.multiply_scalar(math.sin(angle)))
+            let turning = self.y.multiply_scalar(math.cos(angle)).subtract(self.x.multiply_scalar(math.sin(angle)))
+            return (self.center.add(radial.multiply_scalar(self.radius)), turning.multiply_scalar(self.radius * self.sweep))
+        var weights: f64[8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        let u = 1.0 - t if self.turned else t
+        let (p, d, _) = try NurbsCurve.derivatives_checked(self.points.view(), weights[..<self.points.count], 5, self.knots.view(), math.clamp(u, 0.0, 1.0))
+        return (p, d.multiply_scalar(-1.0 if self.turned else 1.0))
+
+    ## The rim's unit normal in F3 at `t`, away from it toward E2's contact.
+    func way_out(t: f64) -> Vector3!:
+        let (_, d) = try self.at(t)
+        return (try self.normal.cross(d).normalized()).multiply_scalar(self.side)
+
+## A Y corner being made: its rim, E2's radius, the way along E1 from F3
+## (E2's other leg), the continuity and section shape, and whether E2's
+## section runs from E1's side (its strip's side 0 the shared face).
+struct YCorner:
+    var rim: YRim
+    var radius: f64
+    var down: Vector3
+    var continuity: i64
+    var blend_shape: BlendShape
+    var forward: bool
+    ## For the cut: P's outward normal and offset.
+    var cut_normal: Vector3
+    var cut_offset: f64
+
+    func close():
+        self.rim.close()
+
+    ## E2's section at `t` onto `points` (its control points, from E1's
+    ## side to F3's when `forward`) and `knots`; its corner and contacts.
+    func section(t: f64, points: Growing[Vector3]*, knots: Growing[f64]*) -> !:
+        points.clear()
+        knots.clear()
+        let (q, _) = try self.rim.at(t)
+        let n = try self.rim.way_out(t)
+        let a = q.add(self.down.multiply_scalar(self.radius))
+        let b = q.add(n.multiply_scalar(self.radius))
+        if self.forward: try fillet_section(a, b, q, self.continuity, points, knots, self.blend_shape)
+        else: try fillet_section(b, a, q, self.continuity, points, knots, self.blend_shape)
+
+    ## The corner surface's point at `t` round the rim and `s` across, from
+    ## E1's contact (0) to F3's (1).
+    func point(t: f64, s: f64) -> Vector3!:
+        let (q, _) = try self.rim.at(t)
+        let n = try self.rim.way_out(t)
+        if self.continuity == 1:
+            let angle = s * math.pi * 0.5
+            let middle = q.add(n.add(self.down).multiply_scalar(self.radius))
+            return middle.subtract(n.multiply_scalar(self.radius * math.cos(angle)).add(self.down.multiply_scalar(self.radius * math.sin(angle))))
+        var points = Growing[Vector3]()
+        defer points.close()
+        var knots = Growing[f64]()
+        defer knots.close()
+        try self.section(t, &points, &knots)
+        var weights: f64[8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        return try NurbsCurve.at(points.view(), weights[..<points.count], 5, knots.view(), s if self.forward else 1.0 - s)
+
+    ## The corner's contact on F3 at `t`.
+    func contact(t: f64) -> Vector3!:
+        let (q, _) = try self.rim.at(t)
+        return q.add((try self.rim.way_out(t)).multiply_scalar(self.radius))
+
+    ## Where the section at `t` crosses P's plane: from F3's contact (off
+    ## P but at t*) toward E1's (on P's kept side, on P itself at t 1, where
+    ## the section touches P: its sign there is only roundoff, so the
+    ## crossing is found by F3's side).
+    func cut_point(t: f64) -> Vector3!:
+        # Near t 1 the surface lies flat on P to second order (third at
+        # G2), so the crossing is lost in roundoff: the cut there is the
+        # cubic through E1's contact and three crossings further back.
+        let guard = 3e-3
+        if 1.0 - t < guard:
+            let d = (1.0 - t) / guard
+            var sum = (try self.point(1.0, 0.0)).multiply_scalar((1.0 - d) * (2.0 - d) * (3.0 - d) / 6.0)
+            sum = sum.add((try self.crossing(1.0 - guard)).multiply_scalar(d * (2.0 - d) * (3.0 - d) / 2.0))
+            sum = sum.add((try self.crossing(1.0 - 2.0 * guard)).multiply_scalar(-d * (1.0 - d) * (3.0 - d) / 2.0))
+            return sum.add((try self.crossing(1.0 - 3.0 * guard)).multiply_scalar(d * (1.0 - d) * (2.0 - d) / 6.0))
+        return try self.crossing(t)
+
+    ## The section at `t`'s crossing of P by bisection (cut_point).
+    func crossing(t: f64) -> Vector3!:
+        let end_point = try self.point(t, 1.0)
+        let above = end_point.dot(self.cut_normal) - self.cut_offset
+        if math.abs(above) <= (math.abs(self.cut_offset) + self.radius) * 1e-13: return end_point
+        # Not across yet (a hair before t*, where the fitted contact meets P).
+        if ((try self.point(t, 0.0)).dot(self.cut_normal) - self.cut_offset) * above > 0.0: return end_point
+        var low = 0.0
+        var high = 1.0
+        for _ in 0..<60:
+            let middle = (low + high) * 0.5
+            let at = (try self.point(t, middle)).dot(self.cut_normal) - self.cut_offset
+            if at * above > 0.0: high = middle
+            else: low = middle
+        return try self.point(t, (low + high) * 0.5)
+
+## The cut's points (P's crossings from t*, the contact on F3 there, to t
+## 1, E1's contact) for row_fit.
+func y_cut_at(context: void*, t: f64, out: Growing[Vector3]*) -> !:
+    out.clear()
+    try out.push(try (*(YCorner*)context).cut_point(t))
+
+## The corner's rows (E2's section's control points) at `t` for row_fit.
+func y_rows_at(context: void*, t: f64, out: Growing[Vector3]*) -> !:
+    var knots = Growing[f64]()
+    defer knots.close()
+    try (*(YCorner*)context).section(t, out, &knots)
+
+## Vertex `v`'s Y corner (two chosen edges of different kinds, the third
+## sharp): `plan`'s chosen edges set to E1, E2 and its strips' ends given
+## their planes (the file's header). Declined (invalid) where E1 is not
+## square to E2 and to F3.
+func plan_y(b: Local*, v: i64, plan: CornerPlan*) -> !:
+    let w = b.w
+    var sharp: i64 = -1
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        if (edge.start == v or edge.end == v) and b.strip_of.items[e] < 0: sharp = (i64)e
+    if sharp < 0: error(invalid, "a Y corner needs a sharp edge")
+    let sharp_convex = try convex(w, (usize)sharp)
+    if b.strips.items[(usize)b.strip_of.items[plan.chosen[0]]].convex != sharp_convex:
+        let swap = plan.chosen[0]
+        plan.chosen[0] = plan.chosen[1]
+        plan.chosen[1] = swap
+    plan.kind = 5
+    let roles = try y_roles(b, plan)
+    let p = w.points.items[(usize)v]
+    let first = b.strips.items[roles.first]
+    let second = b.strips.items[roles.second]
+    let wall = face_outward(w, roles.wall)
+    if math.abs(math.abs(wall.dot(roles.way_first)) - 1.0) > 1e-9 or math.abs(roles.way_first.dot(roles.way_second)) > 1e-9:
+        error(invalid, "a Y corner is built where its edges are square to each other and to the third face")
+    # E2 is then a square edge: its contacts lie its radius from it.
+    let rim_start = p.add(first.intos[0 if first.faces[0] == roles.shared else 1].multiply_scalar(first.reach))
+    try set_end(b, roles.first, v, roles.way_first, roles.way_first.dot(p) + second.radius)
+    try set_end(b, roles.second, v, roles.way_second, roles.way_second.dot(rim_start))
+
+## Vertex `v`'s mixed corner of three chosen edges (one of a kind, E1,
+## and a pair): `plan`'s chosen edges set to E1 and the pair, the strips'
+## ends given their planes. Declined (invalid) unless E1 is square to the
+## pair and to their face, and the pair is of one radius.
+func plan_y3(b: Local*, v: i64, plan: CornerPlan*) -> !:
+    let w = b.w
+    var convexes = 0
+    for k in 0..<3:
+        if b.strips.items[(usize)b.strip_of.items[plan.chosen[k]]].convex: convexes += 1
+    for k in 0..<3:
+        let lone = b.strips.items[(usize)b.strip_of.items[plan.chosen[k]]].convex == (convexes == 1)
+        if lone and k > 0:
+            let swap = plan.chosen[0]
+            plan.chosen[0] = plan.chosen[k]
+            plan.chosen[k] = swap
+    plan.kind = 5
+    let roles = try y_roles(b, plan)
+    let p = w.points.items[(usize)v]
+    let first = b.strips.items[roles.first]
+    let second = b.strips.items[roles.second]
+    let third = b.strips.items[(usize)roles.third]
+    let wall = face_outward(w, roles.wall)
+    if math.abs(math.abs(wall.dot(roles.way_first)) - 1.0) > 1e-9 or math.abs(roles.way_first.dot(roles.way_second)) > 1e-9 or math.abs(roles.way_first.dot(roles.way_third)) > 1e-9:
+        error(invalid, "a mixed corner is rolled where its lone edge is square to the other two and to their face")
+    if math.abs(second.radius - third.radius) > w.tolerance: error(invalid, "a mixed corner's pair must be of one radius")
+    let side_shared = (usize)(0 if first.faces[0] == roles.shared else 1)
+    let rim_start = p.add(first.intos[side_shared].multiply_scalar(first.reach))
+    let rim_end = p.add(first.intos[1 - side_shared].multiply_scalar(first.reach))
+    try set_end(b, roles.first, v, roles.way_first, roles.way_first.dot(p) + second.radius)
+    try set_end(b, roles.second, v, roles.way_second, roles.way_second.dot(rim_start))
+    try set_end(b, (usize)roles.third, v, roles.way_third, roles.way_third.dot(rim_end))
+
+## Plan `plan`'s Y corner roles (plan_y put E1 first).
+func y_roles(b: const Local*, plan: const CornerPlan*) -> YRoles!:
+    let w = b.w
+    let v = plan.vertex
+    let first = (usize)b.strip_of.items[plan.chosen[0]]
+    let second = (usize)b.strip_of.items[plan.chosen[1]]
+    let a = b.strips.items[first]
+    let c = b.strips.items[second]
+    let shared = shared_strip_face(&a, &c)
+    if shared < 0: error(invalid, "a Y corner's fillets share no face")
+    let own = a.faces[1] if a.faces[0] == (usize)shared else a.faces[0]
+    let wall = c.faces[1] if c.faces[0] == (usize)shared else c.faces[0]
+    var sharp: usize = 0
+    for e in 0..<w.edges.count:
+        let edge = w.edges.items[e]
+        if (edge.start == v or edge.end == v) and b.strip_of.items[e] < 0: sharp = e
+    let end_first = end_at(b, first, v)
+    let end_second = end_at(b, second, v)
+    var roles = YRoles(first, second, end_first, end_second, (usize)shared, own, wall, sharp,
+                       a.along.multiply_scalar(1.0 if end_first == 0 else -1.0), c.along.multiply_scalar(1.0 if end_second == 0 else -1.0), -1, 0, Vector3())
+    if plan.count == 3:
+        let third = (usize)b.strip_of.items[plan.chosen[2]]
+        let d = b.strips.items[third]
+        if not ((d.faces[0] == own and d.faces[1] == wall) or (d.faces[1] == own and d.faces[0] == wall)): error(invalid, "a mixed corner's pair must lie on one face")
+        roles.third = (i64)third
+        roles.end_third = end_at(b, third, v)
+        roles.way_third = d.along.multiply_scalar(1.0 if roles.end_third == 0 else -1.0)
+    return roles
+
+## Plan `plan`'s Y corner: the strips' ends and sections, the corner's
+## contact on F3 and its cut on P (each face's link), the sharp edge's new
+## end, and the corner face.
+func make_y(b: Local*, plan: const CornerPlan*, tag: str) -> !:
+    let v = plan.vertex
+    let w = b.w
+    let roles = try y_roles(b, plan)
+    let p = w.points.items[(usize)v]
+    let first = b.strips.items[roles.first]
+    let second = b.strips.items[roles.second]
+    let side_shared = (usize)(0 if first.faces[0] == roles.shared else 1)
+    let side_wall = (usize)(0 if second.faces[0] == roles.wall else 1)
+    let into_shared = first.intos[side_shared]
+    let into_own = first.intos[1 - side_shared]
+    let into_wall = second.intos[side_wall]
+    let r = second.radius
+    let down = roles.way_first
+    # The strips' contacts: one point on the shared face for both.
+    let rim_start = p.add(into_shared.multiply_scalar(first.reach))
+    let rim_end = p.add(into_own.multiply_scalar(first.reach))
+    let meeting = try b.new_point(rim_start.add(down.multiply_scalar(r)))
+    let stop_point = try b.new_point(rim_end.add(down.multiply_scalar(r)))
+    let top_point = try b.new_point(rim_start.add(into_wall.multiply_scalar(r)))
+    b.strips.items[roles.first].contacts[roles.end_first * 2 + side_shared] = meeting
+    b.strips.items[roles.first].contacts[roles.end_first * 2 + 1 - side_shared] = stop_point
+    b.strips.items[roles.second].contacts[roles.end_second * 2 + 1 - side_wall] = meeting
+    b.strips.items[roles.second].contacts[roles.end_second * 2 + side_wall] = top_point
+    let cut_first = b.strips.items[roles.first]
+    let section_first = try plane_section(b, &cut_first, cut_first.planes[roles.end_first], cut_first.offsets[roles.end_first], cut_first.contacts[roles.end_first * 2], cut_first.contacts[roles.end_first * 2 + 1])
+    b.strips.items[roles.first].sections[roles.end_first] = (i64)section_first
+    let cut_second = b.strips.items[roles.second]
+    let section_second = try plane_section(b, &cut_second, cut_second.planes[roles.end_second], cut_second.offsets[roles.end_second], cut_second.contacts[roles.end_second * 2], cut_second.contacts[roles.end_second * 2 + 1])
+    b.strips.items[roles.second].sections[roles.end_second] = (i64)section_second
+    # The rim: E1's section in F3's plane (through the corner), as its
+    # strip makes it, from the shared face's contact.
+    var corner = YCorner(YRim(b.continuity == 1, Vector3(), Vector3(), Vector3(), first.radius, 0.0, Growing[Vector3](), Growing[f64](), side_shared == 1, face_outward(w, roles.wall), 1.0),
+                         r, down, b.continuity, b.blend_shape, side_wall == 1, face_outward(w, roles.own), face_outward(w, roles.own).dot(p))
+    defer corner.close()
+    let ua = first.intos[0]
+    let ub = first.intos[1]
+    let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    let center = p.add((try ua.add(ub).normalized()).multiply_scalar(first.radius / math.sin(angle * 0.5)))
+    if b.continuity == 1:
+        corner.rim.center = center
+        corner.rim.x = try rim_start.subtract(center).normalized()
+        let to = rim_end.subtract(center)
+        corner.rim.y = try to.subtract(corner.rim.x.multiply_scalar(to.dot(corner.rim.x))).normalized()
+        corner.rim.sweep = math.atan2(to.dot(corner.rim.y), to.dot(corner.rim.x))
+    else:
+        try fillet_section(p.add(ua.multiply_scalar(first.reach)), p.add(ub.multiply_scalar(first.reach)), p, b.continuity, &corner.rim.points, &corner.rim.knots, b.blend_shape)
+    if (try corner.rim.way_out(0.0)).dot(into_wall) < 0.0: corner.rim.side = -1.0
+    # The corner face: a torus at G1, else E2's section swept round the
+    # rim (its rows fitted along it, their start held along E2's way so it
+    # meets E2's straight strip with the corner's own continuity).
+    let tolerance = w.tolerance * 0.1
+    var knots = Growing[f64]()
+    defer knots.close()
+    var net = Growing[Vector3]()
+    defer net.close()
+    var contact_row = Growing[Vector3]()
+    defer contact_row.close()
+    var contact_knots = Growing[f64]()
+    defer contact_knots.close()
+    var empty_points: Vector3[]
+    var empty_numbers: f64[]
+    if b.continuity == 1:
+        let ring = center.add(down.multiply_scalar(r))
+        let major = rim_start.add(into_wall.multiply_scalar(r)).subtract(center).length()
+        try b.out.surfaces.push(try Surface(5, ring, corner.rim.x, down, major, r, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+    else:
+        try knots.assign(corner.rim.knots.view())
+        if corner.rim.turned:
+            for k in 0..<knots.count: knots.items[k] = 1.0 - corner.rim.knots.items[knots.count - 1 - k]
+        var rows = Growing[Vector3]()
+        defer rows.close()
+        var across_knots = Growing[f64]()
+        defer across_knots.close()
+        try corner.section(0.0, &rows, &across_knots)
+        var source = RowSource((void*)&corner, y_rows_at, 0.0, 1.0, tolerance)
+        let held = (usize)b.continuity + 1
+        try fit_rows_led(&source, rows.count, 5, &knots, &net, roles.way_second, held, roles.way_third, held if roles.third >= 0 else 2)
+        var weights = Growing[f64]()
+        defer weights.close()
+        try weights.fill(net.count, 1.0)
+        let m = knots.count - 6
+        try b.out.surfaces.push(try Surface(3, Vector3(), Vector3(), Vector3(), 0.0, 0.0, net.view(), weights.view(), across_knots.view(), knots.view(), (i64)rows.count, (i64)m, 5, 5))
+        # Its row on F3 is the corner's contact there, held in F3's plane.
+        let row = (rows.count - 1) if corner.forward else 0
+        for k in 0..<m: try contact_row.push(net.items[row * m + k])
+        try flatten(&contact_row, face_outward(w, roles.wall), face_outward(w, roles.wall).dot(p))
+        try contact_knots.assign(knots.view())
+    if roles.third >= 0:
+        try y_round(b, &corner, &roles, plan, tag, section_first, section_second, top_point, stop_point, center, contact_row.view(), contact_knots.view())
+        return
+    # Where the corner's contact on F3 meets P: the sharp edge's new end.
+    let reach = corner.cut_normal
+    var low = 0.0
+    var high = 1.0
+    let before = (try y_contact(&corner, contact_row.view(), contact_knots.view(), 0.0)).dot(reach) - corner.cut_offset
+    if before * ((try y_contact(&corner, contact_row.view(), contact_knots.view(), 1.0)).dot(reach) - corner.cut_offset) >= 0.0: error(invalid, "a Y corner's blend does not meet the face beyond it")
+    for _ in 0..<60:
+        let middle = (low + high) * 0.5
+        if ((try y_contact(&corner, contact_row.view(), contact_knots.view(), middle)).dot(reach) - corner.cut_offset) * before > 0.0: low = middle
+        else: high = middle
+    let t_meet = (low + high) * 0.5
+    let crossing = try y_contact(&corner, contact_row.view(), contact_knots.view(), t_meet)
+    let sharp_edge = w.edges.items[roles.sharp]
+    let far = w.points.items[(usize)(sharp_edge.end if sharp_edge.start == v else sharp_edge.start)]
+    let along_sharp = far.subtract(p)
+    if crossing.subtract(p).dot(along_sharp) <= w.tolerance or crossing.subtract(p).dot(along_sharp) >= along_sharp.dot(along_sharp) - w.tolerance:
+        error(invalid, "a Y corner's blend runs past the sharp edge beyond it: give the fillets smaller radii")
+    let end_point = try b.new_point(crossing)
+    try end_sharp(b, v, roles.own, roles.wall, end_point)
+    # The corner's contact on F3 (an arc of its ring at G1, else its row
+    # there up to t*), and its cut on P, held in P's plane.
+    var contact_chain: usize = 0
+    if b.continuity == 1:
+        let arc_edge = try b.arc(top_point, end_point, center, crossing.subtract(center).length())
+        let uses: i64[1] = [arc_edge + 1]
+        contact_chain = try b.chain(top_point, end_point, uses[..<1])
+    else:
+        let contact_edge = try b.spline_piece(top_point, end_point, contact_row.view(), contact_knots.view(), 0.0, t_meet)
+        let uses: i64[1] = [contact_edge + 1]
+        contact_chain = try b.chain(top_point, end_point, uses[..<1])
+    try uniform_knots_into(4, t_meet, 1.0, &knots)
+    var cut_source = RowSource((void*)&corner, y_cut_at, t_meet, 1.0, tolerance)
+    try fit_rows(&cut_source, 1, 5, &knots, &net)
+    try flatten(&net, corner.cut_normal, corner.cut_offset)
+    net.items[0] = crossing
+    net.items[net.count - 1] = b.at(stop_point)
+    let cut_edge = try b.spline(end_point, stop_point, net.view(), knots.view())
+    let cut_uses: i64[1] = [cut_edge + 1]
+    let cut_chain = try b.chain(end_point, stop_point, cut_uses[..<1])
+    try b.links.push(Link(v, roles.wall, contact_chain))
+    try b.links.push(Link(v, roles.own, cut_chain))
+    # Outward: toward the rim at an outside E2 (the material lies beyond
+    # the corner face from it), away from it inside.
+    let middle = try corner.point(t_meet * 0.5, 0.5)
+    let (q, _) = try corner.rim.at(t_meet * 0.5)
+    let outward = q.subtract(middle).multiply_scalar(1.0 if second.convex else -1.0)
+    let sense = (try normal_at(&b.out.surfaces.items[b.out.surfaces.count - 1], middle, w.tolerance * 100.0)).dot(outward) > 0.0
+    var loop = Growing[i64]()
+    defer loop.close()
+    try b.walk(section_second, top_point, &loop)
+    try b.walk(section_first, meeting, &loop)
+    try b.walk(cut_chain, stop_point, &loop)
+    try b.walk(contact_chain, end_point, &loop)
+    b.name.clear()
+    try corner_name(w, (usize)v, tag, &b.name)
+    try b.extras.push(Extra((i64)b.out.surfaces.count - 1, sense, try b.out.add_name((str)b.name.view()), b.store.count, loop.count))
+    for use in loop.view(): try b.store.push(use)
+
+## A mixed corner of three edges (make_y's, after its rim and face):
+## E3's contacts and end section at the rim's end, the corner's contact on
+## F3 from E2's to E3's (F3's link), and the corner face, no cut.
+func y_round(b: Local*, corner: const YCorner*, roles: const YRoles*, plan: const CornerPlan*, tag: str, section_first: usize, section_second: usize, top_point: i64, stop_point: i64, center: Vector3, contact_row: const Vector3[], contact_knots: const f64[]) -> !:
+    let w = b.w
+    let v = plan.vertex
+    let p = w.points.items[(usize)v]
+    let third = (usize)roles.third
+    let strip = b.strips.items[third]
+    let side_wall = (usize)(0 if strip.faces[0] == roles.wall else 1)
+    let far = try y_contact(corner, contact_row, contact_knots, 1.0)
+    let far_point = try b.new_point(far)
+    b.strips.items[third].contacts[roles.end_third * 2 + side_wall] = far_point
+    b.strips.items[third].contacts[roles.end_third * 2 + 1 - side_wall] = stop_point
+    let cut = b.strips.items[third]
+    let section_third = try plane_section(b, &cut, cut.planes[roles.end_third], cut.offsets[roles.end_third], cut.contacts[roles.end_third * 2], cut.contacts[roles.end_third * 2 + 1])
+    b.strips.items[third].sections[roles.end_third] = (i64)section_third
+    var contact_chain: usize = 0
+    if b.continuity == 1:
+        let arc_edge = try b.arc(top_point, far_point, center, far.subtract(center).length())
+        let uses: i64[1] = [arc_edge + 1]
+        contact_chain = try b.chain(top_point, far_point, uses[..<1])
+    else:
+        let contact_edge = try b.spline(top_point, far_point, contact_row, contact_knots)
+        let uses: i64[1] = [contact_edge + 1]
+        contact_chain = try b.chain(top_point, far_point, uses[..<1])
+    try b.links.push(Link(v, roles.wall, contact_chain))
+    let middle = try corner.point(0.5, 0.5)
+    let (q, _) = try corner.rim.at(0.5)
+    let outward = q.subtract(middle).multiply_scalar(1.0 if b.strips.items[roles.second].convex else -1.0)
+    let sense = (try normal_at(&b.out.surfaces.items[b.out.surfaces.count - 1], middle, w.tolerance * 100.0)).dot(outward) > 0.0
+    var loop = Growing[i64]()
+    defer loop.close()
+    try b.walk(section_second, top_point, &loop)
+    try b.walk(section_first, b.strips.items[roles.second].contacts[roles.end_second * 2 + (1 if b.strips.items[roles.second].faces[0] == roles.wall else 0)], &loop)
+    try b.walk(section_third, stop_point, &loop)
+    try b.walk(contact_chain, far_point, &loop)
+    b.name.clear()
+    try corner_name(w, (usize)v, tag, &b.name)
+    try b.extras.push(Extra((i64)b.out.surfaces.count - 1, sense, try b.out.add_name((str)b.name.view()), b.store.count, loop.count))
+    for use in loop.view(): try b.store.push(use)
+    _ = p
+
+## The corner's contact on F3 at `t`: the ring's point at G1, else on its
+## fitted row `row` (knots `knots`), which the corner face carries.
+func y_contact(corner: const YCorner*, row: const Vector3[], knots: const f64[], t: f64) -> Vector3!:
+    if row.length == 0: return try corner.contact(t)
+    var weights = Growing[f64]()
+    defer weights.close()
+    try weights.fill(row.length, 1.0)
+    return try NurbsCurve.at(row, weights.view(), 5, knots, t)
+
+## Clamped degree 5 knots of `spans` equal spans over `low`..`high`.
+func uniform_knots_into(spans: usize, low: f64, high: f64, knots: Growing[f64]*) -> !:
+    knots.clear()
+    for _ in 0..<(usize)6: try knots.push(low)
+    for k in 1..<spans: try knots.push(low + (high - low) * (f64)k / (f64)spans)
+    for _ in 0..<(usize)6: try knots.push(high)
+
+## Each of `net`'s points moved onto the plane of unit `normal` and
+## `offset` (a planar curve's net stays in its plane).
+func flatten(net: Growing[Vector3]*, normal: Vector3, offset: f64) -> !:
+    for k in 0..<net.count:
+        let q = net.items[k]
+        net.items[k] = q.subtract(normal.multiply_scalar(q.dot(normal) - offset))

@@ -17,14 +17,23 @@ struct RowSource:
 ## the source's interval; spans are added where needed) onto `net`
 ## (row-major): an error when no fit within the tolerance is found.
 func fit_rows(source: const RowSource*, rows: usize, p: usize, knots: Growing[f64]*, net: Growing[Vector3]*) -> !:
+    try fit_rows_led(source, rows, p, knots, net, Vector3(), 2, Vector3(), 2)
+
+## fit_rows with `held` control points of each row held at the low end
+## (2 to 4), the second on lying along unit `way` from the first, at the
+## row's own speed and turning along it there: a fit that starts where a
+## straight sweep along `way` ends meets it G1, G2 (3) or G3 (4) exactly.
+## Likewise `held_end` at the high end along `end_way`.
+func fit_rows_led(source: const RowSource*, rows: usize, p: usize, knots: Growing[f64]*, net: Growing[Vector3]*, way: Vector3, held: usize, end_way: Vector3, held_end: usize) -> !:
+    if held < 2 or held > 4 or held > p or held_end < 2 or held_end > 4 or held_end > p: error(invalid, "a row fit holds two to four control points at each end")
     var marked = Growing[bool]()
     defer marked.close()
     for _ in 0..<12:
         let m = knots.count - p - 1
         marked.clear()
-        try marked.fill(knots.count, m < 6)
-        if m >= 6:
-            try fit_once(source, rows, p, knots.view(), net)
+        try marked.fill(knots.count, m < held + held_end + 2)
+        if m >= held + held_end + 2:
+            try fit_once(source, rows, p, knots.view(), net, way, held, end_way, held_end)
             if not try mark_strays(source, rows, p, knots.view(), net.view(), &marked): break
         # Each marked span halved.
         var k = knots.count - 1
@@ -52,11 +61,12 @@ func rows_turning(source: const RowSource*, t: f64, out: Growing[Vector3]*) -> !
 func samples_per_span(p: usize) -> usize:
     return 2 * p + 2
 
-## One least-squares fit of each row (as fit_rows) on `knots`, onto
+## One least-squares fit of each row (as fit_rows_led) on `knots`, onto
 ## `net` (row-major): the normal equations factored once, solved per row.
-func fit_once(source: const RowSource*, rows: usize, p: usize, knots: const f64[], net: Growing[Vector3]*) -> !:
+func fit_once(source: const RowSource*, rows: usize, p: usize, knots: const f64[], net: Growing[Vector3]*, way: Vector3, held: usize, end_way: Vector3, held_end: usize) -> !:
     let m = knots.length - p - 1
-    let unknowns = m - 4
+    let unknowns = m - held - held_end
+    let tail = m - held_end
     let low = knots[p]
     let high = knots[m]
     net.clear()
@@ -80,6 +90,8 @@ func fit_once(source: const RowSource*, rows: usize, p: usize, knots: const f64[
         net.items[r * m + 1] = at_low.items[r].add(turning_low.items[r].multiply_scalar((knots[p + 1] - low) / (f64)p))
         net.items[r * m + m - 1] = at_high.items[r]
         net.items[r * m + m - 2] = at_high.items[r].subtract(turning_high.items[r].multiply_scalar((high - knots[m - 1]) / (f64)p))
+    if held > 2: try led_hold(source, rows, p, knots, way, held, false, net)
+    if held_end > 2: try led_hold(source, rows, p, knots, end_way, held_end, true, net)
     var exact = Growing[Vector3]()
     defer exact.close()
     var matrix = Growing[f64]()
@@ -99,21 +111,21 @@ func fit_once(source: const RowSource*, rows: usize, p: usize, knots: const f64[
             let first = nurbs_basis(knots, (i64)m, (i64)p, t, &values)
             for i in 0..<p + 1:
                 let row = first + i
-                if row < 2 or row >= m - 2: continue
+                if row < held or row >= tail: continue
                 for k in 0..<p + 1:
                     let column = first + k
-                    if column < 2 or column >= m - 2: continue
-                    matrix.items[(row - 2) * unknowns + column - 2] += values[i] * values[k]
+                    if column < held or column >= tail: continue
+                    matrix.items[(row - held) * unknowns + column - held] += values[i] * values[k]
             try source.rows_at(source.context, t, &exact)
             for r in 0..<rows:
                 var target = exact.items[r]
                 for k in 0..<p + 1:
                     let column = first + k
-                    if column < 2 or column >= m - 2: target = target.subtract(net.items[r * m + column].multiply_scalar(values[k]))
+                    if column < held or column >= tail: target = target.subtract(net.items[r * m + column].multiply_scalar(values[k]))
                 for i in 0..<p + 1:
                     let row = first + i
-                    if row < 2 or row >= m - 2: continue
-                    let at = (r * unknowns + row - 2) * 3
+                    if row < held or row >= tail: continue
+                    let at = (r * unknowns + row - held) * 3
                     rhs.items[at] += values[i] * target.x
                     rhs.items[at + 1] += values[i] * target.y
                     rhs.items[at + 2] += values[i] * target.z
@@ -126,8 +138,56 @@ func fit_once(source: const RowSource*, rows: usize, p: usize, knots: const f64[
             for i in 0..<unknowns: column.items[i] = rhs.items[(r * unknowns + i) * 3 + axis]
             cholesky_apply(matrix.items[..<unknowns * unknowns], column.items[..<unknowns], unknowns)
             for i in 0..<unknowns:
-                let q = net.items[r * m + i + 2]
-                net.items[r * m + i + 2] = Vector3(column.items[i] if axis == 0 else q.x, column.items[i] if axis == 1 else q.y, column.items[i] if axis == 2 else q.z)
+                let q = net.items[r * m + i + held]
+                net.items[r * m + i + held] = Vector3(column.items[i] if axis == 0 else q.x, column.items[i] if axis == 1 else q.y, column.items[i] if axis == 2 else q.z)
+
+## The third (and fourth) control points of each row at the low end (the
+## high end when `at_end`) for fit_rows_led: the row's turning along `way`
+## there (its offset along `way` from its end, a quintic through six
+## samples), the control points from the clamped bases' derivatives, each
+## on the line along `way` through the end.
+func led_hold(source: const RowSource*, rows: usize, p: usize, knots: const f64[], way: Vector3, held: usize, at_end: bool, net: Growing[Vector3]*) -> !:
+    let m = knots.length - p - 1
+    let end = knots[m] if at_end else knots[p]
+    # Samples step into the span: backward from the high end.
+    let h = (knots[m] - knots[m - 1] if at_end else knots[p + 1] - knots[p]) * 0.01 * (-1.0 if at_end else 1.0)
+    var samples = Growing[Vector3]()
+    defer samples.close()
+    for j in 0..<(usize)6:
+        var out = Growing[Vector3]()
+        defer out.close()
+        try source.rows_at(source.context, end + h * (f64)j, &out)
+        for q in out.view(): try samples.push(q)
+    var ders: f64[48]
+    _ = basis_jet(knots, (i64)m, (i64)p, end, at_end, &ders)
+    for r in 0..<rows:
+        # The offsets along `way` at the six samples, and their quintic's
+        # derivatives at the end (Newton's forward differences, exact for
+        # it; by t, h signed).
+        var d: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        for j in 0..<(usize)6: d[j] = samples.items[j * rows + r].subtract(samples.items[r]).dot(way)
+        var differences: f64[6] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        for order in 1..<(usize)6:
+            for j in 0..<(usize)6 - order: d[j] = d[j + 1] - d[j]
+            differences[order] = d[0]
+        let first = (differences[1] - differences[2] / 2.0 + differences[3] / 3.0 - differences[4] / 4.0 + differences[5] / 5.0) / h
+        let second = (differences[2] - differences[3] + differences[4] * 11.0 / 12.0 - differences[5] * 5.0 / 6.0) / (h * h)
+        let third = (differences[3] - differences[4] * 1.5 + differences[5] * 7.0 / 4.0) / (h * h * h)
+        let turning: f64[4] = [0.0, first, second, third]
+        # C^(k)(end) = sum over the bases of N_i^(k) P_i, each P_i the end
+        # plus c_i way: the end's own term drops (the bases' derivatives
+        # sum to zero), the rest solved from the end inward.
+        let base = (m - 1) if at_end else 0
+        let start = net.items[r * m + base]
+        for k in 1..<held:
+            var sum = turning[k]
+            for i in 1..<k:
+                let index = (base - i) if at_end else i
+                let slot = (p - i) if at_end else i
+                sum -= ders[k * 12 + slot] * net.items[r * m + index].subtract(start).dot(way)
+            let coefficient = ders[k * 12 + ((p - k) if at_end else k)]
+            if coefficient == 0.0: error(invalid, "a row fit's end has no room for its turning")
+            net.items[r * m + ((base - k) if at_end else k)] = start.add(way.multiply_scalar(sum / coefficient))
 
 ## Marks onto `marked` (by knot index) the spans where a fitted row
 ## strays from its exact place by more than the tolerance; whether any.

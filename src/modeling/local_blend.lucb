@@ -111,6 +111,11 @@ struct Local:
     var patches: PatchCache*?
     ## Fusion's Tangency weight (fillet_section).
     var blend_shape: BlendShape
+    ## Fusion's Setback corner type: three G1 fillets of one kind meet at a
+    ## setback corner, not a ball; three of mixed kinds in a vertex blend.
+    var setback: bool
+    ## Setback corners' least setback (radii), edge shape and fullness.
+    var limits: BlendLimits
     ## Each edge's strip, or -1.
     var strip_of: Growing[i64]
     var strips: Growing[Strip]
@@ -198,6 +203,16 @@ struct Local:
         let c = try self.out.add_carrier(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, index))
         return try self.out.add_edge(ShapeEdge(c, knots[5], knots[knots.length - 6], a, b))
 
+    ## A degree 5 B-spline out edge along `net` (`knots`) from `low` to
+    ## `high` of its parameter, from point `a` to `b` there.
+    func spline_piece(a: i64, b: i64, net: const Vector3[], knots: const f64[], low: f64, high: f64) -> i64!:
+        var weights = Growing[f64]()
+        defer weights.close()
+        try weights.fill(net.length, 1.0)
+        let index = try self.out.store_spline(net, weights.view(), knots, 5, Matrix4())
+        let c = try self.out.add_carrier(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, index))
+        return try self.out.add_edge(ShapeEdge(c, low, high, a, b))
+
     ## A chain of `uses` from point `head` to `tail`; its index.
     func chain(head: i64, tail: i64, uses: const i64[]) -> usize!:
         try self.chains.push(Chain(head, tail, self.store.count, uses.length))
@@ -225,9 +240,10 @@ struct Local:
 ## Edges `chosen` of `w` filleted to `radius` (`continuity`), built
 ## directly; none when the body or the edges are beyond what this builds
 ## (the booleans then do it). `patches` keeps setback patches between
-## radii, when given.
-pub func local_blend(w: const Shape*, chosen: const usize[], radius: f64, continuity: i64, tag: str, patches: PatchCache*? = none, blend_shape: BlendShape = plain_blend, radii: (const f64[])? = none) -> interop.Reference[CadModel]?!:
-    var made = try new_local(w, radius, continuity, patches, blend_shape)
+## radii, when given. With `setback` (Fusion's Setback corner type) corners
+## of three are setback corners, mixed kinds too.
+pub func local_blend(w: const Shape*, chosen: const usize[], radius: f64, continuity: i64, tag: str, patches: PatchCache*? = none, blend_shape: BlendShape = plain_blend, radii: (const f64[])? = none, setback: bool = false, limits: BlendLimits = no_limits) -> interop.Reference[CadModel]?!:
+    var made = try new_local(w, radius, continuity, patches, blend_shape, setback, limits)
     defer made.close()
     let b = &made
     if not try eligible(b, chosen): return none
@@ -264,15 +280,16 @@ pub func local_blend(w: const Shape*, chosen: const usize[], radius: f64, contin
             if failure.code != invalid: error(failure.code, failure.message)
             return none
     for plan in plans.view():
+        # A Y corner is only built here: its own reason stands.
         make_corner(b, &plan, tag) catch failure:
-            if failure.code != invalid: error(failure.code, failure.message)
+            if failure.code != invalid or plan.kind == 5: error(failure.code, failure.message)
             return none
     let result = local_result(b, tag) catch failure:
         if failure.code != invalid: error(failure.code, failure.message)
         return none
     return result
 
-func new_local(w: const Shape*, radius: f64, continuity: i64, patches: PatchCache*?, blend_shape: BlendShape) -> Local!:
+func new_local(w: const Shape*, radius: f64, continuity: i64, patches: PatchCache*?, blend_shape: BlendShape, setback: bool, limits: BlendLimits) -> Local!:
     var out = empty_shape(w.tolerance)
     errdefer out.close()
     for c in w.carriers.view(): try out.carriers.push(c)
@@ -282,7 +299,7 @@ func new_local(w: const Shape*, radius: f64, continuity: i64, patches: PatchCach
     for k in w.spline_knots.view(): try out.spline_knots.push(k)
     for s in w.surfaces.view():
         try out.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
-    var made = Local(w, out, radius, continuity, patches, blend_shape, Growing[i64](), Growing[Strip](), Growing[i64](), Growing[i64](), Growing[i64](),
+    var made = Local(w, out, radius, continuity, patches, blend_shape, setback, limits, Growing[i64](), Growing[Strip](), Growing[i64](), Growing[i64](), Growing[i64](),
                      Growing[Chain](), Growing[i64](), Growing[Link](), Growing[Extra](), Growing[u8]())
     errdefer made.close()
     # Every edge used exactly twice (its faces: faces_of).

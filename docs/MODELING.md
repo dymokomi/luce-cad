@@ -767,12 +767,17 @@ rises at G1, G2 and G3, that 1 is the plain fillet, corners and a cap loop.
 **Setback corners.** Three G2 or G3 fillets meeting at a corner of three flat faces can't be rounded
 by a ball: no sphere is tangent to them, since their sections aren't circles. So each fillet stops
 short of the corner, at its setback (setback.lucb), as Fusion and SolidWorks do. That is a plane
-square to its edge, past where the next fillets' contacts cross on the faces, by half the largest
-contact distance (1.5 r at a square corner).
+square to its edge, past where the next fillets' contacts cross on the faces, by the largest contact
+distance: 2 r at a square corner, Fusion 2705's (probe 14: a 20 cube's corner rounded 4 at G1 and G2,
+and a boss's and an L's mixed corners, all stop 2 r from the corner; it was 1.5 r here before).
 
 The hole left is six-sided. Its sides alternate between the fillets' end sections (A curves) and
 curves on the faces (B curves). A B curve runs between two fillets' contacts, its legs along their
-contact lines, built like the profile. Six quads fill the hole, one at each of its corners, meeting
+contact lines: at G1 Fusion's circle tangent to both (radius r at a square corner, 3 r on a face where
+two inside fillets' contacts cross behind the corner; a conic where the legs differ), a polynomial
+quintic within 2e-5 of it so the quads' rows stay exact; at G2 and G3 the profile, flat at its ends
+(three points along each contact line, as the strip beside it runs, which keeps the patch G2 there:
+Fusion's circles at G2 break it). Six quads fill the hole, one at each of its corners, meeting
 at a center (patch_fit.lucb). Each is a degree 5 B-spline net: one span for G2; for G3, two (a
 curve's half, cut at its middle by knot insertion, keeps two of its three spans).
 - **Outer sides:** exact. Next to an A curve, a quad's first rows are the curve's control points
@@ -797,8 +802,25 @@ their section (`g1_spline`) so their ends are the curves the patch meets. The pa
 homogeneous space (`patch_fit.lucb`): the weights first, as a field of their own under the same
 seam and fairness rows, fixed on the sides and along the sweeps; then the weighted points, a
 plane's rule holding n·X = h·w at each point's weight. The seams' G1 rows hold in every
-homogeneous coordinate, so they hold for the rational quads. One row beyond each side (G1). The
-direct build rounds G1 corners with balls, so G1 setbacks go to the booleans.
+homogeneous coordinate, so they hold for the rational quads. One row beyond each side (G1). Built
+directly (local_corners.lucb, asked by Setback), as are mixed corners under it (below).
+
+**Vertex blends** (Fusion's Setback corner type where blends of both kinds meet: a boss's upright
+with its feet, an L's inside upright with its top edges): the same setback corner, 2 r back, its
+patch meeting some faces from the material's side and some from the air's (no one cone holds it, so
+its points are not checked against one; each quad is turned as the face it touches at the hole's
+corner). Fusion's own (probe 14) is one bicubic fitted over a hexagon (a transfinite patch), fuller
+than our fair fill: its solids (exported as STEP, measured here) take 1817.0823 and 6001.6447 against
+our 1816.933 and 6002.838, and its convex cube corner at G1 and G2 7777.892 and 7816.853 against our
+7763.545 and 7811.634. A fullness of about 1.3 at G1 (all three) and 1.1 at G2 takes ours to them.
+
+**The corner's controls** (Alias's; `corner_shape`, `corner_fullness`; `vertex_blend_tests`):
+- **Edge shape** (Corner Blend's Edge Shape sliders): the G1 face curves as conics of that rho
+  relative to the circle's (0.5 the circle, Fusion's; more runs nearer the crossing, keeping more of
+  the corner);
+- **Fullness** (Ball Corner's Pivot Curve Length Ratio): the patch made once, then again with its
+  center held where its bulge from the hole's curves' middle is scaled by it (1 the fair fill's own;
+  more fuller).
 
 **Too large.** Before any tool, each edge's blend must fit (the way into each face is found a
 quarter of the reach in, clear of where a curved boundary's chart, its chords, strays off the
@@ -862,8 +884,8 @@ loops between curved faces, variable radius):
   cut slanted, the spandrel's area times the length to the plane at its centroid (r (5/6 − π/4) /
   (1 − π/4) below the edge); G2 capped at x = 0 half the whole edge's.
 - **Setbacks** (`setback_ratio`): where fillets meet at a corner each stops at least that many radii
-  from it (by default as far as the corner needs: the contacts' crossing and half a reach, 1.5 r at
-  a square corner), and the corner's setback patch fills the larger gap; G1 corners become setback
+  from it (by default as far as the corner needs: the contacts' crossing and a reach, 2 r at a square
+  corner, Fusion's), and the corner's setback patch fills the larger gap; G1 corners become setback
   corners.
 
 **Overflow**, as Parasolid names it: where a fillet runs off its face over a straight edge
@@ -891,11 +913,26 @@ rounded 5 with Cliff take away the triangle between the edge, the top contact (�
 and the cliff edge less the circle's segment on that chord (1501.45 and 2301.45); the plate's bottom
 side edge rounded 3, its top edge rounded 1.5 rolls onto that round (the polygon of the contacts and
 the side's ends, less the fillet's segment, with the round's), G2 fuller; notch alone refuses it.
-Not yet: cliff-end overflow (a chain's end over a cliff), cliff-edge blends along curved cliffs,
-rolling onto curved faces other than a cylinder along the edge, and concave edges' rolled overflow.
 An inside corner whose wall is lower than its fillet takes the cliff-edge blend too (tangent to the
 floor, through the wall's top edge: a 2 high wall rounded 3 adds the triangle less the segment,
-`overflow_tests`).
+`overflow_tests`). **Inside edges and ends** (Fusion 2705, probe 14 of 2026-10-13, `overflow_tests`):
+- **rolled on, inside**: where that wall's top is rounded (a cylinder tangent to the wall), the
+  ball rolls in the air onto the round instead (`rolled_spill`, now either kind: the circle tangent
+  to the floor and outside the round), Fusion's 1764.688847 and 9 faces (ours 1764.68910);
+- **cliff end**: a foot whose floor drops away in a step ends flush with the step's face, its
+  vertex's third face (the direct build's end corner): Fusion's 1948.9712479 and 1923.2190275 at
+  radii 3 and 1, the strips' own areas;
+- **notch under one end**: where a face narrows below part of the edge (a notch cut beside one end,
+  its edge there straight, parallel and convex), the fillet runs on unchanged and the notch's faces
+  trim it (`notched_end`, the booleans'; a blend that spills is no longer offered to the direct
+  builds): a 20 cube's top edge rounded 4, Fusion's 7761.5377437 and 10 faces (ours 7761.53767);
+- **overlap limit** (Parasolid's; `limit_overlap`): instead of overflowing, one straight edge's
+  fillet runs only along the longest stretch where it fits its faces (sampled, its ends bisected,
+  then moved onto a body vertex within a thousandth of the reach), capped square there: that cube
+  stops where the notch begins, 7830 less 15 of its section (7778.495559).
+Not yet: a chain's cliff end, cliff-edge blends along curved cliffs, rolling onto curved faces other
+than a cylinder along the edge, ledges and cliffs under part of an edge (only the notch trims a
+part).
 
 `blend_shape_tests` checks against closed forms: rho relative 0.5 is the circle (volume and its
 middle (√2 − 1) r in from the edge); rho absolute 0.5 the parabola (r² / 6 per length, its middle
@@ -903,7 +940,7 @@ halfway); a middle radius of the circle's own the circle; G2 depth d puts the mi
 from the chord to the corner, skews 0.3 and 0.7 mirror each other, softness 0.9 is deeper than 0.2,
 each G2 at the faces; a fillet limited to the middle half of an edge takes half the edge's section
 area (G1 and G2) with two caps square to it; setbacks of three radii stop a corner's three G2
-fillets 1.5 from it (0.75 by default).
+fillets 1.5 from it (1 by default).
 
 ### Identify blends and reblend (`blend_find.lucb`)
 
@@ -953,7 +990,9 @@ body's:
   - three, G2 or G3: a setback corner, its six quads;
   - four to eight, G1: a ball where one touches every face (a regular pyramid's apex), its sphere
     patch bounded by N arcs; else, and G2 and G3, a setback corner of 2N quads (a G1 one's rational,
-    its strips' ends the circles' arcs in two halves).
+    its strips' ends the circles' arcs in two halves);
+  - two of different kinds where the third edge stays sharp: a Y corner (above), its torus or swept
+    section.
 
 Every point and curve is made once and shared by the faces that meet there, so the result is
 closed by construction. It is still checked: each edge used twice, once each way, with the new
@@ -961,7 +1000,7 @@ faces turned to agree with the body's.
 
 What it declines falls to the booleans:
 - curved faces at a corner, a vertex of four or more edges not all chosen, chamfers and rims;
-- an inside fillet meeting an outside one;
+- an inside fillet meeting outside ones where three are chosen (two passes, above);
 - a miter that isn't symmetric about its plane. The two strips' sections are one curve only when
   the sharp edge lies in the plane.
 
@@ -1161,7 +1200,13 @@ within 0.01 (`fusion_probe_tests`); G3 closes too.
 - **Inside corners** work the same way, mirrored: the ball rolls in the air, on the faces' planes
   moved out by the radius, and the corner tool adds material around it. A pocket's floor edges meet
   in miters; with its walls' edges too, its corners are balls.
-- **Inside and outside fillets meeting** where three edges meet are made in two passes, ordered by
+- **Inside and outside fillets meeting** where three edges meet, one of a kind (the lone edge) and
+  two of the other (the pair, of one radius), the lone one square to the pair and to their face: built
+  directly as Fusion's rolling ball makes them (`y_blend.lucb`, Y corners below): the lone edge runs on
+  to the pair's face and the pair's section rolls round its end from one strip to the other, a torus
+  at G1 (what the two passes below leave, Fusion's), the section swept at G2 and G3 (Fusion's G2: a
+  boss's upright and feet 1816.998776 as its solid, ours 1816.997967). Under the Setback corner type,
+  a vertex blend (below). Where the direct build declines, two passes by the booleans, ordered by
   OpenCASCADE's pivot rule:
   - One outside edge with two inside ones (a boss's upright on a plate): the outside edge first.
     The inside edges then run around its fillet as a tangent chain, a part torus at the corner.
@@ -1169,10 +1214,40 @@ within 0.01 (`fusion_probe_tests`); G3 closes too.
     edge first. The outside edges then run around it.
 
   The second pass finds its edges by reference on the first pass's result.
+- **An inside and an outside fillet meeting where the third edge stays sharp** (a Y corner,
+  `y_blend.lucb`) are built directly, as Fusion makes them (below).
 - **Anything else** is refused: more than eight edges at a corner, or some of a corner's edges only
   where four or more meet, fillets meeting where the faces
-  aren't flat, inside and outside fillets meeting where only two edges are picked, or orders that
-  conflict along one edge.
+  aren't flat, a Y corner whose edges are not square to each other and to the third face, or
+  orders that conflict along one edge.
+
+**Y corners** (`y_blend.lucb`, the direct build's fifth corner kind). Of the two picked edges, the
+one of the sharp edge's kind (E1: the boss's foot under a sharp foot, the L's top edge beside a
+sharp top edge) runs on to the third face F3 (its strip stopping E2's radius short of F3's plane);
+the other (E2) stops square to its edge where E1's contact on their shared face meets F3, and its
+section rolls round E1's end: a ball between F3 and E1's strip, along E1's section in F3's plane (the
+rim). At G1 that is a torus about E1's ball line, its ring E1's and E2's radii added, its tube E2's
+radius; at G2 and G3 E2's section, in the planes through E1's way and the rim's normal, swept round the
+rim (its rows fitted, `fit_rows_led` holding its start along E2's way, so it meets E2's straight strip
+G2 or G3; its rows beside F3 lie in F3 and those beside E1's strip are the rim moved along E1, so it
+meets both with its own continuity). E1's other face P cuts the corner: a curve on P from where E1's
+contact line stops (the corner touches P there, flat to second order at G2, so the crossings next to it
+are a cubic through it and three further back) to where the corner's contact on F3 meets P, the sharp
+edge shortened to there. Both strips' contacts on their shared face end at one point. Built where E1 is
+square to E2 and to F3 (E2 then a square edge); else refused by name.
+
+**Verified against Fusion 2705** (probes 14 and 15 of 2026-10-13, `y_blend_tests`): a 20 × 4 × 20
+plate with a 6 cube boss, its upright and one foot edge filleted 1 in one feature: Fusion's torus
+(center (4, 3, 12) in its frame, axis along the foot, ring 2, tube 1), 14 faces, the closed form
+1815.952928 (the strips, less the torus's spandrel turned while it stays above the plate:
+∫∫ ρ asin(1/ρ) over it); Fusion's own solid, exported as STEP and measured here, 1815.952915. Fusion's
+reported volume, 1815.9313, is its default accuracy's (its highest gives 1815.9492): its cut is a cubic
+within 0.004 of the torus. Radii 1 and 2 either way (Fusion's tori, closed forms 1819.741298 and
+1812.001117, its solids 1819.741710 and 1812.001098); an L's inside upright and one top edge filleted 2
+(the top edge runs on, the upright rolls round it: 11 faces, 6008.960652 against its solid's
+6008.960639). At G2 Fusion's corner is the same sweep (its cut meeting the plate's edge at 2.219250,
+ours too; its solid 1815.966512, ours 1815.966963); at G1, G2 and G3 every smooth edge but the cut
+(a crease, as Fusion's) measures the fillet's continuity.
 
 Tangent faces meet along these circles, so booleans also cut an edge wherever a vertex lies inside
 it, or wherever an edge lying along it is cut (OpenCASCADE's vertex/edge interference). Without
@@ -2448,10 +2523,11 @@ Roughly in order of usefulness:
    faces (`CadModeling.filleted_sets`: setback corners): two radii meeting in a miter, curved faces
    there, and a second fillet on an edge running into the first's corner (refused); corners of four
    or more edges where only some are rounded or the faces are not flat.
-2. **Variable radius fillets at corners** beyond straight edges between flat faces meeting at a
-   corner of the feature's own radius (`variable_filleted_edges`: a law that changes into the corner,
-   or chains round faces and loops between curved faces at a corner), and full rounds of curved ribs
-   whose ends are not flat through the axis.
+2. **Variable radius fillets at corners** beyond straight edges between flat faces
+   (`variable_filleted_edges`; a law may now end at another radius than the feature's, held flat
+   there, the corner an unequal-radius setback corner): chains round faces and loops between curved
+   faces at a corner, and G2 at a variable strip's joint with its corner (the law's bend along it);
+   full rounds of curved ribs whose ends are not flat through the axis.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
    the loop turns a sharp corner into an end wall that is not a plane square to the edge (Fusion

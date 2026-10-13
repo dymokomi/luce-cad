@@ -30,6 +30,13 @@ struct Setback:
     var distances: f64[8]
     var inside: bool
     var radii: f64[8]
+    ## Fillets of both kinds (a vertex blend): its patch meets faces from
+    ## either side, so no one cone holds it.
+    var mixed: bool
+    ## The curves on the faces' rho relative to the circle's, and the
+    ## patch's bulge scale (BlendLimits.corner_shape, corner_fullness).
+    var edge_shape: f64
+    var fullness: f64
 
 ## A fillet's own end section at a setback corner (a G1 variable edge's
 ## rolled envelope, straight_law_tool): the six control points of edge
@@ -42,13 +49,18 @@ struct GivenSection:
 
 ## An empty setback corner at vertex `v`.
 func empty_setback(v: i64) -> Setback:
-    return Setback(v, 0, [0, 0, 0, 0, 0, 0, 0, 0], [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    return Setback(v, 0, [0, 0, 0, 0, 0, 0, 0, 0], [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, 0.5, 1.0)
 
 ## A setback corner of fillets of `radius` at vertex `v`, where `edges`
 ## (three or more, one per line through it) meet. Each fillet stops past
-## where its neighbors' contacts cross its own on the faces, by half the
-## largest contact distance. That is 1.5 times the radius at a square
-## corner, Fusion's default. `hollow` marks an inside corner. With
+## where its neighbors' contacts cross its own on the faces, by the
+## largest contact distance: twice the radius at a square corner, as
+## Fusion 2705's Setback corners (probe 14: a 20 cube's corner rounded 4,
+## G1 and G2, and a boss's or an L's mixed corner, all stop 2 r from it).
+## Fillets of different radii stop past the crossings by half the largest
+## (Fusion's own there, 6, 7 and 7.5 from a cube's corner rounded 4, 3 and
+## 2, follow no rule found; a whole one leaves our patch outside its
+## corner). `hollow` marks an inside corner. With
 ## `radii` (one per edge of `edges`), each fillet has its own radius.
 func setback_at(w: const Shape*, v: i64, edges: const usize[], radius: f64, hollow: bool, radii: (const f64[])? = none) -> Setback!:
     let n = edges.length
@@ -78,13 +90,17 @@ func setback_at(w: const Shape*, v: i64, edges: const usize[], radius: f64, holl
     let frame = try setback_frame(w, &corner, radius)
     let p = w.points.items[(usize)v]
     var most = 0.0
-    for i in 0..<n: most = math.max(most, frame.reaches[i])
+    var least = 1e300
+    for i in 0..<n:
+        most = math.max(most, frame.reaches[i])
+        least = math.min(least, frame.reaches[i])
+    let beyond = most if most - least <= most * 1e-12 else most * 0.5
     for i in 0..<n:
         let before = (i + n - 1) % n
         let next = (i + 1) % n
         let after = try contacts_cross(p, corner.ways[i], frame.intos[i * 2 + 1], frame.reaches[i], corner.ways[next], frame.intos[next * 2], frame.reaches[next])
         let behind = try contacts_cross(p, corner.ways[before], frame.intos[before * 2 + 1], frame.reaches[before], corner.ways[i], frame.intos[i * 2], frame.reaches[i])
-        corner.distances[i] = math.max(after.subtract(p).dot(corner.ways[i]), behind.subtract(p).dot(corner.ways[i])) + most * 0.5
+        corner.distances[i] = math.max(after.subtract(p).dot(corner.ways[i]), behind.subtract(p).dot(corner.ways[i])) + beyond
     return corner
 
 ## Setback corner `corner` (of four or more edges) set back further, by a
@@ -206,9 +222,12 @@ func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continu
     defer knots.close()
     var sides = Growing[HoleSide]()
     defer sides.close()
-    # G1: the B curves on the faces are G2's sections (any smooth curve
-    # from contact to contact serves); the A curves the circles' arcs.
-    let face_continuity = 2 if continuity == 1 else continuity
+    # The A curves the fillets' sections (G1: the circles' arcs); the B
+    # curves on the faces, G1, Fusion's circles tangent to both contact
+    # lines (Edge shape makes them conics); G2 and G3, the fillet's own
+    # section, flat at its ends: three points along each contact line, as
+    # the strip's rows run beside it, so the patch keeps G2 there (Fusion's
+    # circles would break it).
     for i in 0..<n:
         let next = (i + 1) % n
         let foot = p.add(corner.ways[i].multiply_scalar(corner.distances[i]))
@@ -239,16 +258,92 @@ func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continu
         let foot_next = p.add(corner.ways[next].multiply_scalar(corner.distances[next]))
         let tc = foot_next.add(frame.intos[next * 2].multiply_scalar(frame.reaches[next]))
         knots.clear()
-        try fillet_section(tb, tc, cross, face_continuity, &curves, &knots)
-        while weights.count < curves.count: try weights.push(1.0)
+        if continuity == 1:
+            # Fusion's: the circle tangent to both contact lines (a conic
+            # where they reach the crossing unequally), as a polynomial
+            # quintic within 2e-5 of it, so the quads' rows stay exact.
+            let first = curves.count
+            try round_quintic(tb, tc, cross, &curves, &knots, corner.edge_shape)
+            while weights.count < curves.count: try weights.push(1.0)
+            try middle_knot_twice(&curves, &weights, first, &knots)
+        else:
+            try fillet_section(tb, tc, cross, continuity, &curves, &knots)
+            while weights.count < curves.count: try weights.push(1.0)
         try sides.push(HoleSide(false, face_outward(w, frame.faces[i])))
-    try corner_patch(curves.view(), weights.view(), knots.view(), sides.view(), continuity, quads, quad_weights, quad_knots)
+    try corner_patch(curves.view(), weights.view(), knots.view(), sides.view(), continuity, quads, quad_weights, quad_knots, corner.fullness)
+    if corner.mixed: return
     let slack = radius * 1e-9
     let cone = try corner_cone(w, corner, radius)
     for q in quads.view():
         for i in 0..<n:
             if q.subtract(p).dot(cone[i]) < -slack or q.subtract(p).dot(corner.ways[i]) > corner.distances[i] + slack:
                 error(invalid, "the corner patch would leave its corner: use a rolling ball (G1) there")
+
+## A polynomial quintic Bezier from `ta` to `tb` near the conic tangent to
+## the lines from each to `p` of rho `rho` relative to the circle's (0.5 the
+## circle when they are as long; more nearer `p`), onto `points` and
+## `knots` (one span): its second and fifth points along those lines, the
+## inner two free, fitted by least squares to the conic sampled evenly by
+## length, each sample at its share of the length.
+func round_quintic(ta: Vector3, tb: Vector3, p: Vector3, points: Growing[Vector3]*, knots: Growing[f64]*, rho: f64 = 0.5) -> !:
+    if not (rho > 0.0 and rho < 1.0): error(invalid, "a corner's edge shape is a rho from 0 to 1 (0.5 the circle)")
+    let la = try ta.subtract(p).normalized()
+    let lb = try tb.subtract(p).normalized()
+    let middle = math.sin(math.acos(math.clamp(la.dot(lb), -1.0, 1.0)) * 0.5) * rho / (1.0 - rho)
+    # The conic densely, and its length so far at each sample.
+    let dense: usize = 400
+    var conic = Growing[Vector3]()
+    defer conic.close()
+    var lengths = Growing[f64]()
+    defer lengths.close()
+    for k in 0..<dense + 1:
+        let s = (f64)k / (f64)dense
+        let a = (1.0 - s) * (1.0 - s)
+        let c = 2.0 * s * (1.0 - s) * middle
+        let d = s * s
+        try conic.push(ta.multiply_scalar(a).add(p.multiply_scalar(c)).add(tb.multiply_scalar(d)).multiply_scalar(1.0 / (a + c + d)))
+        try lengths.push(0.0 if k == 0 else lengths.items[k - 1] + conic.items[k].subtract(conic.items[k - 1]).length())
+    let total = lengths.items[dense]
+    if not (total > 0.0): error(invalid, "a corner's face curve has no length")
+    # Unknowns: the second point's and fifth's steps along their lines,
+    # then the third's and fourth's coordinates (8).
+    let ea = p.subtract(ta)
+    let eb = p.subtract(tb)
+    var matrix: f64[64]
+    var rhs: f64[8]
+    for i in 0..<(usize)64: matrix[i] = 0.0
+    for i in 0..<(usize)8: rhs[i] = 0.0
+    let samples: usize = 60
+    var at: usize = 0
+    for k in 1..<samples:
+        let s = (f64)k / (f64)samples
+        let want = s * total
+        while at + 1 < dense and lengths.items[at + 1] < want: at += 1
+        let span = lengths.items[at + 1] - lengths.items[at]
+        let f = (want - lengths.items[at]) / span if span > 0.0 else 0.0
+        let target = conic.items[at].add(conic.items[at + 1].subtract(conic.items[at]).multiply_scalar(f))
+        let u = 1.0 - s
+        let bases: f64[6] = [u * u * u * u * u, 5.0 * s * u * u * u * u, 10.0 * s * s * u * u * u, 10.0 * s * s * s * u * u, 5.0 * s * s * s * s * u, s * s * s * s * s]
+        let rest = target.subtract(ta.multiply_scalar(bases[0] + bases[1])).subtract(tb.multiply_scalar(bases[4] + bases[5]))
+        for axis in 0..<(usize)3:
+            let ra = ea.x if axis == 0 else (ea.y if axis == 1 else ea.z)
+            let rb = eb.x if axis == 0 else (eb.y if axis == 1 else eb.z)
+            var row: f64[8] = [bases[1] * ra, bases[4] * rb, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            row[2 + axis] = bases[2]
+            row[5 + axis] = bases[3]
+            let goal = rest.x if axis == 0 else (rest.y if axis == 1 else rest.z)
+            for i in 0..<(usize)8:
+                rhs[i] += row[i] * goal
+                for j in 0..<(usize)8: matrix[i * 8 + j] += row[i] * row[j]
+    try cholesky_solve(matrix[..<64], rhs[..<8], 8)
+    try points.push(ta)
+    try points.push(ta.add(ea.multiply_scalar(rhs[0])))
+    try points.push(Vector3(rhs[2], rhs[3], rhs[4]))
+    try points.push(Vector3(rhs[5], rhs[6], rhs[7]))
+    try points.push(tb.add(eb.multiply_scalar(rhs[1])))
+    try points.push(tb)
+    for _ in 0..<(usize)6: try knots.push(0.0)
+    for _ in 0..<(usize)6: try knots.push(1.0)
 
 ## Of `given`, the place of edge `e`'s section at corner `v`, or -1.
 func given_section(given: (const GivenSection[])?, v: i64, e: usize) -> i64:

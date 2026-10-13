@@ -24,6 +24,16 @@
 ## rounded 1.5 takes the ball onto that round, touching the top and the
 ## cylinder (the polygon of the contacts and the side's ends, less the
 ## fillet's segment, with the cylinder's); notch alone refuses it.
+## Inside edges and ends (Fusion 2705, probe 14 of 2026-10-13): a wall 2
+## high, its top inner edge rounded 1.5, its foot filleted 3 rolls the ball
+## in the air onto that round (Fusion's 1764.688847, 9 faces: the circle
+## tangent to the floor and to the round, outside it); a wall's foot whose
+## floor drops away in a step ends flush with the step's face (a cliff
+## end: 1948.9712479 and 1923.2190275 at 3 and 1, the strips' own areas);
+## a cube's top edge rounded 4 where its side is notched below one end
+## runs on, the notch's faces trimming it (Fusion's 7761.5377437, 10
+## faces); and with Parasolid's overlap limit instead it stops square
+## where the notch begins (7830 less 15 of its section, 7778.495559).
 from luce_cad.modeling import CadModeling, CadDirect
 from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
@@ -79,7 +89,8 @@ pub func overflow_tests() -> unit!:
     cliff_edges(plate, ledge, top_edge)
     inside_cliff(plate)
     rolled_on(plate, top_edge)
-    print("PASS fillet overflow: a plate 4 thick, its top edge rounded 5 and 4.5, trimmed by its bottom (the side face gone; the volumes to 1e-3); over a cliff onto a ledge, stopped at its plane (to 2e-3); rolling on over a line splitting the side face; cliff-edge blends on the plate and the ledge; rolling on onto a round below the side face")
+    inside_ends(plate)
+    print("PASS fillet overflow: a plate 4 thick, its top edge rounded 5 and 4.5, trimmed by its bottom (the side face gone; the volumes to 1e-3); over a cliff onto a ledge, stopped at its plane (to 2e-3); rolling on over a line splitting the side face; cliff-edge blends on the plate and the ledge; rolling on onto a round below the side face; an inside foot rolling onto its wall's rounded top, ending flush over a step (cliff end), a notch below one end trimming a fillet (Fusion's volumes), and an overlap limit stopping it there")
 
 ## A circle's segment of radius `r` on a chord `chord` long.
 func segment(r: float, chord: float) -> float:
@@ -175,3 +186,36 @@ func inside_cliff(plate: CadModel) -> unit!:
         said = failure.message
         recover body
     assert(said.contains("must be less than"), f"inside corner, no cliff: {said}")
+
+## A body's box `w` by `h` by `d` about `at`, tagged.
+func box_at(w: float, h: float, d: float, at: Vector3, tag: str) -> CadModel!:
+    return CadModeling.moved_body(CadModeling.tagged(CadSolids.box(w, h, d), tag), at)
+
+## Fusion's inside-edge overflow and ends (the file's header).
+func inside_ends(plate: CadModel) -> unit!:
+    let foot = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x + 6.0) < 1e-9 and math.abs(b.x + 6.0) < 1e-9 and math.abs(a.y - 2.0) < 1e-9 and math.abs(b.y - 2.0) < 1e-9
+    let walled = CadModeling.combined(plate, box_at(4.0, 2.0, 20.0, Vector3(-8.0, 3.0, 0.0), "w"), 0)
+    let top = CadModeling.filleted(walled, CadModeling.edge_references(walled, edges_where(walled, func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x + 6.0) < 1e-9 and math.abs(b.x + 6.0) < 1e-9 and math.abs(a.y - 4.0) < 1e-9 and math.abs(b.y - 4.0) < 1e-9)), 1.5, "t", 1)
+    let rolled = CadModeling.filleted(top, CadModeling.edge_references(top, edges_where(top, foot)), 3.0, "f", 1)
+    assert(rolled.face_count() == 9, f"{rolled.face_count()} faces")
+    near(extrapolated(rolled), 1764.688847, 1e-3, "an inside foot rolled onto its wall's round")
+    # The floor dropping 2 in a step at z = 5 beside a wall 6 high.
+    let high = CadModeling.combined(plate, box_at(4.0, 6.0, 20.0, Vector3(-8.0, 5.0, 0.0), "w"), 0)
+    let stepped = CadModeling.combined(high, box_at(16.0, 2.0, 5.0, Vector3(2.0, 1.0, 7.5), "s"), 1)
+    for (r, fusion) in [(3.0, 1948.9712479), (1.0, 1923.2190275)]:
+        let made = CadModeling.filleted(stepped, CadModeling.edge_references(stepped, edges_where(stepped, foot)), r, "f", 1)
+        assert(made.face_count() == 11)
+        near(extrapolated(made), fusion, 1e-3, f"a foot ending over a step, {r}")
+        near(1920.0 + 15.0 * r * r * (1.0 - math.pi / 4.0), fusion, 1e-6, "Fusion's step ends")
+    # A 20 cube's side notched below one end of its top edge.
+    let cube = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "c")
+    let notched = CadModeling.combined(cube, box_at(2.0, 17.0, 5.0, Vector3(9.0, -1.5, 7.5), "n"), 1)
+    let edge = CadModeling.edge_references(notched, edges_where(notched, func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - 10.0) < 1e-9 and math.abs(b.x - 10.0) < 1e-9 and math.abs(a.y - 10.0) < 1e-9 and math.abs(b.y - 10.0) < 1e-9))
+    let trimmed = CadModeling.filleted(notched, edge, 4.0, "f", 1)
+    assert(trimmed.face_count() == 10)
+    near(extrapolated(trimmed), 7761.5377437, 1e-3, "a notch trimming a fillet's end")
+    let limited = CadModeling.filleted(notched, edge, 4.0, "f", 1, overflow = 0, limit_overlap = true)
+    near(extrapolated(limited), 7830.0 - 15.0 * 16.0 * (1.0 - math.pi / 4.0), 1e-3, "an overlap limit")

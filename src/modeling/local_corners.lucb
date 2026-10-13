@@ -11,16 +11,22 @@
 ## - Three, G1 (a ball): each strip stops square to its edge through the
 ##   ball's center, in an arc of the ball, and a sphere patch closes the
 ##   corner, touching each face at one point.
-## - Three, G2 or G3 (a setback): each strip stops at its setback, and the
-##   six quads of the patch (setback.lucb) close the corner; each face
-##   gains the curve between its two fillets' contacts.
+## - Three, G2 or G3, or G1 with Fusion's Setback corner type (a setback):
+##   each strip stops at its setback, and the six quads of the patch
+##   (setback.lucb) close the corner; each face gains the curve between its
+##   two fillets' contacts. Three of mixed kinds under Setback: a vertex
+##   blend, the same patch.
 ## - Four to eight, all chosen: G1, a ball when one touches every face (a
 ##   regular pyramid's apex); else, and G2 and G3, a setback corner of 2N
 ##   quads (a G1 one's rational, about the strips' circles).
-## All three outside, or all inside.
+## - Two of different kinds where the third edge stays sharp (a Y
+##   corner, y_blend.lucb): the one of the sharp edge's kind runs on, the
+##   other's section rolls round its end (a torus at G1); three, one of a
+##   kind: the pair's section rolls round all of the lone one's end.
+## Otherwise all outside, or all inside.
 
 ## A corner's plan: its vertex and kind (1 an end, 2 a miter, 3 a ball, 4
-## a setback), the chosen edges there, a ball's center, a setback's frame,
+## a setback, 5 a Y corner), the chosen edges there, a ball's center, a setback's frame,
 ## a miter's or end's plane (normal, offset).
 struct CornerPlan:
     var vertex: i64
@@ -57,7 +63,15 @@ func plan_corner(b: Local*, v: i64) -> CornerPlan!:
     var convex_count: usize = 0
     for k in 0..<plan.count:
         if b.strips.items[(usize)b.strip_of.items[plan.chosen[k]]].convex: convex_count += 1
-    if convex_count != 0 and convex_count != plan.count: error(invalid, "an inside and an outside fillet meet")
+    let mixed = convex_count != 0 and convex_count != plan.count
+    if mixed:
+        if count != 3: error(invalid, "an inside and an outside fillet meet")
+        if plan.count == 2:
+            try plan_y(b, v, &plan)
+            return plan
+        if not b.setback:
+            try plan_y3(b, v, &plan)
+            return plan
     let p = w.points.items[(usize)v]
     if plan.count == 1:
         # The third face: the one the edge does not lie on.
@@ -97,7 +111,7 @@ func plan_corner(b: Local*, v: i64) -> CornerPlan!:
         radii[k] = b.strips.items[(usize)b.strip_of.items[plan.chosen[k]]].radius
         largest = math.max(largest, radii[k])
         same_radius = same_radius and radii[k] == radii[0]
-    if b.continuity == 1 and same_radius:
+    if b.continuity == 1 and same_radius and not mixed and not (b.setback and plan.count == 3):
         # Three G1 fillets of one radius meet in a ball; four or more where
         # one touches every face (inside, the ball's planes move out into
         # the air). Unequal radii meet at a setback corner.
@@ -117,8 +131,15 @@ func plan_corner(b: Local*, v: i64) -> CornerPlan!:
                 try set_end(b, s, v, along, along.dot(plan.center))
             return plan
     plan.kind = 4
+    # (Mixed kinds: a vertex blend, its patch between faces it meets from
+    # either side.)
     plan.setback = try setback_at(w, v, plan.chosen[..<plan.count], largest, convex_count == 0, radii[..<plan.count])
+    plan.setback.mixed = mixed
+    plan.setback.edge_shape = b.limits.corner_shape
+    plan.setback.fullness = b.limits.corner_fullness
     if plan.count > 3 or not same_radius: try roomy_setback(w, &plan.setback, largest, b.continuity)
+    # Setbacks asked: no fillet stops nearer its corner than that.
+    for i in 0..<plan.count: plan.setback.distances[i] = math.max(plan.setback.distances[i], b.limits.setback * largest)
     for i in 0..<plan.count:
         let s = (usize)b.strip_of.items[plan.setback.edges[i]]
         let way = plan.setback.ways[i]
@@ -142,6 +163,7 @@ func make_corner(b: Local*, plan: const CornerPlan*, tag: str) -> !:
     if plan.kind == 1: try make_end(b, plan)
     elif plan.kind == 2: try make_miter(b, plan)
     elif plan.kind == 3: try make_ball(b, plan, tag)
+    elif plan.kind == 5: try make_y(b, plan, tag)
     else: try make_setback(b, plan, tag)
 
 ## A strip's contacts at its end at `v`, where its plane cuts the contact
@@ -386,28 +408,43 @@ func make_setback(b: Local*, plan: const CornerPlan*, tag: str) -> !:
         b.strips.items[s].sections[end] = (i64)(try b.chain(corners[i * 2], corners[i * 2 + 1], halves[..<2]))
         let along_face: i64[2] = [firsts[i * 2 + 1] + 1, seconds[i * 2 + 1] + 1]
         try b.links.push(Link(v, frame.faces[i], try b.chain(corners[i * 2 + 1], corners[(i * 2 + 2) % sides], along_face[..<2])))
-    # The quads, outward toward the corner's apex at an outside corner
-    # (the material is beyond the patch), away from it inside.
+    # The quads, outward as the face they touch at the hole's corner (each
+    # meets it tangentially there): an outside corner's, an inside one's
+    # and a vertex blend's alike.
     var bu: f64[36]
     var bv: f64[36]
-    spline_basis(knots.view(), 0.75, bu[..<36])
-    spline_basis(knots.view(), 0.75, bv[..<36])
+    spline_basis(knots.view(), 0.05, bu[..<36])
+    spline_basis(knots.view(), 0.05, bv[..<36])
     b.name.clear()
     try corner_name(w, (usize)v, tag, &b.name)
     let name = try b.out.add_name((str)b.name.view())
     for k in 0..<sides:
         let before = (k + sides - 1) % sides
-        var du = Vector3()
-        var dv = Vector3()
-        var at = Vector3()
+        # Homogeneous sums: the rational quad's derivatives at (0.05, 0.05).
+        var su = Vector3()
+        var sv = Vector3()
+        var sp = Vector3()
+        var wu = 0.0
+        var wv = 0.0
+        var wp = 0.0
         for a in 0..<m:
             for b_ in 0..<m:
-                let q = quads.items[k * mm + a * m + b_]
-                du = du.add(q.multiply_scalar(bu[9 + a] * bv[b_]))
-                dv = dv.add(q.multiply_scalar(bu[a] * bv[9 + b_]))
-                at = at.add(q.multiply_scalar(bu[a] * bv[b_]))
+                let weight = quad_weights.items[k * mm + a * m + b_]
+                let q = quads.items[k * mm + a * m + b_].multiply_scalar(weight)
+                su = su.add(q.multiply_scalar(bu[9 + a] * bv[b_]))
+                sv = sv.add(q.multiply_scalar(bu[a] * bv[9 + b_]))
+                sp = sp.add(q.multiply_scalar(bu[a] * bv[b_]))
+                wu += weight * bu[9 + a] * bv[b_]
+                wv += weight * bu[a] * bv[9 + b_]
+                wp += weight * bu[a] * bv[b_]
+        let at = sp.multiply_scalar(1.0 / wp)
+        let du = su.subtract(at.multiply_scalar(wu))
+        let dv = sv.subtract(at.multiply_scalar(wv))
         try b.out.surfaces.push(try Surface(3, Vector3(), Vector3(), Vector3(), 0.0, 0.0, quads.view()[k * mm..<(k + 1) * mm], quad_weights.view()[k * mm..<(k + 1) * mm], knots.view(), knots.view(), (i64)m, (i64)m, 5, 5))
-        let away = du.cross(dv).dot(at.subtract(p)) > 0.0
+        # Hole corner 2i opens fillet i's end section, on face i - 1; 2i + 1
+        # closes it, on face i.
+        let face = frame.faces[(k // 2 + n - 1) % n] if k % 2 == 0 else frame.faces[k // 2]
+        let outward = du.cross(dv).dot(face_outward(w, face)) > 0.0
         let loop: i64[4] = [firsts[k] + 1, seams[k] + 1, -(seams[before] + 1), seconds[before] + 1]
-        try b.extras.push(Extra((i64)b.out.surfaces.count - 1, away == corner.inside, name, b.store.count, 4))
+        try b.extras.push(Extra((i64)b.out.surfaces.count - 1, outward, name, b.store.count, 4))
         for use in loop: try b.store.push(use)
