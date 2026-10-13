@@ -1,0 +1,282 @@
+## Identify blends (Parasolid's PK_FACE_identify_blends): the faces of a
+## body that are constant rolling-ball blends, found from the geometry
+## alone, so an imported body's fillets can be picked, deleted or given
+## another radius (reblend.lucb).
+##
+## - **A strip**: a cylinder (a straight edge's fillet) or a torus (a
+##   rim's), met tangentially along two of its edges by two other faces,
+##   turning less than half a turn between them (a slot's half-round end,
+##   between parallel faces, is a full round, not an edge blend). Its
+##   radius is the cylinder's, the torus's minor radius; it is convex (a
+##   round, material taken away) when its outward normal leaves its axis.
+## - **A corner ball**: a sphere met tangentially on every edge, only by
+##   strips of its own radius.
+##
+## G2 and G3 strips are B-splines with no radius of their own; they are
+## left out.
+
+## A blend face found: its face, radius and kind.
+struct FoundBlend:
+    var face: usize
+    var radius: f64
+    var corner: bool
+    var convex: bool
+
+## The blends of `w` onto `found`, strips first, then the corner balls
+## between them.
+func found_blends(w: const Shape*, found: Growing[FoundBlend]*) -> !:
+    for f in 0..<w.faces.count:
+        if let strip = try blend_strip(w, f): try found.push(strip)
+    for f in 0..<w.faces.count:
+        let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind != surface_sphere: continue
+        if try corner_ball(w, f, found.view()): try found.push(FoundBlend(f, s.radius, true, outward_from(w, f, s.origin)))
+
+## Face `f` as a strip blend (see above), or none.
+func blend_strip(w: const Shape*, f: usize) -> FoundBlend?!:
+    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+    if s.kind != surface_cylinder and s.kind != surface_torus: return none
+    var walls = Growing[usize]()
+    defer walls.close()
+    var normals = Growing[Vector3]()
+    defer normals.close()
+    try tangent_walls(w, f, &walls, &normals)
+    if walls.count != 2: return none
+    # A turn of less than half a circle between the walls.
+    let turn = math.acos(math.clamp(normals.items[0].dot(normals.items[1]), -1.0, 1.0))
+    if turn > math.pi - 1e-6 or turn < 1e-6: return none
+    if s.kind == surface_cylinder: return FoundBlend(f, s.radius, false, outward_from(w, f, s.origin))
+    # A torus's tube center nearest a point of the face.
+    let p = try point_on_face(w, f)
+    let d = p.subtract(s.origin)
+    let ring = try d.subtract(s.z.multiply_scalar(d.dot(s.z))).normalized()
+    return FoundBlend(f, s.angle, false, outward_from(w, f, s.origin.add(ring.multiply_scalar(s.radius))))
+
+## Whether edge `e` runs along strip surface `s`: a line along a
+## cylinder's axis, a circle about a torus's.
+func along_strip(w: const Shape*, e: usize, s: const Surface*) -> bool!:
+    let c = w.carriers.items[(usize)w.edges.items[e].carrier]
+    if s.kind == surface_cylinder: return c.kind == curve_line and c.x.cross(s.z).length() < 1e-9
+    if c.kind != curve_circle: return false
+    return math.abs(math.abs(c.x.cross(c.y).dot(s.z)) - 1.0) < 1e-9
+
+## Whether face `f`'s outward normal leaves `center` (its axis's point
+## beside it): a convex face about it.
+func outward_from(w: const Shape*, f: usize, center: Vector3) -> bool:
+    let p = point_on_face(w, f) catch failure:
+        _ = failure
+        return true
+    let n = w.face_normal(f, p) catch failure:
+        _ = failure
+        return true
+    let d = p.subtract(center)
+    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+    # Square to a cylinder's axis.
+    let radial = d.subtract(s.z.multiply_scalar(d.dot(s.z))) if s.kind == surface_cylinder else d
+    return n.dot(radial) > 0.0
+
+## Whether sphere face `f` is a corner ball: every edge tangent, every
+## neighbor one of the strips `found` of the sphere's radius.
+func corner_ball(w: const Shape*, f: usize, found: const FoundBlend[]) -> bool!:
+    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+    var neighbors = 0
+    for use in w.face_uses(f):
+        let e = edge_index(use)
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0: return false
+        let other = (usize)fb if (usize)fa == f else (usize)fa
+        if other == f: continue
+        if not try tangent_edge(w, e): return false
+        var strip = false
+        for blend in found:
+            if blend.face == other and not blend.corner and math.abs(blend.radius - s.radius) <= w.tolerance * 10.0: strip = true
+        if not strip: return false
+        neighbors += 1
+    return neighbors >= 2
+
+## The tangent neighbors of strip face `f` along its long edges (lines
+## along a cylinder's axis, circles about a torus's) onto `walls`, each
+## once, with the strip's normal at the first edge each meets onto
+## `normals`.
+func tangent_walls(w: const Shape*, f: usize, walls: Growing[usize]*, normals: Growing[Vector3]*) -> !:
+    let s = w.surfaces.items[(usize)w.faces.items[f].surface]
+    for use in w.face_uses(f):
+        let e = edge_index(use)
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0 or fa == fb: continue
+        let other = (usize)fb if (usize)fa == f else (usize)fa
+        if not try along_strip(w, e, &s) or not try tangent_edge(w, e): continue
+        if w.faces.items[other].surface == w.faces.items[f].surface: continue
+        var known = false
+        for wall in walls.view(): known = known or wall == other
+        if known: continue
+        try walls.push(other)
+        try normals.push(try w.face_normal(f, try w.edge_at(e, 0.5)))
+
+## The two walls strip `f` blends, as blend_strip found them.
+func strip_walls(w: const Shape*, f: usize) -> (usize, usize)!:
+    var walls = Growing[usize]()
+    defer walls.close()
+    var normals = Growing[Vector3]()
+    defer normals.close()
+    try tangent_walls(w, f, &walls, &normals)
+    if walls.count != 2: error(invalid, "a blend strip has two walls")
+    return (walls.items[0], walls.items[1])
+
+## The blends of `w` among `faces` (their names; empty: every blend) onto
+## `chosen`, grown to the blends they meet tangentially (a chain and its
+## corner balls go together); an error naming a face that is no blend.
+func chosen_blends(w: const Shape*, found: const FoundBlend[], faces: str, chosen: Growing[usize]*) -> !:
+    chosen.clear()
+    if trimmed(faces) == "":
+        for blend in found: try chosen.push(blend.face)
+    else:
+        var picked = Growing[usize]()
+        defer picked.close()
+        try faces_named(w, faces, &picked)
+        for f in picked.view():
+            if blend_at(found, f) < 0:
+                var buffer: u8[300]
+                let owned = try interop.copy_text(try strings.format(buffer, f"face {w.face_name(f)} is no constant rolling-ball blend (a cylinder, torus or corner ball met tangentially by its walls)"))
+                if let owner = owned.owner: _ = ownership.pool_object(owner)
+                error(invalid, owned.value)
+            try chosen.push(f)
+    var grew = true
+    while grew:
+        grew = false
+        for e in 0..<w.edges.count:
+            let fa = w.sides.items[e * 2]
+            let fb = w.sides.items[e * 2 + 1]
+            if fa < 0 or fb < 0: continue
+            let in_a = face_in(chosen.view(), (usize)fa)
+            if in_a == face_in(chosen.view(), (usize)fb): continue
+            let other = (usize)(fb if in_a else fa)
+            if blend_at(found, other) < 0 or not try tangent_edge(w, e): continue
+            try chosen.push(other)
+            grew = true
+    if chosen.count == 0: error(invalid, "the body has no constant rolling-ball blends")
+
+## Where face `f` is among `found`, or -1.
+func blend_at(found: const FoundBlend[], f: usize) -> i64:
+    for at in 0..<found.length:
+        if found[at].face == f: return (i64)at
+    return -1
+
+func face_in(faces: const usize[], f: usize) -> bool:
+    for g in faces:
+        if g == f: return true
+    return false
+
+## A strip's walls by name (in a reblend's text store: `a` and `b` its
+## ranges) and the radius it is filleted to again.
+struct WallPair:
+    var a_from: usize
+    var a_to: usize
+    var b_from: usize
+    var b_to: usize
+    var size: f64
+
+## Reblend (Parasolid's reblend through PK_FACE_change, Fusion's fillet
+## edited on a body without history): `model`'s blends `faces` (names;
+## empty: every blend) given `radius`, the blends they meet tangentially
+## keeping theirs. The chain is deleted with healing (its walls meeting in
+## sharp edges again) and filleted again, edge by edge at each strip's
+## radius, as one feature's edge sets (fillet_sets.lucb): equal radii meet
+## in balls, others at setback corners. The new faces are named for `tag`.
+func reblended(model: interop.Reference[CadModel], faces: str, radius: f64, tag: str) -> interop.Reference[CadModel]!:
+    if not math.is_finite(radius) or radius <= 0.0: error(invalid, "a blend needs a positive size")
+    var w = try shape_of(model.value())
+    defer w.close()
+    var found = Growing[FoundBlend]()
+    defer found.close()
+    try found_blends(&w, &found)
+    var chosen = Growing[usize]()
+    defer chosen.close()
+    try chosen_blends(&w, found.view(), faces, &chosen)
+    # The strips given the radius: those picked, and those meeting a
+    # picked corner ball.
+    var picked = Growing[usize]()
+    defer picked.close()
+    if trimmed(faces) != "":
+        try faces_named(&w, faces, &picked)
+        let count = picked.count
+        for at in 0..<count:
+            let f = picked.items[at]
+            if not found.items[(usize)blend_at(found.view(), f)].corner: continue
+            for use in w.face_uses(f):
+                let e = edge_index(use)
+                let other = (usize)(w.sides.items[e * 2 + 1] if (usize)w.sides.items[e * 2] == f else w.sides.items[e * 2])
+                if not face_in(picked.view(), other): try picked.push(other)
+    # Each strip's walls (by name) and radius; the faces to delete.
+    var store = Growing[u8]()
+    defer store.close()
+    var walls = Growing[WallPair]()
+    defer walls.close()
+    var names = Growing[u8]()
+    defer names.close()
+    for f in chosen.view():
+        let blend = found.items[(usize)blend_at(found.view(), f)]
+        if names.count > 0: try names.push(59)
+        let name = w.face_name(f)
+        if name == "": error(invalid, "a blend without a name cannot be referred to: name the body's faces first (CadModeling.tagged)")
+        for byte in name.bytes: try names.push(byte)
+        if blend.corner: continue
+        let (fa, fb) = try strip_walls(&w, f)
+        let a_from = store.count
+        for byte in w.face_name(fa).bytes: try store.push(byte)
+        let b_from = store.count
+        for byte in w.face_name(fb).bytes: try store.push(byte)
+        let size = radius if trimmed(faces) == "" or face_in(picked.view(), f) else blend.radius
+        try walls.push(WallPair(a_from, b_from, b_from, store.count, size))
+    let sharp = try CadDirect.deleted_faces(model, (str)names.view())
+    defer sharp.release()
+    # Healing leaves each sharp edge in the pieces the strips' ends cut it
+    # into, which would meet as corners of two edges: joined whole first.
+    var h = try shape_of(sharp.value())
+    defer h.close()
+    try join_straight_pieces(&h)
+    let b = try brep_of(&h)
+    defer b.release()
+    let joined = try CadModel.of_brep(b)
+    defer joined.release()
+    # The sharp edges where each strip's walls meet again, in sets by radius.
+    var radii = Growing[f64]()
+    defer radii.close()
+    for pair in walls.view():
+        var known = false
+        for r in radii.view(): known = known or r == pair.size
+        if not known: try radii.push(pair.size)
+    var sets = Growing[u8]()
+    defer sets.close()
+    var edges = Growing[i64]()
+    defer edges.close()
+    var text = Growing[u8]()
+    defer text.close()
+    for at in 0..<radii.count:
+        edges.clear()
+        for pair in walls.view():
+            if pair.size != radii.items[at]: continue
+            try edges_between(&h, (str)store.view()[pair.a_from..<pair.a_to], (str)store.view()[pair.b_from..<pair.b_to], &edges)
+        try references_of(&h, edges.view(), &text)
+        if at > 0: try sets.push(124)
+        for byte in text.view(): try sets.push(byte)
+    return try filleted_sets(joined.value(), (str)sets.view(), radii.view(), tag, 1, false)
+
+## The edges of `w` between the faces named `a` and `b` onto `out`, each
+## once; an error when there are none (the healing did not join them).
+func edges_between(w: const Shape*, a: str, b: str, out: Growing[i64]*) -> !:
+    var any = false
+    for e in 0..<w.edges.count:
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0: continue
+        let na = w.face_name((usize)fa)
+        let nb = w.face_name((usize)fb)
+        if not ((na == a and nb == b) or (na == b and nb == a)): continue
+        any = true
+        var known = false
+        for k in out.view(): known = known or k == (i64)e
+        if not known: try out.push((i64)e)
+    if not any: error(invalid, "a deleted blend's walls did not meet again in a sharp edge")

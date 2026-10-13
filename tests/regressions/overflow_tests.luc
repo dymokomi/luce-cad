@@ -14,6 +14,16 @@
 ## along a line (two faces in one plane) lets the ball roll on past the
 ## line: rounded 3, 1561.37167 (1600 less 20 r² (1 - π/4)); refused before
 ## (only 2 of the side above the line).
+## Choosing among the behaviours (Parasolid's): with Cliff, the plate's and
+## the ledge's top edge rounded 5 is a cliff-edge blend, its circle tangent
+## to the top and through the side face's bottom edge, the side face gone:
+## the section taken away is the triangle between the edge, the top contact
+## and the cliff edge less the circle's segment on that chord. Rolling on
+## onto a curved tangent face (the study's item 8, smooth): the plate's
+## bottom side edge rounded 3 first leaves 1 of side face; its top edge
+## rounded 1.5 takes the ball onto that round, touching the top and the
+## cylinder (the polygon of the contacts and the side's ends, less the
+## fillet's segment, with the cylinder's); notch alone refuses it.
 from luce_cad.modeling import CadModeling, CadDirect
 from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
@@ -66,4 +76,71 @@ pub func overflow_tests() -> unit!:
     let mesh = rolled.tessellate(64)
     closed(mesh)
     near(volume(mesh) + (volume(mesh) - coarse) / 3.0, 1600.0 - 20.0 * 9.0 * (1.0 - math.pi / 4.0), 1e-3, "split side rounded 3")
-    print("PASS fillet overflow: a plate 4 thick, its top edge rounded 5 and 4.5, trimmed by its bottom (the side face gone; the volumes to 1e-3); over a cliff onto a ledge, stopped at its plane (to 2e-3); rolling on over a line splitting the side face")
+    cliff_edges(plate, ledge, top_edge)
+    rolled_on(plate, top_edge)
+    print("PASS fillet overflow: a plate 4 thick, its top edge rounded 5 and 4.5, trimmed by its bottom (the side face gone; the volumes to 1e-3); over a cliff onto a ledge, stopped at its plane (to 2e-3); rolling on over a line splitting the side face; cliff-edge blends on the plate and the ledge; rolling on onto a round below the side face")
+
+## A circle's segment of radius `r` on a chord `chord` long.
+func segment(r: float, chord: float) -> float:
+    let angle = 2.0 * math.asin(chord / (2.0 * r))
+    return r * r * 0.5 * (angle - math.sin(angle))
+
+## The mesh volume of `made` extrapolated from 32 and 64 divisions, closed.
+func extrapolated(made: CadModel) -> float!:
+    let coarse = volume(made.tessellate(32))
+    let mesh = made.tessellate(64)
+    closed(mesh)
+    return volume(mesh) + (volume(mesh) - coarse) / 3.0
+
+func cliff_edges(plate: CadModel, ledge: CadModel, top_edge: func(Vector3, Vector3) -> bool) -> unit!:
+    # Radius 5 over a side 4 high: the circle tangent to the top at sc from
+    # the edge, through the side's bottom edge.
+    let r = 5.0
+    let sc = math.sqrt(r * r - (4.0 - r) * (4.0 - r))
+    let taken = sc * 4.0 * 0.5 - segment(r, math.sqrt(sc * sc + 16.0))
+    let made = CadModeling.filleted(plate, CadModeling.edge_references(plate, edges_where(plate, top_edge)), r, "f", 1, overflow = 3)
+    assert(made.face_count() == 6, f"cliff: {made.face_count()} faces")
+    near(extrapolated(made), 1600.0 - 20.0 * taken, 1e-3, "plate's cliff-edge blend")
+    let on_ledge = CadModeling.filleted(ledge, CadModeling.edge_references(ledge, edges_where(ledge, top_edge)), r, "f", 1, overflow = 3)
+    near(extrapolated(on_ledge), 2400.0 - 20.0 * taken, 2e-3, "ledge's cliff-edge blend")
+    # G2 takes no cliff-edge blend: said, not silently notched.
+    var said = ""
+    _ = CadModeling.filleted(plate, CadModeling.edge_references(plate, edges_where(plate, top_edge)), r, "f", 2, overflow = 2) catch failure:
+        said = failure.message
+        recover plate
+    assert(said.contains("cliff-edge"), f"G2 cliff: {said}")
+
+func rolled_on(plate: CadModel, top_edge: func(Vector3, Vector3) -> bool) -> unit!:
+    let bottom_edge = func (a: Vector3, b: Vector3) -> bool:
+        return math.abs(a.x - 10.0) < 1e-9 and math.abs(b.x - 10.0) < 1e-9 and math.abs(a.y + 2.0) < 1e-9 and math.abs(b.y + 2.0) < 1e-9
+    let big = 3.0
+    let rounded = CadModeling.filleted(plate, CadModeling.edge_references(plate, edges_where(plate, bottom_edge)), big, "b", 1)
+    let edge = CadModeling.edge_references(rounded, edges_where(rounded, top_edge))
+    # The ball of r at (cx, 2 - r) touches the cylinder about (7, 1) inside.
+    let r = 1.5
+    let cx = 7.0 + math.sqrt((big - r) * (big - r) - (1.0 - r) * (1.0 - r))
+    let k = big / (big - r)
+    let tbx = 7.0 + (cx - 7.0) * k
+    let tby = 1.0 + (2.0 - r - 1.0) * k
+    # The polygon (cx, 2), (10, 2), (10, 1), tb by the shoelace formula.
+    let xs = [cx, 10.0, 10.0, tbx]
+    let ys = [2.0, 2.0, 1.0, tby]
+    var twice = 0.0
+    for i in 0..<4:
+        twice += xs[i] * ys[(i + 1) % 4] - xs[(i + 1) % 4] * ys[i]
+    let polygon = math.abs(twice) * 0.5
+    let fillet_chord = math.sqrt((tbx - cx) * (tbx - cx) + (tby - 2.0) * (tby - 2.0))
+    let round_chord = math.sqrt((tbx - 10.0) * (tbx - 10.0) + (tby - 1.0) * (tby - 1.0))
+    let taken = polygon - segment(r, fillet_chord) + segment(big, round_chord)
+    let made = CadModeling.filleted(rounded, edge, r, "f", 1)
+    let rolled = extrapolated(made)
+    near(rolled, 1600.0 - 20.0 * big * big * (1.0 - math.pi / 4.0) - 20.0 * taken, 1e-3, "rolled on onto the round")
+    # G2 rolls on too, its section following the round's curvature at its
+    # contact: closed, and fuller than the circle's.
+    let g2 = extrapolated(CadModeling.filleted(rounded, edge, r, "f", 2))
+    assert(g2 > rolled + 0.1 and g2 < 1600.0, f"G2 rolled on: {g2} against G1's {rolled}")
+    var said = ""
+    _ = CadModeling.filleted(rounded, edge, r, "f", 1, overflow = 4) catch failure:
+        said = failure.message
+        recover rounded
+    assert(said.contains("must be less than"), f"notch alone: {said}")

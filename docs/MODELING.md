@@ -41,7 +41,8 @@ does today.
 | `variable_filleted(model, reference, positions, radii, tag, smooth, continuity, chain, tangency)` | Fusion's Variable radius: one straight edge between flat faces, a tangent chain round a flat face or a loop between curved faces, radii at positions 0 to 1 along it, smooth or straight between, G1 to G3, under a Tangency weight. |
 | `variable_filleted_edges(model, references, radius, variable, positions, radii, counts, tag, continuity, smooth, tangency)` | Constant fillets of `radius` and, in the same feature, variable radius ones on the `variable` edges (one straight edge between flat faces each, edge k's law the next `counts[k]` points), meeting at setback corners at `radius`; a variable edge reaches `radius` at a corner, its law held flat there. |
 | `filleted_sets(model, sets, radii, tag, continuity, chain)` | Fusion's selection sets in one Fillet: `sets` the sets' edge references apart by `\|`, set k filleted to `radii[k]`; where radii differ at a corner, a setback corner (straight edges between flat faces, built directly; two radii in a miter refused). |
-| `filleted(model, references, radius, tag, continuity, chain, setback, tangency)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`); with `setback`, Fusion's Setback corner type for G1 corners too; `tangency`, Fusion's Tangency weight (0.1 to 2, 1 the default: Tangency weight below). |
+| `filleted(model, references, radius, tag, continuity, chain, setback, tangency, ..., overflow)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`); with `setback`, Fusion's Setback corner type for G1 corners too; `tangency`, Fusion's Tangency weight (0.1 to 2, 1 the default: Tangency weight below); Parasolid's sections, limits, setbacks and overflow behaviours (below). |
+| `identified_blends(model)`, `blend_radius(model, face)` | Parasolid's identify blends: the faces that are constant rolling-ball blends (a cylinder or torus met tangentially by its two walls, turning less than half a turn; the corner balls between them), found from the geometry alone; a blend face's radius (Identify blends below). |
 | `rule_edges(model, rounds, fillets, faces, others)` | Fusion's Rule Fillet (`rules.lucb`): references to the blendable edges a rule takes, convex ones (rounds), concave ones (fillets) or both; with `faces` named, only edges on those faces, and with `others` too, only edges between the two sets. Made again on every cook, the edges follow the body. |
 | `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Every edge Equal distance takes (loops round a flat face, rims, curved faces, inside edges); each distance runs straight from the edge to the chamfer's contact in the plane square to the edge (`chamfers.lucb`). |
 | `edge_references(model, edges)` | References to edges, given by their B-rep numbers (what a viewport pick gives). |
@@ -57,6 +58,7 @@ takes them, several apart by `;`:
 | `offset_faces(model, faces, distance, chain)` | Offset Face, Press Pull on a face: each face moved along its outward normal (a plane moved, a cylinder's, cone's, sphere's or torus's radius changed). With `chain` (the default) the faces meeting them tangentially move too. |
 | `moved_faces(model, faces, by)`, `rotated_faces(model, faces, origin, axis, angle)` | Move Face: translated, or turned about a line. |
 | `replaced_faces(model, faces, target, target_faces, chain)` | Replace Face: the faces (with `chain`, their tangent chain too) on the target faces instead (names apart by `;`; empty: the whole target body). Targets on one surface move the faces onto it, as do targets matching the faces one for one; other targets on several surfaces, faces of a solid or of an open surface body, trim or extend the body to them (`face_replace.lucb`, `face_quilt.lucb`). |
+| `reblended(model, faces, radius, tag)` | Reblend: blends (identified_blends' names; none: all) given `radius`, the blends meeting them keeping theirs: deleted with healing and filleted again as one feature's edge sets (Identify blends below). |
 | `deleted_faces(model, faces)` | Delete with healing: holes and bosses whole, one fillet, chamfer or corner face, between flat faces any number of them at once (a rounded chain and its corners, strips apart), or a band between one face and a ring of faces, curved ones too (a top chain beside rounded uprights). |
 | `split_faces(model, faces, tool, tool_face, tag, extend)`, `split_faces_by_plane(model, faces, origin, normal, tag)` | Fusion's Split Face: the faces split where a face's surface (extended; with `extend` off, the face itself, right across each face) or a plane crosses them; one closed solid with the new edges. The pieces on the surface's outer side (a plane's normal side, the side a tool face faces; outside a curved surface) are named `<tag>/split[<name>]`, the others keep the face's name, so each can be picked apart. |
 | `tangent_chain(model, faces)` | Fusion's Tangent chain: the faces and every face meeting them tangentially, and so on, by name. |
@@ -856,13 +858,31 @@ loops between curved faces, variable radius):
   corners.
 
 **Overflow**, as Parasolid names it: where a fillet runs off its face over a straight edge
-(Too large, below), the default rules are smooth (a face split along a line parallel to the edge,
-both pieces in one plane: the ball rolls on), notch (over a convex edge into a face turning the same
-way: the next face trims the unchanged fillet) and cliff (over a concave edge: the fillet's end is
-covered by the ledge's plane). With `overflow` off none of these: the fillet must fit its faces,
-else the size that does is said (`blend_shape_tests`: a plate 4 thick rounded 5 is refused, "less
-than 4"). Not yet: rolling on onto a curved tangent face, cliff-edge blends along the cliff, and a
-choice among the behaviours themselves.
+(Too large, below), `overflow` says which behaviours it may take, a sum of `overflow_smooth` (1),
+`overflow_cliff` (2) and `overflow_notch` (4), tried in Parasolid's order (`blend_fits.lucb`'s
+`fits_plan`, each side's `Spill`):
+
+- **smooth**: the ball rolls on. Over a line splitting the face (both pieces in one plane) it rolls
+  on in the plane; onto a curved face tangent to the face beyond it (a cylinder along the edge: an
+  earlier round of the face's far edge) it touches that cylinder instead, its section the plane and
+  cylinder's (`ruled_profile`, closed back along the cylinder and the face: `rolled_profile`), at
+  G1, G2 and G3 (the SMLib study's item 8, its curved case);
+- **cliff**: Parasolid's cliff-edge blend, its circle tangent to the other face and through the edge
+  where the face it runs off ends (`cliff_profile`): the face goes, the blend meets the next face
+  along that edge. Circular sections only (a G2 one is refused by name);
+- **notch**: the fillet unchanged, the next face trimming it over a convex edge, or (over a concave
+  edge, a ledge below) the ledge's plane covering its end.
+
+The default is smooth and notch. With none (`overflow` 0) the fillet must fit its faces, else the
+size that does is said (`blend_shape_tests`: a plate 4 thick rounded 5 is refused, "less than 4").
+`overflow_tests` checks the choices against closed forms: the plate 20 × 4 × 20 and the ledge plate
+rounded 5 with Cliff take away the triangle between the edge, the top contact (√(r² − (4 − r)²) in)
+and the cliff edge less the circle's segment on that chord (1501.45 and 2301.45); the plate's bottom
+side edge rounded 3, its top edge rounded 1.5 rolls onto that round (the polygon of the contacts and
+the side's ends, less the fillet's segment, with the round's), G2 fuller; notch alone refuses it.
+Not yet: cliff-end overflow (a chain's end over a cliff), cliff-edge blends along curved cliffs,
+rolling onto curved faces other than a cylinder along the edge, and concave edges' cliff and rolled
+overflows.
 
 `blend_shape_tests` checks against closed forms: rho relative 0.5 is the circle (volume and its
 middle (√2 − 1) r in from the edge); rho absolute 0.5 the parabola (r² / 6 per length, its middle
@@ -871,6 +891,33 @@ from the chord to the corner, skews 0.3 and 0.7 mirror each other, softness 0.9 
 each G2 at the faces; a fillet limited to the middle half of an edge takes half the edge's section
 area (G1 and G2) with two caps square to it; setbacks of three radii stop a corner's three G2
 fillets 1.5 from it (0.75 by default).
+
+### Identify blends and reblend (`blend_find.lucb`)
+
+Parasolid's `PK_FACE_identify_blends` and reblend, for bodies whose fillets have no history (a STEP
+import, an Edit CAD model): `CadModeling.identified_blends` finds the constant rolling-ball blends
+from the geometry alone:
+
+- **a strip**: a cylinder (a straight edge's fillet) or a torus (a rim's) met tangentially along two
+  of its edges (lines along the axis, circles about it) by two other faces, turning less than half a
+  turn between them. A slot's half-round end, between parallel faces, is a full round and is left
+  out, as is a cylinder's side. Its radius is the cylinder's or the torus's tube; convex when its
+  outward normal leaves the axis;
+- **a corner ball**: a sphere met tangentially on every edge, only by strips of its radius.
+
+G2 and G3 strips (B-splines) have no radius of their own and are not found. `CadDirect.reblended`
+gives picked blends another radius: the picked ones and every blend meeting them tangentially (a
+chain and its corners go together; a picked ball brings its strips) are deleted with healing, the
+healed edges' pieces joined whole again (`join_straight_pieces`, now dropping the pieces' unused
+edges and vertices), and each strip's walls filleted again where they meet, the picked at the new
+radius and the others at their own, as one feature's edge sets (`filleted_sets`: equal radii meet in
+balls, others at setback corners). The walls are found by name, so the body's faces need names.
+
+`blend_find_tests`: a 20 cube rounded 2 on every edge has 12 strips and 8 balls of radius 2;
+reblended to 3 it is the cube rounded 3 (Steiner's 6272 + 414π to 2e-3); one strip reblended to 3
+leaves the 17 blends away from it at 2; a corner ball picked takes its three strips to 3 with it; a
+hole's rounded rim is a torus of tube 0.2, reblended to 0.3 the rim rounded 0.3 directly; a slot's
+ends and a pin's side are no blends, and reblending one is refused by name.
 
 ### Direct fillets (`local_blend.lucb`, `local_corners.lucb`)
 

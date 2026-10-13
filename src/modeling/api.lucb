@@ -101,12 +101,14 @@ pub struct CadModeling:
     ## blend runs between them, capped by the planes square to the edge
     ## there. `setback_ratio`: where fillets meet at a corner each stops at
     ## least that many radii from the vertex (Parasolid's setbacks; 0 as
-    ## the corner needs), the corners setback patches. `overflow` false:
-    ## a blend running off its face is refused with the size that fits
-    ## (Parasolid's overflow off), else smooth, notch and cliff by the
-    ## default rules.
+    ## the corner needs), the corners setback patches. `overflow`: the
+    ## overflow behaviours allowed where a blend runs off its face, a sum of
+    ## overflow_smooth (1), overflow_cliff (2) and overflow_notch (4),
+    ## tried in that order (blend_fits.lucb); 0 refuses a blend that does
+    ## not fit its faces with the size that would (Parasolid's overflow
+    ## off). The default is smooth and notch.
     pub static func filleted(model: interop.Reference[CadModel], references: str, radius: f64, tag: str, continuity: i64 = 1, chain: bool = true, setback: bool = false, tangency: f64 = 1.0, conic: i64 = 0, rho: f64 = 0.5, depth: f64 = -1.0, skew: f64 = 0.5, softness: f64 = -1.0,
-                                limit_from: f64 = 0.0, limit_to: f64 = 1.0, setback_ratio: f64 = 0.0, overflow: bool = true) -> interop.Reference[CadModel]!:
+                                limit_from: f64 = 0.0, limit_to: f64 = 1.0, setback_ratio: f64 = 0.0, overflow: i64 = overflow_default) -> interop.Reference[CadModel]!:
         return try blended(model.value(), references, radius, true, tag, continuity, chain, true, 1, setback, BlendShape(tangency, conic, rho, depth, skew, softness), BlendLimits(limit_from, limit_to, setback_ratio, overflow))
 
     ## A fillet of several edge sets, each its own radius (Fusion's
@@ -123,6 +125,39 @@ pub struct CadModeling:
     ## it for each radius (FilletPlan.filleted).
     pub static func fillet_plan(model: interop.Reference[CadModel], references: str, continuity: i64, tag: str, chain: bool = true, tangency: f64 = 1.0, conic: i64 = 0, rho: f64 = 0.5, depth: f64 = -1.0, skew: f64 = 0.5, softness: f64 = -1.0) -> interop.Reference[FilletPlan]!:
         return try fillet_plan_of(model, references, continuity, tag, chain, BlendShape(tangency, conic, rho, depth, skew, softness))
+
+    ## Identify blends (Parasolid's): the names of `model`'s faces that are
+    ## constant rolling-ball blends, apart by `;`: cylinders and tori met
+    ## tangentially by their two walls, and the corner balls between them
+    ## (blend_find.lucb). Found from the geometry alone, an imported body's
+    ## too once its faces are named.
+    pub static func identified_blends(model: interop.Reference[CadModel]) -> interop.Owned[str]!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var found = Growing[FoundBlend]()
+        defer found.close()
+        try found_blends(&w, &found)
+        var out = Growing[u8]()
+        defer out.close()
+        for blend in found.view():
+            if out.count > 0: try out.push(59)
+            for byte in w.face_name(blend.face).bytes: try out.push(byte)
+        return try interop.copy_text((str)out.view())
+
+    ## The radius of `model`'s blend face `face` (identified_blends'); an
+    ## error when the face is no blend.
+    pub static func blend_radius(model: interop.Reference[CadModel], face: str) -> f64!:
+        var w = try shape_of(model.value())
+        defer w.close()
+        var found = Growing[FoundBlend]()
+        defer found.close()
+        try found_blends(&w, &found)
+        var picked = Growing[usize]()
+        defer picked.close()
+        try faces_named(&w, face, &picked)
+        let at = blend_at(found.view(), picked.items[0])
+        if at < 0: error(invalid, "the face is no constant rolling-ball blend")
+        return found.items[(usize)at].radius
 
     ## References to `model`'s edges `edges` (B-rep edge numbers), apart by
     ## `;`: each the names of its two faces and where it is, so a feature

@@ -968,7 +968,12 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   extrapolated, the section integral's 2293.3698 and 2313.1790 (refused before; SMLib fails it,
   status 1001). Rolling onto a
   tangent next face in its plane (a side face split along a line): rounded 3, 1561.37 (1600 less
-  20 r² (1 - π/4)), refused before. Still open: rolling onto a curved tangent face, curved faces.
+  20 r² (1 - π/4)), refused before. Then rolling onto a curved tangent face: the side face ending
+  in a round of its far edge (a cylinder along the edge, tangent to it), the ball touches the other
+  face and that cylinder (the plane/cylinder section, closed back along both): the plate's bottom side
+  edge rounded 3, its top edge rounded 1.5 matches the closed form (G2 too). Parasolid's choice among
+  the behaviours came with it (smooth, cliff, notch; a true cliff-edge blend through the cliff edge:
+  1501.45 for F6 at 5, against notch's 1493.37). Still open: curved faces the edge lies on.
 
 - **9, delete healing (part).** Two G2 strips apart on the rounded box deleted: already healed
   group by group, 7831.675 at 32 divisions (8000 less the other two strips' 7831.675). The inside

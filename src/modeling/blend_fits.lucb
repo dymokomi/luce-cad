@@ -70,18 +70,48 @@ func on_face_surface(w: const Shape*, f: usize, p: Vector3) -> bool!:
     if s.kind == surface_spline: return true
     return surface_distance(s, p) <= w.tolerance * 10.0
 
+## How a blend runs off one of its edge's faces (fits_plan): `how` one of
+## the spill kinds, `off` the face it runs off, `far` that face's edge
+## where it does, `face` the face beyond (a ledge, the curved face it rolls
+## onto; -1 none) and `depth` how far `off` goes in from the edge.
+struct Spill:
+    var how: i64
+    var off: i64
+    var far: i64
+    var face: i64
+    var depth: f64
+
+## Spill kinds. Fits: no overflow. Notch: the tool unchanged, reaching past
+## the face for the next one to trim (over a convex edge). Ledge: notch over
+## a concave edge, the tool stopped at the ledge's plane, which covers the
+## blend's end (cliff_cut). Cliff: Parasolid's cliff-edge blend, its section
+## tangent to the other face and running through the edge where this one
+## ends (cliff_profile). Rolled: smooth onto a curved face tangent to this
+## one, the ball touching it instead (rolled_profile).
+let spill_fits: i64 = 0
+let spill_notch: i64 = 1
+let spill_ledge: i64 = 2
+let spill_cliff: i64 = 3
+let spill_rolled: i64 = 4
+
+let no_spill: Spill = Spill(spill_fits, -1, -1, -1, 0.0)
+
 ## A blend of `size` on edge `e` must reach less far than its faces go
 ## (all the way, a face would vanish): else an error saying so, and the
 ## size it must stay under.
-func check_fits(w: const Shape*, e: usize, size: f64, round: bool, overflow: bool = true) -> !:
-    _ = try fits_plan(w, e, size, round, overflow)
+func check_fits(w: const Shape*, e: usize, size: f64, round: bool, overflow: i64 = overflow_default, continuity: i64 = 1, blend_shape: BlendShape = plain_blend) -> !:
+    _ = try fits_plan(w, e, size, round, overflow, continuity, blend_shape)
 
-## check_fits, and the faces beyond a cliff each side runs over (a
-## concave edge down onto a flat face, `-1` none): the edge's tool must
-## then stop at that face's plane (cliff_cut), or it would carve it.
-## Without `overflow` (Parasolid's overflow off) none of these: the
-## blend must fit its faces.
-func fits_plan(w: const Shape*, e: usize, size: f64, round: bool, overflow: bool = true) -> (i64, i64)!:
+## check_fits, and how the blend runs off each of the edge's two faces
+## (Spill): by the behaviours `overflow` allows, in Parasolid's order
+## (smooth, cliff, notch). A face split along a line lets the ball roll on
+## in its plane (flat_room); a curved face tangent to the face beyond it, a
+## cylinder along the edge, takes the ball instead (rolled_spill); a cliff
+## edge (the face's far edge, straight and parallel) holds the section's
+## end (cliff_spill, circular sections only); notch leaves the blend as it
+## is, the next face trimming it, or a ledge's plane covering its end.
+## Without any (overflow 0) the blend must fit its faces.
+func fits_plan(w: const Shape*, e: usize, size: f64, round: bool, overflow: i64 = overflow_default, continuity: i64 = 1, blend_shape: BlendShape = plain_blend) -> (Spill, Spill)!:
     let (fa, fb) = try edge_faces(w, e)
     # How far the blend reaches along each face: alike between planes (and
     # at rims), each its own between a plane and a cylinder (the
@@ -112,26 +142,48 @@ func fits_plan(w: const Shape*, e: usize, size: f64, round: bool, overflow: bool
     # (cap_blend.lucb, which checks its own room): a straight step across
     # it would leave it.
     # Between two curved faces the ball's own fit says when it is too large.
-    if curved_pair(w, fa, fb): return (-1, -1)
+    if curved_pair(w, fa, fb): return (no_spill, no_spill)
+    let smooth = round and (overflow & overflow_smooth) != 0
+    let notch = round and (overflow & overflow_notch) != 0
+    let cliffs = round and (overflow & overflow_cliff) != 0
     var room_a = reach_a * 2.0 if curved_wall(w, e, fa, fb) else try room(w, e, fa, reach_a * 1.01 + w.tolerance * 100.0, around == (i64)fa)
     var room_b = reach_b * 2.0 if curved_wall(w, e, fb, fa) else try room(w, e, fb, reach_b * 1.01 + w.tolerance * 100.0, around == (i64)fb)
     # A face split along a line goes on in its plane past it.
-    if round and overflow and room_a <= reach_a + w.tolerance * 10.0: room_a = try flat_room(w, e, fa, room_a, reach_a * 1.01 + w.tolerance * 100.0)
-    if round and overflow and room_b <= reach_b + w.tolerance * 10.0: room_b = try flat_room(w, e, fb, room_b, reach_b * 1.01 + w.tolerance * 100.0)
+    if smooth and room_a <= reach_a + w.tolerance * 10.0: room_a = try flat_room(w, e, fa, room_a, reach_a * 1.01 + w.tolerance * 100.0)
+    if smooth and room_b <= reach_b + w.tolerance * 10.0: room_b = try flat_room(w, e, fb, room_b, reach_b * 1.01 + w.tolerance * 100.0)
     let fits_a = room_a > reach_a + w.tolerance * 10.0
     let fits_b = room_b > reach_b + w.tolerance * 10.0
-    if fits_a and fits_b: return (-1, -1)
-    # Running off one face over a convex edge into the next face, which
-    # trims it (the study's rail classification, its same-convexity case:
-    # a plate thinner than the radius): the edge's tool reaches past that
-    # face, outside the body, and the booleans cut it at the next face.
-    # Over a concave edge (a cliff: a ledge below the face) the tool would
-    # reach into the ledge: it stops at the ledge's plane, which then
-    # covers the fillet there (the study's cliff case).
-    let cliff_a = (try cliff(w, e, fa, room_a)) if round and overflow and not fits_a else -1
-    let cliff_b = (try cliff(w, e, fb, room_b)) if round and overflow and not fits_b else -1
-    if round and overflow and (fits_a or cliff_a >= 0 or (try overflows(w, e, fa, room_a))) and (fits_b or cliff_b >= 0 or (try overflows(w, e, fb, room_b))) and (fits_a or fits_b): return (cliff_a, cliff_b)
-    let most = size * math.min(room_a / reach_a, room_b / reach_b)
+    if fits_a and fits_b: return (no_spill, no_spill)
+    # Only one face may be run off: the blend needs the other to rest on.
+    if not fits_a and not fits_b: return try spill_too_large(size, round, math.min(room_a / reach_a, room_b / reach_b))
+    let off = fa if not fits_a else fb
+    let depth = room_a if not fits_a else room_b
+    var spill = no_spill
+    # Smooth: onto a curved face tangent to the one it runs off.
+    if smooth: spill = try rolled_spill(w, e, off, depth, size)
+    # Cliff: tangent to the other face, through the edge where this one ends.
+    if spill.how == spill_fits and cliffs: spill = try cliff_spill(w, e, off, depth, size, continuity, blend_shape)
+    # Notch: running off one face over a convex edge into the next face,
+    # which trims it (the study's rail classification, its same-convexity
+    # case: a plate thinner than the radius): the edge's tool reaches past
+    # that face, outside the body, and the booleans cut it at the next
+    # face. Over a concave edge (a ledge below the face) the tool would
+    # reach into the ledge: it stops at the ledge's plane, which then covers
+    # the fillet there.
+    if spill.how == spill_fits and notch:
+        let (ledge, ledge_edge) = try face_across(w, e, off, depth, beyond_concave)
+        if ledge >= 0: spill = Spill(spill_ledge, (i64)off, (i64)ledge_edge, ledge, depth)
+        elif try overflows(w, e, off, depth): spill = Spill(spill_notch, (i64)off, -1, -1, depth)
+    if spill.how == spill_fits:
+        if cliffs and not (continuity == 1 and blend_shape.plain()) and (try far_edge(w, e, off, depth)) >= 0: error(invalid, "a cliff-edge overflow takes a circular (G1) fillet: turn Cliff off or use G1")
+        return try spill_too_large(size, round, depth / (reach_a if not fits_a else reach_b))
+    if not fits_a: return (spill, no_spill)
+    return (no_spill, spill)
+
+## The error for a blend of `size` too large for its faces: it must be
+## under `share` of it.
+func spill_too_large(size: f64, round: bool, share: f64) -> (Spill, Spill)!:
+    let most = size * share
     var buffer: u8[256]
     let text = try strings.format(buffer, f"a fillet radius of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}") if round else try strings.format(buffer, f"a chamfer of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}")
     let owned = try interop.copy_text(text)
@@ -157,12 +209,6 @@ func rounded_text(value: f64) -> f64:
 func overflows(w: const Shape*, e: usize, f: usize, depth: f64) -> bool!:
     return (try face_beyond(w, e, f, depth, beyond_convex)) >= 0
 
-## The flat face beyond a cliff a fillet on straight edge `e` between flat
-## faces runs over off flat face `f` (`depth` in from the edge): a straight
-## concave edge parallel to `e`, the face beyond it flat; else -1.
-func cliff(w: const Shape*, e: usize, f: usize, depth: f64) -> i64!:
-    return try face_beyond(w, e, f, depth, beyond_concave)
-
 ## Edges face_beyond looks for: convex, concave, or flat (the faces each
 ## side in one plane: a face split along a line).
 let beyond_convex: i64 = 0
@@ -177,10 +223,25 @@ func face_beyond(w: const Shape*, e: usize, f: usize, depth: f64, kind: i64) -> 
     return next
 
 func face_across(w: const Shape*, e: usize, f: usize, depth: f64, kind: i64) -> (i64, usize)!:
-    let edge = w.edges.items[e]
-    if w.carriers.items[(usize)edge.carrier].kind != curve_line: return (-1, 0)
-    if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: return (-1, 0)
     if kind != beyond_flat and not try convex(w, e): return (-1, 0)
+    let found = try far_edge(w, e, f, depth)
+    if found < 0: return (-1, 0)
+    let far = (usize)found
+    let (ga, gb) = try edge_faces(w, far)
+    let next = gb if ga == f else ga
+    if w.surfaces.items[(usize)w.faces.items[next].surface].kind != surface_plane: return (-1, 0)
+    let flat = face_outward(w, next).dot(face_outward(w, f)) > 1.0 - 1e-9
+    if kind == beyond_flat: return ((i64)next, far) if flat else (-1, 0)
+    if flat or (try convex(w, far)) != (kind == beyond_convex): return (-1, 0)
+    return ((i64)next, far)
+
+## Of straight edge `e` and flat face `f` beside it, the straight edge of
+## `f` parallel to `e` where a step `depth` into `f` square to `e` leaves
+## the face; -1 when it leaves elsewhere.
+func far_edge(w: const Shape*, e: usize, f: usize, depth: f64) -> i64!:
+    let edge = w.edges.items[e]
+    if w.carriers.items[(usize)edge.carrier].kind != curve_line: return -1
+    if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: return -1
     let along = try along_edge(w, e)
     let p = try w.edge_at(e, 0.5)
     let side = try into_face(w, f, e, along)
@@ -197,17 +258,90 @@ func face_across(w: const Shape*, e: usize, f: usize, depth: f64, kind: i64) -> 
         if d < gap:
             gap = d
             nearest = (i64)k
-    if nearest < 0 or gap > w.tolerance * 1000.0 + depth * 1e-6: return (-1, 0)
+    if nearest < 0 or gap > w.tolerance * 1000.0 + depth * 1e-6: return -1
     let far = (usize)nearest
-    if w.carriers.items[(usize)w.edges.items[far].carrier].kind != curve_line: return (-1, 0)
-    if math.abs((try along_edge(w, far)).dot(along)) < 1.0 - 1e-9: return (-1, 0)
+    if w.carriers.items[(usize)w.edges.items[far].carrier].kind != curve_line: return -1
+    if math.abs((try along_edge(w, far)).dot(along)) < 1.0 - 1e-9: return -1
+    return nearest
+
+## Smooth overflow onto a curved face: where face `off` (flat, `depth` in
+## from straight convex edge `e` between flat faces) ends in a straight
+## edge parallel to `e` with a cylinder about a parallel axis beyond it,
+## tangent to `off` there (an earlier round of the face's far edge), the
+## ball touching the edge's other face and that cylinder (ruled_contacts),
+## when its contacts lie on both faces.
+func rolled_spill(w: const Shape*, e: usize, off: usize, depth: f64, size: f64) -> Spill!:
+    let (fa, fb) = try edge_faces(w, e)
+    if not flat_pair(w, fa, fb) or not try convex(w, e): return no_spill
+    let found = try far_edge(w, e, off, depth)
+    if found < 0: return no_spill
+    let far = (usize)found
     let (ga, gb) = try edge_faces(w, far)
-    let next = gb if ga == f else ga
-    if w.surfaces.items[(usize)w.faces.items[next].surface].kind != surface_plane: return (-1, 0)
-    let flat = face_outward(w, next).dot(face_outward(w, f)) > 1.0 - 1e-9
-    if kind == beyond_flat: return ((i64)next, far) if flat else (-1, 0)
-    if flat or (try convex(w, far)) != (kind == beyond_convex): return (-1, 0)
-    return ((i64)next, far)
+    let next = gb if ga == off else ga
+    let s = w.surfaces.items[(usize)w.faces.items[next].surface]
+    let along = try along_edge(w, e)
+    if s.kind != surface_cylinder or s.z.cross(along).length() > 1e-9: return no_spill
+    # Tangent to `off` along the far edge: the plane at the radius from the
+    # axis, the cylinder's normal there the plane's.
+    let m = try w.edge_at(far, 0.5)
+    if math.abs((try w.face_normal(next, m)).dot(face_outward(w, off)) - 1.0) > 1e-6: return no_spill
+    let rest = fb if off == fa else fa
+    let p = try w.edge_at(e, 0.5)
+    let (ta, tb, _) = ruled_contacts(w, rest, next, p, try into_face(w, rest, e, along), Vector3(), size, true, true, size) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        recover (Vector3(), Vector3(1e300, 0.0, 0.0), Vector3())
+    if tb.x > 1e299: return no_spill
+    if not try rests_on(w, e, rest, ta.subtract(p).length()): return no_spill
+    if try face_contains(w, next, tb, w.tolerance) == outside: return no_spill
+    return Spill(spill_rolled, (i64)off, found, (i64)next, depth)
+
+## Cliff overflow: where face `off` (flat, `depth` in from straight convex
+## edge `e` between flat faces) ends in a straight edge parallel to `e`,
+## Parasolid's cliff-edge blend, its circle tangent to the other face and
+## through that edge (cliff_circle), when it touches the other face on it.
+## Circular sections only.
+func cliff_spill(w: const Shape*, e: usize, off: usize, depth: f64, size: f64, continuity: i64, blend_shape: BlendShape) -> Spill!:
+    if continuity != 1 or not blend_shape.plain(): return no_spill
+    let (fa, fb) = try edge_faces(w, e)
+    if not flat_pair(w, fa, fb) or not try convex(w, e): return no_spill
+    let found = try far_edge(w, e, off, depth)
+    if found < 0: return no_spill
+    let spill = Spill(spill_cliff, (i64)off, found, -1, depth)
+    let p = try w.edge_at(e, 0.5)
+    let (ta, _, _) = cliff_circle(w, e, &spill, p, size) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        recover (Vector3(1e300, 0.0, 0.0), Vector3(), Vector3())
+    if ta.x > 1e299: return no_spill
+    let rest = fb if off == fa else fa
+    if not try rests_on(w, e, rest, ta.subtract(p).length()): return no_spill
+    return spill
+
+## Whether flat face `f` beside edge `e` goes on past `reach` in from it.
+func rests_on(w: const Shape*, e: usize, f: usize, reach: f64) -> bool!:
+    return (try room(w, e, f, reach * 1.01 + w.tolerance * 100.0)) > reach + w.tolerance * 10.0
+
+## A cliff-edge blend's circle at edge point `p` (spill `spill`): its
+## contact on the other face, its end on the cliff edge and its center; an
+## error when no circle of radius `size` tangent to that face passes
+## through the cliff edge on the corner's side.
+func cliff_circle(w: const Shape*, e: usize, spill: const Spill*, p: Vector3, size: f64) -> (Vector3, Vector3, Vector3)!:
+    let (fa, fb) = try edge_faces(w, e)
+    let rest = fb if (usize)spill.off == fa else fa
+    let along = try along_edge(w, e)
+    let ua = try into_face(w, rest, e, along)
+    # The cliff edge's point in p's section plane.
+    let on = try w.edge_at((usize)spill.far, 0.0)
+    let q = on.subtract(along.multiply_scalar(on.subtract(p).dot(along)))
+    let d = q.subtract(p)
+    let qs = d.dot(ua)
+    let lateral = d.subtract(ua.multiply_scalar(qs))
+    let qt = lateral.length()
+    if qt <= w.tolerance or qt >= 2.0 * size: error(invalid, "a cliff-edge blend's cliff is farther from its other face than the fillet's diameter")
+    let na = lateral.multiply_scalar(1.0 / qt)
+    let sc = qs + math.sqrt(size * size - (qt - size) * (qt - size))
+    if sc <= w.tolerance: error(invalid, "a cliff-edge blend's circle touches its other face behind the edge")
+    let center = p.add(ua.multiply_scalar(sc)).add(na.multiply_scalar(size))
+    return (p.add(ua.multiply_scalar(sc)), q, center)
 
 ## How far a fillet on edge `e` can step into flat face `f` (`first`, short
 ## of `reach`) and on into the faces beyond it in its plane, across

@@ -10,8 +10,12 @@
 ## the corner profile between two planes, or between a plane and a
 ## cylinder along the edge (ruled_profile). A chamfer reaches `other` along
 ## the edge's second face when it is positive (chamfers.lucb's two-sided
-## ones), else `size` like the first.
-func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, round: bool, continuity: i64, other: f64 = -1.0, blend_shape: BlendShape = plain_blend) -> Profiles!:
+## ones), else `size` like the first. A fillet running off a face
+## (`spill`, blend_fits.lucb) rolls onto the curved face beyond it, or ends
+## on the cliff edge.
+func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, round: bool, continuity: i64, other: f64 = -1.0, blend_shape: BlendShape = plain_blend, spill: Spill = no_spill) -> Profiles!:
+    if spill.how == spill_rolled: return try rolled_profile(w, e, p, along, size, continuity, blend_shape, &spill)
+    if spill.how == spill_cliff: return try cliff_profile(w, e, p, along, size, &spill)
     let (fa, fb) = try edge_faces(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
@@ -37,8 +41,10 @@ func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size
 ## Tangency weight the conic on that corner (arc_section: Fusion's, its
 ## circle at weight 1). Each touches the cylinder only tangentially; the
 ## booleans meet the swept section with the cylinder along it in closed
-## form (splines.lucb's along_sweep).
-func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool, other: f64, continuity: i64 = 1, blend_shape: BlendShape = plain_blend) -> Profiles!:
+## form (splines.lucb's along_sweep). With `rim` (a ball rolled on onto a
+## cylinder beyond the edge's face, rolled_profile) the region closes back
+## along the cylinder only to that point, then straight to `p`.
+func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool, other: f64, continuity: i64 = 1, blend_shape: BlendShape = plain_blend, rim: Vector3? = none) -> Profiles!:
     let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
     let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
     let radius = s.radius
@@ -68,8 +74,44 @@ func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, a
     else:
         try profile.edges.push(line_edge(ta, tb))
     let back = tb.subtract(axis_point)
-    let home = p.subtract(axis_point)
-    try profile.edges.push(ProfileEdge(1, tb, p, axis_point, radius, math.atan2(along.dot(back.cross(home)), back.dot(home)), -1))
+    let turn_end = rim else p
+    let home = turn_end.subtract(axis_point)
+    try profile.edges.push(ProfileEdge(1, tb, turn_end, axis_point, radius, math.atan2(along.dot(back.cross(home)), back.dot(home)), -1))
+    if rim != none: try profile.edges.push(line_edge(turn_end, p))
+    try profile.loop_offsets.push(profile.edges.count)
+    try single_region(&profile)
+    return profile
+
+## The section of a fillet on straight edge `e` between flat faces whose
+## ball rolls on off one face onto the cylinder beyond it (`spill`,
+## blend_fits.lucb's rolled_spill), at edge point `p`: ruled_profile between
+## the other face and that cylinder, closed back along the cylinder to
+## where the face meets it and along the face to the edge.
+func rolled_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, continuity: i64, blend_shape: BlendShape, spill: const Spill*) -> Profiles!:
+    let (fa, fb) = try edge_faces(w, e)
+    let rest = fb if (usize)spill.off == fa else fa
+    let start = try w.edge_at((usize)spill.far, 0.0)
+    let rim = start.subtract(along.multiply_scalar(start.subtract(p).dot(along)))
+    return try ruled_profile(w, rest, (usize)spill.face, p, along, try into_face(w, rest, e, along), Vector3(), size, true, true, size, continuity, blend_shape, rim)
+
+## The section of a cliff-edge blend on straight edge `e` (`spill`,
+## blend_fits.lucb's cliff_spill) at edge point `p`: from the edge along the
+## other face to the circle's contact, round the circle to the cliff edge,
+## and back along the face run off.
+func cliff_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, spill: const Spill*) -> Profiles!:
+    let (ta, q, center) = try cliff_circle(w, e, spill, p, size)
+    let (fa, fb) = try edge_faces(w, e)
+    let rest = fb if (usize)spill.off == fa else fa
+    let ua = try into_face(w, rest, e, along)
+    var profile = Profiles(p, along, ua, along.cross(ua), Growing[ProfileEdge](), Growing[usize](), Growing[usize](), Growing[usize](),
+                           Growing[ProfileSpline](), Growing[Vector3](), Growing[f64](), Growing[f64]())
+    errdefer profile.close()
+    try profile.loop_offsets.push(0)
+    try profile.edges.push(line_edge(p, ta))
+    let leaving = ta.subtract(center)
+    let arriving = q.subtract(center)
+    try profile.edges.push(ProfileEdge(1, ta, q, center, size, math.atan2(along.dot(leaving.cross(arriving)), leaving.dot(arriving)), -1))
+    try profile.edges.push(line_edge(q, p))
     try profile.loop_offsets.push(profile.edges.count)
     try single_region(&profile)
     return profile
@@ -138,7 +180,7 @@ func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, 
 ## An end marked exact (where a corner ball takes over) stops right there.
 ## Its blend face is named `name`. A two-sided chamfer reaches `other`
 ## along the second face (section_profile).
-func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str, other: f64 = -1.0, blend_shape: BlendShape = plain_blend) -> interop.Reference[CadModel]!:
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str, other: f64 = -1.0, blend_shape: BlendShape = plain_blend, spill: Spill = no_spill) -> interop.Reference[CadModel]!:
     if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_circle: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name, other, blend_shape)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
@@ -151,7 +193,7 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i6
     let extent = math.max(length, size) * 4.0
     let before = 0.0 if exact_start or try body.inside(w, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
     let after = 0.0 if exact_end or try body.inside(w, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
-    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity, other, blend_shape)
+    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity, other, blend_shape, spill)
     defer profile.close()
     let solid = try BrepModel.sized(length + margin * 2.0)
     defer solid.release()

@@ -1,0 +1,121 @@
+## Identify blends and reblend (Parasolid's PK_FACE_identify_blends and
+## reblend, Stage 8): the constant rolling-ball blends found from the
+## geometry alone, then given another radius.
+##   A 20 cube rounded 2 on every edge: its 12 cylinders and 8 corner balls,
+##   each of radius 2; reblended to 3, the cube rounded 3, Steiner's
+##   (20 - 2r)³ + 6 r (20 - 2r)² + 3π r² (20 - 2r) + 4/3 π r³ = 6272 + 414π.
+##   One of its strips reblended to 3: that strip found at 3, the rest at 2,
+##   its two corners setbacks between radii.
+##   A plate's hole rounded 0.2 at its rim: the torus found, its tube 0.2,
+##   concave toward the hole's air; reblended to 0.3, the hole rounded 0.3.
+##   Faces that are no blends are not found: a slot's half-round end
+##   (between parallel faces) and a cylinder's side; picking one to
+##   reblend is refused by name.
+from luce_cad.modeling import CadModeling, CadDirect
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+pub func blend_find_tests() -> unit!:
+    rounded_cube()
+    one_strip()
+    hole_rim()
+    no_blends()
+    print("PASS identify blends: a cube's 12 strips and 8 balls at radius 2, reblended to 3 the cube rounded 3 (Steiner's volume); one strip reblended, the rest kept; a hole's rim torus found and reblended; a slot's end and a cylinder's side not blends, refused by name")
+
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> str!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return CadModeling.edge_references(model, found)
+
+func extrapolated(made: CadModel) -> float!:
+    let coarse = volume(made.tessellate(32))
+    let mesh = made.tessellate(64)
+    closed(mesh)
+    return volume(mesh) + (volume(mesh) - coarse) / 3.0
+
+func names(text: str) -> list[str]:
+    let found: list[str] = []
+    for part in text.split(";"):
+        if part.trim() != "":
+            found.append(part.trim())
+    return found
+
+func rounded_cube() -> unit!:
+    let cube = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "c")
+    let rounded = CadModeling.filleted(cube, "", 2.0, "f", 1)
+    let found = names(CadModeling.identified_blends(rounded))
+    assert(found.length == 20, f"{found.length} blends found")
+    for name in found:
+        assert(math.abs(CadModeling.blend_radius(rounded, name) - 2.0) < 1e-9)
+    let again = CadDirect.reblended(rounded, "", 3.0, "g")
+    let v = extrapolated(again)
+    assert(math.abs(v - (6272.0 + 414.0 * math.pi)) < 2e-3, f"reblended cube: {v}")
+    assert(names(CadModeling.identified_blends(again)).length == 20)
+
+func one_strip() -> unit!:
+    let cube = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "c")
+    let rounded = CadModeling.filleted(cube, "", 2.0, "f", 1)
+    # The strip along the top front edge (y 10, z 10).
+    var picked = ""
+    for name in names(CadModeling.identified_blends(rounded)):
+        let at = CadModeling.face_point(rounded, name)
+        if at.found and at.normal.y > 0.5 and at.normal.z > 0.5 and math.abs(at.normal.x) < 0.1: picked = name
+    assert(picked != "")
+    let made = CadDirect.reblended(rounded, picked, 3.0, "g")
+    closed(made.tessellate(16))
+    var threes = 0
+    var twos = 0
+    for name in names(CadModeling.identified_blends(made)):
+        let r = CadModeling.blend_radius(made, name)
+        if math.abs(r - 3.0) < 1e-9: threes += 1
+        elif math.abs(r - 2.0) < 1e-9: twos += 1
+    # The new strip at 3; the eleven others and the six balls away from it
+    # at 2 (its two corners setbacks now).
+    assert(threes == 1 and twos == 17, f"{threes} at 3, {twos} at 2")
+    # A corner ball picked: its three strips take the radius, the corner a
+    # ball of it again.
+    var ball = ""
+    for name in names(CadModeling.identified_blends(rounded)):
+        let at = CadModeling.face_point(rounded, name)
+        if at.found and at.normal.x > 0.5 and at.normal.y > 0.5 and at.normal.z > 0.5: ball = name
+    let cornered = CadDirect.reblended(rounded, ball, 3.0, "g")
+    threes = 0
+    for name in names(CadModeling.identified_blends(cornered)):
+        if math.abs(CadModeling.blend_radius(cornered, name) - 3.0) < 1e-9: threes += 1
+    assert(threes == 4, f"a ball reblended: {threes} at 3")
+
+func hole_rim() -> unit!:
+    let plate = CadModeling.tagged(CadSolids.box(4.0, 1.0, 4.0), "plate")
+    let drilled = CadModeling.combined(plate, CadModeling.tagged(CadSolids.cylinder(0.5, 3.0), "hole"), 1)
+    let rim = edges_where(drilled, func (a: Vector3, b: Vector3) -> bool: return math.abs(a.y - 0.5) < 1e-6 and math.abs(b.y - 0.5) < 1e-6 and a.length() < 1.0)
+    let rounded = CadModeling.filleted(drilled, rim, 0.2, "f")
+    let found = names(CadModeling.identified_blends(rounded))
+    assert(found.length == 1, f"{found.length} blends at the rim")
+    assert(math.abs(CadModeling.blend_radius(rounded, found[0]) - 0.2) < 1e-9)
+    let again = CadDirect.reblended(rounded, found[0], 0.3, "g")
+    let expected = volume(CadModeling.filleted(drilled, rim, 0.3, "f").tessellate(32))
+    let v = volume(again.tessellate(32))
+    assert(math.abs(v - expected) < 1e-6, f"reblended rim: {v} against {expected}")
+
+func no_blends() -> unit!:
+    # A slot: a box with half-round ends (cylinders between its parallel
+    # sides), and a plain cylinder.
+    let middle = CadModeling.tagged(CadSolids.box(10.0, 2.0, 4.0), "m")
+    let ends = CadModeling.combined(CadModeling.tagged(CadSolids.cylinder(2.0, 2.0), "a").transformed(Vector3(5.0, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)),
+                                    CadModeling.tagged(CadSolids.cylinder(2.0, 2.0), "b").transformed(Vector3(-5.0, 0.0, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)), 0)
+    let slot = CadModeling.combined(middle, ends, 0)
+    assert(CadModeling.identified_blends(slot) == "", "a slot's ends are no edge blends")
+    let pin = CadModeling.tagged(CadSolids.cylinder(1.0, 3.0), "p")
+    assert(CadModeling.identified_blends(pin) == "")
+    var said = ""
+    _ = CadDirect.reblended(pin, CadModeling.face_name_of(pin, 0), 1.0, "g") catch failure:
+        said = failure.message
+        recover pin
+    assert(said.contains("no constant rolling-ball blend"), said)
