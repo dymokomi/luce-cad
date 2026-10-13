@@ -940,8 +940,12 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   edge between planes that runs off one face over a parallel convex edge into a flat face is trimmed
   by that face, its tool reaching past the body for the booleans to cut. F6 (a plate 4 thick, its
   top edge 5) now runs: 6 faces, closed, 1493.36981 against the section integral's 1493.36981 (and
-  4.5: 1513.17902); SMLib fails it. A cliff (a concave edge beyond) is still refused. Regression:
-  `overflow_tests`. Still open: rolling onto a tangent next face, the cliff's cover, curved faces.
+  4.5: 1513.17902); SMLib fails it. Regression: `overflow_tests`. Then the cliff: over a concave
+  edge the tool reached into the ledge below; it is now cut back to the ledge's plane, which covers
+  the fillet's end. A plate on a ledge (2400) rounded 5 and 4.5: 2293.3706 and 2313.1775
+  extrapolated, the section integral's 2293.3698 and 2313.1790 (refused before). Rolling onto a
+  tangent next face in its plane (a side face split along a line): rounded 3, 1561.37 (1600 less
+  20 r² (1 - π/4)), refused before. Still open: rolling onto a curved tangent face, curved faces.
 
 - **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
   plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was

@@ -795,8 +795,11 @@ on a straight edge between flat faces that runs off one face over a straight con
 it, into a flat face that turns the same way (a plate thinner than the radius). That face trims the
 fillet (the study's rail classification, its same-convexity case): the edge's tool reaches past the
 face, outside the body, and the booleans cut it there, so the face it runs off goes and the round
-meets the next face at an angle. Rolling on onto a tangent next face (Parasolid's overflow) and
-covering a cliff (a concave edge beyond) are not done: refused as above.
+meets the next face at an angle. Over a cliff (a straight concave edge parallel to it, a ledge
+beyond) the tool would carve the ledge: it is cut back to the ledge's plane (`cliff_cut`), which
+then covers the fillet's end. A face split along a straight line parallel to the edge, the faces
+each side in one plane, lets the ball roll on past the line (`flat_room`). Rolling on onto a curved
+tangent next face is not done: refused as above.
 
 **Tangent chains.** Like Fusion's Tangent Chain, a referenced edge brings the edges that continue
 it tangentially with the same convexity, such as a rounded slot's rim or the edges around an

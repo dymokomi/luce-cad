@@ -74,6 +74,12 @@ func on_face_surface(w: const Shape*, f: usize, p: Vector3) -> bool!:
 ## (all the way, a face would vanish): else an error saying so, and the
 ## size it must stay under.
 func check_fits(w: const Shape*, e: usize, size: f64, round: bool) -> !:
+    _ = try fits_plan(w, e, size, round)
+
+## check_fits, and the faces beyond a cliff each side runs over (a
+## concave edge down onto a flat face, `-1` none): the edge's tool must
+## then stop at that face's plane (cliff_cut), or it would carve it.
+func fits_plan(w: const Shape*, e: usize, size: f64, round: bool) -> (i64, i64)!:
     let (fa, fb) = try edge_faces(w, e)
     # How far the blend reaches along each face: alike between planes (and
     # at rims), each its own between a plane and a cylinder (the
@@ -104,17 +110,25 @@ func check_fits(w: const Shape*, e: usize, size: f64, round: bool) -> !:
     # (cap_blend.lucb, which checks its own room): a straight step across
     # it would leave it.
     # Between two curved faces the ball's own fit says when it is too large.
-    if curved_pair(w, fa, fb): return
-    let room_a = reach_a * 2.0 if curved_wall(w, e, fa, fb) else try room(w, e, fa, reach_a * 1.01 + w.tolerance * 100.0, around == (i64)fa)
-    let room_b = reach_b * 2.0 if curved_wall(w, e, fb, fa) else try room(w, e, fb, reach_b * 1.01 + w.tolerance * 100.0, around == (i64)fb)
+    if curved_pair(w, fa, fb): return (-1, -1)
+    var room_a = reach_a * 2.0 if curved_wall(w, e, fa, fb) else try room(w, e, fa, reach_a * 1.01 + w.tolerance * 100.0, around == (i64)fa)
+    var room_b = reach_b * 2.0 if curved_wall(w, e, fb, fa) else try room(w, e, fb, reach_b * 1.01 + w.tolerance * 100.0, around == (i64)fb)
+    # A face split along a line goes on in its plane past it.
+    if round and room_a <= reach_a + w.tolerance * 10.0: room_a = try flat_room(w, e, fa, room_a, reach_a * 1.01 + w.tolerance * 100.0)
+    if round and room_b <= reach_b + w.tolerance * 10.0: room_b = try flat_room(w, e, fb, room_b, reach_b * 1.01 + w.tolerance * 100.0)
     let fits_a = room_a > reach_a + w.tolerance * 10.0
     let fits_b = room_b > reach_b + w.tolerance * 10.0
-    if fits_a and fits_b: return
+    if fits_a and fits_b: return (-1, -1)
     # Running off one face over a convex edge into the next face, which
     # trims it (the study's rail classification, its same-convexity case:
     # a plate thinner than the radius): the edge's tool reaches past that
     # face, outside the body, and the booleans cut it at the next face.
-    if round and (fits_a or (try overflows(w, e, fa, room_a))) and (fits_b or (try overflows(w, e, fb, room_b))) and (fits_a or fits_b): return
+    # Over a concave edge (a cliff: a ledge below the face) the tool would
+    # reach into the ledge: it stops at the ledge's plane, which then
+    # covers the fillet there (the study's cliff case).
+    let cliff_a = (try cliff(w, e, fa, room_a)) if round and not fits_a else -1
+    let cliff_b = (try cliff(w, e, fb, room_b)) if round and not fits_b else -1
+    if round and (fits_a or cliff_a >= 0 or (try overflows(w, e, fa, room_a))) and (fits_b or cliff_b >= 0 or (try overflows(w, e, fb, room_b))) and (fits_a or fits_b): return (cliff_a, cliff_b)
     let most = size * math.min(room_a / reach_a, room_b / reach_b)
     var buffer: u8[256]
     let text = try strings.format(buffer, f"a fillet radius of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}") if round else try strings.format(buffer, f"a chamfer of {rounded_text(size)} is too large for this edge's faces: it must be less than {rounded_text(most)}")
@@ -139,10 +153,32 @@ func rounded_text(value: f64) -> f64:
 ## straight convex edge parallel to `e` whose other face is flat and turns
 ## the same way, so that face trims the fillet's surface across it.
 func overflows(w: const Shape*, e: usize, f: usize, depth: f64) -> bool!:
+    return (try face_beyond(w, e, f, depth, beyond_convex)) >= 0
+
+## The flat face beyond a cliff a fillet on straight edge `e` between flat
+## faces runs over off flat face `f` (`depth` in from the edge): a straight
+## concave edge parallel to `e`, the face beyond it flat; else -1.
+func cliff(w: const Shape*, e: usize, f: usize, depth: f64) -> i64!:
+    return try face_beyond(w, e, f, depth, beyond_concave)
+
+## Edges face_beyond looks for: convex, concave, or flat (the faces each
+## side in one plane: a face split along a line).
+let beyond_convex: i64 = 0
+let beyond_concave: i64 = 1
+let beyond_flat: i64 = 2
+
+## The flat face across the straight edge of flat face `f` (parallel to
+## straight convex edge `e`, of the kind `kind` asks) where a step `depth`
+## into `f` square to `e` leaves it, else -1; and that edge.
+func face_beyond(w: const Shape*, e: usize, f: usize, depth: f64, kind: i64) -> i64!:
+    let (next, _) = try face_across(w, e, f, depth, kind)
+    return next
+
+func face_across(w: const Shape*, e: usize, f: usize, depth: f64, kind: i64) -> (i64, usize)!:
     let edge = w.edges.items[e]
-    if w.carriers.items[(usize)edge.carrier].kind != curve_line: return false
-    if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: return false
-    if not try convex(w, e): return false
+    if w.carriers.items[(usize)edge.carrier].kind != curve_line: return (-1, 0)
+    if w.surfaces.items[(usize)w.faces.items[f].surface].kind != surface_plane: return (-1, 0)
+    if kind != beyond_flat and not try convex(w, e): return (-1, 0)
     let along = try along_edge(w, e)
     let p = try w.edge_at(e, 0.5)
     let side = try into_face(w, f, e, along)
@@ -159,11 +195,47 @@ func overflows(w: const Shape*, e: usize, f: usize, depth: f64) -> bool!:
         if d < gap:
             gap = d
             nearest = (i64)k
-    if nearest < 0 or gap > w.tolerance * 1000.0 + depth * 1e-6: return false
+    if nearest < 0 or gap > w.tolerance * 1000.0 + depth * 1e-6: return (-1, 0)
     let far = (usize)nearest
-    if w.carriers.items[(usize)w.edges.items[far].carrier].kind != curve_line: return false
-    if math.abs((try along_edge(w, far)).dot(along)) < 1.0 - 1e-9: return false
-    if not try convex(w, far): return false
+    if w.carriers.items[(usize)w.edges.items[far].carrier].kind != curve_line: return (-1, 0)
+    if math.abs((try along_edge(w, far)).dot(along)) < 1.0 - 1e-9: return (-1, 0)
     let (ga, gb) = try edge_faces(w, far)
     let next = gb if ga == f else ga
-    return w.surfaces.items[(usize)w.faces.items[next].surface].kind == surface_plane
+    if w.surfaces.items[(usize)w.faces.items[next].surface].kind != surface_plane: return (-1, 0)
+    let flat = face_outward(w, next).dot(face_outward(w, f)) > 1.0 - 1e-9
+    if kind == beyond_flat: return ((i64)next, far) if flat else (-1, 0)
+    if flat or (try convex(w, far)) != (kind == beyond_convex): return (-1, 0)
+    return ((i64)next, far)
+
+## How far a fillet on edge `e` can step into flat face `f` (`first`, short
+## of `reach`) and on into the faces beyond it in its plane, across
+## straight edges parallel to `e` (a face split along a line: the ball
+## rolls on over the line).
+func flat_room(w: const Shape*, e: usize, f: usize, first: f64, reach: f64) -> f64!:
+    var total = first
+    var step = first
+    var face = f
+    var edge = e
+    for _ in 0..<8:
+        if total > reach: return total
+        let (next, far) = try face_across(w, edge, face, step, beyond_flat)
+        if next < 0: return total
+        step = try room(w, far, (usize)next, reach - total + w.tolerance * 100.0)
+        total += step
+        face = (usize)next
+        edge = far
+    return total
+
+## Edge tool `tool` stopped at the plane of flat face `beyond` (a cliff's
+## ledge, cliff): its part on the face's outward side kept.
+func cliff_cut(w: const Shape*, tool: interop.Reference[CadModel], beyond: i64, name: str) -> interop.Reference[CadModel]!:
+    let s = &w.surfaces.items[(usize)w.faces.items[(usize)beyond].surface]
+    let out = face_outward(w, (usize)beyond)
+    var no_points = Growing[Vector3]()
+    defer no_points.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var plane = try Surface(surface_plane, s.origin, s.x, out.multiply_scalar(-1.0), 0.0, 0.0, no_points.view(), knots.view(), knots.view(), knots.view(), 0, 0, 0, 0)
+    defer plane.close()
+    let kept = (try behind_surface(tool.value(), &plane, name)) else return tool.clone()
+    return kept
