@@ -1042,7 +1042,12 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   coarse chart (eight steps a curved edge) and charts finely only the outlines, of each hole just
   its first two points for the probe beside it (each hole had been charted whole, 126 points); and
   `vertex_cuts` skips an edge's own ends. P1: 310 to 158 ms (SMLib 290 single-threaded), the
-  quickest of three quiet runs; the rest is the new curves' crossings with the faces' edges.
+  quickest of three quiet runs; the rest is the new curves' crossings with the faces' edges. Those
+  were refound: a hole's new circle against the cylinder's seam line (8 samples over its length)
+  found their one crossing from nearly every segment pair, each time checking whether the curves
+  ran along each other there (73 checks a pair). A crossing known already is now remembered and
+  the segments by it skipped (`clip.lucb`): P1 158 to 117 ms; the rest is splitting faces into
+  pieces (`face_pieces`). The comparison cases are unchanged by it (B8 52 to 31 ms).
 
 ## 12. What not to take
 
