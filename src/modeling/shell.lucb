@@ -67,11 +67,23 @@ func shell_of(model: interop.Reference[CadModel], removed: const bool[], thickne
     for f in 0..<faces: try distances.push(wall_in + wall_out if removed[f] else -wall_in)
     # Its own reason, not a guess at one (it blamed a thin wall for a
     # B-spline face it could not offset).
-    let inner = try substitute(&w, all.view(), &m, targets.view(), senses.view(), distances.view()) catch failure:
+    var reason = Growing[u8]()
+    defer reason.close()
+    var inner = substitute(&w, all.view(), &m, targets.view(), senses.view(), distances.view()) catch failure:
         if failure.code != invalid: error(failure.code, failure.message)
-        var buffer: u8[640]
-        error(invalid, try strings.format(buffer, f"the shell's thickness is too large for this body: {failure.message}"))
+        for byte in failure.message.bytes: try reason.push(byte)
+        recover model.clone()
     defer inner.release()
+    if reason.count > 0:
+        # Convex rounds thinner than the wall vanish from the inner body
+        # (vanishing_inner): it is the inner body of the body without them.
+        let past = try vanishing_inner(model, removed, wall_in, wall_out, &m)
+        if let made = past:
+            inner.release()
+            inner = made
+        else:
+            var buffer: u8[640]
+            error(invalid, try strings.format(buffer, f"the shell's thickness is too large for this body: {(str)reason.view()}"))
     var name = Growing[u8]()
     defer name.close()
     for byte in tag.bytes: try name.push(byte)
@@ -79,3 +91,135 @@ func shell_of(model: interop.Reference[CadModel], removed: const bool[], thickne
     let named = try CadModeling.prefixed(inner, (str)name.view())
     defer named.release()
     return try combine(outer.value(), named.value(), op_subtract)
+
+## The inner body of a shell whose wall (`wall_in` inside, nothing
+## outside) is thicker than some convex rounds' radii (cylinders, spheres
+## and tori turned outward, a fillet's strip or ball corner): their offsets
+## vanish, and the faces round them meet past them. For a convex round that
+## is exact: the body's inner parallel body at a distance beyond a round's
+## radius is the one of the body with the round healed sharp (its tangent
+## planes in between are then implied by its neighbors'). So the rounds are
+## deleted (Delete's healing) and that body offset in; `removed` faces
+## (marked on `model`) keep their names. None when nothing so vanishes or
+## the healed body cannot be offset either.
+func vanishing_inner(model: interop.Reference[CadModel], removed: const bool[], wall_in: f64, wall_out: f64, m: const FaceMove*) -> interop.Reference[CadModel]?!:
+    if wall_out > 0.0 or not (wall_in > 0.0): return none
+    var w = try shape_of(model.value())
+    defer w.close()
+    var names = Growing[u8]()
+    defer names.close()
+    for f in 0..<w.faces.count:
+        if removed[f]: continue
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind != surface_cylinder and s.kind != surface_sphere and s.kind != surface_torus: continue
+        let radius = s.angle if s.kind == surface_torus else s.radius
+        if radius > wall_in + w.tolerance * 10.0: continue
+        # Convex: its outward normal points away from its axis (center).
+        let p = try w.edge_at(edge_index(w.face_uses(f)[0]), 0.5)
+        var core = s.origin
+        if s.kind == surface_cylinder: core = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+        if s.kind == surface_torus:
+            let flat = p.subtract(s.origin).subtract(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+            core = s.origin.add((try flat.normalized()).multiply_scalar(s.radius))
+        if (try w.face_normal(f, p)).dot(p.subtract(core)) <= 0.0: continue
+        if names.count > 0: try names.push(59)
+        for byte in w.face_name(f).bytes: try names.push(byte)
+    if names.count == 0: return none
+    let sharp = CadDirect.deleted_faces(model, (str)names.view()) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return none
+    defer sharp.release()
+    var v = try shape_of(sharp.value())
+    defer v.close()
+    # Healing leaves each sharp edge in the pieces the rounds' ends cut it
+    # into; a vertex between two pieces has only two faces to be found on.
+    try join_straight_pieces(&v)
+    var all = Growing[usize]()
+    defer all.close()
+    var distances = Growing[f64]()
+    defer distances.close()
+    for f in 0..<v.faces.count:
+        try all.push(f)
+        var open = false
+        for g in 0..<w.faces.count:
+            if removed[g] and w.face_name(g) == v.face_name(f): open = true
+        try distances.push(wall_in if open else -wall_in)
+    var targets = Growing[Surface]()
+    defer targets.close()
+    var senses = Growing[bool]()
+    defer senses.close()
+    let made = substitute(&v, all.view(), m, targets.view(), senses.view(), distances.view()) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return none
+    return made
+
+## Straight edges of `w` meeting end to end at a vertex no other edge has,
+## along one line between the same two faces, joined into one (the vertex
+## goes from every loop).
+func join_straight_pieces(w: Shape*) -> !:
+    try w.index_sides()
+    var gone = Growing[bool]()
+    defer gone.close()
+    try gone.fill(w.edges.count, false)
+    var at_vertex = Growing[i64]()
+    defer at_vertex.close()
+    var changed = true
+    while changed:
+        changed = false
+        for v in 0..<w.points.count:
+            at_vertex.clear()
+            for e in 0..<w.edges.count:
+                if gone.items[e]: continue
+                let edge = w.edges.items[e]
+                if edge.start == (i64)v or edge.end == (i64)v: try at_vertex.push((i64)e)
+            if at_vertex.count != 2: continue
+            let a = (usize)at_vertex.items[0]
+            let b = (usize)at_vertex.items[1]
+            let ea = w.edges.items[a]
+            let eb = w.edges.items[b]
+            if w.carriers.items[(usize)ea.carrier].kind != curve_line or w.carriers.items[(usize)eb.carrier].kind != curve_line: continue
+            let same_faces = (w.sides.items[a * 2] == w.sides.items[b * 2] and w.sides.items[a * 2 + 1] == w.sides.items[b * 2 + 1]) or (w.sides.items[a * 2] == w.sides.items[b * 2 + 1] and w.sides.items[a * 2 + 1] == w.sides.items[b * 2])
+            if not same_faces: continue
+            let far_a = ea.start if ea.end == (i64)v else ea.end
+            let far_b = eb.start if eb.end == (i64)v else eb.end
+            let pa = w.points.items[(usize)far_a]
+            let pb = w.points.items[(usize)far_b]
+            let pv = w.points.items[v]
+            let line = pb.subtract(pa)
+            if line.length() <= w.tolerance: continue
+            let off = pv.subtract(pa).subtract(line.multiply_scalar(pv.subtract(pa).dot(line) / line.dot(line))).length()
+            if off > w.tolerance * 10.0: continue
+            # Edge a now runs from its far end to b's, on a's line, its way kept.
+            let c = w.carriers.items[(usize)ea.carrier]
+            let start = far_a if ea.end == (i64)v else far_b
+            let end = far_b if ea.end == (i64)v else far_a
+            let t0 = w.points.items[(usize)start].subtract(c.origin).dot(c.x)
+            let t1 = w.points.items[(usize)end].subtract(c.origin).dot(c.x)
+            w.edges.items[a] = ShapeEdge(ea.carrier, t0, t1, start, end)
+            gone.items[b] = true
+            changed = true
+    # Every loop without the joined edges' second pieces.
+    var uses = Growing[i64]()
+    defer uses.close()
+    var sizes = Growing[i64]()
+    defer sizes.close()
+    var faces = Growing[ShapeFace]()
+    defer faces.close()
+    for f in 0..<w.faces.count:
+        let face = w.faces.items[f]
+        let first_use = uses.count
+        let first_size = sizes.count
+        var at: usize = 0
+        for size in w.face_sizes(f):
+            var kept: i64 = 0
+            for use in w.face_uses(f)[at..<at + (usize)size]:
+                if gone.items[edge_index(use)]: continue
+                try uses.push(use)
+                kept += 1
+            try sizes.push(kept)
+            at += (usize)size
+        try faces.push(ShapeFace(face.surface, face.sense, first_use, uses.count - first_use, first_size, sizes.count - first_size, face.name))
+    try w.uses.assign(uses.view())
+    try w.sizes.assign(sizes.view())
+    try w.faces.assign(faces.view())
+    try w.index_sides()

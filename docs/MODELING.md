@@ -1177,9 +1177,13 @@ body pokes through where the hollow opens. The shell is the outer body less the 
 removed faces the inner body lies wholly inside: a closed void, a second shell.
 
 Faces offset as Offset Face's do, so a box's rounded uprights of 0.3 give a hollow rounded by 0.2
-for a wall of 0.1. A wall thicker than a rounded face's radius, or one that would change the body's
-topology, is refused: "the shell's thickness is too large for this body", with the inner wall's own
-reason after it. The inner wall's faces are named `<tag>/` and the face's own name. B-spline faces are offset as
+for a wall of 0.1. A wall inside thicker than convex rounds' radii (cylinders, spheres and tori
+turned outward: fillets, corner balls) makes them vanish from the hollow; the inner body is then the
+one of the body with those rounds deleted (Delete's healing, its sharp edges' pieces joined), which
+for convex rounds is exact (the rounds' tangent planes in between are implied by their neighbors'):
+a 20 cube rounded 1 all over, shelled 2, has the sharp 16 box for its hollow. Any other wall that
+would change the body's topology is refused: "the shell's thickness is too large for this body",
+with the inner wall's own reason after it. The inner wall's faces are named `<tag>/` and the face's own name. B-spline faces are offset as
 Offset Face's are: a box rounded G2 shells closed or opened at its top.
 
 ### Every edge rounded whole (`rounded.lucb`)
@@ -2189,7 +2193,8 @@ Roughly in order of usefulness:
    it, joined; a pipe inside a box touching its wall, subtracted; a pipe grazing a box's top and
    bottom, taken from it; a box laid against a B-spline strip, found by `modeling/contact.lucb`
    since no curve follows a touch) are refused as non-manifold.
-9. **Offsets where faces vanish or reconnect** (a shell thicker than a fillet's radius), a shell of
+9. **Offsets where faces vanish or reconnect** beyond convex analytic rounds (a G2 strip or a flat
+   face swallowed by an inset; the face soup's arrangement by winding number), a shell of
    a box rounded G2 on every edge (its offset body closes, but the booleans' tolerance is tighter
    than the corners it finds), and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face and strips apart (adjacent strips of a curved chain, healing by

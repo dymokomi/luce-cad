@@ -970,6 +970,18 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   to 0.0000°. Regression: `variable_corner_tests`. Still open: laws on chains round faces and
   loops between curved faces at corners, and Fusion's rolled-ball G1 envelope there.
 
+- **11, offsets where faces vanish (part).** Not the face soup's arrangement: for convex rounds
+  the answer has a closed form. A body's inner parallel body at a distance past a convex round's
+  radius is that of the body with the round healed sharp (its tangent planes between are implied by
+  its neighbors'). Shell's inner body, when the offset refuses, deletes the convex cylinders,
+  spheres and tori thinner than the wall (Delete's healing, then the healed body's edge pieces
+  joined back into whole edges: a vertex with two faces cannot be found again) and offsets that. A
+  20 cube rounded 1 on every edge, shelled 2: closed 3853.8312 and opened at its top 3341.8308
+  extrapolated, against 3853.8348 and 3341.8348 (the rounded cube less the sharp 16 box, and less
+  16 × 18 × 16); refused before. The rounded uprights 0.3 of the 2 box shelled 0.5 likewise.
+  Regression: `shell_tests`. Still open: G2/G3 strips and flat faces swallowed by an inset (the
+  face soup and winding numbers), and outward offsets that reconnect.
+
 - **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
   plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was
   finding a point well inside a piece (`piece_point`), asked even of the plate's face with all its
