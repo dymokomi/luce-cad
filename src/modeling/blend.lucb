@@ -249,6 +249,9 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
     # Whether each tool is added (a concave edge's) rather than taken away.
     var adds = Growing[bool]()
     defer adds.close()
+    # Variable edges' own end sections at setback corners.
+    var given = Growing[GivenSection]()
+    defer given.close()
     # Collinear chosen edges between the same two faces (one edge cut into
     # pieces by earlier operations) are one chain: one tool spans them.
     var done = Growing[bool]()
@@ -345,7 +348,10 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
                 let end = high if forward else low
                 let way = try end.subtract(start).normalized()
                 let ends = EndPlanes(way.multiply_scalar(-1.0), 0.0, false, way, 0.0, false)
-                try tools.push(try straight_law_tool(w, e, &held.laws.items[(usize)at], tool_continuity, blend_shape, (str)name.view(), start, end, &ends, true))
+                try tools.push(try straight_law_tool(w, e, &held.laws.items[(usize)at], tool_continuity, blend_shape, (str)name.view(), start, end, &ends))
+                # A G1 one rolls its ball (straight_law_tool): its end
+                # sections are the setback corners' sides there.
+                if round and continuity == 1 and blend_shape.plain(): try give_sections(w, e, &held.laws.items[(usize)at], start, end, setbacks.view(), &given)
                 lawed = true
         if not lawed:
             if adding: try tools.push(try concave_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b, blend_shape))
@@ -366,7 +372,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
         try adds.push(ball.inside)
     for at in setbacks.view():
         try corner_name(w, (usize)at.vertex, tag, &name)
-        try tools.push(try setback_tool(w, &at, size, continuity, (str)name.view(), blend_shape))
+        try tools.push(try setback_tool(w, &at, size, continuity, (str)name.view(), blend_shape, given.view()))
         try adds.push(at.inside)
     # Chamfers meeting three at a corner: its own face through the contact
     # lines' crossings (Chamfer) or set back past them (Blend); Miter is the
@@ -500,3 +506,22 @@ func check_limits(w: const Shape*, chosen: const usize[], limits: BlendLimits) -
         let (ga, gb) = try edge_faces(w, e)
         let same_faces = (ga == fa and gb == fb) or (ga == fb and gb == fa)
         if not same_faces or not try same_curve(w, w.edges.items[first].carrier, e, w.tolerance): error(invalid, "a limited blend takes one straight edge (or its pieces along one line between the same faces)")
+
+## Of straight edge `e` rolled by `law` from `start` to `end`, its end
+## sections at the setback corners `corners` it reaches onto `given`
+## (rolled_ends; none when its strip does not roll).
+func give_sections(w: const Shape*, e: usize, law: const RadiusLaw*, start: Vector3, end: Vector3, corners: const Setback[], given: Growing[GivenSection]*) -> !:
+    var at_start = Growing[Vector3]()
+    defer at_start.close()
+    var at_end = Growing[Vector3]()
+    defer at_end.close()
+    if not try rolled_ends(w, e, law, start, end, &at_start, &at_end): return
+    let edge = w.edges.items[e]
+    for corner in corners:
+        if corner.vertex != edge.start and corner.vertex != edge.end: continue
+        let apex = w.points.items[(usize)corner.vertex]
+        let near_start = apex.subtract(start).length() <= apex.subtract(end).length()
+        let section = at_start if near_start else at_end
+        var points: Vector3[6] = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
+        for k in 0..<(usize)6: points[k] = section.items[k]
+        try given.push(GivenSection(corner.vertex, e, points))

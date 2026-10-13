@@ -990,8 +990,11 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   section is the scaled circle in the patch's degree 5 rational form, so it ends in the corner's
   curve exactly. A 20 cube's corner, x and y edges 4, z edge 2 → 4 into it: G1 7805.04, G2
   7843.88 at 32 divisions (constant 4, ball: 7804.58; G2 setback: 7830.76), closed, every edge G1
-  to 0.0000°. Regression: `variable_corner_tests`. Still open: laws on chains round faces and
-  loops between curved faces at corners, and Fusion's rolled-ball G1 envelope there.
+  to 0.0000°. Regression: `variable_corner_tests`. Then Fusion's rolled-ball G1 envelope there:
+  the strip rolls its ball (the straight-law check had taken a law held flat at a corner for a
+  cone), and the setback patch takes the strip's own fitted end section as its side
+  (`GivenSection`): 7805.36 at G1, closed, every seam G1. Still open: laws on chains round faces
+  and loops between curved faces at corners.
 
 - **11, offsets where faces vanish (part).** Not the face soup's arrangement: for convex rounds
   the answer has a closed form. A body's inner parallel body at a distance past a convex round's

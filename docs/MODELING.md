@@ -533,8 +533,13 @@ each with its own law. The corners are setback corners at the feature's radius (
 sphere would meet a variable B-spline strip tangentially along its end circle, which the booleans
 cannot follow). A variable edge must reach that radius at a corner it runs into (else it is refused,
 naming both radii), and its law is held flat there (its slope 0), as if constant at its end radius
-through the corner: between the setbacks the law spans the edge's stretch, its G1 section the circle
-scaled (the setback patch's degree 5 rational arc), so the strip ends in the corner's own curve.
+through the corner: between the setbacks the law spans the edge's stretch. At G1 (Tangency weight 1)
+the strip is the rolled balls' envelope, as Fusion's (`rolled_ball.lucb`); held flat, its end
+section is the corner's circle, and the setback patch takes the strip's own fitted end section as
+that side (`GivenSection`), so the strip ends in the patch's curve exactly. A straight law held flat
+at a corner is no longer taken for a cone (both its slopes are checked). The cube's corner with its
+z edge 2 → 4 into it: 7805.36 at G1, closed, every seam G1 (the scaled circle had made 7805.04).
+At G2 and G3 the section is scaled, as before.
 
 Where the spline would not keep the shape Fusion's own pieces are **not cubics and not decoded**: a
 piece from an open end to a flat run is one universal shape in Fusion (the same on four laws, its
@@ -2357,8 +2362,8 @@ Roughly in order of usefulness:
    or more edges where only some are rounded or the faces are not flat.
 2. **Variable radius fillets at corners** beyond straight edges between flat faces meeting at a
    corner of the feature's own radius (`variable_filleted_edges`: a law that changes into the corner,
-   or chains round faces, or a G1 rolled-ball envelope there: its G1 section is the scaled circle),
-   and full rounds of curved ribs whose ends are not flat through the axis.
+   or chains round faces and loops between curved faces at a corner), and full rounds of curved ribs
+   whose ends are not flat through the axis.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
    the loop turns a sharp corner into an end wall that is not a plane square to the edge (Fusion

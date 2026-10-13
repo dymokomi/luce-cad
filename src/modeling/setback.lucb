@@ -31,6 +31,15 @@ struct Setback:
     var inside: bool
     var radii: f64[8]
 
+## A fillet's own end section at a setback corner (a G1 variable edge's
+## rolled envelope, straight_law_tool): the six control points of edge
+## `edge`'s section where it reaches corner `vertex`, from one face's
+## contact to the other's. The corner's patch takes it as that side.
+struct GivenSection:
+    var vertex: i64
+    var edge: usize
+    var points: Vector3[6]
+
 ## An empty setback corner at vertex `v`.
 func empty_setback(v: i64) -> Setback:
     return Setback(v, 0, [0, 0, 0, 0, 0, 0, 0, 0], [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -149,14 +158,14 @@ func contacts_cross(p: Vector3, way_a: Vector3, into_a: Vector3, reach_a: f64, w
 ## A setback corner's tool for fillets of `radius` and `continuity`: the
 ## region between the sharp corner and the patch, within the setback
 ## planes. The patch's quads are named `name`.
-func setback_tool(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, name: str, blend_shape: BlendShape = plain_blend) -> interop.Reference[CadModel]!:
+func setback_tool(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, name: str, blend_shape: BlendShape = plain_blend, given: (const GivenSection[])? = none) -> interop.Reference[CadModel]!:
     var quads = Growing[Vector3]()
     defer quads.close()
     var quad_weights = Growing[f64]()
     defer quad_weights.close()
     var quad_knots = Growing[f64]()
     defer quad_knots.close()
-    try setback_patch(w, corner, radius, continuity, &quads, &quad_weights, &quad_knots, blend_shape)
+    try setback_patch(w, corner, radius, continuity, &quads, &quad_weights, &quad_knots, blend_shape, given)
     let p = w.points.items[(usize)corner.vertex]
     let cone = try corner_cone(w, corner, radius)
     return try corner_solid(p, corner, quads.view(), quad_weights.view(), cone[..<corner.count], quad_knots.view(), quad_knots.count - 6, name)
@@ -180,7 +189,8 @@ func corner_cone(w: const Shape*, corner: const Setback*, radius: f64) -> Vector
 ## `quad_weights` (1 but at a G1 corner), their knots onto `quad_knots`.
 ## Its control points must stay between the faces and the setback planes
 ## (so it meets the body only along curves both carry).
-func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, quads: Growing[Vector3]*, quad_weights: Growing[f64]*, quad_knots: Growing[f64]*, blend_shape: BlendShape = plain_blend) -> !:
+## A fillet whose own end section is `given` takes it as its side.
+func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, quads: Growing[Vector3]*, quad_weights: Growing[f64]*, quad_knots: Growing[f64]*, blend_shape: BlendShape = plain_blend, given: (const GivenSection[])? = none) -> !:
     let n = corner.count
     let frame = try setback_frame(w, corner, radius)
     let p = w.points.items[(usize)corner.vertex]
@@ -205,7 +215,19 @@ func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continu
         let ta = foot.add(frame.intos[i * 2].multiply_scalar(frame.reaches[i]))
         let tb = foot.add(frame.intos[i * 2 + 1].multiply_scalar(frame.reaches[i]))
         knots.clear()
-        if continuity == 1:
+        let own = given_section(given, corner.vertex, corner.edges[i])
+        if own >= 0 and continuity == 1:
+            # Its own section, run from face i - 1's contact to face i's.
+            let first = curves.count
+            let section = given_points(given, own)
+            let forward = section[0].subtract(ta).length() <= section[5].subtract(ta).length()
+            for k in 0..<(usize)6:
+                try curves.push(section[k if forward else 5 - k])
+                try weights.push(1.0)
+            for _ in 0..<(usize)6: try knots.push(0.0)
+            for _ in 0..<(usize)6: try knots.push(1.0)
+            try middle_knot_twice(&curves, &weights, first, &knots)
+        elif continuity == 1:
             let first = curves.count
             try arc_section(ta, tb, foot, &curves, &weights, &knots, blend_shape)
             try middle_knot_twice(&curves, &weights, first, &knots)
@@ -227,6 +249,18 @@ func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continu
         for i in 0..<n:
             if q.subtract(p).dot(cone[i]) < -slack or q.subtract(p).dot(corner.ways[i]) > corner.distances[i] + slack:
                 error(invalid, "the corner patch would leave its corner: use a rolling ball (G1) there")
+
+## Of `given`, the place of edge `e`'s section at corner `v`, or -1.
+func given_section(given: (const GivenSection[])?, v: i64, e: usize) -> i64:
+    if let all = given:
+        for k in 0..<all.length:
+            if all[k].vertex == v and all[k].edge == e: return (i64)k
+    return -1
+
+## Of `given`, section `k`'s points.
+func given_points(given: (const GivenSection[])?, k: i64) -> Vector3[6]:
+    if let all = given: return all[(usize)k].points
+    return [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
 
 ## A one-span degree 5 curve (the points from `first` on `points`, their
 ## weights alike on `weights`, its knots `knots`) given the knot 1/2 twice:

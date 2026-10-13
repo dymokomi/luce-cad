@@ -106,11 +106,11 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
 ## The tool of straight edge `e` between flat faces filleted by `law` from
 ## `start` to `end` (the edge's ends, or where corners stop it: the law then
 ## spans that stretch), of `continuity` under `blend_shape`, its blend face
-## named `name`, ending as `ends` says (see the header).
-## With `scaled` the G1 section is the circle scaled by the radius, not the
-## rolled balls' envelope: at a corner's ball (variable_corners.lucb) its
-## end section is then exactly the ball's circle.
-func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continuity: i64, blend_shape: BlendShape, name: str, start: Vector3, end: Vector3, ends: const EndPlanes*, scaled: bool = false) -> interop.Reference[CadModel]!:
+## named `name`, ending as `ends` says (see the header). At G1 (or a
+## setback corner's G1, `g1_spline`) under the weight of 1 it is the rolled
+## balls' envelope, as Fusion's: at a corner its law is held flat, its end
+## section the corner's (rolled_ends gives the corner patch that section).
+func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continuity: i64, blend_shape: BlendShape, name: str, start: Vector3, end: Vector3, ends: const EndPlanes*) -> interop.Reference[CadModel]!:
     let (fa, fb) = try edge_faces(w, e)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
@@ -120,31 +120,16 @@ func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continu
     let reach = 1.0 / math.tan(theta * 0.5)
     let weight = math.sin(theta * 0.5)
     let convex_edge = try convex(w, e)
-    # The law's points that change nothing (on a straight run, or between
-    # equal radii) go: fewer knots.
     var kept_at = Growing[f64]()
     defer kept_at.close()
     var kept_sizes = Growing[f64]()
     defer kept_sizes.close()
     var kept_slopes = Growing[f64]()
     defer kept_slopes.close()
-    let at = law.positions.view()
-    let sizes = law.radii.view()
-    let slopes = law.slopes.view()
-    for k in 0..<at.length:
-        if k > 0 and k + 1 < at.length:
-            # Within one straight run (a flat one too): the slopes all the
-            # chord from the last point kept to the next.
-            let chord = (sizes[k + 1] - kept_sizes.items[kept_sizes.count - 1]) / (at[k + 1] - kept_at.items[kept_at.count - 1])
-            let near = 1e-12 * math.max(1.0, math.abs(chord))
-            let on = math.abs(sizes[k] - (sizes[k + 1] - chord * (at[k + 1] - at[k]))) <= near
-            if on and math.abs(kept_slopes.items[kept_slopes.count - 1] - chord) <= near and math.abs(slopes[k] - chord) <= near and math.abs(slopes[k + 1] - chord) <= near: continue
-        try kept_at.push(at[k])
-        try kept_sizes.push(sizes[k])
-        try kept_slopes.push(slopes[k])
+    try keep_law(law, &kept_at, &kept_sizes, &kept_slopes)
+    let straight = straight_law(kept_at.view(), kept_sizes.view(), kept_slopes.view())
     # Fusion rolls a ball at G1 under the weight of 1 (exactly; 0.999 and
     # 1.001 scale the section): one straight piece of the law makes a cone.
-    let straight = kept_at.count == 2 and math.abs(kept_slopes.items[0] - (kept_sizes.items[1] - kept_sizes.items[0])) <= 1e-12 * math.max(1.0, kept_sizes.items[1])
     var cone = -1.0
     if continuity == 1 and blend_shape.plain() and straight:
         cone = rolling_weight(theta, (kept_sizes.items[1] - kept_sizes.items[0]) / (length * (kept_at.items[1] - kept_at.items[0])))
@@ -153,7 +138,7 @@ func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continu
     var rolled = Rolled(start, along, length, ua, ub, theta, try ua.add(ub).normalized().multiply_scalar(1.0 / math.sin(theta * 0.5)), kept_at.view(), kept_sizes.view(), kept_slopes.view(), n0, n1)
     # Any other law: the balls' envelope (rolled_ball.lucb), unless it
     # folds, where Fusion scales the section instead.
-    if continuity == 1 and blend_shape.plain() and not straight and not scaled and not rolled_folds(&rolled):
+    if (continuity == 1 or continuity == g1_spline) and blend_shape.plain() and not straight and not rolled_folds(&rolled):
         var net = Growing[Vector3]()
         defer net.close()
         var weights = Growing[f64]()
@@ -198,6 +183,59 @@ func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continu
         let tilted_tool = try strip_solid(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), net.view(), weights.view(), section.count, count, 5, along_degree, fitted_knots.view(), knots.view(), length + reach * law.largest() * 4.0, name, convex_edge, ends)
         return tilted_tool
     return try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), kept_slopes.view(), name, convex_edge, continuity, ends, blend_shape, cone)
+
+## Law `law`'s points that change something onto `kept_at`, `kept_sizes`
+## and `kept_slopes`: those within one straight run (a flat one too, or
+## between equal radii) go, for fewer knots.
+func keep_law(law: const RadiusLaw*, kept_at: Growing[f64]*, kept_sizes: Growing[f64]*, kept_slopes: Growing[f64]*) -> !:
+    let at = law.positions.view()
+    let sizes = law.radii.view()
+    let slopes = law.slopes.view()
+    for k in 0..<at.length:
+        if k > 0 and k + 1 < at.length:
+            # Within one straight run: the slopes all the chord from the
+            # last point kept to the next.
+            let chord = (sizes[k + 1] - kept_sizes.items[kept_sizes.count - 1]) / (at[k + 1] - kept_at.items[kept_at.count - 1])
+            let near = 1e-12 * math.max(1.0, math.abs(chord))
+            let on = math.abs(sizes[k] - (sizes[k + 1] - chord * (at[k + 1] - at[k]))) <= near
+            if on and math.abs(kept_slopes.items[kept_slopes.count - 1] - chord) <= near and math.abs(slopes[k] - chord) <= near and math.abs(slopes[k + 1] - chord) <= near: continue
+        try kept_at.push(at[k])
+        try kept_sizes.push(sizes[k])
+        try kept_slopes.push(slopes[k])
+
+## Whether a kept law is one straight piece: two points, both slopes its
+## chord (a law held flat at a corner is not).
+func straight_law(at: const f64[], sizes: const f64[], slopes: const f64[]) -> bool:
+    if at.length != 2: return false
+    let chord = sizes[1] - sizes[0]
+    let near = 1e-12 * math.max(1.0, sizes[1])
+    return math.abs(slopes[0] - chord) <= near and math.abs(slopes[1] - chord) <= near
+
+## The end sections of straight edge `e`'s rolled strip under `law` from
+## `start` to `end` (straight_law_tool's, G1 at the weight of 1): its six
+## control points across at the start and at the end, from face a's
+## contact to face b's; false when it does not roll (a straight law's cone,
+## or a folding envelope, scaled).
+func rolled_ends(w: const Shape*, e: usize, law: const RadiusLaw*, start: Vector3, end: Vector3, at_start: Growing[Vector3]*, at_end: Growing[Vector3]*) -> bool!:
+    let (fa, fb) = try edge_faces(w, e)
+    let length = end.subtract(start).length()
+    let along = try end.subtract(start).normalized()
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let theta = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    var kept_at = Growing[f64]()
+    defer kept_at.close()
+    var kept_sizes = Growing[f64]()
+    defer kept_sizes.close()
+    var kept_slopes = Growing[f64]()
+    defer kept_slopes.close()
+    try keep_law(law, &kept_at, &kept_sizes, &kept_slopes)
+    if straight_law(kept_at.view(), kept_sizes.view(), kept_slopes.view()): return false
+    var rolled = Rolled(start, along, length, ua, ub, theta, try ua.add(ub).normalized().multiply_scalar(1.0 / math.sin(theta * 0.5)), kept_at.view(), kept_sizes.view(), kept_slopes.view(), along, along)
+    if rolled_folds(&rolled): return false
+    try rolled_section(&rolled, 0.0, at_start)
+    try rolled_section(&rolled, length, at_end)
+    return true
 
 ## The middle weight of the section square to the edge of the cone a ball
 ## rolls out between flat faces `theta` apart, its radius growing `slope`
