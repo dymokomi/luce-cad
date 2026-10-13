@@ -9,6 +9,14 @@
 ## of which is offset 1 in together make the box again; offset 1 out and
 ## back in, the box again; offset 2 in, each strip's middle 2 inside its
 ## old one along the old normal.
+##
+## Extension (surface_extend.lucb): the rounded box's top moved up 2, 5 and
+## 15 makes the box that much taller (whole times (20 + up) / 20); it made
+## one too small before, silently, the strips ending at their old top. A
+## box rounded G2 on every edge offset 1 in on every face closes (its
+## strips and corner patches meet tangentially: the edges between them are
+## moved along their normals). A strip's surface extended 3 (Extended
+## Surface) is a sheet 6 higher than its surface was, its middle where the strip's is.
 from luce_cad.modeling import CadModeling, CadDirect
 from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
@@ -46,6 +54,16 @@ func all_faces(model: CadModel) -> str!:
         names = name if names.length == 0 else names + ";" + name
     return names
 
+## The lowest and highest y of `model`'s mesh at 16 divisions.
+func heights(model: CadModel) -> (float, float)!:
+    let mesh = model.tessellate(16)
+    var low = 1e9
+    var high = -1e9
+    for at in 0..<mesh.point_count():
+        low = math.min(low, mesh.point(at).y)
+        high = math.max(high, mesh.point(at).y)
+    return (low, high)
+
 pub func offset_spline_tests() -> unit!:
     let box = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "r")
     let upright = func (a: Vector3, b: Vector3) -> bool:
@@ -80,4 +98,26 @@ pub func offset_spline_tests() -> unit!:
         # The new face's point lies 2 in from the old surface along the old
         # normal there: its distance from the old point's tangent plane.
         near(before.point.subtract(after.point).dot(before.normal), 2.0, 1e-3, "a strip offset 2 in")
-    print("PASS B-spline offsets: a box rounded G2 shelled 1 closed (with its void, the body offset 1 in, it makes the box) and opened at its top; offset 1 out and back in, the box; strips offset 2 in lie 2 inside along their normals")
+    for up in [2.0, 5.0, 15.0]:
+        let taller = CadDirect.moved_faces(rounded, top, Vector3(0.0, up, 0.0))
+        near(refined(taller), whole * (20.0 + up) / 20.0, 0.02, "the rounded box's top moved up")
+    let corners = CadModeling.filleted(box, "", 3.0, "c", 2)
+    let shrunk = CadDirect.offset_faces(corners, all_faces(corners), -1.0, false)
+    closed(shrunk.tessellate(32))
+    assert(volume(shrunk.tessellate(32)) < volume(corners.tessellate(32)) and volume(shrunk.tessellate(32)) > 14.0 * 14.0 * 14.0)
+    var strip = ""
+    for face in 0..<rounded.face_count():
+        let name = CadModeling.face_name_of(rounded, face)
+        if name.starts_with("g/") and strip.length == 0: strip = name
+    let sheet = CadModeling.extended_surface(rounded, strip, 3.0)
+    # Against the surface barely extended (its natural extent: the strip's
+    # surface reaches a little past the face), 3 more each way.
+    let (low, high) = heights(sheet)
+    let (low0, high0) = heights(CadModeling.extended_surface(rounded, strip, 1e-9))
+    near(low0 - low, 3.0, 1e-6, "an extended strip's bottom")
+    near(high - high0, 3.0, 1e-6, "an extended strip's top")
+    let middle = CadModeling.face_point(rounded, strip)
+    let extended = CadModeling.face_point(sheet, strip)
+    assert(middle.found and extended.found)
+    near(extended.point.subtract(middle.point).length(), 0.0, 1e-6, "an extended strip's middle")
+    print("PASS B-spline offsets: the top moved up 2, 5 and 15 past the strips' ends (extended naturally); a box rounded G2 all round offset 1 in; a strip's surface extended 3; a box rounded G2 shelled 1 closed (with its void, the body offset 1 in, it makes the box) and opened at its top; offset 1 out and back in, the box; strips offset 2 in lie 2 inside along their normals")

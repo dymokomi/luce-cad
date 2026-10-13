@@ -1,0 +1,145 @@
+## A B-spline surface carried on past its sides naturally (Alias's
+## Extrapolate, SMLib's end-span continuation): along each direction the
+## last span's polynomial goes on past the end, by de Casteljau beyond 1 on
+## the homogeneous net, so the surface is unchanged over its old domain
+## and as smooth past it as within (an arc stays on its circle). The last
+## span is first made a Bezier (its inner breakpoint inserted to the
+## degree); the extended span then runs from that breakpoint to the new
+## end. Faces keep their place on the surface: the extended one holds the
+## old one, its parameters only renormalized.
+##
+## Surfacing's Extend (surfacing/extend.lucb, Natural) carries one net
+## side on the same way, through `continued_bezier`.
+
+## The homogeneous Bezier `points` (`degree` + 1 points of `stride`
+## numbers each, back to back) over parameters 0..1 carried on to 0..`s`
+## (s > 1, de Casteljau past the end), in place.
+pub func continued_bezier(points: f64[], degree: usize, stride: usize, s: f64) -> !:
+    let work = try new f64[points.length] --- in memory.heap
+    defer free(work) in memory.heap
+    for at in 0..<points.length: work[at] = points[at]
+    # The left polygon of the subdivision at s: each level's first point.
+    for level in 1..<degree + 1:
+        for i in 0..<degree + 1 - level:
+            for c in 0..<stride: work[i * stride + c] = work[i * stride + c] * (1.0 - s) + work[(i + 1) * stride + c] * s
+        for c in 0..<stride: points[level * stride + c] = work[c]
+
+## `s` (a B-spline) extended by `amounts`: the u low, u high, v low and v
+## high sides by those shares of the domain's length along them (0: that
+## side stays). An error when a rational net's weights would vanish.
+pub func extended_spline(s: const Surface*, amounts: const f64[]) -> Surface!:
+    if s.kind != surface_spline: error(invalid, "only a B-spline surface extends this way (an analytic one goes on of itself)")
+    let nu = (usize)s.nu
+    let nv = (usize)s.nv
+    # Rows along u: row i holds net points (i, 0..nv) as (wx, wy, wz, w).
+    var rows = Growing[f64]()
+    defer rows.close()
+    for i in 0..<nu:
+        for j in 0..<nv:
+            let w = s.weights[i * nv + j] if s.weights.length > 0 else 1.0
+            let p = s.points[i * nv + j]
+            for value in [p.x * w, p.y * w, p.z * w, w]: try rows.push(value)
+    var ku = Growing[f64]()
+    defer ku.close()
+    for k in s.ku: try ku.push(k)
+    var kv = Growing[f64]()
+    defer kv.close()
+    for k in s.kv: try kv.push(k)
+    let span_u = s.ku[nu] - s.ku[(usize)s.du]
+    let span_v = s.kv[nv] - s.kv[(usize)s.dv]
+    try extend_side(&rows, &ku, (usize)s.du, nv * 4, amounts[0] * span_u, false)
+    try extend_side(&rows, &ku, (usize)s.du, nv * 4, amounts[1] * span_u, true)
+    let rows_u = rows.count // (nv * 4)
+    # Turned: rows along v.
+    var turned = Growing[f64]()
+    defer turned.close()
+    for j in 0..<nv:
+        for i in 0..<rows_u:
+            for c in 0..<(usize)4: try turned.push(rows.items[(i * nv + j) * 4 + c])
+    try extend_side(&turned, &kv, (usize)s.dv, rows_u * 4, amounts[2] * span_v, false)
+    try extend_side(&turned, &kv, (usize)s.dv, rows_u * 4, amounts[3] * span_v, true)
+    let rows_v = turned.count // (rows_u * 4)
+    let points = try new Vector3[rows_u * rows_v] --- in memory.heap
+    defer free(points) in memory.heap
+    let weights = try new f64[rows_u * rows_v] --- in memory.heap
+    defer free(weights) in memory.heap
+    for i in 0..<rows_u:
+        for j in 0..<rows_v:
+            let at = (j * rows_u + i) * 4
+            let w = turned.items[at + 3]
+            if not (w > 0.0): error(invalid, "a rational B-spline cannot be carried that far (its weights would vanish): extend it less")
+            points[i * rows_v + j] = Vector3(turned.items[at] / w, turned.items[at + 1] / w, turned.items[at + 2] / w)
+            weights[i * rows_v + j] = w
+    return try Surface(surface_spline, s.origin, s.x, s.z, s.radius, s.angle, points, weights, ku.view(), kv.view(), (i64)rows_u, (i64)rows_v, s.du, s.dv)
+
+## The B-spline whose rows of `stride` numbers are `rows` (knots `knots`,
+## `degree`) carried on past its high end (`high`) or low end by parameter
+## length `h`: the last span made a Bezier, continued, its end knots moved.
+func extend_side(rows: Growing[f64]*, knots: Growing[f64]*, degree: usize, stride: usize, h: f64, high: bool) -> !:
+    if not (h > 0.0): return
+    if not high: try mirror(rows, knots, stride)
+    let p = degree
+    var count = rows.count // stride
+    let end = knots.items[count]
+    let start = knots.items[p]
+    # The last span's inner breakpoint, to the degree.
+    var breakpoint = start
+    for k in p + 1..<count:
+        if knots.items[k] < end: breakpoint = knots.items[k]
+    if breakpoint > start:
+        var times: usize = 0
+        for k in knots.view():
+            if k == breakpoint: times += 1
+        var scratch = Growing[f64]()
+        defer scratch.close()
+        while times < p:
+            try insert_knot(rows, knots, &scratch, p, stride, breakpoint)
+            times += 1
+        count = rows.count // stride
+    let first = (count - p - 1) * stride
+    try continued_bezier(rows.items[first..<count * stride], p, stride, (end + h - breakpoint) / (end - breakpoint))
+    for k in count..<knots.count: knots.items[k] = end + h
+    if not high: try mirror(rows, knots, stride)
+
+## Rows and knots reversed (knot k becomes -k), so the low end is the high.
+func mirror(rows: Growing[f64]*, knots: Growing[f64]*, stride: usize) -> !:
+    let count = rows.count // stride
+    for i in 0..<count // 2:
+        for c in 0..<stride:
+            let swap = rows.items[i * stride + c]
+            rows.items[i * stride + c] = rows.items[(count - 1 - i) * stride + c]
+            rows.items[(count - 1 - i) * stride + c] = swap
+    let n = knots.count
+    for i in 0..<n // 2:
+        let swap = knots.items[i]
+        knots.items[i] = -knots.items[n - 1 - i]
+        knots.items[n - 1 - i] = -swap
+    if n % 2 == 1: knots.items[n // 2] = -knots.items[n // 2]
+
+## The B-spline face named `face` of `model`, its surface extended by
+## `distance` every way (as shares of its middle isoparms' lengths), as a
+## one-face sheet (CadModeling.extended_surface).
+func extended_face(model: const CadModel*, face: str, distance: f64) -> interop.Reference[CadModel]!:
+    if not (distance > 0.0) or not math.is_finite(distance): error(invalid, "Extend: the distance must be more than zero")
+    var w = try shape_of(model)
+    defer w.close()
+    var f: i64 = -1
+    for k in 0..<w.faces.count:
+        if w.face_name(k) == face:
+            f = (i64)k
+            break
+    if f < 0: error(invalid, "the face to extend is not in the body: pick it again")
+    let shape_face = w.faces.items[(usize)f]
+    let s = &w.surfaces.items[(usize)shape_face.surface]
+    if s.kind != surface_spline: error(invalid, "an analytic face's surface goes on of itself: Untrim gives its natural extent")
+    let share_u = distance / math.max(try isoparm_length(s, true), 1e-300)
+    let share_v = distance / math.max(try isoparm_length(s, false), 1e-300)
+    let amounts = [share_u, share_u, share_v, share_v]
+    var longer = try extended_spline(s, amounts[..<4])
+    defer longer.close()
+    let output = try BrepModel.held(math.max(w.tolerance, least_tolerance))
+    defer output.release()
+    let b = output.value()
+    try untrim_spline(b, &longer, shape_face.sense, w.tolerance)
+    for k in 0..<b.face_count(): try b.set_face_name(k, face)
+    return try CadModel.of_brep(output)

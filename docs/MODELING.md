@@ -1066,7 +1066,17 @@ faces take new surfaces and the body keeps its topology. Built directly, without
   halved until it holds at the spans' middles. A profile swept straight (a G2 or G3 blend's strip)
   stays one and is swept four offsets further both ways, so a neighbor moved out past its old end
   still meets it. A moved face and a B-spline neighbor meet along the booleans' curve: in closed form
-  where they have one (a plane across a swept profile), else traced round the edge.
+  where they have one (a plane across a swept profile), else traced round the edge. B-spline faces
+  beside a moved one first have their surfaces carried on naturally past every end
+  (`surface_extend.lucb`: the last span's polynomial continued by de Casteljau past 1 on the
+  homogeneous net, the surface unchanged over its old domain) by twice as far as the move takes any
+  vertex, so a face moved past a strip's end still meets it (a rounded box's top moved up made the
+  box too short before, silently); an edge left off its B-spline face's surface is refused. Two
+  offset B-spline faces tangent along an edge (a G2 corner patch and its strip) no longer cross:
+  their edge is the old one's points moved along the normal, refitted.
+- **Extended Surface** (`CadModeling.extended_surface`): the extension operator itself, a B-spline
+  face's surface carried on naturally by a distance every way, as a one-face sheet. Surfacing's
+  Extend, Natural, continues a side the same way (`continued_bezier`).
 
 The result is checked closed. Not checked yet: a moved face passing through a far part of the
 body (a self-intersection), which needs the booleans' face pairs.
@@ -2154,9 +2164,9 @@ Roughly in order of usefulness:
    it, joined; a pipe inside a box touching its wall, subtracted; a pipe grazing a box's top and
    bottom, taken from it; a box laid against a B-spline strip, found by `modeling/contact.lucb`
    since no curve follows a touch) are refused as non-manifold.
-9. **Offsets where faces vanish or reconnect** (a shell thicker than a fillet's radius), B-spline
-   offsets of other than profiles swept straight past their surfaces' ends (no extension yet), and
-   draft; Delete healing several faces at once beside curved faces
+9. **Offsets where faces vanish or reconnect** (a shell thicker than a fillet's radius), a shell of
+   a box rounded G2 on every edge (its offset body closes, but the booleans' tolerance is tighter
+   than the corners it finds), and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face (strips apart, inside corners).
 10. **Long strips and narrow corners in meshes:** a hole's wall meshed as one row of strips from
    its floor to its rim, and a floor as strips across it, are long by design (aspects in the

@@ -200,6 +200,9 @@ func substitute(w: Shape*, faces: const usize[], m: const FaceMove*, targets: co
     # Where each vertex was, to judge each edge's way after.
     var old_points = try copied_points(w)
     defer old_points.close()
+    # B-spline neighbors carried on past their ends, so a moved face going
+    # past one still meets it (and its corners are found on it).
+    try extend_neighbors(w, moved.view(), m, distances)
     for at in 0..<moved_count:
         let f = faces[at]
         let distance = distances[at] if distances.length > 0 else m.distance
@@ -240,10 +243,80 @@ func substitute(w: Shape*, faces: const usize[], m: const FaceMove*, targets: co
         let edge = w.edges.items[e]
         try refit_edge(w, e, moved.view(), m, old_points.items[(usize)edge.start], old_points.items[(usize)edge.end])
     try check_loops(w)
+    try check_reach(w)
     try orient(w, w.faces.count)
     let solid = try used_brep(w)
     defer solid.release()
     return try CadModel.of_brep(solid)
+
+## Each B-spline face of `w` beside a moved face (not moved itself) on a
+## surface extended naturally (surface_extend.lucb) every way by twice as
+## far as the move takes any moved face's vertex (an offset's distance, a
+## replacement's tenth of the model), as a share of the surface's middle
+## isoparms' lengths. Over its old domain the surface is the same.
+func extend_neighbors(w: Shape*, moved: const bool[], m: const FaceMove*, distances: const f64[]) -> !:
+    var reach = math.abs(m.distance)
+    for d in distances: reach = math.max(reach, math.abs(d))
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for e in 0..<w.edges.count:
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        let on_moved = (fa >= 0 and moved[(usize)fa]) or (fb >= 0 and moved[(usize)fb])
+        for v in [w.edges.items[e].start, w.edges.items[e].end]:
+            let p = w.points.items[(usize)v]
+            low = lower(low, p)
+            high = upper(high, p)
+            if on_moved: reach = math.max(reach, m.point(p).subtract(p).length())
+    if m.kind == move_replace: reach = math.max(reach, high.subtract(low).length() * 0.1)
+    if not (reach > 0.0): return
+    var done = Growing[i64]()
+    defer done.close()
+    for e in 0..<w.edges.count:
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0 or moved[(usize)fa] == moved[(usize)fb]: continue
+        let neighbor = (usize)(fb if moved[(usize)fa] else fa)
+        let index = w.faces.items[neighbor].surface
+        if w.surfaces.items[(usize)index].kind != surface_spline: continue
+        var seen = false
+        for k in done.view(): seen = seen or k == index
+        if seen: continue
+        try done.push(index)
+        let s = &w.surfaces.items[(usize)index]
+        let along_u = try isoparm_length(s, true)
+        let along_v = try isoparm_length(s, false)
+        let share_u = math.min(2.0, 2.0 * reach / math.max(along_u, 1e-300))
+        let share_v = math.min(2.0, 2.0 * reach / math.max(along_v, 1e-300))
+        let amounts = [share_u, share_u, share_v, share_v]
+        let longer = try extended_spline(s, amounts[..<4])
+        w.surfaces.items[(usize)index].close()
+        w.surfaces.items[(usize)index] = longer
+
+## The length of B-spline `s`'s middle isoparm along u (`along_u`) or v,
+## by 32 chords.
+func isoparm_length(s: const Surface*, along_u: bool) -> f64!:
+    var run = 0.0
+    var before = try evaluate(*s, Vector3(0.0, 0.5, 0.0) if along_u else Vector3(0.5, 0.0, 0.0))
+    for k in 1..<33:
+        let t = (f64)k / 32.0
+        let p = try evaluate(*s, Vector3(t, 0.5, 0.0) if along_u else Vector3(0.5, t, 0.0))
+        run += p.subtract(before).length()
+        before = p
+    return run
+
+## An error when a B-spline face's edge runs off its surface (past an end
+## extend_neighbors could not carry it to): five points of each within a
+## hundred tolerances of the surface, found over the whole surface.
+func check_reach(w: const Shape*) -> !:
+    for f in 0..<w.faces.count:
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind != surface_spline: continue
+        for use in w.face_uses(f):
+            for k in 0..<5:
+                let p = try w.edge_at(edge_index(use), ((f64)k + 0.5) / 5.0)
+                let q = try evaluate(*s, try nearest_parameters(*s, p, Vector3(0.5, 0.5, 0.0), true))
+                if q.subtract(p).length() > w.tolerance * 100.0: error(invalid, "a B-spline face cannot reach where its edge has moved: the move takes it past where its surface can be carried on")
 
 ## A shape of its own with everything `w` has.
 func shape_copy(w: const Shape*) -> Shape!:
@@ -353,7 +426,7 @@ func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, ol
                 # corner) offset alike stay tangent, so they touch rather
                 # than cross: the edge is the old one moved along their
                 # shared normal.
-                recover try tangent_carrier(w, (usize)fa, (usize)fb, &old, start, end, middle, failure.message)
+                recover try tangent_carrier(w, (usize)fa, (usize)fb, &old, e, start, end, middle, failure.message)
             carrier = try w.add_carrier(met)
     let c = w.carriers.items[(usize)carrier]
     var t0 = 0.0
@@ -391,11 +464,12 @@ func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, ol
     w.edges.items[e] = ShapeEdge(carrier, t0, t1, edge.start, edge.end)
 
 ## The carrier of a tangent edge between faces `fa` and `fb` of `w`, both
-## offset alike: the old carrier `old` moved onto them, a line through the
-## new ends or the circle through them and the old middle `middle` moved
-## onto the new surface along its normal. Anything else, or faces not
-## meeting tangentially, fails with `reason`.
-func tangent_carrier(w: const Shape*, fa: usize, fb: usize, old: const Carrier*, start: Vector3, end: Vector3, middle: Vector3, reason: str) -> Carrier!:
+## offset alike: the old carrier `old` (of old edge `edge`) moved onto
+## them, a line through the new ends, the circle through them and the old
+## middle `middle` moved onto the new surface along its normal, or a
+## B-spline through edge `e`'s old points so moved (a G2 corner patch's
+## edge with its strip). Faces not meeting tangentially fail with `reason`.
+func tangent_carrier(w: Shape*, fa: usize, fb: usize, old: const Carrier*, e: usize, start: Vector3, end: Vector3, middle: Vector3, reason: str) -> Carrier!:
     let na = try w.face_normal(fa, start)
     let nb = try w.face_normal(fb, start)
     if na.dot(nb) < 1.0 - 1e-6: error(invalid, reason)
@@ -405,6 +479,7 @@ func tangent_carrier(w: const Shape*, fa: usize, fb: usize, old: const Carrier*,
         let d = end.subtract(start)
         if d.length() <= w.tolerance * 10.0: error(invalid, reason)
         return Carrier(curve_line, start, try d.normalized(), Vector3(), 0.0, 0.0, -1)
+    if old.kind == curve_spline: return try moved_spline_carrier(w, fa, fb, e, start, end, reason)
     if old.kind != curve_circle: error(invalid, reason)
     # The circle through start, the moved middle and end.
     let a = start.subtract(moved)
@@ -425,6 +500,46 @@ func tangent_carrier(w: const Shape*, fa: usize, fb: usize, old: const Carrier*,
     if z.dot(old.x.cross(old.y)) < 0.0: z = z.multiply_scalar(-1.0)
     let x = try start.subtract(center).normalized()
     return Carrier(curve_circle, center, x, z.cross(x), radius, radius, -1)
+
+## A B-spline carrier through edge `e`'s old points (33 along it) each
+## moved onto face `fa`'s surface along its normal, from `start` to `end`:
+## faces offset alike and tangent along the edge share the moved points.
+## It must lie on both faces' surfaces to within ten tolerances at the
+## points between, else `reason`; the edge keeps how far it strays (the
+## faces' offsets are each fitted to the tolerance).
+func moved_spline_carrier(w: Shape*, fa: usize, fb: usize, e: usize, start: Vector3, end: Vector3, reason: str) -> Carrier!:
+    let edge = w.edges.items[e]
+    var points = Growing[Vector3]()
+    defer points.close()
+    let count = 32
+    for k in 0..<count + 1:
+        if k == 0: try points.push(start)
+        elif k == count: try points.push(end)
+        else:
+            let p = try w.at(edge.carrier, edge.t0 + (edge.t1 - edge.t0) * (f64)k / (f64)count)
+            let (gap, n) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[fa].surface], p, w.tolerance)
+            try points.push(p.subtract(n.multiply_scalar(gap)))
+    var net = Growing[Vector3]()
+    defer net.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    try interpolate_cubic(points.view(), &net, &knots)
+    var weights = Growing[f64]()
+    defer weights.close()
+    for _ in net.view(): try weights.push(1.0)
+    let spline = try w.store_spline(net.view(), weights.view(), knots.view(), 3, Matrix4())
+    let carrier = Carrier(curve_spline, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline)
+    let index = try w.add_carrier(carrier)
+    var strays = 0.0
+    for k in 0..<count * 2 + 1:
+        let q = try w.at(index, (f64)k / (f64)(count * 2))
+        for f in [fa, fb]:
+            let (off, _) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[f].surface], q, w.tolerance)
+            strays = math.max(strays, math.abs(off))
+    if strays > w.tolerance * 10.0: error(invalid, reason)
+    while w.edge_slack.count <= e: try w.edge_slack.push(0.0)
+    if strays > w.tolerance: w.edge_slack.items[e] = math.max(w.edge_slack.items[e], strays * 1.5)
+    return carrier
 
 ## Circle or ellipse `c`'s parameter at `p` (on it).
 func angle_on(c: const Carrier*, p: Vector3) -> f64:

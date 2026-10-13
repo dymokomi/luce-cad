@@ -901,9 +901,19 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   plane across a swept profile, else traced). S2 and S3 run, closed: 1699.144 and 2013.059 (SMLib
   1717.846 and 2034.240, whose G2 strips are a different, faired quintic, as in B8); the closed
   shell and the body offset 1 in make the rounded box again within 0.02, offset 1 out and back in
-  too. A shell's refusal now gives the inner wall's own reason. Still open: extending other
-  B-splines (end-span continuation), offsets of rational bases kept rational, and the surface
-  extension operator as a modeling tool of its own.
+  too. A shell's refusal now gives the inner wall's own reason. Then: end-span continuation for
+  any B-spline (`modeling/surface_extend.lucb`, de Casteljau past the end on the homogeneous net,
+  the last span first made a Bezier), exposed as `CadModeling.extended_surface` (a face's surface
+  extended by a distance every way, as a sheet) and used by surfacing's Extend Natural, so the two
+  share one continuation. Face moves extend the B-spline faces beside a moved face first: moving
+  the G2-rounded box's top up 2, 5 and 15 had silently made a box too short (5743.2 for 8429.7;
+  the strips ended at their old top), and now gives the whole times (20 + up) / 20 to 1e-6. Two
+  offset B-spline faces tangent along an edge (a G2 corner patch and its strip) take the old
+  edge moved along the normal: a box rounded G2 on every edge offset 1 in now closes (refused
+  before); its shell still fails in the boolean, whose tolerance (size × 1e-7) is tighter than
+  the offset body's corners. Still open: offsets of rational bases kept rational, and extending
+  offsets themselves beyond profiles (tried naturally: the shell's boolean then marched on and
+  on over the extended patches).
 
 - **7, fillet corners of N edges (part).** F8 (a square pyramid, every edge 1) was already built
   whole by `rounded.lucb` (the solid shrunk and grown back by a ball): 1933.19 extrapolated against
