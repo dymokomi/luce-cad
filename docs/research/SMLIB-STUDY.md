@@ -1049,6 +1049,23 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   the segments by it skipped (`clip.lucb`): P1 158 to 117 ms; the rest is splitting faces into
   pieces (`face_pieces`). The comparison cases are unchanged by it (B8 52 to 31 ms).
 
+- **14, UsdSolid write and read (NURBS, manifold).** luce-usd writes each CAD model's B-rep as a
+  `BrepArray` beside the NurbsPatch faces (`convert/export_solids.lucb`, `solid_curves.lucb`; the
+  draft's names in one table, `solid_schema.lucb`) and reads it back (`solids.lucb`,
+  `solid_build.lucb`): regions (the outside, each lump, each cavity, by box nesting), shells,
+  faceuses on the surfaces' normal sides, loops counterclockwise about it, edgeuse pairs; vertices,
+  edges as NURBS from their start vertex to their end one, faces' surfaces as the patches, with U the
+  rows (the cube of the proposal's README puts the `same` faceuse on du x dv's side only so). Planes,
+  cylinders, cones, spheres and tori are recognised again from their rational arcs
+  (`solid_shapes.lucb`), so their seams and poles mesh as ours do (a sphere's B-spline patch with
+  poles refused to). Round trips as text and binary: a box, a box rounded G2 on every edge (its 66
+  faces, volume identical), a dome, a drilled ball, two lumps, an open sheet, a closed shell with
+  its cavity (regions void, solid of two shells, void); a non-manifold array refused by name
+  (`solid_tests`). Not done: the analytic shape APIs (NVIDIA's omniSolid) and trim curves, and a
+  check against NVIDIA's reader (its USD build). The proposal's sample's radial entry types fit no
+  rule we could find; ours enter a face from its normal side where the edgeuse runs against its
+  edge (loops counterclockwise about the normal), and our reader does not need them.
+
 ## 12. What not to take
 
 - **Its surfaces.** Cubic approximations of circles by default, G1-within-an-angle corners, Coons
