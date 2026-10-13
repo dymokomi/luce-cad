@@ -764,17 +764,37 @@ along a box's edge, 2 to 6 straight, G2 at 0.5, 1, 2 and G1 at 0.5, 0.9, 0.99, 0
 radius below), all Fusion's volumes. Full round takes no weight (Fusion's Full Round has none). `tangency_tests` checks that a box edge keeps more of its corner as the weight
 rises at G1, G2 and G3, that 1 is the plain fillet, corners and a cap loop.
 
-**Setback corners.** Three G2 or G3 fillets meeting at a corner of three flat faces can't be rounded
-by a ball: no sphere is tangent to them, since their sections aren't circles. So each fillet stops
-short of the corner, at its setback (setback.lucb), as Fusion and SolidWorks do. That is a plane
-square to its edge, past where the next fillets' contacts cross on the faces, by the largest contact
-distance: 2 r at a square corner, Fusion 2705's (probe 14: a 20 cube's corner rounded 4 at G1 and G2,
-and a boss's and an L's mixed corners, all stop 2 r from the corner; it was 1.5 r here before).
+**Three-sided corners** (Fusion's default, Rolling ball, for G2 and G3 fillets; `three_sided.lucb`).
+Three G2 or G3 fillets of one radius meeting at a corner of three flat faces can't be rounded by a
+ball: no sphere is tangent to them, since their sections aren't circles. As Fusion 2705 does (probes 14
+and 17: its patch a 25 x 25 bicubic with one side collapsed), each strip stops where a G1 one would meet
+the ball, square to its edge through the ball's center (r from a square corner), and a three-sided
+patch fills the hole between the three end sections, touching each face at one point: three quads of
+`corner_patch` about a center, each side's rows along its strip's sweep (two inner knots more in each
+half, for room). At a hole's corner the two strips' first rows lie in the face there, so the quad's
+points beside both sit where the two sweeps cross: at a square corner G2 all round; at a slanted one
+the patch misses G1 by a few hundredths of a degree and G2 near the hole's corners (Fusion's patch has
+these rate conflicts too). The seams keep G1 exactly; their G2 rows are left out (at a vertex of three
+they ask for no second derivatives, and the quads collapse onto the center), and still come out G2
+within a few percent. Fusion's patch is fuller than the fair fill: a fullness of 1.143
+(`fusion_three_sided_fullness`, the default 0) gives its solids for a 20 cube's corner rounded 4 and 2,
+7845.406289 and 7960.487036, within 0.01 (`vertex_blend_tests`). The booleans make the same corner as a
+tool (`three_sided_tool`). Under the Setback corner type these corners are setback corners.
+
+**Setback corners.** Under the Setback corner type (and where radii differ), each fillet stops short of
+the corner, at its setback (setback.lucb), as Fusion and SolidWorks do. That is a plane square to its
+edge, past the farther of the points where the next fillets' contacts cross its own on the faces, by
+Fusion 2705's reach (probes 14 and 17: a 20 cube's corner with every mix of radii 1 to 6, G1 and G2,
+Setback and Rolling ball alike): the mean of the corner's contact distances, and for the one smallest
+fillet half its gap to the next smallest more. At a square corner of one radius that is 2 r; radii 2,
+3 and 4 stop 7.5, 7 and 6 from it, 1, 4 and 4 stop 8.5, 7 and 7 (every one of probe 17's nineteen
+cases exactly; `fillet_sets_tests`).
 
 The hole left is six-sided. Its sides alternate between the fillets' end sections (A curves) and
 curves on the faces (B curves). A B curve runs between two fillets' contacts, its legs along their
 contact lines: at G1 Fusion's circle tangent to both (radius r at a square corner, 3 r on a face where
-two inside fillets' contacts cross behind the corner; a conic where the legs differ), a polynomial
+two inside fillets' contacts cross behind the corner; a conic where the legs differ, where Fusion's
+own is a fitted cubic a little fuller: unequal radii's volumes within 0.3 to 3.6 of its), a polynomial
 quintic within 2e-5 of it so the quads' rows stay exact; at G2 and G3 the profile, flat at its ends
 (three points along each contact line, as the strip beside it runs, which keeps the patch G2 there:
 Fusion's circles at G2 break it). Six quads fill the hole, one at each of its corners, meeting
@@ -812,7 +832,7 @@ its points are not checked against one; each quad is turned as the face it touch
 corner). Fusion's own (probe 14) is one bicubic fitted over a hexagon (a transfinite patch), fuller
 than our fair fill: its solids (exported as STEP, measured here) take 1817.0823 and 6001.6447 against
 our 1816.933 and 6002.838, and its convex cube corner at G1 and G2 7777.892 and 7816.853 against our
-7763.545 and 7811.634 with the fair fill (fullness 1, the default); Fusion's fullness (below) meets
+7763.545 and 7811.634 with the fair fill (fullness 1); Fusion's fullness (below, the default) meets
 them.
 
 **The corner's controls** (Alias's; `corner_shape`, `corner_fullness`; `vertex_blend_tests`):
@@ -821,10 +841,11 @@ them.
   the corner);
 - **Fullness** (Ball Corner's Pivot Curve Length Ratio): the patch made once, then again with its
   center held where its bulge from the hole's curves' middle is scaled by it (1 the fair fill's own;
-  more fuller); 0 asks Fusion's: 1.27 at G1 and 1.1 at G2 and G3 (`fusion_fullness`), which takes
-  the corners above to Fusion's volumes within 0.4 (the cube's at G1 and G2, the boss's and the L's
-  vertex blends). Not the default: a fuller patch's offsets (a box rounded G2 on every edge, shelled)
-  no longer meet within the tolerance at its center.
+  more fuller); 0, the default, Fusion's: 1.27 at G1 and 1.1 at G2 and G3 (`fusion_fullness`), 1.143
+  at a three-sided corner, which takes the corners above to Fusion's volumes within 0.4 (the cube's
+  at G1 and G2, the boss's and the L's vertex blends). A fuller patch's offsets (a box rounded G2 on
+  every edge, shelled) had met their strips' 1.4e-6 apart at 0.04 degrees and their meshes did not
+  close: B-spline offsets are now fitted to a quarter of the tolerance over every span (Shell).
 
 **Too large.** Before any tool, each edge's blend must fit (the way into each face is found a
 quarter of the reach in, clear of where a curved boundary's chart, its chords, strays off the
@@ -991,7 +1012,7 @@ body's:
     the cut;
   - two: a miter, both strips cut by the plane bisecting their edges;
   - three, G1: a ball, the strips stopping square to their edges through its center;
-  - three, G2 or G3: a setback corner, its six quads;
+  - three, G2 or G3: a three-sided corner, its three quads (a setback corner, six, under Setback);
   - four to eight, G1: a ball where one touches every face (a regular pyramid's apex), its sphere
     patch bounded by N arcs; else, and G2 and G3, a setback corner of 2N quads (a G1 one's rational,
     its strips' ends the circles' arcs in two halves);
@@ -1376,7 +1397,7 @@ them, is refused. With Fusion's **Extend splitting tool** off the tool face itse
 B-spline face too, which cannot be extended): it splits only where it reaches, and a face it meets
 must be cut right across. A cut ending inside a face is refused, naming the option.
 
-### Shell (`shell.lucb`)
+### Shell (`shell.lucb`, `shell_cells.lucb`)
 
 Two offset bodies are made with the local face operations above. The outer one has every face moved
 out by the outside thickness; the removed faces stay where they are. The inner one has every face
@@ -1408,14 +1429,39 @@ Delete cannot heal the swallowed rounds alone, `refilleted_inner` deletes every 
 cylinder between two flat walls, and their balls and tori), offsets the sharp body and makes the
 rounds again on it as one fillet of edge sets (convex r at r − wall, gone past it; concave at r +
 wall: the offsets of rounds about the same axes); a round beside an opened face is left to
-`tangent_opening`. `convex_inner` now checks the body is convex (every vertex behind every flat
+`tangent_opening`. `convex_inner` checks the body is convex (every vertex behind every flat
 face's plane, its rounds turned outward): an L rounded 1 on every edge had been taken for convex and
-given 5374 where Fusion gives 3423.30; it is refused by name now (Delete cannot heal all its rounds
-together). Any other wall that
+given 5374 where Fusion gives 3423.30.
+
+**The cells of the body's planes** (`shell_cells.lucb`, the SMLib study's item 11: an offset body from a
+soup of faces, its cells kept by winding) take what the paths above cannot: bodies of flat faces and
+rounds between them that are not convex and whose rounds Delete cannot heal together (an L rounded on
+every edge), and walls that swallow a flat face (a small chamfer) on such a body. The flat faces'
+planes cut the body's box into convex cells (split one plane after another, the solid halves kept);
+a cell is the body's when a point inside it is inside the body (three rays: no plane cuts a round's
+own cell, so the kept cells are the sharp body, chamfers and all). Each kept cell made again from its
+planes moved in by the wall (an opened face's out past the outer body) is that cell of the inner body;
+their union (the booleans) is the sharp body's inner parallel body as Fusion makes it, its inside edges
+mitered (Fusion's L shelled 2 is 3504: its planes moved in), a face the others' moved planes pass gone.
+Its faces are named after their planes' faces, and the rounds are made again on it as one fillet of
+edge sets between the same faces: a convex round of r at r − wall (gone past it), a concave one at
+r + wall, a cylinder's offset a cylinder, a G2 or G3 strip's its offset surface: the section offset
+(`BlendShape.offset`, `offset_section`: the plain section between the walls moved back, sampled,
+moved by the wall along its normals and fitted in the plain layout, flat at the walls; a plain G2
+section of r + wall missed Fusion by 4.35 on the L, its section's region 1.514 against the offset's
+1.786 per length). Fusion 2705's probe 15 (`shell_tests`): an L rounded 1 on every edge shelled 2
+closed 3423.2973 (Fusion 3423.3006, 47 faces both), opened at its top 3107.4330 (3107.4377, 46 faces
+both: the hollow's own top face swept out through the wall, the inner body poking through, where
+sweeping the removed face in had cut 134 more from the walls), at G2 3435.946 (3436.146; 67 faces, its
+corners three quads each), and one long top edge chamfered 1, shelled 3, 4646 (17 faces, Fusion's).
+Rounds grown and shrunk together at G2 take the plain section (one offset per fillet). Any other wall that
 would change the body's topology is refused: "the shell's thickness is too large for this body",
 with the inner wall's own reason after it. The inner wall's faces are named `<tag>/` and the face's own name. B-spline faces are offset as
 Offset Face's are: a box rounded G2 shells closed or opened at its top, and one rounded G2 on every
-edge shells closed in 0.7 s. Its offsets are each fitted to the tolerance and meet nearly
+edge (its corners three-sided, or setback corners under Setback, at any fullness) shells closed in
+0.5 to 1 s. Each offset is fitted to a quarter of the tolerance over a five by five grid in every span
+(a sparser check let a fuller corner patch's offset stray seven tolerances between its points, and
+neighbors' offsets then met at an angle). Its offsets meet nearly
 tangentially at its corner patches, so their corners are found within ten tolerances and their
 edges stray up to a few: such vertices and edges keep how far (tolerant, as Stitch's joins), the
 B-rep keeps those precisions, and the booleans' charts take an input's points within ten of their
@@ -2372,7 +2418,11 @@ gives the numbers; three constructions answer them.
   spans, 107 s, G2 missed by up to 199%): G1 to a ten-thousandth of a degree, G2 to the walls exact,
   along the fillets within 2% (most stations within the 0.5% tolerance) but within a tenth of a side of
   the hole's corners, its five seams G2 by the Check tools. G1 corners of the same kind fill G1
-  everywhere, no conflicts, in a fraction of a second.
+  everywhere, no conflicts, in a fraction of a second. A box corner's setback hole fills G2 exactly at
+  any reach (`fill_tests`, radii 0.3 and 0.6 on a 2 box): its joined face curves' middle knot came out
+  a rounding off 0.5 (0.49999999999999856) at some radii, the halves' split inserted 0.5 again beside
+  it, and the spans of no length left the solve singular (r 0.4 and 0.5 at G3); `split_middle` now
+  takes a knot within a billionth of the middle as the middle.
 - **Strips for a lid's turns** (`fill_strips.lucb`). Where a Quad lid's corner turns (above), the first
   answer's cross derivative along each side is taken off it (off the turns its own; on them its length
   at the turn's start blended to the corner's own, the other boundary's derivative, turned on the great
@@ -2567,11 +2617,10 @@ Roughly in order of usefulness:
    it, joined; a pipe inside a box touching its wall, subtracted; a pipe grazing a box's top and
    bottom, taken from it; a box laid against a B-spline strip, found by `modeling/contact.lucb`
    since no curve follows a touch) are refused as non-manifold.
-9. **Offsets where faces vanish or reconnect** beyond convex bodies and convex rounds (a body that is
-   not convex shells where Delete heals its swallowed rounds, or all its rounds for the refillet
-   (Shell); an L rounded 1 on every edge shelled 2 is refused, as are G2 strips and flat faces an
-   inset swallows on a body that is not convex: the face soup's arrangement by winding number is not
-   built), outward offsets that reconnect, a body rounded on every edge shelled open at a
+9. **Offsets where faces vanish or reconnect** beyond bodies of flat faces and rounds between them
+   (those shell by Delete's healing, the refillet or the cells of their planes: Shell), curved faces
+   other than rounds between flat walls (a B-spline face that is no strip or corner, a cylinder not
+   between two flat walls), outward offsets that reconnect, a body rounded on every edge shelled open at a
    curved face (a flat one opens square to it: Shell above), and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face and strips apart (adjacent strips of a curved chain, healing by
    extended neighbors' arrangement).

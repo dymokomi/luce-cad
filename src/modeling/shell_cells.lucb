@@ -1,0 +1,396 @@
+## The inner body of a shell by the cells of the body's planes (the SMLib
+## study's item 11: an offset body from a soup of faces, its cells kept by
+## winding), for bodies of flat faces and rounds between them that are not
+## convex and whose rounds Delete cannot heal together (an L rounded on
+## every edge, G1 or G2), or where the wall swallows a flat face (an L with
+## one edge chamfered, shelled thicker than the chamfer).
+##
+## The flat faces' planes cut space into convex cells (a tree of splits
+## over the body's box). A cell is the body's when a point inside it lies
+## inside the body (three rays): the rounds lie within their radii of the
+## sharp edges, where no plane cuts a cell of their own, so the kept cells
+## are the sharp body, chamfers and all. Each kept cell, its planes moved
+## in by the wall (an opened face's out past the outer body), is the same
+## cell of the inner body: their union is the sharp body's inner parallel
+## body as Fusion makes it, its edges mitered (Fusion's shells keep an
+## inside edge sharp: an L shelled 2 is 3504, the plain L's planes moved
+## in), a face the others' moved planes pass (a small chamfer) gone. The
+## rounds are then made again on it as one fillet of edge sets, between
+## the same faces' moved planes: a convex round of r at r - wall (gone when
+## the wall passes it), a concave one at r + wall (a cylinder's offset
+## about its axis; a G2 strip's at G2, r + wall); their corners are the
+## fillet's own.
+
+## A plane of the body's flat faces: its outward normal and offset, the
+## first face on it (its name), whether that face is opened, and its offset
+## moved for the inner body.
+struct CellPlane:
+    var normal: Vector3
+    var offset: f64
+    var face: usize
+    var opened: bool
+    var moved: f64
+
+## A round to make again: its walls' faces, its new size and, a G2 or G3
+## strip's, how far its section is offset (BlendShape.offset: the strip's
+## offset surface; 0 a cylinder's, whose offset is a cylinder).
+struct CellRound:
+    var a: usize
+    var b: usize
+    var size: f64
+    var offset: f64
+
+## The most planes the cells take.
+let most_cell_planes: usize = 24
+
+## The inner body of `model` (`removed` faces opened) for a wall of
+## `wall_in` inside (`wall_out` outside: the opened faces' planes go that
+## much further out), by the cells of its planes (above); none when a face
+## is neither flat nor a round between flat walls, a plane carries faces
+## facing both ways, or a step fails.
+func cells_inner(model: interop.Reference[CadModel], removed: const bool[], wall_in: f64, wall_out: f64) -> interop.Reference[CadModel]?!:
+    if not (wall_in > 0.0): return none
+    var w = try shape_of(model.value())
+    defer w.close()
+    var planes = Growing[CellPlane]()
+    defer planes.close()
+    var rounds = Growing[CellRound]()
+    defer rounds.close()
+    var continuity: i64 = 0
+    var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+    var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(&w, f)
+        low = lower(low, l)
+        high = upper(high, h)
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind == surface_plane:
+            if not try add_cell_plane(&w, f, removed[f], wall_in, wall_out, &planes): return none
+            continue
+        if removed[f]: return none
+        # A round beside an opened face is tangent_opening's (the hollow
+        # opens square to the face there).
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            let fa = w.sides.items[e * 2]
+            let fb = w.sides.items[e * 2 + 1]
+            if (fa >= 0 and removed[(usize)fa]) or (fb >= 0 and removed[(usize)fb]): return none
+        # A round between two flat walls: its size on the inner body.
+        let (round, kind) = try cell_round(&w, f, wall_in)
+        if kind < 0: return none
+        if kind == 0: continue
+        if continuity != 0 and continuity != kind: return none
+        continuity = kind
+        if round.size > w.tolerance * 100.0: try rounds.push(round)
+    if planes.count < 4 or planes.count > most_cell_planes: return none
+    let size = high.subtract(low).length()
+    # The cells of the body's planes, kept where the body is.
+    var signs = Growing[i8]()
+    defer signs.close()
+    try kept_cells(&w, planes.view(), low, high, size, &signs)
+    if signs.count == 0: return none
+    # Each kept cell from the moved planes; their union, its faces named
+    # and its rounds made again.
+    let united = try moved_cells(planes.view(), signs.view(), low, high, size)
+    if let cells = united:
+        defer cells.release()
+        return try cells_remade(&w, planes.view(), rounds.view(), continuity, cells)
+    return none
+
+## The cells' union `united` with every face named after the face of `w`
+## whose plane (of `planes`, moved) it lies on, and `rounds` made again on
+## it at `continuity` as one fillet of edge sets by size; none when a face
+## lies on no plane or the fillet refuses.
+func cells_remade(w: const Shape*, planes: const CellPlane[], rounds: const CellRound[], continuity: i64, united: interop.Reference[CadModel]) -> interop.Reference[CadModel]?!:
+    # Every face named after the face whose plane it lies on.
+    var v = try shape_of(united.value())
+    defer v.close()
+    for f in 0..<v.faces.count:
+        let s = &v.surfaces.items[(usize)v.faces.items[f].surface]
+        if s.kind != surface_plane: return none
+        let normal = face_outward(&v, f)
+        let offset = normal.dot(s.origin)
+        var named = false
+        for plane in planes:
+            if plane.normal.dot(normal) > 1.0 - 1e-9 and math.abs(plane.moved - offset) <= w.tolerance * 100.0:
+                v.faces.items[f].name = try v.add_name(w.face_name(plane.face))
+                named = true
+        if not named: return none
+    let b = try brep_of(&v)
+    defer b.release()
+    let inner = try CadModel.of_brep(b)
+    if rounds.length == 0: return inner
+    defer inner.release()
+    # The rounds again, as edge sets by size, between their walls' faces.
+    var o = try shape_of(inner.value())
+    defer o.close()
+    var radii = Growing[f64]()
+    defer radii.close()
+    for round in rounds:
+        var known = false
+        for r in radii.view(): known = known or math.abs(r - round.size) <= w.tolerance
+        if not known: try radii.push(round.size)
+    var sets = Growing[u8]()
+    defer sets.close()
+    var edges = Growing[i64]()
+    defer edges.close()
+    var text = Growing[u8]()
+    defer text.close()
+    for at in 0..<radii.count:
+        edges.clear()
+        for round in rounds:
+            if math.abs(round.size - radii.items[at]) > w.tolerance: continue
+            # Its walls' planes' faces (a wall's first face on its plane).
+            let fa = planes[(usize)try plane_of(w, planes, round.a)].face
+            let fb = planes[(usize)try plane_of(w, planes, round.b)].face
+            edges_between(&o, w.face_name(fa), w.face_name(fb), &edges) catch failure:
+                if failure.code != invalid: error(failure.code, failure.message)
+                return none
+        text.clear()
+        try references_of(&o, edges.view(), &text)
+        if at > 0: try sets.push(124)
+        for byte in text.view(): try sets.push(byte)
+    # G2 and G3 rounds are their strips' offsets (one offset for the
+    # feature: rounds grown and shrunk together take the plain section).
+    var shape = plain_blend
+    shape.offset = rounds[0].offset
+    for round in rounds:
+        if round.offset != shape.offset: shape.offset = 0.0
+    let made = filleted_sets(inner.value(), (str)sets.view(), radii.view(), "r", continuity, false, shape) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return none
+    return made
+
+## Flat face `f`'s plane onto `planes` (once: a face of a plane already
+## there joins it); false when a plane carries faces facing both ways.
+func add_cell_plane(w: const Shape*, f: usize, opened: bool, wall_in: f64, wall_out: f64, planes: Growing[CellPlane]*) -> bool!:
+    let normal = face_outward(w, f)
+    let offset = normal.dot(w.surfaces.items[(usize)w.faces.items[f].surface].origin)
+    for plane in planes.view():
+        if math.abs(plane.normal.dot(normal)) < 1.0 - 1e-9: continue
+        if math.abs(plane.offset - offset * plane.normal.dot(normal)) > w.tolerance * 100.0: continue
+        if plane.normal.dot(normal) < 0.0 or plane.opened != opened: return false
+        return true
+    try planes.push(CellPlane(normal, offset, f, opened, offset + (wall_in + wall_out if opened else -wall_in)))
+    return true
+
+## The place in `planes` of flat face `f`'s plane.
+func plane_of(w: const Shape*, planes: const CellPlane[], f: usize) -> i64!:
+    let normal = face_outward(w, f)
+    let offset = normal.dot(w.surfaces.items[(usize)w.faces.items[f].surface].origin)
+    for k in 0..<planes.length:
+        if planes[k].normal.dot(normal) > 1.0 - 1e-9 and math.abs(planes[k].offset - offset) <= w.tolerance * 100.0: return (i64)k
+    error(invalid, "a round's wall has no plane")
+
+## Curved face `f` of `w` as cells_inner takes it: a round strip between
+## two flat walls (a cylinder: 1; a G2 or G3 B-spline strip: 2) with its
+## size on the inner body for a wall of `wall` (its walls, r - wall turned
+## outward, r + wall inward); a corner (a sphere, a torus, a B-spline patch
+## meeting strips) to be made again with them (0); or neither (-1).
+func cell_round(w: const Shape*, f: usize, wall: f64) -> (CellRound, i64)!:
+    let none_round = CellRound(0, 0, 0.0, 0.0)
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    if s.kind == surface_sphere or s.kind == surface_torus: return (none_round, 0)
+    if s.kind == surface_cylinder:
+        let (fa, fb) = strip_walls(w, f) catch failure:
+            if failure.code != invalid: error(failure.code, failure.message)
+            return (none_round, -1)
+        if w.surfaces.items[(usize)w.faces.items[fa].surface].kind != surface_plane or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != surface_plane: return (none_round, -1)
+        let size = s.radius - wall if try outward_round(w, f) else s.radius + wall
+        return (CellRound(fa, fb, size, 0.0), 1)
+    if s.kind != surface_spline: return (none_round, -1)
+    let (round, found) = try spline_strip(w, f, wall)
+    if found: return (round, 2)
+    # A corner patch: it meets some strip (a spline face beside flat walls).
+    for use in w.face_uses(f):
+        let e = edge_index(use)
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0: continue
+        let other = (usize)(fb if (usize)fa == f else fa)
+        if other == f or w.surfaces.items[(usize)w.faces.items[other].surface].kind != surface_spline: continue
+        let (_, strip) = try spline_strip(w, other, wall)
+        if strip: return (none_round, 0)
+    return (none_round, -1)
+
+## Whether B-spline face `f` is a G2 or G3 fillet's strip between two flat
+## walls it meets tangentially along straight edges, and its round: its
+## radius the contacts' distance from the walls' meeting line over
+## tan(φ/2) (φ their turn), r - `wall` round a convex edge, r + `wall` in a
+## concave one.
+func spline_strip(w: const Shape*, f: usize, wall: f64) -> (CellRound, bool)!:
+    let none_round = CellRound(0, 0, 0.0, 0.0)
+    var walls = Growing[usize]()
+    defer walls.close()
+    var contacts = Growing[Vector3]()
+    defer contacts.close()
+    for use in w.face_uses(f):
+        let e = edge_index(use)
+        let fa = w.sides.items[e * 2]
+        let fb = w.sides.items[e * 2 + 1]
+        if fa < 0 or fb < 0: continue
+        let other = (usize)(fb if (usize)fa == f else fa)
+        if w.surfaces.items[(usize)w.faces.items[other].surface].kind != surface_plane: continue
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line: continue
+        if not try tangent_edge(w, e): continue
+        var known = false
+        for k in walls.view(): known = known or k == other
+        if known: continue
+        try walls.push(other)
+        try contacts.push(try w.edge_at(e, 0.5))
+    if walls.count != 2: return (none_round, false)
+    let na = face_outward(w, walls.items[0])
+    let nb = face_outward(w, walls.items[1])
+    let turn = math.acos(math.clamp(na.dot(nb), -1.0, 1.0))
+    if turn < 1e-6 or turn > math.pi - 1e-6: return (none_round, false)
+    let line = try na.cross(nb).normalized()
+    let ca = contacts.items[0]
+    let hb = nb.dot(w.surfaces.items[(usize)w.faces.items[walls.items[1]].surface].origin)
+    let into_a = line.cross(na)
+    let apex = ca.add(into_a.multiply_scalar((hb - nb.dot(ca)) / nb.dot(into_a)))
+    let radius = apex.subtract(ca).length() / math.tan(turn * 0.5)
+    let middle = try point_on_face(w, f)
+    let outward = (try w.face_normal(f, middle)).dot(apex.subtract(middle)) > 0.0
+    return (CellRound(walls.items[0], walls.items[1], radius - wall if outward else radius + wall, -wall if outward else wall), true)
+
+## The six planes of the box about `low` to `high`, a tenth of `size` out
+## (every cell's outer bounds), onto `normals` and `offsets`.
+func box_planes(low: Vector3, high: Vector3, size: f64, normals: Growing[Vector3]*, offsets: Growing[f64]*) -> !:
+    let margin = size * 0.1
+    let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+    for axis in axes:
+        try normals.push(axis)
+        try offsets.push(axis.dot(high) + margin)
+        try normals.push(axis.multiply_scalar(-1.0))
+        try offsets.push(-axis.dot(low) + margin)
+
+## The corners of the cell n . x <= h over `normals` and `offsets` onto
+## `corners` (cleared first): each three planes' meeting point inside all.
+func cell_corners(normals: const Vector3[], offsets: const f64[], size: f64, corners: Growing[Vector3]*) -> !:
+    corners.clear()
+    let eps = size * 1e-9
+    for i in 0..<normals.length:
+        for j in i + 1..<normals.length:
+            for k in j + 1..<normals.length:
+                if math.abs(normals[i].dot(normals[j].cross(normals[k]))) < 1e-9: continue
+                let three: Vector3[3] = [normals[i], normals[j], normals[k]]
+                let at: f64[3] = [offsets[i], offsets[j], offsets[k]]
+                let p = try least_squares_point(three[..<3], at[..<3])
+                var within = true
+                for m in 0..<normals.length:
+                    if normals[m].dot(p) > offsets[m] + eps: within = false
+                if not within: continue
+                var known = false
+                for q in corners.view(): known = known or q.subtract(p).length() <= eps * 10.0
+                if not known: try corners.push(p)
+
+## Whether `corners` span a solid (not all on one plane), of more than a
+## billionth of `size` across.
+func solid_corners(corners: const Vector3[], size: f64) -> bool:
+    if corners.length < 4: return false
+    let a = corners[0]
+    var far = 0
+    for k in 1..<corners.length:
+        if corners[k].subtract(a).length() > corners[far].subtract(a).length(): far = (i64)k
+    let b = corners[(usize)far]
+    var best = 0.0
+    var c = a
+    for q in corners:
+        let lift = q.subtract(a).cross(b.subtract(a)).length()
+        if lift > best:
+            best = lift
+            c = q
+    let n = b.subtract(a).cross(c.subtract(a))
+    if n.length() <= size * size * 1e-12: return false
+    let across_unit = n.multiply_scalar(1.0 / n.length())
+    for q in corners:
+        if math.abs(q.subtract(a).dot(across_unit)) > size * 1e-7: return true
+    return false
+
+## The cells of `planes` over the box about `low` to `high` inside the
+## body `w` (a point inside the cell, its corners' middle, inside the body
+## by three rays): each cell's signs (1: behind the plane, -1 in front)
+## onto `signs`, n per cell. The cells come from splitting the box by one
+## plane after another, keeping the solid halves.
+func kept_cells(w: const Shape*, planes: const CellPlane[], low: Vector3, high: Vector3, size: f64, signs: Growing[i8]*) -> !:
+    let n = planes.length
+    # The live cells' signs (0: not cut by that plane yet).
+    var cells = Growing[i8]()
+    defer cells.close()
+    try cells.fill(n, 0)
+    var next = Growing[i8]()
+    defer next.close()
+    var normals = Growing[Vector3]()
+    defer normals.close()
+    var offsets = Growing[f64]()
+    defer offsets.close()
+    var corners = Growing[Vector3]()
+    defer corners.close()
+    for i in 0..<n:
+        next.clear()
+        for cell in 0..<cells.count // n:
+            for sign in [1, -1]:
+                normals.clear()
+                offsets.clear()
+                for j in 0..<n:
+                    let s = (i8)sign if j == i else cells.items[cell * n + j]
+                    if s == 0: continue
+                    try normals.push(planes[j].normal.multiply_scalar((f64)s))
+                    try offsets.push(planes[j].offset * (f64)s)
+                try box_planes(low, high, size, &normals, &offsets)
+                try cell_corners(normals.view(), offsets.view(), size, &corners)
+                if not solid_corners(corners.view(), size): continue
+                for j in 0..<n: try next.push((i8)sign if j == i else cells.items[cell * n + j])
+        try cells.assign(next.view())
+    var rays = try shape_rays(w)
+    defer rays.close()
+    for cell in 0..<cells.count // n:
+        normals.clear()
+        offsets.clear()
+        for j in 0..<n:
+            let s = (f64)cells.items[cell * n + j]
+            try normals.push(planes[j].normal.multiply_scalar(s))
+            try offsets.push(planes[j].offset * s)
+        try box_planes(low, high, size, &normals, &offsets)
+        try cell_corners(normals.view(), offsets.view(), size, &corners)
+        var middle = Vector3()
+        for q in corners.view(): middle = middle.add(q)
+        middle = middle.multiply_scalar(1.0 / (f64)corners.count)
+        if not try rays.inside(w, middle, size): continue
+        for j in 0..<n: try signs.push(cells.items[cell * n + j])
+
+## The union of the kept cells (`signs`, one per plane per cell) each made
+## of `planes` moved (their `moved` offsets) and the box about `low` to
+## `high`; none when no cell stays solid or the booleans refuse.
+func moved_cells(planes: const CellPlane[], signs: const i8[], low: Vector3, high: Vector3, size: f64) -> interop.Reference[CadModel]?!:
+    let n = planes.length
+    var normals = Growing[Vector3]()
+    defer normals.close()
+    var offsets = Growing[f64]()
+    defer offsets.close()
+    var corners = Growing[Vector3]()
+    defer corners.close()
+    var joined_cells: interop.Reference[CadModel]? = none
+    for cell in 0..<signs.length // n:
+        normals.clear()
+        offsets.clear()
+        for i in 0..<n:
+            let sign = (f64)signs[cell * n + i]
+            try normals.push(planes[i].normal.multiply_scalar(sign))
+            try offsets.push(planes[i].moved * sign)
+        try box_planes(low, high, size, &normals, &offsets)
+        try cell_corners(normals.view(), offsets.view(), size, &corners)
+        if not solid_corners(corners.view(), size): continue
+        let piece = try convex_cell(normals.view(), offsets.view(), size)
+        if let so_far = joined_cells:
+            let joined = combine(so_far.value(), piece.value(), op_union) catch failure:
+                so_far.release()
+                piece.release()
+                if failure.code != invalid: error(failure.code, failure.message)
+                return none
+            so_far.release()
+            piece.release()
+            joined_cells = joined
+        else:
+            joined_cells = piece
+    return joined_cells

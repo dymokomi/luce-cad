@@ -292,6 +292,9 @@ func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: 
 ## At a square corner with contacts a unit from it, G2's middle is 0.366
 ## from the corner and G3's 0.360, the circle's 0.414.
 pub func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, points: Growing[Vector3]*, knots: Growing[f64]*, blend_shape: BlendShape = plain_blend, bend_a: Vector3 = Vector3(), bend_b: Vector3 = Vector3(), turn_a: f64 = 0.0, turn_b: f64 = 0.0) -> !:
+    if blend_shape.offset != 0.0:
+        try offset_section(ta, tb, p, continuity, blend_shape.offset, points, knots)
+        return
     if continuity == 2:
         if blend_shape.shaped_g2(): try shaped_g2(ta, tb, p, blend_shape, points, knots, bend_a, bend_b)
         else: try fusion_g2(ta, tb, p, points, knots, blend_shape, bend_a, bend_b)
@@ -304,6 +307,89 @@ pub func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, p
     try knots.push(1.0 / 3.0)
     try knots.push(2.0 / 3.0)
     for _ in 0..<(usize)6: try knots.push(1.0)
+
+## A G2 or G3 section from contact `ta` to `tb` (legs meeting at `p`, both
+## walls flat) that is the offset by `offset` of the plain section between
+## the walls moved `offset` toward it (BlendShape.offset: a shell's inner
+## round, its strip's offset surface): that section sampled, each point
+## moved back by `offset` along its normal, and fitted in the plain one's
+## layout (its knots), its points along each leg kept there (the first
+## three at G2, four at G3: flat at the walls, as an offset of a section
+## flat there is), the rest free, by least squares; within 1e-5 of the
+## radius.
+func offset_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, offset: f64, points: Growing[Vector3]*, knots: Growing[f64]*) -> !:
+    let ea = try p.subtract(ta).normalized()
+    let eb = try p.subtract(tb).normalized()
+    # Each wall's normal toward the section (the other contact's side).
+    let ua = try eb.subtract(ea.multiply_scalar(eb.dot(ea))).multiply_scalar(-1.0).normalized()
+    let ub = try ea.subtract(eb.multiply_scalar(ea.dot(eb))).multiply_scalar(-1.0).normalized()
+    let ta0 = ta.add(ua.multiply_scalar(offset))
+    let tb0 = tb.add(ub.multiply_scalar(offset))
+    # The moved legs' meeting point.
+    let k = ea.dot(eb)
+    let det = 1.0 - k * k
+    if det < 1e-12: error(invalid, "a section's legs run along one line")
+    let r = ta0.subtract(tb0)
+    let s = (k * r.dot(eb) - r.dot(ea)) / det
+    let p0 = ta0.add(ea.multiply_scalar(s))
+    var base = Growing[Vector3]()
+    defer base.close()
+    try fillet_section(ta0, tb0, p0, continuity, &base, knots)
+    let n = base.count
+    let held = (usize)continuity + 1
+    if n != 8 or knots.count != 14 or held > 4: error(invalid, "an offset section needs a G2 or G3 fillet's layout")
+    var weights: f64[8] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    let plane = ea.cross(eb)
+    # Unknowns: the steps along each leg of its held points but the contact
+    # (held - 1 each), then the free middle points' coordinates.
+    let loose = n - 2 * held
+    let size = 2 * (held - 1) + 3 * loose
+    var matrix: f64[100]
+    var rhs: f64[10]
+    for i in 0..<(usize)100: matrix[i] = 0.0
+    for i in 0..<(usize)10: rhs[i] = 0.0
+    var values: f64[12]
+    var row: f64[10]
+    var sign = 0.0
+    let samples: usize = 200
+    for q in 0..<samples + 1:
+        let t = (f64)q / (f64)samples
+        let at = try NurbsCurve.at(base.view(), weights[..<8], 5, knots.view(), t)
+        let ahead = try NurbsCurve.at(base.view(), weights[..<8], 5, knots.view(), math.min(t + 1e-5, 1.0))
+        let behind = try NurbsCurve.at(base.view(), weights[..<8], 5, knots.view(), math.max(t - 1e-5, 0.0))
+        var normal = try plane.cross(ahead.subtract(behind)).normalized()
+        if q == 0: sign = 1.0 if normal.dot(ua) > 0.0 else -1.0
+        normal = normal.multiply_scalar(sign)
+        let target = at.subtract(normal.multiply_scalar(offset))
+        let first = nurbs_basis(knots.view(), (i64)n, 5, t, &values)
+        var b: f64[8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        for j in 0..<(usize)6:
+            if first + j < n: b[first + j] = values[j]
+        # What the fixed parts give, and each unknown's share, per axis.
+        var rest = target.subtract(ta.multiply_scalar(b[0])).subtract(tb.multiply_scalar(b[n - 1]))
+        for j in 1..<held:
+            rest = rest.subtract(ta.multiply_scalar(b[j])).subtract(tb.multiply_scalar(b[n - 1 - j]))
+        for axis in 0..<(usize)3:
+            for i in 0..<size: row[i] = 0.0
+            for j in 1..<held:
+                let along_a = ea.x if axis == 0 else (ea.y if axis == 1 else ea.z)
+                let along_b = eb.x if axis == 0 else (eb.y if axis == 1 else eb.z)
+                row[j - 1] = b[j] * along_a
+                row[held - 1 + j - 1] = b[n - 1 - j] * along_b
+            for m in 0..<loose: row[2 * (held - 1) + m * 3 + axis] = b[held + m]
+            let goal = rest.x if axis == 0 else (rest.y if axis == 1 else rest.z)
+            for i in 0..<size:
+                rhs[i] += row[i] * goal
+                for j in 0..<size: matrix[i * size + j] += row[i] * row[j]
+    try cholesky_solve(matrix[..<size * size], rhs[..<size], size)
+    try points.push(ta)
+    for j in 1..<held: try points.push(ta.add(ea.multiply_scalar(rhs[j - 1])))
+    for m in 0..<loose: try points.push(Vector3(rhs[2 * (held - 1) + m * 3], rhs[2 * (held - 1) + m * 3 + 1], rhs[2 * (held - 1) + m * 3 + 2]))
+    var j = held
+    while j > 1:
+        j -= 1
+        try points.push(tb.add(eb.multiply_scalar(rhs[held - 1 + j - 1])))
+    try points.push(tb)
 
 ## Fusion's G2 section (fillet_section): its six degree 4 points, then
 ## raised to degree 5 (eight points, knots 0 six times, 1/2 twice, 1 six

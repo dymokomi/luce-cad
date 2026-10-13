@@ -1,0 +1,222 @@
+## Three G2 or G3 fillets of one radius and kind meeting at a corner of
+## three flat faces, under Fusion's default corner type (Rolling ball;
+## probe 14 of 2026-10-13, FINDINGS 35 and probe 17). No ball is tangent to
+## their sections, so, as Fusion does, each strip stops where a G1 one
+## would meet the ball: square to its edge through the ball's center (r
+## from a square corner). Their three end sections close a three-sided
+## hole, touching each face at one point, and a three-sided patch fills it
+## (Fusion's: a 25 x 25 bicubic, one side collapsed). Ours: three quads
+## about a center (patch_fit.lucb's corner_patch, one per hole corner),
+## each side's rows along its strip's sweep, so the patch meets every strip
+## with its continuity. At a hole's corner two strips' rows meet: at a
+## square corner both sweeps hold there exactly (G2 all round); where the
+## faces are not square, one strip's leg is not along the other's sweep,
+## so near each hole corner the patch misses G2 and G1 by a few hundredths
+## of a degree (Fusion's own patch has these rate conflicts at its
+## corners). Built directly (local_corners.lucb) or as the booleans' corner
+## tool (three_sided_tool). Under the Setback corner type these corners are
+## setback corners (setback.lucb) instead.
+
+## Fusion's three-sided corner is fuller than our fair fill: its bulge
+## scaled by this (a fullness of 0, the default) takes a 20 cube's corner
+## rounded 4 and 2 at G2 to Fusion's volumes (7845.406289 and 7960.487036)
+## within 0.01.
+let fusion_three_sided_fullness: f64 = 1.143
+
+## A three-sided corner at vertex `v` where `edges` (three) meet, fillets
+## of `radius`: a Setback (its edges ordered round the corner, face i
+## holding edges i and i + 1) whose distances are the ball's center's
+## along each edge. `hollow` marks an inside corner.
+func three_sided_at(w: const Shape*, v: i64, edges: const usize[], radius: f64, hollow: bool) -> Setback!:
+    if edges.length != 3: error(invalid, "a three-sided corner needs three fillets")
+    var corner = try setback_at(w, v, edges, radius, hollow)
+    let p = w.points.items[(usize)v]
+    let center = try ball_center(w, v, -radius if hollow else radius)
+    for i in 0..<(usize)3: corner.distances[i] = corner.ways[i].dot(center.subtract(p))
+    corner.three_sided = true
+    return corner
+
+## Three-sided corner `corner`'s patch for fillets of `radius` and
+## `continuity`: three quads onto `quads` (corner_patch's order: quad i at
+## the hole's corner where edge i's section starts, on face i - 1), their
+## weights onto `quad_weights` (all 1), their knots onto `quad_knots`. Each
+## section is its fillet's own (fillet_section from its first face's
+## contact to its second's), run from face i - 1 to face i.
+func three_sided_patch(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, quads: Growing[Vector3]*, quad_weights: Growing[f64]*, quad_knots: Growing[f64]*, blend_shape: BlendShape = plain_blend) -> !:
+    let frame = try setback_frame(w, corner, radius)
+    let p = w.points.items[(usize)corner.vertex]
+    var curves = Growing[Vector3]()
+    defer curves.close()
+    var section = Growing[Vector3]()
+    defer section.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    var sides = Growing[HoleSide]()
+    defer sides.close()
+    for i in 0..<(usize)3:
+        let foot = p.add(corner.ways[i].multiply_scalar(corner.distances[i]))
+        let (first, _) = try edge_faces(w, corner.edges[i])
+        let before = frame.faces[(i + 2) % 3]
+        let into_first = frame.intos[i * 2] if first == before else frame.intos[i * 2 + 1]
+        let into_second = frame.intos[i * 2 + 1] if first == before else frame.intos[i * 2]
+        section.clear()
+        knots.clear()
+        try fillet_section(foot.add(into_first.multiply_scalar(frame.reaches[i])), foot.add(into_second.multiply_scalar(frame.reaches[i])), foot, continuity, &section, &knots, blend_shape)
+        let forward = first == before
+        for at in 0..<section.count: try curves.push(section.items[at if forward else section.count - 1 - at])
+        try sides.push(HoleSide(true, corner.ways[i]))
+    var weights = Growing[f64]()
+    defer weights.close()
+    try weights.fill(curves.count, 1.0)
+    let fullness = corner.fullness if corner.fullness > 0.0 else fusion_three_sided_fullness
+    try corner_patch(curves.view(), weights.view(), knots.view(), sides.view(), continuity, quads, quad_weights, quad_knots, fullness, 2)
+
+## Three-sided corner `plan` built directly: its patch's quads as faces, each
+## strip ending in its section's halves, its contacts the patch's corners.
+func make_three_sided(b: Local*, plan: const CornerPlan*, tag: str) -> !:
+    let v = plan.vertex
+    let w = b.w
+    let corner = &plan.setback
+    var radius = 0.0
+    for i in 0..<(usize)3: radius = math.max(radius, b.strips.items[(usize)b.strip_of.items[corner.edges[i]]].radius)
+    var quads = Growing[Vector3]()
+    defer quads.close()
+    var quad_weights = Growing[f64]()
+    defer quad_weights.close()
+    var quad_knots = Growing[f64]()
+    defer quad_knots.close()
+    # Fitted once per corner when a plan keeps patches; scaled after.
+    let p = w.points.items[(usize)v]
+    var kept = false
+    if let cache = b.patches: kept = try cache.scaled(v, p, radius, &quads, &quad_knots)
+    if kept: try quad_weights.fill(quads.count, 1.0)
+    else:
+        try three_sided_patch(w, corner, radius, b.continuity, &quads, &quad_weights, &quad_knots, b.blend_shape)
+        if let cache = b.patches: try cache.keep(v, p, radius, quads.view(), quad_knots.view())
+    let frame = try setback_frame(w, corner, radius)
+    # Hole corner i (edge i's section's start) touches face i - 1.
+    let touching: usize[3] = [frame.faces[2], frame.faces[0], frame.faces[1]]
+    let made = try patch_faces(b, v, tag, quads.view(), quad_weights.view(), quad_knots.view(), 3, touching[..<3])
+    for i in 0..<(usize)3:
+        let s = (usize)b.strip_of.items[corner.edges[i]]
+        let end = end_at(b, s, v)
+        let next = (i + 1) % 3
+        for side in 0..<(usize)2:
+            let f = b.strips.items[s].faces[side]
+            if f == touching[i]: b.strips.items[s].contacts[end * 2 + side] = made.corners[i]
+            elif f == frame.faces[i]: b.strips.items[s].contacts[end * 2 + side] = made.corners[next]
+            else: error(invalid, "a three-sided corner's fillet is not on its faces")
+        let halves: i64[2] = [made.firsts[i] + 1, made.seconds[i] + 1]
+        b.strips.items[s].sections[end] = (i64)(try b.chain(made.corners[i], made.corners[next], halves[..<2]))
+
+## Three-sided corner `corner`'s tool for the booleans (fillets of `radius`
+## and `continuity`): the region between the sharp corner and the patch,
+## within the planes square to each edge where its fillet stops: the three
+## quads (named `name`), a cap on each such plane (the edge's foot, its
+## section) and a piece of each face (the corner, two feet and the point
+## the patch touches it).
+func three_sided_tool(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, name: str, blend_shape: BlendShape = plain_blend) -> interop.Reference[CadModel]!:
+    var quads = Growing[Vector3]()
+    defer quads.close()
+    var quad_weights = Growing[f64]()
+    defer quad_weights.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    try three_sided_patch(w, corner, radius, continuity, &quads, &quad_weights, &knots, blend_shape)
+    let p = w.points.items[(usize)corner.vertex]
+    let cone = try corner_cone(w, corner, radius)
+    let m = knots.count - 6
+    let mm = m * m
+    let size = quads.items[0].subtract(p).length() * 4.0
+    let solid = try BrepModel.sized(size)
+    defer solid.release()
+    let b = solid.value()
+    let apex = try b.add_vertex(p)
+    var feet: i64[3] = [0, 0, 0]
+    for i in 0..<(usize)3: feet[i] = try b.add_vertex(p.add(corner.ways[i].multiply_scalar(corner.distances[i])))
+    # The hole's corners (quad i's corner (0, 0): where edge i's section
+    # starts, on face i - 1), the sections' middles and the center.
+    var corners: i64[3] = [0, 0, 0]
+    var middles: i64[3] = [0, 0, 0]
+    for k in 0..<(usize)3:
+        corners[k] = try b.add_vertex(quads.items[k * mm])
+        middles[k] = try b.add_vertex(quads.items[k * mm + (m - 1) * m])
+    let center = try b.add_vertex(quads.items[mm - 1])
+    var lines: i64[3] = [0, 0, 0]
+    var to_start: i64[3] = [0, 0, 0]
+    var to_end: i64[3] = [0, 0, 0]
+    for i in 0..<(usize)3:
+        lines[i] = try b.add_line(apex, feet[i])
+        to_start[i] = try b.add_line(feet[i], corners[i])
+        to_end[i] = try b.add_line(feet[i], corners[(i + 1) % 3])
+    var reversed = Growing[f64]()
+    defer reversed.close()
+    var k_ = knots.count
+    while k_ > 0:
+        k_ -= 1
+        try reversed.push(1.0 - knots.items[k_])
+    var net = Growing[Vector3]()
+    defer net.close()
+    var net_weights = Growing[f64]()
+    defer net_weights.close()
+    var firsts: i64[3] = [0, 0, 0]
+    var seconds: i64[3] = [0, 0, 0]
+    var seams: i64[3] = [0, 0, 0]
+    for k in 0..<(usize)3:
+        let next = (k + 1) % 3
+        net.clear()
+        net_weights.clear()
+        for a in 0..<m:
+            try net.push(quads.items[k * mm + a * m])
+            try net_weights.push(1.0)
+        firsts[k] = try b.add_spline_edge(corners[k], middles[k], net.view(), net_weights.view(), 5, knots.view(), true)
+        net.clear()
+        net_weights.clear()
+        for b_ in 0..<m:
+            try net.push(quads.items[next * mm + m - 1 - b_])
+            try net_weights.push(1.0)
+        seconds[k] = try b.add_spline_edge(middles[k], corners[next], net.view(), net_weights.view(), 5, reversed.view(), true)
+        net.clear()
+        net_weights.clear()
+        for b_ in 0..<m:
+            try net.push(quads.items[k * mm + (m - 1) * m + b_])
+            try net_weights.push(1.0)
+        seams[k] = try b.add_spline_edge(middles[k], center, net.view(), net_weights.view(), 5, knots.view(), true)
+    # The quads: outward (away from the corner) is du x dv or against it.
+    var bu: f64[36]
+    var bv: f64[36]
+    spline_basis(knots.view(), 0.75, bu[..<36])
+    spline_basis(knots.view(), 0.75, bv[..<36])
+    let four: i64[1] = [4]
+    for k in 0..<(usize)3:
+        let before = (k + 2) % 3
+        var du = Vector3()
+        var dv = Vector3()
+        var at = Vector3()
+        for a in 0..<m:
+            for b_ in 0..<m:
+                let q = quads.items[k * mm + a * m + b_]
+                du = du.add(q.multiply_scalar(bu[9 + a] * bv[b_]))
+                dv = dv.add(q.multiply_scalar(bu[a] * bv[9 + b_]))
+                at = at.add(q.multiply_scalar(bu[a] * bv[b_]))
+        let surface = try b.add_spline_surface(quads.view()[k * mm..<(k + 1) * mm], quad_weights.view()[k * mm..<(k + 1) * mm], (i64)m, (i64)m, 5, 5, knots.view(), knots.view())
+        let outward = du.cross(dv).dot(at.subtract(p)) > 0.0
+        let forward: i64[4] = [firsts[k] + 1, seams[k] + 1, -(seams[before] + 1), seconds[before] + 1]
+        let backward: i64[4] = [-(seconds[before] + 1), seams[before] + 1, -(seams[k] + 1), -(firsts[k] + 1)]
+        var face: i64 = 0
+        if outward: face = try b.add_face(surface, forward[..<4], four[..<1], true)
+        else: face = try b.add_face(surface, backward[..<4], four[..<1], false)
+        try b.set_face_name(face, name)
+    # The caps, outward along each edge; the faces' pieces, outward away
+    # from the corner's inside (face i holds edges i and i + 1).
+    for i in 0..<(usize)3:
+        let foot = p.add(corner.ways[i].multiply_scalar(corner.distances[i]))
+        let uses: i64[4] = [to_start[i] + 1, firsts[i] + 1, seconds[i] + 1, -(to_end[i] + 1)]
+        let around: Vector3[4] = [foot, quads.items[i * mm], quads.items[i * mm + (m - 1) * m], quads.items[(i + 1) % 3 * mm]]
+        try flat_face(b, foot, corner.ways[i], uses[..<4], around[..<4])
+    for i in 0..<(usize)3:
+        let next = (i + 1) % 3
+        let uses: i64[4] = [lines[i] + 1, to_end[i] + 1, -(to_start[next] + 1), -(lines[next] + 1)]
+        let around: Vector3[4] = [p, p.add(corner.ways[i].multiply_scalar(corner.distances[i])), quads.items[next * mm], p.add(corner.ways[next].multiply_scalar(corner.distances[next]))]
+        try flat_face(b, p, cone[i].multiply_scalar(-1.0), uses[..<4], around[..<4])
+    return try CadModel.of_brep(solid)

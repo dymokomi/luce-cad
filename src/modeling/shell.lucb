@@ -80,6 +80,9 @@ func shell_of(model: interop.Reference[CadModel], removed: const bool[], thickne
         var past = try vanishing_inner(model, removed, wall_in, wall_out, &m)
         if past == none: past = try convex_inner(model, removed, wall_in, wall_out)
         if past == none: past = try refilleted_inner(model, removed, wall_in, &m)
+        # Not convex, its rounds not healed together, or a flat face
+        # swallowed: the cells of its planes (shell_cells.lucb).
+        if past == none: past = try cells_inner(model, removed, wall_in, wall_out)
         if let made = past:
             inner.release()
             inner = made
@@ -138,11 +141,29 @@ func tangent_opening(model: interop.Reference[CadModel], removed: const bool[], 
     defer rim.close()
     for byte in tag.bytes: try rim.push(byte)
     for byte in "/rim".bytes: try rim.push(byte)
+    var inner_name = Growing[u8]()
+    defer inner_name.close()
+    var found = Growing[usize]()
+    defer found.close()
     for f in 0..<w.faces.count:
         if not removed[f]: continue
-        let one: usize[1] = [f]
-        let inward = face_outward(&w, f).multiply_scalar(-1.0)
-        let cut = closed_quilt(&w, one[..<1], inward, wall_in, "", (str)rim.view()) catch failure:
+        # The hollow's own copy of the face (`<tag>/` and its name), swept
+        # out through the wall: the inner body poking through, as Fusion's
+        # opening (where the wall swallows the rounds round the face, the
+        # hollow's face is wider than the face itself: an L rounded 1,
+        # shelled 2 open, 3107.4377).
+        var c = try shape_of(current.value())
+        defer c.close()
+        inner_name.clear()
+        for byte in tag.bytes: try inner_name.push(byte)
+        try inner_name.push(47)
+        for byte in w.face_name(f).bytes: try inner_name.push(byte)
+        found.clear()
+        faces_named(&c, (str)inner_name.view(), &found) catch failure:
+            if failure.code != invalid: error(failure.code, failure.message)
+            recover ()
+        let outward = face_outward(&w, f)
+        let cut = (closed_quilt(&c, found.view()[..<1], outward, wall_in * 2.0, "", (str)rim.view()) if found.count == 1 else closed_quilt(&w, [f][..<1], outward.multiply_scalar(-1.0), wall_in, "", (str)rim.view())) catch failure:
             current.release()
             error(failure.code, failure.message)
         defer cut.release()

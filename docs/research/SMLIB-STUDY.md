@@ -1001,7 +1001,7 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   (`GivenSection`): 7805.36 at G1, closed, every seam G1. Still open: laws on chains round faces
   and loops between curved faces at corners.
 
-- **11, offsets where faces vanish (part).** Not the face soup's arrangement: for convex rounds
+- **11, offsets where faces vanish (most of it).** First without the face soup's arrangement: for convex rounds
   the answer has a closed form. A body's inner parallel body at a distance past a convex round's
   radius is that of the body with the round healed sharp (its tangent planes between are implied by
   its neighbors'). Shell's inner body, when the offset refuses, deletes the convex cylinders,
@@ -1017,10 +1017,18 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   Delete cannot heal a G2 setback corner's quads, a convex body's inner body is the cell of its flat
   faces' planes moved in (which drops a swallowed chamfer too). A 20 cube's uprights rounded 3 G2
   and G3 shelled 4 (closed and open), every edge G2 shelled 4, a chamfer of 1 swallowed at 3: the
-  sharp hollows exactly. Still open: the face soup and winding numbers for bodies that are not
-  convex where faces vanish, and outward offsets that reconnect. Also: a body rounded on every edge
-  shelled open at its top with a wall thinner than the rounds (their inner offsets never reach the
-  top's plane) is the closed shell opened by the top swept in, its rim square to it.
+  sharp hollows exactly. Also: a body rounded on every edge shelled open at its top with a wall
+  thinner than the rounds (their inner offsets never reach the top's plane) is the closed shell
+  opened by the hollow's own top swept out through the wall (Fusion's: the inner body poking through).
+  Then (2026-10-13) the soup's cells for bodies of flat faces and rounds that are not convex
+  (`shell_cells.lucb`): the flat faces' planes cut the box into convex cells, those inside the body
+  (by rays: the sharp body, chamfers and all) are made again from the planes moved in and joined (the
+  sharp body's mitered inner parallel body, a swallowed face gone), and the rounds made again on it
+  (concave r + wall; a G2 strip's its offset section). An L rounded 1 on every edge shelled 2: Fusion's
+  3423.3006 closed, 3107.4377 open, 3436.1456 at G2 (ours within 0.005, 0.005, 0.2); an L with a
+  chamfer swallowed: 4646 exactly. Still open: curved faces other than rounds between flat walls in
+  the soup (their offsets intersected as the booleans do, cells by winding number), and outward
+  offsets that reconnect.
 
 - **12, stitch passes and edge refinement (done in part).** Vertices within the gap merge closest
   pair first (the limit of SMLib's doubling passes) and never two of one face, the orientation

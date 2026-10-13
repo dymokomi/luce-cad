@@ -38,6 +38,10 @@ struct Setback:
     ## Fusion's, fusion_fullness).
     var edge_shape: f64
     var fullness: f64
+    ## Fusion's Rolling ball corner of three G2 or G3 fillets
+    ## (three_sided.lucb): each stops through the ball's center, a
+    ## three-sided patch between their end sections, no curves on the faces.
+    var three_sided: bool
 
 ## A fillet's own end section at a setback corner (a G1 variable edge's
 ## rolled envelope, straight_law_tool): the six control points of edge
@@ -50,19 +54,19 @@ struct GivenSection:
 
 ## An empty setback corner at vertex `v`.
 func empty_setback(v: i64) -> Setback:
-    return Setback(v, 0, [0, 0, 0, 0, 0, 0, 0, 0], [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, 0.5, 1.0)
+    return Setback(v, 0, [0, 0, 0, 0, 0, 0, 0, 0], [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, 0.5, 0.0, false)
 
 ## A setback corner of fillets of `radius` at vertex `v`, where `edges`
 ## (three or more, one per line through it) meet. Each fillet stops past
-## where its neighbors' contacts cross its own on the faces, by the
-## largest contact distance: twice the radius at a square corner, as
-## Fusion 2705's Setback corners (probe 14: a 20 cube's corner rounded 4,
-## G1 and G2, and a boss's or an L's mixed corner, all stop 2 r from it).
-## Fillets of different radii stop past the crossings by half the largest
-## (Fusion's own there, 6, 7 and 7.5 from a cube's corner rounded 4, 3 and
-## 2, follow no rule found; a whole one leaves our patch outside its
-## corner). `hollow` marks an inside corner. With
-## `radii` (one per edge of `edges`), each fillet has its own radius.
+## where its neighbors' contacts cross its own on the faces (the farther
+## crossing), by Fusion 2705's reach (probes 14 and 17 of 2026-10-13, a 20
+## cube's corner with every mix of radii 1 to 6, G1 and G2, Setback and
+## Rolling ball alike): the mean of the corner's contact distances, and
+## for the one smallest fillet half the gap to the next smallest more. At a
+## square corner of one radius that is 2 r; radii 2, 3 and 4 stop 7.5, 7
+## and 6 from it; 1, 4 and 4 stop 8.5, 7 and 7. `hollow` marks an inside
+## corner. With `radii` (one per edge of `edges`), each fillet has its own
+## radius.
 func setback_at(w: const Shape*, v: i64, edges: const usize[], radius: f64, hollow: bool, radii: (const f64[])? = none) -> Setback!:
     let n = edges.length
     if n < 3 or n > most_setback_edges: error(invalid, "a setback corner needs three to eight edges")
@@ -90,13 +94,23 @@ func setback_at(w: const Shape*, v: i64, edges: const usize[], radius: f64, holl
         corner.ways[i] = try w.leaving(corner.edges[i], 0 if edge.start == v else 1)
     let frame = try setback_frame(w, &corner, radius)
     let p = w.points.items[(usize)v]
-    var most = 0.0
+    # The mean reach, and the smallest and next smallest (the smallest
+    # alone when its next is larger).
+    var mean = 0.0
     var least = 1e300
     for i in 0..<n:
-        most = math.max(most, frame.reaches[i])
+        mean += frame.reaches[i] / (f64)n
         least = math.min(least, frame.reaches[i])
-    let beyond = most if most - least <= most * 1e-12 else most * 0.5
+    var next_least = 1e300
+    var lowest: usize = 0
+    var ties: usize = 0
     for i in 0..<n:
+        if frame.reaches[i] <= least * (1.0 + 1e-12):
+            lowest = i
+            ties += 1
+        else: next_least = math.min(next_least, frame.reaches[i])
+    for i in 0..<n:
+        let beyond = mean + ((next_least - least) * 0.5 if ties == 1 and i == lowest and next_least < 1e299 else 0.0)
         let before = (i + n - 1) % n
         let next = (i + 1) % n
         let after = try contacts_cross(p, corner.ways[i], frame.intos[i * 2 + 1], frame.reaches[i], corner.ways[next], frame.intos[next * 2], frame.reaches[next])
@@ -176,6 +190,7 @@ func contacts_cross(p: Vector3, way_a: Vector3, into_a: Vector3, reach_a: f64, w
 ## region between the sharp corner and the patch, within the setback
 ## planes. The patch's quads are named `name`.
 func setback_tool(w: const Shape*, corner: const Setback*, radius: f64, continuity: i64, name: str, blend_shape: BlendShape = plain_blend, given: (const GivenSection[])? = none) -> interop.Reference[CadModel]!:
+    if corner.three_sided: return try three_sided_tool(w, corner, radius, continuity, name, blend_shape)
     var quads = Growing[Vector3]()
     defer quads.close()
     var quad_weights = Growing[f64]()
@@ -272,14 +287,29 @@ func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continu
             while weights.count < curves.count: try weights.push(1.0)
         try sides.push(HoleSide(false, face_outward(w, frame.faces[i])))
     let fullness = corner.fullness if corner.fullness > 0.0 else fusion_fullness(continuity)
+    let first_quad = quads.count
+    let first_weight = quad_weights.count
     try corner_patch(curves.view(), weights.view(), knots.view(), sides.view(), continuity, quads, quad_weights, quad_knots, fullness)
     if corner.mixed: return
+    # A full patch of three fillets of unequal radii can bulge through a
+    # face beside its curve there: fitted again with two rows in each face's
+    # plane, flat across it to second order.
+    if n == 3 and not try patch_inside(w, corner, radius, quads.view()[first_quad..]):
+        quads.count = first_quad
+        quad_weights.count = first_weight
+        try corner_patch(curves.view(), weights.view(), knots.view(), sides.view(), continuity, quads, quad_weights, quad_knots, fullness, 0, true)
+    if not try patch_inside(w, corner, radius, quads.view()[first_quad..]): error(invalid, "the corner patch would leave its corner: use a rolling ball (G1) there")
+
+## Whether setback corner `corner`'s patch control points `quads` stay
+## between its faces and its setback planes.
+func patch_inside(w: const Shape*, corner: const Setback*, radius: f64, quads: const Vector3[]) -> bool!:
+    let p = w.points.items[(usize)corner.vertex]
     let slack = radius * 1e-9
     let cone = try corner_cone(w, corner, radius)
-    for q in quads.view():
-        for i in 0..<n:
-            if q.subtract(p).dot(cone[i]) < -slack or q.subtract(p).dot(corner.ways[i]) > corner.distances[i] + slack:
-                error(invalid, "the corner patch would leave its corner: use a rolling ball (G1) there")
+    for q in quads:
+        for i in 0..<corner.count:
+            if q.subtract(p).dot(cone[i]) < -slack or q.subtract(p).dot(corner.ways[i]) > corner.distances[i] + slack: return false
+    return true
 
 ## A polynomial quintic Bezier from `ta` to `tb` near the conic tangent to
 ## the lines from each to `p` of rho `rho` relative to the circle's (0.5 the
