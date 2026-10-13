@@ -76,6 +76,14 @@ pub struct SweepOptions:
     pub var pivot_point: Vector3 = Vector3()
     pub var fixed: i64 = 0
     pub var segments: f64[6] = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+    ## Alias's Rebuild per curve (rail 1, rail 2, the generation curves):
+    ## each refitted by its length to the fewest spans within the build's
+    ## tolerance; Colinear per rail: the sections placed by the rail's own
+    ## parameter (its isoparms, as a face's edge has them) rather than its
+    ## length; Explicit Control.
+    pub var rebuild: bool[3] = [false, false, false]
+    pub var colinear: bool[2] = [false, false]
+    pub var explicit: Explicit = Explicit(false, 0, 0, 0, 0)
 
 ## What a sweep needs to make a section anywhere along the rail.
 struct Sweeper:
@@ -404,11 +412,11 @@ func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, o
         let a = opts.segments[2 * k]
         let b = opts.segments[2 * k + 1]
         if not (a >= 0.0 and b <= 1.0 and b - a > 1e-6): error(invalid, "Rail: a curve segment runs from 0 to 1 of its curve, start before end")
-    var rail = try segment_of(&rail_masters.items[0].curve, opts.segments[0], opts.segments[1])
+    var rail = try rebuilt_if(&rail_masters.items[0].curve, opts.segments[0], opts.segments[1], opts.rebuild[0])
     var other = empty_spline(1)
     if two:
         other.close()
-        other = try segment_of(&rail_masters.items[1].curve, opts.segments[2], opts.segments[3])
+        other = try rebuilt_if(&rail_masters.items[1].curve, opts.segments[2], opts.segments[3], opts.rebuild[1])
         # The second rail runs the way the first does.
         if rail.point_at(0.0).subtract(other.point_at(1.0)).length() < rail.point_at(0.0).subtract(other.point_at(0.0)).length():
             let turned_round = try reversed_spline(&other)
@@ -417,7 +425,7 @@ func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, o
     var curves = Growing[Spline]()
     defer close_splines_of(&curves)
     for m in section_masters.view():
-        var c = try segment_of(&m.curve, opts.segments[4], opts.segments[5])
+        var c = try rebuilt_if(&m.curve, opts.segments[4], opts.segments[5], opts.rebuild[2])
         if curves.count > 0 and runs_against(&c, &curves.items[0]):
             let turned_round = try reversed_spline(&c)
             c.close()
@@ -447,7 +455,7 @@ func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, o
         spine_frames = try make_frames(&spine, Vector3()) catch failure:
             spine.close()
             error(failure.code, failure.message)
-    var w = Sweeper(rail, other, two, try make_frames(&rail, start_up), try arc_table(&rail), try arc_table(&other) if two else ArcTable(Growing[f64]()),
+    var w = Sweeper(rail, other, two, try make_frames(&rail, start_up), try placing_table(&rail, opts.colinear[0]), try placing_table(&other, opts.colinear[1]) if two else ArcTable(Growing[f64]()),
                     Growing[Spline](), Growing[f64](), opts.mode, opts.vector, opts.transform, opts.transition, opts.bias, spine, spine_frames)
     defer w.close()
     # The face a curve-on-face rail lies on, for Surface normal.
@@ -495,4 +503,33 @@ func sweep_net(set: interop.Reference[GeometrySet], sections: str, rails: str, o
                 best = d
                 index = m
         try match_side(&net, 2 + (i64)k, &section_masters.items[index], order, tolerance)
+    if opts.explicit.on:
+        let keep_u = (usize)math.max((f64)opts.continuity[0], (f64)opts.continuity[1])
+        let keep_v = (usize)math.max((f64)opts.continuity[2], (f64)opts.continuity[3])
+        let refitted = try explicit_net(&net, &opts.explicit, keep_u, keep_v)
+        net.close()
+        net = refitted
     return net
+
+## Curve `c`'s stretch `a` to `b` (fractions) on 0..1, refitted by its
+## length to the fewest spans within its size's ten-millionth with
+## `rebuild` (Alias's Rebuild of a rail or generation curve).
+func rebuilt_if(c: const Spline*, a: f64, b: f64, rebuild: bool) -> Spline!:
+    var piece = try segment_of(c, a, b)
+    if not rebuild: return piece
+    defer piece.close()
+    let tolerance = size_of(&piece) * 1e-7
+    var plain = try plain_curve(&piece, tolerance * 0.1)
+    defer plain.close()
+    return try rebuilt_curve(&plain, tolerance)
+
+## The table sections are placed along a rail by: its arc length, or with
+## `colinear` its own parameter (a table as long as the parameter: the
+## sections follow the parameter's spacing, a face's isoparms along its
+## edge).
+func placing_table(c: const Spline*, colinear: bool) -> ArcTable!:
+    if not colinear: return try arc_table(c)
+    var table = ArcTable(Growing[f64](), true)
+    errdefer table.close()
+    for k in 0..<(usize)1025: try table.lengths.push((f64)k / 1024.0)
+    return table

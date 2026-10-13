@@ -17,12 +17,14 @@ pub struct CadSurfaceBlend:
     ## fractions of its length); through the curves `profiles` (words apart
     ## by `;`).
     pub static func blend(set: interop.Reference[GeometrySet], first: str, second: str, continuity: const i64[] = [1, 1], shape: const f64[] = [1.0, 1.0], crown: f64 = 0.0,
-                          flow: i64 = 0, range: const f64[] = [0.0, 1.0, 0.0, 1.0], profiles: str = "", name: str = "Blend") -> interop.Reference[CadSurfaceEdit]!:
+                          flow: i64 = 0, range: const f64[] = [0.0, 1.0, 0.0, 1.0], profiles: str = "", name: str = "Blend", interior: bool = false,
+                          explicit: bool = false, degree_u: i64 = 0, spans_u: i64 = 1, degree_v: i64 = 0, spans_v: i64 = 4) -> interop.Reference[CadSurfaceEdit]!:
         if continuity.length != 2 or shape.length != 2: error(invalid, "Blend Surface: a continuity and a shape for each side")
         if range.length != 4: error(invalid, "Blend Surface: each side's range is two fractions")
         if not (crown >= -0.25 and crown <= 0.25): error(invalid, "Blend Surface: Proportional Crown is -0.25 to 0.25")
-        if flow != flow_connect and flow != flow_free: error(invalid, "Blend Surface: Flow Control is Connect ends or Free")
-        let opts = BlendOptions([continuity[0], continuity[1]], [shape[0], shape[1]], crown, flow, [range[0], range[1], range[2], range[3]])
+        if flow != flow_connect and flow != flow_free and flow != flow_edge: error(invalid, "Blend Surface: Flow Control is Connect ends, Free or Edge align")
+        let opts = BlendOptions([continuity[0], continuity[1]], [shape[0], shape[1]], crown, flow, [range[0], range[1], range[2], range[3]], interior,
+                                Explicit(explicit, degree_u, spans_u, degree_v, spans_v))
         var net = try blend_net(set, first, second, &opts, profiles)
         defer net.close()
         return try added_sheet(set, &net, name)
@@ -32,17 +34,24 @@ pub struct CadSurfaceBlend:
     ## radius `size` (with `chordal`, the chord between the contacts), each
     ## set's side flipped by `flips` (the default: toward the other set),
     ## the section `section` (fillet_chamfer, fillet_circular, fillet_g2,
-    ## fillet_g3) with Form Factor `form`, and `trim` (fillet_trim_automatic,
-    ## fillet_trim_curves, fillet_trim_off).
+    ## fillet_g3, fillet_bias with Bias Factor `bias`, fillet_lead with Knee
+    ## Ratio `knee`) with Form Factor `form`, Curvature `curvature`
+    ## (curvature_both, _one, _two, _none: the sets whose curvature G2, G3 and
+    ## Bias match), `trim` (fillet_trim_automatic, fillet_trim_curves,
+    ## fillet_trim_off), and Variable Fillets `variable` (pairs of a fraction
+    ## along the fillet and the radius or chord there; fewer than two pairs:
+    ## constant).
     pub static func fillet(set: interop.Reference[GeometrySet], first: str, second: str, size: f64, section: i64 = 1, chordal: bool = false, flips: const bool[] = [false, false],
-                           trim: i64 = 0, form: f64 = 1.0, name: str = "Fillet") -> interop.Reference[CadSurfaceEdit]!:
+                           trim: i64 = 0, form: f64 = 1.0, name: str = "Fillet", bias: f64 = 0.0, knee: f64 = 0.0, curvature: i64 = 0,
+                           variable: const f64[] = [0.0, 0.0]) -> interop.Reference[CadSurfaceEdit]!:
         if flips.length != 2: error(invalid, "Surface Fillet: a flip for each set")
         if trim < fillet_trim_automatic or trim > fillet_trim_off: error(invalid, "Surface Fillet: Trim is Automatic, Curves on surface or Off")
-        let opts = FilletOptions(section, size, chordal, [flips[0], flips[1]], trim, form)
+        let opts = FilletOptions(section, size, chordal, [flips[0], flips[1]], trim, form, bias, knee, curvature)
         var sets: FilletSet[2] = [FilletSet(Growing[Master](), 1.0), FilletSet(Growing[Master](), 1.0)]
         defer sets[0].close()
         defer sets[1].close()
-        var made = try fillet_net(set, first, second, &opts, &sets)
+        # A law of fewer than two points is none (the default's one pair).
+        var made = try fillet_net(set, first, second, &opts, &sets, variable if variable.length >= 4 else variable[..<0])
         defer made.close()
         let body = try net_body(&made.net, name, true)
         defer body.release()
@@ -59,8 +68,22 @@ pub struct CadSurfaceBlend:
     ## along the curve `curve` (Align's master words: a curve, a curve on a
     ## face, an edge, an isoparm), its center moved `normal_offset` along
     ## the face's normal (the curve's frame's up off a face; negated with
-    ## `flip`: a groove for a bump) and `tangent_offset` across.
-    pub static func tube(set: interop.Reference[GeometrySet], curve: str, radius: f64, tangent_offset: f64 = 0.0, normal_offset: f64 = 0.0, flip: bool = false, name: str = "Tube") -> interop.Reference[CadSurfaceEdit]!:
-        var net = try tube_net(set, curve, radius, tangent_offset, normal_offset, flip)
+    ## `flip`: a groove for a bump) and `tangent_offset` across; Alias's
+    ## variable radius `variable` (pairs of a fraction along the curve and a
+    ## radius; fewer than two pairs: constant) and `trim` (tube_trim_off,
+    ## tube_trim_curves: where it meets the face as curves on it,
+    ## tube_trim_inside: the face's strip under it taken away).
+    pub static func tube(set: interop.Reference[GeometrySet], curve: str, radius: f64, tangent_offset: f64 = 0.0, normal_offset: f64 = 0.0, flip: bool = false, name: str = "Tube",
+                         variable: const f64[] = [0.0, 0.0], trim: i64 = 0) -> interop.Reference[CadSurfaceEdit]!:
+        if trim < tube_trim_off or trim > tube_trim_inside: error(invalid, "Tube: Trim is Off, Curves on surface or Inside")
+        let law = variable if variable.length >= 4 else variable[..<0]
+        var net = try tube_net(set, curve, radius, tangent_offset, normal_offset, flip, law)
         defer net.close()
-        return try added_sheet(set, &net, name)
+        let added = try added_sheet(set, &net, name)
+        if trim == tube_trim_off: return added
+        defer added.release()
+        let geometry = try added.value().geometry()
+        defer geometry.release()
+        let edit = try edit_of(try tube_trims(geometry, curve, radius, tangent_offset, normal_offset, flip, law, trim, name))
+        edit.value().count = 1
+        return edit

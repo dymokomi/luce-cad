@@ -22,7 +22,15 @@
 ## fillet between planes is exactly a cylinder), G2 and G3 Curvature
 ## (fillet_section's degree 5 sections of the edge fillets on the same
 ## contacts: G2 matching each face's normal curvature across, G3 also its
-## rate on flat and round faces), their arms by the Form Factor. Chordal
+## rate, measured along the leg on any face), their arms by the Form Factor;
+## Bias (G3's legs, side 1's arms longer by the Bias Factor and side 2's
+## shorter: the peak toward the shorter, set 1 for a negative factor); Lead
+## (a conic on the contacts and corner whose peak radius is the Knee Ratio
+## times the tangent offset). Curvature on one side only matches the other
+## side's to the ball's curvature: tangent there, no more. Variable
+## Fillets: the ball rolled once at the first size reads the law's
+## fractions along its spine, then rolls again at the law's size at each
+## station (a smoothstep between the points). Chordal
 ## (Alias's Chord, Parasolid's constant width): the ball's radius at each
 ## station is the one whose contacts lie the chord apart. The sections'
 ## rows are fitted along the spine (along.lucb), exact where they vary as
@@ -38,6 +46,19 @@ pub let fillet_chamfer: i64 = 0
 pub let fillet_circular: i64 = 1
 pub let fillet_g2: i64 = 2
 pub let fillet_g3: i64 = 3
+## Alias's Bias (the peak radius pushed toward a set; curvature and its rate
+## matched, as G3's) and Lead (a conic touching both sets, its peak radius a
+## Knee Ratio of the tangent offset; tangent both sides).
+pub let fillet_bias: i64 = 4
+pub let fillet_lead: i64 = 5
+
+## Alias's Curvature (G2, G3 and Bias sections): which sets the section
+## matches the curvature of; the other it meets tangent only (its curvature
+## the ball's there).
+pub let curvature_both: i64 = 0
+pub let curvature_one: i64 = 1
+pub let curvature_two: i64 = 2
+pub let curvature_none: i64 = 3
 
 pub let fillet_trim_automatic: i64 = 0
 pub let fillet_trim_curves: i64 = 1
@@ -53,6 +74,12 @@ pub struct FilletOptions:
     pub var flips: bool[2]
     pub var trim: i64
     pub var form: f64
+    ## Bias's factor (-1 to 1; negative toward set 1), Lead's Knee Ratio
+    ## (the peak radius over the tangent offset; 0 the circle's own), and
+    ## Curvature (curvature_both ... curvature_none).
+    pub var bias: f64 = 0.0
+    pub var knee: f64 = 0.0
+    pub var curvature: i64 = 0
 
 ## A face set: each face as a face master (its shape, chart and loops) and
 ## the side the ball rolls on (+1 along the faces' normals, -1 against).
@@ -82,12 +109,36 @@ struct FilletWork:
     var size: f64
     var stations: Growing[BallStation]
     var spine: Spline
+    ## Variable Fillets: the radius (or chord) at fractions along the
+    ## spine, pairs (fraction, size), and the spine a constant ball first
+    ## made that the fractions are read on.
+    var law: Growing[f64]
+    var guide: Spline
 
     func close():
         self.one.close()
         self.two.close()
         self.stations.close()
         self.spine.close()
+        self.law.close()
+        self.guide.close()
+
+    ## The radius (or chord) asked for the ball centered near `o`: the
+    ## law's, by `o`'s fraction along the first spine (smoothstep between
+    ## its points, flat past the ends), else the options'.
+    func size_at(o: Vector3) -> f64:
+        if self.law.count < 2 or self.guide.points.count == 0: return self.opts.size
+        let f = spline_nearest(&self.guide, o)
+        let n = self.law.count // 2
+        if f <= self.law.items[0]: return self.law.items[1]
+        for k in 1..<n:
+            let a = self.law.items[2 * (k - 1)]
+            let b = self.law.items[2 * k]
+            if f <= b:
+                let t = (f - a) / math.max(1e-300, b - a)
+                let smooth = t * t * (3.0 - 2.0 * t)
+                return self.law.items[2 * k - 1] * (1.0 - smooth) + self.law.items[2 * k + 1] * smooth
+        return self.law.items[2 * n - 1]
 
 ## The direction the spine runs at station `s` (the two normals' cross,
 ## turned along `before`).
@@ -153,7 +204,7 @@ func seed_station(w: FilletWork*) -> BallStation!:
     var faces = Growing[usize]()
     defer faces.close()
     try face_samples(&w.one, 12, &uvs, &faces)
-    let r = w.opts.size
+    let r = w.opts.size if w.law.count < 2 else w.law.items[1]
     var best = 1.0e300
     var found = BallStation(0.0, Vector3(), 0.0, 0, Vector3(), 0, Vector3())
     for k in 0..<uvs.count:
@@ -183,7 +234,9 @@ func seed_station(w: FilletWork*) -> BallStation!:
 func march(w: FilletWork*, start: BallStation, way: f64, out: Growing[BallStation]*) -> !:
     var current = start
     var before = (try spine_way(w, &current, Vector3(1.0, 0.0, 0.0))).multiply_scalar(way)
-    let longest = math.max(w.opts.size * 0.5, w.size * 1e-4)
+    var smallest = w.opts.size
+    for k in 0..<w.law.count // 2: smallest = math.min(smallest, w.law.items[2 * k + 1])
+    let longest = math.max(smallest * 0.5, w.size * 1e-4)
     var h = longest
     var count = 0
     while count < 4000:
@@ -304,17 +357,58 @@ func fillet_cross(w: FilletWork*, b: const BallStation*, out: Growing[Weighted]*
         try out.push(Weighted(corner.x * half, corner.y * half, corner.z * half, half))
         try out.push(weighted(p2, 1.0))
         return
+    if w.opts.section == fillet_lead:
+        # A conic on the same contacts and corner, its weight set so its
+        # peak radius is the Knee Ratio of the tangent offset (0: the
+        # ball's circle, weight cos(θ/2)).
+        let offset = corner.subtract(p1).length()
+        let weight = half if w.opts.knee <= 0.0 else try conic_weight(p1, corner, p2, w.opts.knee * offset)
+        try out.push(weighted(p1, 1.0))
+        try out.push(Weighted(corner.x * weight, corner.y * weight, corner.z * weight, weight))
+        try out.push(weighted(p2, 1.0))
+        return
     # G2 and G3: the edge fillets' sections on the same contacts and
     # corner, bent by each face's normal curvature toward the corner.
     let e1 = corner.subtract(p1).normalized() catch failure: error(invalid, "Surface Fillet: a contact is the corner")
     let e2 = corner.subtract(p2).normalized() catch failure: error(invalid, "Surface Fillet: a contact is the corner")
-    let bend1 = try bend_of(&w.one, b.f1, b.uv1, e1)
-    let bend2 = try bend_of(&w.two, b.f2, b.uv2, e2)
+    var bend1 = try bend_of(&w.one, b.f1, b.uv1, e1)
+    var bend2 = try bend_of(&w.two, b.f2, b.uv2, e2)
+    # G3 (and Bias): the faces' curvature's rate along each leg, so the
+    # section's matches it on any face.
+    var turn1 = 0.0
+    var turn2 = 0.0
+    if w.opts.section != fillet_g2:
+        turn1 = try turn_of(&w.one, b.f1, b.uv1, e1, bend1, w.size)
+        turn2 = try turn_of(&w.two, b.f2, b.uv2, e2, bend2, w.size)
+    # Curvature on one side only: the other side's curvature the ball's
+    # (toward its center), tangent there and no more.
+    if w.opts.curvature == curvature_two or w.opts.curvature == curvature_none:
+        bend1 = c.subtract(p1).multiply_scalar(1.0 / (r * r))
+        turn1 = 0.0
+    if w.opts.curvature == curvature_one or w.opts.curvature == curvature_none:
+        bend2 = c.subtract(p2).multiply_scalar(1.0 / (r * r))
+        turn2 = 0.0
     var points = Growing[Vector3]()
     defer points.close()
     var knots = Growing[f64]()
     defer knots.close()
-    try fillet_section(p1, p2, corner, w.opts.section, &points, &knots, w.opts.form, bend1, bend2)
+    if w.opts.section == fillet_bias:
+        # G3's legs, the arms of side 1 at weight 1 + bias, side 2's at
+        # 1 - bias (the Form Factor on both): the peak goes toward the
+        # side with the shorter arms, set 1 for a negative factor.
+        let a1 = math.clamp(w.opts.form * (1.0 + w.opts.bias), 0.1, 2.0)
+        let a2 = math.clamp(w.opts.form * (1.0 - w.opts.bias), 0.1, 2.0)
+        # (G3's section's first four points are side 1's leg, the last four
+        # side 2's: one section at each weight, a leg from each.)
+        var other = Growing[Vector3]()
+        defer other.close()
+        try fillet_section(p1, p2, corner, fillet_g3, &points, &knots, a1, bend1, bend2, turn1, turn2)
+        knots.clear()
+        try fillet_section(p1, p2, corner, fillet_g3, &other, &knots, a2, bend1, bend2, turn1, turn2)
+        for k in 0..<(usize)4: try out.push(weighted(points.items[k], 1.0))
+        for k in 4..<(usize)8: try out.push(weighted(other.items[k], 1.0))
+        return
+    try fillet_section(p1, p2, corner, w.opts.section, &points, &knots, w.opts.form, bend1, bend2, turn1, turn2)
     for q in points.view(): try out.push(weighted(q, 1.0))
 
 ## The section source's call: the section at fraction `s` of the spine.
@@ -327,15 +421,60 @@ func fillet_section_at(context: void*, s: f64, out: Growing[Weighted]*) -> !:
 ## degree 2 (one Bezier each), G2 and G3 fillet_section's.
 func cross_knots(section: i64, out: Growing[f64]*) -> i64!:
     out.clear()
-    if section == fillet_chamfer or section == fillet_circular:
-        let degree = (usize)section + 1
+    if section == fillet_chamfer or section == fillet_circular or section == fillet_lead:
+        let degree: usize = 1 if section == fillet_chamfer else 2
         for _ in 0..<degree + 1: try out.push(0.0)
         for _ in 0..<degree + 1: try out.push(1.0)
         return (i64)degree
     var points = Growing[Vector3]()
     defer points.close()
-    try fillet_section(Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, 0.0), section, &points, out)
+    try fillet_section(Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(1.0, 1.0, 0.0), fillet_g3 if section == fillet_bias else section, &points, out)
     return 5
+
+## The change of face `k`'s normal curvature along unit `e` per length
+## (G3's rate on any face), by a step of a millionth of the model along it.
+func turn_of(set: FilletSet*, k: usize, uv: Vector3, e: Vector3, bend: Vector3, size: f64) -> f64!:
+    let master = &set.faces.items[k]
+    let j = try surface_jet(master.surface(), uv, false, false)
+    let a = chart_direction(j.su, j.sv, e)
+    let h = size * 1e-5
+    let ahead = Vector3(uv.x + a.x * h, uv.y + a.y * h, 0.0)
+    let later = bend_of(set, k, ahead, e) catch failure: return 0.0
+    var way = bend.normalized() catch failure: recover Vector3()
+    if way.length() == 0.0: way = later.normalized() catch failure: recover Vector3()
+    if way.length() == 0.0: return 0.0
+    return (later.dot(way) - bend.dot(way)) / h
+
+## The weight of the conic from `p1` through corner `c` to `p2` whose
+## radius of curvature at its middle is `peak` (bisection: a heavier weight
+## draws the curve to the corner, its peak tighter).
+func conic_weight(p1: Vector3, c: Vector3, p2: Vector3, peak: f64) -> f64!:
+    var low = 1e-3
+    var high = 1e3
+    for _ in 0..<200:
+        let middle = math.sqrt(low * high)
+        if conic_peak(p1, c, p2, middle) > peak: low = middle
+        else: high = middle
+    return math.sqrt(low * high)
+
+## The radius of curvature at t = 1/2 of the rational quadratic (p1, w c,
+## p2): A = p1 + 2wc + p2 over 2 + 2w at the shoulder, by differences.
+func conic_peak(p1: Vector3, c: Vector3, p2: Vector3, weight: f64) -> f64:
+    let h = 1e-4
+    let a = conic_point(p1, c, p2, weight, 0.5 - h)
+    let m = conic_point(p1, c, p2, weight, 0.5)
+    let b = conic_point(p1, c, p2, weight, 0.5 + h)
+    let d1 = b.subtract(a).multiply_scalar(0.5 / h)
+    let d2 = a.add(b).subtract(m.multiply_scalar(2.0)).multiply_scalar(1.0 / (h * h))
+    let speed = d1.length()
+    let k = d1.cross(d2).length() / math.max(1e-300, speed * speed * speed)
+    return 1.0e300 if k <= 0.0 else 1.0 / k
+
+func conic_point(p1: Vector3, c: Vector3, p2: Vector3, weight: f64, t: f64) -> Vector3:
+    let b0 = (1.0 - t) * (1.0 - t)
+    let b1 = 2.0 * t * (1.0 - t) * weight
+    let b2 = t * t
+    return p1.multiply_scalar(b0).add(c.multiply_scalar(b1)).add(p2.multiply_scalar(b2)).multiply_scalar(1.0 / (b0 + b1 + b2))
 
 ## A face set from `words` (face names apart by `;`).
 func fillet_set(set: interop.Reference[GeometrySet], words: str) -> FilletSet!:
@@ -364,15 +503,21 @@ struct FilletMade:
         self.contacts.close()
 
 ## Surface Fillet's net between face sets `first` and `second`.
-func fillet_net(set: interop.Reference[GeometrySet], first: str, second: str, opts: const FilletOptions*, sets: FilletSet[2]*) -> FilletMade!:
+func fillet_net(set: interop.Reference[GeometrySet], first: str, second: str, opts: const FilletOptions*, sets: FilletSet[2]*, law: const f64[]) -> FilletMade!:
     if not (opts.size > 0.0): error(invalid, "Surface Fillet: the radius (or chord) must be more than zero")
-    if opts.section < fillet_chamfer or opts.section > fillet_g3: error(invalid, "Surface Fillet: the section is G0 Chamfer, G1 Circular, G2 or G3 Curvature")
+    if opts.section < fillet_chamfer or opts.section > fillet_lead: error(invalid, "Surface Fillet: the section is G0 Chamfer, G1 Circular, G2 or G3 Curvature, Bias or Lead")
     if not (opts.form >= 0.1 and opts.form <= 2.0): error(invalid, "Surface Fillet: the Form Factor is 0.1 to 2")
+    if not (opts.bias >= -1.0 and opts.bias <= 1.0): error(invalid, "Surface Fillet: the Bias Factor is -1 to 1")
+    if not (opts.knee >= 0.0 and opts.knee <= 10.0): error(invalid, "Surface Fillet: the Knee Ratio is 0 (the circle's) to 10")
+    if opts.curvature < curvature_both or opts.curvature > curvature_none: error(invalid, "Surface Fillet: Curvature is Both, Side 1, Side 2 or None")
+    if law.length % 2 != 0: error(invalid, "Surface Fillet: a variable fillet's points are pairs of a fraction and a size")
+    for k in 0..<law.length // 2:
+        if not (law[2 * k + 1] > 0.0) or law[2 * k] < 0.0 or law[2 * k] > 1.0 or (k > 0 and law[2 * k] <= law[2 * k - 2]): error(invalid, "Surface Fillet: a variable fillet's points run 0 to 1 along it, each size more than zero")
     var one = try fillet_set(set, first)
     var two = fillet_set(set, second) catch failure:
         one.close()
         error(failure.code, failure.message)
-    var w = FilletWork(one, two, *opts, 1.0, Growing[BallStation](), empty_spline(1))
+    var w = FilletWork(one, two, *opts, 1.0, Growing[BallStation](), empty_spline(1), Growing[f64](), empty_spline(1))
     defer w.close()
     # The model's size from the sets' samples (the tolerances' scale).
     let a = try set_middle(&w.one)
@@ -390,6 +535,26 @@ func fillet_net(set: interop.Reference[GeometrySet], first: str, second: str, op
     try w.stations.push(seed)
     try march(&w, seed, 1.0, &w.stations)
     try make_spine(&w)
+    if law.length >= 4:
+        # Variable: the constant ball's spine reads the fractions; the
+        # ball rolled again, its size by the law at each station.
+        w.guide.close()
+        w.guide = try w.spine.copy()
+        try w.law.assign(law)
+        var start = w.stations.items[w.stations.count // 2]
+        let way = try spine_way(&w, &start, Vector3(1.0, 0.0, 0.0))
+        if try ball_at(&w, &start, start.center, way, true) != ball_found: error(invalid, "Surface Fillet: the variable ball could not be placed; change its sizes")
+        w.stations.clear()
+        var back = Growing[BallStation]()
+        defer back.close()
+        try march(&w, start, -1.0, &back)
+        var k2 = back.count
+        while k2 > 0:
+            k2 -= 1
+            try w.stations.push(back.items[k2])
+        try w.stations.push(start)
+        try march(&w, start, 1.0, &w.stations)
+        try make_spine(&w)
     var across = Growing[f64]()
     defer across.close()
     let degree = try cross_knots(opts.section, &across)

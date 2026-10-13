@@ -24,10 +24,13 @@ from luce_std import math
 pub func blend_build_tests() -> unit!:
     fillet_planes()
     fillet_apart()
+    fillet_sections()
+    tube_options()
+    blend_options()
     blend_cylinders()
     blend_profiles()
     tubes()
-    print("PASS blend build: Surface Fillet between perpendicular planes is the cylinder exactly, the planes trimmed to it and G1, G2 and G3 as asked, Chordal's chord, a ball between a plane and a cylinder apart, contacts as curves on the faces; Blend Surface between cylinders G0 to G3 at both edges (G3 three quintic spans), Crown, a profile on the blend; Tube a cylinder and a torus")
+    print("PASS blend build: Surface Fillet between perpendicular planes is the cylinder exactly, the planes trimmed to it and G1, G2 and G3 as asked, Chordal's chord, a ball between a plane and a cylinder apart, contacts as curves on the faces; Blend Surface between cylinders G0 to G3 at both edges (G3 three quintic spans), Crown, a profile on the blend; Tube a cylinder and a torus; Bias, Lead, one-sided Curvature and Variable fillets; Tube's variable radius and trims; Blend Surface's Edge align, Interior Edge Align and Explicit Control")
 
 # -- Shapes.
 
@@ -276,3 +279,131 @@ func tubes() -> unit!:
     let centre_l = axis_l.multiply_scalar(0.125)
     let centre_d = axis_d.multiply_scalar(0.125)
     assert(math.abs(math.hypot(centre_l.x, centre_l.y) - 0.25) < 1e-6 and math.hypot(centre_l.x + centre_d.x, centre_l.y + centre_d.y) < 1e-6, f"Normal offset moves the axis to {centre_l}, flipped to {centre_d}")
+
+## The levels of the fillet's own two edges once `data` is stitched: the
+## one on `first` (the floor), then the other.
+func fillet_levels(data: GeometrySet) -> list[int]!:
+    let sewn = CadSurfacing.stitched(data, [], 0.0001)
+    let check = CadMeasure.check(CadGeometry.model(sewn.geometry(), 0), "", 3, 16, 0.0001, 0.1, 0.5, 1.0, false, 8, false, 1.0, true, faces = "Fillet")
+    let found: list[int] = []
+    for e in 0..<check.edge_count():
+        let edge = check.edge(e)
+        found.append(edge.level)
+    return found
+
+func fillet_sections() -> unit!:
+    var data = CadGeometry.of_model(flat(Vector3(0.0, 0.0, 0.0), Vector3(4.0, 0.0, 0.0), Vector3(0.0, 4.0, 0.0), "floor"))
+    data = data.merged(CadGeometry.of_model(flat(Vector3(0.0, 0.0, 0.0), Vector3(0.0, 0.0, 4.0), Vector3(0.0, 4.0, 0.0), "wall")))
+    # Bias: the section's middle leans to the side with the shorter arms
+    # (set 1, the floor, for a negative factor); still G3 on both.
+    let middles: list[Vector3] = []
+    for bias in [-0.5, 0.5]:
+        let made = CadSurfaceBlend.fillet(data, "floor", "wall", 1.0, section = 4, bias = bias, trim = 2)
+        let (sheet, s) = sheet_named(made.geometry(), "Fillet")
+        middles.append(CadNurbs.point_at(sheet, s, 0.5, 0.5))
+    assert(middles[0].z < middles[0].x - 1e-3 and middles[1].x < middles[1].z - 1e-3, f"Bias's middles {middles}")
+    for level in fillet_levels(CadSurfaceBlend.fillet(data, "floor", "wall", 1.0, section = 4, bias = -0.5).geometry()):
+        assert(level >= 3, "a Bias fillet's contacts are not G3")
+    # Lead: Knee Ratio 0 is the circle; 0.6, a conic whose middle bends at
+    # radius 0.6 (the tangent offset is 1 at a right angle).
+    let round = CadSurfaceBlend.fillet(data, "floor", "wall", 1.0, section = 5, trim = 2)
+    let (rs, ri) = sheet_named(round.geometry(), "Fillet")
+    for i in 0..<5:
+        let p = CadNurbs.point_at(rs, ri, float(i) / 4.0, 0.5)
+        assert(math.abs(math.hypot(p.x - 1.0, p.z - 1.0) - 1.0) < 1e-9, f"Lead at the circle's knee: {p}")
+    let lead = CadSurfaceBlend.fillet(data, "floor", "wall", 1.0, section = 5, knee = 0.6, trim = 2)
+    let (ls, li) = sheet_named(lead.geometry(), "Fillet")
+    let h = 1e-3
+    let a = CadNurbs.point_at(ls, li, 0.5 - h, 0.5)
+    let m = CadNurbs.point_at(ls, li, 0.5, 0.5)
+    let b = CadNurbs.point_at(ls, li, 0.5 + h, 0.5)
+    let d1 = b.subtract(a).multiply_scalar(0.5 / h)
+    let d2 = a.add(b).subtract(m.multiply_scalar(2.0)).multiply_scalar(1.0 / (h * h))
+    let radius = math.pow(d1.length(), 3.0) / d1.cross(d2).length()
+    assert(math.abs(radius - 0.6) < 1e-3, f"Lead's peak radius {radius}")
+    # Curvature on side 1 only: the floor's contact G2, the wall's G1.
+    let one = fillet_levels(CadSurfaceBlend.fillet(data, "floor", "wall", 1.0, section = 2, curvature = 1).geometry())
+    assert(one.length == 2 and ((one[0] >= 2 and one[1] == 1) or (one[1] >= 2 and one[0] == 1)), f"one-sided curvature measured {one}")
+    # Variable: radius 0.5 at y = 0 growing to 1 at y = 4.
+    let grown = CadSurfaceBlend.fillet(data, "floor", "wall", 1.0, trim = 2, variable = [0.0, 0.5, 1.0, 1.0])
+    let (gs, gi) = sheet_named(grown.geometry(), "Fillet")
+    for j in [0, 1]:
+        let p = CadNurbs.point_at(gs, gi, 0.0, float(j))
+        let q = CadNurbs.point_at(gs, gi, 1.0, float(j))
+        let want = 0.5 if (p.y < 2.0) else 1.0
+        let reach = math.max(p.x, q.x)
+        assert(math.abs(reach - want) < 1e-4, f"the variable fillet's contact at y = {p.y} reaches {reach}, not {want}")
+
+func tube_options() -> unit!:
+    # Variable radius: 0.2 at the line's start growing to 0.4 at its end.
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "line", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(0.0, 0.0, 3.0)], 1))
+    let grown = CadSurfaceBlend.tube(data, "curve line", 0.2, variable = [0.0, 0.2, 1.0, 0.4])
+    let (g, gi) = sheet_named(grown.geometry(), "Tube")
+    for v in [0.0, 1.0]:
+        let p = CadNurbs.point_at(g, gi, 0.3, v)
+        let want = 0.2 if p.z < 1.5 else 0.4
+        assert(math.abs(math.hypot(p.x, p.y) - want) < 1e-6, f"the variable tube at z = {p.z} has radius {math.hypot(p.x, p.y)}")
+    # Trims: a line cast onto a 4 by 4 floor, a tube of radius 0.25 round
+    # it: Curves on surface leaves two curves on the floor, Inside takes
+    # the 3 by 0.5 strip away.
+    var floor = CadGeometry.of_model(flat(Vector3(0.0, 0.0, 0.0), Vector3(4.0, 0.0, 0.0), Vector3(0.0, 4.0, 0.0), "floor"))
+    floor = CadCurves.with_curve(floor, "above", CadCurveTools.by_points([Vector3(0.5, 2.0, 1.0), Vector3(3.5, 2.0, 1.0)], 1))
+    let cast = CadSurfacing.projected(floor, 0, "floor", "above", Vector3(0.0, 0.0, -1.0))
+    let on_floor = cast.geometry()
+    var name = ""
+    for index in 0..<CadCurves.count(on_floor):
+        if CadCurves.face(on_floor, index) == "floor":
+            name = CadCurves.name(on_floor, index)
+    assert(name != "", "no curve on the floor")
+    let curves = CadSurfaceBlend.tube(on_floor, f"curve {name}", 0.25, trim = 1)
+    var on_faces = 0
+    for index in 0..<CadCurves.count(curves.geometry()):
+        if CadCurves.face(curves.geometry(), index) == "floor":
+            on_faces += 1
+    assert(on_faces == 3, f"{on_faces} curves on the floor (the cast line and the tube's two)")
+    let cut = CadSurfaceBlend.tube(on_floor, f"curve {name}", 0.25, trim = 2)
+    assert(math.abs(area_of(cut.geometry(), "floor") - 14.5) < 1e-3, f"the floor trimmed under the tube keeps {area_of(cut.geometry(), "floor")}")
+
+## How far curve `c` lies off face `name` of `data` (eleven samples).
+func miss(data: GeometrySet, name: str, c: CadSpline) -> float!:
+    let (sheet, s) = sheet_named(data, name)
+    var worst = 0.0
+    for k in 0..<11:
+        let p = c.at(c.low() + (c.high() - c.low()) * float(k) / 10.0)
+        let uv = CadNurbs.parameters_at(sheet, s, p)
+        worst = math.max(worst, CadNurbs.point_at(sheet, s, uv.x, uv.y).subtract(p).length())
+    return worst
+
+func blend_options() -> unit!:
+    # Edge align: a side whose control points crowd its start is matched
+    # by its parameter: the middle isoparm leaves it at its parameter's
+    # middle, not its length's.
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "crowded", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(0.2, 0.0, 0.0), Vector3(0.4, 0.0, 0.0), Vector3(4.0, 0.0, 0.0)], 3))
+    data = CadCurves.with_curve(data, "plain", CadCurveTools.by_points([Vector3(0.0, 2.0, 1.0), Vector3(4.0, 2.0, 1.0)], 1))
+    let crowded = CadCurves.curve(data, CadCurves.find(data, "crowded"))
+    let middle = crowded.at((crowded.low() + crowded.high()) * 0.5).x
+    for (flow, want) in [(0, 2.0), (2, middle)]:
+        let made = CadSurfaceBlend.blend(data, "curve crowded", "curve plain", continuity = [0, 0], flow = flow)
+        let (sheet, s) = sheet_named(made.geometry(), "Blend")
+        let a = CadNurbs.point_at(sheet, s, 0.0, 0.5)
+        let b = CadNurbs.point_at(sheet, s, 1.0, 0.5)
+        let on_side = a if math.abs(a.y) < math.abs(b.y) else b
+        assert(math.abs(on_side.x - want) < 1e-4, f"Flow Control {flow}: the middle isoparm leaves the crowded side at {on_side}, not x {want}")
+    # Interior Edge Align: a profile running slant across (z 1 on the left
+    # to 3 on the right) lies on the blend with it on.
+    var walls = quarter(Vector3(0.0, 0.0, 0.0), 1.0, math.pi / 2.0, "left")
+    walls = walls.merged(quarter(Vector3(5.0, 0.0, 0.0), 1.0, 0.0, "right"))
+    let slant = CadCurveTools.by_points([Vector3(0.0, 1.0, 1.0), Vector3(1.5, 1.6, 1.6), Vector3(3.5, 1.6, 2.4), Vector3(5.0, 1.0, 3.0)], 3)
+    let shaped = CadCurves.with_curve(walls, "slant", slant)
+    let aligned = CadSurfaceBlend.blend(shaped, "edge left 0 1 2", "edge right 5 1 2", continuity = [0, 0], profiles = "curve slant", interior = true)
+    let off_aligned = miss(aligned.geometry(), "Blend", slant)
+    assert(off_aligned < 1e-5, f"Interior Edge Align: the slant profile is {off_aligned} off the blend")
+    # Explicit Control: its degrees and spans.
+    let explicit = CadSurfaceBlend.blend(walls, "edge left 0 1 2", "edge right 5 1 2", continuity = [1, 1], explicit = true, degree_u = 5, spans_u = 1, degree_v = 3, spans_v = 2)
+    let (es, ei) = sheet_named(explicit.geometry(), "Blend")
+    let shape = CadNurbs.structure(es, ei)
+    assert(shape.du == 5 and shape.spans_u == 1 and shape.dv == 3 and shape.spans_v == 2, f"Blend Explicit Control: {shape.du} {shape.spans_u} {shape.dv} {shape.spans_v}")
+    for level in levels(explicit.geometry()):
+        assert(level >= 1, "an Explicit Control blend lost its G1")

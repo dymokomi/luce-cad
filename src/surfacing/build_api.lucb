@@ -50,12 +50,16 @@ pub struct CadSurfaceBuild:
     ## G`end` (0 to 3) to the surface it lies on; Alias's Multiple
     ## Surfaces (`multiple`: a sheet for each curve of the sets) and
     ## Proportional Crown (`crown`, -0.25 to 0.25 of the gap, two
-    ## sections).
+    ## sections); Flow Control `flow` (skin_connect: by the curves' own
+    ## parameters, skin_free: by their length) and Modify Range
+    ## (`range_from` to `range_to` of every curve); Explicit Control
+    ## (`explicit`: degrees, 0 as built, and spans along u and across v).
     pub static func skin(set: interop.Reference[GeometrySet], sections: str, degree: i64 = 5, closed: bool = false, start: i64 = 0, end: i64 = 0, name: str = "Skin",
-                         multiple: bool = false, crown: f64 = 0.0) -> interop.Reference[CadSurfaceEdit]!:
+                         multiple: bool = false, crown: f64 = 0.0, flow: i64 = 0, range_from: f64 = 0.0, range_to: f64 = 1.0, explicit: bool = false,
+                         degree_u: i64 = 0, spans_u: i64 = 4, degree_v: i64 = 0, spans_v: i64 = 4) -> interop.Reference[CadSurfaceEdit]!:
         if start < 0 or start > 3 or end < 0 or end > 3: error(invalid, "Skin's start and end continuity are G0 to G3")
         if not (crown >= -0.25 and crown <= 0.25): error(invalid, "Skin's Proportional Crown is -0.25 to 0.25")
-        let opts = SkinOptions(degree, closed, start, end, crown)
+        let opts = SkinOptions(degree, closed, start, end, crown, flow, [range_from, range_to], Explicit(explicit, degree_u, spans_u, degree_v, spans_v))
         var nets = Growing[Net]()
         defer close_nets(&nets)
         try skin_nets(set, sections, &opts, multiple, &nets)
@@ -87,7 +91,10 @@ pub struct CadSurfaceBuild:
     ## curves).
     pub static func rail(set: interop.Reference[GeometrySet], sections: str, rails: str, mode: i64 = 0, vector: Vector3 = Vector3(0.0, 0.0, 1.0), transform: i64 = 0,
                          bias: f64 = 1.0, continuity: const i64[] = [0, 0, 0, 0], name: str = "Rail", spine: str = "", pivot: i64 = 0, pivot_rail: f64 = 0.0,
-                         pivot_generation: f64 = 0.0, pivot_point: Vector3 = Vector3(), fixed: i64 = 0, segments: const f64[] = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]) -> interop.Reference[CadSurfaceEdit]!:
+                         pivot_generation: f64 = 0.0, pivot_point: Vector3 = Vector3(), fixed: i64 = 0, segments: const f64[] = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+                         rebuild: const bool[] = [false, false, false], colinear: const bool[] = [false, false], explicit: bool = false, degree_u: i64 = 0, spans_u: i64 = 4,
+                         degree_v: i64 = 0, spans_v: i64 = 4) -> interop.Reference[CadSurfaceEdit]!:
+        if rebuild.length != 3 or colinear.length != 2: error(invalid, "Rail: Rebuild takes rail 1, rail 2 and the generation curves; Colinear each rail")
         if mode != sweep_natural and mode != sweep_parallel and mode != sweep_vector and mode != sweep_spine: error(invalid, "Rail's sweep mode is Natural, Parallel, Vector or Spine")
         if transform < two_rail_scale or transform > two_rail_rotate: error(invalid, "Rail's two-rail transform is Scale, Non-proportional scale or Rotate")
         if pivot < pivot_closest or pivot > pivot_off_curve: error(invalid, "Rail's Sweep Pivot is Closest, On Curve or Off Curve")
@@ -98,7 +105,8 @@ pub struct CadSurfaceBuild:
             if continuity[k] < 0 or continuity[k] > 3: error(invalid, "Rail's continuity is G0 to G3")
             orders[k] = continuity[k]
         let opts = SweepOptions(mode, vector, transform, transition_linear, bias, orders, pivot, pivot_rail, pivot_generation, pivot_point, fixed,
-                                [segments[0], segments[1], segments[2], segments[3], segments[4], segments[5]])
+                                [segments[0], segments[1], segments[2], segments[3], segments[4], segments[5]], [rebuild[0], rebuild[1], rebuild[2]], [colinear[0], colinear[1]],
+                                Explicit(explicit, degree_u, spans_u, degree_v, spans_v))
         var net = try sweep_net(set, sections, rails, &opts, spine)
         defer net.close()
         return try added_sheet(set, &net, name)
@@ -108,12 +116,14 @@ pub struct CadSurfaceBuild:
     ## Parallel, 1 Radial: turning with the rail, 2 Surface normal: up the
     ## face the rail lies on), and between them `transition`
     ## (transition_linear, transition_local, transition_global,
-    ## transition_limited).
-    pub static func profile(set: interop.Reference[GeometrySet], profiles: str, rail: str, orientation: i64 = 1, transition: i64 = 0, name: str = "Profile") -> interop.Reference[CadSurfaceEdit]!:
+    ## transition_limited); Explicit Control as Rail's.
+    pub static func profile(set: interop.Reference[GeometrySet], profiles: str, rail: str, orientation: i64 = 1, transition: i64 = 0, name: str = "Profile",
+                            explicit: bool = false, degree_u: i64 = 0, spans_u: i64 = 4, degree_v: i64 = 0, spans_v: i64 = 4) -> interop.Reference[CadSurfaceEdit]!:
         if orientation < 0 or orientation > 2: error(invalid, "Profile's orientation is Parallel, Radial or Surface normal")
         if transition < transition_linear or transition > transition_limited: error(invalid, "Profile's transition is Linear, Local, Global or Limited")
         let modes: i64[3] = [sweep_parallel, sweep_natural, sweep_normal]
-        let opts = SweepOptions(modes[(usize)orientation], Vector3(0.0, 0.0, 1.0), two_rail_scale, transition, 1.0, [0, 0, 0, 0])
+        var opts = SweepOptions(modes[(usize)orientation], Vector3(0.0, 0.0, 1.0), two_rail_scale, transition, 1.0, [0, 0, 0, 0])
+        opts.explicit = Explicit(explicit, degree_u, spans_u, degree_v, spans_v)
         var net = try sweep_net(set, profiles, rail, &opts, "")
         defer net.close()
         return try added_sheet(set, &net, name)

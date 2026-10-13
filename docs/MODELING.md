@@ -1866,10 +1866,36 @@ eight rows across, three spans); Crown 0.1 lifts a G0 blend's middle 0.5, a tent
 profile curve lies on the Profile Blend within 1e-5. Tube along a line is the cylinder to
 1e-12, along a circle the torus within 1e-7; Normal offset moves the axis, Flip the other way.
 
-Not yet (Stage 8 and later): Alias's Bias and Lead sections, one-sided Curvature, variable radius and
-chord along the fillet, Flow Control Edge align, Interior Edge Align, Explicit Control on the blends;
-G3 Curvature's rate on faces whose curvature changes; Tube's variable radius and its trims; Round,
-Ball Corner, Corner Blend, Bridge Fillet; conic sections.
+**Stage 6 follow-ups.** Surface Fillet's **Bias** (G3's legs, side 1's arms at the Form Factor times
+1 + bias and side 2's at 1 − bias: the peak toward the shorter, set 1 for a negative factor; G3 at both
+contacts) and **Lead** (a conic on the contacts and corner whose middle's radius is the Knee Ratio times
+the tangent offset, by bisection on its weight; 0 the ball's circle); **Curvature** on one side only
+(the other side's curvature set to the ball's: tangent there, no more); G3's rate of curvature measured
+along each leg on any face (a step of a hundred-thousandth of the model); **Variable Fillets** (pairs of
+a fraction along the fillet and a radius or chord: the ball rolled at the first size gives a spine whose
+fractions the law is read on, then rolled again at the law's size at each station, smoothstep between;
+the contacts of a variable fillet with G3 sections measure G2, their sections leaning off the square
+plane). Blend Surface's Flow Control **Edge align** (the sides matched by their own parameters),
+**Interior Edge Align** (side 2 matched through the profiles' far ends, so a slanted profile lies on the
+blend) and **Explicit Control** (the net refitted to the degrees and spans, its end rows held). Tube's
+**variable radius** (the same law) and **trims**: where the tube meets its face (each station's circle
+crossing the face, Newton on the angle) as two curves, cast onto the face (Curves on surface) or, closed
+by chords across the open ends, the strip under the tube taken away (Inside). Skin's **Flow Control**
+(Connect ends: the curves' own parameters; Free: each refitted by its length), **Modify Range** (of the
+parameter, or with Free of the length) and **Explicit Control**; Rail's **Rebuild** per curve (rail 1,
+rail 2, the generation curves: by length to the fewest spans within a ten-millionth), **Colinear** per
+rail (sections placed by the rail's parameter: a parametric arc table) and **Explicit Control**;
+Profile's **Explicit Control** (all by `explicit_net`, the sides' continuity rows held). Tests:
+`blend_build_tests.luc` (Bias leans, G3 both sides; Lead at Knee 0 is the circle, at 0.6 bends at
+radius 0.6; one-sided G2 then G1; a variable fillet's contacts 0.5 and 1 off the edge at its ends; a
+fillet whose faces end where it ends; a variable tube's radius at both ends; Tube's two curves on the
+floor and its 3 by 0.5 strip trimmed away; Edge align's isoparm at the crowded side's parameter
+middle; a slanted profile on the blend within 1e-5; Explicit Control's structure, G1 kept) and
+`surface_build_tests.luc` (Skin's Flow Control and Modify Range; Rail's Colinear and Rebuild; Explicit
+Control on Skin, Rail and Profile).
+
+Not yet (Stage 8 and later): Round, Ball Corner, Corner Blend, Bridge Fillet; conic sections of the
+edge fillets.
 
 ## Fill (`surfacing/fill.lucb`, `fill_bounds`, `fill_net`, `fill_bands`, `fill_reference`, `fill_solve`, `fill_refine`, `fill_api`)
 

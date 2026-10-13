@@ -30,6 +30,47 @@ pub struct SkinOptions:
     pub var start: i64
     pub var end: i64
     pub var crown: f64 = 0.0
+    ## Alias's Flow Control (skin_connect: the sections matched by their
+    ## own parameters, their ends joined; skin_free: by arc length, the
+    ## isoparms spread evenly along each) and Modify Range (the stretch of
+    ## every section used, fractions).
+    pub var flow: i64 = 0
+    pub var range: f64[2] = [0.0, 1.0]
+    ## Explicit Control: the degrees and spans as asked (0: as built).
+    pub var explicit: Explicit = Explicit(false, 0, 0, 0, 0)
+
+pub let skin_connect: i64 = 0
+pub let skin_free: i64 = 1
+
+## Explicit Control (Alias's): degrees and spans each way (u along the
+## curves, v across), the net refitted to them holding its sides'
+## continuity.
+pub struct Explicit:
+    pub var on: bool
+    pub var degree_u: i64
+    pub var spans_u: i64
+    pub var degree_v: i64
+    pub var spans_v: i64
+
+## `net` refitted by Explicit Control `e` (0: its own degree), holding
+## `keep_u` and `keep_v` rows at each side (its continuity there).
+func explicit_net(net: const Net*, e: const Explicit*, keep_u: usize, keep_v: usize) -> Net!:
+    let du = e.degree_u if e.degree_u > 0 else net.du
+    let dv = e.degree_v if e.degree_v > 0 else net.dv
+    if du < 1 or du > most_degree or dv < 1 or dv > most_degree: error(invalid, "Explicit Control's degrees are 1 to 11")
+    if e.spans_u < 1 or e.spans_v < 1 or e.spans_u > 128 or e.spans_v > 128: error(invalid, "Explicit Control's spans are 1 to 128")
+    var ku = Growing[f64]()
+    defer ku.close()
+    var kv = Growing[f64]()
+    defer kv.close()
+    try uniform_knots(du, (usize)e.spans_u, net.u_low(), net.u_high(), &ku)
+    try uniform_knots(dv, (usize)e.spans_v, net.v_low(), net.v_high(), &kv)
+    let room_u = (usize)du + (usize)e.spans_u
+    let room_v = (usize)dv + (usize)e.spans_v
+    if 2 * (keep_u + 1) > room_u or 2 * (keep_v + 1) > room_v:
+        var buffer: u8[200]
+        error(invalid, try strings.format(buffer, f"Explicit Control: holding the sides' continuity needs {2 * (keep_u + 1)} by {2 * (keep_v + 1)} control points, this has {room_u} by {room_v}"))
+    return try refit_net(net, du, ku.view(), dv, kv.view(), keep_u, keep_v, net.rational())
 
 ## The mean distance between the control points of `a` and `b` (alike).
 func mean_gap(a: const Spline*, b: const Spline*) -> f64:
@@ -147,10 +188,24 @@ func skin_nets(set: interop.Reference[GeometrySet], words: str, opts: const Skin
 func skin_from(picked: Growing[Spline]*, ends: Master*[2], opts: const SkinOptions*) -> Net!:
     let n = picked.count
     if opts.degree < 1 or opts.degree > most_degree: error(invalid, "Skin's degree across is 1 to 11")
+    if opts.flow != skin_connect and opts.flow != skin_free: error(invalid, "Skin's Flow Control is Connect ends or Free")
+    if not (opts.range[0] >= 0.0 and opts.range[1] <= 1.0 and opts.range[1] - opts.range[0] > 1e-6): error(invalid, "Skin's Modify Range runs from 0 to 1 of the curves, start before end")
+    if opts.closed and (opts.range[0] > 0.0 or opts.range[1] < 1.0): error(invalid, "Skin's Modify Range takes open sections (a closed Skin's go round)")
     var sections = Growing[Spline]()
     defer close_splines_of(&sections)
     for at in 0..<n:
-        var c = try picked.items[at].copy()
+        var whole = try picked.items[at].copy()
+        if opts.flow == skin_free:
+            # By arc length: the curve refitted so its parameter is its
+            # length's fraction (Rebuild's, within the build's tolerance);
+            # the range then a stretch of its length.
+            var plain = try plain_curve(&whole, build_tolerance(picked.items[at..<at + 1]) * 0.1)
+            defer plain.close()
+            let even = try rebuilt_curve(&plain, build_tolerance(picked.items[at..<at + 1]) * 0.1)
+            whole.close()
+            whole = even
+        var c = try segment_of(&whole, opts.range[0], opts.range[1])
+        whole.close()
         if at > 0 and runs_against(&c, &sections.items[at - 1]):
             let turned_round = try reversed_spline(&c)
             c.close()
@@ -230,6 +285,11 @@ func skin_from(picked: Growing[Spline]*, ends: Master*[2], opts: const SkinOptio
             let order_asked = opts.start if k == 0 else opts.end
             if order_asked <= 0: continue
             try match_side(&made, 2 + k, ends[(usize)k], order_asked, tolerance)
+    if opts.explicit.on:
+        let keep = (usize)math.max(0.0, (f64)math.max((f64)opts.start, (f64)opts.end))
+        let refitted = try explicit_net(&made, &opts.explicit, 0, keep)
+        made.close()
+        made = refitted
     return made
 
 ## Proportional Crown on a Skin of two sections (`net` of degree 1

@@ -10,6 +10,18 @@
 ## groove) and Tangent offset (across, in the face). The circles' rows are
 ## fitted along the curve by its length (along.lucb): a straight curve
 ## gives a cylinder exactly, a circle a torus within the tolerance.
+##
+## Alias's variable radius: a law of (fraction along the curve, radius)
+## points, a smoothstep between them. Its trims (a curve on a face or an
+## edge's face): where the tube meets the face (at each station the
+## section's circle where it crosses the face, by Newton on its angle from
+## the face's tangent plane's answer), two curves; Curves on surface casts
+## them onto the face, Trim inside takes the strip between them (closed by
+## the chords across the tube's open ends) away.
+
+pub let tube_trim_off: i64 = 0
+pub let tube_trim_curves: i64 = 1
+pub let tube_trim_inside: i64 = 2
 
 ## What the sections need: the curve (on 0..1) and its master (its face),
 ## its arc table and natural frames, the radius and offsets.
@@ -21,16 +33,46 @@ struct TubeWork:
     var radius: f64
     var tangent_offset: f64
     var normal_offset: f64
+    ## Variable radius: (fraction, radius) pairs; none: `radius`.
+    var law: Growing[f64]
 
     func close():
         self.master.close()
         self.curve.close()
         self.arc.close()
         self.frames.close()
+        self.law.close()
+
+    ## The radius at fraction `s` of the curve's length.
+    func radius_at(s: f64) -> f64:
+        let n = self.law.count // 2
+        if n < 2: return self.radius
+        if s <= self.law.items[0]: return self.law.items[1]
+        for k in 1..<n:
+            let a = self.law.items[2 * (k - 1)]
+            let b = self.law.items[2 * k]
+            if s <= b:
+                let t = (s - a) / math.max(1e-300, b - a)
+                let smooth = t * t * (3.0 - 2.0 * t)
+                return self.law.items[2 * k - 1] * (1.0 - smooth) + self.law.items[2 * k + 1] * smooth
+        return self.law.items[2 * n - 1]
 
 ## The tube's circle at fraction `s` of the curve's length.
 func tube_section(context: void*, s: f64, out: Growing[Weighted]*) -> !:
     let w = (TubeWork*)context
+    let (center, up, side) = try tube_frame(w, s)
+    let radius = w.radius_at(s)
+    let half = math.sqrt(0.5)
+    let xs: f64[9] = [1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0, 1.0, 1.0]
+    let ys: f64[9] = [0.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0]
+    out.clear()
+    for k in 0..<(usize)9:
+        let p = center.add(up.multiply_scalar(radius * xs[k])).add(side.multiply_scalar(radius * ys[k]))
+        try out.push(weighted(p, 1.0) if k % 2 == 0 else Weighted(p.x * half, p.y * half, p.z * half, half))
+
+## The section's center at fraction `s`, its up (the face's normal, else
+## the curve's frame's) and its side.
+func tube_frame(w: TubeWork*, s: f64) -> (Vector3, Vector3, Vector3)!:
     let t = try arc_param(&w.curve, &w.arc, s)
     var (x, tangent, up) = try frame_at(&w.curve, &w.frames, sweep_natural, Vector3(), &w.master, &w.curve, &w.frames, t)
     if w.master.has_face:
@@ -42,19 +84,29 @@ func tube_section(context: void*, s: f64, out: Growing[Weighted]*) -> !:
         up = n.subtract(tangent.multiply_scalar(n.dot(tangent))).normalized() catch failure: error(invalid, "Tube: the face's normal runs along the curve")
     let side = tangent.cross(up)
     let center = x.add(up.multiply_scalar(w.normal_offset)).add(side.multiply_scalar(w.tangent_offset))
-    let half = math.sqrt(0.5)
-    let xs: f64[9] = [1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0, 1.0, 1.0]
-    let ys: f64[9] = [0.0, 1.0, 1.0, 1.0, 0.0, -1.0, -1.0, -1.0, 0.0]
-    out.clear()
-    for k in 0..<(usize)9:
-        let p = center.add(up.multiply_scalar(w.radius * xs[k])).add(side.multiply_scalar(w.radius * ys[k]))
-        try out.push(weighted(p, 1.0) if k % 2 == 0 else Weighted(p.x * half, p.y * half, p.z * half, half))
+    return (center, up, side)
 
 ## Tube's net along the curve `words` (a master's words): radius `radius`,
 ## Normal offset `normal_offset` (negated with `flip`), Tangent offset
 ## `tangent_offset`.
-func tube_net(set: interop.Reference[GeometrySet], words: str, radius: f64, tangent_offset: f64, normal_offset: f64, flip: bool) -> Net!:
+func tube_net(set: interop.Reference[GeometrySet], words: str, radius: f64, tangent_offset: f64, normal_offset: f64, flip: bool, law: const f64[]) -> Net!:
+    var w = try tube_work(set, words, radius, tangent_offset, normal_offset, flip, law)
+    defer w.close()
+    var across = Growing[f64]()
+    defer across.close()
+    for k in [0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0]: try across.push(k)
+    var largest = radius
+    for k in 0..<law.length // 2: largest = math.max(largest, law[2 * k + 1])
+    let tolerance = math.max(1e-12, (size_of(&w.curve) + largest) * 1e-8)
+    var source = SectionSource((void*)&w, tube_section, tolerance)
+    return try along_net(&source, across.view(), 2, 9, (usize)math.max(2.0, (f64)span_count(&w.curve)))
+
+## Tube's work along the curve `words`, its radius law checked.
+func tube_work(set: interop.Reference[GeometrySet], words: str, radius: f64, tangent_offset: f64, normal_offset: f64, flip: bool, law: const f64[]) -> TubeWork!:
     if not (radius > 0.0): error(invalid, "Tube: the radius must be more than zero")
+    if law.length % 2 != 0: error(invalid, "Tube: a variable radius's points are pairs of a fraction and a radius")
+    for k in 0..<law.length // 2:
+        if not (law[2 * k + 1] > 0.0) or law[2 * k] < 0.0 or law[2 * k] > 1.0 or (k > 0 and law[2 * k] <= law[2 * k - 2]): error(invalid, "Tube: a variable radius's points run 0 to 1 along it, each radius more than zero")
     var master = try master_of(set, words, -1, Vector3())
     errdefer master.close()
     if master.curve.points.count == 0: error(invalid, "Tube: pick a curve, an edge or an isoparm")
@@ -64,11 +116,127 @@ func tube_net(set: interop.Reference[GeometrySet], words: str, radius: f64, tang
     var arc = try arc_table(&curve)
     errdefer arc.close()
     let frames = try make_frames(&curve, Vector3())
-    var w = TubeWork(master, curve, arc, frames, radius, tangent_offset, -normal_offset if flip else normal_offset)
+    var w = TubeWork(master, curve, arc, frames, radius, tangent_offset, -normal_offset if flip else normal_offset, Growing[f64]())
+    errdefer w.close()
+    if law.length >= 4: try w.law.assign(law)
+    return w
+
+## Where the tube meets its face at fraction `s`: the section's circle's
+## two crossings (each side of the curve), by Newton on the angle from the
+## tangent plane's answer; none when it does not reach the face.
+func tube_crossings(w: TubeWork*, s: f64) -> (Vector3, Vector3)?!:
+    let (center, up, side) = try tube_frame(w, s)
+    let r = w.radius_at(s)
+    let lean = -w.normal_offset / r
+    if math.abs(lean) >= 1.0: return none
+    var found: Vector3[2] = [Vector3(), Vector3()]
+    for k in 0..<(usize)2:
+        var angle = math.acos(lean) * (1.0 if k == 0 else -1.0)
+        for _ in 0..<20:
+            let p = center.add(up.multiply_scalar(r * math.cos(angle))).add(side.multiply_scalar(r * math.sin(angle)))
+            let uv = try w.master.chart_of(p)
+            let j = try surface_jet(w.master.surface(), uv, false, false)
+            let n = j.su.cross(j.sv).normalized() catch failure: break
+            let f = p.subtract(j.p).dot(n)
+            let dp = up.multiply_scalar(-r * math.sin(angle)).add(side.multiply_scalar(r * math.cos(angle)))
+            let df = dp.dot(n)
+            if not (math.abs(df) > 1e-300): break
+            let step = f / df
+            angle -= step
+            if math.abs(step) < 1e-14: break
+        found[k] = center.add(up.multiply_scalar(r * math.cos(angle))).add(side.multiply_scalar(r * math.sin(angle)))
+    return (found[0], found[1])
+
+## `set` (the tube already added) with Tube's trim of the face the curve
+## lies on: the two curves where it meets the face cast onto it (Curves on
+## surface), or the strip between them taken away (Trim inside).
+func tube_trims(set: interop.Reference[GeometrySet], words: str, radius: f64, tangent_offset: f64, normal_offset: f64, flip: bool, law: const f64[], trim: i64, name: str) -> interop.Reference[GeometrySet]!:
+    var w = try tube_work(set, words, radius, tangent_offset, normal_offset, flip, law)
     defer w.close()
-    var across = Growing[f64]()
-    defer across.close()
-    for k in [0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0]: try across.push(k)
-    let tolerance = math.max(1e-12, (size_of(&w.curve) + radius) * 1e-8)
-    var source = SectionSource((void*)&w, tube_section, tolerance)
-    return try along_net(&source, across.view(), 2, 9, (usize)math.max(2.0, (f64)span_count(&w.curve)))
+    if not w.master.has_face: error(invalid, "Tube: a trim needs the curve on a face (a curve on a face, or an edge)")
+    var sides: Growing[Vector3][2] = [Growing[Vector3](), Growing[Vector3]()]
+    defer sides[0].close()
+    defer sides[1].close()
+    let count: usize = 64
+    for q in 0..<count + 1:
+        let met = try tube_crossings(&w, (f64)q / (f64)count) else error(invalid, "Tube: the tube does not reach its face there (its normal offset is a radius or more); no trim")
+        let (a, b) = met
+        try sides[0].push(a)
+        try sides[1].push(b)
+    let face = w.master.w.face_name(w.master.f)
+    let body = try body_holding(set, face)
+    var current = set.clone()
+    errdefer current.release()
+    var names = Growing[u8]()
+    defer names.close()
+    # The two meeting curves, and (Trim inside) the chords across the
+    # tube's open ends, closing the strip.
+    let pieces: usize = 2 if trim == tube_trim_curves else 4
+    for k in 0..<pieces:
+        var ends: Vector3[2] = [Vector3(), Vector3()]
+        if k >= 2:
+            let at = 0 if k == 2 else count
+            ends = [sides[0].items[at], sides[1].items[at]]
+        var curve = try through_points(sides[k].view()) if k < 2 else try through_points(ends[..<2])
+        defer curve.close()
+        var buffer: u8[300]
+        let curve_name = try strings.format(buffer, f"{name}/meets{k + 1}[{face}]")
+        if k > 0: try names.push(59)
+        for byte in curve_name.bytes: try names.push(byte)
+        let held = try held_spline(try curve.copy())
+        defer held.release()
+        let next = try CadCurves.with_curve(current, curve_name, held)
+        current.release()
+        current = next
+    let both = (str)names.view()
+    if trim == tube_trim_curves:
+        let cast = try CadSurfacing.projected(current, body, face, both, Vector3(), normal = true, both = true)
+        defer cast.release()
+        let geometry = try cast.value().geometry()
+        current.release()
+        current = geometry
+    else:
+        # The strip under the tube: its curve's middle.
+        let middle = w.curve.point_at(0.5)
+        let away: Vector3[1] = [middle]
+        let cut = try CadSurfacing.trimmed(current, body, face, away[..<1], 1, both, "trim", cast = trim_cast_normal)
+        current.release()
+        current = cut
+    # The meeting curves were only the trim's means.
+    var start: usize = 0
+    let bytes = both.bytes
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 59: continue
+        let without = try CadCurves.without_curve(current, (str)bytes[start..<at])
+        current.release()
+        current = without
+        start = at + 1
+    return current
+
+## A cubic through `points` by chord length (a line through two).
+func through_points(points: const Vector3[]) -> Spline!:
+    var params = Growing[f64]()
+    defer params.close()
+    var run = 0.0
+    try params.push(0.0)
+    for k in 1..<points.length:
+        run += points[k].subtract(points[k - 1]).length()
+        try params.push(run)
+    if not (run > 0.0): error(invalid, "Tube: its meeting curve has no length")
+    for k in 0..<params.count: params.items[k] = params.items[k] / run
+    var knots = Growing[f64]()
+    defer knots.close()
+    var matrix = Growing[f64]()
+    defer matrix.close()
+    try collocation(params.view(), fewer(3, points.length - 1), &knots, &matrix)
+    var values = Growing[Weighted]()
+    defer values.close()
+    for p in points: try values.push(weighted(p, 1.0))
+    var solved = Growing[Weighted]()
+    defer solved.close()
+    try interpolate_points(matrix.view(), values.view(), &solved)
+    var curve = empty_spline((i64)fewer(3, points.length - 1))
+    errdefer curve.close()
+    try curve.knots.assign(knots.view())
+    try curve.points.assign(solved.view())
+    return curve

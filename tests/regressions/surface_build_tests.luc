@@ -42,7 +42,8 @@ pub func surface_build_tests() -> unit!:
     extend_chain()
     detach_closed()
     align_followups()
-    print("PASS surface build: Square is bilinear on four lines and meets a hole's neighbors G0, G1 and G2 on every edge (Cubic, Implied Tangent, Tangent Angle too); Skin of circles is a cone and a surface of revolution exactly, closed smoothly, G1 to an edge at its start; Rail round a circle is a torus and reaches both of two rails; Profile passes its profiles, Limited without overshoot; Set Planar, Extrude and Revolve are exact; Extend Natural keeps the polynomial, Linear is G1 only, Soft and Reflective G2; Detach periodic splits a closed sheet; Align's proxy is the old hull; a curve's Modify Both meets an edge halfway; Project takes an isoparm; a cap on four walls meets them G1 and G2; Boundary Blend, Influence, Colinear and Rebuild; Rail's Spine, Sweep Pivot, Fixed Curve and Curve Segments; Skin's curve sets, Multiple Surfaces and Proportional Crown; Extend's Chain Select")
+    builder_options()
+    print("PASS surface build: Square is bilinear on four lines and meets a hole's neighbors G0, G1 and G2 on every edge (Cubic, Implied Tangent, Tangent Angle too); Skin of circles is a cone and a surface of revolution exactly, closed smoothly, G1 to an edge at its start; Rail round a circle is a torus and reaches both of two rails; Profile passes its profiles, Limited without overshoot; Set Planar, Extrude and Revolve are exact; Extend Natural keeps the polynomial, Linear is G1 only, Soft and Reflective G2; Detach periodic splits a closed sheet; Align's proxy is the old hull; a curve's Modify Both meets an edge halfway; Project takes an isoparm; a cap on four walls meets them G1 and G2; Boundary Blend, Influence, Colinear and Rebuild; Rail's Spine, Sweep Pivot, Fixed Curve and Curve Segments; Skin's curve sets, Multiple Surfaces and Proportional Crown; Extend's Chain Select; Skin's Flow Control and Modify Range, Rail's Colinear and Rebuild, Explicit Control on Skin, Rail and Profile")
 
 # -- Shapes.
 
@@ -670,3 +671,58 @@ func align_followups() -> unit!:
     let box = CadGeometry.of_model(flat(Vector3(-2.0, -2.0, 0.0), Vector3(2.0, -2.0, 0.0), Vector3(-2.0, 2.0, 0.0), "floor")).merged(CadGeometry.of_model(quarter))
     let cast = CadSurfacing.projected(box, 0, "floor", "isoparm cylinder 1 0.5", Vector3(0.0, 0.0, -1.0))
     assert(cast.count >= 1, "Project of an isoparm made nothing")
+
+func builder_options() -> unit!:
+    # A straight line whose control points crowd its start (its parameter's
+    # middle well before its length's), and a plain line beside it.
+    var data = GeometrySet()
+    data = CadCurves.with_curve(data, "crowded", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(0.2, 0.0, 0.0), Vector3(0.4, 0.0, 0.0), Vector3(4.0, 0.0, 0.0)], 3))
+    data = CadCurves.with_curve(data, "plain", CadCurveTools.by_points([Vector3(0.0, 2.0, 0.0), Vector3(4.0, 2.0, 0.0)], 1))
+    let crowded = CadCurves.curve(data, CadCurves.find(data, "crowded"))
+    let middle = crowded.at((crowded.low() + crowded.high()) * 0.5).x
+    assert(middle < 1.5, f"the crowded line's parameter middle at {middle}")
+    # Skin's Flow Control: Connect ends follows the curves' parameters,
+    # Free their lengths.
+    for (flow, want) in [(0, middle), (1, 2.0)]:
+        let made = CadSurfaceBuild.skin(data, "curve crowded;curve plain", flow = flow)
+        let (model, s) = sheet_of(made.geometry(), 0)
+        let p = CadNurbs.point_at(model, s, 0.5, 0.0)
+        assert(math.abs(p.x - want) < 1e-6, f"Skin Flow Control {flow}: the middle isoparm leaves the crowded line at {p}")
+    # Modify Range: the first quarter to the half of every curve.
+    let ranged = CadSurfaceBuild.skin(data, "curve crowded;curve plain", flow = 1, range_from = 0.25, range_to = 0.5)
+    let (rm, rs) = sheet_of(ranged.geometry(), 0)
+    let a = CadNurbs.point_at(rm, rs, 0.0, 0.5)
+    let b = CadNurbs.point_at(rm, rs, 1.0, 0.5)
+    assert(math.abs(math.min(a.x, b.x) - 1.0) < 1e-6 and math.abs(math.max(a.x, b.x) - 2.0) < 1e-6, f"Skin's Modify Range runs {a} to {b}")
+    # Explicit Control: the degrees and spans asked.
+    let explicit = CadSurfaceBuild.skin(data, "curve crowded;curve plain", explicit = true, degree_u = 3, spans_u = 6, degree_v = 2, spans_v = 1)
+    let (em, es) = sheet_of(explicit.geometry(), 0)
+    let shape = CadNurbs.structure(em, es)
+    assert(shape.du == 3 and shape.spans_u == 6 and shape.dv == 2 and shape.spans_v == 1, f"Skin Explicit Control: {shape.du} {shape.spans_u} {shape.dv} {shape.spans_v}")
+    # Rail along the crowded line: by its length the middle section stands
+    # at x = 2; Colinear, at its parameter's middle.
+    data = CadCurves.with_curve(data, "gen", CadCurveTools.by_points([Vector3(0.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.5), Vector3(0.0, 2.0, 0.0)], 2))
+    for (colinear, want) in [(false, 2.0), (true, middle)]:
+        let swept = CadSurfaceBuild.rail(data, "curve gen", "curve crowded", colinear = [colinear, false])
+        let (sm, ss) = sheet_of(swept.geometry(), 0)
+        let shape_r = CadNurbs.structure(sm, ss)
+        # The rail runs along v (or u): the section in the middle of it.
+        let p = CadNurbs.point_at(sm, ss, 0.0, 0.5) if shape_r.dv >= 1 and math.abs(CadNurbs.point_at(sm, ss, 0.0, 1.0).x - 4.0) < 1e-6 else CadNurbs.point_at(sm, ss, 0.5, 0.0)
+        assert(math.abs(p.x - want) < 1e-4, f"Rail Colinear {colinear}: the middle section at {p}, not x {want}")
+    # Rebuild per curve: the rail refitted by its length; the sweep still
+    # runs along it.
+    let rebuilt = CadSurfaceBuild.rail(data, "curve gen", "curve crowded", rebuild = [true, false, true])
+    let (bm, bs) = sheet_of(rebuilt.geometry(), 0)
+    for k in 0..<5:
+        let t = float(k) / 4.0
+        let q = CadNurbs.point_at(bm, bs, 0.0, t)
+        let r = CadNurbs.point_at(bm, bs, t, 0.0)
+        assert(math.abs(q.y) < 1e-6 or math.abs(r.y) < 1e-6, f"Rebuild: the rail's side left it at {q} {r}")
+    let exp_rail = CadSurfaceBuild.rail(data, "curve gen", "curve crowded", explicit = true, degree_u = 3, spans_u = 2, degree_v = 3, spans_v = 5)
+    let (xm, xs) = sheet_of(exp_rail.geometry(), 0)
+    let rs2 = CadNurbs.structure(xm, xs)
+    assert(rs2.du == 3 and rs2.dv == 3 and rs2.spans_u == 2 and rs2.spans_v == 5, f"Rail Explicit Control: {rs2.du} {rs2.spans_u} {rs2.dv} {rs2.spans_v}")
+    let exp_profile = CadSurfaceBuild.profile(data, "curve gen", "curve crowded", explicit = true, degree_u = 4, spans_u = 1, degree_v = 4, spans_v = 3)
+    let (pm, ps) = sheet_of(exp_profile.geometry(), 0)
+    let ps2 = CadNurbs.structure(pm, ps)
+    assert(ps2.du == 4 and ps2.dv == 4 and ps2.spans_u == 1 and ps2.spans_v == 3, f"Profile Explicit Control: {ps2.du} {ps2.spans_u} {ps2.dv} {ps2.spans_v}")
