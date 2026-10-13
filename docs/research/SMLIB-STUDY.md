@@ -1005,9 +1005,14 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   tracing (`whole_piece`: the other holes' walls), the face pairs' containment questions are
   answered from a lookup that traces a face's loops once, and on a plane only the loops whose box
   holds the point (`face_lookup.lucb`), and boundary edges whose box is far from a curve are not
-  sampled against it. P1: 790 to 310 ms in the comparison run (SMLib 290). What remains: the plate's top and bottom are still
-  traced whole for each hole (`group_cycles` charts every loop) and classified from a chart of
-  every loop (`inside_faces`); a chart cache shared by the boolean's steps would take most of it.
+  sampled against it. P1: 790 to 310 ms in the comparison run (SMLib 290). Then, instead of a
+  chart cache: the rays that classify pieces place their hits on analytic faces through the
+  intersection step's face lookup (only the loops round the hit traced, not a chart of every
+  hole: classification 25% of P1 to 4%); `group_cycles` takes each cycle's turning sense from a
+  coarse chart (eight steps a curved edge) and charts finely only the outlines, of each hole just
+  its first two points for the probe beside it (each hole had been charted whole, 126 points); and
+  `vertex_cuts` skips an edge's own ends. P1: 310 to 158 ms (SMLib 290 single-threaded), the
+  quickest of three quiet runs; the rest is the new curves' crossings with the faces' edges.
 
 ## 12. What not to take
 
