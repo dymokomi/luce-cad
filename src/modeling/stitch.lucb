@@ -4,6 +4,9 @@
 ##
 ## Stitch joins bodies (open surface bodies above all) into one where their
 ## boundary edges meet within a gap: vertices closer than the gap merge,
+## the closest pairs first (SMLib's passes of a doubling tolerance, in
+## their limit), never two of one face (a face thinner than the gap keeps
+## its width: it is not glued to itself),
 ## an edge passing a merged vertex within the gap is cut there, and two
 ## edges between the same vertices whose middles lie within the gap become
 ## one edge the two faces share (the booleans' vertex and edge steps,
@@ -14,7 +17,12 @@
 ## by up to the gap. Each edge so made keeps that distance as its precision
 ## and each merged vertex its own (Parasolid's tolerant edges and
 ## vertices: BrepModel.edge_precision), so the model's tolerance is not
-## widened for all of it; meshing reads the largest.
+## widened for all of it; meshing reads the largest. A closed result's
+## tolerant edges are then rebuilt where their faces' surfaces meet, and
+## its vertices where theirs do (SMLib's edge refinement after sewing):
+## their precision falls back under the tolerance. Where that changes the
+## body's shape too much (a face's surface not reaching), the tolerant
+## result stays.
 ##
 ## Unstitch is the other way: every face of a body its own open body, its
 ## edges its own.
@@ -27,8 +35,9 @@ pub struct Stitched:
     pub var widest: f64
     pub var closed: bool
 
-## `models` stitched within `gap` (see the file's header).
-pub func stitch_models(models: const interop.Reference[CadModel][], gap: f64) -> Stitched!:
+## `models` stitched within `gap` (see the file's header); with `tolerant`
+## a closed result keeps its tolerant joins as they are (not rebuilt).
+pub func stitch_models(models: const interop.Reference[CadModel][], gap: f64, tolerant: bool = false) -> Stitched!:
     if not (gap > 0.0) or not math.is_finite(gap) or gap > 1.0: error(invalid, "Stitch's gap is between 0 and 1 model units, as Alias's")
     if models.length == 0: error(invalid, "Stitch: pick the surfaces to join")
     var w = try shape_of(models[0].value())
@@ -52,9 +61,8 @@ pub func stitch_models(models: const interop.Reference[CadModel][], gap: f64) ->
     work.size = math.max(1e-6, high.subtract(low).length())
     # Edges used once (each face's boundary), before: what may join.
     var before = try stitch_open_edges(&work.w)
-    # Vertices within the gap merge (Work.vertex merges within ten
-    # tolerances: the gap).
-    for p in work.w.points.view(): try work.point_vertex.push(try work.vertex(p))
+    # Vertices within the gap merge, the closest first (closest_merges).
+    try closest_merges(&work, gap)
     try vertex_cuts(&work)
     try cut_edges(&work)
     # Each face's loops in final edges: each use replaced by its pieces.
@@ -111,9 +119,16 @@ pub func stitch_models(models: const interop.Reference[CadModel][], gap: f64) ->
     for model in models:
         let b = model.value().brep() else error(invalid, "Stitch needs B-rep bodies")
         base = math.max(base, b.base_tolerance())
-    let made = try write_pieces(&work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view(), false, 0.0, base, gaps.view())
+    var made = try write_pieces(&work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view(), false, 0.0, base, gaps.view())
     errdefer made.release()
     let widest = try tolerant_joins(made.value(), gap, base)
+    # A closed result's tolerant edges rebuilt where their faces' surfaces
+    # meet (rebuilt_joins): their precision falls back under the tolerance.
+    if after == 0 and widest > base and not tolerant:
+        if let exact = try rebuilt_joins(made.value(), base):
+            made.release()
+            made = exact
+            _ = try tolerant_joins(made.value(), gap, base)
     return Stitched(made, (i64)(before - after) // 2, widest, after == 0)
 
 ## How many edges of `w` one face uses once and no other face uses.
@@ -400,3 +415,125 @@ func split_closed_loops(w: Shape*) -> i64!:
     try w.sizes.assign(sizes.view())
     try w.index_sides()
     return count
+
+## `model` (closed) with its tolerant edges (precision over `base`) and
+## their faces' other edges found again where the faces' surfaces meet,
+## and their vertices where theirs do: Offset Face's machinery with each
+## face replaced by its own surface (face_moves.lucb). None when that
+## refuses.
+func rebuilt_joins(model: const CadModel*, base: f64) -> interop.Reference[CadModel]?!:
+    let b = model.brep() else return none
+    var w = try shape_of(model)
+    defer w.close()
+    var chosen = Growing[bool]()
+    defer chosen.close()
+    try chosen.fill(w.faces.count, false)
+    for e in 0..<w.edges.count:
+        if (try b.edge_precision_of((i64)e)) <= base: continue
+        for side in 0..<(usize)2:
+            let f = w.sides.items[e * 2 + side]
+            if f >= 0: chosen.items[(usize)f] = true
+    var faces = Growing[usize]()
+    defer faces.close()
+    var targets = Growing[Surface]()
+    defer:
+        for k in 0..<targets.count: targets.items[k].close()
+        targets.close()
+    var senses = Growing[bool]()
+    defer senses.close()
+    for f in 0..<w.faces.count:
+        if not chosen.items[f]: continue
+        try faces.push(f)
+        try targets.push(try surface_copy(&w.surfaces.items[(usize)w.faces.items[f].surface]))
+        try senses.push(w.faces.items[f].sense)
+    if faces.count == 0: return none
+    # The precision the stitch gave is found again from the new geometry;
+    # the body's tolerance is its faces' own again (shape_of reads the
+    # largest).
+    w.tolerance = base
+    for e in 0..<w.edge_slack.count: w.edge_slack.items[e] = 0.0
+    for p in 0..<w.point_slack.count: w.point_slack.items[p] = 0.0
+    let m = FaceMove(move_replace, Vector3(), Vector3(), Vector3(), 0.0, 0.0)
+    var no_distances = Growing[f64]()
+    defer no_distances.close()
+    let made = substitute(&w, faces.view(), &m, targets.view(), senses.view(), no_distances.view()) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return none
+    return made
+
+## Each point of `work`'s shape its merged vertex (`work.point_vertex`):
+## pairs within `gap` merged closest first, unless the two groups hold a
+## point of one face between them (that face would lose an edge). Each
+## vertex sits at its group's first point, its zone reaching its farthest.
+func closest_merges(work: Work*, gap: f64) -> !:
+    let w = &work.w
+    let n = w.points.count
+    # The faces at each point (by its edges), as pairs (point, face).
+    var at_point = Growing[i64]()
+    defer at_point.close()
+    for f in 0..<w.faces.count:
+        for use in w.face_uses(f):
+            let edge = w.edges.items[edge_index(use)]
+            for v in [edge.start, edge.end]:
+                try at_point.push(v)
+                try at_point.push((i64)f)
+    # Candidate pairs within the gap, by distance.
+    var pairs = Growing[f64]()
+    defer pairs.close()
+    var order = Growing[usize]()
+    defer order.close()
+    var keys = Growing[f64]()
+    defer keys.close()
+    for i in 0..<n:
+        for j in i + 1..<n:
+            let d = w.points.items[i].subtract(w.points.items[j]).length()
+            if d > gap: continue
+            try keys.push(d)
+            try pairs.push((f64)i)
+            try pairs.push((f64)j)
+    try order.fill(keys.count, 0)
+    for k in 0..<order.count: order.items[k] = k
+    # Insertion by distance (the pairs are few: boundary points near each
+    # other).
+    for k in 1..<order.count:
+        var at = k
+        while at > 0 and keys.items[order.items[at - 1]] > keys.items[order.items[at]]:
+            let swap = order.items[at]
+            order.items[at] = order.items[at - 1]
+            order.items[at - 1] = swap
+            at -= 1
+    var group = Growing[usize]()
+    defer group.close()
+    for i in 0..<n: try group.push(i)
+    for k in order.view():
+        let a = union_root(group.items, (usize)pairs.items[k * 2])
+        let b = union_root(group.items, (usize)pairs.items[k * 2 + 1])
+        if a == b: continue
+        # A face holding a point of each group refuses the merge.
+        var shared = false
+        var x: usize = 0
+        while x < at_point.count and not shared:
+            if union_root(group.items, (usize)at_point.items[x]) == a:
+                let face = at_point.items[x + 1]
+                var y: usize = 0
+                while y < at_point.count:
+                    if at_point.items[y + 1] == face and union_root(group.items, (usize)at_point.items[y]) == b:
+                        shared = true
+                        break
+                    y += 2
+            x += 2
+        if shared: continue
+        group.items[b if a < b else a] = a if a < b else b
+    # One vertex per group, at its first point.
+    var merged_at = Growing[i64]()
+    defer merged_at.close()
+    try merged_at.fill(n, -1)
+    for i in 0..<n:
+        let root = union_root(group.items, i)
+        if merged_at.items[root] < 0:
+            merged_at.items[root] = (i64)work.vertices.count
+            try work.vertices.push(w.points.items[root])
+            try work.zones.push(math.max(work.tol * 5.0, w.point_slack_of(root)))
+        let v = (usize)merged_at.items[root]
+        work.zones.items[v] = math.max(work.zones.items[v], w.points.items[i].subtract(work.vertices.items[v]).length())
+        try work.point_vertex.push((i64)v)

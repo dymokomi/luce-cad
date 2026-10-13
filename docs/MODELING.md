@@ -1470,7 +1470,7 @@ by index and faces by name; curves on faces are the set's `CadCurves`.
 | `untrimmed(set, body, face, all)`, `stages(set, face)` | Untrim Last (or All): the face's latest (first) stage back in place of its pieces, stitched to its neighbors; with no stage, its natural surface. |
 | `trim_converted(set, body, face, du, dv, su, sv, swap, keep)` | Trim Convert: a four-sided face an untrimmed B-spline face of those degrees and spans, its surface and edge deviations reported; `keep` keeps the original as a body of its own. |
 | `shrunk(set, body, face)` | Shrink: a B-spline face's net cut down to its loops' box. |
-| `stitched(set, bodies, gap, detach_periodic, detach_single)`, `unstitched(set, body)` | Shell Stitch within a gap (how many edges it joined, the widest gap, whether it closed into a solid; with Alias's Detach options for export, how many faces and closed edges it split), and Unstitch (every face an open body). |
+| `stitched(set, bodies, gap, detach_periodic, detach_single, tolerant)`, `unstitched(set, body)` | Shell Stitch within a gap (how many edges it joined, the widest gap, whether it closed into a solid, its joins rebuilt exact unless `tolerant`; with Alias's Detach options for export, how many faces and closed edges it split), and Unstitch (every face an open body). |
 | `patch(points, weights, nu, nv, du, dv, ku, kv, name)` | A body of one B-spline face over its whole domain. |
 | `aligned(set, input, master, continuity, …)` | Align (below): a `CadAlignEdit` with the set, Alias's Diagnostic Feedback, the side and the aligned rows. |
 | `edge_precision(model, edge)`, `vertex_precision(model, vertex)`, `is_closed(model)` | A tolerant edge's or vertex's precision; whether every edge is shared. |
@@ -1519,14 +1519,19 @@ one, stitched to its neighbors within the edge deviation. **Shrink** cuts a B-sp
 box its loops span in the chart, and a fiftieth more each way (the loops' samples miss a curve's bulge
 between them), by knot insertion (`nurbs.extract` along each direction); the edges stay.
 
-**Stitch** (`modeling/stitch.lucb`): the bodies' shapes in one; vertices within the gap merge
-(`Work.vertex` at a tenth of it), an edge passing a merged vertex within the gap is cut there, and two
+**Stitch** (`modeling/stitch.lucb`): the bodies' shapes in one; vertices within the gap merge, the
+closest pairs first and never two of one face (`closest_merges`: a plate thinner than the gap is not
+glued to itself), an edge passing a merged vertex within the gap is cut there, and two
 edges between the same vertices whose middles lie within ten gaps become one (`cut_edges`); each joined
 edge is then sampled against the edges it joined, refused when they lie farther apart than the gap. Faces
 are turned so every shared edge is used once each way (a breadth-first walk; a one-sided shell refuses),
 and a body whose every edge is shared is a closed solid. The joined edges keep the first face's curve;
 their **precision** is the widest the joined edges lay apart, or the faces' surfaces off the edge
 (sampled), and each merged vertex's the most of its edges'; the model's own tolerance stays as it was.
+A closed result's tolerant joins are then rebuilt where their faces' surfaces meet, and its vertices
+where theirs do (`rebuilt_joins`: Offset Face's machinery, each face replaced by its own surface), so
+their precision falls back under the tolerance (a box's faces moved 1e-3 apart stitch into the moved
+box exactly); `tolerant` keeps them as they are, and so does a rebuild that would change the shape.
 Unstitch makes every face its own open body.
 
 Tests (`tests/regressions/surfacing_tests.luc`), against closed forms:

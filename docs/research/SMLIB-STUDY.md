@@ -982,6 +982,17 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   Regression: `shell_tests`. Still open: G2/G3 strips and flat faces swallowed by an inset (the
   face soup and winding numbers), and outward offsets that reconnect.
 
+- **12, stitch passes and edge refinement (done in part).** Vertices within the gap merge closest
+  pair first (the limit of SMLib's doubling passes) and never two of one face, the orientation
+  guard's cousin: a plate 0.002 thin stitched within 0.003 was refused as a one-sided shell (each
+  thin side's top and bottom merged), and now closes at 0.8. A closed result's tolerant joins are
+  rebuilt where their faces' surfaces meet and its vertices where theirs do (Offset Face's
+  machinery, each face replaced by itself): a 20 box's faces moved apart 1e-4, 1e-3 and mixed (some
+  in), stitched within 0.003, close with every edge's precision back at the model's tolerance
+  (2e-5, from 1.4e-3) and the moved box's volume to 3e-4 at 8 divisions. `tolerant` keeps the joins
+  (a boolean through tolerant edges is still tested). Regression: `surfacing_tests`
+  (`stitch_passes`). Still open: short-edge and sliver removal, open results' joins.
+
 - **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
   plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was
   finding a point well inside a piece (`piece_point`), asked even of the plate's face with all its
