@@ -100,11 +100,18 @@ struct BallStation:
     var uv1: Vector3
     var f2: usize
     var uv2: Vector3
+    ## Bridge Fillet's third contact (bridge_fillet.lucb).
+    var f3: usize = 0
+    var uv3: Vector3 = Vector3()
+    var placed_third: bool = false
+    var third: Vector3 = Vector3()
 
 ## What a fillet's sections need.
 struct FilletWork:
     var one: FilletSet
     var two: FilletSet
+    ## Bridge Fillet's center set (no faces: a Surface Fillet).
+    var three: FilletSet
     var opts: FilletOptions
     var size: f64
     var stations: Growing[BallStation]
@@ -118,6 +125,7 @@ struct FilletWork:
     func close():
         self.one.close()
         self.two.close()
+        self.three.close()
         self.stations.close()
         self.spine.close()
         self.law.close()
@@ -145,7 +153,13 @@ struct FilletWork:
 func spine_way(w: FilletWork*, s: const BallStation*, before: Vector3) -> Vector3!:
     let (_, m1) = try ball_side(&w.one, s.f1, s.uv1)
     let (_, m2) = try ball_side(&w.two, s.f2, s.uv2)
-    let t = m1.cross(m2).normalized() catch failure: error(invalid, "Surface Fillet: the two sets run parallel there; the ball touches them nowhere apart")
+    var cross = m1.cross(m2)
+    if w.three.faces.count > 0:
+        # A bridge between parallel walls: the third set's normal crosses.
+        let (_, m3) = try ball_side(&w.three, s.f3, s.uv3)
+        for other in [m1.cross(m3), m2.cross(m3)]:
+            if other.length() > cross.length(): cross = other
+    let t = cross.normalized() catch failure: error(invalid, "Surface Fillet: the two sets run parallel there; the ball touches them nowhere apart")
     return t.multiply_scalar(-1.0) if t.dot(before) < 0.0 else t
 
 ## Each face's chart box, sampled `count` by `count`: chart points the
@@ -338,6 +352,9 @@ func fillet_cross(w: FilletWork*, b: const BallStation*, out: Growing[Weighted]*
     let (p1, _) = try ball_side(&w.one, b.f1, b.uv1)
     let (p2, _) = try ball_side(&w.two, b.f2, b.uv2)
     out.clear()
+    if w.three.faces.count > 0:
+        try bridge_cross(w, b, out)
+        return
     if w.opts.section == fillet_chamfer:
         try out.push(weighted(p1, 1.0))
         try out.push(weighted(p2, 1.0))
@@ -402,13 +419,13 @@ func fillet_cross(w: FilletWork*, b: const BallStation*, out: Growing[Weighted]*
         # side 2's: one section at each weight, a leg from each.)
         var other = Growing[Vector3]()
         defer other.close()
-        try fillet_section(p1, p2, corner, fillet_g3, &points, &knots, a1, bend1, bend2, turn1, turn2)
+        try fillet_section(p1, p2, corner, fillet_g3, &points, &knots, weighted_shape(a1), bend1, bend2, turn1, turn2)
         knots.clear()
-        try fillet_section(p1, p2, corner, fillet_g3, &other, &knots, a2, bend1, bend2, turn1, turn2)
+        try fillet_section(p1, p2, corner, fillet_g3, &other, &knots, weighted_shape(a2), bend1, bend2, turn1, turn2)
         for k in 0..<(usize)4: try out.push(weighted(points.items[k], 1.0))
         for k in 4..<(usize)8: try out.push(weighted(other.items[k], 1.0))
         return
-    try fillet_section(p1, p2, corner, w.opts.section, &points, &knots, w.opts.form, bend1, bend2, turn1, turn2)
+    try fillet_section(p1, p2, corner, w.opts.section, &points, &knots, weighted_shape(w.opts.form), bend1, bend2, turn1, turn2)
     for q in points.view(): try out.push(weighted(q, 1.0))
 
 ## The section source's call: the section at fraction `s` of the spine.
@@ -421,6 +438,10 @@ func fillet_section_at(context: void*, s: f64, out: Growing[Weighted]*) -> !:
 ## degree 2 (one Bezier each), G2 and G3 fillet_section's.
 func cross_knots(section: i64, out: Growing[f64]*) -> i64!:
     out.clear()
+    if section == fillet_bridge:
+        # Two rational quadratic arcs (bridge_cross).
+        for k in [0.0, 0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.0]: try out.push(k)
+        return 2
     if section == fillet_chamfer or section == fillet_circular or section == fillet_lead:
         let degree: usize = 1 if section == fillet_chamfer else 2
         for _ in 0..<degree + 1: try out.push(0.0)
@@ -502,10 +523,11 @@ struct FilletMade:
         self.net.close()
         self.contacts.close()
 
-## Surface Fillet's net between face sets `first` and `second`.
-func fillet_net(set: interop.Reference[GeometrySet], first: str, second: str, opts: const FilletOptions*, sets: FilletSet[2]*, law: const f64[]) -> FilletMade!:
+## Surface Fillet's net between face sets `first` and `second` (and with
+## faces named in `center`, Bridge Fillet's, tangent to that set too).
+func fillet_net(set: interop.Reference[GeometrySet], first: str, second: str, opts: const FilletOptions*, sets: FilletSet[2]*, law: const f64[], center: str = "") -> FilletMade!:
     if not (opts.size > 0.0): error(invalid, "Surface Fillet: the radius (or chord) must be more than zero")
-    if opts.section < fillet_chamfer or opts.section > fillet_lead: error(invalid, "Surface Fillet: the section is G0 Chamfer, G1 Circular, G2 or G3 Curvature, Bias or Lead")
+    if (opts.section < fillet_chamfer or opts.section > fillet_lead) and not (opts.section == fillet_bridge and center.length > 0): error(invalid, "Surface Fillet: the section is G0 Chamfer, G1 Circular, G2 or G3 Curvature, Bias or Lead")
     if not (opts.form >= 0.1 and opts.form <= 2.0): error(invalid, "Surface Fillet: the Form Factor is 0.1 to 2")
     if not (opts.bias >= -1.0 and opts.bias <= 1.0): error(invalid, "Surface Fillet: the Bias Factor is -1 to 1")
     if not (opts.knee >= 0.0 and opts.knee <= 10.0): error(invalid, "Surface Fillet: the Knee Ratio is 0 (the circle's) to 10")
@@ -517,13 +539,17 @@ func fillet_net(set: interop.Reference[GeometrySet], first: str, second: str, op
     var two = fillet_set(set, second) catch failure:
         one.close()
         error(failure.code, failure.message)
-    var w = FilletWork(one, two, *opts, 1.0, Growing[BallStation](), empty_spline(1), Growing[f64](), empty_spline(1))
+    var w = FilletWork(one, two, FilletSet(Growing[Master](), 1.0), *opts, 1.0, Growing[BallStation](), empty_spline(1), Growing[f64](), empty_spline(1))
     defer w.close()
+    if center.length > 0:
+        w.three.close()
+        w.three = try fillet_set(set, center)
     # The model's size from the sets' samples (the tolerances' scale).
     let a = try set_middle(&w.one)
     let b = try set_middle(&w.two)
     w.size = math.max(a.subtract(b).length() + opts.size, opts.size)
     try choose_sides(&w)
+    try choose_third_side(&w)
     let seed = try seed_station(&w)
     var behind = Growing[BallStation]()
     defer behind.close()

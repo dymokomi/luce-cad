@@ -289,3 +289,48 @@ func fit_reference(w: FillWork*, fn: FillNet*, stations: const FillStation[]) ->
                 for j in 0..<(usize)net.dv + 1: have = have.add(fn.reference.items[(fu + i) * nv + fv + j].point().multiply_scalar(bu[i] * bv[j]))
             worst = math.max(worst, have.subtract(want).length())
     return worst
+
+## How far apart the sides' ribbons lie within the loop's chart (its
+## middle, and halfway from there to each side; normalized): where the neighbors carried on into the hole disagree (a
+## ball corner's three cylinders, each running on straight), their blend is
+## a dent no fill should keep, and the plate's own bending is the rule.
+func ribbon_spread(w: FillWork*, stations: const FillStation[]) -> f64!:
+    var starts = Growing[usize]()
+    defer starts.close()
+    var at: usize = 0
+    for k in 0..<w.sides.count:
+        try starts.push(at)
+        while at < stations.length and stations[at].side == k: at += 1
+    try starts.push(at)
+    var charts = Growing[Vector3]()
+    defer charts.close()
+    var middle = Vector3()
+    for st in stations:
+        let c = st.uv if w.molded else w.chart(st.p)
+        try charts.push(c)
+        middle = middle.add(c)
+    if stations.length == 0: return 0.0
+    middle = middle.multiply_scalar(1.0 / (f64)stations.length)
+    # At the middle and halfway from it to each side's middle station (by
+    # symmetry the sides may agree at the middle alone).
+    var places = Growing[Vector3]()
+    defer places.close()
+    try places.push(middle)
+    for k in 0..<w.sides.count:
+        let first = starts.items[k]
+        let count = starts.items[k + 1] - first
+        if count == 0: continue
+        try places.push(middle.add(charts.items[first + count // 2].subtract(middle).multiply_scalar(0.5)))
+    var spread = 0.0
+    for q in places.view():
+        var low = Vector3(1.0e300, 1.0e300, 1.0e300)
+        var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
+        for k in 0..<w.sides.count:
+            let first = starts.items[k]
+            let count = starts.items[k + 1] - first
+            if count == 0: continue
+            let r = try ribbon_at(w, k, q, stations, charts.view(), first, count)
+            low = Vector3(math.min(low.x, r.x), math.min(low.y, r.y), math.min(low.z, r.z))
+            high = Vector3(math.max(high.x, r.x), math.max(high.y, r.y), math.max(high.z, r.z))
+        if low.x <= high.x: spread = math.max(spread, high.subtract(low).length())
+    return spread

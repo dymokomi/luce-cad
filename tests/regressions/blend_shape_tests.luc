@@ -1,0 +1,189 @@
+## Parasolid's blend sections on a box's edge (surfacing Stage 8,
+## blend_shape.lucb), against closed forms: rho relative 0.5 is the circle,
+## rho absolute 0.5 the parabola (r² / 6 taken per length at a square
+## corner), a middle radius of the circle's own is the circle; G2 by depth
+## puts the section's middle that share of the way from the chord to the
+## corner, skews mirror each other, softness deepens it; every G2 section
+## meets the faces G2.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_cad.measure import CadMeasure
+from luce_geocore.geocore import Vector3
+from checks import manifold, volume
+from luce_std import math
+
+pub func blend_shape_tests() -> unit!:
+    conics()
+    shaped_g2()
+    limits()
+    setbacks()
+    overflow_off()
+    print("PASS blend shapes: rho 0.5 relative is the circle, 0.5 absolute the parabola, a middle radius of the circle's the circle; G2 by depth at its share of the way to the corner, skews mirrored, softness deeper, all G2 at the faces; limits halfway along an edge capped by planes square to it (G1 and G2 against the section's area); setbacks of three radii stop a corner's fillets that far from it; overflow off refuses a fillet running off its face with the size that fits")
+
+## The box of side 2 and its front top edge (y = z = 1).
+func box_edge() -> (CadModel, str)!:
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let found: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            let id = box.face_edge_id(face, use)
+            if a.y > 0.99 and b.y > 0.99 and a.z > 0.99 and b.z > 0.99 and not (id in found):
+                found.append(id)
+    return (box, CadModeling.edge_references(box, found))
+
+## How far in from the edge's corner the blend's surface crosses the
+## diagonal at the edge's middle (bisection on inside).
+func depth_in(model: CadModel) -> float!:
+    var low = 0.0
+    var high = 0.5
+    for _ in 0..<50:
+        let mid = (low + high) * 0.5
+        let p = Vector3(0.0, 1.0 - mid / math.sqrt(2.0), 1.0 - mid / math.sqrt(2.0))
+        if CadModeling.inside(model, p):
+            high = mid
+        else:
+            low = mid
+    return (low + high) * 0.5
+
+func conics() -> unit!:
+    let (box, edge) = box_edge()
+    let r = 0.5
+    let circle = 8.0 - (r * r - math.pi * r * r / 4.0) * 2.0
+    let relative = CadModeling.filleted(box, edge, r, "f", conic = 2, rho = 0.5)
+    let mesh = relative.tessellate(32)
+    manifold(mesh)
+    assert(math.abs(volume(mesh) - circle) < 1e-3, f"rho 0.5 relative: {volume(mesh)}, the circle's {circle}")
+    assert(math.abs(depth_in(relative) - (math.sqrt(2.0) - 1.0) * r) < 1e-6, f"rho 0.5 relative's middle {depth_in(relative)}")
+    # The parabola (middle weight 1): its segment is two thirds of the
+    # triangle, so r² / 6 is taken per length; its middle halfway from the
+    # chord to the corner.
+    let parabola = CadModeling.filleted(box, edge, r, "f", conic = 1, rho = 0.5)
+    assert(math.abs(volume(parabola.tessellate(32)) - (8.0 - r * r / 6.0 * 2.0)) < 1e-3, "rho 0.5 absolute is not the parabola")
+    assert(math.abs(depth_in(parabola) - r * math.sqrt(2.0) / 4.0) < 1e-6, f"the parabola's middle {depth_in(parabola)}")
+    # A middle radius of the circle's own: the circle; twice it, flatter
+    # (less taken, its middle further from the corner).
+    let own = CadModeling.filleted(box, edge, r, "f", conic = 3, rho = 1.0)
+    assert(math.abs(depth_in(own) - (math.sqrt(2.0) - 1.0) * r) < 1e-5, f"a middle radius of the circle's: {depth_in(own)}")
+    let flatter = CadModeling.filleted(box, edge, r, "f", conic = 3, rho = 2.0)
+    assert(depth_in(flatter) > depth_in(own) + 1e-3, "a larger middle radius is not flatter")
+    # Rho outside 0 to 1 is refused.
+    var said = ""
+    _ = CadModeling.filleted(box, edge, r, "f", conic = 1, rho = 1.0) catch failure:
+        said = failure.message
+        recover box
+    assert(said.contains("rho"), f"rho 1: {said}")
+
+func shaped_g2() -> unit!:
+    let (box, edge) = box_edge()
+    let r = 0.5
+    # Depth d: the middle (on the diagonal, skew 0.5) lies d of the way
+    # from the chord (r / √2 in from the corner) to the corner.
+    let chord = r / math.sqrt(2.0)
+    for d in [0.3, 0.6]:
+        let made = CadModeling.filleted(box, edge, r, "f", continuity = 2, depth = d)
+        manifold(made.tessellate(16))
+        assert(math.abs(depth_in(made) - chord * (1.0 - d)) < 1e-4, f"depth {d}: the middle {depth_in(made)} in, not {chord * (1.0 - d)}")
+        let check = CadMeasure.check(made, "", 2, 12, 0.0001, 0.1, 0.5, 1.0, false, 8, false, 1.0, true)
+        var g2 = 0
+        for e in 0..<check.edge_count():
+            if check.edge(e).level >= 2:
+                g2 += 1
+        assert(g2 >= 2, f"depth {d}: {check.summary()}")
+    # Skews mirror each other about the diagonal: the same volume, off the
+    # symmetric one's.
+    let left = volume(CadModeling.filleted(box, edge, r, "f", continuity = 2, depth = 0.5, skew = 0.3).tessellate(32))
+    let right = volume(CadModeling.filleted(box, edge, r, "f", continuity = 2, depth = 0.5, skew = 0.7).tessellate(32))
+    let even = volume(CadModeling.filleted(box, edge, r, "f", continuity = 2, depth = 0.5).tessellate(32))
+    assert(math.abs(left - right) < 1e-4 and math.abs(left - even) > 1e-4, f"skews {left} {right}, even {even}")
+    # Softness: more is deeper (its middle nearer the corner).
+    let soft = depth_in(CadModeling.filleted(box, edge, r, "f", continuity = 2, softness = 0.9))
+    let hard = depth_in(CadModeling.filleted(box, edge, r, "f", continuity = 2, softness = 0.2))
+    assert(soft < hard - 1e-3, f"softness 0.9 at {soft}, 0.2 at {hard}")
+
+func limits() -> unit!:
+    # The front top edge (x from -1 to 1) rounded from a quarter to three
+    # quarters of the way: half the edge's length of the section's area is
+    # taken, and two caps square to it close the notch.
+    let (box, edge) = box_edge()
+    let r = 0.5
+    let circle = r * r - math.pi * r * r / 4.0
+    let made = CadModeling.filleted(box, edge, r, "f", limit_from = 0.25, limit_to = 0.75)
+    let mesh = made.tessellate(32)
+    manifold(mesh)
+    assert(math.abs(volume(mesh) - (8.0 - circle * 1.0)) < 1e-3, f"the limited fillet's volume {volume(mesh)}")
+    assert(made.face_count() == 9, f"{made.face_count()} faces: the fillet and two caps")
+    var caps = 0
+    for f in 0..<made.face_count():
+        let name = made.face_name(f)
+        let point = CadModeling.face_point(made, name)
+        if name.ends_with("/cap") and math.abs(math.abs(point.normal.x) - 1.0) < 1e-9 and math.abs(math.abs(point.point.x) - 0.5) < 1e-9:
+            caps += 1
+    assert(caps == 2, f"{caps} caps square to the edge at its limits")
+    # G2 likewise (its section's area: 0.16824 r² at a square corner).
+    let g2 = CadModeling.filleted(box, edge, r, "f", continuity = 2, limit_from = 0.25, limit_to = 0.75)
+    let g2_mesh = g2.tessellate(32)
+    manifold(g2_mesh)
+    assert(math.abs(volume(g2_mesh) - (8.0 - 0.16824 * r * r * 1.0)) < 2e-3, f"the limited G2 fillet's volume {volume(g2_mesh)}")
+
+func setbacks() -> unit!:
+    # The three edges at the box's corner (1, 1, 1), G2, radius 0.5, set
+    # back three radii: each fillet stops 1.5 from the corner (by default
+    # 0.75: the contacts' crossing and half a reach), the corner's patch
+    # filling the rest; closed.
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let found: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            let id = box.face_edge_id(face, use)
+            let at_corner = (a.x > 0.99 and a.y > 0.99 and a.z > 0.99) or (b.x > 0.99 and b.y > 0.99 and b.z > 0.99)
+            if at_corner and not (id in found):
+                found.append(id)
+    let edges = CadModeling.edge_references(box, found)
+    for (ratio, reach) in [(0.0, 0.75), (3.0, 1.5)]:
+        let made = CadModeling.filleted(box, edges, 0.5, "f", continuity = 2, setback_ratio = ratio)
+        manifold(made.tessellate(16))
+        # Each strip runs along an edge from x, y or z = -1 up to 1 less its
+        # setback (its other coordinates reach 1 at its contacts).
+        var strips = 0
+        for f in 0..<made.face_count():
+            if not made.face_name(f).contains("blend["):
+                continue
+            var high = Vector3(-10.0, -10.0, -10.0)
+            for use in 0..<made.face_edge_count(f):
+                for k in 0..<9:
+                    let p = made.face_edge_point(f, use, float(k) / 8.0)
+                    high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+            let along = math.min(high.x, math.min(high.y, high.z))
+            assert(math.abs(along - (1.0 - reach)) < 1e-6, f"setback ratio {ratio}: a strip stops {1.0 - along} from the corner, not {reach}")
+            strips += 1
+        assert(strips == 3, f"{strips} strips")
+
+## Why filleting `model`'s `edge` by `radius` is refused ("" when it is
+## not), overflow off.
+func refused(model: CadModel, edge: str, radius: float) -> str:
+    _ = CadModeling.filleted(model, edge, radius, "f", overflow = false) catch failure:
+        return failure.message
+    return ""
+
+func overflow_off() -> unit!:
+    # A plate 4 thick, its top edge rounded 5: by default it runs off the
+    # side face and the bottom trims it (overflow_tests); with overflow off
+    # it must fit the side face, under 4.
+    let plate = CadModeling.tagged(CadSolids.box(20.0, 4.0, 20.0), "p")
+    let found: list[int] = []
+    for face in 0..<plate.face_count():
+        for use in 0..<plate.face_edge_count(face):
+            let a = plate.face_edge_point(face, use, 0.0)
+            let b = plate.face_edge_point(face, use, 1.0)
+            let id = plate.face_edge_id(face, use)
+            if math.abs(a.x - 10.0) < 1e-9 and math.abs(b.x - 10.0) < 1e-9 and math.abs(a.y - 2.0) < 1e-9 and math.abs(b.y - 2.0) < 1e-9 and not (id in found):
+                found.append(id)
+    let edge = CadModeling.edge_references(plate, found)
+    let said = refused(plate, edge, 5.0)
+    assert(said.contains("must be less than 4"), f"overflow off: {said}")
+    assert(refused(plate, edge, 3.0) == "", "overflow off refuses a fillet that fits")

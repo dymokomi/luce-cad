@@ -11,17 +11,17 @@
 ## cylinder along the edge (ruled_profile). A chamfer reaches `other` along
 ## the edge's second face when it is positive (chamfers.lucb's two-sided
 ## ones), else `size` like the first.
-func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, round: bool, continuity: i64, other: f64 = -1.0, tangency: f64 = 1.0) -> Profiles!:
+func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size: f64, round: bool, continuity: i64, other: f64 = -1.0, blend_shape: BlendShape = plain_blend) -> Profiles!:
     let (fa, fb) = try edge_faces(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     let cylinder = ruled_pair(w, e, fa, fb)
-    if cylinder < 0: return try corner_profile(p, along, ua, ub, size, round, continuity, other, tangency)
+    if cylinder < 0: return try corner_profile(p, along, ua, ub, size, round, continuity, other, blend_shape)
     let plane = fb if (usize)cylinder == fa else fa
     let second = other if not round and other > 0.0 else size
     let on_plane = size if plane == fa else second
     let on_round = second if plane == fa else size
-    return try ruled_profile(w, plane, (usize)cylinder, p, along, ua if plane == fa else ub, ub if plane == fa else ua, on_plane, round, try convex(w, e), on_round, continuity, tangency)
+    return try ruled_profile(w, plane, (usize)cylinder, p, along, ua if plane == fa else ub, ub if plane == fa else ua, on_plane, round, try convex(w, e), on_round, continuity, blend_shape)
 
 ## The section of a blend between plane face `plane` and cylinder face
 ## `cylinder` (its axis along the edge), at edge point `p`: the region
@@ -38,7 +38,7 @@ func section_profile(w: const Shape*, e: usize, p: Vector3, along: Vector3, size
 ## circle at weight 1). Each touches the cylinder only tangentially; the
 ## booleans meet the swept section with the cylinder along it in closed
 ## form (splines.lucb's along_sweep).
-func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool, other: f64, continuity: i64 = 1, tangency: f64 = 1.0) -> Profiles!:
+func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, along: Vector3, into_plane: Vector3, into_round: Vector3, size: f64, round: bool, outward: bool, other: f64, continuity: i64 = 1, blend_shape: BlendShape = plain_blend) -> Profiles!:
     let s = w.surfaces.items[(usize)w.faces.items[cylinder].surface]
     let axis_point = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
     let radius = s.radius
@@ -48,15 +48,15 @@ func ruled_profile(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, a
     errdefer profile.close()
     try profile.loop_offsets.push(0)
     try profile.edges.push(line_edge(p, ta))
-    if round and (continuity >= 2 or continuity == g1_spline or tangency != 1.0):
+    if round and (continuity >= 2 or continuity == g1_spline or not blend_shape.plain()):
         let to_tb = tb.subtract(axis_point)
         let corner = try lines_meet(ta, into_plane, tb, s.z.cross(to_tb))
         let first = profile.spline_points.count
         let knot_first = profile.spline_knots.count
         if continuity >= 2:
-            try fillet_section(ta, tb, corner, continuity, &profile.spline_points, &profile.spline_knots, tangency, Vector3(), to_tb.multiply_scalar(-1.0 / (radius * radius)))
+            try fillet_section(ta, tb, corner, continuity, &profile.spline_points, &profile.spline_knots, blend_shape, Vector3(), to_tb.multiply_scalar(-1.0 / (radius * radius)))
         else:
-            try arc_section(ta, tb, corner, &profile.spline_points, &profile.spline_weights, &profile.spline_knots, tangency)
+            try arc_section(ta, tb, corner, &profile.spline_points, &profile.spline_weights, &profile.spline_knots, blend_shape)
         while profile.spline_weights.count < profile.spline_points.count: try profile.spline_weights.push(1.0)
         try off_cylinder(profile.spline_points.view()[first..], profile.spline_weights.view()[first..], profile.spline_knots.view()[knot_first..], axis_point, s.z, radius)
         try profile.splines.push(ProfileSpline(first, profile.spline_points.count - first, knot_first, 5))
@@ -138,8 +138,8 @@ func ruled_contacts(w: const Shape*, plane: usize, cylinder: usize, p: Vector3, 
 ## An end marked exact (where a corner ball takes over) stops right there.
 ## Its blend face is named `name`. A two-sided chamfer reaches `other`
 ## along the second face (section_profile).
-func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str, other: f64 = -1.0, tangency: f64 = 1.0) -> interop.Reference[CadModel]!:
-    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_circle: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name, other, tangency)
+func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str, other: f64 = -1.0, blend_shape: BlendShape = plain_blend) -> interop.Reference[CadModel]!:
+    if w.carriers.items[(usize)w.edges.items[e].carrier].kind == curve_circle: return try rim_tool(w, e, size, round, continuity, exact_start, exact_end, body, name, other, blend_shape)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -151,13 +151,25 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i6
     let extent = math.max(length, size) * 4.0
     let before = 0.0 if exact_start or try body.inside(w, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
     let after = 0.0 if exact_end or try body.inside(w, end.add(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
-    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity, other, tangency)
+    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(before)), along, size, round, continuity, other, blend_shape)
     defer profile.close()
     let solid = try BrepModel.sized(length + margin * 2.0)
     defer solid.release()
     try extrude_into(solid.value(), &profile, length + before + after, "")
     try name_tool(solid.value(), name)
+    try name_caps(solid.value(), name)
     return try CadModel.of_brep(solid)
+
+## The tool's two ends (its extrusion's floor and roof, its last faces)
+## named `<name>/cap`: where the tool stops square inside the body (a
+## limit), the end is left as a face of the result, the blend's cap.
+func name_caps(b: BrepModel*, name: str) -> !:
+    let count = b.face_count()
+    if count < 2: return
+    var buffer: u8[300]
+    let cap = try strings.format(buffer, f"{name}/cap")
+    try b.set_face_name(count - 2, cap)
+    try b.set_face_name(count - 1, cap)
 
 ## The corner profile at `p` on an edge running `along`, between its faces'
 ## directions `ua` and `ub` (into each face): a chamfer's triangle `size`
@@ -173,7 +185,7 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i6
 ## the very curves a G1 setback corner's patch meets (continuity code 0).
 pub let g1_spline: i64 = 0
 
-func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool, continuity: i64, other: f64 = -1.0, tangency: f64 = 1.0) -> Profiles!:
+func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool, continuity: i64, other: f64 = -1.0, blend_shape: BlendShape = plain_blend) -> Profiles!:
     let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
     let reach = size / math.tan(angle * 0.5) if round else size
     let ta = p.add(ua.multiply_scalar(reach))
@@ -187,9 +199,9 @@ func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: 
         let first = profile.spline_points.count
         let knot_first = profile.spline_knots.count
         if continuity == g1_spline:
-            try arc_section(ta, tb, p, &profile.spline_points, &profile.spline_weights, &profile.spline_knots, tangency)
+            try arc_section(ta, tb, p, &profile.spline_points, &profile.spline_weights, &profile.spline_knots, blend_shape)
         else:
-            try fillet_section(ta, tb, p, continuity, &profile.spline_points, &profile.spline_knots, tangency)
+            try fillet_section(ta, tb, p, continuity, &profile.spline_points, &profile.spline_knots, blend_shape)
         let count = profile.spline_points.count - first
         while profile.spline_weights.count < profile.spline_points.count: try profile.spline_weights.push(1.0)
         try profile.splines.push(ProfileSpline(first, count, knot_first, 5))
@@ -211,8 +223,9 @@ func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: 
 ## A G2 or G3 fillet's section from contact `ta` to contact `tb`, whose
 ## legs run along the faces to the corner `p`: a degree 5 B-spline (the
 ## degree of every freeform element), its control points onto `points`
-## and its knots onto `knots`. `tangency` is Fusion's Tangency weight (0.1
-## to 2, 1 the default).
+## and its knots onto `knots`. `blend_shape` carries Fusion's Tangency weight
+## (0.1 to 2, 1 the default) and Parasolid's G2 depth, skew or softness
+## (blend_shape.lucb's shaped_g2 then makes the G2 section).
 ## G2 is Fusion's own (Fusion 2705's blend faces read back as B-splines,
 ## probe of 2026-10-12, matched to 1e-14 at seven corner angles and nine
 ## weights): degree 4, two spans (knots 0, 1/2, 1), six points: each
@@ -236,12 +249,13 @@ func corner_profile(p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: 
 ## inner ones never past the corner.
 ## At a square corner with contacts a unit from it, G2's middle is 0.366
 ## from the corner and G3's 0.360, the circle's 0.414.
-pub func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, points: Growing[Vector3]*, knots: Growing[f64]*, tangency: f64 = 1.0, bend_a: Vector3 = Vector3(), bend_b: Vector3 = Vector3(), turn_a: f64 = 0.0, turn_b: f64 = 0.0) -> !:
+pub func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, points: Growing[Vector3]*, knots: Growing[f64]*, blend_shape: BlendShape = plain_blend, bend_a: Vector3 = Vector3(), bend_b: Vector3 = Vector3(), turn_a: f64 = 0.0, turn_b: f64 = 0.0) -> !:
     if continuity == 2:
-        try fusion_g2(ta, tb, p, points, knots, tangency, bend_a, bend_b)
+        if blend_shape.shaped_g2(): try shaped_g2(ta, tb, p, blend_shape, points, knots, bend_a, bend_b)
+        else: try fusion_g2(ta, tb, p, points, knots, blend_shape, bend_a, bend_b)
         return
-    let leg_a = try g3_leg(ta, p, tangency, bend_a, turn_a)
-    let leg_b = try g3_leg(tb, p, tangency, bend_b, turn_b)
+    let leg_a = try g3_leg(ta, p, blend_shape, bend_a, turn_a)
+    let leg_b = try g3_leg(tb, p, blend_shape, bend_b, turn_b)
     for k in 0..<(usize)4: try points.push(leg_a[k])
     for k in 0..<(usize)4: try points.push(leg_b[3 - k])
     for _ in 0..<(usize)6: try knots.push(0.0)
@@ -252,7 +266,7 @@ pub func fillet_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, p
 ## Fusion's G2 section (fillet_section): its six degree 4 points, then
 ## raised to degree 5 (eight points, knots 0 six times, 1/2 twice, 1 six
 ## times).
-func fusion_g2(ta: Vector3, tb: Vector3, p: Vector3, points: Growing[Vector3]*, knots: Growing[f64]*, tangency: f64, bend_a: Vector3, bend_b: Vector3) -> !:
+func fusion_g2(ta: Vector3, tb: Vector3, p: Vector3, points: Growing[Vector3]*, knots: Growing[f64]*, blend_shape: BlendShape, bend_a: Vector3, bend_b: Vector3) -> !:
     let la = p.subtract(ta)
     let lb = p.subtract(tb)
     let ea = try la.normalized()
@@ -261,7 +275,7 @@ func fusion_g2(ta: Vector3, tb: Vector3, p: Vector3, points: Growing[Vector3]*, 
     let phi = math.pi - math.acos(math.clamp(ea.dot(eb), -1.0, 1.0))
     let leg = (la.length() + lb.length()) * 0.5
     let r = leg / math.tan(phi * 0.5)
-    let a = r * phi * tangency / 8.0
+    let a = r * phi * blend_shape.weight / 8.0
     let b = r * math.sin(phi) / 4.0 + a * (5.0 - 2.0 * math.cos(phi)) / 3.0
     let off = 8.0 * a * a / 3.0
     let q: Vector3[6] = [ta, ta.add(ea.multiply_scalar(a)), ta.add(ea.multiply_scalar(b)).add(bend_a.multiply_scalar(off)),
@@ -280,7 +294,7 @@ func fusion_g2(ta: Vector3, tb: Vector3, p: Vector3, points: Growing[Vector3]*, 
     for _ in 0..<(usize)6: try knots.push(1.0)
 
 ## A G3 section's first four points from contact `t` along its leg to the
-## corner `p` (fillet_section's fractions under `tangency`).
+## corner `p` (fillet_section's fractions under `blend_shape`).
 ## On a curved face (`bend`: its curvature times the unit way toward its
 ## center of curvature in the section; `turn`: the curvature's change per
 ## length along the leg toward the corner) the third and fourth points move
@@ -293,19 +307,19 @@ func fusion_g2(ta: Vector3, tb: Vector3, p: Vector3, points: Growing[Vector3]*, 
 ## Its change dκ/ds = (T_n / A² - 3 B_n B_e / A³) / A, for A = 15 a1 and
 ## B, T the second and third derivatives' parts along e and n, gives the
 ## fourth point's offset h3 from T_n = 270 h3 - 1485 h2.
-func g3_leg(t: Vector3, p: Vector3, tangency: f64, bend: Vector3, turn: f64) -> Vector3[4]!:
+func g3_leg(t: Vector3, p: Vector3, blend_shape: BlendShape, bend: Vector3, turn: f64) -> Vector3[4]!:
     let g3: f64[4] = [0.0, 0.1, 0.2, 0.6]
     let span = p.subtract(t)
     var leg: Vector3[4] = [t, Vector3(), Vector3(), Vector3()]
-    for k in 1..<(usize)4: leg[k] = t.add(span.multiply_scalar(weighted_fraction(g3[k], tangency)))
+    for k in 1..<(usize)4: leg[k] = t.add(span.multiply_scalar(weighted_fraction(g3[k], blend_shape)))
     # Flat across at the contact (to rounding): the points stay on the leg.
     let kappa = bend.length()
     let length = span.length()
     if kappa * length <= 1e-12: return leg
     let e = span.multiply_scalar(1.0 / length)
     let n = try bend.subtract(e.multiply_scalar(bend.dot(e))).normalized()
-    let a1 = weighted_fraction(g3[1], tangency) * length
-    let a2 = weighted_fraction(g3[2], tangency) * length
+    let a1 = weighted_fraction(g3[1], blend_shape) * length
+    let a2 = weighted_fraction(g3[2], blend_shape) * length
     let big_a = 15.0 * a1
     let h2 = 2.5 * kappa * a1 * a1
     let b_n = kappa * big_a * big_a
@@ -317,22 +331,17 @@ func g3_leg(t: Vector3, p: Vector3, tangency: f64, bend: Vector3, turn: f64) -> 
     return leg
 
 ## A section control point's fraction `f` toward the corner under tangency
-## weight `tangency` (fillet_section).
-func weighted_fraction(f: f64, tangency: f64) -> f64:
-    if tangency == 1.0: return f
-    return 1.0 - math.pow(1.0 - f, tangency)
-
-## Fusion's Tangency weight checked: 0.1 to 2 (1, the default, leaves a
-## fillet's section as it is).
-func check_tangency(tangency: f64) -> !:
-    if not math.is_finite(tangency) or tangency < 0.1 or tangency > 2.0: error(invalid, "a fillet's tangency weight is from 0.1 to 2")
+## weight `blend_shape` (fillet_section).
+func weighted_fraction(f: f64, blend_shape: BlendShape) -> f64:
+    if blend_shape.weight == 1.0: return f
+    return 1.0 - math.pow(1.0 - f, blend_shape.weight)
 
 ## A concave edge's tool, added to the solid: the corner profile (in the
 ## air between its faces) swept from `start` to `end`, ending flush with
 ## the face at each end: exactly there when that face is square to the
 ## edge, else swept past and cut by the face's plane.
 ## An end marked exact (where a corner ball takes over) ends square there.
-func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, name: str, other: f64 = -1.0, tangency: f64 = 1.0) -> interop.Reference[CadModel]!:
+func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, start: Vector3, end: Vector3, exact_start: bool, exact_end: bool, name: str, other: f64 = -1.0, blend_shape: BlendShape = plain_blend) -> interop.Reference[CadModel]!:
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
     let (fa, fb) = try edge_faces(w, e)
@@ -342,7 +351,7 @@ func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity:
     let (n1, h1) = (along, along.dot(end)) if exact_end else try end_plane(w, end, fa, fb)
     let square = math.abs(n0.dot(along)) > 1.0 - 1e-9 and math.abs(n1.dot(along)) > 1.0 - 1e-9
     let margin = 0.0 if square else size * 4.0 + length * 0.1
-    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(margin)), along, size, round, continuity, other, tangency)
+    var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(margin)), along, size, round, continuity, other, blend_shape)
     defer profile.close()
     let solid = try BrepModel.sized(length + margin * 2.0)
     defer solid.release()
@@ -394,7 +403,7 @@ func name_tool(b: BrepModel*, name: str) -> !:
 ## turns all the way; an arc's turns along it, reaching past an end where
 ## the corner beyond is empty and stopping at an exact one (a tangent
 ## joint with the next edge of a chain).
-func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str, other: f64 = -1.0, tangency: f64 = 1.0) -> interop.Reference[CadModel]!:
+func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64, exact_start: bool, exact_end: bool, body: ShapeRays*, name: str, other: f64 = -1.0, blend_shape: BlendShape = plain_blend) -> interop.Reference[CadModel]!:
     let edge = w.edges.items[e]
     let carrier = w.carriers.items[(usize)edge.carrier]
     let (fa, fb) = try edge_faces(w, e)
@@ -409,7 +418,7 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     let solid = try BrepModel.sized(carrier.a + size * 4.0)
     defer solid.release()
     if edge.start == edge.end:
-        var profile = try rim_profile(w, e, ball, p, along, ua, ub, size, round, continuity, other, tangency)
+        var profile = try rim_profile(w, e, ball, p, along, ua, ub, size, round, continuity, other, blend_shape)
         defer profile.close()
         try revolve_into(solid.value(), &profile, carrier.origin, normal, (carrier.a + size) * 1e-7, "")
         try name_tool(solid.value(), name)
@@ -428,7 +437,7 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     let after = 0.0 if exact_end or try body.inside(w, turned_point(last, carrier.origin, a, size * 0.5 / carrier.a).add(turned_direction(corner, a, sweep * 0.5)), extent) else margin
     # The profile where the tool starts: the middle's turned back.
     let back = -(sweep * 0.5 + before)
-    var profile = try rim_profile(w, e, ball, turned_point(p, carrier.origin, a, back), turned_direction(along, a, back), turned_direction(ua, a, back), turned_direction(ub, a, back), size, round, continuity, other, tangency)
+    var profile = try rim_profile(w, e, ball, turned_point(p, carrier.origin, a, back), turned_direction(along, a, back), turned_direction(ua, a, back), turned_direction(ub, a, back), size, round, continuity, other, blend_shape)
     defer profile.close()
     try revolve_into(solid.value(), &profile, carrier.origin, a, (carrier.a + size) * 1e-7, "", sweep + before + after)
     try name_tool(solid.value(), name)
@@ -436,8 +445,8 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
 
 ## A rim tool's section: a chamfer's on a sphere (face `ball`,
 ## sphere_rims.lucb), else the corner profile.
-func rim_profile(w: const Shape*, e: usize, ball: i64, p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool, continuity: i64, other: f64, tangency: f64) -> Profiles!:
-    if ball < 0: return try corner_profile(p, along, ua, ub, size, round, continuity, other, tangency)
+func rim_profile(w: const Shape*, e: usize, ball: i64, p: Vector3, along: Vector3, ua: Vector3, ub: Vector3, size: f64, round: bool, continuity: i64, other: f64, blend_shape: BlendShape) -> Profiles!:
+    if ball < 0: return try corner_profile(p, along, ua, ub, size, round, continuity, other, blend_shape)
     let s = w.surfaces.items[(usize)w.faces.items[(usize)ball].surface]
     # The legs: `size` along ua, `other` (when positive) along ub.
     let second = other if other > 0.0 else size

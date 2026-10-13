@@ -116,13 +116,13 @@ func convex(w: const Shape*, e: usize) -> bool!:
 ## earlier fillet.
 ## `direct` false skips the direct build (local_blend.lucb), for tests
 ## that compare it with the booleans.
-pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true, direct: bool = true, corner_type: i64 = 1, setback: bool = false, tangency: f64 = 1.0) -> interop.Reference[CadModel]!:
+pub func blended(model: const CadModel*, references: str, size: f64, round: bool, tag: str, continuity: i64 = 1, chain: bool = true, direct: bool = true, corner_type: i64 = 1, setback: bool = false, blend_shape: BlendShape = plain_blend, limits: BlendLimits = no_limits) -> interop.Reference[CadModel]!:
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
     defer chosen.close()
     try choose_edges(&w, references, chain, &chosen)
-    return try blend_chosen(model, &w, chosen.view(), trimmed(references) == "", size, round, tag, continuity, direct, none, none, corner_type, setback, tangency)
+    return try blend_chosen(model, &w, chosen.view(), trimmed(references) == "", size, round, tag, continuity, direct, none, none, corner_type, setback, blend_shape, none, limits)
 
 ## The edges of `w` that `references` names onto `chosen` (empty: every
 ## straight convex edge between flat faces; rims and inside corners only
@@ -146,7 +146,8 @@ func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize
 ## (chamfer_corners.lucb: corner_chamfer, corner_miter, corner_blend); a
 ## fillet's `setback` is Fusion's Setback corner type, which G1 fillets
 ## take only when asked (G2 and G3 corners are always setbacks).
-## A fillet's `tangency` is Fusion's Tangency weight (fillet_section,
+## A fillet's `blend_shape` is its section's shape (blend_shape.lucb:
+## Fusion's Tangency weight, Parasolid's conic and G2 shapes; fillet_section,
 ## arc_section): 1 leaves the sections as they are. A G1 fillet with
 ## another weight is a conic, not a circle, so it takes the booleans'
 ## tools (straight edges and rims, their sections rational splines) and
@@ -154,33 +155,39 @@ func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize
 ## fit the conic's weight directly.
 ## With `laws`, the edges they hold are rounded by their radius laws
 ## between where the corners stop them (variable_corners.lucb).
-func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct_asked: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1, setback_asked: bool = false, tangency: f64 = 1.0, laws: const EdgeLaws*? = none) -> interop.Reference[CadModel]!:
+func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct_asked: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1, setback_asked: bool = false, blend_shape: BlendShape = plain_blend, laws: const EdgeLaws*? = none, limits: BlendLimits = no_limits) -> interop.Reference[CadModel]!:
     if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
-    if round: try check_tangency(tangency)
-    let conic = round and continuity == 1 and tangency != 1.0
-    let direct = direct_asked and not conic
-    let setback = setback_asked or conic
+    if round: try check_shape(blend_shape)
+    let conic = round and continuity == 1 and not blend_shape.plain()
+    # Limits (BlendLimits) take one straight edge, or its collinear pieces,
+    # by the booleans: the tool stops square at each limit, and the cut
+    # leaves the cap.
+    let limited = limits.limited()
+    if limited: try check_limits(w, chosen, limits)
+    if not (limits.setback >= 0.0 and limits.setback < 100.0): error(invalid, "a fillet's setback is a share of its radius from 0 (as the corner needs) to 100")
+    let direct = direct_asked and not conic and not limited and not (limits.setback > 0.0)
+    let setback = setback_asked or conic or limits.setback > 0.0
     # Each edge's blend must fit its faces: said precisely, before any tool.
     for e in chosen:
         let (leg_a, leg_b) = try chamfer_legs(w, e, size, sides)
-        try check_fits(w, e, math.max(leg_a, leg_b), round)
+        try check_fits(w, e, math.max(leg_a, leg_b), round, limits.overflow)
     # Tangent loops round a flat face (its walls square to it) and
     # straight edges between flat faces are built directly; what those
     # decline (curved faces at a corner, mixed corners, chamfers...) the
     # booleans below make.
     # (Under a Tangency weight a G1 section is a conic, which a cap loop's
     # strip carries as well; only the corner balls below need circles.)
-    if direct_asked:
-        if let made = try cap_blend(w, chosen, size, round, continuity, tag, sides, none, tangency): return made
+    if direct_asked and not limited:
+        if let made = try cap_blend(w, chosen, size, round, continuity, tag, sides, none, blend_shape): return made
     # (G1 setback corners are the booleans'; the direct build rounds G1
     # corners with balls.)
     if round and direct and not (setback and continuity == 1):
-        if let made = try local_blend(w, chosen, size, continuity, tag, patches, tangency): return made
+        if let made = try local_blend(w, chosen, size, continuity, tag, patches, blend_shape): return made
     # Loops between two curved faces (or a flat face and a sphere): a ball
     # rolling between them, its G1 section a conic under a weight too.
-    if direct_asked:
-        if let made = try curved_blend(w, chosen, size, round, continuity, tag, sides, none, tangency): return made
+    if direct_asked and not limited:
+        if let made = try curved_blend(w, chosen, size, round, continuity, tag, sides, none, blend_shape): return made
     # The booleans' tools follow lines and rims only.
     for e in chosen:
         let kind = w.carriers.items[(usize)w.edges.items[e].carrier].kind
@@ -203,10 +210,10 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             var text = Growing[u8]()
             defer text.close()
             try references_of(w, first.view(), &text)
-            let earlier = try blended(model, (str)text.view(), size, round, tag, continuity, false, direct, 1, setback_asked, tangency)
+            let earlier = try blended(model, (str)text.view(), size, round, tag, continuity, false, direct, 1, setback_asked, blend_shape)
             defer earlier.release()
             try references_of(w, second.view(), &text)
-            return try blended(earlier.value(), (str)text.view(), size, round, tag, continuity, true, direct, 1, setback_asked, tangency)
+            return try blended(earlier.value(), (str)text.view(), size, round, tag, continuity, true, direct, 1, setback_asked, blend_shape)
     # Every edge of a convex polyhedron rounded: built whole.
     if round and every and continuity == 1 and not setback:
         if let whole = try rounded_polyhedron(w, size, tag): return whole
@@ -220,6 +227,11 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
     var joints = Growing[i64]()
     defer joints.close()
     try fillet_corners(w, chosen, size, continuity, round, &balls, &setbacks, &joints, setback)
+    # Setbacks asked: no fillet stops nearer its corner than that.
+    if limits.setback > 0.0:
+        for at in 0..<setbacks.count:
+            let corner = &setbacks.items[at]
+            for i in 0..<corner.count: corner.distances[i] = math.max(corner.distances[i], limits.setback * size)
     # G1 setback corners: the edges' sections the circle's arc as a
     # B-spline, so their ends are the curves the corner's patch meets.
     let tool_continuity = g1_spline if round and continuity == 1 and (setbacks.count > 0 or conic) else continuity
@@ -259,7 +271,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             let edge = w.edges.items[e]
             let at_start = vertex_in(joints.view(), edge.start)
             let at_end = vertex_in(joints.view(), edge.end)
-            try tools.push(try edge_tool(w, e, leg_a, round, tool_continuity, low, high, at_start, at_end, &body, (str)name.view(), leg_b, tangency))
+            try tools.push(try edge_tool(w, e, leg_a, round, tool_continuity, low, high, at_start, at_end, &body, (str)name.view(), leg_b, blend_shape))
             try adds.push(adding)
             continue
         let (fa, fb) = try edge_faces(w, e)
@@ -275,6 +287,12 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
                 let p = try w.edge_at(other, (f64)k)
                 if p.subtract(low).dot(along) < 0.0: low = p
                 if p.subtract(high).dot(along) > 0.0: high = p
+        # Limits: the tool from and to its fractions of the edge, square there.
+        if limited:
+            let span = high.subtract(low).dot(along)
+            let begin = low.add(along.multiply_scalar(span * limits.start))
+            high = low.add(along.multiply_scalar(span * limits.finish))
+            low = begin
         # An end at a ball's corner stops where the ball's center is along it.
         var exact_low = false
         var exact_high = false
@@ -313,6 +331,8 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             let corner = w.points.items[(usize)v]
             if corner.subtract(low).length() <= w.tolerance * 10.0: exact_low = true
             elif corner.subtract(high).length() <= w.tolerance * 10.0: exact_high = true
+        if limits.start > 0.0: exact_low = true
+        if limits.finish < 1.0: exact_high = true
         var lawed = false
         if let held = laws:
             let at = held.find(e)
@@ -325,14 +345,14 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
                 let end = high if forward else low
                 let way = try end.subtract(start).normalized()
                 let ends = EndPlanes(way.multiply_scalar(-1.0), 0.0, false, way, 0.0, false)
-                try tools.push(try straight_law_tool(w, e, &held.laws.items[(usize)at], tool_continuity, tangency, (str)name.view(), start, end, &ends, true))
+                try tools.push(try straight_law_tool(w, e, &held.laws.items[(usize)at], tool_continuity, blend_shape, (str)name.view(), start, end, &ends, true))
                 lawed = true
         if not lawed:
-            if adding: try tools.push(try concave_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b, tangency))
+            if adding: try tools.push(try concave_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b, blend_shape))
             else:
-                var tool = try edge_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, &body, (str)name.view(), leg_b, tangency)
+                var tool = try edge_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, &body, (str)name.view(), leg_b, blend_shape)
                 # Over a cliff the tool stops at the ledge's plane (fits_plan).
-                let (cliff_a, cliff_b) = try fits_plan(w, e, math.max(leg_a, leg_b), round)
+                let (cliff_a, cliff_b) = try fits_plan(w, e, math.max(leg_a, leg_b), round, limits.overflow)
                 for beyond in [cliff_a, cliff_b]:
                     if beyond < 0: continue
                     let cut = try cliff_cut(w, tool, beyond, (str)name.view())
@@ -346,7 +366,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
         try adds.push(ball.inside)
     for at in setbacks.view():
         try corner_name(w, (usize)at.vertex, tag, &name)
-        try tools.push(try setback_tool(w, &at, size, continuity, (str)name.view(), tangency))
+        try tools.push(try setback_tool(w, &at, size, continuity, (str)name.view(), blend_shape))
         try adds.push(at.inside)
     # Chamfers meeting three at a corner: its own face through the contact
     # lines' crossings (Chamfer) or set back past them (Blend); Miter is the
@@ -466,3 +486,17 @@ func copy_model(model: const CadModel*) -> interop.Reference[CadModel]!:
     let b = try brep_of(&w)
     defer b.release()
     return try CadModel.of_brep(b)
+
+## Limits checked against the edges they cut: fractions 0 <= start <
+## finish <= 1, one straight edge or collinear pieces of it between the same
+## two faces (a limit is a place along one edge).
+func check_limits(w: const Shape*, chosen: const usize[], limits: BlendLimits) -> !:
+    if not (limits.start >= 0.0 and limits.finish <= 1.0 and limits.start < limits.finish): error(invalid, "a blend's limits run from 0 to 1 along its edge, the first before the second")
+    if chosen.length == 0: return
+    let first = chosen[0]
+    if w.carriers.items[(usize)w.edges.items[first].carrier].kind != curve_line: error(invalid, "a limited blend takes a straight edge")
+    let (fa, fb) = try edge_faces(w, first)
+    for e in chosen:
+        let (ga, gb) = try edge_faces(w, e)
+        let same_faces = (ga == fa and gb == fb) or (ga == fb and gb == fa)
+        if not same_faces or not try same_curve(w, w.edges.items[first].carrier, e, w.tolerance): error(invalid, "a limited blend takes one straight edge (or its pieces along one line between the same faces)")

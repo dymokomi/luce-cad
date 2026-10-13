@@ -83,7 +83,7 @@ struct Cap:
     var chamfer: const ChamferSides*?
     var cap_first: bool
     ## Fusion's Tangency weight of a G2 or G3 section (fillet_section).
-    var tangency: f64
+    var blend_shape: BlendShape
     ## A G1 variable fillet at weight 1 round a closed loop: the ball rolled
     ## (cap_rolled.lucb), its sections degree 5.
     var rolled: bool
@@ -152,11 +152,11 @@ struct Cap:
 ## changing along the chain by `law` when given (`size` then its largest),
 ## else chamfered (by `sides` when given: chamfers.lucb); none when they are
 ## not all such loops (the booleans then try).
-pub func cap_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str, sides: const ChamferSides*? = none, law: const RadiusLaw*? = none, tangency: f64 = 1.0) -> interop.Reference[CadModel]?!:
+pub func cap_blend(w: const Shape*, chosen: const usize[], size: f64, round: bool, continuity: i64, tag: str, sides: const ChamferSides*? = none, law: const RadiusLaw*? = none, blend_shape: BlendShape = plain_blend) -> interop.Reference[CadModel]?!:
     var made = try new_cap(w, size, round, continuity)
     defer made.close()
     let b = &made
-    b.tangency = tangency
+    b.blend_shape = blend_shape
     b.law = law
     if not try cap_eligible(b, chosen): return none
     try chamfer_first(b, sides)
@@ -182,7 +182,7 @@ func new_cap(w: const Shape*, size: f64, round: bool, continuity: i64) -> Cap!:
     for k in w.spline_knots.view(): try out.spline_knots.push(k)
     for s in w.surfaces.view():
         try out.surfaces.push(try Surface(s.kind, s.origin, s.x, s.z, s.radius, s.angle, s.points, s.weights, s.ku, s.kv, s.nu, s.nv, s.du, s.dv))
-    var made = Cap(w, out, size, none, empty_law(), round, continuity, math.sqrt(0.5), none, true, 1.0, false, SampledBalls(Growing[Vector3](), Growing[f64](), 1.0), Growing[CapSide](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](),
+    var made = Cap(w, out, size, none, empty_law(), round, continuity, math.sqrt(0.5), none, true, plain_blend, false, SampledBalls(Growing[Vector3](), Growing[f64](), 1.0), Growing[CapSide](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[i64](), Growing[i64](),
                    Growing[i64](), Growing[bool](), Growing[i64](), Growing[i64](), Growing[Runout](), Growing[i64](), Growing[bool](), Growing[i64](), Growing[u8]())
     errdefer made.close()
     try made.side_of.fill(w.edges.count, -1)
@@ -253,7 +253,7 @@ func chamfer_first(b: Cap*, sides: const ChamferSides*?) -> !:
 ## law that changes): a closed loop (no open end).
 func rolled_cap(b: const Cap*) -> bool:
     let law = b.law else return false
-    if not b.round or b.continuity != 1 or b.tangency != 1.0: return false
+    if not b.round or b.continuity != 1 or not b.blend_shape.plain(): return false
     var changes = false
     for r in law.radii.view():
         if r != law.radii.items[0]: changes = true
@@ -455,7 +455,7 @@ func cap_strip(b: Cap*, k: usize) -> !:
         b.sides.items[k].outer = try b.line(cap_start, cap_end)
         b.sides.items[k].inner = try b.line(wall_start, wall_end)
         let along = carrier.x.multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
-        if b.round and b.continuity == 1 and b.tangency == 1.0:
+        if b.round and b.continuity == 1 and b.blend_shape.plain():
             let axis = corner.add(u0.multiply_scalar(c)).add(side.into_wall.multiply_scalar(b.reach))
             try b.out.surfaces.push(try Surface(1, axis, try b.at(cap_start).subtract(axis).normalized(), along, b.reach, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
             return try finish_strip(b, k)
@@ -476,7 +476,7 @@ func cap_strip(b: Cap*, k: usize) -> !:
         let lowered = carrier.origin.add(side.into_wall.multiply_scalar(down * mu))
         let c_wall = try b.out.add_carrier(Carrier(1, lowered, carrier.x, carrier.y, wall_radius, wall_radius, -1))
         b.sides.items[k].inner = try b.out.add_edge(ShapeEdge(c_wall, edge.t0, edge.t1, wall_start, wall_end))
-        if b.round and b.continuity == 1 and b.tangency == 1.0:
+        if b.round and b.continuity == 1 and b.blend_shape.plain():
             # A torus about the arc's axis, its tube's center the ball's path.
             let center = carrier.origin.add(side.into_wall.multiply_scalar(b.reach))
             try b.out.surfaces.push(try Surface(5, center, carrier.x, carrier.x.cross(carrier.y), radius, b.reach, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
@@ -601,7 +601,7 @@ func cap_sections(b: Cap*) -> !:
                 let degree = try section_at(b, 0.0, r, &a, &z, &ku, &wu)
                 b.sections.items[v] = try b.spline(head, tail, net.view(), wu.view(), ku.view(), degree, true)
                 continue
-            if b.continuity == 1 and b.tangency == 1.0 and math.abs(s.dot(tangent)) <= 1e-12 * s.length():
+            if b.continuity == 1 and b.blend_shape.plain() and math.abs(s.dot(tangent)) <= 1e-12 * s.length():
                 # A circle's arc square to the edge, from the cap's contact
                 # round to the wall's: π - θ (under a Tangency weight the
                 # conic's spline, below).

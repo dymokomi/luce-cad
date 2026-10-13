@@ -16,6 +16,8 @@ from luce_cad.curves import CadCurveTools
 from luce_cad.measure import CadMeasure
 from luce_cad.model import BrepModel, CadModel
 from luce_cad.nurbs import CadNurbs
+from luce_cad.modeling import CadModeling
+from luce_cad.solids import CadSolids
 from luce_geocore.geocore import Vector3, GeometrySet
 from luce_std import math
 
@@ -31,7 +33,8 @@ pub func fill_tests() -> unit!:
     fill_lid()
     fill_molded()
     fill_rates()
-    print("PASS fill: a planar pentagon and a hole in a plane fill with the plane (G1, G2, N-sided and Quad untrimmed); a height field's hole fills G0, G1 and G2 on every edge both ways; a ball's cap G1 and G2 near the sphere; a five-sided corner of three fillets and two walls G1 on all five edges, circular fillets' twist conflicts reported at their corners; guides and points on the fill; a hole found from one edge; Tension, Flatness, Normal flow and Explicit Control; a lid on four walls G1 and G2 turns onto the walls' plane at its corners (no pinch), every wall met elsewhere; Auto molds a steep pentagon; G2 fillets' corners against walls are rate conflicts, G3 fillets' are not")
+    fill_ball_corner()
+    print("PASS fill: a planar pentagon and a hole in a plane fill with the plane (G1, G2, N-sided and Quad untrimmed); a height field's hole fills G0, G1 and G2 on every edge both ways; a ball's cap G1 and G2 near the sphere; a five-sided corner of three fillets and two walls G1 on all five edges, circular fillets' twist conflicts reported at their corners; guides and points on the fill; a hole found from one edge; Tension, Flatness, Normal flow and Explicit Control; a lid on four walls G1 and G2 turns onto the walls' plane at its corners (no pinch), every wall met elsewhere; Auto molds a steep pentagon; G2 fillets' corners against walls are rate conflicts, G3 fillets' are not; a rounded box corner's ball taken away fills G1 within 3% of the ball (its cylinders carried on disagree: no reference)")
 
 # -- Shapes.
 
@@ -427,3 +430,49 @@ func fill_rates() -> unit!:
             if c.corner and c.order == 2:
                 rates += 1
         assert(rates == (4 if section == 2 else 0), f"G{section} fillets: {rates} rate conflicts at the corners")
+
+func fill_ball_corner() -> unit!:
+    # A box's corner rounded G1 (radius 0.5, one ball) unstitched and its
+    # ball taken away: the three-sided hole between the fillets' cylinders
+    # fills G1 to all three, within 3% of the radius of the ball it
+    # replaces (the cylinders carried on into the hole disagree, so the
+    # plate's own bending rules, not their blend's dent).
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let found: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            let id = box.face_edge_id(face, use)
+            let near = (a.x > 0.99 and a.y > 0.99 and a.z > 0.99) or (b.x > 0.99 and b.y > 0.99 and b.z > 0.99)
+            if near and not (id in found):
+                found.append(id)
+    let rounded = CadModeling.filleted(box, CadModeling.edge_references(box, found), 0.5, "f", chain = false)
+    let pieces = CadSurfacing.unstitched(CadGeometry.of_model(rounded), 0)
+    var kept = GeometrySet()
+    var hole_edge = ""
+    for index in 0..<CadGeometry.model_count(pieces):
+        let m = CadGeometry.model(pieces, index)
+        let name = m.face_name(0)
+        if name.contains("corner"):
+            continue
+        kept = kept.merged(CadGeometry.of_model(m))
+        if name.contains("blend[") and hole_edge == "":
+            for use in 0..<m.face_edge_count(0):
+                let p = m.face_edge_point(0, use, 0.5)
+                if math.abs(p.subtract(Vector3(0.5, 0.5, 0.5)).length() - 0.5) < 1e-6:
+                    hole_edge = f"edge {name} {p.x} {p.y} {p.z}"
+    let loop = CadSurfaceFill.hole(kept, hole_edge)
+    assert(loop.split(";").length == 3, f"the ball corner's hole: {loop}")
+    let made = CadSurfaceFill.fill(kept, loop, [2, 2, 2], [])
+    for k in 0..<3:
+        assert(made.angle(k) < 0.05, f"the ball corner's side {k} at {made.angle(k)} degrees")
+    let model = CadGeometry.model(made.geometry(), CadGeometry.model_count(made.geometry()) - 1)
+    let s = CadNurbs.surface_of_face(model, model.face_name(0))
+    var off = 0.0
+    for i in 0..<21:
+        for j in 0..<21:
+            let d = CadNurbs.point_at(model, s, float(i) / 20.0, float(j) / 20.0).subtract(Vector3(0.5, 0.5, 0.5))
+            if d.x > 0.0 and d.y > 0.0 and d.z > 0.0:
+                off = math.max(off, math.abs(d.length() - 0.5))
+    assert(off < 0.015, f"the ball corner's fill lies {off} off the ball")

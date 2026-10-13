@@ -35,10 +35,10 @@
 ## `chain`) filleted with `radii` at `positions` along the chain (0 its
 ## start, 1 its end; the ends are added from the nearest radius when
 ## missing), Fusion's law between them or `smooth`, of `continuity`, the blend
-## named for feature `tag`, under Tangency weight `tangency`.
-func variable_filleted_edge(model: const CadModel*, reference: str, positions: const f64[], radii: const f64[], smooth: bool, tag: str, continuity: i64 = 1, chain: bool = true, tangency: f64 = 1.0) -> interop.Reference[CadModel]!:
+## named for feature `tag`, under Tangency weight `blend_shape`.
+func variable_filleted_edge(model: const CadModel*, reference: str, positions: const f64[], radii: const f64[], smooth: bool, tag: str, continuity: i64 = 1, chain: bool = true, blend_shape: BlendShape = plain_blend) -> interop.Reference[CadModel]!:
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
-    try check_tangency(tangency)
+    try check_shape(blend_shape)
     var w = try shape_of(model)
     defer w.close()
     var chosen = Growing[usize]()
@@ -53,17 +53,17 @@ func variable_filleted_edge(model: const CadModel*, reference: str, positions: c
     defer law.close()
     let largest = law.largest()
     for e in chosen.view(): try check_fits(&w, e, largest, true)
-    if let made = try cap_blend(&w, chosen.view(), largest, true, continuity, tag, none, &law, tangency): return made
-    if let made = try curved_blend(&w, chosen.view(), largest, true, continuity, tag, none, &law, tangency): return made
+    if let made = try cap_blend(&w, chosen.view(), largest, true, continuity, tag, none, &law, blend_shape): return made
+    if let made = try curved_blend(&w, chosen.view(), largest, true, continuity, tag, none, &law, blend_shape): return made
     let e = chosen.items[0]
     let (fa, fb) = try edge_faces(&w, e)
     if chosen.count != 1 or w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line or not flat_pair(&w, fa, fb):
         error(invalid, "a variable radius fillet takes one straight edge between flat faces, a tangent chain round a flat face, or a loop between two curved faces")
-    return try variable_straight(model, &w, e, &law, continuity, tag, tangency)
+    return try variable_straight(model, &w, e, &law, continuity, tag, blend_shape)
 
 ## One straight edge `e` between flat faces filleted by `law`, of
 ## `continuity` (see the header).
-func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: const RadiusLaw*, continuity: i64, tag: str, tangency: f64) -> interop.Reference[CadModel]!:
+func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: const RadiusLaw*, continuity: i64, tag: str, blend_shape: BlendShape) -> interop.Reference[CadModel]!:
     let edge = w.edges.items[e]
     let (fa, fb) = try edge_faces(w, e)
     let start = try w.edge_at(e, 0.0)
@@ -99,18 +99,18 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
     var name = Growing[u8]()
     defer name.close()
     try blend_name(w, e, tag, &name)
-    let tool = try straight_law_tool(w, e, law, continuity, tangency, (str)name.view(), start, end, &ends)
+    let tool = try straight_law_tool(w, e, law, continuity, blend_shape, (str)name.view(), start, end, &ends)
     defer tool.release()
     return try combine(model, tool.value(), op_subtract if convex_edge else op_union)
 
 ## The tool of straight edge `e` between flat faces filleted by `law` from
 ## `start` to `end` (the edge's ends, or where corners stop it: the law then
-## spans that stretch), of `continuity` under `tangency`, its blend face
+## spans that stretch), of `continuity` under `blend_shape`, its blend face
 ## named `name`, ending as `ends` says (see the header).
 ## With `scaled` the G1 section is the circle scaled by the radius, not the
 ## rolled balls' envelope: at a corner's ball (variable_corners.lucb) its
 ## end section is then exactly the ball's circle.
-func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continuity: i64, tangency: f64, name: str, start: Vector3, end: Vector3, ends: const EndPlanes*, scaled: bool = false) -> interop.Reference[CadModel]!:
+func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continuity: i64, blend_shape: BlendShape, name: str, start: Vector3, end: Vector3, ends: const EndPlanes*, scaled: bool = false) -> interop.Reference[CadModel]!:
     let (fa, fb) = try edge_faces(w, e)
     let length = end.subtract(start).length()
     let along = try end.subtract(start).normalized()
@@ -146,14 +146,14 @@ func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continu
     # 1.001 scale the section): one straight piece of the law makes a cone.
     let straight = kept_at.count == 2 and math.abs(kept_slopes.items[0] - (kept_sizes.items[1] - kept_sizes.items[0])) <= 1e-12 * math.max(1.0, kept_sizes.items[1])
     var cone = -1.0
-    if continuity == 1 and tangency == 1.0 and straight:
+    if continuity == 1 and blend_shape.plain() and straight:
         cone = rolling_weight(theta, (kept_sizes.items[1] - kept_sizes.items[0]) / (length * (kept_at.items[1] - kept_at.items[0])))
     let n0 = ends.n0.multiply_scalar(1.0 if ends.n0.dot(along) > 0.0 else -1.0) if ends.slanted0 else along
     let n1 = ends.n1.multiply_scalar(1.0 if ends.n1.dot(along) > 0.0 else -1.0) if ends.slanted1 else along
     var rolled = Rolled(start, along, length, ua, ub, theta, try ua.add(ub).normalized().multiply_scalar(1.0 / math.sin(theta * 0.5)), kept_at.view(), kept_sizes.view(), kept_slopes.view(), n0, n1)
     # Any other law: the balls' envelope (rolled_ball.lucb), unless it
     # folds, where Fusion scales the section instead.
-    if continuity == 1 and tangency == 1.0 and not straight and not scaled and not rolled_folds(&rolled):
+    if continuity == 1 and blend_shape.plain() and not straight and not scaled and not rolled_folds(&rolled):
         var net = Growing[Vector3]()
         defer net.close()
         var weights = Growing[f64]()
@@ -179,9 +179,9 @@ func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continu
         defer section_weights.close()
         var section_knots = Growing[f64]()
         defer section_knots.close()
-        if continuity == 1: try arc_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), &section, &section_weights, &section_knots, tangency)
+        if continuity == 1: try arc_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), &section, &section_weights, &section_knots, blend_shape)
         else:
-            try fillet_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), continuity, &section, &section_knots, tangency)
+            try fillet_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), continuity, &section, &section_knots, blend_shape)
             try section_weights.fill(section.count, 1.0)
         var tilted = Tilted(start, along, length, kept_at.view(), kept_sizes.view(), kept_slopes.view(), section.view(), section_weights.view(), 5, section_knots.view(), (usize)continuity, ua, ub, n0, n1)
         var net = Growing[Vector3]()
@@ -197,7 +197,7 @@ func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continu
         let count = net.count // section.count
         let tilted_tool = try strip_solid(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), net.view(), weights.view(), section.count, count, 5, along_degree, fitted_knots.view(), knots.view(), length + reach * law.largest() * 4.0, name, convex_edge, ends)
         return tilted_tool
-    return try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), kept_slopes.view(), name, convex_edge, continuity, ends, tangency, cone)
+    return try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), kept_slopes.view(), name, convex_edge, continuity, ends, blend_shape, cone)
 
 ## The middle weight of the section square to the edge of the cone a ball
 ## rolls out between flat faces `theta` apart, its radius growing `slope`
@@ -280,7 +280,7 @@ func ends_square(w: const Shape*, v: i64, fa: usize, fb: usize, along: Vector3) 
 ## at different radii, still meet in a section of the cone (a row's part
 ## along the cone's rulings is then the same for every row: the surface
 ## stays on the cone).
-func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, reach: f64, weight: f64, positions: const f64[], radii: const f64[], slopes: const f64[], name: str, convex_edge: bool, continuity: i64, ends: const EndPlanes*, tangency: f64, cone: f64 = -1.0) -> interop.Reference[CadModel]!:
+func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: Vector3, nb: Vector3, reach: f64, weight: f64, positions: const f64[], radii: const f64[], slopes: const f64[], name: str, convex_edge: bool, continuity: i64, ends: const EndPlanes*, blend_shape: BlendShape, cone: f64 = -1.0) -> interop.Reference[CadModel]!:
     let pieces = positions.length - 1
     let count = 3 * pieces + 1
     # Along: a cubic Bezier per piece, knots thrice at each point.
@@ -302,7 +302,7 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
     if continuity == g1_spline:
         # The circle's arc as setback corners' patches carry it (degree 5,
         # rational, the middle knot twice), so the strip ends in their curve.
-        try arc_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), &unit_section, &section_weights, &section_knots, tangency)
+        try arc_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), &unit_section, &section_weights, &section_knots, blend_shape)
         try middle_knot_twice(&unit_section, &section_weights, 0, &section_knots)
         degree = 5
     elif continuity == 1:
@@ -311,10 +311,10 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
         try unit_section.push(ub.multiply_scalar(reach))
         let k6: f64[6] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
         try section_knots.assign(k6[..<6])
-        let x3: f64[3] = [1.0, cone if cone >= 0.0 else weight * tangency, 1.0]
+        let x3: f64[3] = [1.0, cone if cone >= 0.0 else blend_shape.middle(weight), 1.0]
         try section_weights.assign(x3[..<3])
     else:
-        try fillet_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), continuity, &unit_section, &section_knots, tangency)
+        try fillet_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), continuity, &unit_section, &section_knots, blend_shape)
         try section_weights.fill(unit_section.count, 1.0)
         degree = 5
     let rows = unit_section.count

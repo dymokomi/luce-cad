@@ -1,0 +1,260 @@
+## Bridge Fillet (surfacing Stage 8: Alias's Bridge Fillet, Parasolid's
+## three-face blend; luced-3d docs/research/SURFACING-ALIAS-PLASTICITY.md
+## §4.1, §5.3): a circular blend tangent to three face sets, a ball rolling
+## between the first two whose radius at each station is the one that also
+## touches the third (the center set, its middle wall consumed: a rib's top
+## rounded away whole).
+##
+## At a station the ball touches all three sets in the plane square to the
+## spine: its radius is an unknown beside the three contacts. The section is the
+## circle through the three contacts: a circle of the ball, so tangent to
+## each set where it touches it, as two rational quadratic arcs meeting at
+## the third contact.
+
+pub let fillet_bridge: i64 = 6
+
+## The ball of `s` (`s` holds the answer) in the plane through `o` square
+## to `d` touching all three sets: Newton on seven unknowns, the three
+## contacts' chart points and the radius, for the three sets moved by the
+## radius agreeing (six equations) on the plane (the seventh). (A ball
+## between parallel walls has its radius fixed and its height free: the
+## third set fixes that, so the radius is an unknown like the contacts.)
+## Contacts leaving a face move onto their set's face holding them; with
+## `bounded`, outside when one leaves its set.
+func bridge_ball(w: FilletWork*, s: BallStation*, o: Vector3, d: Vector3, bounded: bool) -> i64!:
+    if s.radius <= 0.0: s.radius = w.opts.size
+    if not s.placed_third:
+        # The third contact's start: the nearest point of set three.
+        let (k, uv) = try nearest_of_three(w, s.center)
+        s.f3 = k
+        s.uv3 = uv
+        s.placed_third = true
+    var tries = 0
+    while true:
+        if not try bridge_newton(w, s, o, d): return ball_failed
+        let (p1, _) = try ball_side(&w.one, s.f1, s.uv1)
+        let (p2, _) = try ball_side(&w.two, s.f2, s.uv2)
+        let in1 = w.one.faces.items[s.f1].holds(s.uv1)
+        let in2 = w.two.faces.items[s.f2].holds(s.uv2)
+        if not w.three.faces.items[s.f3].holds(s.uv3):
+            let (q3, _) = try ball_side(&w.three, s.f3, s.uv3)
+            let (k, uv) = try holding_face(w, &w.three, q3)
+            if k >= 0 and (usize)k != s.f3:
+                s.f3 = (usize)k
+                s.uv3 = uv
+                continue
+        if in1 and in2: return ball_found
+        var moved = false
+        if not in1:
+            let (k, uv) = try holding_face(w, &w.one, p1)
+            if k >= 0 and (usize)k != s.f1:
+                s.f1 = (usize)k
+                s.uv1 = uv
+                moved = true
+        if not in2:
+            let (k, uv) = try holding_face(w, &w.two, p2)
+            if k >= 0 and (usize)k != s.f2:
+                s.f2 = (usize)k
+                s.uv2 = uv
+                moved = true
+        tries += 1
+        if not moved or tries > 3:
+            if bounded: return ball_outside
+            return ball_found
+
+## Set three's face and chart point nearest `p`.
+func nearest_of_three(w: FilletWork*, p: Vector3) -> (usize, Vector3)!:
+    var best = 1.0e300
+    var face: usize = 0
+    var at = Vector3()
+    for k in 0..<w.three.faces.count:
+        let master = &w.three.faces.items[k]
+        let uv = master.chart_of(p) catch failure: continue
+        let (q, _) = try ball_side(&w.three, k, uv)
+        if q.subtract(p).length() < best:
+            best = q.subtract(p).length()
+            face = k
+            at = uv
+    if not (best < 1.0e300): error(invalid, "Bridge Fillet: the ball finds the center set nowhere")
+    return (face, at)
+
+## The residual of the bridge ball at `x` (u1 v1 u2 v2 u3 v3 r): the first
+## set's moved point less the second's and the third's, and its height off
+## the plane through `o` square to `d`.
+func bridge_residual(w: FilletWork*, s: const BallStation*, x: const f64[7], o: Vector3, d: Vector3, out: f64[7]*) -> !:
+    let (p1, m1) = try ball_side(&w.one, s.f1, Vector3(x[0], x[1], 0.0))
+    let (p2, m2) = try ball_side(&w.two, s.f2, Vector3(x[2], x[3], 0.0))
+    let (p3, m3) = try ball_side(&w.three, s.f3, Vector3(x[4], x[5], 0.0))
+    let r = x[6]
+    let c1 = p1.add(m1.multiply_scalar(r))
+    let c2 = p2.add(m2.multiply_scalar(r))
+    let c3 = p3.add(m3.multiply_scalar(r))
+    (*out)[0] = c1.x - c2.x
+    (*out)[1] = c1.y - c2.y
+    (*out)[2] = c1.z - c2.z
+    (*out)[3] = c1.x - c3.x
+    (*out)[4] = c1.y - c3.y
+    (*out)[5] = c1.z - c3.z
+    (*out)[6] = c1.subtract(o).dot(d)
+
+func norm7(f: const f64[7]) -> f64:
+    var sum = 0.0
+    for k in 0..<(usize)7: sum += f[k] * f[k]
+    return math.sqrt(sum)
+
+## Newton (damped by halving) on the bridge ball from `s`; `s` holds the
+## answer. Whether it converged.
+func bridge_newton(w: FilletWork*, s: BallStation*, o: Vector3, d: Vector3) -> bool!:
+    var x: f64[7] = [s.uv1.x, s.uv1.y, s.uv2.x, s.uv2.y, s.uv3.x, s.uv3.y, s.radius]
+    var f: f64[7] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    try bridge_residual(w, s, x, o, d, &f)
+    var size_now = norm7(f)
+    for _ in 0..<60:
+        if size_now <= w.size * 1e-13: break
+        var a: f64[49]
+        for k in 0..<(usize)7:
+            let h = 1e-7 * (1.0 + math.abs(x[k]))
+            var moved = x
+            moved[k] += h
+            var g: f64[7] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            try bridge_residual(w, s, moved, o, d, &g)
+            for row in 0..<(usize)7: a[row * 7 + k] = (g[row] - f[row]) / h
+        var step: f64[7] = [-f[0], -f[1], -f[2], -f[3], -f[4], -f[5], -f[6]]
+        if not solve7(&a, &step): return false
+        var scale = 1.0
+        var taken = false
+        for _ in 0..<12:
+            var next = x
+            for k in 0..<(usize)7: next[k] += scale * step[k]
+            var g: f64[7] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            var ok = true
+            bridge_residual(w, s, next, o, d, &g) catch failure:
+                ok = false
+            if ok and next[6] > 0.0 and norm7(g) < size_now:
+                x = next
+                f = g
+                size_now = norm7(g)
+                taken = true
+                break
+            scale *= 0.5
+        if not taken: break
+    if size_now > w.size * 1e-9: return false
+    s.uv1 = Vector3(x[0], x[1], 0.0)
+    s.uv2 = Vector3(x[2], x[3], 0.0)
+    s.uv3 = Vector3(x[4], x[5], 0.0)
+    s.radius = x[6]
+    let (p1, m1) = try ball_side(&w.one, s.f1, s.uv1)
+    s.center = p1.add(m1.multiply_scalar(s.radius))
+    let (p3, _) = try ball_side(&w.three, s.f3, s.uv3)
+    s.third = p3
+    return true
+
+## A 7 by 7 system `a` (row major) solved for `b` in place (partial
+## pivoting); false when it is singular.
+func solve7(a: f64[49]*, b: f64[7]*) -> bool:
+    for col in 0..<(usize)7:
+        var pivot = col
+        for r in col + 1..<(usize)7:
+            if math.abs((*a)[r * 7 + col]) > math.abs((*a)[pivot * 7 + col]): pivot = r
+        if not (math.abs((*a)[pivot * 7 + col]) > 1e-300): return false
+        if pivot != col:
+            for k in 0..<(usize)7:
+                let t = (*a)[col * 7 + k]
+                (*a)[col * 7 + k] = (*a)[pivot * 7 + k]
+                (*a)[pivot * 7 + k] = t
+            let t = (*b)[col]
+            (*b)[col] = (*b)[pivot]
+            (*b)[pivot] = t
+        for r in col + 1..<(usize)7:
+            let factor = (*a)[r * 7 + col] / (*a)[col * 7 + col]
+            for k in col..<(usize)7: (*a)[r * 7 + k] -= factor * (*a)[col * 7 + k]
+            (*b)[r] -= factor * (*b)[col]
+    var i: usize = 7
+    while i > 0:
+        i -= 1
+        var sum = (*b)[i]
+        for k in i + 1..<(usize)7: sum -= (*a)[i * 7 + k] * (*b)[k]
+        (*b)[i] = sum / (*a)[i * 7 + i]
+    return true
+
+## Ball `b`'s contact on set three.
+func third_contact(w: FilletWork*, b: const BallStation*) -> Vector3!:
+    let (q, _) = try ball_side(&w.three, b.f3, b.uv3)
+    return q
+
+## The bridge's section of ball `b`: the circle through its three contacts
+## (a circle of the ball), as two rational quadratic arcs from the first
+## contact to the third and on to the second, onto `out` (homogeneous).
+func bridge_cross(w: FilletWork*, b: const BallStation*, out: Growing[Weighted]*) -> !:
+    let (p1, _) = try ball_side(&w.one, b.f1, b.uv1)
+    let (p2, _) = try ball_side(&w.two, b.f2, b.uv2)
+    let p3 = try third_contact(w, b)
+    # The circle's plane and center: the ball's center moved onto it.
+    let normal = p3.subtract(p1).cross(p2.subtract(p1)).normalized() catch failure: error(invalid, "Bridge Fillet: the three contacts lie on a line")
+    let center = b.center.subtract(normal.multiply_scalar(b.center.subtract(p1).dot(normal)))
+    out.clear()
+    try out.push(weighted(p1, 1.0))
+    try push_arc(center, p1, p3, out)
+    try out.push(weighted(p3, 1.0))
+    try push_arc(center, p3, p2, out)
+    try out.push(weighted(p2, 1.0))
+
+## The middle control point of the circle's arc from `a` to `b` about
+## `center` (homogeneous: the point where the arc's end tangents meet,
+## weighted cos of half the arc's angle).
+func push_arc(center: Vector3, a: Vector3, b: Vector3, out: Growing[Weighted]*) -> !:
+    let ua = a.subtract(center)
+    let ub = b.subtract(center)
+    let radius = ua.length()
+    let angle = math.acos(math.clamp(ua.dot(ub) / math.max(1e-300, radius * ub.length()), -1.0, 1.0))
+    if not (angle < math.pi - 1e-6): error(invalid, "Bridge Fillet: a half of the section turns half round or more (the center set lies beside the others, not between)")
+    let half = math.cos(angle * 0.5)
+    let bisector = ua.add(ub).normalized() catch failure: error(invalid, "Bridge Fillet: a contact lies opposite another on the ball")
+    let corner = center.add(bisector.multiply_scalar(radius / half))
+    try out.push(Weighted(corner.x * half, corner.y * half, corner.z * half, half))
+
+## Set three's side: its normals toward the first two sets' middle.
+func choose_third_side(w: FilletWork*) -> !:
+    if w.three.faces.count == 0: return
+    let middle = (try set_middle(&w.one)).add(try set_middle(&w.two)).multiply_scalar(0.5)
+    var uvs = Growing[Vector3]()
+    defer uvs.close()
+    var faces = Growing[usize]()
+    defer faces.close()
+    try face_samples(&w.three, 5, &uvs, &faces)
+    w.three.sign = 1.0
+    var lean = 0.0
+    for k in 0..<uvs.count:
+        let (p, m) = try ball_side(&w.three, faces.items[k], uvs.items[k])
+        lean += m.dot(middle.subtract(p))
+    w.three.sign = -1.0 if lean < 0.0 else 1.0
+
+## `set` with the faces named in `names` (apart by `;`) taken out of their
+## bodies (a body left with none dropped): the center set a bridge consumes.
+func without_faces(set: interop.Reference[GeometrySet], names: str) -> interop.Reference[GeometrySet]!:
+    let source = try set.get()
+    var list = Growing[interop.Reference[CadModel]]()
+    defer:
+        for m in list.view(): m.release()
+        list.close()
+    for m in set_models(source):
+        let model = m.value()
+        var kept = Growing[i64]()
+        defer kept.close()
+        for f in 0..<model.face_count():
+            if not named_in_list(names, try model.face_name(f)): try kept.push((i64)f)
+        if kept.count == (usize)model.face_count():
+            try list.push(m.clone())
+        elif kept.count > 0:
+            try list.push(try model.subset(kept.view()))
+    return try with_models(source, list.view())
+
+## Whether `name` is one of `names` (apart by `;`).
+func named_in_list(names: str, name: str) -> bool:
+    let bytes = names.bytes
+    var start: usize = 0
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 59: continue
+        if (str)bytes[start..<at] == name: return true
+        start = at + 1
+    return false

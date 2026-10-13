@@ -1,0 +1,214 @@
+## A blend's section shape (surfacing plan Stage 8: Parasolid's edge blend
+## sections, luced-3d docs/research/SURFACING-ALIAS-PLASTICITY.md §5.3):
+## what a fillet's cross-section is between its two contacts, beyond its
+## continuity.
+##   Fusion's Tangency weight (`weight`, 0.1 to 2): G1's conic middle
+##     weight scaled, G2's speed at the contacts, G3's legs' fractions.
+##   Conic (G1; Parasolid's rho, three ways): `conic` rho_absolute (the
+##     middle weight ρ / (1 - ρ): 0.5 a parabola, below an ellipse, above a
+##     hyperbola), rho_relative (ρ against the circle's: 0.5 the circle, so
+##     the middle weight sin(θ/2) ρ / (1 - ρ)), or rho_middle (ρ the radius
+##     of curvature at the section's middle over the circle's radius).
+##   G2 by depth and skew, or by softness (Parasolid's face-face blends'
+##     G2 section, here for edge blends too): a quintic whose first three
+##     points lie along each leg from its contact (curvature zero on a flat
+##     face, the face's on a curved one), its arms a share of the leg; depth
+##     0 at the chord to 1 at the corner where the legs meet, skew 0 toward
+##     the first face's leg to 1 toward the second's (0.5 symmetric);
+##     softness the arms' share itself: high flatter and deeper, low like a
+##     chamfer with rounded edges.
+
+pub let rho_none: i64 = 0
+pub let rho_absolute: i64 = 1
+pub let rho_relative: i64 = 2
+pub let rho_middle: i64 = 3
+
+pub struct BlendShape:
+    pub var weight: f64
+    pub var conic: i64
+    pub var rho: f64
+    pub var depth: f64
+    pub var skew: f64
+    pub var softness: f64
+
+    ## No shape of its own: Fusion's plain section at weight 1.
+    pub func plain() -> bool:
+        return self.weight == 1.0 and self.conic == rho_none and not self.shaped_g2()
+
+    ## A G2 section shaped by depth (and skew) or softness.
+    pub func shaped_g2() -> bool:
+        return self.depth >= 0.0 or self.softness >= 0.0
+
+    pub func same(other: BlendShape) -> bool:
+        return self.weight == other.weight and self.conic == other.conic and self.rho == other.rho and self.depth == other.depth and self.skew == other.skew and self.softness == other.softness
+
+    ## A G1 section's middle weight for legs whose half angle has sine
+    ## `sin_half` (the circle's is sin_half itself).
+    pub func middle(sin_half: f64) -> f64:
+        if self.conic == rho_absolute: return self.rho / (1.0 - self.rho)
+        if self.conic == rho_relative: return sin_half * self.rho / (1.0 - self.rho)
+        if self.conic == rho_middle: return middle_radius_weight(sin_half, self.rho)
+        return sin_half * self.weight
+
+## Where a blend stops. Limits (Parasolid's limit points with planar
+## caps): it runs along its edge only from `start` to `finish` (fractions of
+## the edge, or of its collinear pieces together), each limit inside the
+## edge a plane square to it that caps the blend: the blend's end section,
+## the plane's face between it and the sharp edge going on. Setbacks
+## (Parasolid's): where fillets meet at a corner, each stops at least
+## `setback` times its radius from the vertex (0: as far as the corner
+## needs), the corner's patch filling the larger gap. Overflow
+## (Parasolid's): where a blend runs off its face over an edge, by the
+## default rules (smooth, notch, cliff: blend_fits.lucb), or not at all
+## (`overflow` false: the blend must fit its faces, else the size that
+## does is said).
+pub struct BlendLimits:
+    pub var start: f64
+    pub var finish: f64
+    pub var setback: f64 = 0.0
+    pub var overflow: bool = true
+
+    pub func limited() -> bool:
+        return self.start > 0.0 or self.finish < 1.0
+
+pub let no_limits: BlendLimits = BlendLimits(0.0, 1.0, 0.0, true)
+
+## The plain section: Fusion's at weight 1.
+pub let plain_blend: BlendShape = BlendShape(1.0, 0, 0.5, -1.0, 0.5, -1.0)
+
+## Fusion's Tangency weight `weight` alone.
+pub func weighted_shape(weight: f64) -> BlendShape:
+    return BlendShape(weight, rho_none, 0.5, -1.0, 0.5, -1.0)
+
+## The shape checked: the weight 0.1 to 2 (Fusion's), ρ inside 0 to 1 (a
+## middle radius more than zero), depth 0 to 1, skew 0 to 1, softness more
+## than 0 to 1.
+func check_shape(blend_shape: BlendShape) -> !:
+    let w = blend_shape.weight
+    if not math.is_finite(w) or w < 0.1 or w > 2.0: error(invalid, "a fillet's tangency weight is from 0.1 to 2")
+    if blend_shape.conic < rho_none or blend_shape.conic > rho_middle: error(invalid, "a fillet's rho is absolute, relative or a middle radius")
+    if blend_shape.conic == rho_middle and not (blend_shape.rho > 0.0 and blend_shape.rho < 100.0): error(invalid, "a fillet's middle radius must be more than zero (a share of its radius)")
+    if blend_shape.conic != rho_none and blend_shape.conic != rho_middle and not (blend_shape.rho > 0.0 and blend_shape.rho < 1.0): error(invalid, "a fillet's rho is more than 0 and less than 1")
+    if blend_shape.depth >= 0.0 and not (blend_shape.depth > 0.0 and blend_shape.depth < 1.0): error(invalid, "a G2 section's depth is more than 0 and less than 1")
+    if not (blend_shape.skew > 0.0 and blend_shape.skew < 1.0): error(invalid, "a G2 section's skew is more than 0 and less than 1")
+    if blend_shape.softness >= 0.0 and not (blend_shape.softness > 0.0 and blend_shape.softness <= 1.0): error(invalid, "a G2 section's softness is more than 0 and at most 1")
+
+# -- Conics.
+
+## The rational quadratic (`a`, w `c`, `b`)'s point at `t`.
+func conic_point(a: Vector3, c: Vector3, b: Vector3, weight: f64, t: f64) -> Vector3:
+    let s = 1.0 - t
+    let d = s * s + 2.0 * weight * s * t + t * t
+    return a.multiply_scalar(s * s).add(c.multiply_scalar(2.0 * weight * s * t)).add(b.multiply_scalar(t * t)).multiply_scalar(1.0 / d)
+
+## The radius of curvature at the middle (t = 1/2) of the rational
+## quadratic (`a`, w `c`, `b`), by central differences.
+func conic_peak(a: Vector3, c: Vector3, b: Vector3, weight: f64) -> f64:
+    let h = 1e-4
+    let before = conic_point(a, c, b, weight, 0.5 - h)
+    let m = conic_point(a, c, b, weight, 0.5)
+    let after = conic_point(a, c, b, weight, 0.5 + h)
+    let d1 = after.subtract(before).multiply_scalar(0.5 / h)
+    let d2 = before.add(after).subtract(m.multiply_scalar(2.0)).multiply_scalar(1.0 / (h * h))
+    let speed = d1.length()
+    let k = d1.cross(d2).length() / math.max(1e-300, speed * speed * speed)
+    return 1.0 / math.max(k, 1e-300)
+
+## The middle weight of the symmetric conic on legs whose half angle has
+## sine `sin_half` whose radius of curvature at its middle is `ratio`
+## times the circle's (bisection: a heavier weight draws the curve to the
+## corner, its middle tighter).
+func middle_radius_weight(sin_half: f64, ratio: f64) -> f64:
+    # Legs of length 1 from the corner at the origin, θ apart (θ/2 the
+    # half angle): the circle's radius is tan(θ/2).
+    let half = math.asin(math.clamp(sin_half, 1e-9, 1.0))
+    let a = Vector3(1.0, 0.0, 0.0)
+    let b = Vector3(math.cos(2.0 * half), math.sin(2.0 * half), 0.0)
+    let want = ratio * math.tan(half)
+    var low = 1e-4
+    var high = 1e4
+    for _ in 0..<200:
+        let mid = math.sqrt(low * high)
+        if conic_peak(a, Vector3(), b, mid) > want: low = mid
+        else: high = mid
+    return math.sqrt(low * high)
+
+# -- G2 by depth, skew and softness.
+
+## The shaped G2 section from contact `ta` to `tb` with legs to the corner
+## `p` (BlendShape's depth and skew, or softness), onto `points` and
+## `knots` as Fusion's G2 lays them (eight points, the middle knot twice):
+## a quintic, its first three points along each leg, the third moved off it
+## by 5 a² κ / 4 toward the face's center of curvature (`bend_a`, `bend_b`)
+## so the section's curvature at each contact is the face's.
+func shaped_g2(ta: Vector3, tb: Vector3, p: Vector3, blend_shape: BlendShape, points: Growing[Vector3]*, knots: Growing[f64]*, bend_a: Vector3, bend_b: Vector3) -> !:
+    var arm_a = 0.5
+    var arm_b = 0.5
+    if blend_shape.softness >= 0.0:
+        arm_a = blend_shape.softness
+        arm_b = blend_shape.softness
+    else:
+        # The arms' split by the skew, their size by the depth: the middle's
+        # distance from the chord over the corner's grows with the arms.
+        let chord = tb.subtract(ta)
+        let corner_height = height_over(p, ta, chord)
+        var low = 1e-3
+        var high = 1.0
+        for _ in 0..<80:
+            let size = (low + high) * 0.5
+            let (sa, sb) = skewed_arms(size, blend_shape.skew)
+            let q = shaped_points(ta, tb, p, sa, sb, bend_a, bend_b)
+            let middle = bezier5(q, 0.5)
+            if height_over(middle, ta, chord) / corner_height < blend_shape.depth: low = size
+            else: high = size
+        let (found_a, found_b) = skewed_arms((low + high) * 0.5, blend_shape.skew)
+        arm_a = found_a
+        arm_b = found_b
+    let q = shaped_points(ta, tb, p, arm_a, arm_b, bend_a, bend_b)
+    # The middle knot inserted twice (Boehm) so the section has Fusion's G2
+    # layout: eight points, knots 0 six times, 1/2 twice, 1 six times. Once:
+    # every inner point the mean of two; again, the inner four of those.
+    var once: Vector3[7] = [q[0], Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), q[5]]
+    for i in 1..<(usize)6: once[i] = q[i - 1].add(q[i]).multiply_scalar(0.5)
+    var twice: Vector3[8] = [once[0], once[1], Vector3(), Vector3(), Vector3(), Vector3(), once[5], once[6]]
+    for i in 2..<(usize)6: twice[i] = once[i - 1].add(once[i]).multiply_scalar(0.5)
+    for k in 0..<(usize)8: try points.push(twice[k])
+    for _ in 0..<(usize)6: try knots.push(0.0)
+    try knots.push(0.5)
+    try knots.push(0.5)
+    for _ in 0..<(usize)6: try knots.push(1.0)
+
+## The arms of size `size` split by `skew` (0.5 even): toward the second
+## leg the first arm grows.
+func skewed_arms(size: f64, skew: f64) -> (f64, f64):
+    let a = math.clamp(size * 2.0 * skew, 1e-3, 1.0)
+    let b = math.clamp(size * 2.0 * (1.0 - skew), 1e-3, 1.0)
+    return (a, b)
+
+## The quintic's six points: each contact, then along its leg at half and
+## all of its arm's share, the third bent toward the face's curvature.
+func shaped_points(ta: Vector3, tb: Vector3, p: Vector3, arm_a: f64, arm_b: f64, bend_a: Vector3, bend_b: Vector3) -> Vector3[6]:
+    let la = p.subtract(ta)
+    let lb = p.subtract(tb)
+    let a1 = la.multiply_scalar(arm_a * 0.5)
+    let b1 = lb.multiply_scalar(arm_b * 0.5)
+    # Curvature at a quintic's start: (4/5) h / a² for the first arm a and
+    # the third point's offset h square to it.
+    let ha = 1.25 * a1.dot(a1)
+    let hb = 1.25 * b1.dot(b1)
+    return [ta, ta.add(a1), ta.add(la.multiply_scalar(arm_a)).add(bend_a.multiply_scalar(ha)),
+            tb.add(lb.multiply_scalar(arm_b)).add(bend_b.multiply_scalar(hb)), tb.add(b1), tb]
+
+## A quintic Bezier's point at `t`.
+func bezier5(q: Vector3[6], t: f64) -> Vector3:
+    let s = 1.0 - t
+    let c: f64[6] = [s * s * s * s * s, 5.0 * t * s * s * s * s, 10.0 * t * t * s * s * s, 10.0 * t * t * t * s * s, 5.0 * t * t * t * t * s, t * t * t * t * t]
+    var sum = Vector3()
+    for k in 0..<(usize)6: sum = sum.add(q[k].multiply_scalar(c[k]))
+    return sum
+
+## `x`'s distance from the line through `a` along `chord`.
+func height_over(x: Vector3, a: Vector3, chord: Vector3) -> f64:
+    let d = x.subtract(a)
+    let along = chord.multiply_scalar(d.dot(chord) / math.max(1e-300, chord.dot(chord)))
+    return d.subtract(along).length()

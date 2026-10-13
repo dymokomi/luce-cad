@@ -809,7 +809,7 @@ meets the next face at an angle. Over a cliff (a straight concave edge parallel 
 beyond) the tool would carve the ledge: it is cut back to the ledge's plane (`cliff_cut`), which
 then covers the fillet's end. A face split along a straight line parallel to the edge, the faces
 each side in one plane, lets the ball roll on past the line (`flat_room`). Rolling on onto a curved
-tangent next face is not done: refused as above.
+tangent next face is not done: refused as above. (Parasolid's names for these, Overflow, below.)
 
 **Tangent chains.** Like Fusion's Tangent Chain, a referenced edge brings the edges that continue
 it tangentially with the same convexity, such as a rounded slot's rim or the edges around an
@@ -819,6 +819,52 @@ Arcs of rims (an arc between a flat face and a cylinder about it) are blended by
 turned part way along them, a part torus or cone. Where chained edges meet, each tool ends square
 at the joint, so neighboring tools share their end planes. A free end of an arc reaches past, as a
 line's does, when the corner beyond is empty.
+
+### Parasolid's sections, limits and setbacks (`blend_shape.lucb`)
+
+Stage 8 of the surfacing plan (luced-3d `docs/research/SURFACING-ALIAS-PLASTICITY.md` §5.3). A
+fillet's section shape (`BlendShape`) carries Fusion's Tangency weight and Parasolid's sections, and
+travels every path the weight did (the booleans' tools, setback corners, loops round a flat face,
+loops between curved faces, variable radius):
+
+- **Conic** (G1; `conic`, `rho`), Parasolid's three ways: **rho** itself, the middle weight
+  ρ / (1 − ρ) (0.5 the parabola, below an ellipse, above a hyperbola); **rho relative** to the
+  circle's, the middle weight sin(θ/2) ρ / (1 − ρ), so 0.5 is the circle at any angle between the
+  faces; **middle radius**, ρ the radius of curvature at the section's middle over the fillet's
+  radius (the weight found by bisection on the symmetric conic; 1 the circle). A conic has no ball
+  tangent to three of them, so its corners are setback corners, as a weighted G1 fillet's are.
+- **G2 by depth and skew, or by softness** (`depth`, `skew`, `softness`): a quintic whose first
+  three points lie along each leg from its contact (the face's curvature at a curved one, the third
+  point moved off the leg by 5 a² κ / 4), its arms a share of each leg; the depth (0 at the chord,
+  1 at the faces' corner) found by bisection on the arms' size, the skew (0.5 even) splitting it
+  between the legs, the softness the share itself (more is flatter and deeper, less like a chamfer
+  with rounded edges). Laid out as Fusion's G2 is (the middle knot twice), so every path takes it.
+- **Chamfers by apex range**: the distances (Chamfer types and distances, above) are already
+  measured straight from the edge, where the faces' tangents meet: Parasolid's apex range.
+- **Limits** (`limit_from`, `limit_to`, `BlendLimits`): the fillet runs only between two fractions
+  of one straight edge (or its collinear pieces), its tool stopping square at each limit, so the
+  booleans leave the plane there as the blend's cap (`<tag>/cap`). The direct builds are skipped.
+- **Setbacks** (`setback_ratio`): where fillets meet at a corner each stops at least that many radii
+  from it (by default as far as the corner needs: the contacts' crossing and half a reach, 1.5 r at
+  a square corner), and the corner's setback patch fills the larger gap; G1 corners become setback
+  corners.
+
+**Overflow**, as Parasolid names it: where a fillet runs off its face over a straight edge
+(Too large, below), the default rules are smooth (a face split along a line parallel to the edge,
+both pieces in one plane: the ball rolls on), notch (over a convex edge into a face turning the same
+way: the next face trims the unchanged fillet) and cliff (over a concave edge: the fillet's end is
+covered by the ledge's plane). With `overflow` off none of these: the fillet must fit its faces,
+else the size that does is said (`blend_shape_tests`: a plate 4 thick rounded 5 is refused, "less
+than 4"). Not yet: rolling on onto a curved tangent face, cliff-edge blends along the cliff, and a
+choice among the behaviours themselves.
+
+`blend_shape_tests` checks against closed forms: rho relative 0.5 is the circle (volume and its
+middle (√2 − 1) r in from the edge); rho absolute 0.5 the parabola (r² / 6 per length, its middle
+halfway); a middle radius of the circle's own the circle; G2 depth d puts the middle d of the way
+from the chord to the corner, skews 0.3 and 0.7 mirror each other, softness 0.9 is deeper than 0.2,
+each G2 at the faces; a fillet limited to the middle half of an edge takes half the edge's section
+area (G1 and G2) with two caps square to it; setbacks of three radii stop a corner's three G2
+fillets 1.5 from it (0.75 by default).
 
 ### Direct fillets (`local_blend.lucb`, `local_corners.lucb`)
 
@@ -1944,8 +1990,21 @@ middle; a slanted profile on the blend within 1e-5; Explicit Control's structure
 `surface_build_tests.luc` (Skin's Flow Control and Modify Range; Rail's Colinear and Rebuild; Explicit
 Control on Skin, Rail and Profile).
 
-Not yet (Stage 8 and later): Round, Ball Corner, Corner Blend, Bridge Fillet; conic sections of the
-edge fillets.
+Bridge Fillet and the edge fillets' conic sections came with Stage 8 (below, and Parasolid's sections
+above); Ball Corner and Corner Blend are luced-3d's Corner over Fill (Fill, Follow-ups). Not yet:
+Round; Alias's Ball Corner shape controls (Pivot Curve Length Ratio, Center Adjust).
+
+**Bridge Fillet** (Stage 8; Alias's Bridge Fillet, Parasolid's three-face blend;
+`bridge_fillet.lucb`, `CadSurfaceBlend.bridge`): a circular blend tangent to two side sets and a
+center set. At each station the ball touches all three in the plane square to the spine: Newton on
+seven unknowns (the three contacts' chart points and the radius; between parallel walls the radius
+is fixed and the height free, so the radius is an unknown like the contacts), its spine marched as
+Surface Fillet's (the third set's normal crossing where the sides' are parallel). The section is
+the circle through the three contacts, a circle of the ball and so tangent to each set, as two
+rational quadratic arcs meeting at the third contact. Trim Automatic trims the sides back to their
+contacts (toward the third contact: a rib's walls face straight across) and consumes the center
+set. `blend_build_tests`: over a rib's top it is the half cylinder to 1e-15, the walls trimmed to
+its contacts and the top gone.
 
 ## Fill (`surfacing/fill.lucb`, `fill_bounds`, `fill_net`, `fill_bands`, `fill_reference`, `fill_solve`, `fill_refine`, `fill_api`)
 
@@ -2063,6 +2122,13 @@ cross isoparms square to the side.
   face), the band Cholesky runs on the band's pointer, Gauss–Newton settles to a hundredth of the
   position tolerance: the G1 five-sided corner 7.5 s to 3.9 s, G2 22 s to 10 s (48 by 32 spans; the
   factor is what is left, n h²).
+
+- **Corners** (luced-3d's Corner, Alias's Ball Corner and Corner Blend): the hole a rounded corner
+  leaves when its ball or patch is taken away is found from its blends (`hole`) and filled G1; the
+  sides' neighbors carried on disagree there (three cylinders, each running on straight), and a
+  reference of ribbons apart by more than a twentieth of the loop at its middle or halfway to a
+  side is dropped for the plate's own bending (it kept their blend's dent: 22% of the radius off the
+  ball, now 2.7%; `fill_tests`).
 
 Not yet: the five-sided corner between G3 fillets and walls fills G1 but not G2 (its stations' G2
 rows do not settle together: 60 to 190% off at the walls); a Molded fill's trimmed face can be hard to

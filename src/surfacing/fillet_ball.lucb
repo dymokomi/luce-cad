@@ -126,6 +126,38 @@ func holding_face(w: FilletWork*, set: FilletSet*, p: Vector3) -> (i64, Vector3)
         if q.subtract(p).length() <= w.size * 1e-6: return ((i64)k, uv)
     return (-1, Vector3())
 
+## The ball of radius `r` in the plane through `o` square to `d`, from
+## `s`'s contacts (`s` holds the answer), each contact moved onto another
+## face of its set where it leaves its own; with `bounded`, outside when a
+## contact leaves its set.
+func ball_with(w: FilletWork*, s: BallStation*, r: f64, o: Vector3, d: Vector3, bounded: bool) -> i64!:
+    var tries = 0
+    while true:
+        if not try ball_newton(w, s, r, o, d): return ball_failed
+        # A contact past its face: onto the set's face holding it.
+        let (p1, _) = try ball_side(&w.one, s.f1, s.uv1)
+        let (p2, _) = try ball_side(&w.two, s.f2, s.uv2)
+        let in1 = w.one.faces.items[s.f1].holds(s.uv1)
+        let in2 = w.two.faces.items[s.f2].holds(s.uv2)
+        if in1 and in2: return ball_found
+        var moved = false
+        if not in1:
+            let (k, uv) = try holding_face(w, &w.one, p1)
+            if k >= 0 and (usize)k != s.f1:
+                s.f1 = (usize)k
+                s.uv1 = uv
+                moved = true
+        if not in2:
+            let (k, uv) = try holding_face(w, &w.two, p2)
+            if k >= 0 and (usize)k != s.f2:
+                s.f2 = (usize)k
+                s.uv2 = uv
+                moved = true
+        tries += 1
+        if not moved or tries > 3:
+            if bounded: return ball_outside
+            return ball_found
+
 ## Ball outcomes.
 let ball_found: i64 = 0
 let ball_outside: i64 = 1
@@ -137,35 +169,12 @@ let ball_failed: i64 = 2
 ## face of its set where it leaves its own. With `bounded`, outside when a
 ## contact leaves its set.
 func ball_at(w: FilletWork*, s: BallStation*, o: Vector3, d: Vector3, bounded: bool) -> i64!:
+    if w.three.faces.count > 0: return try bridge_ball(w, s, o, d, bounded)
     let asked = w.size_at(o)
     var r = asked if w.law.count >= 2 and not w.opts.chordal else (s.radius if s.radius > 0.0 else w.opts.size)
     for _ in 0..<4:
-        var tries = 0
-        while true:
-            if not try ball_newton(w, s, r, o, d): return ball_failed
-            # A contact past its face: onto the set's face holding it.
-            let (p1, _) = try ball_side(&w.one, s.f1, s.uv1)
-            let (p2, _) = try ball_side(&w.two, s.f2, s.uv2)
-            let in1 = w.one.faces.items[s.f1].holds(s.uv1)
-            let in2 = w.two.faces.items[s.f2].holds(s.uv2)
-            if in1 and in2: break
-            var moved = false
-            if not in1:
-                let (k, uv) = try holding_face(w, &w.one, p1)
-                if k >= 0 and (usize)k != s.f1:
-                    s.f1 = (usize)k
-                    s.uv1 = uv
-                    moved = true
-            if not in2:
-                let (k, uv) = try holding_face(w, &w.two, p2)
-                if k >= 0 and (usize)k != s.f2:
-                    s.f2 = (usize)k
-                    s.uv2 = uv
-                    moved = true
-            tries += 1
-            if not moved or tries > 3:
-                if bounded: return ball_outside
-                break
+        let placed = try ball_with(w, s, r, o, d, bounded)
+        if placed != ball_found: return placed
         if not w.opts.chordal: return ball_found
         # Chordal: the radius scaled by the chord asked over the chord had.
         let (q1, _) = try ball_side(&w.one, s.f1, s.uv1)
