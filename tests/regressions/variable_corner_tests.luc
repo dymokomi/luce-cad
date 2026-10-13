@@ -1,0 +1,62 @@
+## Variable radius fillets meeting other fillets at a corner in one feature
+## (the SMLib study's item 10; CadModeling.variable_filleted_edges). A 20
+## cube's corner at (10, 10, 10): its two edges along x and y rounded 4,
+## its edge along z rounded 2 at z = -10 growing to 4 at the corner. The
+## corner is a setback corner at 4 (G1 ones too), the variable strip's law
+## held flat at the corner so its end section is the corner's own curve.
+## Closed at 32 and 64 divisions, every edge between two faces G1 to 0.5
+## degrees, and the volume between the constant 4's (less taken away) and
+## the constant 2's. A law that does not reach the corner's radius there is
+## refused by name. (Refused before: a variable radius took one edge or one
+## tangent chain.)
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_cad.measure import CadMeasure
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+## The cube's edge whose points all have `p`'s nonzero coordinates.
+func edge_on(model: CadModel, p: Vector3) -> str!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            var on = true
+            for f in [0.0, 0.5, 1.0]:
+                let q = model.face_edge_point(face, use, f)
+                if p.x != 0.0 and math.abs(q.x - p.x) > 1e-6: on = false
+                if p.y != 0.0 and math.abs(q.y - p.y) > 1e-6: on = false
+                if p.z != 0.0 and math.abs(q.z - p.z) > 1e-6: on = false
+            if on and not (id in found): found.append(id)
+    return CadModeling.edge_references(model, found)
+
+pub func variable_corner_tests() -> unit!:
+    let cube = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "c")
+    let along_z = edge_on(cube, Vector3(10.0, 10.0, 0.0))
+    let along_x = edge_on(cube, Vector3(0.0, 10.0, 10.0))
+    let along_y = edge_on(cube, Vector3(10.0, 0.0, 10.0))
+    let all = along_z + ";" + along_x + ";" + along_y
+    for continuity in [1, 2]:
+        let made = CadModeling.variable_filleted_edges(cube, along_x + ";" + along_y, 4.0, along_z, [0.0, 1.0], [2.0, 4.0], [2], "v", continuity)
+        let coarse = made.tessellate(32)
+        let fine = made.tessellate(64)
+        closed(coarse)
+        closed(fine)
+        if math.abs(volume(fine) - volume(coarse)) > 0.5: print(f"G{continuity}: {volume(coarse)} then {volume(fine)}")
+        assert(math.abs(volume(fine) - volume(coarse)) <= 0.5)
+        let four = volume(CadModeling.filleted(cube, all, 4.0, "k", continuity, true, true).tessellate(64))
+        let two = volume(CadModeling.filleted(cube, all, 2.0, "k", continuity, true, true).tessellate(64))
+        if not (volume(fine) > four and volume(fine) < two): print(f"G{continuity}: {volume(fine)} not between {four} and {two}")
+        assert(volume(fine) > four and volume(fine) < two)
+        let check = CadMeasure.check(made, "", 1, 8, 0.0001, 0.5, 0.5, 1.0, false, 8, false, 1.0, false)
+        if check.passed() != check.edge_count(): print(f"G{continuity}: {check.summary()}")
+        assert(check.passed() == check.edge_count())
+    var refused = ""
+    _ = CadModeling.variable_filleted_edges(cube, along_x + ";" + along_y, 4.0, along_z, [0.0, 1.0], [2.0, 3.0], [2], "v", 1) catch failure:
+        refused = failure.message
+        recover cube
+    if not refused.contains("must reach its radius"): print(f"refused: {refused}")
+    assert(refused.contains("must reach its radius"))
+    print("PASS variable fillets at a corner: a cube's corner of two edges rounded 4 and one 2 growing to 4 into it, G1 and G2 (setback corners), closed, G1 at every edge, between the constant 4 and 2; a law short of the corner's radius refused")

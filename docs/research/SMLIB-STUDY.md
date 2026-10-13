@@ -958,6 +958,18 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   (intersecting extended patches with the booleans' face/face step) for gaps the local, cap and
   band healings refuse.
 
+- **10, variable fillets at corners (done for straight edges between flat faces).**
+  `CadModeling.variable_filleted_edges` takes constant edges and variable ones (each its own law)
+  in one feature; the blend pipeline builds a variable edge's tool between where the corners stop
+  it, its law held flat at the corner's radius there (`variable_corners.lucb`). The corners are
+  setback corners: a G1 ball's sphere met the variable B-spline strip tangentially along its end
+  circle and the booleans failed ("a face being split traced into another loop"); the strip's G1
+  section is the scaled circle in the patch's degree 5 rational form, so it ends in the corner's
+  curve exactly. A 20 cube's corner, x and y edges 4, z edge 2 → 4 into it: G1 7805.04, G2
+  7843.88 at 32 divisions (constant 4, ball: 7804.58; G2 setback: 7830.76), closed, every edge G1
+  to 0.0000°. Regression: `variable_corner_tests`. Still open: laws on chains round faces and
+  loops between curved faces at corners, and Fusion's rolled-ball G1 envelope there.
+
 - **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
   plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was
   finding a point well inside a piece (`piece_point`), asked even of the plate's face with all its

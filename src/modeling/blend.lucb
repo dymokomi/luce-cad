@@ -152,7 +152,9 @@ func choose_edges(w: Shape*, references: str, chain: bool, chosen: Growing[usize
 ## tools (straight edges and rims, their sections rational splines) and
 ## setback corners, which a ball can't round; curved loops (curved_blend)
 ## fit the conic's weight directly.
-func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct_asked: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1, setback_asked: bool = false, tangency: f64 = 1.0) -> interop.Reference[CadModel]!:
+## With `laws`, the edges they hold are rounded by their radius laws
+## between where the corners stop them (variable_corners.lucb).
+func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], every: bool, size: f64, round: bool, tag: str, continuity: i64, direct_asked: bool, patches: PatchCache*?, sides: const ChamferSides*? = none, corner_type: i64 = 1, setback_asked: bool = false, tangency: f64 = 1.0, laws: const EdgeLaws*? = none) -> interop.Reference[CadModel]!:
     if not math.is_finite(size) or size <= 0.0: error(invalid, "a blend needs a positive size")
     if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
     if round: try check_tangency(tangency)
@@ -311,17 +313,32 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
             let corner = w.points.items[(usize)v]
             if corner.subtract(low).length() <= w.tolerance * 10.0: exact_low = true
             elif corner.subtract(high).length() <= w.tolerance * 10.0: exact_high = true
-        if adding: try tools.push(try concave_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b, tangency))
-        else:
-            var tool = try edge_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, &body, (str)name.view(), leg_b, tangency)
-            # Over a cliff the tool stops at the ledge's plane (fits_plan).
-            let (cliff_a, cliff_b) = try fits_plan(w, e, math.max(leg_a, leg_b), round)
-            for beyond in [cliff_a, cliff_b]:
-                if beyond < 0: continue
-                let cut = try cliff_cut(w, tool, beyond, (str)name.view())
-                tool.release()
-                tool = cut
-            try tools.push(tool)
+        var lawed = false
+        if let held = laws:
+            let at = held.find(e)
+            if at >= 0:
+                # Its law from its start to its end, as far as the corners
+                # let it go (the law's end radius held through them).
+                let first = try w.edge_at(e, 0.0)
+                let forward = low.subtract(first).length() <= high.subtract(first).length()
+                let start = low if forward else high
+                let end = high if forward else low
+                let way = try end.subtract(start).normalized()
+                let ends = EndPlanes(way.multiply_scalar(-1.0), 0.0, false, way, 0.0, false)
+                try tools.push(try straight_law_tool(w, e, &held.laws.items[(usize)at], tool_continuity, tangency, (str)name.view(), start, end, &ends, true))
+                lawed = true
+        if not lawed:
+            if adding: try tools.push(try concave_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, (str)name.view(), leg_b, tangency))
+            else:
+                var tool = try edge_tool(w, e, leg_a, round, tool_continuity, low, high, exact_low, exact_high, &body, (str)name.view(), leg_b, tangency)
+                # Over a cliff the tool stops at the ledge's plane (fits_plan).
+                let (cliff_a, cliff_b) = try fits_plan(w, e, math.max(leg_a, leg_b), round)
+                for beyond in [cliff_a, cliff_b]:
+                    if beyond < 0: continue
+                    let cut = try cliff_cut(w, tool, beyond, (str)name.view())
+                    tool.release()
+                    tool = cut
+                try tools.push(tool)
         try adds.push(adding)
     for ball in balls.view():
         try corner_name(w, (usize)ball.vertex, tag, &name)

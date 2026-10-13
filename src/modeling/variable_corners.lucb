@@ -1,0 +1,101 @@
+## Variable radius fillets meeting other fillets at corners, in one
+## feature (the SMLib study's item 10). The corners are built as a constant
+## fillet's are, at the feature's radius, as setback corners (G1 ones too:
+## a ball's sphere would meet a variable strip tangentially along its end
+## circle; corners.lucb, setback.lucb). Each variable edge must reach that radius at a corner it
+## runs into, and its law is held flat there (its slope made 0: the
+## corner's sections are the constant fillet's, so the strip meets the
+## corner tangentially, G1). Between where the corners stop it, the edge is
+## rounded by its own law (straight_law_tool), the law spanning that
+## stretch: the law's end radius is held through the corner, as if it were
+## constant there.
+
+## Radius laws by edge: `laws[k]` is edge `edges[k]`'s.
+struct EdgeLaws:
+    var edges: Growing[usize]
+    var laws: Growing[RadiusLaw]
+
+    func close():
+        for k in 0..<self.laws.count: self.laws.items[k].close()
+        self.laws.close()
+        self.edges.close()
+
+    ## The place of edge `e`'s law, or -1.
+    func find(e: usize) -> i64:
+        for k in 0..<self.edges.count:
+            if self.edges.items[k] == e: return (i64)k
+        return -1
+
+## `model` with the edges `references` names filleted `radius` and the
+## edges `variable` names (references apart by `;`, one straight edge
+## between flat faces each) by their own laws: edge k's points are the
+## next `counts[k]` of `positions` and `radii` (0 its start, 1 its end;
+## Fusion's law between them, or `smooth`), all of `continuity` under
+## Tangency weight `tangency`, the blend named for feature `tag`. A
+## variable edge running into a corner of the feature must have the
+## feature's radius there.
+func variable_corner_fillets(model: const CadModel*, references: str, radius: f64, variable: str, positions: const f64[], radii: const f64[], counts: const i64[], tag: str, continuity: i64, smooth: bool, tangency: f64) -> interop.Reference[CadModel]!:
+    if not math.is_finite(radius) or radius <= 0.0: error(invalid, "a fillet needs a positive radius")
+    var w = try shape_of(model)
+    defer w.close()
+    var chosen = Growing[usize]()
+    defer chosen.close()
+    if references.length > 0: try resolve_edges(&w, references, &chosen)
+    var held = EdgeLaws(Growing[usize](), Growing[RadiusLaw]())
+    defer held.close()
+    var group = Growing[usize]()
+    defer group.close()
+    var taken: usize = 0
+    var k: usize = 0
+    var ranges = Growing[(usize, usize)]()
+    defer ranges.close()
+    try top_parts(variable, reference_separator, &ranges)
+    for range in ranges.view():
+        let part = trimmed(part_of(variable, range))
+        if part == "": continue
+        if k >= counts.length: error(invalid, "a variable radius edge needs its count of points")
+        let count = (usize)counts[k]
+        if count < 1 or taken + count > positions.length or taken + count > radii.length: error(invalid, "a variable radius edge's points run past those given")
+        group.clear()
+        try resolve_edges(&w, part, &group)
+        if group.count != 1: error(invalid, "each variable radius edge is one edge")
+        let e = group.items[0]
+        let (fa, fb) = try edge_faces(&w, e)
+        if w.carriers.items[(usize)w.edges.items[e].carrier].kind != curve_line or not flat_pair(&w, fa, fb):
+            error(invalid, "a variable radius edge meeting other fillets is a straight edge between flat faces")
+        let edge_list: usize[1] = [e]
+        var law = try chain_law(&w, edge_list[..<1], e, positions[taken..<taken + count], radii[taken..<taken + count], smooth)
+        try held.edges.push(e)
+        try held.laws.push(law)
+        try chosen.push(e)
+        taken += count
+        k += 1
+    if chosen.count == 0: error(invalid, "a fillet takes an edge")
+    # At a corner (an end another chosen edge meets) the law reaches the
+    # radius, held flat.
+    for at in 0..<held.edges.count:
+        let e = held.edges.items[at]
+        let edge = w.edges.items[e]
+        let law = &held.laws.items[at]
+        for side in 0..<(usize)2:
+            let v = edge.start if side == 0 else edge.end
+            var corner = false
+            for other in chosen.view():
+                if other == e: continue
+                let o = w.edges.items[other]
+                corner = corner or o.start == v or o.end == v
+            if not corner: continue
+            let last = law.radii.count - 1
+            let end_radius = law.radii.items[0] if side == 0 else law.radii.items[last]
+            if math.abs(end_radius - radius) > radius * 1e-9:
+                var buffer: u8[256]
+                error(invalid, try strings.format(buffer, f"a variable radius running into a corner of the fillet must reach its radius there ({radius}), not {end_radius}"))
+            if side == 0: law.slopes.items[0] = 0.0
+            else: law.slopes.items[last] = 0.0
+    var largest = radius
+    for law in held.laws.view(): largest = math.max(largest, law.largest())
+    for e in chosen.view(): try check_fits(&w, e, largest, true)
+    # G1 corners are setback corners too (Fusion's Setback type): a ball's
+    # sphere would meet a variable strip tangentially along its end circle,
+    # a B-spline against a sphere the booleans cannot follow.
+    return try blend_chosen(model, &w, chosen.view(), false, radius, true, tag, continuity, false, none, none, 1, true, tangency, &held)

@@ -96,6 +96,30 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
             ends.n1 = n
             ends.h1 = h
             ends.slanted1 = true
+    var name = Growing[u8]()
+    defer name.close()
+    try blend_name(w, e, tag, &name)
+    let tool = try straight_law_tool(w, e, law, continuity, tangency, (str)name.view(), start, end, &ends)
+    defer tool.release()
+    return try combine(model, tool.value(), op_subtract if convex_edge else op_union)
+
+## The tool of straight edge `e` between flat faces filleted by `law` from
+## `start` to `end` (the edge's ends, or where corners stop it: the law then
+## spans that stretch), of `continuity` under `tangency`, its blend face
+## named `name`, ending as `ends` says (see the header).
+## With `scaled` the G1 section is the circle scaled by the radius, not the
+## rolled balls' envelope: at a corner's ball (variable_corners.lucb) its
+## end section is then exactly the ball's circle.
+func straight_law_tool(w: const Shape*, e: usize, law: const RadiusLaw*, continuity: i64, tangency: f64, name: str, start: Vector3, end: Vector3, ends: const EndPlanes*, scaled: bool = false) -> interop.Reference[CadModel]!:
+    let (fa, fb) = try edge_faces(w, e)
+    let length = end.subtract(start).length()
+    let along = try end.subtract(start).normalized()
+    let ua = try into_face(w, fa, e, along)
+    let ub = try into_face(w, fb, e, along)
+    let theta = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
+    let reach = 1.0 / math.tan(theta * 0.5)
+    let weight = math.sin(theta * 0.5)
+    let convex_edge = try convex(w, e)
     # The law's points that change nothing (on a straight run, or between
     # equal radii) go: fewer knots.
     var kept_at = Growing[f64]()
@@ -118,9 +142,6 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
         try kept_at.push(at[k])
         try kept_sizes.push(sizes[k])
         try kept_slopes.push(slopes[k])
-    var name = Growing[u8]()
-    defer name.close()
-    try blend_name(w, e, tag, &name)
     # Fusion rolls a ball at G1 under the weight of 1 (exactly; 0.999 and
     # 1.001 scale the section): one straight piece of the law makes a cone.
     let straight = kept_at.count == 2 and math.abs(kept_slopes.items[0] - (kept_sizes.items[1] - kept_sizes.items[0])) <= 1e-12 * math.max(1.0, kept_sizes.items[1])
@@ -132,7 +153,7 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
     var rolled = Rolled(start, along, length, ua, ub, theta, try ua.add(ub).normalized().multiply_scalar(1.0 / math.sin(theta * 0.5)), kept_at.view(), kept_sizes.view(), kept_slopes.view(), n0, n1)
     # Any other law: the balls' envelope (rolled_ball.lucb), unless it
     # folds, where Fusion scales the section instead.
-    if continuity == 1 and tangency == 1.0 and not straight and not rolled_folds(&rolled):
+    if continuity == 1 and tangency == 1.0 and not straight and not scaled and not rolled_folds(&rolled):
         var net = Growing[Vector3]()
         defer net.close()
         var weights = Growing[f64]()
@@ -148,9 +169,8 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
         for _ in 0..<(usize)6: try section_knots.push(1.0)
         # The net row-major across (6 rows, each along).
         let count = net.count // 6
-        let rolled_tool = try strip_solid(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), net.view(), weights.view(), 6, count, 5, along_degree, section_knots.view(), knots.view(), length + reach * law.largest() * 4.0, (str)name.view(), convex_edge, &ends)
-        defer rolled_tool.release()
-        return try combine(model, rolled_tool.value(), op_subtract if convex_edge else op_union)
+        let rolled_tool = try strip_solid(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), net.view(), weights.view(), 6, count, 5, along_degree, section_knots.view(), knots.view(), length + reach * law.largest() * 4.0, name, convex_edge, ends)
+        return rolled_tool
     if (ends.slanted0 or ends.slanted1) and cone < 0.0:
         # A slanted end: the sweep trimmed by it (tilted_sweep.lucb).
         var section = Growing[Vector3]()
@@ -175,12 +195,9 @@ func variable_straight(model: const CadModel*, w: const Shape*, e: usize, law: c
         defer fitted_knots.close()
         try fitted_knots.assign(section_knots.view())
         let count = net.count // section.count
-        let tilted_tool = try strip_solid(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), net.view(), weights.view(), section.count, count, 5, along_degree, fitted_knots.view(), knots.view(), length + reach * law.largest() * 4.0, (str)name.view(), convex_edge, &ends)
-        defer tilted_tool.release()
-        return try combine(model, tilted_tool.value(), op_subtract if convex_edge else op_union)
-    let tool = try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), kept_slopes.view(), (str)name.view(), convex_edge, continuity, &ends, tangency, cone)
-    defer tool.release()
-    return try combine(model, tool.value(), op_subtract if convex_edge else op_union)
+        let tilted_tool = try strip_solid(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), net.view(), weights.view(), section.count, count, 5, along_degree, fitted_knots.view(), knots.view(), length + reach * law.largest() * 4.0, name, convex_edge, ends)
+        return tilted_tool
+    return try variable_tool(start, end, ua, ub, face_outward(w, fa), face_outward(w, fb), reach, weight, kept_at.view(), kept_sizes.view(), kept_slopes.view(), name, convex_edge, continuity, ends, tangency, cone)
 
 ## The middle weight of the section square to the edge of the cone a ball
 ## rolls out between flat faces `theta` apart, its radius growing `slope`
@@ -282,7 +299,13 @@ func variable_tool(start: Vector3, end: Vector3, ua: Vector3, ub: Vector3, na: V
     var section_weights = Growing[f64]()
     defer section_weights.close()
     var degree: i64 = 2
-    if continuity == 1:
+    if continuity == g1_spline:
+        # The circle's arc as setback corners' patches carry it (degree 5,
+        # rational, the middle knot twice), so the strip ends in their curve.
+        try arc_section(ua.multiply_scalar(reach), ub.multiply_scalar(reach), Vector3(), &unit_section, &section_weights, &section_knots, tangency)
+        try middle_knot_twice(&unit_section, &section_weights, 0, &section_knots)
+        degree = 5
+    elif continuity == 1:
         try unit_section.push(ua.multiply_scalar(reach))
         try unit_section.push(Vector3())
         try unit_section.push(ub.multiply_scalar(reach))

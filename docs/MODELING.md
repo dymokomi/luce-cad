@@ -39,6 +39,7 @@ does today.
 | `chord_radius(model, references, chord, chain)` | Fusion's Chord Length: the radius whose fillets leave the faces `chord` apart. |
 | `full_round(model, center, tag, continuity, side1, side2)` | Fusion's Full Round Fillet: the flat center face rounded away whole, tangent to it and its sides. |
 | `variable_filleted(model, reference, positions, radii, tag, smooth, continuity, chain, tangency)` | Fusion's Variable radius: one straight edge between flat faces, a tangent chain round a flat face or a loop between curved faces, radii at positions 0 to 1 along it, smooth or straight between, G1 to G3, under a Tangency weight. |
+| `variable_filleted_edges(model, references, radius, variable, positions, radii, counts, tag, continuity, smooth, tangency)` | Constant fillets of `radius` and, in the same feature, variable radius ones on the `variable` edges (one straight edge between flat faces each, edge k's law the next `counts[k]` points), meeting at setback corners at `radius`; a variable edge reaches `radius` at a corner, its law held flat there. |
 | `filleted(model, references, radius, tag, continuity, chain, setback, tangency)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`); with `setback`, Fusion's Setback corner type for G1 corners too; `tangency`, Fusion's Tangency weight (0.1 to 2, 1 the default: Tangency weight below). |
 | `rule_edges(model, rounds, fillets, faces, others)` | Fusion's Rule Fillet (`rules.lucb`): references to the blendable edges a rule takes, convex ones (rounds), concave ones (fillets) or both; with `faces` named, only edges on those faces, and with `others` too, only edges between the two sets. Made again on every cook, the edges follow the body. |
 | `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Every edge Equal distance takes (loops round a flat face, rims, curved faces, inside edges); each distance runs straight from the edge to the chamfer's contact in the plane square to the edge (`chamfers.lucb`). |
@@ -524,6 +525,15 @@ transition off), read back from its faces in probes 5 to 7 of 2026-10-12 (15 law
   runs between such points natural splines held flat at those ends (Fusion's to 0.03 on alternating
   extremes);
 - limited as Fritsch and Carlson's monotone cubic where a run's spline would still turn back.
+
+**Variable radius at corners** (`variable_corners.lucb`, `CadModeling.variable_filleted_edges`): in
+one feature, constant fillets of a radius and variable ones on straight edges between flat faces,
+each with its own law. The corners are setback corners at the feature's radius (G1 too: a ball's
+sphere would meet a variable B-spline strip tangentially along its end circle, which the booleans
+cannot follow). A variable edge must reach that radius at a corner it runs into (else it is refused,
+naming both radii), and its law is held flat there (its slope 0), as if constant at its end radius
+through the corner: between the setbacks the law spans the edge's stretch, its G1 section the circle
+scaled (the setback patch's degree 5 rational arc), so the strip ends in the corner's own curve.
 
 Where the spline would not keep the shape Fusion's own pieces are **not cubics and not decoded**: a
 piece from an open end to a flat run is one universal shape in Fusion (the same on four laws, its
@@ -2152,8 +2162,10 @@ Roughly in order of usefulness:
 1. **Unequal radii at a corner** (one feature has one radius; a second fillet on an edge running
    into the first's corner is refused), and corners of four or more edges where only some are
    rounded or the faces are not flat.
-2. **Variable radius fillets meeting other fillets at a corner** of three edges within one
-   feature, and full rounds of curved ribs whose ends are not flat through the axis.
+2. **Variable radius fillets at corners** beyond straight edges between flat faces meeting at a
+   corner of the feature's own radius (`variable_filleted_edges`: a law that changes into the corner,
+   or chains round faces, or a G1 rolled-ball envelope there: its G1 section is the scaled circle),
+   and full rounds of curved ribs whose ends are not flat through the axis.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
    the loop turns a sharp corner into an end wall that is not a plane square to the edge (Fusion
