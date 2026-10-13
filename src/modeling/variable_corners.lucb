@@ -88,6 +88,9 @@ func variable_corner_fillets(model: const CadModel*, references: str, radius: f6
                 let o = w.edges.items[other]
                 corner = corner or o.start == v or o.end == v
             if not corner: continue
+            # A straight law runs into the corner as it is (Fusion's cone,
+            # law_setback); any other is held flat there.
+            if straight_piece(law): continue
             let last = law.radii.count - 1
             if side == 0: law.slopes.items[0] = 0.0
             else: law.slopes.items[last] = 0.0
@@ -98,3 +101,120 @@ func variable_corner_fillets(model: const CadModel*, references: str, radius: f6
     # sphere would meet a variable strip tangentially along its end circle,
     # a B-spline against a sphere the booleans cannot follow.
     return try blend_chosen(model, &w, chosen.view(), false, radius, true, tag, continuity, false, none, none, 1, true, blend_shape, &held)
+
+## Whether law `law` is one straight piece (two points, its slopes the
+## chord): its strip is a cone (Fusion's at G1, Tangency weight 1, and its
+## scaled sections at G2 and G3).
+func straight_piece(law: const RadiusLaw*) -> bool:
+    return law.positions.count == 2 and straight_law(law.positions.view(), law.radii.view(), law.slopes.view())
+
+## Law `law`'s radius at point `x` of straight edge `e` (on its chain).
+func law_radius_at(w: const Shape*, e: usize, law: const RadiusLaw*, x: Vector3) -> f64!:
+    let c = w.carriers.items[(usize)w.edges.items[e].carrier]
+    return law.at_fraction(try law.fraction(w, e, x.subtract(c.origin).dot(c.x)))
+
+## Straight law `law` on edge `e` cut to run from `start` to `end` (both on
+## the edge): the same line, its points there (Fusion's law along the
+## whole edge, its strip cut where the corners stop it).
+func cut_law(w: const Shape*, e: usize, law: const RadiusLaw*, start: Vector3, end: Vector3) -> RadiusLaw!:
+    var made = try law.copied()
+    errdefer made.close()
+    let a = try law_radius_at(w, e, law, start)
+    let b = try law_radius_at(w, e, law, end)
+    made.positions.items[0] = 0.0
+    made.positions.items[1] = 1.0
+    made.radii.items[0] = a
+    made.radii.items[1] = b
+    made.slopes.items[0] = b - a
+    made.slopes.items[1] = b - a
+    return made
+
+## Fusion 2705's corner where variable fillets on straight laws run into
+## other fillets (probe 18 of 2026-10-13: a 20 cube's corner, its x and y
+## edges constant, its z edge's law 1 to 6 into it, G1 and G2, Rolling ball
+## and Setback alike): a setback corner whose fillets stop by Fusion's
+## setback rule (setback_at) on their true contact lines. A cone's contact
+## line runs to its apex, so the crossings on its faces move with its law;
+## the mean takes the law's radius at its farther crossing, and its own stop
+## is measured along its contact line (2 to 4 into a corner of 4: the 4s
+## stop 7.866 from it, the 2 to 4 one 8.046, its radius there 3.195;
+## Fusion's to 1e-3). Each straight-law edge's strip there is a cone
+## (`coned`, its apex where its radius would be 0, its rolling weight at
+## G1), which the patch meets along its rulings. `held` holds the laws;
+## `hollow` marks an inside corner; `radius` the other fillets'.
+func law_setback(w: const Shape*, v: i64, edges: const usize[], radius: f64, hollow: bool, held: const EdgeLaws*) -> Setback!:
+    var corner = try setback_at(w, v, edges, radius, hollow)
+    let n = corner.count
+    let p = w.points.items[(usize)v]
+    # Each edge's radius at the corner and its growth per length away.
+    var at_corner: f64[8] = [radius, radius, radius, radius, radius, radius, radius, radius]
+    for i in 0..<n:
+        let k = held.find(corner.edges[i])
+        if k < 0: continue
+        let law = &held.laws.items[(usize)k]
+        if not straight_piece(law): error(invalid, "a variable fillet into a corner on a straight law only")
+        at_corner[i] = try law_radius_at(w, corner.edges[i], law, p)
+        let further = try law_radius_at(w, corner.edges[i], law, p.add(corner.ways[i]))
+        corner.growth[i] = further - at_corner[i]
+        corner.coned[i] = math.abs(corner.growth[i]) > 1e-12
+    # (Radii unset: the frame's reaches per unit radius.)
+    let frame = try setback_frame(w, &corner, 1.0)
+    # Contact lines: edge i's on its side `side` (0: face i - 1, 1: face i)
+    # from p + into reach at the corner, per length along the edge.
+    var cross: f64[8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    for i in 0..<n:
+        let next = (i + 1) % n
+        let (si, sn) = try contact_params(p, &corner, &frame, at_corner, i, next)
+        cross[i] = math.max(cross[i], si)
+        cross[next] = math.max(cross[next], sn)
+    # The mean reach (radii at the farther crossings), the one smallest's
+    # extra (setback_at's rule).
+    var reach: f64[8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    var mean = 0.0
+    var least = 1e300
+    for i in 0..<n:
+        reach[i] = (at_corner[i] + corner.growth[i] * cross[i]) * frame.reaches[i]
+        mean += reach[i] / (f64)n
+        least = math.min(least, reach[i])
+    var next_least = 1e300
+    var lowest: usize = 0
+    var ties: usize = 0
+    for i in 0..<n:
+        if reach[i] <= least * (1.0 + 1e-12):
+            lowest = i
+            ties += 1
+        else: next_least = math.min(next_least, reach[i])
+    for i in 0..<n:
+        let beyond = mean + ((next_least - least) * 0.5 if ties == 1 and i == lowest and next_least < 1e299 else 0.0)
+        # Along its contact line: its length per length along the edge.
+        let slant = math.sqrt(1.0 + corner.growth[i] * frame.reaches[i] * corner.growth[i] * frame.reaches[i])
+        corner.distances[i] = cross[i] + beyond / slant
+        corner.radii[i] = at_corner[i] + corner.growth[i] * corner.distances[i]
+        if corner.radii[i] <= 0.0: error(invalid, "a variable fillet's radius runs out before its corner")
+        if corner.coned[i]:
+            corner.apexes[i] = p.add(corner.ways[i].multiply_scalar(-at_corner[i] / corner.growth[i]))
+            let theta = math.acos(math.clamp(frame.intos[i * 2].dot(frame.intos[i * 2 + 1]), -1.0, 1.0))
+            corner.cone_weights[i] = rolling_weight(theta, corner.growth[i])
+    return corner
+
+## Where edge `i`'s contact line on face i crosses edge `next`'s (setback
+## corner `corner`, `frame` at unit radius: its reaches per radius; radii
+## `at_corner` at the vertex `p`, growing by corner.growth per length): the
+## two crossings' distances along their edges from the vertex.
+func contact_params(p: Vector3, corner: const Setback*, frame: const Frame*, at_corner: f64[8], i: usize, next: usize) -> (f64, f64)!:
+    let ia = frame.intos[i * 2 + 1]
+    let ib = frame.intos[next * 2]
+    let pa = p.add(ia.multiply_scalar(at_corner[i] * frame.reaches[i]))
+    let pb = p.add(ib.multiply_scalar(at_corner[next] * frame.reaches[next]))
+    let da = corner.ways[i].add(ia.multiply_scalar(corner.growth[i] * frame.reaches[i]))
+    let db = corner.ways[next].add(ib.multiply_scalar(corner.growth[next] * frame.reaches[next]))
+    # pa + s da = pb + t db, least squares (both lines lie in the face).
+    let aa = da.dot(da)
+    let bb = db.dot(db)
+    let ab = da.dot(db)
+    let det = aa * bb - ab * ab
+    if det < 1e-12 * aa * bb: error(invalid, "fillets meeting at a corner run along one line")
+    let r = pb.subtract(pa)
+    let s = (r.dot(da) * bb - r.dot(db) * ab) / det
+    let t = (r.dot(da) * ab - r.dot(db) * aa) / det
+    return (s, t)

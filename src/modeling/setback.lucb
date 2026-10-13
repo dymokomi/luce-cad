@@ -42,6 +42,15 @@ struct Setback:
     ## (three_sided.lucb): each stops through the ball's center, a
     ## three-sided patch between their end sections, no curves on the faces.
     var three_sided: bool
+    ## Variable fillets on straight radius laws (variable_corners.lucb's
+    ## law_setback): edge i's strip a cone (`coned[i]`) whose rulings meet
+    ## at `apexes[i]` (where its radius would be 0), its radius growing by
+    ## `growth[i]` per length away from the corner, its G1 section's middle
+    ## weight `cone_weights[i]` (the ball's rolling: rolling_weight).
+    var coned: bool[8]
+    var apexes: Vector3[8]
+    var growth: f64[8]
+    var cone_weights: f64[8]
 
 ## A fillet's own end section at a setback corner (a G1 variable edge's
 ## rolled envelope, straight_law_tool): the six control points of edge
@@ -54,7 +63,9 @@ struct GivenSection:
 
 ## An empty setback corner at vertex `v`.
 func empty_setback(v: i64) -> Setback:
-    return Setback(v, 0, [0, 0, 0, 0, 0, 0, 0, 0], [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, 0.5, 0.0, false)
+    return Setback(v, 0, [0, 0, 0, 0, 0, 0, 0, 0], [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], false, 0.5, 0.0, false,
+                   [false, false, false, false, false, false, false, false], [Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3(), Vector3()],
+                   [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 ## A setback corner of fillets of `radius` at vertex `v`, where `edges`
 ## (three or more, one per line through it) meet. Each fillet stops past
@@ -173,6 +184,23 @@ func shared_face(w: const Shape*, a: usize, b: usize) -> i64!:
     if fb == ga or fb == gb: return (i64)fb
     return -1
 
+## Where fillet `i`'s contact line on face i crosses fillet `next`'s on it
+## (`frame`'s reaches at the corner's setbacks): a cone's contact line runs
+## to its apex (its radius changing along it), a plain one along its edge.
+func contact_lines_cross(p: Vector3, corner: const Setback*, frame: const Frame*, i: usize, next: usize) -> Vector3!:
+    let ta = p.add(corner.ways[i].multiply_scalar(corner.distances[i])).add(frame.intos[i * 2 + 1].multiply_scalar(frame.reaches[i]))
+    let tb = p.add(corner.ways[next].multiply_scalar(corner.distances[next])).add(frame.intos[next * 2].multiply_scalar(frame.reaches[next]))
+    var da = corner.ways[i]
+    if corner.coned[i]: da = try ta.subtract(corner.apexes[i]).normalized()
+    var db = corner.ways[next]
+    if corner.coned[next]: db = try tb.subtract(corner.apexes[next]).normalized()
+    let k = da.dot(db)
+    let det = 1.0 - k * k
+    if det < 1e-12: error(invalid, "fillets meeting at a corner run along one line")
+    let r = ta.subtract(tb)
+    let s = (k * r.dot(db) - r.dot(da)) / det
+    return ta.add(da.multiply_scalar(s))
+
 ## Where two fillets' contact lines cross on the face they share: fillet
 ## `a` runs along `way_a` from corner `p`, its contact `reach_a` into the
 ## face along `into_a`; likewise `b`.
@@ -263,14 +291,17 @@ func setback_patch(w: const Shape*, corner: const Setback*, radius: f64, continu
             for _ in 0..<(usize)6: try knots.push(1.0)
             try middle_knot_twice(&curves, &weights, first, &knots)
         elif continuity == 1:
+            # A cone's section: its rolling ball's middle weight.
+            var shape = blend_shape
+            if corner.coned[i]: shape = weighted_shape(corner.cone_weights[i] / math.sin(math.acos(math.clamp(frame.intos[i * 2].dot(frame.intos[i * 2 + 1]), -1.0, 1.0)) * 0.5))
             let first = curves.count
-            try arc_section(ta, tb, foot, &curves, &weights, &knots, blend_shape)
+            try arc_section(ta, tb, foot, &curves, &weights, &knots, shape)
             try middle_knot_twice(&curves, &weights, first, &knots)
         else:
             try fillet_section(ta, tb, foot, continuity, &curves, &knots, blend_shape)
             while weights.count < curves.count: try weights.push(1.0)
-        try sides.push(HoleSide(true, corner.ways[i]))
-        let cross = try contacts_cross(p, corner.ways[i], frame.intos[i * 2 + 1], frame.reaches[i], corner.ways[next], frame.intos[next * 2], frame.reaches[next])
+        try sides.push(HoleSide(true, corner.ways[i], corner.apexes[i], corner.coned[i]))
+        let cross = try contact_lines_cross(p, corner, &frame, i, next)
         let foot_next = p.add(corner.ways[next].multiply_scalar(corner.distances[next]))
         let tc = foot_next.add(frame.intos[next * 2].multiply_scalar(frame.reaches[next]))
         knots.clear()

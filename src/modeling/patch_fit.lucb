@@ -28,10 +28,15 @@
 
 ## A side of the hole: how the surface beyond its curve goes on. Either
 ## swept straight along `direction` (`swept`: a fillet's end section), or
-## flat, in the plane of normal `direction` (a face).
+## flat, in the plane of normal `direction` (a face). A swept side `coned`
+## goes on along the lines from `apex` instead (a variable fillet's cone:
+## a straight radius law's strip, its rulings meeting where the radius
+## would be 0).
 struct HoleSide:
     var swept: bool
     var direction: Vector3
+    var apex: Vector3 = Vector3()
+    var coned: bool = false
 
 ## A control point of the quads: `base`, plus unknowns `first..<first + count`
 ## times `axes`.
@@ -278,6 +283,14 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
             kinds.items[key] = 1
             bases.items[key] = second.items[before * m + m - 1 - b]
             known.items[key] = second_weights.items[before * m + m - 1 - b]
+    # A coned side's rows run along the lines to its apex, each point a
+    # step of its own (in the unit frame). (One share of the line for the
+    # whole row is the cone's own net, exact, but only with the face curves'
+    # legs at its ends taking it too, and the fit then collapsed the rows
+    # onto the side.)
+    var apexes = Growing[Vector3]()
+    defer apexes.close()
+    for side in sides: try apexes.push(side.apex.subtract(origin).multiply_scalar(1.0 / scale))
     # Beside a face (a B side) a G1 patch of four or more fillets still
     # takes two rows in its plane: flat across it to second order, it cannot
     # bulge out through the face past the first row (an irregular apex's
@@ -288,9 +301,9 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
         let rows_k = h if sides[k].swept else flat
         let rows_before = h if sides[before].swept else flat
         for a in 1..<m:
-            for b in 1..<rows_k: set_rule(&kinds, &bases, &ways, &known, patch_key(k, a, b, m, count), first.items[k * m + a], first_weights.items[k * m + a], &sides[k])
+            for b in 1..<rows_k: set_rule(&kinds, &bases, &ways, &known, patch_key(k, a, b, m, count), first.items[k * m + a], first_weights.items[k * m + a], &sides[k], apexes.items[k], b)
         for a in 1..<rows_before:
-            for b in 1..<m: set_rule(&kinds, &bases, &ways, &known, patch_key(k, a, b, m, count), second.items[before * m + m - 1 - b], second_weights.items[before * m + m - 1 - b], &sides[before])
+            for b in 1..<m: set_rule(&kinds, &bases, &ways, &known, patch_key(k, a, b, m, count), second.items[before * m + m - 1 - b], second_weights.items[before * m + m - 1 - b], &sides[before], apexes.items[before], a)
     # Where two fillets' sides meet at a hole corner (a three-sided corner),
     # the quad's points (a, b) beside both (a and b below h) lie on both
     # sweeps: where the line from side k's point a along its sweep crosses
@@ -345,13 +358,24 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
             kinds.items[center] = 1
             bases.items[center] = bulge.multiply_scalar(fullness * point_weights.items[center])
         try fit_points(&kinds, &bases, &ways, &used, &point_weights, m, qk, count, origin, scale, out, out_weights)
+    # G2 or G3 beside a cone: its curvature across, at stations along the
+    # side, held to the cone's in that fit's slopes, a second solve
+    # (fill_quads' rule: G2 linear once the slope is held).
+    var stations = Growing[ConeStation]()
+    defer stations.close()
+    if continuity >= 2 and not rational:
+        try cone_stations(sides, out.view(), m, qk, count, origin, scale, &stations)
+        if stations.count > 0:
+            out.clear()
+            out_weights.clear()
+            try fit_points(&kinds, &bases, &ways, &used, &point_weights, m, qk, count, origin, scale, out, out_weights, stations.view())
     # (fit_points ends with the center: not a quad's point.)
     out.count -= 1
 
 ## The quads' points for corner_patch (its kinds of control points, their
 ## bases and ways, the weights fitted), onto `out` and `out_weights` keyed as
 ## corner_patch's, the center last; `origin` and `scale` its unit frame.
-func fit_points(kinds: const Growing[i64]*, bases: const Growing[Vector3]*, ways: const Growing[Vector3]*, used: const Growing[bool]*, point_weights: const Growing[f64]*, m: usize, qk: const f64[], count: usize, origin: Vector3, scale: f64, out: Growing[Vector3]*, out_weights: Growing[f64]*) -> !:
+func fit_points(kinds: const Growing[i64]*, bases: const Growing[Vector3]*, ways: const Growing[Vector3]*, used: const Growing[bool]*, point_weights: const Growing[f64]*, m: usize, qk: const f64[], count: usize, origin: Vector3, scale: f64, out: Growing[Vector3]*, out_weights: Growing[f64]*, stations: (const ConeStation[])? = none) -> !:
     let center = count * m * m
     var slots = Growing[Slot]()
     defer slots.close()
@@ -380,6 +404,7 @@ func fit_points(kinds: const Growing[i64]*, bases: const Growing[Vector3]*, ways
     try rows.marked.fill(size, false)
     try fairness_rows(&rows, slots.view(), m, qk, count)
     try seam_rows(&rows, slots.view(), m, qk, count)
+    if let held = stations: try cone_rows(&rows, slots.view(), m, qk, count, held)
     try cholesky_solve(rows.matrix.items[..<size * size], rows.rhs.items[..<size], size)
     for k in 0..<count:
         for a in 0..<m:
@@ -396,6 +421,81 @@ func fit_points(kinds: const Growing[i64]*, bases: const Growing[Vector3]*, ways
     var p = slot.base
     for j in 0..<slot.count: p = p.add(slot.axes[j].multiply_scalar(rows.rhs.items[slot.first + j]))
     try out.push(origin.add(p.multiply_scalar(scale / point_weights.items[center])))
+
+## A station beside a coned side for corner_patch's second solve: quad
+## `quad` at `uv`, the way `d` across into it (u or v), the slope across
+## held (`slope`, the unit frame's) and the cone's normal `n` and normal
+## curvature `curvature` in that slope.
+struct ConeStation:
+    var quad: usize
+    var uv: Vector3
+    var d: Vector3
+    var slope: Vector3
+    var n: Vector3
+    var curvature: f64
+
+## The stations beside `sides`' coned sides (24 a half) from the first
+## solve's quads `quads` (world, keyed as corner_patch's out): the cone
+## through each side's curve and its apex, its normal and its normal
+## curvature in the quad's slope across there (the rulings straight, only
+## the slope's part along the curve bends: S_u·N times its share squared).
+func cone_stations(sides: const HoleSide[], quads: const Vector3[], m: usize, qk: const f64[], count: usize, origin: Vector3, scale: f64, out: Growing[ConeStation]*) -> !:
+    var b0: f64[64]
+    var b1: f64[64]
+    let mm = m * m
+    for c in 0..<count:
+        if not sides[c].coned: continue
+        let apex = sides[c].apex.subtract(origin).multiply_scalar(1.0 / scale)
+        # The side's first half on quad c (v = 0, across along v), its second
+        # on quad c + 1 (u = 0, across along u).
+        for half in 0..<(usize)2:
+            let quad = c if half == 0 else (c + 1) % count
+            for q in 0..<(usize)24:
+                let t = ((f64)q + 0.5) / 24.0
+                spline_basis_by(qk, t, basis_stride, b0[..<64])
+                spline_basis_by(qk, 0.0, basis_stride, b1[..<64])
+                var p = Vector3()
+                var along = Vector3()
+                var bend = Vector3()
+                var slope = Vector3()
+                for a in 0..<m:
+                    for b in 0..<m:
+                        let x = quads[quad * mm + a * m + b].subtract(origin).multiply_scalar(1.0 / scale)
+                        let fa = b0[a] if half == 0 else b1[a]
+                        let fb = b1[b] if half == 0 else b0[b]
+                        p = p.add(x.multiply_scalar(fa * fb))
+                        along = along.add(x.multiply_scalar((b0[basis_stride + a] * b1[b]) if half == 0 else (b1[a] * b0[basis_stride + b])))
+                        bend = bend.add(x.multiply_scalar((b0[2 * basis_stride + a] * b1[b]) if half == 0 else (b1[a] * b0[2 * basis_stride + b])))
+                        slope = slope.add(x.multiply_scalar((b0[a] * b1[basis_stride + b]) if half == 0 else (b1[basis_stride + a] * b0[b])))
+                let ruling = p.subtract(apex)
+                let n = along.cross(ruling).normalized() catch failure: continue
+                # The slope as along and ruling parts.
+                let aa = along.dot(along)
+                let ar = along.dot(ruling)
+                let rr = ruling.dot(ruling)
+                let det = aa * rr - ar * ar
+                if det <= 0.0: continue
+                let share = (slope.dot(along) * rr - slope.dot(ruling) * ar) / det
+                let d = Vector3(0.0, 1.0, 0.0) if half == 0 else Vector3(1.0, 0.0, 0.0)
+                let uv = Vector3(t, 0.0, 0.0) if half == 0 else Vector3(0.0, t, 0.0)
+                try out.push(ConeStation(quad, uv, d, slope, n, share * share * bend.dot(n)))
+
+## The second solve's rows at `stations`: the slope across held, and the
+## normal part of the second derivative across the cone's curvature in it.
+func cone_rows(rows: Rows*, slots: const Slot[], m: usize, qk: const f64[], count: usize, stations: const ConeStation[]) -> !:
+    var bu: f64[64]
+    var bv: f64[64]
+    let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+    for st in stations:
+        spline_basis_by(qk, st.uv.x, basis_stride, bu[..<64])
+        spline_basis_by(qk, st.uv.y, basis_stride, bv[..<64])
+        for axis in axes:
+            for a in 0..<m:
+                for b in 0..<m: try rows.add(&slots[patch_key(st.quad, a, b, m, count)], st.d.x * bu[basis_stride + a] * bv[b] + st.d.y * bu[a] * bv[basis_stride + b], axis)
+            rows.commit(st.slope.dot(axis), 1e-2)
+        for a in 0..<m:
+            for b in 0..<m: try rows.add(&slots[patch_key(st.quad, a, b, m, count)], st.d.x * st.d.x * bu[2 * basis_stride + a] * bv[b] + st.d.y * st.d.y * bu[a] * bv[2 * basis_stride + b], st.n)
+        rows.commit(st.curvature, 1e5)
 
 ## The quads' weights onto `out` (keyed as corner_patch's points): fixed
 ## where `kinds` says a side or a sweep fixes them (`known`), else fitted
@@ -470,17 +570,24 @@ pub func patch_key(k: usize, a: usize, b: usize, m: usize, count: usize) -> usiz
     if b == m - 1: return (((k + count - 1) % count) * m + m - 1) * m + a
     return (k * m + a) * m + b
 
-## The rule of a side for control point `key` (moved from `base` along
-## its sweep, or in its plane), unless it is fixed. A sweep's rule wins:
-## where a fillet's rows meet a face's, the fillet's lie in the face.
-func set_rule(kinds: Growing[i64]*, bases: Growing[Vector3]*, ways: Growing[Vector3]*, known: Growing[f64]*, key: usize, base: Vector3, weight: f64, side: const HoleSide*):
+## The rule of a side for control point `key` in row `row` beside it
+## (moved from `base` along its sweep, or in its plane; a coned side's
+## first row along its line to `apex`), unless it is fixed. A sweep's rule wins: where a fillet's rows meet a
+## face's, the fillet's lie in the face.
+func set_rule(kinds: Growing[i64]*, bases: Growing[Vector3]*, ways: Growing[Vector3]*, known: Growing[f64]*, key: usize, base: Vector3, weight: f64, side: const HoleSide*, apex: Vector3, row: usize):
     let kind = kinds.items[key]
     if kind == 1 or kind == 2: return
+    # A cone's rows past the first are free: its curvature across is held
+    # by stations (cone_stations), not by them.
+    if side.coned and row >= 2: return
     if kind == 3 and not side.swept: return
     kinds.items[key] = 2 if side.swept else 3
     bases.items[key] = base
     ways.items[key] = side.direction
     known.items[key] = weight
+    if side.coned:
+        # Along its line to the apex (a ruling of the cone).
+        ways.items[key] = base.multiply_scalar(1.0 / weight).subtract(apex).normalized() catch failure: recover side.direction
 
 ## The thin-plate energy of every quad (S_uu^2 + 2 S_uv^2 + S_vv^2 over
 ## its square), weighted lightly: it only chooses among the surfaces the

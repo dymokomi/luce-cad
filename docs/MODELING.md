@@ -39,7 +39,7 @@ does today.
 | `chord_radius(model, references, chord, chain)` | Fusion's Chord Length: the radius whose fillets leave the faces `chord` apart. |
 | `full_round(model, center, tag, continuity, side1, side2)` | Fusion's Full Round Fillet: the flat center face rounded away whole, tangent to it and its sides. |
 | `variable_filleted(model, reference, positions, radii, tag, smooth, continuity, chain, tangency)` | Fusion's Variable radius: one straight edge between flat faces, a tangent chain round a flat face or a loop between curved faces, radii at positions 0 to 1 along it, smooth or straight between, G1 to G3, under a Tangency weight. |
-| `variable_filleted_edges(model, references, radius, variable, positions, radii, counts, tag, continuity, smooth, tangency)` | Constant fillets of `radius` and, in the same feature, variable radius ones on the `variable` edges (one straight edge between flat faces each, edge k's law the next `counts[k]` points), meeting at setback corners at `radius`; a variable edge reaches `radius` at a corner, its law held flat there. |
+| `variable_filleted_edges(model, references, radius, variable, positions, radii, counts, tag, continuity, smooth, tangency)` | Constant fillets of `radius` and, in the same feature, variable radius ones on the `variable` edges (one straight edge between flat faces each, edge k's law the next `counts[k]` points), meeting at setback corners: a straight law runs in as Fusion's (a cone, Fusion's setbacks), any other reaches `radius` there, held flat. |
 | `capped_fillet(model, references, radius, tag, cap, cap_face, flip, continuity, chain)` | Parasolid's caps by faces or sheets: the fillets stop where they meet the surface of `cap`'s face `cap_face`, the part behind it kept (Parasolid's sections, limits and setbacks below). |
 | `filleted_sets(model, sets, radii, tag, continuity, chain)` | Fusion's selection sets in one Fillet: `sets` the sets' edge references apart by `\|`, set k filleted to `radii[k]`; where radii differ at a corner, a setback corner (straight edges between flat faces, built directly; two radii in a miter refused). |
 | `filleted(model, references, radius, tag, continuity, chain, setback, tangency, ..., overflow)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`); with `setback`, Fusion's Setback corner type for G1 corners too; `tangency`, Fusion's Tangency weight (0.1 to 2, 1 the default: Tangency weight below); Parasolid's sections, limits, setbacks and overflow behaviours (below). |
@@ -532,17 +532,33 @@ transition off), read back from its faces in probes 5 to 7 of 2026-10-12 (15 law
 
 **Variable radius at corners** (`variable_corners.lucb`, `CadModeling.variable_filleted_edges`): in
 one feature, constant fillets of a radius and variable ones on straight edges between flat faces,
-each with its own law. The corners are setback corners at the feature's radius (G1 too: a ball's
-sphere would meet a variable B-spline strip tangentially along its end circle, which the booleans
-cannot follow). A variable edge must reach that radius at a corner it runs into (else it is refused,
-naming both radii), and its law is held flat there (its slope 0), as if constant at its end radius
-through the corner: between the setbacks the law spans the edge's stretch. At G1 (Tangency weight 1)
-the strip is the rolled balls' envelope, as Fusion's (`rolled_ball.lucb`); held flat, its end
-section is the corner's circle, and the setback patch takes the strip's own fitted end section as
-that side (`GivenSection`), so the strip ends in the patch's curve exactly. A straight law held flat
-at a corner is no longer taken for a cone (both its slopes are checked). The cube's corner with its
-z edge 2 → 4 into it: 7805.36 at G1, closed, every seam G1 (the scaled circle had made 7805.04).
-At G2 and G3 the section is scaled, as before.
+each with its own law. The corners are setback corners (G1 too: a ball's sphere would meet a variable
+strip tangentially along its end circle, which the booleans cannot follow).
+- **A straight law** (two points) runs into the corner as Fusion's does (probe 18 of 2026-10-13: a 20
+  cube's corner, its x and y edges 4, its z edge's law 1 to 6 into it; Rolling ball and Setback
+  alike): its law the edge's whole, its strip cut where the corner stops it, a cone (its rulings
+  meeting where its radius would be 0; at G1 the rolling ball's, its section's middle weight
+  `rolling_weight`). The fillets stop by the setback rule (`law_setback`) on their true contact
+  lines: a cone's runs to its apex, so the crossings move with its law; the mean takes the law's
+  radius at its farther crossing, and the cone's own stop is measured along its contact line. 2 → 4
+  into a corner of 4: the 4s stop 7.8667 from it, the cone 8.0465 (its radius there 3.195), Fusion's
+  to 1e-3; 2 → 3: 7.6 and 8.1948. The patch's rows beside the cone run along its rulings
+  (`HoleSide.coned`), each point a step of its own: G1 to the cone within thousandths of a degree
+  (Fusion's own patch, measured from its STEP, misses by 0.4 degrees; one step shared by a row is
+  the cone's own net, exact, but only with the face curves' legs taking it too, and the fit then
+  collapsed the rows onto the side); at G2 its second rows free and its curvature across held to the
+  cone's at stations along the side (a second solve, as Fill's quads), within 3% (Fusion's: 150%).
+  Volumes against Fusion's (`variable_corner_tests`): 2 → 4 G1 7808.65 (7811.980), 2 → 3 G1 7824.31
+  (7824.203), 1 → 4 G1 7819.63 (7822.792), 2 → 4 G2 7840.91 (7845.118), 2 → 3 G2 7850.86
+  (7855.757). Where the law's radius at the crossing reaches the others' (2 → 5 or 6 → 4 into a
+  corner of 4), Fusion stops the cone at the others' radius and the others where they cross it (a
+  ball-like corner); ours keeps the setback rule there.
+- **Any other law** must reach the feature's radius at a corner it runs into (else it is refused,
+  naming both radii) and is held flat there (its slope 0), as if constant at its end radius through
+  the corner: between the setbacks the law spans the edge's stretch. At G1 (Tangency weight 1) the
+  strip is the rolled balls' envelope (`rolled_ball.lucb`); held flat, its end section is the
+  corner's circle, and the setback patch takes the strip's own fitted end section as that side
+  (`GivenSection`). At G2 and G3 the section is scaled.
 
 Where the spline would not keep the shape Fusion's own pieces are **not cubics and not decoded**: a
 piece from an open end to a flat run is one universal shape in Fusion (the same on four laws, its
@@ -2590,10 +2606,11 @@ Roughly in order of usefulness:
    there, and a second fillet on an edge running into the first's corner (refused); corners of four
    or more edges where only some are rounded or the faces are not flat.
 2. **Variable radius fillets at corners** beyond straight edges between flat faces
-   (`variable_filleted_edges`; a law may now end at another radius than the feature's, held flat
-   there, the corner an unequal-radius setback corner): chains round faces and loops between curved
-   faces at a corner, and G2 at a variable strip's joint with its corner (the law's bend along it);
-   full rounds of curved ribs whose ends are not flat through the axis.
+   (`variable_filleted_edges`): chains round faces and loops between curved faces at a corner;
+   Fusion's ball-like corner where a straight law's radius at the crossing reaches the others'; G2
+   at a cone's joint with its corner within 3%, not exact; laws other than straight held flat at the
+   corner (the law's bend along the strip); full rounds of curved ribs whose ends are not flat
+   through the axis.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from
    it (beyond rims, ruled walls and sweeps); open chains between two curved faces; open ends where
    the loop turns a sharp corner into an end wall that is not a plane square to the edge (Fusion

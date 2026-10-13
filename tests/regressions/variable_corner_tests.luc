@@ -1,15 +1,17 @@
 ## Variable radius fillets meeting other fillets at a corner in one feature
 ## (the SMLib study's item 10; CadModeling.variable_filleted_edges). A 20
 ## cube's corner at (10, 10, 10): its two edges along x and y rounded 4,
-## its edge along z rounded 2 at z = -10 growing to 4 at the corner. The
-## corner is a setback corner at 4 (G1 ones too), the variable strip's law
-## held flat at the corner so its end section is the corner's own curve.
-## Closed at 32 and 64 divisions, every edge between two faces G1 to 0.5
-## degrees, and the volume between the constant 4's (less taken away) and
-## the constant 2's. A law ending at another radius (2 growing to 3 into a
-## corner of 4, held flat there) makes the corner an unequal-radius setback
-## corner, each fillet its own section: closed, G1 at every edge, and
-## keeping more than the corner of 4 (it was refused before).
+## its edge along z rounded 2 at z = -10 growing to 4 at the corner. A
+## straight law runs into the corner as Fusion's does (probe 18 of
+## 2026-10-13, variable_corners.lucb's law_setback): its strip a cone, the
+## fillets stopping by Fusion's setback rule on their true contact lines
+## (the 4s 7.8667 from the corner, the cone 8.0465: Fusion's to 1e-3), the
+## patch's rows along the cone's rulings (G1 to thousandths of a degree;
+## at G2 its curvature across held to the cone's at stations, within 3%).
+## Closed at 32 and 64 divisions, every edge G1 to 0.5 degrees, the volume
+## between the constant 4's and the constant 2's; Fusion's volumes within
+## 5 (0.06%: 2 to 3 within 0.12; 2 to 4 at G1 3.3 under). A law ending at 3
+## into it: closed, G1 at every edge, keeping more than the corner of 4.
 from luce_cad.modeling import CadModeling
 from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
@@ -68,4 +70,32 @@ pub func variable_corner_tests() -> unit!:
         let to_four = volume(CadModeling.variable_filleted_edges(cube, along_x + ";" + along_y, 4.0, along_z, [0.0, 1.0], [2.0, 4.0], [2], "v", continuity).tessellate(64))
         if not (volume(fine) > four and volume(fine) > to_four - 1.0): print(f"law to 3, G{continuity}: {volume(fine)} against {four} and {to_four}")
         assert(volume(fine) > four and volume(fine) > to_four - 1.0)
-    print("PASS variable fillets at a corner: a cube's corner of two edges rounded 4 and one 2 growing to 4 into it, G1 and G2 (setback corners), closed, G1 at every edge, between the constant 4 and 2; a law ending at 3 into it (an unequal-radius setback corner), G1 and G2")
+    fusion_corners(cube, along_x + ";" + along_y, along_z)
+    print("PASS variable fillets at a corner: a cube's corner of two edges rounded 4 and one 2 growing to 4 into it, G1 and G2 (Fusion's corner: a cone into a setback corner), closed, G1 at every edge, between the constant 4 and 2; a law ending at 3 into it, G1 and G2; Fusion's stops exactly and its volumes within 5")
+
+## Fusion 2705's corners with a straight law running in (probe 18): each
+## strip's stop from the corner, and the volume.
+func fusion_corners(cube: CadModel, constant: str, variable: str) -> unit!:
+    for (a, b, continuity, constant_stop, cone_stop, fusion) in [(2.0, 4.0, 1, 7.8666667, 8.0464846, 7811.980279), (2.0, 3.0, 1, 7.6, 8.1947598, 7824.203018), (1.0, 4.0, 1, 7.8, 8.0546390, 7822.7916),
+                                                                 (2.0, 4.0, 2, 7.8666667, 8.0464846, 7845.1178), (2.0, 3.0, 2, 7.6, 8.1947598, 7855.756608)]:
+        let made = CadModeling.variable_filleted_edges(cube, constant, 4.0, variable, [0.0, 1.0], [a, b], [2], "v", continuity)
+        for f in 0..<made.face_count():
+            if not made.face_name(f).contains("blend["): continue
+            var low = Vector3(100.0, 100.0, 100.0)
+            var high = Vector3(-100.0, -100.0, -100.0)
+            for use in 0..<made.face_edge_count(f):
+                for k in 0..<9:
+                    let p = made.face_edge_point(f, use, float(k) / 8.0)
+                    low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
+                    high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
+            let spread = high.subtract(low)
+            let cone = spread.z > spread.x and spread.z > spread.y
+            let stop = 10.0 - (high.z if cone else (high.x if spread.x > spread.y else high.y))
+            let expected = cone_stop if cone else constant_stop
+            assert(math.abs(stop - expected) < 1e-6, f"{a} to {b} G{continuity}: a strip stops {stop} from the corner, Fusion's {expected}")
+        let coarse = volume(made.tessellate(32))
+        let fine = volume(made.tessellate(64))
+        let v = fine + (fine - coarse) / 3.0
+        assert(math.abs(v - fusion) < 5.0, f"{a} to {b} G{continuity}: {v} against Fusion's {fusion}")
+        let check = CadMeasure.check(made, "", 1, 8, 0.0001, 0.01, 0.5, 1.0, false, 8, false, 1.0, false)
+        assert(check.passed() == check.edge_count(), f"{a} to {b} G{continuity}: {check.summary()}")
