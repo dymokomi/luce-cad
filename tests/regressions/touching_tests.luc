@@ -7,7 +7,13 @@
 ## refused, naming it, never a body that meshes open. A ball touching a box
 ## and two pipes touching at a point stay manifold and are joined. A pipe
 ## grazing a box's top and bottom from inside is refused only where it
-## pinches the box (taken from it).
+## pinches the box (taken from it). A box laid against a G2-rounded box's
+## B-spline strip at its extreme (found exactly, by point-in-solid along the
+## strip's bisector) touches it along a line no curve follows: joined,
+## refused; the box taken away leaves the rounded box; nothing in common.
+## (It failed with "a face piece has no inside to classify": the box's
+## plane crossed the rounded box's top and bottom edges twice a hair apart
+## at their extreme, and the sliver between was a piece.)
 from luce_cad.modeling import CadModeling
 from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
@@ -71,4 +77,44 @@ pub func touching_tests() -> unit!:
     closed(hollowed.tessellate(32))
     near(volume(hollowed.tessellate(32)), 500.0 * pi - inside, 1.0, "box taken from a grazing pipe")
     refused(block, rod, 1, "pipe grazing a box's top and bottom, taken from it")
-    print("PASS touching solids: equal pipes crossing joined at the points they touch (closed, 2πr²l - 16r³/3); touching along a line refused as non-manifold (outside, inside a wall, side by side, a pipe grazing a box's top and bottom taken from it); touching at a point joined; the grazing pipe joined, intersected and hollowed closed")
+    strip_contact()
+    print("PASS touching solids: a box against a G2 strip's extreme, at it and a ten-millionth of the size off either way, refused joined, unchanged taken away, empty in common, and pushed in a thousandth closing every way; equal pipes crossing joined at the points they touch (closed, 2πr²l - 16r³/3); touching along a line refused as non-manifold (outside, inside a wall, side by side, a pipe grazing a box's top and bottom taken from it); touching at a point joined; the grazing pipe joined, intersected and hollowed closed")
+
+## A 20 box with its upright edges rounded G2 (r 5), and a 20 x 30 x 20
+## box turned 45 degrees about y with its face across the diagonal at the
+## strip's extreme, pushed in by `push` (negative: held off).
+func strip_contact() -> unit!:
+    let rbox = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "r")
+    let uprights: list[int] = []
+    for face in 0..<rbox.face_count():
+        for use in 0..<rbox.face_edge_count(face):
+            let a = rbox.face_edge_point(face, use, 0.0)
+            let m = rbox.face_edge_point(face, use, 0.5)
+            let id = rbox.face_edge_id(face, use)
+            if math.abs(a.x - m.x) < 1e-9 and math.abs(a.z - m.z) < 1e-9 and not (id in uprights): uprights.append(id)
+    let rounded = CadModeling.filleted(rbox, CadModeling.edge_references(rbox, uprights), 5.0, "g", 2)
+    # The strip's point on the bisector x = z, by point-in-solid.
+    var low = 0.0
+    var high = 20.0
+    for k in 0..<80:
+        let middle = (low + high) * 0.5
+        if CadModeling.inside(rounded, Vector3(middle, 0.0, middle)): low = middle
+        else: high = middle
+    let reach = low * math.sqrt(2.0)
+    let whole = volume(rounded.tessellate(32))
+    for push in [0.0, 3e-6, -3e-6, 1e-3]:
+        let center = Vector3(1.0, 0.0, 1.0).multiply_scalar((reach - push + 10.0) / math.sqrt(2.0))
+        let tool = placed(CadModeling.tagged(CadSolids.box(20.0, 30.0, 20.0), "t"), center, Vector3(0.0, math.pi / 4.0, 0.0))
+        if push < 1e-4:
+            refused(rounded, tool, 0, f"a box against a G2 strip pushed {push}, joined")
+            let taken = CadModeling.combined(rounded, tool, 1)
+            closed(taken.tessellate(32))
+            near(volume(taken.tessellate(32)), whole, 1e-6, f"a box against a G2 strip pushed {push}, taken away")
+            assert(CadModeling.combined(rounded, tool, 2).face_count() == 0)
+            continue
+        let joined = CadModeling.combined(rounded, tool, 0)
+        let taken = CadModeling.combined(rounded, tool, 1)
+        let common = CadModeling.combined(rounded, tool, 2)
+        for made in [joined, taken, common]: closed(made.tessellate(32))
+        near(volume(joined.tessellate(32)) + volume(common.tessellate(32)), whole + 12000.0, 0.01, "a box pushed into a G2 strip: joined and in common")
+        near(volume(taken.tessellate(32)) + volume(common.tessellate(32)), whole, 0.01, "a box pushed into a G2 strip: taken away and in common")

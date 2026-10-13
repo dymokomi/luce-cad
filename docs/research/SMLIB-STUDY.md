@@ -875,10 +875,23 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   refused as non-manifold even when it closes: a pipe grazing a box's top and bottom from inside,
   taken from it, merged the faces either side of each line and meshed open before. Merged vertices
   meet within the sum of their zones (five tolerances each, or a tolerant entity's precision; a
-  vertex's zone grows to the larger), and a written vertex's precision holds its edges'. Still
-  open: gap repair (a lone vertex squeezed onto its partner before refusing), section precision
-  from the traced deviation, and a B-spline tangency case built exactly (a G2 strip's tangent
-  plane needs the strip's own extreme).
+  vertex's zone grows to the larger), and a written vertex's precision holds its edges'. Then:
+  each traced section's precision is measured (its largest distance from both faces over its
+  stretch), its ends merge within it and its edge keeps it when over the tolerance (every case
+  of §2 measured under 1e-6, so none changed); and a B-spline tangency built exactly: a box laid
+  against a G2 strip at the strip's extreme, found by point-in-solid along its bisector. It
+  failed every way with "a face piece has no inside to classify": the box's plane crossed the
+  rounded box's top and bottom edges twice, a hair apart at their extreme, and the sliver of face
+  between became a piece. A stretch lying on a face's boundary all along (not the same curve) is
+  now a graze, and a curve that leaves no section leaves no cuts. Marching finds no curve where
+  surfaces only touch, so B-spline face pairs with none are searched for contact
+  (`modeling/contact.lucb`: the distance between the surfaces minimized from the nearest seeds of
+  a grid; two minima apart, strictly inside both faces, make a line); a line contact whose two
+  faces are both kept is refused as non-manifold. At the extreme and 3e-6 either way: joined,
+  refused; taken away, the rounded box unchanged; in common, empty. Pushed in 1e-3 every way
+  closes and the volumes add up. Regression: `touching_tests`. Gap repair beyond the zones (a
+  lone vertex squeezed onto a farther partner) is not built: no case needs it once zones hold the
+  traced precision.
 
 - **6, B-spline offsets (part).** A B-spline face's offset is fitted within the tolerance by
   interpolation at the Greville points of the base's knots (each interior breakpoint once more,

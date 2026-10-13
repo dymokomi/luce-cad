@@ -1,0 +1,107 @@
+## B-spline faces that touch another face without crossing it: a plane
+## laid against a rounded box's strip at its extreme, a strip on a strip.
+## Marching finds no curve where two surfaces only touch (nothing changes
+## sign), so the boolean would keep both faces whole and write two bodies
+## pinched together along the line they share. The contact is found where
+## the distance between the surfaces falls to nothing: from the seeds of a
+## 9 x 9 grid over the B-spline's parameters nearest the other surface, the
+## distance is minimized (a minimum is where the normals are parallel), and
+## a minimum within the tolerance strictly inside both faces is a contact.
+## A second minimum from a seed three rows or columns away landing apart
+## from the first makes it a line; else it is a point (a ball resting on a
+## face, a manifold result). Contacts on a face's boundary are left out: a
+## fillet's tool touches the body's faces along its rails by design.
+
+## Contacts between two faces: none, at a point, or along a line.
+let contact_none: i64 = 0
+let contact_point: i64 = 1
+let contact_line: i64 = 2
+
+## How faces `fa` and `fb` touch, when one is a B-spline and no curve
+## where they meet was found.
+func spline_contact(work: Work*, lookup: Lookup*, fa: usize, fb: usize) -> i64!:
+    let w = &work.w
+    let a_spline = w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_spline
+    let spline = fa if a_spline else fb
+    let other = fb if a_spline else fa
+    let s = &w.surfaces.items[(usize)w.faces.items[spline].surface]
+    var gaps: f64[81]
+    var seed = Vector3(0.5, 0.5, 0.0)
+    var best: usize = 0
+    for k in 0..<(usize)81:
+        gaps[k] = try gap_at(w, s, other, seed_uv(k), &seed, true)
+        if gaps[k] < gaps[best]: best = k
+    # Near a contact some seed lies within a sliver of the other surface
+    # (the surfaces part quadratically from it); far off, nothing to find.
+    let near = work.size * 0.01
+    if gaps[best] > near: return contact_none
+    let first = (try settle(work, lookup, s, spline, other, best)) else return contact_none
+    var second: usize = 81
+    for k in 0..<(usize)81:
+        let rows = math.abs((f64)(k // 9) - (f64)(best // 9))
+        let columns = math.abs((f64)(k % 9) - (f64)(best % 9))
+        if math.max(rows, columns) < 3.0 or gaps[k] > near: continue
+        if second == 81 or gaps[k] < gaps[second]: second = k
+    if second == 81: return contact_point
+    let other_point = (try settle(work, lookup, s, spline, other, second)) else return contact_point
+    return contact_line if other_point.subtract(first).length() > work.size * 1e-3 else contact_point
+
+## The point of grid seed `k` (row k // 9, column k % 9).
+func seed_uv(k: usize) -> Vector3:
+    return Vector3(((f64)(k % 9) + 0.5) / 9.0, ((f64)(k // 9) + 0.5) / 9.0, 0.0)
+
+## The point of B-spline `s` (face `spline`) nearest face `other`'s
+## surface from seed `k`, by steps along each parameter halving down to a
+## billionth; when within ten tolerances of it and strictly inside both
+## faces, the contact there.
+func settle(work: Work*, lookup: Lookup*, s: const Surface*, spline: usize, other: usize, k: usize) -> Vector3?!:
+    let w = &work.w
+    var uv = seed_uv(k)
+    var seed = Vector3(0.5, 0.5, 0.0)
+    var gap = try gap_at(w, s, other, uv, &seed, true)
+    var step = 0.5 / 9.0
+    while step > 1e-9 and gap > work.tol:
+        var moved = false
+        for direction in [Vector3(step, 0.0, 0.0), Vector3(-step, 0.0, 0.0), Vector3(0.0, step, 0.0), Vector3(0.0, -step, 0.0)]:
+            let next = uv.add(direction)
+            if next.x < 0.0 or next.x > 1.0 or next.y < 0.0 or next.y > 1.0: continue
+            let g = try gap_at(w, s, other, next, &seed, false)
+            if g < gap:
+                gap = g
+                uv = next
+                moved = true
+        if not moved: step *= 0.5
+    if gap > work.tol * 10.0: return none
+    let p = try evaluate(*s, uv)
+    if try lookup_contains(lookup, w, spline, p, work.tol) != inside_face: return none
+    if try lookup_contains(lookup, w, other, try nearest_on_surface(w, other, p), work.tol) != inside_face: return none
+    return p
+
+## How far the point of `s` at `uv` lies from face `f`'s surface (a
+## B-spline's nearest point found from `seed`, which moves to it, and over
+## the whole surface too when `whole`).
+func gap_at(w: const Shape*, s: const Surface*, f: usize, uv: Vector3, seed: Vector3*, whole: bool) -> f64!:
+    let p = try evaluate(*s, uv)
+    return try surface_gap(w, f, p, seed, whole)
+
+## How far `p` lies from face `f`'s surface: exactly for an analytic one;
+## for a B-spline, from its point nearest `p` searched from `seed` (which
+## moves there), and over the whole surface too when `whole` or that search
+## fails, the nearer kept.
+func surface_gap(w: const Shape*, f: usize, p: Vector3, seed: Vector3*, whole: bool) -> f64!:
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    if s.kind != surface_spline:
+        let (gap, _) = try signed_gap(s, p, w.tolerance)
+        return math.abs(gap)
+    var local = 1e300
+    let near = nearest_parameters(*s, p, *seed, false) catch failure: recover Vector3(-1.0, -1.0, 0.0)
+    if near.x >= 0.0:
+        local = (try evaluate(*s, near)).subtract(p).length()
+        *seed = near
+    if not whole and near.x >= 0.0: return local
+    let found = try nearest_parameters(*s, p, *seed, true)
+    let distance = (try evaluate(*s, found)).subtract(p).length()
+    if distance < local:
+        *seed = found
+        return distance
+    return local

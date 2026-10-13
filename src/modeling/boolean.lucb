@@ -37,11 +37,13 @@ struct Cut:
     var t: f64
 
 ## A new edge: an interval of a carrier between merged vertices, lying
-## across faces fa and fb (fb -1 for one face).
+## across faces fa and fb (fb -1 for one face); `precision`, how far a
+## traced carrier strays from the faces there (0: exact).
 struct Section:
     var edge: ShapeEdge
     var fa: i64
     var fb: i64
+    var precision: f64 = 0.0
 
 ## Original edge `edge`'s pieces lie across face `face` where inside it.
 struct Imprint:
@@ -86,6 +88,9 @@ struct Work:
     var chosen: Growing[bool]
     ## Faces touching along sections (note_tangency).
     var tangencies: Growing[Tangency] = Growing[Tangency]()
+    ## B-spline faces touching another along a line no section follows
+    ## (contact.lucb); `same` unused.
+    var contacts: Growing[Tangency] = Growing[Tangency]()
     ## Each merged vertex's zone: how far from it a point is still it
     ## (the work's own tolerance, or a tolerant entity's precision).
     var zones: Growing[f64] = Growing[f64]()
@@ -99,6 +104,7 @@ struct Work:
         self.imprints.close()
         self.coincident.close()
         self.tangencies.close()
+        self.contacts.close()
         self.zones.close()
         self.finals.close()
         self.piece_ids.close()
@@ -128,9 +134,11 @@ struct Work:
     ## The merged vertex for a new edge's end at `p` across faces `fa` and
     ## `fb`: on a tolerant edge of either it merges within the edge's
     ## precision, so the sections either face makes there (each crossing
-    ## it where its own surface does) meet at one vertex.
-    func section_end(p: Vector3, fa: usize, fb: usize) -> i64!:
-        var slack = 0.0
+    ## it where its own surface does) meet at one vertex; and within the
+    ## section's own precision (`own`, a traced curve's measured distance
+    ## from the faces).
+    func section_end(p: Vector3, fa: usize, fb: usize, own: f64) -> i64!:
+        var slack = own
         for f in [fa, fb]:
             for use in self.w.face_uses(f):
                 let e = edge_index(use)
@@ -368,6 +376,12 @@ func intersect_faces(work: Work*) -> !:
                 try imprint(work, fa, fb)
                 try imprint(work, fb, fa)
                 continue
+            if curves.count == 0:
+                # No curve where a B-spline face meets the other: they may
+                # still touch (contact.lucb).
+                let spline_pair = w.surfaces.items[(usize)sa.surface].kind == surface_spline or w.surfaces.items[(usize)sb.surface].kind == surface_spline
+                if spline_pair and (try spline_contact(work, &lookup, fa, fb)) == contact_line: try work.contacts.push(Tangency(fa, fb, false))
+                continue
             # Where curves of this pair cross each other (two ellipses where
             # equal pipes cross, at the points the pipes touch): one vertex
             # each, which both curves are cut at.
@@ -411,6 +425,9 @@ func intersect_faces(work: Work*) -> !:
                     curve_low = lower(curve_low, q)
                     curve_high = upper(curve_high, q)
                 let curve_pad = curve_high.subtract(curve_low).length() / 64.0 + work.size * 1e-6
+                let cuts_before = work.cuts.count
+                let sections_before = work.sections.count
+                let imprints_before = work.imprints.count
                 for side in 0..<2:
                     let f = fa if side == 0 else fb
                     let other = fb if side == 0 else fa
@@ -430,6 +447,11 @@ func intersect_faces(work: Work*) -> !:
                     if (try w.at(c, t)).subtract(p).length() <= work.tol * 10.0: try ts.push(t)
                 sort.sort(ts.items[..<ts.count])
                 try add_sections(work, &lookup, c, closed, lowest, highest, ts.view(), fa, fb)
+                # A curve that leaves no section (it grazes a face's
+                # boundary, a plane touching a rounded face's edge at its
+                # extreme) leaves no cut either: its crossings would split
+                # the edge into a sliver no section closes.
+                if work.sections.count == sections_before and work.imprints.count == imprints_before: work.cuts.count = cuts_before
 
 ## The points where the `count` curves from carrier `first` on cross one
 ## another, onto `out`: each curve sampled, the other's nearest point found,
@@ -515,7 +537,7 @@ func add_sections(work: Work*, lookup: Lookup*, c: i64, closed: bool, low: f64, 
         if ia == outside or ib == outside or (ia == on_boundary and ib == on_boundary): continue
         # A closed traced curve's stretch may run past its end: wrap it.
         if t1 > high and w.carriers.items[(usize)c].kind == curve_spline:
-            try add_wrapped(work, c, t0, t1, low, high, fa, fb)
+            try add_wrapped(work, c, t0, t1, low, high, fa, fb, try traced_deviation(work, c, fa, fb, t0, t1, low, high))
             continue
         # Along a boundary edge of one face: that edge, cut at the stretch's
         # ends, lies across the other face (no second edge on the same line).
@@ -536,13 +558,42 @@ func add_sections(work: Work*, lookup: Lookup*, c: i64, closed: bool, low: f64, 
                 found = true
                 break
             if found: continue
-        let start = try work.section_end(try w.at(c, t0), fa, fb)
-        let end = try work.section_end(try w.at(c, t1), fa, fb)
+            # Not along an edge but within the tolerance of one all the way:
+            # the faces graze there (a plane at a rounded face's extreme).
+            if try hugs_boundary(work, lookup, c, t0, t1, owner): continue
+        let precision = try traced_deviation(work, c, fa, fb, t0, t1, low, high)
+        let start = try work.section_end(try w.at(c, t0), fa, fb, precision)
+        let end = try work.section_end(try w.at(c, t1), fa, fb, precision)
         # Ends merged into one vertex: nothing between them (a closed curve
         # once around is its own loop).
         if start == end and not (closed and count == 2): continue
-        try work.sections.push(Section(ShapeEdge(c, t0, t1, start, end), (i64)fa, (i64)fb))
+        try work.sections.push(Section(ShapeEdge(c, t0, t1, start, end), (i64)fa, (i64)fb, precision))
         try note_tangency(work, fa, fb, c, t0, t1)
+
+## How far traced curve `c` (a B-spline fitted to where faces `fa` and
+## `fb` meet) strays from their surfaces over t0..t1 (past `high`, from
+## `low` again: a closed curve's stretch through its end): the largest
+## distance at 17 points along it. An exact curve's is 0. It is the
+## section's precision: its ends merge within it, and its edge keeps it.
+func traced_deviation(work: Work*, c: i64, fa: usize, fb: usize, t0: f64, t1: f64, low: f64, high: f64) -> f64!:
+    let w = &work.w
+    if w.carriers.items[(usize)c].kind != curve_spline: return 0.0
+    var deviation = 0.0
+    var seeds = [Vector3(0.5, 0.5, 0.0), Vector3(0.5, 0.5, 0.0)]
+    for k in 0..<17:
+        var t = t0 + (t1 - t0) * (f64)k / 16.0
+        if t > high: t -= high - low
+        let p = try w.at(c, t)
+        for side in 0..<(usize)2: deviation = math.max(deviation, try surface_gap(w, fa if side == 0 else fb, p, &seeds[side], k == 0))
+    return deviation
+
+## Whether stretch t0..t1 of curve `c` lies on face `f`'s boundary within
+## ten tolerances at nine points along it.
+func hugs_boundary(work: Work*, lookup: Lookup*, c: i64, t0: f64, t1: f64, f: usize) -> bool!:
+    for k in 1..<10:
+        let p = try work.w.at(c, t0 + (t1 - t0) * (f64)k / 10.0)
+        if try lookup_contains(lookup, &work.w, f, p, work.tol * 10.0) != on_boundary: return false
+    return true
 
 ## Whether faces `fa` and `fb` touch along section `c` (t0..t1) rather
 ## than cross it, noted as a tangency. At a quarter, half and three quarters
@@ -577,13 +628,13 @@ func note_tangency(work: Work*, fa: usize, fb: usize, c: i64, t0: f64, t1: f64) 
 
 ## A stretch of closed traced curve `c` (parameters low..high) from t0
 ## past its end to t1: two sections meeting at its ends' vertex.
-func add_wrapped(work: Work*, c: i64, t0: f64, t1: f64, low: f64, high: f64, fa: usize, fb: usize) -> !:
+func add_wrapped(work: Work*, c: i64, t0: f64, t1: f64, low: f64, high: f64, fa: usize, fb: usize, precision: f64) -> !:
     let w = &work.w
-    let start = try work.section_end(try w.at(c, t0), fa, fb)
-    let seam = try work.section_end(try w.at(c, high), fa, fb)
-    let end = try work.section_end(try w.at(c, t1 - (high - low)), fa, fb)
-    if start != seam: try work.sections.push(Section(ShapeEdge(c, t0, high, start, seam), (i64)fa, (i64)fb))
-    if seam != end: try work.sections.push(Section(ShapeEdge(c, low, t1 - (high - low), seam, end), (i64)fa, (i64)fb))
+    let start = try work.section_end(try w.at(c, t0), fa, fb, precision)
+    let seam = try work.section_end(try w.at(c, high), fa, fb, precision)
+    let end = try work.section_end(try w.at(c, t1 - (high - low)), fa, fb, precision)
+    if start != seam: try work.sections.push(Section(ShapeEdge(c, t0, high, start, seam), (i64)fa, (i64)fb, precision))
+    if seam != end: try work.sections.push(Section(ShapeEdge(c, low, t1 - (high - low), seam, end), (i64)fa, (i64)fb, precision))
 
 ## Face `onto` and coincident face `source`: where `source`'s boundary
 ## crosses `onto`'s, both cut; `source`'s boundary inside `onto` imprints it.

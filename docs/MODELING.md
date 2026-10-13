@@ -331,9 +331,17 @@ This is OpenCASCADE's General Fuse structure, in a lean form:
    non-manifold. So does a result whose edges are each used twice but where a kept face passes
    through one of them (no thickness there), one whose kept faces both reach such a contact (their
    pieces either side merged, it closes but is pinched to nothing there), and one whose only open
-   edges are such four-face edges. Vertices merge within the sum of their zones: five tolerances
-   each, or a tolerant edge's or vertex's precision; a written vertex's precision holds its edges'.
-   Coincident faces imprint each other's boundaries.
+   edges are such four-face edges. A B-spline face and another that meet in no curve may still
+   touch (marching finds nothing where nothing changes sign): `contact.lucb` minimizes the distance
+   between their surfaces from the nearest seeds of a grid over the B-spline, and two minima apart,
+   within the tolerance and strictly inside both faces, are a line contact; when both faces are
+   kept the result is refused the same way (a box laid against a rounded box's strip, joined). A
+   curve stretch lying on a face's boundary all along without being its edge is a graze, no
+   section; a curve that leaves no section leaves no cuts on the edges it crossed. Vertices merge
+   within the sum of their zones: five tolerances each, a tolerant edge's or vertex's precision,
+   or a traced section's (its largest distance from both faces over its stretch, which its edge
+   keeps when over the tolerance); a written vertex's precision holds its edges'. Coincident faces
+   imprint each other's boundaries.
 4. **Shared edges.** Edges are cut at every crossing. Pieces with the same ends and middle are one
    edge, so the faces on both sides share it.
 5. **Face splitting.** Each face is split by tracing (`split.lucb`). From each half-edge, the trace
@@ -2144,7 +2152,8 @@ Roughly in order of usefulness:
 7. **Profiles on faces:** a sketch's plane from a picked face, kept by name.
 8. **Non-manifold results:** bodies touching along a line or a face (a box and a pipe lying on
    it, joined; a pipe inside a box touching its wall, subtracted; a pipe grazing a box's top and
-   bottom, taken from it) are refused as non-manifold.
+   bottom, taken from it; a box laid against a B-spline strip, found by `modeling/contact.lucb`
+   since no curve follows a touch) are refused as non-manifold.
 9. **Offsets where faces vanish or reconnect** (a shell thicker than a fillet's radius), B-spline
    offsets of other than profiles swept straight past their surfaces' ends (no extension yet), and
    draft; Delete healing several faces at once beside curved faces
