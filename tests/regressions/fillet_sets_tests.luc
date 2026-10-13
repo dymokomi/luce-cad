@@ -1,0 +1,90 @@
+## Fillets of several edge sets in one feature, each its own radius
+## (Fusion's selection sets; CadModeling.filleted_sets, fillet_sets.lucb).
+## A cube's corner with its edges in sets of 2, 3 and 4: a setback corner
+## whose patch meets each fillet's own section, G1 (rational) and G2,
+## closed and continuous at every seam; its volume between the corner's
+## all at 4 and all at 2, and sets of one radius the plain fillet. A
+## rectangular pyramid's apex in two sets. Two radii meeting in a miter:
+## refused by name.
+from luce_cad.modeling import CadModeling
+from luce_cad.model import CadModel
+from luce_cad.solids import CadSolids
+from luce_cad.measure import CadMeasure
+from luce_geocore.geocore import Vector3
+from checks import closed, volume
+from luce_std import math
+
+## The ids of `model`'s edges whose ends `keep` takes.
+func edges_where(model: CadModel, keep: func(Vector3, Vector3) -> bool) -> list[int]!:
+    let found: list[int] = []
+    for face in 0..<model.face_count():
+        for use in 0..<model.face_edge_count(face):
+            let id = model.face_edge_id(face, use)
+            if keep(model.face_edge_point(face, use, 0.0), model.face_edge_point(face, use, 1.0)) and not (id in found):
+                found.append(id)
+    return found
+
+## The reference of `model`'s edge from `a` to `b` (either way).
+func edge(model: CadModel, a: Vector3, b: Vector3) -> str!:
+    let between = func (p: Vector3, q: Vector3) -> bool:
+        return (p.subtract(a).length() < 1e-6 and q.subtract(b).length() < 1e-6) or (p.subtract(b).length() < 1e-6 and q.subtract(a).length() < 1e-6)
+    let found = edges_where(model, between)
+    assert(found.length == 1)
+    return CadModeling.edge_references(model, found)
+
+pub func fillet_sets_tests() -> unit!:
+    let cube = CadModeling.tagged(CadSolids.box(20.0, 20.0, 20.0), "c")
+    let corner = Vector3(10.0, 10.0, 10.0)
+    let ex = edge(cube, Vector3(-10.0, 10.0, 10.0), corner)
+    let ey = edge(cube, Vector3(10.0, -10.0, 10.0), corner)
+    let ez = edge(cube, Vector3(10.0, 10.0, -10.0), corner)
+    let sets = ex + "|" + ey + "|" + ez
+    for continuity in [1, 2]:
+        let made = CadModeling.filleted_sets(cube, sets, [2.0, 3.0, 4.0], "s", continuity)
+        let coarse = made.tessellate(32)
+        let fine = made.tessellate(64)
+        closed(coarse)
+        closed(fine)
+        assert(math.abs(volume(fine) - volume(coarse)) < 0.05)
+        let check = CadMeasure.check(made, "", continuity, 8, 0.0001, 0.5, 0.5, 1.0, false, 8, false, 1.0, false)
+        if check.passed() != check.edge_count(): print(f"corner of 2, 3 and 4, G{continuity}: {check.summary()}")
+        assert(check.passed() == check.edge_count())
+        let big = volume(CadModeling.filleted(cube, ex + ";" + ey + ";" + ez, 4.0, "s", continuity).tessellate(64))
+        let small = volume(CadModeling.filleted(cube, ex + ";" + ey + ";" + ez, 2.0, "s", continuity).tessellate(64))
+        assert(volume(fine) > big and volume(fine) < small)
+        # Sets of one radius: the plain fillet.
+        let same = CadModeling.filleted_sets(cube, sets, [4.0, 4.0, 4.0], "s", continuity)
+        assert(math.abs(volume(same.tessellate(32)) - volume(CadModeling.filleted(cube, ex + ";" + ey + ";" + ez, 4.0, "s", continuity).tessellate(32))) < 1e-9)
+    # A rectangular pyramid's apex: its long sides' edges 1, the others 1.5.
+    let pyramid = oblong_pyramid()
+    let apex = Vector3(0.0, 15.0, 0.0)
+    let front = edge(pyramid, apex, Vector3(10.0, 0.0, 6.0)) + ";" + edge(pyramid, apex, Vector3(-10.0, 0.0, 6.0))
+    let back = edge(pyramid, apex, Vector3(10.0, 0.0, -6.0)) + ";" + edge(pyramid, apex, Vector3(-10.0, 0.0, -6.0))
+    let tipped = CadModeling.filleted_sets(pyramid, front + "|" + back, [1.0, 1.5], "a", 2)
+    closed(tipped.tessellate(32))
+    let check = CadMeasure.check(tipped, "", 2, 8, 0.0001, 0.5, 0.5, 1.0, false, 8, false, 1.0, false)
+    if check.passed() != check.edge_count(): print(f"pyramid apex of 1 and 1.5: {check.summary()}")
+    assert(check.passed() == check.edge_count())
+    # Two radii in a miter (the upright between them left sharp): refused.
+    var refused = ""
+    _ = CadModeling.filleted_sets(cube, ex + "|" + ey, [2.0, 3.0], "m", 1) catch failure:
+        refused = failure.message
+        recover cube
+    assert(refused.contains("miter"))
+    print("PASS fillet sets: a cube's corner of 2, 3 and 4 (a setback corner, G1 rational and G2), closed and continuous, between all 4 and all 2; sets of one radius the plain fillet; a pyramid's apex of 1 and 1.5; two radii in a miter refused")
+
+## A pyramid over a 20 by 12 base at y = 0, its apex at y = 15.
+func oblong_pyramid() -> CadModel!:
+    var made = CadModeling.tagged(CadSolids.box(20.0, 15.0, 12.0), "py").transformed(Vector3(0.0, 7.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    let alpha = math.atan2(10.0, 15.0)
+    let beta = math.atan2(6.0, 15.0)
+    let cuts = [(Vector3(10.0, 0.0, 0.0), Vector3(math.cos(alpha), math.sin(alpha), 0.0), Vector3(0.0, 0.0, alpha)),
+                (Vector3(-10.0, 0.0, 0.0), Vector3(-math.cos(alpha), math.sin(alpha), 0.0), Vector3(0.0, 0.0, -alpha)),
+                (Vector3(0.0, 0.0, 6.0), Vector3(0.0, math.sin(beta), math.cos(beta)), Vector3(-beta, 0.0, 0.0)),
+                (Vector3(0.0, 0.0, -6.0), Vector3(0.0, math.sin(beta), -math.cos(beta)), Vector3(beta, 0.0, 0.0))]
+    var k = 0
+    for (at, out, turn) in cuts:
+        let block = CadModeling.tagged(CadSolids.box(60.0, 60.0, 60.0), f"c{k}").transformed(at.add(out.multiply_scalar(30.0)), turn, Vector3(1.0, 1.0, 1.0))
+        made = CadModeling.combined(made, block, 1)
+        k += 1
+    return made

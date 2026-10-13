@@ -89,10 +89,19 @@ func plan_corner(b: Local*, v: i64) -> CornerPlan!:
         try set_end(b, sa, v, plan.plane, plan.offset)
         try set_end(b, sb, v, plan.plane, plan.offset)
         return plan
-    if b.continuity == 1:
-        # Three G1 fillets meet in a ball; four or more where one touches
-        # every face (inside, the ball's planes move out into the air).
-        let radius = b.radius if convex_count > 0 else -b.radius
+    # Each chosen edge's radius here (a feature's may differ edge by edge).
+    var radii: f64[8] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    var largest = 0.0
+    var same_radius = true
+    for k in 0..<plan.count:
+        radii[k] = b.strips.items[(usize)b.strip_of.items[plan.chosen[k]]].radius
+        largest = math.max(largest, radii[k])
+        same_radius = same_radius and radii[k] == radii[0]
+    if b.continuity == 1 and same_radius:
+        # Three G1 fillets of one radius meet in a ball; four or more where
+        # one touches every face (inside, the ball's planes move out into
+        # the air). Unequal radii meet at a setback corner.
+        let radius = radii[0] if convex_count > 0 else -radii[0]
         var center = Vector3(1e300, 0.0, 0.0)
         if plan.count == 3: center = try ball_center(w, v, radius)
         else:
@@ -108,8 +117,8 @@ func plan_corner(b: Local*, v: i64) -> CornerPlan!:
                 try set_end(b, s, v, along, along.dot(plan.center))
             return plan
     plan.kind = 4
-    plan.setback = try setback_at(w, v, plan.chosen[..<plan.count], b.radius, convex_count == 0)
-    if plan.count > 3: try roomy_setback(w, &plan.setback, b.radius, b.continuity)
+    plan.setback = try setback_at(w, v, plan.chosen[..<plan.count], largest, convex_count == 0, radii[..<plan.count])
+    if plan.count > 3 or not same_radius: try roomy_setback(w, &plan.setback, largest, b.continuity)
     for i in 0..<plan.count:
         let s = (usize)b.strip_of.items[plan.setback.edges[i]]
         let way = plan.setback.ways[i]
@@ -226,7 +235,7 @@ func section_middle(b: const Local*, strip: const Strip*, n: Vector3, h: f64) ->
     let ub = strip.intos[1]
     let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
     let bisector = try ua.add(ub).normalized()
-    var middle = strip.origin.add(bisector.multiply_scalar(b.radius / math.sin(angle * 0.5) - b.radius))
+    var middle = strip.origin.add(bisector.multiply_scalar(strip.radius / math.sin(angle * 0.5) - strip.radius))
     if b.continuity > 1:
         var section = Growing[Vector3]()
         defer section.close()
@@ -246,12 +255,14 @@ func make_ball(b: Local*, plan: const CornerPlan*, tag: str) -> !:
     let n = plan.count
     let first = (usize)b.strip_of.items[plan.chosen[0]]
     let sign = 1.0 if b.strips.items[first].convex else -1.0
+    # (The strips here are of one radius: plan_corner.)
+    let radius = b.strips.items[first].radius
     # The ball touches each face at one point.
     var faces = Growing[usize]()
     defer faces.close()
     try corner_faces(b, v, &faces)
     var touches: i64[8] = [0, 0, 0, 0, 0, 0, 0, 0]
-    for k in 0..<faces.count: touches[k] = try b.new_point(c.add(face_outward(w, faces.items[k]).multiply_scalar(sign * b.radius)))
+    for k in 0..<faces.count: touches[k] = try b.new_point(c.add(face_outward(w, faces.items[k]).multiply_scalar(sign * radius)))
     var sections: usize[8] = [0, 0, 0, 0, 0, 0, 0, 0]
     for k in 0..<n:
         let s = (usize)b.strip_of.items[plan.chosen[k]]
@@ -261,7 +272,7 @@ func make_ball(b: Local*, plan: const CornerPlan*, tag: str) -> !:
                 if faces.items[j] == b.strips.items[s].faces[side]: b.strips.items[s].contacts[end * 2 + side] = touches[j]
         let a = b.strips.items[s].contacts[end * 2]
         let z = b.strips.items[s].contacts[end * 2 + 1]
-        let arc = try b.arc(a, z, c, b.radius)
+        let arc = try b.arc(a, z, c, radius)
         let uses: i64[1] = [arc + 1]
         sections[k] = try b.chain(a, z, uses[..<1])
         b.strips.items[s].sections[end] = (i64)sections[k]
@@ -287,7 +298,7 @@ func make_ball(b: Local*, plan: const CornerPlan*, tag: str) -> !:
     let pole = try middle.normalized()
     var empty_points: Vector3[]
     var empty_numbers: f64[]
-    try b.out.surfaces.push(try Surface(4, c, try across(pole), pole, b.radius, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+    try b.out.surfaces.push(try Surface(4, c, try across(pole), pole, radius, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
     b.name.clear()
     try corner_name(w, (usize)v, tag, &b.name)
     try b.extras.push(Extra((i64)b.out.surfaces.count - 1, sign > 0.0, try b.out.add_name((str)b.name.view()), b.store.count, loop.count))
@@ -306,17 +317,19 @@ func make_setback(b: Local*, plan: const CornerPlan*, tag: str) -> !:
     var quad_weights = Growing[f64]()
     defer quad_weights.close()
     let p = w.points.items[(usize)v]
+    var largest = 0.0
+    for i in 0..<n: largest = math.max(largest, b.strips.items[(usize)b.strip_of.items[corner.edges[i]]].radius)
     # Fitted once per corner when a plan keeps patches; scaled after (G2
     # and G3, whose weights are all 1; a G1 corner's quads are rational).
     var kept = false
     if b.continuity > 1:
-        if let cache = b.patches: kept = try cache.scaled(v, p, b.radius, &quads, &knots)
+        if let cache = b.patches: kept = try cache.scaled(v, p, largest, &quads, &knots)
     if kept: try quad_weights.fill(quads.count, 1.0)
     else:
-        try setback_patch(w, corner, b.radius, b.continuity, &quads, &quad_weights, &knots, b.blend_shape)
+        try setback_patch(w, corner, largest, b.continuity, &quads, &quad_weights, &knots, b.blend_shape)
         if b.continuity > 1:
-            if let cache = b.patches: try cache.keep(v, p, b.radius, quads.view(), knots.view())
-    let frame = try setback_frame(w, corner, b.radius)
+            if let cache = b.patches: try cache.keep(v, p, largest, quads.view(), knots.view())
+    let frame = try setback_frame(w, corner, largest)
     let m = knots.count - 6
     let mm = m * m
     var reversed = Growing[f64]()

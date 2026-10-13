@@ -38,6 +38,8 @@ struct Strip:
     var lines: i64[2]
     var surface: i64
     var sense: bool
+    ## Its fillet's radius (one feature's may differ edge by edge).
+    var radius: f64
 
 ## A run of out edges from point `head` to point `tail`: uses[first..<first
 ## + count] in the builder's store, signed as they run that way.
@@ -224,12 +226,16 @@ struct Local:
 ## directly; none when the body or the edges are beyond what this builds
 ## (the booleans then do it). `patches` keeps setback patches between
 ## radii, when given.
-pub func local_blend(w: const Shape*, chosen: const usize[], radius: f64, continuity: i64, tag: str, patches: PatchCache*? = none, blend_shape: BlendShape = plain_blend) -> interop.Reference[CadModel]?!:
+pub func local_blend(w: const Shape*, chosen: const usize[], radius: f64, continuity: i64, tag: str, patches: PatchCache*? = none, blend_shape: BlendShape = plain_blend, radii: (const f64[])? = none) -> interop.Reference[CadModel]?!:
     var made = try new_local(w, radius, continuity, patches, blend_shape)
     defer made.close()
     let b = &made
     if not try eligible(b, chosen): return none
-    for e in chosen: try begin_strip(b, e)
+    # Each edge its own radius (`radii`, one per chosen edge), or `radius`.
+    for at in 0..<chosen.length:
+        var own = radius
+        if let given = radii: own = given[at]
+        try begin_strip(b, chosen[at], own)
     # Each corner: where its strips stop, then the strip surfaces (their
     # extent known), then the corner's curves and faces.
     var corners = Growing[i64]()
@@ -355,8 +361,8 @@ func vertex_faces(b: const Local*, v: i64) -> usize[3]!:
     if faces.count != 3: error(invalid, "a corner needs three faces")
     return [faces.items[0], faces.items[1], faces.items[2]]
 
-## Edge `e`'s strip: its frame, its ends still open.
-func begin_strip(b: Local*, e: usize) -> !:
+## Edge `e`'s strip of `radius`: its frame, its ends still open.
+func begin_strip(b: Local*, e: usize, radius: f64) -> !:
     let w = b.w
     let (fa, fb) = faces_of(b, e)
     let edge = w.edges.items[e]
@@ -365,8 +371,8 @@ func begin_strip(b: Local*, e: usize) -> !:
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     let angle = math.acos(math.clamp(ua.dot(ub), -1.0, 1.0))
-    let strip = Strip(e, [fa, fb], [ua, ub], along, origin, b.radius / math.tan(angle * 0.5), try convex(w, e),
-                      [Vector3(), Vector3()], [0.0, 0.0], [-1, -1, -1, -1], [-1, -1], [-1, -1], -1, true)
+    let strip = Strip(e, [fa, fb], [ua, ub], along, origin, radius / math.tan(angle * 0.5), try convex(w, e),
+                      [Vector3(), Vector3()], [0.0, 0.0], [-1, -1, -1, -1], [-1, -1], [-1, -1], -1, true, radius)
     b.strip_of.items[e] = (i64)b.strips.count
     try b.strips.push(strip)
 
@@ -403,9 +409,9 @@ func strip_surface(b: Local*, s: usize) -> !:
             low = math.min(low, at)
             high = math.max(high, at)
     if b.continuity == 1:
-        let axis = strip.origin.add(bisector.multiply_scalar(b.radius / math.sin(angle * 0.5)))
+        let axis = strip.origin.add(bisector.multiply_scalar(strip.radius / math.sin(angle * 0.5)))
         let x = try contact_at(&strip, 0, 0.0).subtract(axis).normalized()
-        try b.out.surfaces.push(try Surface(1, axis, x, strip.along, b.radius, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
+        try b.out.surfaces.push(try Surface(1, axis, x, strip.along, strip.radius, 0.0, empty_points, empty_numbers, empty_numbers, empty_numbers, 0, 0, 0, 0))
         b.strips.items[s].surface = (i64)b.out.surfaces.count - 1
         b.strips.items[s].sense = strip.convex
         return
@@ -447,17 +453,17 @@ func plane_section(b: Local*, strip: const Strip*, n: Vector3, h: f64, a: i64, z
     let bisector = try ua.add(ub).normalized()
     let crossing = n.dot(strip.along)
     if b.continuity == 1:
-        let axis = strip.origin.add(bisector.multiply_scalar(b.radius / math.sin(angle * 0.5)))
+        let axis = strip.origin.add(bisector.multiply_scalar(strip.radius / math.sin(angle * 0.5)))
         let center = axis.add(strip.along.multiply_scalar((h - n.dot(axis)) / crossing))
         var id: i64 = 0
         if math.abs(math.abs(crossing) - 1.0) < 1e-12:
-            id = try b.arc(a, z, center, b.radius)
+            id = try b.arc(a, z, center, strip.radius)
         else:
             # The minor axis lies in the plane across the edge; the major
             # along the plane's steepest way, longer by 1 / |cos|.
             let minor = try n.cross(strip.along).normalized()
             let major = try minor.cross(n).normalized()
-            id = try b.elliptic(a, z, center, major, minor, b.radius / math.abs(crossing), b.radius)
+            id = try b.elliptic(a, z, center, major, minor, strip.radius / math.abs(crossing), strip.radius)
         let uses: i64[1] = [id + 1]
         return try b.chain(a, z, uses[..<1])
     var section = Growing[Vector3]()

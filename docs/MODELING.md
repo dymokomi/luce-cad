@@ -40,6 +40,7 @@ does today.
 | `full_round(model, center, tag, continuity, side1, side2)` | Fusion's Full Round Fillet: the flat center face rounded away whole, tangent to it and its sides. |
 | `variable_filleted(model, reference, positions, radii, tag, smooth, continuity, chain, tangency)` | Fusion's Variable radius: one straight edge between flat faces, a tangent chain round a flat face or a loop between curved faces, radii at positions 0 to 1 along it, smooth or straight between, G1 to G3, under a Tangency weight. |
 | `variable_filleted_edges(model, references, radius, variable, positions, radii, counts, tag, continuity, smooth, tangency)` | Constant fillets of `radius` and, in the same feature, variable radius ones on the `variable` edges (one straight edge between flat faces each, edge k's law the next `counts[k]` points), meeting at setback corners at `radius`; a variable edge reaches `radius` at a corner, its law held flat there. |
+| `filleted_sets(model, sets, radii, tag, continuity, chain)` | Fusion's selection sets in one Fillet: `sets` the sets' edge references apart by `\|`, set k filleted to `radii[k]`; where radii differ at a corner, a setback corner (straight edges between flat faces, built directly; two radii in a miter refused). |
 | `filleted(model, references, radius, tag, continuity, chain, setback, tangency)` | The referenced edges filleted to `radius`: G1 (circular, `1`), G2 (`2`) or G3 (`3`); with `setback`, Fusion's Setback corner type for G1 corners too; `tangency`, Fusion's Tangency weight (0.1 to 2, 1 the default: Tangency weight below). |
 | `rule_edges(model, rounds, fillets, faces, others)` | Fusion's Rule Fillet (`rules.lucb`): references to the blendable edges a rule takes, convex ones (rounds), concave ones (fillets) or both; with `faces` named, only edges on those faces, and with `others` too, only edges between the two sets. Made again on every cook, the edges follow the body. |
 | `chamfered_sides(model, references, distance, second, angle, tag, chain, flip)` | Fusion's Two distances (`second` along the other face) and Distance and angle (`second` 0: leaving the first face at `angle`) chamfers (`chamfers.lucb`). The first face of each edge is the one more of the chosen edges lie on (a loop's own face), a tie by name; `flip` swaps. Every edge Equal distance takes (loops round a flat face, rims, curved faces, inside edges); each distance runs straight from the edge to the chamfer's contact in the plane square to the edge (`chamfers.lucb`). |
@@ -1083,6 +1084,13 @@ within 0.01 (`fusion_probe_tests`); G3 closes too.
   leave the corner. Every edge of a convex polyhedron rounded at once (`rounded.lucb`, the solid
   shrunk and grown back by a ball) declines where no ball fits a vertex, and the edges are then
   rounded one by one with such corners.
+- **Edge sets of different radii** in one feature (`CadModeling.filleted_sets`, Fusion's selection
+  sets, `fillet_sets.lucb`): each set's edges take its radius, and where radii differ at a corner of
+  three or more fillets it is a setback corner, G1 too (rational), each fillet's contact distance and
+  end section its own and the patch's face curves running from each contact to its neighbor's. Built
+  directly; two radii meeting in a miter are refused (their sections are not one curve), as is
+  anything the direct build declines. A 20 cube's corner with its edges in sets of 2, 3 and 4: closed,
+  every seam G1 (G2) to 0.5°, 7867.26 at G1 and 7893.97 at G2 extrapolated, in 13 ms.
 - **Inside corners** work the same way, mirrored: the ball rolls in the air, on the faces' planes
   moved out by the radius, and the corner tool adds material around it. A pocket's floor edges meet
   in miters; with its walls' edges too, its corners are balls.
@@ -2343,9 +2351,10 @@ Not yet: ellipses, splines, slots and text; curvature (G2) constraints; Blend Cu
 
 Roughly in order of usefulness:
 
-1. **Unequal radii at a corner** (one feature has one radius; a second fillet on an edge running
-   into the first's corner is refused), and corners of four or more edges where only some are
-   rounded or the faces are not flat.
+1. **Unequal radii at a corner** beyond one feature's edge sets on straight edges between flat
+   faces (`CadModeling.filleted_sets`: setback corners): two radii meeting in a miter, curved faces
+   there, and a second fillet on an edge running into the first's corner (refused); corners of four
+   or more edges where only some are rounded or the faces are not flat.
 2. **Variable radius fillets at corners** beyond straight edges between flat faces meeting at a
    corner of the feature's own radius (`variable_filleted_edges`: a law that changes into the corner,
    or chains round faces, or a G1 rolled-ball envelope there: its G1 section is the scaled circle),

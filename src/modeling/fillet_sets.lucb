@@ -1,0 +1,51 @@
+## Fillets of several edge sets in one feature, each set its own radius
+## (Fusion's selection sets in one Fillet). Where sets of different radii
+## meet at a corner, the corner is a setback one (setback.lucb), each
+## fillet's end section its own and the patch's sides from each contact
+## to its neighbor's; at a corner of one radius, as the direct build
+## makes it (a ball or a setback). Built directly (local_blend.lucb) for
+## straight edges between flat faces; what that declines (two radii in a
+## miter, curved faces at a corner) is refused by name: one feature's
+## booleans take one radius.
+
+## `model`'s edge sets `sets` (edge references, the sets apart by `|`)
+## filleted at `continuity`, set k to `radii[k]`. With `chain`, each
+## edge brings the edges continuing it tangentially, at its radius.
+func filleted_sets(model: const CadModel*, sets: str, radii: const f64[], tag: str, continuity: i64, chain: bool) -> interop.Reference[CadModel]!:
+    if continuity < 1 or continuity > 3: error(invalid, "a fillet's continuity is G1, G2 or G3")
+    var w = try shape_of(model)
+    defer w.close()
+    var chosen = Growing[usize]()
+    defer chosen.close()
+    var sizes = Growing[f64]()
+    defer sizes.close()
+    var edges = Growing[usize]()
+    defer edges.close()
+    let bytes = sets.bytes
+    var start: usize = 0
+    var set: usize = 0
+    for at in 0..<bytes.length + 1:
+        if at < bytes.length and bytes[at] != 124: continue
+        if set >= radii.length: error(invalid, "each edge set of a fillet needs its radius")
+        let radius = radii[set]
+        if not math.is_finite(radius) or radius <= 0.0: error(invalid, "a blend needs a positive size")
+        edges.clear()
+        try choose_edges(&w, trimmed((str)bytes[start..<at]), chain, &edges)
+        for e in edges.view():
+            var known = false
+            for k in 0..<chosen.count:
+                if chosen.items[k] != e: continue
+                known = true
+                if sizes.items[k] != radius: error(invalid, "an edge is in two fillet sets of different radii")
+            if known: continue
+            try check_fits(&w, e, radius, true)
+            try chosen.push(e)
+            try sizes.push(radius)
+        start = at + 1
+        set += 1
+    if set != radii.length: error(invalid, "each edge set of a fillet needs its radius")
+    var same_radius = true
+    for size in sizes.view(): same_radius = same_radius and size == sizes.items[0]
+    if same_radius: return try blend_chosen(model, &w, chosen.view(), false, sizes.items[0], true, tag, continuity, true, none)
+    if let made = try local_blend(&w, chosen.view(), sizes.items[0], continuity, tag, none, plain_blend, sizes.view()): return made
+    error(invalid, "fillets of different radii are built where each is a straight edge between flat faces and they meet at corners of three or more of them (or end at a face); where two meet in a miter, or faces at a corner are curved, give them one radius")

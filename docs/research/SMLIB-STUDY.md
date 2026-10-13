@@ -951,9 +951,12 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   no face over 13,300 (`apex_tests`'s lean_corners bounds them, and the time). F7pre and F7 moved
   with the rows on their pipes: 3431.0205 to 3431.0217 (exact 3431.022), 3433.1636 to 3433.1688
   (SMLib 3433.167). Stage 7's Fill was not used: it lives in surfacing, above modeling, and gives a
-  trimmed face with tolerant edges where these quads meet the fillets exactly. Still open:
-  unequal radii (one feature has one radius; a second fillet into the first's corner is
-  refused), mixed convexity at N edges.
+  trimmed face with tolerant edges where these quads meet the fillets exactly. Then unequal
+  radii: one feature's edge sets each of its own radius (`CadModeling.filleted_sets`, Fusion's
+  selection sets) meet at setback corners, each fillet's contact distance and end section its own
+  (`Setback.radii`). A 20 cube's corner of 2, 3 and 4: closed, every seam G1 (G2) to 0.5°, G1
+  7867.26 and G2 7893.97 extrapolated, 13 ms (`fillet_sets_tests`). Still open: two radii in a
+  miter, a second fillet into the first's corner (refused), mixed convexity at N edges.
 
 - **8, overflow by rail classification (part).** The same-convexity case: a fillet on a straight
   edge between planes that runs off one face over a parallel convex edge into a flat face is trimmed
