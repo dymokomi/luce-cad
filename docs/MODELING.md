@@ -2204,7 +2204,11 @@ Roughly in order of usefulness:
    than the corners it finds), and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face and strips apart (adjacent strips of a curved chain, healing by
    extended neighbors' arrangement).
-10. **Long strips and narrow corners in meshes:** a hole's wall meshed as one row of strips from
+10. **Dense meshes on B-spline fillet strips of setback corners at slanted edges:** a rectangular
+   pyramid's apex edges rounded 1 (G1, setback corners) mesh each strip with 3,477 triangles at 8
+   divisions and 216,000 at 64 (a cube's setback strips: 5,376 at 32); its patch quads 8,000 to
+   33,000 at 32.
+11. **Long strips and narrow corners in meshes:** a hole's wall meshed as one row of strips from
    its floor to its rim, and a floor as strips across it, are long by design (aspects in the
    hundreds to thousands); an extremum of a trim between two crossings keeps both crossings; a
    rim meeting another trim at under a few degrees fills with a flat triangle. Needles where shared

@@ -931,7 +931,10 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   pyramid's apex alone, G1 and G2: closed, every edge between two faces G1 to 0.5° (angle
   0.0000°, the G2 corner's curvature to 0.003%); every edge rounded: G1 1152.586, G2 1154.428 at
   64 divisions (32: 1152.578, 1154.425); the square pyramid's apex G2 1993.82 (its G1 a ball,
-  1991.93). Stage 7's Fill was not used: it lives in surfacing, above modeling, and gives a
+  1991.93). SMLib (its corner a G1 approximation): apex 1189.95 (ours 1188.73 at 32), every edge
+  1153.92 (ours 1152.59), 10 and 18 faces against our 17 and 25. Our strips beside the setback
+  corners mesh far too finely (54,000 triangles each at 32 divisions; MODELING.md Limits 10), and
+  every edge takes 2 s against SMLib's 30 ms. Stage 7's Fill was not used: it lives in surfacing, above modeling, and gives a
   trimmed face with tolerant edges where these quads meet the fillets exactly. Still open:
   unequal radii (one feature has one radius; a second fillet into the first's corner is
   refused), mixed convexity at N edges.
@@ -943,7 +946,8 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   4.5: 1513.17902); SMLib fails it. Regression: `overflow_tests`. Then the cliff: over a concave
   edge the tool reached into the ledge below; it is now cut back to the ledge's plane, which covers
   the fillet's end. A plate on a ledge (2400) rounded 5 and 4.5: 2293.3706 and 2313.1775
-  extrapolated, the section integral's 2293.3698 and 2313.1790 (refused before). Rolling onto a
+  extrapolated, the section integral's 2293.3698 and 2313.1790 (refused before; SMLib fails it,
+  status 1001). Rolling onto a
   tangent next face in its plane (a side face split along a line): rounded 3, 1561.37 (1600 less
   20 r² (1 - π/4)), refused before. Still open: rolling onto a curved tangent face, curved faces.
 
@@ -978,7 +982,8 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   joined back into whole edges: a vertex with two faces cannot be found again) and offsets that. A
   20 cube rounded 1 on every edge, shelled 2: closed 3853.8312 and opened at its top 3341.8308
   extrapolated, against 3853.8348 and 3341.8348 (the rounded cube less the sharp 16 box, and less
-  16 × 18 × 16); refused before. The rounded uprights 0.3 of the 2 box shelled 0.5 likewise.
+  16 × 18 × 16); refused before (SMLib fails the closed one, status 1001). The rounded uprights 0.3
+  of the 2 box shelled 0.5 likewise.
   Regression: `shell_tests`. Still open: G2/G3 strips and flat faces swallowed by an inset (the
   face soup and winding numbers), and outward offsets that reconnect.
 
