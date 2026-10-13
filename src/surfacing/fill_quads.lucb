@@ -1,0 +1,568 @@
+## Fill by quads (surfacing Stage 7; fill.lucb has the plan): an N-sided
+## hole as N quads round a center, Alias's N-sided split into four-sided
+## patches, on the frame of luce-cad's setback corners (modeling/patch_fit.lucb):
+## each boundary is split at its middle; quad k sits at the hole's corner
+## where boundary k starts, its sides the first half of boundary k and the
+## second half of boundary k - 1, its inner sides seams to the center.
+## Across the seams the quads meet G1 exactly (the coefficients of a
+## regular vertex of N at the center: no point where a parameter line
+## collapses) and G2 by least squares; the least thin-plate energy chooses
+## among the rest. Each quad's boundary row is its boundary itself (the
+## curves raised to degree 5 on one knot vector, eight spans a half or
+## more: exact). Beside a plane the next rows lie in it (G1 and G2 exact);
+## beside anything else, at 64 stations a side, rows hold G1 (n . S_d = 0)
+## and then, the slopes held to that answer's, G2 (n . S_dd = II(S_d, S_d),
+## linear once S_d is known), in one dense system of a few thousand
+## unknowns. A five-sided corner of three G3
+## fillets and two walls, which took a trimmed net of 96 by 64 spans and
+## two minutes and missed G2 by up to 199%, fills in about a second, G1 to
+## a ten-thousandth of a degree, G2 exact to the walls and within about 1%
+## along the fillets (a few stations next to the hole's corners and the
+## seams miss more).
+##
+## Auto fills with quads where some G1 or G2 boundary lies beside a
+## straight sweep (a fillet's end section) and every one beside a plane or
+## such a sweep near the boundary (the corners of fillets and walls), the
+## boundaries polynomial curves of degree 5 or less; Domain: Quads asks it
+## for any neighbors.
+
+## How strongly G2's rounds keep the first answer's slopes (of G1's and
+## G2's own weight).
+let slope_hold: f64 = 1e-3
+
+## The seams' G2 rows' weight (patch_fit's G1 rows weigh a thousand, its
+## setbacks' G2 one).
+let seam_g2: f64 = 1e2
+
+## The stations' rows' weight (the seams' G1 rows weigh a thousand, the
+## fairness a hundred-thousandth): stronger rows meet the boundaries no
+## better and leave the dense solve's rounding at a ten-thousandth.
+let station_weight: f64 = 1e2
+
+## The stations along each boundary.
+let quad_station_count: usize = 64
+
+## The spans along each half of a boundary, at least.
+let quad_spans: usize = 8
+
+## Whether `w`'s hole fills with quads (see the header).
+func quads_wanted(w: FillWork*) -> bool!:
+    if w.opts.quad or w.opts.explicit or w.guides.count > 0 or w.points.count > 0: return false
+    if w.sides.count < 3 or w.sides.count > 16: return false
+    if w.opts.domain == fill_domain_projected or w.opts.domain == fill_domain_molded: return false
+    for side in w.sides.view():
+        if side.curve.degree > 5: return false
+    if w.opts.domain == fill_domain_quads: return true
+    # Beside a sweep (beside planes alone the trimmed net is exact).
+    var swept = false
+    for k in 0..<w.sides.count:
+        let order = w.sides.items[k].order()
+        if order < 1: continue
+        let (kind, _) = try ruled_neighbor(w, k)
+        if kind == 0: return false
+        swept = swept or kind == 2
+    return swept
+
+## Side `k`'s neighbor near it: a plane (1, its normal), a straight sweep
+## across it (2: the way it leaves the side the same all along it, and the
+## neighbor going on straight that way), else neither (0). Checked at nine
+## stations, a step of 2% and 6% of the hole in along the neighbor, within
+## a billionth of the hole.
+func ruled_neighbor(w: FillWork*, k: usize) -> (i64, Vector3)!:
+    var normals = Growing[Vector3]()
+    defer normals.close()
+    var leaves = Growing[Vector3]()
+    defer leaves.close()
+    var points = Growing[Vector3]()
+    defer points.close()
+    var flat_form = true
+    for q in 0..<(usize)9:
+        let st = try make_station(w, k, ((f64)q + 0.5) / 9.0, Vector3(), Vector3())
+        if not st.has_face: return (0, Vector3())
+        let t = st.tangent
+        let leave = st.leave.subtract(t.multiply_scalar(st.leave.dot(t))).normalized() catch failure: return (0, Vector3())
+        try normals.push(st.form.n)
+        try leaves.push(leave)
+        try points.push(st.p)
+        for value in st.form.h: flat_form = flat_form and math.abs(value) < 1e-9
+    var same_normal = true
+    var same_leave = true
+    for at in 1..<normals.count:
+        same_normal = same_normal and normals.items[at].cross(normals.items[0]).length() < 1e-9
+        same_leave = same_leave and leaves.items[at].cross(leaves.items[0]).length() < 1e-9
+    if not same_leave and not (same_normal and flat_form): return (0, Vector3())
+    # The neighbor goes on as the rule says: a step in along it lies on it.
+    var m = w.sides.items[k].master
+    for at in 0..<points.count:
+        for step in [0.02, 0.06]:
+            let q = w.world(points.items[at].subtract(leaves.items[at].multiply_scalar(step)))
+            let uv = try m.chart_of(q)
+            let on = try surface_point(*m.surface(), uv)
+            if on.subtract(q).length() > w.scale * 1e-9: return (0, Vector3())
+    if same_normal and flat_form: return (1, normals.items[0])
+    return (2, leaves.items[0])
+
+## The quads' sides: runs of the hole's boundaries that go on one another
+## smoothly beside one face (a setback corner's curves, two edges each:
+## one side, not two), starting at a corner. Each run's first boundary
+## onto `firsts` and its length onto `counts`.
+func quad_runs(w: const FillWork*, firsts: Growing[usize]*, counts: Growing[usize]*) -> !:
+    firsts.clear()
+    counts.clear()
+    let n = w.sides.count
+    var smooth = Growing[bool]()
+    defer smooth.close()
+    var any_corner = false
+    for k in 0..<n:
+        # Whether side k goes on smoothly into side k + 1.
+        let a = &w.sides.items[k]
+        let b = &w.sides.items[(k + 1) % n]
+        var goes_on = n > 1 and a.code == b.code and a.master.has_face == b.master.has_face
+        if goes_on and a.master.has_face: goes_on = a.master.w.face_name(a.master.f) == b.master.w.face_name(b.master.f)
+        if goes_on:
+            let ta = (try curve_jet(&a.curve, 1.0, 1, true)).d[1].normalized() catch failure: recover Vector3()
+            let tb = (try curve_jet(&b.curve, 0.0, 1, false)).d[1].normalized() catch failure: recover Vector3()
+            goes_on = ta.cross(tb).length() < 1e-6 and ta.dot(tb) > 0.0
+        try smooth.push(goes_on)
+        any_corner = any_corner or not goes_on
+    if not any_corner: return
+    # From the first side after a corner, round the loop.
+    var start: usize = 0
+    while smooth.items[(start + n - 1) % n]: start += 1
+    var k: usize = 0
+    while k < n:
+        let first = (start + k) % n
+        var count: usize = 1
+        while smooth.items[(first + count - 1) % n] and count < n: count += 1
+        try firsts.push(first)
+        try counts.push(count)
+        k += count
+
+## The quads' sides as one curve each (a run's boundaries joined, on the
+## unit domain) onto `sides`, and as degree 5 curves on one knot vector
+## (each raised to degree 5 and given every knot any of them has, and its
+## mirror, as often as any has it, then the widest gaps split to eight
+## spans a half: the same curves), their control points, weights and the
+## knots onto `points`, `weights` and `knots`; false when a curve is of
+## degree above 5 or a half would have more control points than the frame
+## takes.
+func quad_curves(w: const FillWork*, firsts: const usize[], counts: const usize[], sides: Growing[Spline]*, points: Growing[Vector3]*, weights: Growing[f64]*, knots: Growing[f64]*) -> bool!:
+    var curves = Growing[Spline]()
+    defer close_splines_of(&curves)
+    var values = Growing[f64]()
+    defer values.close()
+    var times_of = Growing[usize]()
+    defer times_of.close()
+    for run in 0..<firsts.length:
+        var c = try w.sides.items[firsts[run]].curve.copy()
+        for more in 1..<counts[run]:
+            var next = try w.sides.items[(firsts[run] + more) % w.sides.count].curve.copy()
+            defer next.close()
+            if next.degree < c.degree: try elevate(&next, (usize)(c.degree - next.degree))
+            if c.degree < next.degree: try elevate(&c, (usize)(next.degree - c.degree))
+            let both = try joined(&c, &next)
+            c.close()
+            c = both
+        unit_domain(&c)
+        try sides.push(try c.copy())
+        if c.degree > 5:
+            c.close()
+            return false
+        if c.degree < 5: try elevate(&c, (usize)(5 - c.degree))
+        var inner = Growing[f64]()
+        defer inner.close()
+        try distinct_inner(&c, 1e-12, &inner)
+        for u in inner.view():
+            let times = multiplicity(c.knots.view(), u, 1e-12)
+            for v in [u, 1.0 - u]:
+                var found = false
+                for at in 0..<values.count:
+                    if math.abs(values.items[at] - v) <= 1e-9:
+                        found = true
+                        if times > times_of.items[at]: times_of.items[at] = times
+                if not found:
+                    try values.push(v)
+                    try times_of.push(times)
+        try curves.push(c)
+    # Eight spans a half: room for the rows to follow the neighbors between
+    # the hole's corners. The widest gap of the first half split, mirrored.
+    while true:
+        var marks = Growing[f64]()
+        defer marks.close()
+        try marks.push(0.0)
+        try marks.push(0.5)
+        for v in values.view():
+            if v > 1e-9 and v < 0.5 - 1e-9: try marks.push(v)
+        if marks.count >= quad_spans + 1: break
+        var widest = 0.0
+        var at = 0.0
+        for a in marks.view():
+            var next = 1.0
+            for b in marks.view():
+                if b > a + 1e-12 and b < next: next = b
+            if next <= 0.5 and next - a > widest:
+                widest = next - a
+                at = (a + next) * 0.5
+        for v in [at, 1.0 - at]:
+            try values.push(v)
+            try times_of.push(1)
+    for at in 0..<curves.count:
+        let c = &curves.items[at]
+        for q in 0..<values.count:
+            let have = multiplicity(c.knots.view(), values.items[q], 1e-9)
+            if have < times_of.items[q]: _ = try insert_knot(c, values.items[q], times_of.items[q] - have)
+    let n = curves.items[0].points.count
+    # Each half keeps n / 2 + 3 points (the middle inserted five times).
+    if n // 2 + 3 > basis_stride: return false
+    for c in curves.view():
+        if c.points.count != n: return false
+    try knots.assign(curves.items[0].knots.view())
+    for c in curves.view():
+        for q in c.points.view():
+            try points.push(q.point())
+            try weights.push(q.w)
+    return true
+
+## Whether the quad sides beside run `run` (its joined curve `sides[run]`)
+## leave its corners along `way` (a sweep's rows then fit both corners).
+func leaves_along(w: const FillWork*, sides: const Spline[], run: usize, way: Vector3) -> bool!:
+    let count = sides.length
+    let before = &sides[(run + count - 1) % count]
+    let after = &sides[(run + 1) % count]
+    let a = (try curve_jet(before, 1.0, 1, true)).d[1].normalized() catch failure: return false
+    let b = (try curve_jet(after, 0.0, 1, false)).d[1].normalized() catch failure: return false
+    return a.cross(way).length() < 1e-6 and b.cross(way).length() < 1e-6
+
+## Where boundary `k`'s station `st` lies on the quads: its run's quad side,
+## the fraction along that side's joined curve `side` (unit domain), the quad
+## and (u, v) on it, and the chart direction across into it.
+func quad_place_of(w: const FillWork*, side: const Spline*, run: usize, runs: usize, st: const FillStation*) -> (usize, Vector3, Vector3):
+    let t = spline_nearest(side, w.world(st.p))
+    if t <= 0.5: return (run, Vector3(2.0 * t, 0.0, 0.0), Vector3(0.0, 1.0, 0.0))
+    return ((run + 1) % runs, Vector3(0.0, 2.0 * (1.0 - t), 0.0), Vector3(1.0, 0.0, 0.0))
+
+## The fill of `w`'s hole by quads (quads_wanted said so): the quads'
+## nets (world units), measured at the stations as the net's fill is; none
+## when the boundaries do not fit the frame (rational, of degree above 5,
+## or halves of more control points than it takes).
+func quads_made(w: FillWork*) -> FillMade?!:
+    var firsts = Growing[usize]()
+    defer firsts.close()
+    var counts = Growing[usize]()
+    defer counts.close()
+    try quad_runs(w, &firsts, &counts)
+    if firsts.count < 3: return none
+    var sides = Growing[Spline]()
+    defer close_splines_of(&sides)
+    var points = Growing[Vector3]()
+    defer points.close()
+    var weights = Growing[f64]()
+    defer weights.close()
+    var knots = Growing[f64]()
+    defer knots.close()
+    if not try quad_curves(w, firsts.view(), counts.view(), &sides, &points, &weights, &knots): return none
+    for weight in weights.view():
+        if weight != 1.0: return none
+    var quads = Growing[Vector3]()
+    defer quads.close()
+    var quad_knots = Growing[f64]()
+    defer quad_knots.close()
+    try quad_patch(w, firsts.view(), counts.view(), sides.view(), points.view(), knots.view(), &quads, &quad_knots)
+    let count = firsts.count
+    let m = quad_knots.count - 6
+    var nets = Growing[Net]()
+    errdefer close_nets(&nets)
+    for k in 0..<count:
+        var net = empty_net()
+        errdefer net.close()
+        net.du = 5
+        net.dv = 5
+        net.nu = m
+        net.nv = m
+        try net.ku.assign(quad_knots.view())
+        try net.kv.assign(quad_knots.view())
+        for at in 0..<m * m: try net.points.push(weighted(quads.items[k * m * m + at], 1.0))
+        try nets.push(net)
+    var made = FillMade(try nets.items[0].copy(), true, Growing[FillConflict](), Growing[f64](), Growing[f64](), Growing[f64](), 0.0, 0, Growing[Spline](), Vector3(), nets)
+    errdefer made.close()
+    let n = w.sides.count
+    try made.gaps.fill(n, 0.0)
+    try made.angles.fill(n, 0.0)
+    try made.curvatures.fill(n, 0.0)
+    try made.conflicts.assign(w.corners.view())
+    # Each boundary at 64 stations, on its run's quads: a run's first half
+    # on quad k's side v = 0, its second on quad k + 1's side u = 0 run back.
+    var lean = 0.0
+    for run in 0..<count:
+        for more in 0..<counts.items[run]:
+            let k = (firsts.items[run] + more) % n
+            let side = &w.sides.items[k]
+            for q in 0..<(usize)64:
+                var st = try make_station(w, k, ((f64)q + 0.5) / 64.0, Vector3(), Vector3())
+                st.weight = corner_ease(w, &st)
+                let (quad, uv, d) = quad_place_of(w, &sides.items[run], run, count, &st)
+                st.d = d
+                let j = quad_jet(w, &made.quads.items[quad], uv)
+                let (gap, angle, curvature) = jet_measure(j, &st)
+                made.gaps.items[side.picked] = math.max(made.gaps.items[side.picked], gap * w.scale)
+                if st.has_face and st.order >= 1: lean += j[1].cross(j[2]).dot(st.form.n)
+                if st.weight < 1.0: continue
+                made.angles.items[side.picked] = math.max(made.angles.items[side.picked], angle * 180.0 / math.pi)
+                made.curvatures.items[side.picked] = math.max(made.curvatures.items[side.picked], curvature)
+                if angle > w.angle or (st.order >= 2 and curvature > w.curvature):
+                    let p = w.world(st.p)
+                    try made.conflicts.push(FillConflict((i64)side.picked, 1 if angle > w.angle else 2, p, p, angle * 180.0 / math.pi if angle > w.angle else curvature, false, 0.0))
+    made.sense = lean >= 0.0
+    return made
+
+## Quad `net`'s jet at (u, v) in `w`'s normalized units: S, S_u, S_v,
+## S_uu, S_uv, S_vv (the rational net's Euclidean derivatives).
+func quad_jet(w: const FillWork*, net: const Net*, uv: Vector3) -> Vector3[6]:
+    var a: Weighted[16] = ---
+    net.partials(uv.x, uv.y, &a)
+    var e: Weighted[16] = ---
+    euclidean_partials(&a, &e)
+    let k = 1.0 / w.scale
+    return [w.local(e[0].point()), Vector3(e[4].x, e[4].y, e[4].z).multiply_scalar(k), Vector3(e[1].x, e[1].y, e[1].z).multiply_scalar(k),
+            Vector3(e[8].x, e[8].y, e[8].z).multiply_scalar(k), Vector3(e[5].x, e[5].y, e[5].z).multiply_scalar(k), Vector3(e[2].x, e[2].y, e[2].z).multiply_scalar(k)]
+
+## The quads' body: a face each, stitched into one sheet along their
+## seams (their rows there are the same control points).
+func quads_body(w: const FillWork*, made: const FillMade*, name: str) -> interop.Reference[CadModel]!:
+    var models = Growing[interop.Reference[CadModel]]()
+    defer:
+        for model in models.view(): model.release()
+        models.close()
+    for at in 0..<made.quads.count: try models.push(try net_body(&made.quads.items[at], name, made.sense))
+    let stitched = try stitch_models(models.view(), math.min(w.scale * 1e-6, 0.5))
+    return stitched.model
+
+## A station of a side for quad_patch: the quad and its (u, v) on it, the
+## chart direction across into it, the neighbor's normal and its normal
+## curvature form (the patch's units), the order held, and its weight
+## (eased near a conflicting corner).
+struct QuadStation:
+    var quad: usize
+    var uv: Vector3
+    var d: Vector3
+    var n: Vector3
+    var h: f64[6]
+    var order: i64
+    var weight: f64
+
+## H x for the form `h` (xx, yy, zz, xy, xz, yz).
+func form_times(h: const f64[6]*, x: Vector3) -> Vector3:
+    return Vector3((*h)[0] * x.x + (*h)[3] * x.y + (*h)[4] * x.z, (*h)[3] * x.x + (*h)[1] * x.y + (*h)[5] * x.z, (*h)[4] * x.x + (*h)[5] * x.y + (*h)[2] * x.z)
+
+## The quads of `w`'s hole (see the header) onto `out` (count m^2 points
+## each, u-major, world units) and their knots, the same both ways, onto
+## `quad_knots`: the runs of boundaries `firsts`, `counts` (quad_runs),
+## their joined curves `sides`, and those on one knot vector, `curves` on
+## `knots`.
+func quad_patch(w: FillWork*, firsts: const usize[], counts: const usize[], sides: const Spline[], curves: const Vector3[], knots: const f64[], out: Growing[Vector3]*, quad_knots: Growing[f64]*) -> !:
+    let count = firsts.length
+    let n = knots.length - 6
+    # Unit size about the curves' middle (patch_fit's frame).
+    var origin = Vector3()
+    for p in curves: origin = origin.add(p)
+    origin = origin.multiply_scalar(1.0 / (f64)curves.length)
+    var scale = 0.0
+    for p in curves: scale = math.max(scale, p.subtract(origin).length())
+    var first = Growing[Vector3]()
+    defer first.close()
+    var second = Growing[Vector3]()
+    defer second.close()
+    var first_weights = Growing[f64]()
+    defer first_weights.close()
+    var second_weights = Growing[f64]()
+    defer second_weights.close()
+    var local = Growing[Vector3]()
+    defer local.close()
+    var ones = Growing[f64]()
+    defer ones.close()
+    try ones.fill(n, 1.0)
+    var second_knots = Growing[f64]()
+    defer second_knots.close()
+    for k in 0..<count:
+        local.clear()
+        for i in 0..<n: try local.push(curves[k * n + i].subtract(origin).multiply_scalar(1.0 / scale))
+        quad_knots.clear()
+        second_knots.clear()
+        try split_middle(local.view(), ones.view(), knots, &first, &second, &first_weights, &second_weights, quad_knots, &second_knots)
+    let m = first.count // count
+    let qk = quad_knots.view()
+    # The control points: the boundary rows fixed, the rest free, keyed as
+    # patch_fit's (the seams' points shared, the center last).
+    let center = count * m * m
+    var slots = Growing[Slot]()
+    defer slots.close()
+    var fixed = Growing[bool]()
+    defer fixed.close()
+    try fixed.fill(center + 1, false)
+    var bases = Growing[Vector3]()
+    defer bases.close()
+    try bases.fill(center + 1, Vector3())
+    for k in 0..<count:
+        let before = (k + count - 1) % count
+        for a in 0..<m:
+            let key = patch_key(k, a, 0, m, count)
+            fixed.items[key] = true
+            bases.items[key] = first.items[k * m + a]
+        for b in 0..<m:
+            let key = patch_key(k, 0, b, m, count)
+            fixed.items[key] = true
+            bases.items[key] = second.items[before * m + m - 1 - b]
+    # Beside a plane its rows lie in it, exactly (patch_fit's faces): two
+    # unknowns each, in the plane; other neighbors take the stations' rows.
+    var planes = Growing[Vector3]()
+    defer planes.close()
+    try planes.fill(center + 1, Vector3())
+    # Beside a straight sweep whose neighbors both leave the corners along
+    # its way (a setback corner's fillet ends, the faces' curves running on
+    # along the contacts) its rows go along it, exactly (patch_fit's
+    # fillets): one unknown each. A sweep's rule wins where it meets a
+    # plane's (its way lies in the plane).
+    var sweeps = Growing[Vector3]()
+    defer sweeps.close()
+    try sweeps.fill(center + 1, Vector3())
+    var exact = Growing[bool]()
+    defer exact.close()
+    for run in 0..<count:
+        let k = firsts[run]
+        let order = w.sides.items[k].order()
+        var (kind, way) = try ruled_neighbor(w, k)
+        if order < 1: kind = 0
+        if kind == 2 and not try leaves_along(w, sides, run, way): kind = 0
+        try exact.push(kind != 0)
+        if kind == 0: continue
+        let next = (run + 1) % count
+        for a in 1..<m:
+            for b in 1..<(usize)order + 1:
+                let key = patch_key(run, a, b, m, count)
+                if fixed.items[key]: continue
+                if kind == 1 and sweeps.items[key].length() > 0.0: continue
+                if kind == 1: planes.items[key] = way
+                else: sweeps.items[key] = way
+                bases.items[key] = first.items[run * m + a]
+        # The side's second half, on quad k + 1's side u = 0.
+        for a in 1..<(usize)order + 1:
+            for b in 1..<m:
+                let key = patch_key(next, a, b, m, count)
+                if fixed.items[key]: continue
+                if kind == 1 and sweeps.items[key].length() > 0.0: continue
+                if kind == 1: planes.items[key] = way
+                else: sweeps.items[key] = way
+                bases.items[key] = second.items[run * m + m - 1 - b]
+    for key in 0..<center + 1:
+        if sweeps.items[key].length() > 0.0: planes.items[key] = Vector3()
+    # Keys no quad uses (a seam's points live under one quad) get none.
+    var used = Growing[bool]()
+    defer used.close()
+    try used.fill(center + 1, false)
+    for k in 0..<count:
+        for a in 0..<m:
+            for b in 0..<m: used.items[patch_key(k, a, b, m, count)] = true
+    var size: usize = 0
+    for key in 0..<center + 1:
+        var slot = Slot(bases.items[key], size, 0, [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)])
+        if used.items[key] and not fixed.items[key]:
+            slot.count = 3
+            if planes.items[key].length() > 0.0:
+                slot.count = 2
+                slot.axes[0] = try square_to(planes.items[key])
+                slot.axes[1] = planes.items[key].cross(slot.axes[0])
+            elif sweeps.items[key].length() > 0.0:
+                slot.count = 1
+                slot.axes[0] = sweeps.items[key]
+        size += slot.count
+        try slots.push(slot)
+    # The stations, on quad k's side v = 0 for a side's first half,
+    # on quad k + 1's side u = 0 for its second; the neighbor's form in the
+    # patch's units (fill's normalized curvatures times scale / w.scale).
+    var stations = Growing[QuadStation]()
+    defer stations.close()
+    for run in 0..<count:
+        if exact.items[run]: continue
+        for more in 0..<counts[run]:
+            let k = (firsts[run] + more) % w.sides.count
+            if w.sides.items[k].order() < 1: continue
+            for q in 0..<quad_station_count:
+                var st = try make_station(w, k, ((f64)q + 0.5) / (f64)quad_station_count, Vector3(), Vector3())
+                if not st.has_face: continue
+                let ease = corner_ease(w, &st)
+                if not (ease > 0.0): continue
+                let (quad, uv, d) = quad_place_of(w, &sides[run], run, count, &st)
+                var station = QuadStation(quad, uv, d, st.form.n, st.form.h, st.order, ease)
+                for c in 0..<(usize)6: station.h[c] = station.h[c] * scale / w.scale
+                try stations.push(station)
+    var any_g2 = false
+    for st in stations.view(): any_g2 = any_g2 or st.order >= 2
+    # The seams and the fairness, once.
+    var base = Rows(size, Growing[f64](), Growing[f64](), Growing[f64](), Growing[bool](), Growing[usize](), 0.0)
+    defer base.close()
+    try base.matrix.fill(size * size, 0.0)
+    try base.rhs.fill(size, 0.0)
+    try base.row.fill(size, 0.0)
+    try base.marked.fill(size, false)
+    try fairness_rows(&base, slots.view(), m, qk, count)
+    try seam_rows(&base, slots.view(), m, qk, count, g2_weight = seam_g2)
+    var rows = Rows(size, Growing[f64](), Growing[f64](), Growing[f64](), Growing[bool](), Growing[usize](), 0.0)
+    defer rows.close()
+    try rows.row.fill(size, 0.0)
+    try rows.marked.fill(size, false)
+    var answer = Growing[f64]()
+    defer answer.close()
+    var crosses = Growing[Vector3]()
+    defer crosses.close()
+    var bu: f64[64]
+    var bv: f64[64]
+    # G1 first; then, the slopes across held to that answer's (rows that
+    # ask a curvature of a free slope pull it longer or shorter round after
+    # round), G2 is linear: one more solve.
+    for round in 0..<2:
+        try rows.matrix.assign(base.matrix.view())
+        try rows.rhs.assign(base.rhs.view())
+        for at in 0..<stations.count:
+            let st = &stations.items[at]
+            spline_basis_by(qk, st.uv.x, basis_stride, bu[..<64])
+            spline_basis_by(qk, st.uv.y, basis_stride, bv[..<64])
+            let weight = station_weight * st.weight
+            # G1: n . S_d = 0.
+            for a in 0..<m:
+                for b in 0..<m: try rows.add(&slots.items[patch_key(st.quad, a, b, m, count)], st.d.x * bu[basis_stride + a] * bv[b] + st.d.y * bu[a] * bv[basis_stride + b], st.n)
+            rows.commit(0.0, weight)
+            if st.order < 2 or round == 0: continue
+            # The slope held: S_d = l, the first answer's.
+            let l = crosses.items[at]
+            for axis in [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]:
+                for a in 0..<m:
+                    for b in 0..<m: try rows.add(&slots.items[patch_key(st.quad, a, b, m, count)], st.d.x * bu[basis_stride + a] * bv[b] + st.d.y * bu[a] * bv[basis_stride + b], axis)
+                rows.commit(l.dot(axis), weight * slope_hold)
+            # G2: n . S_dd = H l . l.
+            for a in 0..<m:
+                for b in 0..<m: try rows.add(&slots.items[patch_key(st.quad, a, b, m, count)], st.d.x * st.d.x * bu[2 * basis_stride + a] * bv[b] + 2.0 * st.d.x * st.d.y * bu[basis_stride + a] * bv[basis_stride + b] + st.d.y * st.d.y * bu[a] * bv[2 * basis_stride + b], st.n)
+            rows.commit(l.dot(form_times(&st.h, l)), weight)
+        try cholesky_solve(rows.matrix.items[..<size * size], rows.rhs.items[..<size], size)
+        # The slopes at the stations.
+        for at in 0..<stations.count:
+            let st = &stations.items[at]
+            spline_basis_by(qk, st.uv.x, basis_stride, bu[..<64])
+            spline_basis_by(qk, st.uv.y, basis_stride, bv[..<64])
+            var sd = Vector3()
+            for a in 0..<m:
+                for b in 0..<m:
+                    let slot = &slots.items[patch_key(st.quad, a, b, m, count)]
+                    var p = slot.base
+                    for j in 0..<slot.count: p = p.add(slot.axes[j].multiply_scalar(rows.rhs.items[slot.first + j]))
+                    sd = sd.add(p.multiply_scalar(st.d.x * bu[basis_stride + a] * bv[b] + st.d.y * bu[a] * bv[basis_stride + b]))
+            if crosses.count <= at: try crosses.push(sd)
+            else: crosses.items[at] = sd
+        try answer.assign(rows.rhs.items[..<size])
+        if not any_g2: break
+    for k in 0..<count:
+        for a in 0..<m:
+            for b in 0..<m:
+                let slot = &slots.items[patch_key(k, a, b, m, count)]
+                var p = slot.base
+                for j in 0..<slot.count: p = p.add(slot.axes[j].multiply_scalar(answer.items[slot.first + j]))
+                try out.push(origin.add(p.multiply_scalar(scale)))

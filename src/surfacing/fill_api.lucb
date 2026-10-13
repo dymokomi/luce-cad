@@ -23,6 +23,9 @@ pub struct CadFill:
     pub var trimmed: bool
     ## N-sided on a Molded domain (Auto chose it, or it was asked).
     pub var molded: bool
+    ## N-sided by quads round a center (fill_quads.lucb): how many (zero:
+    ## one face).
+    pub var quads: i64
 
     pub func init():
         self.made = none
@@ -38,6 +41,7 @@ pub struct CadFill:
         self.degree_v = 0
         self.trimmed = false
         self.molded = false
+        self.quads = 0
 
     pub func geometry() -> interop.Reference[GeometrySet]!:
         let made = self.made else error(invalid, "a fill has no geometry")
@@ -93,7 +97,7 @@ pub struct CadSurfaceFill:
     ## `refine` up to `most_spans` each way; the tolerances (`position` in
     ## model units, 0: a millionth of the loop's size; `angle` degrees;
     ## `curvature` percent); N-sided's `domain` (fill_domain_auto, _projected,
-    ## _molded). The fill is a body of one sheet named `name`.
+    ## _molded, _quads). The fill is a body of one sheet named `name`.
     pub static func fill(set: interop.Reference[GeometrySet], boundaries: str, continuity: const i64[], points: const Vector3[], guides: str = "", guide_order: i64 = 0,
                          quad: bool = false, tension: f64 = 0.0, flatness: f64 = 0.0, flow: i64 = 0, explicit: bool = false, degree_u: i64 = 5, spans_u: i64 = 4,
                          degree_v: i64 = 5, spans_v: i64 = 4, refine: bool = true, most_spans: i64 = 32, position: f64 = 0.0, angle: f64 = 0.05, curvature: f64 = 0.5,
@@ -104,9 +108,9 @@ pub struct CadSurfaceFill:
         if guide_order < 0 or guide_order > 1: error(invalid, "Fill: guides are G0 or G1")
         if explicit and (spans_u < 1 or spans_v < 1 or spans_u > 64 or spans_v > 64): error(invalid, "Fill: Explicit Control's spans are 1 to 64")
         if not (angle > 0.0 and curvature > 0.0 and position >= 0.0): error(invalid, "Fill: the tolerances must be more than zero")
-        if domain < fill_domain_auto or domain > fill_domain_molded: error(invalid, "Fill: the domain is Auto, Projected or Molded")
+        if domain < fill_domain_auto or domain > fill_domain_quads: error(invalid, "Fill: the domain is Auto, Projected, Molded or Quads")
         let opts = FillOptions(quad, tension, flatness, flow, guide_order, explicit, degree_u, spans_u, degree_v, spans_v, refine, most_spans, position, angle, curvature, domain)
-        var w = FillWork(Growing[FillSide](), opts, Growing[Master](), Growing[Vector3](), Vector3(), 1.0, Vector3(), Vector3(), Vector3(), 0.0, 0.0, 0.0, Growing[FillConflict](), Growing[bool](), Growing[CornerTurn](), false, Growing[f64]())
+        var w = FillWork(Growing[FillSide](), opts, Growing[Master](), Growing[Vector3](), Vector3(), 1.0, Vector3(), Vector3(), Vector3(), 0.0, 0.0, 0.0, Growing[FillConflict](), Growing[bool](), Growing[CornerTurn](), false, Growing[f64](), no_ball())
         defer w.close()
         try walk_loop(set, boundaries, continuity, &w.sides)
         if guides.length > 0: try builder_masters(set, guides, &w.guides)
@@ -129,7 +133,8 @@ pub struct CadSurfaceFill:
         fill.spans_v = (i64)spans_of(made.net.kv.view(), made.net.dv)
         fill.degree_u = made.net.du
         fill.degree_v = made.net.dv
-        fill.trimmed = not w.opts.quad
+        fill.trimmed = not w.opts.quad and made.quads.count == 0
+        fill.quads = (i64)made.quads.count
         fill.molded = w.molded
         return result
 
@@ -147,6 +152,7 @@ pub struct CadSurfaceFill:
 ## the fill's worst gap (Stitch's tolerant edges join them).
 func fill_body(w: const FillWork*, made: const FillMade*, name: str) -> interop.Reference[CadModel]!:
     if w.opts.quad: return try net_body(&made.net, name, made.sense)
+    if made.quads.count > 0: return try quads_body(w, made, name)
     var worst = 0.0
     for g in made.gaps.view(): worst = math.max(worst, g)
     let precision = math.max(worst * 2.0, w.scale * 1e-7)

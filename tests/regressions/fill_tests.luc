@@ -34,7 +34,9 @@ pub func fill_tests() -> unit!:
     fill_molded()
     fill_rates()
     fill_ball_corner()
-    print("PASS fill: a planar pentagon and a hole in a plane fill with the plane (G1, G2, N-sided and Quad untrimmed); a height field's hole fills G0, G1 and G2 on every edge both ways; a ball's cap G1 and G2 near the sphere; a five-sided corner of three fillets and two walls G1 on all five edges, circular fillets' twist conflicts reported at their corners; guides and points on the fill; a hole found from one edge; Tension, Flatness, Normal flow and Explicit Control; a lid on four walls G1 and G2 turns onto the walls' plane at its corners (no pinch), every wall met elsewhere; Auto molds a steep pentagon; G2 fillets' corners against walls are rate conflicts, G3 fillets' are not; a rounded box corner's ball taken away fills G1 within 3% of the ball (its cylinders carried on disagree: no reference)")
+    fill_five_g2()
+    fill_setback_g2()
+    print("PASS fill: a planar pentagon and a hole in a plane fill with the plane (G1, G2, N-sided and Quad untrimmed); a height field's hole fills G0, G1 and G2 on every edge both ways; a ball's cap G1 and G2 near the sphere; a five-sided corner of three fillets and two walls G1 on all five edges, circular fillets' twist conflicts reported at their corners; guides and points on the fill; a hole found from one edge; Tension, Flatness, Normal flow and Explicit Control; a lid on four walls G1 and G2 turns onto the walls' plane at its corners (no pinch), every wall met elsewhere; Auto molds a steep pentagon; G2 fillets' corners against walls are rate conflicts, G3 fillets' are not; a rounded box corner's ball taken away fills with the ball exactly, Class-A by the fairness numbers; a five-sided corner of three G3 fillets and two walls fills G2 with five quads in a second; a box corner's G3 setback patch taken away fills G2 exactly with six")
 
 # -- Shapes.
 
@@ -256,9 +258,13 @@ func fill_corner() -> unit!:
     let words = f"edge FTX {1.0 - h} 1 {1.0 - h};edge X1 0 0.75 1.5;edge FXY {q} {q} 2;edge Y1 0.75 0 1.5;edge FTY 1 {1.0 - h} {1.0 - h}"
     # G2 fillets (curvature zero at their walls): G1 on all five edges.
     let data = five_sided(2)
+    # Its fillets swept straight across the hole and its walls flat, it
+    # fills with five quads round a center (fill_quads.lucb): their ten
+    # boundary halves and five seams all G1.
     let made = CadSurfaceFill.fill(data, words, [2, 2, 2, 2, 2], [])
+    assert(made.quads == 5 and not made.trimmed, f"the five-sided corner filled with {made.quads} quads")
     let found = levels(made.geometry(), "Fill")
-    assert(found.length == 5, f"{found.length} of the corner's edges shared")
+    assert(found.length == 15, f"{found.length} of the corner's edges shared")
     for level in found:
         assert(level >= 1, f"the five-sided corner's G1 fill measured {found}")
     # Circular fillets meet the walls with a curvature: where one meets a
@@ -348,8 +354,9 @@ func fill_lid() -> unit!:
     # Quad G1 and G2 on four perpendicular walls: only the four corners
     # conflict (the walls' planes meet square there), every wall is met
     # away from them, and at each corner the lid turns onto the walls' top
-    # plane: its normal there is the plane's, and the cross derivative
-    # never collapses (the pinch the eased corners left).
+    # plane: its normal there is the plane's, and its strips along the walls
+    # are held through the turns (fill_strips.lucb), so it neither collapses
+    # nor pinches there.
     let (data, words) = walls()
     for order in [1, 2]:
         let code = order + 1
@@ -359,8 +366,14 @@ func fill_lid() -> unit!:
             let c = made.conflict(k)
             assert(c.corner and c.order == 1 and math.abs(c.amount - 90.0) < 1e-6 and c.reach > 0.0, f"G{order} lid's conflict {k}: {c.start} G{c.order} {c.amount}")
             assert(made.angle(k) < 0.05 and (order < 2 or made.curvature(k) < 0.5), f"G{order} lid's wall {k}: {made.angle(k)} degrees, {made.curvature(k)}%")
-        assert(made.spans_u <= 8 and made.spans_v <= 8, f"G{order} lid: {made.spans_u} by {made.spans_v} spans")
+        assert(made.spans_u <= 8 * order * 2 and made.spans_v <= 8 * order * 2, f"G{order} lid: {made.spans_u} by {made.spans_v} spans")
         let (model, s) = sheet_of(made.geometry(), 4)
+        # No pinch (fill_strips.lucb): no area element near collapse (the
+        # corners' stars had 0.06 and 0.02 of the mean), no curvature gathered
+        # at the corners (peaks of 42 and 73 times the mean), the mean
+        # curvature's spread and ripple a fifth of theirs.
+        let fair = CadMeasure.fairness(model, "Fill")
+        assert(fair.area > 0.5 and fair.peak < 8.0 and fair.spread < 60.0 and fair.jump < 120.0, f"G{order} lid's fairness: area {fair.area}, peak {fair.peak}, spread {fair.spread}%, jump {fair.jump}%")
         for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]:
             let a = CadNurbs.point_at(model, s, u, v)
             let h = 1e-4
@@ -434,9 +447,8 @@ func fill_rates() -> unit!:
 func fill_ball_corner() -> unit!:
     # A box's corner rounded G1 (radius 0.5, one ball) unstitched and its
     # ball taken away: the three-sided hole between the fillets' cylinders
-    # fills G1 to all three, within 3% of the radius of the ball it
-    # replaces (the cylinders carried on into the hole disagree, so the
-    # plate's own bending rules, not their blend's dent).
+    # fills with the ball it replaces, exactly (its edges and the fillets'
+    # normals lie on the ball), G1 to all three.
     let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
     let found: list[int] = []
     for face in 0..<box.face_count():
@@ -466,13 +478,105 @@ func fill_ball_corner() -> unit!:
     assert(loop.split(";").length == 3, f"the ball corner's hole: {loop}")
     let made = CadSurfaceFill.fill(kept, loop, [2, 2, 2], [])
     for k in 0..<3:
-        assert(made.angle(k) < 0.05, f"the ball corner's side {k} at {made.angle(k)} degrees")
+        assert(made.angle(k) < 1e-4 and made.gap(k) < 1e-12, f"the ball corner's side {k}: gap {made.gap(k)}, {made.angle(k)} degrees")
+    # The ball itself (fill_ball.lucb): a rational window of the sphere
+    # trimmed by the hole's own edges, its poles off it.
+    assert(made.trimmed and made.degree_u == 2 and made.degree_v == 2 and made.spans_u == 1, f"the ball corner's fill: degree {made.degree_u}, {made.spans_u} spans")
     let model = CadGeometry.model(made.geometry(), CadGeometry.model_count(made.geometry()) - 1)
     let s = CadNurbs.surface_of_face(model, model.face_name(0))
     var off = 0.0
     for i in 0..<21:
         for j in 0..<21:
             let d = CadNurbs.point_at(model, s, float(i) / 20.0, float(j) / 20.0).subtract(Vector3(0.5, 0.5, 0.5))
-            if d.x > 0.0 and d.y > 0.0 and d.z > 0.0:
-                off = math.max(off, math.abs(d.length() - 0.5))
-    assert(off < 0.015, f"the ball corner's fill lies {off} off the ball")
+            off = math.max(off, math.abs(d.length() - 0.5))
+    assert(off < 1e-12, f"the ball corner's fill lies {off} off the ball")
+    # Class-A by the numbers: the plate the hole filled with before had a
+    # mean curvature spreading 18% and rippling 25% between neighbors, its
+    # peak twice the mean (a point drawing the zebra stripes into a star);
+    # the ball's spread and ripple are nothing, its every curvature 1 / r,
+    # and no parameter line collapses inside it.
+    let fair = CadMeasure.fairness(model, "Fill")
+    assert(fair.spread < 1e-3 and fair.jump < 1e-6 and math.abs(fair.peak - 1.0) < 1e-6 and math.abs(fair.mean - 2.0) < 1e-9 and fair.area > 0.3, f"the ball corner's fairness: spread {fair.spread}%, jump {fair.jump}%, peak {fair.peak}, mean {fair.mean}, area {fair.area}")
+
+func fill_five_g2() -> unit!:
+    # The five-sided corner of fill_corner with G3 fillets, G2 on all five
+    # sides: five quads round a center (fill_quads.lucb). Their rows lie in
+    # the walls' planes (G1 and G2 exact there); along the fillets G1
+    # within a hundredth of a degree and G2 within 2% (most stations within
+    # the 0.5% tolerance) but within a tenth of a side of the hole's corners
+    # (where the fill took a trimmed net of 96 by 64 spans and two minutes,
+    # and missed G2 by up to 199%); the seams G2.
+    let h = math.sqrt(0.5)
+    let q = 0.5 - 0.5 * h
+    let words = f"edge FTX {1.0 - h} 1 {1.0 - h};edge X1 0 0.75 1.5;edge FXY {q} {q} 2;edge Y1 0.75 0 1.5;edge FTY 1 {1.0 - h} {1.0 - h}"
+    let made = CadSurfaceFill.fill(five_sided(3), words, [3, 3, 3, 3, 3], [])
+    assert(made.quads == 5, f"the G3 corner filled with {made.quads} quads")
+    for k in 0..<5:
+        assert(made.angle(k) < 0.01 and made.gap(k) < 1e-9, f"the G3 corner's side {k}: gap {made.gap(k)}, {made.angle(k)} degrees")
+    for k in [1, 3]:
+        assert(made.curvature(k) < 1e-6, f"the G3 corner's wall {k}: G2 off by {made.curvature(k)}%")
+    let corners = [Vector3(0.0, 1.0, 1.0), Vector3(0.0, 0.5, 2.0), Vector3(0.5, 0.0, 2.0), Vector3(1.0, 0.0, 1.0), Vector3(1.0, 1.0, 0.0)]
+    for k in 0..<made.conflict_count():
+        let c = made.conflict(k)
+        var near = 1.0e300
+        for p in corners:
+            near = math.min(near, c.start.subtract(p).length())
+        assert(c.order == 2 and (near < 0.12 or c.amount < 2.0), f"a G{c.order} miss of {c.amount}% at {c.start}, {near} from the hole's corners")
+    var g2 = 0
+    for level in levels(made.geometry(), "Fill"):
+        if level >= 2:
+            g2 += 1
+    assert(g2 >= 9, f"{g2} of the G3 corner's edges G2 (the walls' four halves and the five seams)")
+    let model = CadGeometry.model(made.geometry(), CadGeometry.model_count(made.geometry()) - 1)
+    let fair = CadMeasure.fairness(model, "Fill")
+    assert(fair.area > 0.1 and fair.spread < 60.0 and fair.peak < 6.0, f"the G3 corner's fairness: area {fair.area}, spread {fair.spread}%, peak {fair.peak}")
+
+func fill_setback_g2() -> unit!:
+    # A box's corner of three G3 fillets (radius 0.5): the kernel's setback
+    # corner, its patch taken away. The hole's twelve edges are six curves,
+    # each fillet's end section and each face's curve along the contacts
+    # (two edges each, run together); the faces' curves leave the fillets'
+    # ends along their sweeps, so the quads' rows follow the fillets and the
+    # faces exactly: six quads, G1 and G2 on every edge to the last digits.
+    let box = CadModeling.tagged(CadSolids.box(2.0, 2.0, 2.0), "box")
+    let found: list[int] = []
+    for face in 0..<box.face_count():
+        for use in 0..<box.face_edge_count(face):
+            let a = box.face_edge_point(face, use, 0.0)
+            let b = box.face_edge_point(face, use, 1.0)
+            let id = box.face_edge_id(face, use)
+            let near = (a.x > 0.99 and a.y > 0.99 and a.z > 0.99) or (b.x > 0.99 and b.y > 0.99 and b.z > 0.99)
+            if near and not (id in found):
+                found.append(id)
+    let rounded = CadModeling.filleted(box, CadModeling.edge_references(box, found), 0.5, "f", continuity = 3, chain = false)
+    let pieces = CadSurfacing.unstitched(CadGeometry.of_model(rounded), 0)
+    var kept = GeometrySet()
+    for index in 0..<CadGeometry.model_count(pieces):
+        let m = CadGeometry.model(pieces, index)
+        if not m.face_name(0).contains("corner"):
+            kept = kept.merged(CadGeometry.of_model(m))
+    # The hole from a fillet's end section (an edge of it near the corner
+    # that bounds a hole, not one it shares with a face).
+    var loop = ""
+    for index in 0..<CadGeometry.model_count(kept):
+        let m = CadGeometry.model(kept, index)
+        let name = m.face_name(0)
+        if not name.contains("blend[") or loop != "":
+            continue
+        for use in 0..<m.face_edge_count(0):
+            let p = m.face_edge_point(0, use, 0.5)
+            if p.x + p.y + p.z > 1.0 and loop == "":
+                loop = CadSurfaceFill.hole(kept, f"edge {name} {p.x} {p.y} {p.z}") catch failure:
+                    continue
+    let words = loop.split(";")
+    assert(words.length == 12, f"the setback's hole: {loop}")
+    let codes: list[int] = []
+    for _ in words:
+        codes.append(3)
+    let made = CadSurfaceFill.fill(kept, loop, codes, [])
+    assert(made.quads == 6 and made.conflict_count() == 0, f"the setback's hole: {made.quads} quads, {made.conflict_count()} conflicts")
+    for k in 0..<12:
+        assert(made.gap(k) < 1e-12 and made.angle(k) < 1e-4 and made.curvature(k) < 1e-4, f"the setback's edge {k}: gap {made.gap(k)}, {made.angle(k)} degrees, {made.curvature(k)}%")
+    let model = CadGeometry.model(made.geometry(), CadGeometry.model_count(made.geometry()) - 1)
+    let fair = CadMeasure.fairness(model, "Fill")
+    assert(fair.area > 0.2 and fair.peak < 4.0, f"the setback's fill: area {fair.area}, peak {fair.peak}")

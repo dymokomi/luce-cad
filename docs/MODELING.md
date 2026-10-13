@@ -1270,6 +1270,7 @@ after Alias's Evaluate tools. luced-3d's Check node draws what it returns.
 | `check(model, references, level, stations, distance, angle, curvature, rate, combs, samples, quills, scale, sharp)` | The edges `references` names (empty: every edge between two faces) checked for continuity `level` (0 to 3) at `stations` per edge. Returns a `CadCheck`: per edge (`edge(i)`, an `EdgeCheck`) its faces, its worst gap, angle and curvature and rate differences, and the highest order every station meets; per station (`station(i)`) the values behind them; the comb samples (`comb(i)`); `passed()`, `summary()`; how many creases were left out (`creases_left_out()`; without `sharp`, edges whose faces meet at more than 10° all along them are not checked, though they keep their combs); the lines to draw by group (`line_count`, `line_point`; Base readers `check_lines`); and a label an edge (`label_count`, `label(i)`). |
 | `with_curve_combs(check, set, samples, scale)`, `curve_check(set, samples, scale)` | Curvature combs of a set's shown curves (free and on faces, `samples` a span) added to a check, or a check of the curves alone (Alias's Curve Curvature on curves). |
 | `deviation(model, reference, acceptable, ramp, segments)` | `model`'s tessellation with point attributes `deviation` (its signed distance from `reference`'s surfaces) and `Cd` (a color ramp), and its largest, smallest, mean and RMS deviation, and the share within `acceptable`. |
+| `fairness(model, faces, samples)` | How evenly the faces `faces` (names apart by `;`, empty every face) curve, the Class-A numbers behind the zebra (`fairness.lucb`): each face sampled `samples` by `samples` over its parameters inside its trim, principal curvatures from the exact jet. Returns a `CadFairness`: the samples, the mean \|H\|, the mean curvature's spread (standard deviation over the mean, percent: a ball's patch 0), the peak (largest \|k\| over the mean: a pinch gathers curvature into a peak), the jump (largest change of H between neighboring samples over the mean, percent: a ripple) and the area (smallest area element over the mean: a collapsing parameter line, a point singularity, goes to zero). |
 
 **Jets** (`geometry/jets.lucb`). Continuity to G3 needs third derivatives. `basis_jet` extends
 The NURBS Book's A2.3 to the third order, and takes the limit from below (`left`) at an inner knot,
@@ -2023,7 +2024,7 @@ contacts (toward the third contact: a rib's walls face straight across) and cons
 set. `blend_build_tests`: over a rib's top it is the half cylinder to 1e-15, the walls trimmed to
 its contacts and the top gone.
 
-## Fill (`surfacing/fill.lucb`, `fill_bounds`, `fill_net`, `fill_bands`, `fill_reference`, `fill_solve`, `fill_refine`, `fill_api`)
+## Fill (`surfacing/fill.lucb`, `fill_bounds`, `fill_net`, `fill_bands`, `fill_reference`, `fill_ball`, `fill_quads`, `fill_solve`, `fill_strips`, `fill_refine`, `fill_api`)
 
 Stage 7 of the surfacing plan (luced-3d `docs/research/SURFACING-ALIAS-PLASTICITY.md` §5.2, §6.8): xNURBS's
 fill (Plasticity's xNURBS and Patch, Alias's N-sided, Rhino 9's Patch), as `CadSurfaceFill.fill`, which
@@ -2147,10 +2148,62 @@ cross isoparms square to the side.
   side is dropped for the plate's own bending (it kept their blend's dent: 22% of the radius off the
   ball, now 2.7%; `fill_tests`).
 
-Not yet: the five-sided corner between G3 fillets and walls fills G1 but not G2 (its stations' G2
-rows do not settle together: 60 to 190% off at the walls); a Molded fill's trimmed face can be hard to
-mesh where it rises square from its boundaries (its nearest-point searches stall), so four steep
-sides go to Quad; a corner's turn zone is a fixed share of each side.
+**Class-A corners and lids (2026-10-12).** The corner fills and lids above measured well at their
+boundaries but not inside: a ball corner's plate had a mean curvature spreading 18% and twice the
+ball's at its middle (the zebra stripes drawn into a point and wavy round it), and a lid on four walls
+collapsed its cross derivative in each corner's turn (stars there). `CadMeasure.fairness` (Measuring)
+gives the numbers; three constructions answer them.
+
+- **The ball** (`fill_ball.lucb`). A hole whose boundaries and neighbors' normals lie on one sphere
+  (p − ρ n = c at 32 stations a side, linear in c and ρ, within the position tolerance; a G2 side's
+  neighbor as curved as the sphere every way) fills with that sphere, as Parasolid's vertex blend of
+  equal rolling-ball blends is its ball: a rational biquadratic window of it about the hole, its poles
+  square to the hole's mean direction (none on it, no parameter line collapsing inside), a tenth
+  larger than the boundaries' latitudes and longitudes, trimmed by the boundaries themselves. A rounded
+  box corner's ball taken away fills with the ball to 1e-15 (was 2.7% of the radius off it), its mean
+  curvature's spread 18% → 0, its ripple 25% → 0, its peak 2 → 1 times the mean. A cap cut from a ball
+  fills with the ball the same way. Where the data lie near one sphere (within a thousandth of its
+  radius) but not on it and the neighbors carried on disagree, the sphere is the reference instead of
+  none.
+- **Quads round a center** (`fill_quads.lucb`, Alias's N-sided split into four-sided patches). Each
+  boundary is split at its middle; quad k sits at the hole's corner where boundary k starts, its
+  inner sides seams to a center, on the frame of the setback corners (`patch_fit.lucb`: the seams G1
+  exactly with the coefficients of a regular vertex of N, G2 by least squares, the thin-plate energy
+  choosing among the rest; its pieces are public for this). The boundary rows are the boundaries
+  themselves, raised to degree 5 on one knot vector of eight spans a half or more (exact). Beside a
+  plane the next rows lie in it (G1 and G2 exact); beside other neighbors rows at 64 stations a side
+  hold G1, then, the slopes held to that answer's, G2, linear once the slope is known: one dense
+  solve of a few thousand unknowns. Auto takes quads where some G1 or G2 boundary lies beside a
+  straight sweep (a fillet's end section) and every one beside a plane or such a sweep (the corners of
+  fillets and walls), the boundaries polynomial; Domain Quads (`fill_domain_quads`) asks it anyway.
+  The five-sided corner of three G3 fillets and two walls fills G2 in about a second (was 96 by 64
+  spans, 107 s, G2 missed by up to 199%): G1 to a ten-thousandth of a degree, G2 to the walls exact,
+  along the fillets within 2% (most stations within the 0.5% tolerance) but within a tenth of a side of
+  the hole's corners, its five seams G2 by the Check tools. G1 corners of the same kind fill G1
+  everywhere, no conflicts, in a fraction of a second.
+- **Strips for a lid's turns** (`fill_strips.lucb`). Where a Quad lid's corner turns (above), the first
+  answer's cross derivative along each side is taken off it (off the turns its own; on them its length
+  at the turn's start blended to the corner's own, the other boundary's derivative, turned on the great
+  circle by the same eased fraction), the turn's change fitted into the first inner row by least
+  squares on the control points reaching into it, the twist's control point set so the corner has
+  none, the row off the turns laid in the walls' tangent planes, and that row fixed: the lid bends
+  between fixed strips, G2 linear on its second row. The turn reaches 35% of each side at a right
+  angle (a quarter bent it sharply) and G1 and G2 ease over it and a quarter more. The G1 lid's
+  smallest area element went from 0.06 to 0.73 of the mean, its peak curvature from 42 to 4.7 times
+  the mean, its mean curvature's ripple from 2247% to 65% (G2: 0.02 to 0.63, 73 to 4.1, 5727% to 93%),
+  at 16 by 16 spans (G2 32 by 32; was 4 by 4).
+
+The zebra stripes' poles are the environment's, not the surface's: Zebra reflects a cylinder of stripes
+round an axis, and where the reflected view runs along the axis every stripe meets (a ball shows one
+wherever its normal sends the view up the axis). A ball corner's fill now shows the pole the ball
+itself shows, the stripes running straight into it from the fillets.
+
+Not yet: a Molded fill's trimmed face can be hard to mesh where it rises square from its boundaries
+(its nearest-point searches stall), so four steep sides go to Quad; a corner's turn zone is a fixed
+share of each side; the quads' G2 along a fillet misses by up to 30% at the stations nearest the
+hole's corners (the other boundary leaves the corner off the fillet's sweep), and their rows beside
+curved neighbors other than sweeps are left to the trimmed fill; lids turned at their corners take 16
+by 16 spans (G2 32 by 32).
 
 ## Sketches (`sketch/`)
 

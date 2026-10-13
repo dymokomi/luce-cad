@@ -23,10 +23,12 @@ func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, h
         for c in 0..<(usize)3:
             try put_derivative(fn, row, st.uv, st.d, 0, axes[c])
             try held.hold(system, row, weight, st.p.dot(axes[c]), close)
-    if st.order >= 1 and st.has_face and (ease > 0.0 or st.turned):
-        # Turned toward a conflicting corner (corner_turn): held whole to
-        # the turned normal, by the weight alone (the turn is not a spline
-        # of the net's: driven exactly, its rows' leftovers would spread).
+    # Where a lid's turned corners are held (fill_strips.lucb: `cross` set),
+    # the strip along the boundary is fixed, its slope with it: no G1 row.
+    if st.cross.length() == 0.0 and st.order >= 1 and st.has_face and (ease > 0.0 or st.turned):
+        # G1, driven to its tolerance; turned toward a conflicting corner
+        # (corner_turn), held whole to the turned normal by the weight
+        # alone (the first answer, before the strips are held).
         try put_derivative(fn, row, st.uv, st.d, 1, st.held)
         if st.turned: try held.hold(system, row, weight, 0.0, 0.0)
         else: try held.hold(system, row, weight * ease, 0.0, square if exact else 0.0)
@@ -54,7 +56,9 @@ func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, h
                 let way = st.way.normalized() catch failure: recover Vector3()
                 try put_derivative(fn, row, st.uv, st.d, 1, way)
                 try held.hold(system, row, weight * 1e-4, across.length(), 0.0)
-    if st.order >= 2 and st.has_face and ease > 0.0:
+    # A turn held (its cross derivative leaves the neighbor's plane) has no
+    # curvature of the neighbor's to meet.
+    if st.order >= 2 and st.has_face and ease > 0.0 and not (st.turned and st.cross.length() > 0.0):
         if let l = cross:
             # n . S_dd = II(S_d, S_d), linearized about the last answer's
             # S_d = l (Gauss-Newton): II(S_d, S_d) ~ 2 II(l, S_d) - II(l, l).
@@ -114,12 +118,15 @@ func guide_points(w: FillWork*, per_length: f64, out: Growing[GuidePoint]*) -> !
 ## derivatives (iterating the right side alone diverges: a larger S_d asks
 ## a larger S_dd, which stretches S_d further; the linearized row weighs
 ## that), until the cross derivatives settle. Returns the passes.
-func solve_fill(w: const FillWork*, fn: FillNet*, stations: const FillStation[], guides: const GuidePoint[]) -> i64!:
+## `warm`: the net holds an answer already (a lid's turns, held now), so
+## G2's rounds start from it rather than from a solve without G2's rows.
+func solve_fill(w: const FillWork*, fn: FillNet*, stations: const FillStation[], guides: const GuidePoint[], warm: bool = false) -> i64!:
     var any_g2 = false
     for st in stations: any_g2 = any_g2 or (st.order >= 2 and st.has_face)
     var crosses = Growing[Vector3?]()
     defer crosses.close()
-    var passes = try solve_once(w, fn, stations, guides, crosses.view())
+    var passes: i64 = 0
+    if not (warm and any_g2): passes = try solve_once(w, fn, stations, guides, crosses.view())
     if not any_g2: return passes
     var merit = fill_merit(w, fn, stations)
     var before = Growing[Weighted]()

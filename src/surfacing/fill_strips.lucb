@@ -1,0 +1,201 @@
+## Fill's strips (surfacing Stage 7; fill.lucb has the plan): a Quad lid on
+## walls whose planes meet at its corners (a box's top on its four walls).
+## No surface is G1 to both walls at such a corner: its own tangent plane
+## there is the plane of the two boundaries, so the way it leaves each wall
+## must turn, near the corner, from the wall's to the other boundary's
+## (corner_turn). Rows asking that turn of a station at a time let the
+## cross derivative shrink inside the turn (the energy prefers it short),
+## and the lid pinched to a point at each corner: zebra stripes drawn into
+## a star there.
+##
+## So, as Coons and Gregory build a patch from boundary curves and cross
+## derivatives, the lid's first answer gives each side's cross derivative
+## field: its own off the turns (G1 met there), and on them its length at
+## the turn's start blended to the corner's (the other boundary's own
+## derivative, fixed by its row), turned on the great circle by the same
+## eased fraction. The field is fitted into the net's first inner row along
+## each side (S_d = p (P_1 - P_0) / (t_p+1 - t_1) at a clamped end), its
+## corner control points the other sides' boundary rows' and the twists at
+## the corners each side asks alike (a turn starts and ends with no rate,
+## so a turned corner's twist is zero; elsewhere the first answer's), and
+## that row fixed with the boundary's (off the turns its coefficients laid
+## in the neighbors' tangent planes, so the fit's leftovers from the turns
+## tilt no wall): the lid then bends between fixed strips, G2's rows
+## (linear, the slope known) on its second row.
+
+## The cross derivative of side `k` at fraction `s` (`fn` the first answer):
+## the answer's own off a turn, or the turn's blend (see the header). The
+## station there, eased and turned, onto `st`.
+func strip_cross(w: FillWork*, fn: const FillNet*, k: usize, s: f64, st: FillStation*) -> Vector3!:
+    let (uv, d) = quad_place(&fn.net, k, s)
+    *st = try make_station(w, k, s, uv, d)
+    st.weight = corner_ease(w, st)
+    try corner_turn(w, st)
+    let j = net_jet(fn, uv)
+    let own = j[1].multiply_scalar(d.x).add(j[2].multiply_scalar(d.y))
+    if not st.turned: return own
+    let n = w.sides.count
+    let zone = w.turns.items[k].zone if st.toward_end else w.turns.items[(k + n - 1) % n].zone
+    let (edge_uv, edge_d) = quad_place(&fn.net, k, 1.0 - zone if st.toward_end else zone)
+    let (corner_uv, corner_d) = quad_place(&fn.net, k, 1.0 if st.toward_end else 0.0)
+    let je = net_jet(fn, edge_uv)
+    let jc = net_jet(fn, corner_uv)
+    let at_edge = je[1].multiply_scalar(edge_d.x).add(je[2].multiply_scalar(edge_d.y))
+    let at_corner = jc[1].multiply_scalar(corner_d.x).add(jc[2].multiply_scalar(corner_d.y))
+    let t = st.tangent
+    let a = st.leave.subtract(t.multiply_scalar(st.leave.dot(t))).normalized() catch failure: return own
+    let b = at_corner.normalized() catch failure: return own
+    let e = st.turn
+    let angle = math.acos(math.clamp(a.dot(b), -1.0, 1.0))
+    var way = b
+    if angle > 1e-9 and angle < math.pi - 1e-6:
+        way = a.multiply_scalar(math.sin((1.0 - e) * angle) / math.sin(angle)).add(b.multiply_scalar(math.sin(e * angle) / math.sin(angle)))
+    return way.multiply_scalar(at_edge.length() * (1.0 - e) + at_corner.length() * e)
+
+## Side `k`'s boundary and first inner control points at index `i` along
+## it (the net's own order), and the step h with P_inner = P_bnd + h S_d
+## (h = (t_p+1 - t_1) / p at the low end, (t_n+p-1 - t_n-1) / p at the high).
+func strip_slots(net: const Net*, k: usize, i: usize) -> (usize, usize, f64):
+    let nv = net.nv
+    if k == 0: return (i * nv, i * nv + 1, (net.kv.items[(usize)net.dv + 1] - net.kv.items[1]) / (f64)net.dv)
+    if k == 2: return (i * nv + nv - 1, i * nv + nv - 2, (net.kv.items[nv + (usize)net.dv - 1] - net.kv.items[nv - 1]) / (f64)net.dv)
+    if k == 1: return ((net.nu - 1) * nv + i, (net.nu - 2) * nv + i, (net.ku.items[net.nu + (usize)net.du - 1] - net.ku.items[net.nu - 1]) / (f64)net.du)
+    return (i, nv + i, (net.ku.items[(usize)net.du + 1] - net.ku.items[1]) / (f64)net.du)
+
+## The lid's net with its strips fixed (see the header), from the first
+## answer `fn`; each station's cross derivative onto `stations` (held: no
+## G1 rows are left for them).
+func quad_strips(w: FillWork*, fn: const FillNet*, stations: Growing[FillStation]*) -> FillNet!:
+    let net = &fn.net
+    var points = Growing[Weighted]()
+    defer points.close()
+    try points.assign(net.points.view())
+    var fixed = Growing[bool]()
+    defer fixed.close()
+    try fixed.fill(net.nu * net.nv, false)
+    var st = FillStation(0, 0.0, Vector3(), Vector3(), Vector3(), Vector3(), -1, false, NeighborForm(Vector3(), [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]), Vector3(), 1.0, Vector3(), Vector3(), Vector3(), false, 0.0, false, Vector3())
+    for k in 0..<(usize)4:
+        let count = net.nu if k % 2 == 0 else net.nv
+        for i in 0..<count:
+            let (b, inner, _) = strip_slots(net, k, i)
+            fixed.items[b] = true
+            fixed.items[inner] = true
+        for end in 0..<(usize)2:
+            try strip_turn(w, fn, k, end, &points, &st)
+        try strip_settle(w, fn, k, &points)
+    # Each station's cross derivative: held by the strip (station_rows
+    # leaves out its G1 row).
+    for at in 0..<stations.count:
+        let s = &stations.items[at]
+        if s.order < 1 or not s.has_face: continue
+        s.cross = try strip_cross(w, fn, s.side, s.s, &st)
+    return try fill_net(net.du, net.dv, net.ku.view(), net.kv.view(), fixed.view(), points.view())
+
+## Side `k`'s strip at its end `end` of the net's order (0 low, 1 high)
+## turned into `points` where that corner turns: the first answer's own
+## strip changed only on the control points reaching into the turn, by the
+## least-squares fit of the turn's change of the cross derivative there
+## (zero past the turn, so the rest of the strip, G1 already, stays), the
+## twist's control point set so the corner has none (C_1 = C_0: both sides
+## ask the same).
+func strip_turn(w: FillWork*, fn: const FillNet*, k: usize, end: usize, points: Growing[Weighted]*, st: FillStation*) -> !:
+    let net = &fn.net
+    let along_u = k % 2 == 0
+    let knots = net.ku.view() if along_u else net.kv.view()
+    let degree = net.du if along_u else net.dv
+    let p = (usize)degree
+    let count = net.nu if along_u else net.nv
+    let back = k >= 2
+    # The corner at this end: loop corner k at side k's start, k + 1 at its
+    # end (sides 2 and 3 run back); corner c lies between sides c - 1 and c.
+    let at_loop_start = (end == 0) != back
+    let corner = k if at_loop_start else (k + 1) % 4
+    let turn = &w.turns.items[(corner + 3) % 4]
+    if not turn.turned: return
+    let low = knots[p]
+    let high = knots[count]
+    let reach = (high - low) * turn.zone
+    let i0 = 0 if end == 0 else count - 1
+    let i1 = 1 if end == 0 else count - 2
+    let (b0, n0, h) = strip_slots(net, k, i0)
+    let (b1, n1, _) = strip_slots(net, k, i1)
+    # The twist's control point: no twist.
+    let c0 = points.items[n0].point().subtract(points.items[b0].point()).multiply_scalar(1.0 / h)
+    let d1 = c0.subtract(net.points.items[n1].point().subtract(net.points.items[b1].point()).multiply_scalar(1.0 / h))
+    points.items[n1] = weighted(points.items[b1].point().add(c0.multiply_scalar(h)), 1.0)
+    # The control points reaching into the turn (not the corner's two).
+    var ids = Growing[usize]()
+    defer ids.close()
+    for i in 2..<count - 2:
+        let inside = knots[i] < low + reach if end == 0 else knots[i + p + 1] > high - reach
+        if inside: try ids.push(i)
+    let m = ids.count
+    if m == 0: return
+    # Samples over their supports, sixteen a span.
+    var first = knots[ids.items[0]]
+    var last = knots[ids.items[m - 1] + p + 1]
+    if end == 0: first = low
+    else: last = high
+    var normal = Growing[f64]()
+    defer normal.close()
+    try normal.fill(m * m, 0.0)
+    var rhs = Growing[Vector3]()
+    defer rhs.close()
+    try rhs.fill(m, Vector3())
+    var bases: f64[12]
+    let steps = (usize)math.max(16.0, math.ceil(16.0 * (last - first) / ((high - low) / (f64)(count - p))))
+    for q in 0..<steps + 1:
+        let t = first + (last - first) * (f64)q / (f64)steps
+        var s = (t - low) / (high - low)
+        if back: s = 1.0 - s
+        let (uv, d) = quad_place(net, k, s)
+        let j = net_jet(fn, uv)
+        let own = j[1].multiply_scalar(d.x).add(j[2].multiply_scalar(d.y))
+        var change = (try strip_cross(w, fn, k, s, st)).subtract(own)
+        let f = nurbs_basis(knots, (i64)count, degree, t, &bases)
+        # Less the twist control point's own change.
+        if f <= i1 and i1 <= f + p: change = change.subtract(d1.multiply_scalar(bases[i1 - f]))
+        for a in 0..<m:
+            let ia = ids.items[a]
+            if ia < f or ia > f + p: continue
+            let na = bases[ia - f]
+            rhs.items[a] = rhs.items[a].add(change.multiply_scalar(na))
+            for c in 0..<m:
+                let ic = ids.items[c]
+                if ic < f or ic > f + p: continue
+                normal.items[a * m + c] += na * bases[ic - f]
+    try solve_dense(&normal, m, &rhs)
+    for a in 0..<m:
+        let (b, inner, _) = strip_slots(net, k, ids.items[a])
+        _ = b
+        points.items[inner] = weighted(net.points.items[inner].point().add(rhs.items[a].multiply_scalar(h)), 1.0)
+
+## Side `k`'s strip off its turns laid in the neighbor's tangent plane: each
+## inner control point's slope coefficient (P_inner - P_bnd) / h without
+## its part along the neighbor's normal at the control point's Greville
+## point, so neither the first answer's leftovers (its G1 rows met only to
+## their multipliers' tolerance beside the turns' held normals) nor the
+## turns' fits reaching past them tilt a wall: a plane neighbor is then met
+## exactly.
+func strip_settle(w: FillWork*, fn: const FillNet*, k: usize, points: Growing[Weighted]*) -> !:
+    let net = &fn.net
+    let along_u = k % 2 == 0
+    let knots = net.ku.view() if along_u else net.kv.view()
+    let degree = net.du if along_u else net.dv
+    let count = net.nu if along_u else net.nv
+    let back = k >= 2
+    let low = knots[(usize)degree]
+    let high = knots[count]
+    for i in 1..<count - 1:
+        var s = (greville(knots, i, degree) - low) / (high - low)
+        if back: s = 1.0 - s
+        let (uv, d) = quad_place(net, k, s)
+        var probe = try make_station(w, k, s, uv, d)
+        if probe.order < 1 or not probe.has_face: continue
+        probe.weight = corner_ease(w, &probe)
+        try corner_turn(w, &probe)
+        if probe.turned: continue
+        let (b, inner, h) = strip_slots(net, k, i)
+        let c = points.items[inner].point().subtract(points.items[b].point()).multiply_scalar(1.0 / h)
+        let n = probe.form.n
+        points.items[inner] = weighted(points.items[b].point().add(c.subtract(n.multiply_scalar(c.dot(n))).multiply_scalar(h)), 1.0)

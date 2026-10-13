@@ -64,12 +64,16 @@
 ## stations' G1 and G2 rows eased to nothing at the corner within a zone,
 ## and what fails at the end is reported as runs along the boundaries.
 
-## N-sided domains (Alias's N-sided Projected and Molded): Auto projects
-## onto the loop's best plane unless a neighbor stands square to it, then
-## molds.
+## N-sided domains (Alias's N-sided Projected and Molded, and its N
+## quads round a center): Auto fills with quads where their rows can match
+## every neighbor exactly (fill_quads.lucb), else projects onto the loop's
+## best plane unless a neighbor stands square to it, then molds.
 pub let fill_domain_auto: i64 = 0
 pub let fill_domain_projected: i64 = 1
 pub let fill_domain_molded: i64 = 2
+## N quads round a center (fill_quads.lucb): Auto takes it where every
+## boundary's neighbor is a plane or a straight sweep across it.
+pub let fill_domain_quads: i64 = 3
 
 ## Boundary flows (Quad; Plasticity's xNURBS Boundary).
 pub let fill_flow_natural: i64 = 0
@@ -141,6 +145,12 @@ struct FillStation:
     var held: Vector3
     var way: Vector3
     var turned: bool
+    ## Turned (Quad): how far the turn has gone (0 to 1, eased), whether
+    ## toward the side's end (else its start), and the cross derivative held
+    ## there (turn_crosses; zero: none yet, the rows let go).
+    var turn: f64
+    var toward_end: bool
+    var cross: Vector3
 
 ## A corner whose neighbors' tangent planes disagree (a lid's corner on two
 ## walls) and whose boundaries meet at an angle: the fill cannot be G1 to
@@ -183,6 +193,10 @@ struct FillWork:
     ## side k from angles[k] to angles[k + 1] (the last 2π).
     var molded: bool
     var angles: Growing[f64]
+    ## Where the sides' ribbons disagree but their points and normals lie on
+    ## one sphere (a ball corner's three fillets), the reference is that
+    ## sphere (fill_reference.lucb's ball_fit).
+    var ball: FillBall
 
     func close():
         close_fill_sides(&self.sides)
@@ -250,9 +264,13 @@ struct FillMade:
     ## holding it).
     var cuts: Growing[Spline]
     var inside: Vector3
+    ## N-sided by quads (fill_quads.lucb): the quads' nets (world units),
+    ## one face each, `net` the first's.
+    var quads: Growing[Net]
 
     func close():
         self.net.close()
+        close_nets(&self.quads)
         self.conflicts.close()
         self.gaps.close()
         self.angles.close()
@@ -321,7 +339,7 @@ func make_station(w: FillWork*, k: usize, s: f64, uv: Vector3, d: Vector3) -> Fi
             let goal = try m.target(spline_nearest(&m.curve, p), &probe, 0.0)
             leave = goal.t.multiply_scalar(-1.0) if m.kind == master_edge else goal.t
             if w.opts.quad and w.opts.flow == fill_flow_adjacent: flow = leave
-    return FillStation(k, s, w.local(p), tangent, uv, d, order, has_face, form, flow, 1.0, leave, form.n, leave, false)
+    return FillStation(k, s, w.local(p), tangent, uv, d, order, has_face, form, flow, 1.0, leave, form.n, leave, false, 0.0, false, Vector3())
 
 ## The stations of the N-sided chart: `per` along each side by the side's
 ## share of the loop's chart length, at the middles of equal steps (never
@@ -516,10 +534,21 @@ func find_corners(w: FillWork*) -> !:
         if planes_apart and ta.cross(tb).length() > 0.1 and into_a.length() > 0.0 and into_b.length() > 0.0:
             # The zone grows with the turn: a quarter of each side for a
             # right angle (a lid's corner on two walls), narrower for less.
-            zone = math.clamp(0.25 * worst / 90.0, 0.03, 0.25)
+            let most = quad_turn_zone if w.opts.quad else 0.25
+            zone = math.clamp(most * worst / 90.0, 0.03, most)
             w.turns.items[k] = CornerTurn(true, zone, into_a, into_b)
         let corner = p
-        try w.corners.push(FillConflict((i64)a.picked, order, corner, corner, worst, true, zone * math.max(a.length, b.length)))
+        let eased_zone = zone * turn_margin(w) if w.turns.items[k].turned else zone
+        try w.corners.push(FillConflict((i64)a.picked, order, corner, corner, worst, true, eased_zone * math.max(a.length, b.length)))
+
+## A Quad lid's turn reaches 35% of each side at a right angle (its strips,
+## fill_strips.lucb, spread the turn: a quarter bent them sharply), N-sided
+## ones a quarter; a Quad's G1 and G2 ease over its turn and a quarter more
+## (where the strip settles onto the neighbor).
+let quad_turn_zone: f64 = 0.35
+
+func turn_margin(w: const FillWork*) -> f64:
+    return 1.25 if w.opts.quad else 1.0
 
 ## |a - b| relative to the larger magnitude, in percent, below a floor of
 ## 5e-4 in normalized units (the Check tools' floor, a thousandth over the
@@ -539,20 +568,25 @@ func corner_turn(w: const FillWork*, st: FillStation*) -> !:
     st.held = st.form.n
     st.way = st.leave
     st.turned = false
+    st.turn = 0.0
+    st.cross = Vector3()
     if st.order < 1 or not st.has_face or st.leave.length() == 0.0: return
     let n = w.sides.count
     let end = &w.turns.items[st.side]
     let start = &w.turns.items[(st.side + n - 1) % n]
     var into = Vector3()
     var f = 0.0
+    var toward_end = false
     if end.turned and st.s > 1.0 - end.zone:
         into = end.into_a
         f = 1.0 - (1.0 - st.s) / end.zone
+        toward_end = true
     if start.turned and st.s < start.zone:
         let g = 1.0 - st.s / start.zone
         if g > f:
             into = start.into_b
             f = g
+            toward_end = false
     if not (f > 0.0): return
     let t = st.tangent
     let leave = st.leave.subtract(t.multiply_scalar(st.leave.dot(t))).normalized() catch failure: return
@@ -570,6 +604,8 @@ func corner_turn(w: const FillWork*, st: FillStation*) -> !:
     st.held = normal
     st.way = way
     st.turned = true
+    st.turn = e
+    st.toward_end = toward_end
 
 ## |a - b| relative to the larger rate of curvature, in percent, below a
 ## floor of 1e-3 in normalized units (the Check tools' rate floor, a
@@ -585,8 +621,8 @@ func corner_ease(w: const FillWork*, st: const FillStation*) -> f64:
     let n = w.sides.count
     let before = (st.side + n - 1) % n
     # A turned corner's zone is its turn's.
-    let zone_end = w.turns.items[st.side].zone if w.turns.items[st.side].turned else 0.03
-    let zone_start = w.turns.items[before].zone if w.turns.items[before].turned else 0.03
+    let zone_end = w.turns.items[st.side].zone * turn_margin(w) if w.turns.items[st.side].turned else 0.03
+    let zone_start = w.turns.items[before].zone * turn_margin(w) if w.turns.items[before].turned else 0.03
     var ease = 1.0
     if w.eased.items[st.side] and st.s > 1.0 - zone_end: ease = math.min(ease, math.pow((1.0 - st.s) / zone_end, 2.0))
     if w.eased.items[before] and st.s < zone_start: ease = math.min(ease, math.pow(st.s / zone_start, 2.0))

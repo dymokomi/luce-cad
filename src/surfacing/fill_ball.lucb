@@ -1,0 +1,226 @@
+## Fill's ball (surfacing Stage 7; fill.lucb has the plan): a hole whose
+## boundaries and neighbors' normals lie on one sphere (a ball corner's
+## three fillets of one radius meet their ball along their edges, the
+## ball's normals theirs there; a cap cut from a ball) fills with that
+## sphere, exactly, as Parasolid's vertex blend of equal rolling-ball
+## blends is the ball: an untrimmed rational biquadratic window of it about
+## the hole, its poles off it (no parameter line collapses inside), trimmed
+## by the boundaries themselves. A hole whose data lie near one sphere but
+## not on it takes the sphere as the reference the fill bends least from
+## (fill_reference.lucb), where the neighbors carried on disagree.
+
+## A sphere (normalized units): its center and radius, which of the chart
+## line's two meetings with it is the fill's (+1 the one further along the
+## chart's normal ez, -1 the nearer), and how far off its axis (the line
+## through the center along ez) the reference's height is the sphere's
+## own: further out, toward the sphere's silhouette, where only the
+## trimmed-away margin of the net lies, the height carries on as its
+## second-order Taylor polynomial (the sphere has no height past its
+## silhouette, and the net must fit what lies over its whole box).
+struct FillBall:
+    var on: bool
+    var center: Vector3
+    var radius: f64
+    var sign: f64
+    var reach: f64
+
+func no_ball() -> FillBall:
+    return FillBall(false, Vector3(), 0.0, 1.0, 0.0)
+
+## The sphere of `stations`' points and normals (their G1 and G2 ones)
+## onto `w.ball`, on when they lie on it within `within` (normalized
+## units) and `share` of its radius. p - rho n = c at every station is linear in the center c and
+## the signed radius rho: for a given rho, c is the mean of p - rho n, and
+## rho is then the least-squares slope of the points' spread on the
+## normals'. Off where the chart cannot see the hole as a height of the
+## sphere (boundary points on both sides of its equator seen along ez, or
+## nearly at its silhouette). Returns the worst miss (1e300: no sphere).
+func ball_fit(w: FillWork*, stations: const FillStation[], within: f64, share: f64) -> f64:
+    w.ball = no_ball()
+    var count = 0.0
+    var pm = Vector3()
+    var nm = Vector3()
+    for st in stations:
+        if st.order < 1 or not st.has_face: continue
+        pm = pm.add(st.p)
+        nm = nm.add(st.form.n)
+        count += 1.0
+    if count < 6.0: return 1.0e300
+    pm = pm.multiply_scalar(1.0 / count)
+    nm = nm.multiply_scalar(1.0 / count)
+    var num = 0.0
+    var den = 0.0
+    for st in stations:
+        if st.order < 1 or not st.has_face: continue
+        let dn = st.form.n.subtract(nm)
+        num += st.p.subtract(pm).dot(dn)
+        den += dn.dot(dn)
+    # Normals all alike: a plane, not a ball.
+    if not (den > 1e-6 * count): return 1.0e300
+    let rho = num / den
+    let center = pm.subtract(nm.multiply_scalar(rho))
+    let radius = math.abs(rho)
+    if not (radius > 1e-9 and radius < 1e3): return 1.0e300
+    var misfit = 0.0
+    var side = 0.0
+    var reach = 0.0
+    for st in stations:
+        if st.order < 1 or not st.has_face: continue
+        misfit = math.max(misfit, st.p.subtract(st.form.n.multiply_scalar(rho)).subtract(center).length())
+        let off = st.p.subtract(center)
+        side += off.dot(w.ez)
+        reach = math.max(reach, off.subtract(w.ez.multiply_scalar(off.dot(w.ez))).length())
+    if misfit > within + share * radius: return misfit
+    let sign = 1.0 if side > 0.0 else -1.0
+    for st in stations:
+        if st.order < 1 or not st.has_face: continue
+        if st.p.subtract(center).dot(w.ez) * sign <= 0.0: return 1.0e300
+    if reach > radius * 0.95: return 1.0e300
+    w.ball = FillBall(true, center, radius, sign, reach + 0.25 * (radius * 0.95 - reach))
+    return misfit
+
+## How far chart point `q` lies off the ball's axis.
+func ball_off_axis(w: const FillWork*, q: Vector3) -> f64:
+    let d = w.ex.multiply_scalar(q.x).add(w.ey.multiply_scalar(q.y)).subtract(w.ball.center)
+    return d.subtract(w.ez.multiply_scalar(d.dot(w.ez))).length()
+
+## The ball's point over chart point `q`: the sphere's, or past its reach
+## the height's Taylor polynomial there.
+func ball_height(w: const FillWork*, q: Vector3) -> Vector3:
+    let b = &w.ball
+    let d = w.ex.multiply_scalar(q.x).add(w.ey.multiply_scalar(q.y)).subtract(b.center)
+    let off = d.subtract(w.ez.multiply_scalar(d.dot(w.ez)))
+    let r = off.length()
+    let rr = b.radius * b.radius
+    var h = 0.0
+    if r <= b.reach: h = b.sign * math.sqrt(rr - r * r)
+    else:
+        let root = math.sqrt(rr - b.reach * b.reach)
+        let step = r - b.reach
+        h = b.sign * (root - b.reach / root * step - 0.5 * rr / (root * root * root) * step * step)
+    return b.center.add(off).add(w.ez.multiply_scalar(h))
+
+# -- The exact ball.
+
+## Whether `w`'s hole is a ball's (its sphere onto `w.ball`): every side G1
+## or G2 beside a face, their points and normals on one sphere within the
+## position tolerance at 32 stations a side, and a G2 side's neighbor as
+## curved as the sphere every way there (a hole in a ball; a cylinder's
+## curvature along its axis is not the ball's). Not with guides or points,
+## nor Explicit Control.
+func exact_ball(w: FillWork*) -> bool!:
+    if w.opts.quad or w.opts.explicit or w.guides.count > 0 or w.points.count > 0 or w.sides.count < 2: return false
+    var stations = Growing[FillStation]()
+    defer stations.close()
+    for k in 0..<w.sides.count:
+        if w.sides.items[k].order() < 1: return false
+        for q in 0..<(usize)32:
+            try stations.push(try make_station(w, k, ((f64)q + 0.5) / 32.0, Vector3(), Vector3()))
+    if ball_fit(w, stations.view(), w.position, 0.0) > w.position:
+        w.ball = no_ball()
+        return false
+    let bent = 1.0 / w.ball.radius
+    for st in stations.view():
+        if st.order < 2: continue
+        let across = st.form.n.cross(st.tangent)
+        for x in [st.tangent, across]:
+            let k = st.form.curvature_of(x) / math.max(1e-300, x.dot(x))
+            if fill_relative(math.abs(k), bent) > w.curvature * 0.1:
+                w.ball = no_ball()
+                return false
+    return true
+
+## The rational quadratic arc of the unit circle from angle `a0` to `a1`
+## (less than half a turn): its control points' cosines, sines and weights.
+func arc_controls(a0: f64, a1: f64) -> (Vector3, Vector3, Vector3):
+    let half = (a1 - a0) * 0.5
+    let middle = (a0 + a1) * 0.5
+    let c = math.cos(half)
+    return (Vector3(math.cos(a0), math.cos(middle) / c, math.cos(a1)), Vector3(math.sin(a0), math.sin(middle) / c, math.sin(a1)), Vector3(1.0, c, 1.0))
+
+## The fill of a ball's hole (exact_ball): the window of the sphere (world
+## units) between the boundary's least and greatest latitude and longitude
+## and a tenth more each way, about poles square to the hole's mean
+## direction from the center (so they lie off it); the boundaries
+## themselves trim it; measured at the stations as the net's fill is.
+func ball_made(w: FillWork*) -> FillMade!:
+    let c = w.world(w.ball.center)
+    let r = w.ball.radius * w.scale
+    var mean = Vector3()
+    for side in w.sides.view():
+        for q in 0..<(usize)32: mean = mean.add(side.curve.point_at((f64)q / 32.0).subtract(c).normalized() catch failure: recover Vector3())
+    let m = mean.normalized() catch failure: error(invalid, "Fill: the ball's hole has no middle")
+    let pole = try square_to(m)
+    let east = pole.cross(m)
+    var lat0 = 1.0e300
+    var lat1 = -1.0e300
+    var lon0 = 1.0e300
+    var lon1 = -1.0e300
+    for side in w.sides.view():
+        for q in 0..<(usize)129:
+            let d = side.curve.point_at((f64)q / 128.0).subtract(c).multiply_scalar(1.0 / r)
+            let lat = math.asin(math.clamp(d.dot(pole), -1.0, 1.0))
+            let lon = math.atan2(d.dot(east), d.dot(m))
+            lat0 = math.min(lat0, lat)
+            lat1 = math.max(lat1, lat)
+            lon0 = math.min(lon0, lon)
+            lon1 = math.max(lon1, lon)
+    let grow_lat = (lat1 - lat0) * 0.1 + 0.02
+    let grow_lon = (lon1 - lon0) * 0.1 + 0.02
+    lat0 = lat0 - grow_lat
+    lat1 = lat1 + grow_lat
+    lon0 = lon0 - grow_lon
+    lon1 = lon1 + grow_lon
+    if lat0 < -1.45 or lat1 > 1.45 or lon1 - lon0 > 2.9: error(invalid, "Fill: the ball's hole spans too much of it")
+    # A surface of revolution (Piegl and Tiller): the meridian's arc (u)
+    # turned by the longitude's (v), its control points (x_i Q_j, z_i).
+    let (mx, mz, mw) = arc_controls(lat0, lat1)
+    let (qx, qy, qw) = arc_controls(lon0, lon1)
+    let xs: f64[3] = [mx.x, mx.y, mx.z]
+    let zs: f64[3] = [mz.x, mz.y, mz.z]
+    let ws: f64[3] = [mw.x, mw.y, mw.z]
+    let cs: f64[3] = [qx.x, qx.y, qx.z]
+    let ss: f64[3] = [qy.x, qy.y, qy.z]
+    let vs: f64[3] = [qw.x, qw.y, qw.z]
+    var net = empty_net()
+    errdefer net.close()
+    net.du = 2
+    net.dv = 2
+    net.nu = 3
+    net.nv = 3
+    for k in [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]:
+        try net.ku.push(k)
+        try net.kv.push(k)
+    for i in 0..<(usize)3:
+        for j in 0..<(usize)3:
+            let p = c.add(m.multiply_scalar(r * xs[i] * cs[j]).add(east.multiply_scalar(r * xs[i] * ss[j])).add(pole.multiply_scalar(r * zs[i])))
+            try net.points.push(weighted(p, ws[i] * vs[j]))
+    var made = FillMade(net, true, Growing[FillConflict](), Growing[f64](), Growing[f64](), Growing[f64](), 0.0, 0, Growing[Spline](), c.add(m.multiply_scalar(r)), Growing[Net]())
+    errdefer made.close()
+    let count = w.sides.count
+    try made.gaps.fill(count, 0.0)
+    try made.angles.fill(count, 0.0)
+    try made.curvatures.fill(count, 0.0)
+    try made.conflicts.assign(w.corners.view())
+    # Facing the neighbors: the window's normal (meridian x longitude
+    # points away from the center) against theirs.
+    var lean = 0.0
+    for k in 0..<count:
+        let side = &w.sides.items[k]
+        for q in 0..<(usize)64:
+            var st = try make_station(w, k, ((f64)q + 0.5) / 64.0, Vector3(), Vector3())
+            st.weight = corner_ease(w, &st)
+            let p = w.world(st.p)
+            let out = p.subtract(c).normalized() catch failure: continue
+            made.gaps.items[side.picked] = math.max(made.gaps.items[side.picked], math.abs(p.subtract(c).length() - r))
+            lean += out.dot(st.form.n)
+            if st.weight < 1.0: continue
+            made.angles.items[side.picked] = math.max(made.angles.items[side.picked], math.acos(math.clamp(math.abs(out.dot(st.form.n)), -1.0, 1.0)) * 180.0 / math.pi)
+            if st.order >= 2:
+                let across = st.form.n.cross(st.tangent)
+                let theirs = st.form.curvature_of(across) / math.max(1e-300, across.dot(across))
+                let mine = -w.scale / r if out.dot(st.form.n) > 0.0 else w.scale / r
+                made.curvatures.items[side.picked] = math.max(made.curvatures.items[side.picked], fill_relative(mine, theirs))
+    made.sense = lean >= 0.0
+    for side in w.sides.view(): try made.cuts.push(try side.curve.copy())
+    return made

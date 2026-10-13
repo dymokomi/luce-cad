@@ -1,0 +1,100 @@
+## Fairness (Class-A evaluation, Alias's Surface Evaluate and the curvature
+## views as numbers): how evenly a surface's curvature flows. Each face
+## chosen is sampled on a grid over its parameters, inside its trim, its
+## principal curvatures from the exact jet (the normal oriented by the
+## face's sense). From the mean curvature H = (k1 + k2) / 2:
+##   spread: its standard deviation over the mean |H|, in percent (a ball's
+##     patch 0; a dented or pointed one tens);
+##   peak: the largest |k| over the mean |H| (a pinch, the curvature
+##     gathered at a corner, shows as a peak in the hundreds);
+##   jump: the largest change of H between neighboring samples over the
+##     mean |H|, in percent (a ripple, wavy zebra stripes);
+##   area: the smallest area element |S_u x S_v| over the mean (a parameter
+##     line collapsing inside the face, a point singularity, goes to zero).
+
+## A face's fairness (see the file's header): the samples taken and the
+## measures.
+pub struct CadFairness:
+    pub var samples: i64
+    pub var mean: f64
+    pub var spread: f64
+    pub var peak: f64
+    pub var jump: f64
+    pub var area: f64
+
+## The fairness of `model`'s faces `faces` (names apart by `;`; empty:
+## every face) on grids of `samples` by `samples` a face.
+pub func fairness_of(model: const CadModel*, faces: str, samples: i64) -> CadFairness!:
+    if samples < 3 or samples > 1000: error(invalid, "a fairness takes 3 to 1000 samples a side")
+    let n = (usize)samples
+    var w = try shape_of(model)
+    defer w.close()
+    var hs = Growing[f64]()
+    defer hs.close()
+    var inside = Growing[bool]()
+    defer inside.close()
+    var chart = Growing[Vector3]()
+    defer chart.close()
+    var starts = Growing[usize]()
+    defer starts.close()
+    var count = 0.0
+    var sum = 0.0
+    var sum2 = 0.0
+    var largest = 0.0
+    var area_sum = 0.0
+    var area_least = 1.0e300
+    var jump = 0.0
+    for f in 0..<w.faces.count:
+        if faces.length > 0 and not named_in(faces, w.face_name(f)): continue
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        try face_chart(&w, f, &chart, &starts)
+        if chart.count == 0: continue
+        var low = Vector3(1.0e300, 1.0e300, 0.0)
+        var high = Vector3(-1.0e300, -1.0e300, 0.0)
+        for q in chart.view():
+            low = Vector3(math.min(low.x, q.x), math.min(low.y, q.y), 0.0)
+            high = Vector3(math.max(high.x, q.x), math.max(high.y, q.y), 0.0)
+        let sense = 1.0 if w.faces.items[f].sense else -1.0
+        hs.clear()
+        inside.clear()
+        for i in 0..<n:
+            for j in 0..<n:
+                let u = low.x + (high.x - low.x) * ((f64)i + 0.5) / (f64)n
+                let v = low.y + (high.y - low.y) * ((f64)j + 0.5) / (f64)n
+                var h = 0.0
+                var kept = chart_winding(chart.view(), starts.view(), u, v, periodic(s), s.kind == surface_torus) != 0
+                if kept:
+                    let jet = try surface_jet(s, Vector3(u, v, 0.0), false, false)
+                    let cross = jet.su.cross(jet.sv)
+                    let element = cross.length()
+                    kept = element > 0.0
+                    if kept:
+                        let normal = cross.multiply_scalar(sense / element)
+                        let e = jet.su.dot(jet.su)
+                        let ff = jet.su.dot(jet.sv)
+                        let g = jet.sv.dot(jet.sv)
+                        let l = normal.dot(jet.suu)
+                        let m = normal.dot(jet.suv)
+                        let nn = normal.dot(jet.svv)
+                        let det = e * g - ff * ff
+                        h = (e * nn - 2.0 * ff * m + g * l) / (2.0 * det)
+                        let k = (l * nn - m * m) / det
+                        let root = math.sqrt(math.max(0.0, h * h - k))
+                        largest = math.max(largest, math.abs(h) + root)
+                        count += 1.0
+                        sum += math.abs(h)
+                        sum2 += h * h
+                        area_sum += element
+                        area_least = math.min(area_least, element)
+                try hs.push(h)
+                try inside.push(kept)
+        for i in 0..<n:
+            for j in 0..<n:
+                if not inside.items[i * n + j]: continue
+                if i + 1 < n and inside.items[(i + 1) * n + j]: jump = math.max(jump, math.abs(hs.items[(i + 1) * n + j] - hs.items[i * n + j]))
+                if j + 1 < n and inside.items[i * n + j + 1]: jump = math.max(jump, math.abs(hs.items[i * n + j + 1] - hs.items[i * n + j]))
+    if count == 0.0: error(invalid, "a fairness found no face to sample (check the names)")
+    let mean = sum / count
+    let floor = math.max(mean, 1e-300)
+    let spread = math.sqrt(math.max(0.0, sum2 / count - mean * mean))
+    return CadFairness((i64)count, mean, spread / floor * 100.0, largest / floor, jump / floor * 100.0, area_least / (area_sum / count))

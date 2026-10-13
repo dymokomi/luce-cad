@@ -9,7 +9,11 @@
 ## normals (radians) and the normal curvatures' difference across
 ## (percent), each zero where the station does not hold that order.
 func fill_measure(fn: const FillNet*, st: const FillStation*) -> (f64, f64, f64):
-    let j = net_jet(fn, st.uv)
+    return jet_measure(net_jet(fn, st.uv), st)
+
+## The same from the fill's jet `j` (S, S_u, S_v, S_uu, S_uv, S_vv) at the
+## station, normalized units.
+func jet_measure(j: Vector3[6], st: const FillStation*) -> (f64, f64, f64):
     let gap = j[0].subtract(st.p).length()
     if st.order < 1 or not st.has_face: return (gap, 0.0, 0.0)
     let normal = j[1].cross(j[2])
@@ -133,6 +137,12 @@ func fill_made(w: FillWork*) -> FillMade!:
     if w.sides.count > 64: error(invalid, "Fill: a hole takes at most 64 boundaries")
     try choose_domain(w)
     try find_corners(w)
+    # A ball's hole fills with its ball; a hole whose neighbors are planes
+    # and straight sweeps with quads round a center.
+    if try exact_ball(w): return try ball_made(w)
+    if try quads_wanted(w):
+        if let made = try quads_made(w): return made
+    if w.opts.domain == fill_domain_quads: error(invalid, "Fill: Quads takes boundaries whose neighbors are planes or straight sweeps across them, curves of degree 5 or less")
     let du = w.opts.degree_u if w.opts.explicit else 5
     let dv = w.opts.degree_v if w.opts.explicit else 5
     if du < 2 or du > 9 or dv < 2 or dv > 9: error(invalid, "Fill: Explicit Control's degrees are 2 to 9")
@@ -226,16 +236,24 @@ func fill_made(w: FillWork*) -> FillMade!:
         # The reference's miss on this net: the spans the fill needs to
         # follow its neighbors' shape (a ball's cap its sphere), refined
         # while it misses by more than a ten-thousandth of the loop.
+        # Ribbons apart by more than a twentieth of the loop at its middle
+        # (neighbors that do not carry on into one surface: a ball corner's
+        # cylinders) would keep their blend's dent: the reference is then
+        # the sphere their points and normals lie on, when they do (a ball
+        # corner fills with its ball), else none and the plate's own bending
+        # is the rule. Molded's ribbons only start the fill (rough near the
+        # polygon's corners, measured from they rippled it).
         var reference_miss = 0.0
-        if not w.opts.quad: reference_miss = try fit_reference(w, &fn, stations.view())
-        # Molded's ribbons only start the fill (rough near the polygon's
-        # corners, measured from they rippled it), and ribbons apart by more
-        # than a twentieth of the loop at its middle (neighbors that do not
-        # carry on into one surface: a ball corner's cylinders) would keep
-        # their blend's dent: the plate's own bending is the rule there.
-        if not w.opts.quad and (w.molded or try ribbon_spread(w, stations.view()) > 0.05):
-            fn.reference.clear()
-            reference_miss = 0.0
+        if not w.opts.quad:
+            var apart = false
+            w.ball = no_ball()
+            if not w.molded:
+                apart = try ribbon_spread(w, stations.view()) > 0.05
+                if apart: _ = ball_fit(w, stations.view(), 0.0, 1e-3)
+            reference_miss = try fit_reference(w, &fn, stations.view())
+            if w.molded or (apart and not w.ball.on):
+                fn.reference.clear()
+                reference_miss = 0.0
         let width = math.min((high.x - low.x) / (f64)spans_of(ku.view(), du), (high.y - low.y) / (f64)spans_of(kv.view(), dv))
         try guide_points(w, 4.0 / width, &guides)
         if (w.opts.quad or w.molded) and guides.count > 0:
@@ -244,6 +262,15 @@ func fill_made(w: FillWork*) -> FillMade!:
             passes += try solve_fill(w, &fn, stations.view(), none_guides[..<0])
             for at in 0..<guides.count: guides.items[at].uv = net_nearest(&fn, guides.items[at].p)
         passes += try solve_fill(w, &fn, stations.view(), guides.view())
+        var any_turned = false
+        for st in stations.view(): any_turned = any_turned or st.turned
+        if w.opts.quad and any_turned:
+            # A lid's turned corners: its strips fixed from this answer
+            # (fill_strips.lucb), and the rest solved again.
+            var strips = try quad_strips(w, &fn, &stations)
+            fn.close()
+            fn = strips
+            passes += try solve_fill(w, &fn, stations.view(), guides.view(), warm = true)
         # The measures between the stations (N-sided: twice as dense).
         if w.opts.quad:
             for at in 0..<stations.count: try checks.push(stations.items[at])
@@ -331,7 +358,7 @@ func fill_finished(w: const FillWork*, fn: const FillNet*, checks: const FillSta
     let (u0, u1, v0, v1) = (net.u_low(), net.u_high(), net.v_low(), net.v_high())
     for at in 0..<net.ku.count: net.ku.items[at] = (net.ku.items[at] - u0) / (u1 - u0)
     for at in 0..<net.kv.count: net.kv.items[at] = (net.kv.items[at] - v0) / (v1 - v0)
-    var made = FillMade(net, true, Growing[FillConflict](), Growing[f64](), Growing[f64](), Growing[f64](), 0.0, passes, Growing[Spline](), Vector3())
+    var made = FillMade(net, true, Growing[FillConflict](), Growing[f64](), Growing[f64](), Growing[f64](), 0.0, passes, Growing[Spline](), Vector3(), Growing[Net]())
     errdefer made.close()
     let count = w.sides.count
     try made.gaps.fill(count, 0.0)
