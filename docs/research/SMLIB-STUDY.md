@@ -820,8 +820,17 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   64: T2 510,396 to 232,960 (volume extrapolated 3597.119, SMLib 3597.120), F7 281,574 to 115,750
   (3433.164, SMLib 3433.167), B4 330,466 to 49,692 (4045.7218, exact 4045.7223); T1 51,032 to
   157,474 and B3 65,036 to 162,632, whose spheres were meshed coarser than their target before
-  (T1's volume error 0.0065 to 0.0011). A few needles remain where one face's grid line crosses a
-  shared edge a hair from a sample it cannot snap to (both stay).
+  (T1's volume error 0.0065 to 0.0011). Then the needles where one face's grid line crossed a
+  shared edge a hair from a sample (both stayed, as stations): such a crossing now moves the
+  sample onto the line in that face's chart instead (`absorb_crossing`; the display is checked
+  through the sample's true chart point), lattice points keep a quarter cell clear of trim sides,
+  and chart refinement shapes every triangle, with an off-center on a short trim side. Worst
+  aspect (longest side squared over twice the area) of the holed balls' faces at 16/32/64
+  divisions: sphere faces 49/53/47 to 18/16/26; the walls 13,820/1,050,824/66,086 to
+  1,720/5,521/17,293 (one-row strips by design); floors 1,419/15,531/31,438 to 994/7,196/24,679
+  (strips across). `mesh_quality_tests` bounds the sphere faces at 30 and the walls at 20,000.
+  Triangles at 64: T2 232,960 to 227,720, B4 49,692 to 46,296; every comparison case still
+  closed, its extrapolated volume within 1e-3 of before but B5's (-0.011 to +0.009 of exact).
 
 - **Long cylinders at 64 divisions.** Their layouts need about a thousand columns round the axis
   (the sag target is relative to the section); the axis refinement halved intervals until the sag

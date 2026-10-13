@@ -2149,7 +2149,13 @@ Roughly in order of usefulness:
    offsets of other than profiles swept straight past their surfaces' ends (no extension yet), and
    draft; Delete healing several faces at once beside curved faces
    beyond a band round one face (strips apart, inside corners).
-10. **Needles where shared samples crowd:** a grid line of one face crossing a shared edge a hair
-   from one of its samples becomes a station beside it, and both faces keep a needle there (the
-   walls and floors of holes drilled in a ball). Sphere and other curved faces are otherwise
-   graded to their trims and shaped on the surface (`meshing/chart_delaunay.lucb`).
+10. **Long strips and narrow corners in meshes:** a hole's wall meshed as one row of strips from
+   its floor to its rim, and a floor as strips across it, are long by design (aspects in the
+   hundreds to thousands); an extremum of a trim between two crossings keeps both crossings; a
+   rim meeting another trim at under a few degrees fills with a flat triangle. Needles where shared
+   samples crowd are gone: a face's grid line crossing a shared edge under a quarter of the spacing
+   from a sample moves that sample onto the line in that face's chart instead of adding a station
+   beside it (`layout/trim_crossings.absorb_crossing`; the display is checked against the surface
+   through the sample's true chart point), lattice points keep clear of trim sides
+   (`polygons/grid_lattice.beside_side`), and chart refinement grades away from two trim samples
+   close together with an off-center (`meshing/chart_delaunay.lucb`).

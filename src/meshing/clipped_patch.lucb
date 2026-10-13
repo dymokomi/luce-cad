@@ -32,6 +32,15 @@ pub func clipped_patch(mesh: MeshBuilder*, face: BrepFace, surface: Surface, sam
         sizes[loop] = (i64)(written - start)
     try align(uv, sizes, ids, mesh.points[..<mesh.np], surface, plan, tolerance)
     try settle(uv, sizes, ids, plan)
+    # Where a trim point sits on a grid line in this chart but not on the
+    # surface there (absorb_crossing), the chart point it truly has, for
+    # checking the display against the surface.
+    let trim = try new Vector3[uv.length] --- in memory.heap
+    defer free(trim) in memory.heap
+    for at in 0..<uv.length:
+        let p = mesh.points[(usize)ids[at]]
+        let off = (try surface_point(surface, uv[at])).subtract(p).length()
+        trim[at] = uv[at] if off <= tolerance else (try chart_parameter(surface, p, uv[at], tolerance))
     let chart_ids = try chart_identities(surface, uv, ids, tolerance)
     defer free(chart_ids) in memory.heap
     let raw_cells = try TrimGrid.clip_identified(uv, sizes, plan.u.values[..<plan.u.count], plan.v.values[..<plan.v.count], chart_ids)
@@ -53,7 +62,7 @@ pub func clipped_patch(mesh: MeshBuilder*, face: BrepFace, surface: Surface, sam
     let normals = try new Vector3[mapping.length] --- in memory.heap
     defer free(normals) in memory.heap
     for at in 0..<normals.length:
-        let n = try support_normal(surface, try part.point((i64)at))
+        let n = try support_normal(surface, trim[at] if at < trim.length else (try part.point((i64)at)))
         if n.length() < 1e-15: error(invalid, "trimmed grid touches a singular support")
         normals[at] = n.multiply_scalar(1.0 if face.sense else -1.0)
     var repaired = try append_repaired(&lifted, cells, face.sense, normals)
@@ -62,8 +71,8 @@ pub func clipped_patch(mesh: MeshBuilder*, face: BrepFace, surface: Surface, sam
     # invalid baseline by hiding a failed normal or surface-deviation check.
     let baseline = try lifted.finish()
     defer baseline.release()
-    try validate_display_error(baseline.value(), repaired.value(), surface, tolerance, divisions)
-    let spaced = try redistribute_cells(&lifted, repaired, ids.length, surface, face.sense, normals, tolerance, divisions)
+    try validate_display_error(baseline.value(), repaired.value(), surface, tolerance, divisions, trim)
+    let spaced = try redistribute_cells(&lifted, repaired, ids.length, surface, face.sense, normals, tolerance, divisions, trim)
     let unchanged = repaired.value() == spaced.value()
     repaired.release()
     repaired = spaced

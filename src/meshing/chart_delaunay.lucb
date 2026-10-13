@@ -14,17 +14,16 @@
 ## they are never split or flipped, since the face's neighbors share them.
 ## A point that would land on a trim side, or near enough to make a flat
 ## triangle against one (inside its 120-degree lens), is not inserted; a
-## triangle that strays too far then takes its centroid, one badly shaped
-## is left as it is.
+## triangle that strays too far then takes its centroid, and one badly
+## shaped against a short trim side (two trim samples close together) the
+## apex of an equilateral triangle on that side (an off-center), so the
+## mesh grades away from the pair instead of fanning a needle from it.
+## Every triangle may be refined for its shape, however short its sides;
+## the face budget bounds the grading near tiny trim features.
 
 ## How far a triangle's circumradius may exceed its shortest side on the
 ## surface (2: no angle under 14.5 degrees).
 let quality_bound: f64 = 2.0
-
-## Triangles whose shortest side is under this share of the median trim
-## side are never refined for their shape (it bounds the grading near tiny
-## trim features, as Ruppert's local feature size does).
-let shape_floor: f64 = 0.5
 
 ## How a chart's points lie on the surface: the surface's own parameters
 ## scaled by `uscale` and `vscale` (chart_sample), or, when `azimuthal`, a
@@ -78,7 +77,6 @@ pub func chart_refine(source: interop.Reference[Mesh], lift: ChartLift*, toleran
         if (try input.face_size(face)) != 3: error(invalid, "chart refinement requires triangles")
         for at in 0..<3: try m.corners.push(try input.face_point(face, at))
     try link_twins(&m, constraints)
-    let floor = try median_frozen(&m) * shape_floor
     # Delaunay on the surface first, then refine from every triangle.
     var sides = Growing[i64]()
     defer sides.close()
@@ -91,12 +89,15 @@ pub func chart_refine(source: interop.Reference[Mesh], lift: ChartLift*, toleran
     while m.pending.count > 0 and m.corners.count // 3 < (usize)face_budget:
         m.pending.count -= 1
         let face = (usize)m.pending.items[m.pending.count]
-        let wanted = try assess(&m, face, lift, target, floor)
+        let wanted = try assess(&m, face, lift, target)
         if wanted.z == 0.0: continue
         if try insert(&m, face, Vector3(wanted.x, wanted.y, 0.0), lift, boundary_ids): continue
         # A triangle too far from the surface whose circumcenter could not
-        # go in takes its centroid.
+        # go in takes its centroid; a badly shaped one, the apex of an
+        # equilateral triangle on its shortest side (an off-center), which
+        # grades the mesh away from two trim samples close together.
         if wanted.z == 2.0: _ = try insert(&m, face, centroid(&m, face), lift, boundary_ids)
+        elif let apex = off_center(&m, face): _ = try insert(&m, face, apex, lift, boundary_ids)
     var output = try MeshBuilder(precise = true)
     defer output.close()
     for at in 0..<m.chart.count: _ = try output.point(m.chart.items[at])
@@ -148,23 +149,10 @@ func link_twins(m: Chart*, constraints: TrimConstraints) -> !:
     for corner in 0..<count:
         if m.twin.items[corner] < 0: m.twin.items[corner] = -1
 
-## The median length on the surface of the frozen sides.
-func median_frozen(m: const Chart*) -> f64!:
-    var lengths = Growing[f64]()
-    defer lengths.close()
-    for corner in 0..<m.corners.count:
-        if m.twin.items[corner] >= 0: continue
-        let a = m.world.items[(usize)m.corners.items[corner]]
-        let b = m.world.items[(usize)m.corners.items[after_corner(corner)]]
-        try lengths.push(b.subtract(a).length())
-    if lengths.count == 0: return 0.0
-    sort.sort(lengths.items[..<lengths.count])
-    return lengths.items[lengths.count // 2]
-
 ## What triangle `face` needs: z 0 nothing, 1 a better shape, 2 to come
 ## closer to the surface; x and y where its circumcenter on the surface
 ## lies in the chart.
-func assess(m: const Chart*, face: usize, lift: ChartLift*, target: f64, floor: f64) -> Vector3!:
+func assess(m: const Chart*, face: usize, lift: ChartLift*, target: f64) -> Vector3!:
     let ia = (usize)m.corners.items[face * 3]
     let ib = (usize)m.corners.items[face * 3 + 1]
     let ic = (usize)m.corners.items[face * 3 + 2]
@@ -203,11 +191,48 @@ func assess(m: const Chart*, face: usize, lift: ChartLift*, target: f64, floor: 
     let at = m.chart.items[ia].multiply_scalar(wa / sum).add(m.chart.items[ib].multiply_scalar(wb / sum)).add(m.chart.items[ic].multiply_scalar(wc / sum))
     if deviation > allowed: return Vector3(at.x, at.y, 2.0)
     let shortest = math.sqrt(math.min(ab, math.min(bc, ca)))
-    if shortest < floor: return Vector3()
     # Circumradius over the shortest side.
     let radius = math.sqrt(ab * bc * ca) / (2.0 * area)
     if radius > quality_bound * shortest: return Vector3(at.x, at.y, 1.0)
     return Vector3()
+
+## The chart point of the apex of an equilateral triangle on `face`'s
+## shortest side on the surface, towards its third corner (mapped into the
+## chart through its barycentric coordinates there, as circumcenters are),
+## when that side is frozen and the third corner is further off.
+func off_center(m: const Chart*, face: usize) -> Vector3?:
+    var shortest: usize = 0
+    var least: f64 = 1e300
+    for k in 0..<(usize)3:
+        let a = m.world.items[(usize)m.corners.items[face * 3 + k]]
+        let b = m.world.items[(usize)m.corners.items[face * 3 + (k + 1) % 3]]
+        let length = b.subtract(a).length()
+        if length < least:
+            least = length
+            shortest = k
+    if m.twin.items[face * 3 + shortest] >= 0: return none
+    let ia = (usize)m.corners.items[face * 3 + shortest]
+    let ib = (usize)m.corners.items[face * 3 + (shortest + 1) % 3]
+    let ic = (usize)m.corners.items[face * 3 + (shortest + 2) % 3]
+    let a = m.world.items[ia]
+    let b = m.world.items[ib]
+    let c = m.world.items[ic]
+    # In the plane of a b c: the apex's distance from the side's middle
+    # over the third corner's.
+    let side = b.subtract(a)
+    let middle = a.add(b).multiply_scalar(0.5)
+    let toward = c.subtract(middle)
+    let across = toward.subtract(side.multiply_scalar(toward.dot(side) / math.max(side.dot(side), 1e-300))).length()
+    let height = least * 0.8660254037844386
+    if across <= height: return none
+    let reach = height / across
+    # The apex is middle + reach * (c - middle) less its share along the
+    # side, which moves it back over the middle: weights for a, b and c.
+    let along = toward.dot(side) / math.max(side.dot(side), 1e-300) * reach
+    let wc = reach
+    let wa = 0.5 - wc * 0.5 + along
+    let wb = 0.5 - wc * 0.5 - along
+    return m.chart.items[ia].multiply_scalar(wa).add(m.chart.items[ib].multiply_scalar(wb)).add(m.chart.items[ic].multiply_scalar(wc))
 
 func centroid(m: const Chart*, face: usize) -> Vector3:
     let a = m.chart.items[(usize)m.corners.items[face * 3]]
