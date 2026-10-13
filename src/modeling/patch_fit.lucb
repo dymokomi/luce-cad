@@ -1,7 +1,7 @@
-## The surface where three G2 or G3 fillets meet at a corner of three flat
+## The surface where N G1, G2 or G3 fillets meet at a corner of N flat
 ## faces (setback.lucb). The fillets stop short of the corner (the
 ## setback). Between their end sections (A curves, each on a fillet swept
-## straight) and curves on the faces (B curves) is a six-sided hole. Six
+## straight) and curves on the faces (B curves) is a 2N-sided hole. 2N
 ## quads fill it, one at each of its corners: degree 5 B-spline nets (one
 ## span for G2; two for G3, whose curves have three). Their outer sides
 ## are halves of its curves; their inner sides (seams) run from the
@@ -11,8 +11,9 @@
 ## they lie in its plane. So the patch meets the fillets and faces with
 ## their own continuity: two rows beyond the side for G2, three for G3.
 ## Across the seams the quads meet in G1 exactly, with the fixed
-## coefficients of a vertex where six meet: one quad's cross derivative is
-## the next one's turned back, plus t times the seam's. They meet in G2 by
+## coefficients of a vertex where 2N meet: one quad's cross derivative is
+## the next one's turned back, plus c t times the seam's, c = 2 cos(2π/2N)
+## (1 where six meet, at three fillets). They meet in G2 by
 ## least squares. Their remaining freedom goes to the smoothest surface
 ## (least thin-plate energy). It is one linear solve, with no iteration.
 ## G1 corners (circular fillets) take rational A curves: the circle's arc
@@ -189,7 +190,8 @@ func spline_basis(knots: const f64[], t: f64, out: f64[]):
 func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f64[], sides: const HoleSide[], continuity: i64, out: Growing[Vector3]*, out_weights: Growing[f64]*, quad_knots: Growing[f64]*) -> !:
     let n = knots.length - 6
     let h = (usize)continuity + 1
-    if sides.length != 6 or curves.length != 6 * n or weights.length != curves.length or continuity < 1 or continuity > 3: error(invalid, "a corner patch needs six degree 5 curves, G1, G2 or G3")
+    let count = sides.length
+    if count < 6 or count > 16 or count % 2 != 0 or curves.length != count * n or weights.length != curves.length or continuity < 1 or continuity > 3: error(invalid, "a corner patch needs six to sixteen degree 5 curves, G1, G2 or G3")
     var rational = false
     for weight in weights: rational = rational or weight != 1.0
     # Unit size about the curves' middle, so the weights mean the same at
@@ -212,7 +214,7 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
     defer local.close()
     var second_knots = Growing[f64]()
     defer second_knots.close()
-    for k in 0..<(usize)6:
+    for k in 0..<count:
         local.clear()
         for i in 0..<n: try local.push(curves[k * n + i].subtract(origin).multiply_scalar(1.0 / scale))
         quad_knots.clear()
@@ -220,14 +222,14 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
         try split_middle(local.view(), weights[k * n..<(k + 1) * n], knots, &first, &second, &first_weights, &second_weights, quad_knots, &second_knots)
     # Halves are m points; the second half run backwards has the first's
     # knots (the curves are symmetric in their knots).
-    let m = first.count // 6
-    if m > 9 or second.count != 6 * m or m < h * 2 - 1: error(invalid, "a corner patch's curves are not split evenly")
+    let m = first.count // count
+    if m > 9 or second.count != count * m or m < h * 2 - 1: error(invalid, "a corner patch's curves are not split evenly")
     let qk = quad_knots.view()
     # What each control point is: kind 1 fixed (on a side), 2 a side's
     # point moved along its sweep, 3 in a side's plane, 0 free. Keys are
     # quad points (k * m + a) * m + b, a seam's points under the quad whose
     # side u = 1 it is, the center last.
-    let center = 6 * m * m
+    let center = count * m * m
     var kinds = Growing[i64]()
     defer kinds.close()
     try kinds.fill(center + 1, 0)
@@ -241,37 +243,44 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
     var known = Growing[f64]()
     defer known.close()
     try known.fill(center + 1, 1.0)
-    for k in 0..<(usize)6:
-        let before = (k + 5) % 6
+    for k in 0..<count:
+        let before = (k + count - 1) % count
         for a in 0..<m:
-            let key = patch_key(k, a, 0, m)
+            let key = patch_key(k, a, 0, m, count)
             kinds.items[key] = 1
             bases.items[key] = first.items[k * m + a]
             known.items[key] = first_weights.items[k * m + a]
         for b in 0..<m:
-            let key = patch_key(k, 0, b, m)
+            let key = patch_key(k, 0, b, m, count)
             kinds.items[key] = 1
             bases.items[key] = second.items[before * m + m - 1 - b]
             known.items[key] = second_weights.items[before * m + m - 1 - b]
-    for k in 0..<(usize)6:
-        let before = (k + 5) % 6
+    # Beside a face (a B side) a G1 patch of four or more fillets still
+    # takes two rows in its plane: flat across it to second order, it cannot
+    # bulge out through the face past the first row (an irregular apex's
+    # patch did). Three keep Fusion's Setback shape.
+    for k in 0..<count:
+        let before = (k + count - 1) % count
+        let flat = h if h > 3 or count == 6 else 3
+        let rows_k = h if sides[k].swept else flat
+        let rows_before = h if sides[before].swept else flat
         for a in 1..<m:
-            for b in 1..<h: set_rule(&kinds, &bases, &ways, &known, patch_key(k, a, b, m), first.items[k * m + a], first_weights.items[k * m + a], &sides[k])
-        for a in 1..<h:
-            for b in 1..<m: set_rule(&kinds, &bases, &ways, &known, patch_key(k, a, b, m), second.items[before * m + m - 1 - b], second_weights.items[before * m + m - 1 - b], &sides[before])
+            for b in 1..<rows_k: set_rule(&kinds, &bases, &ways, &known, patch_key(k, a, b, m, count), first.items[k * m + a], first_weights.items[k * m + a], &sides[k])
+        for a in 1..<rows_before:
+            for b in 1..<m: set_rule(&kinds, &bases, &ways, &known, patch_key(k, a, b, m, count), second.items[before * m + m - 1 - b], second_weights.items[before * m + m - 1 - b], &sides[before])
     # The unknowns behind each control point (keys no quad uses get none).
     var used = Growing[bool]()
     defer used.close()
     try used.fill(center + 1, false)
-    for k in 0..<(usize)6:
+    for k in 0..<count:
         for a in 0..<m:
-            for b in 0..<m: used.items[patch_key(k, a, b, m)] = true
+            for b in 0..<m: used.items[patch_key(k, a, b, m, count)] = true
     # Rational: the weights first, a field of their own (in x), fixed on
     # the sides and along the sweeps, free elsewhere.
     var point_weights = Growing[f64]()
     defer point_weights.close()
     try point_weights.assign(known.view())
-    if rational: try fit_weights(&kinds, &known, &used, m, quad_knots.view(), &point_weights)
+    if rational: try fit_weights(&kinds, &known, &used, m, quad_knots.view(), &point_weights, count)
     # A sweep moves a point's weighted position along its way times its
     # weight; a plane holds n . X = h w at the point's weight.
     for key in 0..<center + 1:
@@ -302,13 +311,13 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
     try rows.rhs.fill(size, 0.0)
     try rows.row.fill(size, 0.0)
     try rows.marked.fill(size, false)
-    try fairness_rows(&rows, slots.view(), m, qk)
-    try seam_rows(&rows, slots.view(), m, qk)
+    try fairness_rows(&rows, slots.view(), m, qk, count)
+    try seam_rows(&rows, slots.view(), m, qk, count)
     try cholesky_solve(rows.matrix.items[..<size * size], rows.rhs.items[..<size], size)
-    for k in 0..<(usize)6:
+    for k in 0..<count:
         for a in 0..<m:
             for b in 0..<m:
-                let key = patch_key(k, a, b, m)
+                let key = patch_key(k, a, b, m, count)
                 let slot = slots.items[key]
                 var p = slot.base
                 for j in 0..<slot.count: p = p.add(slot.axes[j].multiply_scalar(rows.rhs.items[slot.first + j]))
@@ -319,7 +328,7 @@ func corner_patch(curves: const Vector3[], weights: const f64[], knots: const f6
 ## The quads' weights onto `out` (keyed as corner_patch's points): fixed
 ## where `kinds` says a side or a sweep fixes them (`known`), else fitted
 ## by the seams' rows and the fairness, in one coordinate.
-func fit_weights(kinds: const Growing[i64]*, known: const Growing[f64]*, used: const Growing[bool]*, m: usize, knots: const f64[], out: Growing[f64]*) -> !:
+func fit_weights(kinds: const Growing[i64]*, known: const Growing[f64]*, used: const Growing[bool]*, m: usize, knots: const f64[], out: Growing[f64]*, count: usize) -> !:
     var slots = Growing[Slot]()
     defer slots.close()
     var size: usize = 0
@@ -340,8 +349,8 @@ func fit_weights(kinds: const Growing[i64]*, known: const Growing[f64]*, used: c
     try rows.rhs.fill(size, 0.0)
     try rows.row.fill(size, 0.0)
     try rows.marked.fill(size, false)
-    try fairness_rows(&rows, slots.view(), m, knots)
-    try seam_rows(&rows, slots.view(), m, knots)
+    try fairness_rows(&rows, slots.view(), m, knots, count)
+    try seam_rows(&rows, slots.view(), m, knots, count)
     try cholesky_solve(rows.matrix.items[..<size * size], rows.rhs.items[..<size], size)
     out.clear()
     for key in 0..<kinds.count:
@@ -350,12 +359,12 @@ func fit_weights(kinds: const Growing[i64]*, known: const Growing[f64]*, used: c
         if not (weight > 0.0): error(invalid, "a corner patch's weights turned negative: use another corner type there")
         try out.push(weight)
 
-## Quad k's control point (a, b) as a key: a seam's points under the quad
-## whose side u = 1 it is (quad k's side v = 1 is quad k - 1's side u = 1,
-## run the same way), the center last.
-func patch_key(k: usize, a: usize, b: usize, m: usize) -> usize:
-    if a == m - 1 and b == m - 1: return 6 * m * m
-    if b == m - 1: return (((k + 5) % 6) * m + m - 1) * m + a
+## Quad k's control point (a, b) of `count` quads as a key: a seam's
+## points under the quad whose side u = 1 it is (quad k's side v = 1 is
+## quad k - 1's side u = 1, run the same way), the center last.
+func patch_key(k: usize, a: usize, b: usize, m: usize, count: usize) -> usize:
+    if a == m - 1 and b == m - 1: return count * m * m
+    if b == m - 1: return (((k + count - 1) % count) * m + m - 1) * m + a
     return (k * m + a) * m + b
 
 ## The rule of a side for control point `key` (moved from `base` along
@@ -375,7 +384,7 @@ func set_rule(kinds: Growing[i64]*, bases: Growing[Vector3]*, ways: Growing[Vect
 ## seams allow. Over a quad it is p^T M p (p its control points, each
 ## axis alike), M the same for every quad: made once by Gauss points in
 ## each span, then added for each quad's unknowns.
-func fairness_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[]) -> !:
+func fairness_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[], count: usize) -> !:
     let nodes: f64[8] = [0.019855071751231856, 0.10166676129318664, 0.2372337950418355, 0.4082826787521751, 0.5917173212478249, 0.7627662049581645, 0.8983332387068134, 0.9801449282487681]
     let weights: f64[8] = [0.05061426814518813, 0.11119051722668724, 0.15685332293894364, 0.18134189168918100, 0.18134189168918100, 0.15685332293894364, 0.11119051722668724, 0.05061426814518813]
     let orders: usize[6] = [2, 0, 1, 1, 0, 2]
@@ -418,13 +427,13 @@ func fairness_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[
                     for j in 0..<mm: energy.items[i * mm + j] += wi * term.items[j]
     # Each quad's share: p_i . p_j times M_ij, through its slots.
     let n = rows.size
-    for k in 0..<(usize)6:
+    for k in 0..<count:
         for i in 0..<mm:
-            let si = slots[patch_key(k, i // m, i % m, m)]
+            let si = slots[patch_key(k, i // m, i % m, m, count)]
             for j in 0..<mm:
                 let coefficient = energy.items[i * mm + j]
                 if coefficient == 0.0: continue
-                let sj = slots[patch_key(k, j // m, j % m, m)]
+                let sj = slots[patch_key(k, j // m, j % m, m, count)]
                 for x in 0..<si.count:
                     let axis = si.axes[x]
                     rows.rhs.items[si.first + x] -= coefficient * axis.dot(sj.base)
@@ -432,11 +441,13 @@ func fairness_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[
 
 ## The seams' rows. Seam k is quad k's side u = 1 and quad k + 1's side
 ## v = 1, both from a curve's middle (t = 0) to the center. G1, weighted
-## to hold: Q_k,u(1, t) + Q_k+1,v(t, 1) = t Q_k,v(1, t). That is C1 at the
-## curve (where the halves meet smoothly) and, at the center, the six
-## quads' corners an affine regular hexagon about it (2 cos 60 = 1).
-## G2, by least squares: Q_k+1,vv = Q_k,uu - 2t Q_k,uv + t^2 Q_k,vv.
-func seam_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[]) -> !:
+## to hold: Q_k,u(1, t) + Q_k+1,v(t, 1) = c t Q_k,v(1, t), c = 2 cos(2π /
+## count). That is C1 at the curve (where the halves meet smoothly) and, at
+## the center, the quads' corners an affine regular polygon about it (c = 1
+## for six). G2, by least squares: Q_k+1,vv = Q_k,uu - 2ct Q_k,uv +
+## (ct)^2 Q_k,vv.
+func seam_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[], count: usize) -> !:
+    let c = 2.0 * math.cos(2.0 * math.pi / (f64)count)
     let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
     var at_end: f64[36]
     spline_basis(knots, 1.0, at_end[..<36])
@@ -445,20 +456,21 @@ func seam_rows(rows: Rows*, slots: const Slot[], m: usize, knots: const f64[]) -
     for s in 0..<samples:
         let t = ((f64)s + 0.5) / (f64)samples
         spline_basis(knots, t, bt[..<36])
-        for k in 0..<(usize)6:
-            let next = (k + 1) % 6
+        let ct = c * t
+        for k in 0..<count:
+            let next = (k + 1) % count
             for axis in axes:
                 for a in 0..<m:
                     for b in 0..<m:
-                        try rows.add(&slots[patch_key(k, a, b, m)], at_end[9 + a] * bt[b] - t * at_end[a] * bt[9 + b], axis)
-                        try rows.add(&slots[patch_key(next, a, b, m)], bt[a] * at_end[9 + b], axis)
+                        try rows.add(&slots[patch_key(k, a, b, m, count)], at_end[9 + a] * bt[b] - ct * at_end[a] * bt[9 + b], axis)
+                        try rows.add(&slots[patch_key(next, a, b, m, count)], bt[a] * at_end[9 + b], axis)
                 rows.commit(0.0, 1e3)
             for axis in axes:
                 for a in 0..<m:
                     for b in 0..<m:
-                        try rows.add(&slots[patch_key(next, a, b, m)], bt[a] * at_end[18 + b], axis)
-                        let w = -at_end[18 + a] * bt[b] + 2.0 * t * at_end[9 + a] * bt[9 + b] - t * t * at_end[a] * bt[18 + b]
-                        try rows.add(&slots[patch_key(k, a, b, m)], w, axis)
+                        try rows.add(&slots[patch_key(next, a, b, m, count)], bt[a] * at_end[18 + b], axis)
+                        let w = -at_end[18 + a] * bt[b] + 2.0 * ct * at_end[9 + a] * bt[9 + b] - ct * ct * at_end[a] * bt[18 + b]
+                        try rows.add(&slots[patch_key(k, a, b, m, count)], w, axis)
                 rows.commit(0.0, 1.0)
 
 ## Solves symmetric positive definite `matrix` (n x n) x = `rhs`, in

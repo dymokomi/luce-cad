@@ -1007,10 +1007,15 @@ within 0.01 (`fusion_probe_tests`); G3 closes too.
 - **Four or more fillets** meeting at a corner of as many flat faces, all its edges, G1: a ball too,
   where one touches every face there (its planes moved in by the radius meet in one point: a regular
   pyramid's apex). The corner tool is the convex cell beyond each edge's plane and past each face
-  (`convex_cell`), minus the ball. Where no ball touches them all (a rectangular pyramid's apex) the
-  fillets are refused, naming it; every edge of a convex polyhedron rounded at once (`rounded.lucb`,
-  the solid shrunk and grown back by a ball) asks the same of each vertex, and so is refused there
-  too rather than built with its shrunk corner guessed.
+  (`convex_cell`), minus the ball. Where no ball touches them all (a rectangular pyramid's apex),
+  and for G2 and G3 fillets, the corner is a setback corner of 2N sides (`setback.lucb`): each
+  fillet stops at its setback, and the hole between the N end sections and the N curves on the faces
+  is filled by 2N quads about a center (`patch_fit.lucb`; G1 across their seams with a vertex's
+  coefficient 2 cos(2π/2N), the fillets' continuity to the sides; a G1 corner's quads keep two rows
+  in each face's plane, so they cannot bulge out through it), set back further when its quads would
+  leave the corner. Every edge of a convex polyhedron rounded at once (`rounded.lucb`, the solid
+  shrunk and grown back by a ball) declines where no ball fits a vertex, and the edges are then
+  rounded one by one with such corners.
 - **Inside corners** work the same way, mirrored: the ball rolls in the air, on the faces' planes
   moved out by the radius, and the corner tool adds material around it. A pocket's floor edges meet
   in miters; with its walls' edges too, its corners are balls.
@@ -1022,7 +1027,8 @@ within 0.01 (`fusion_probe_tests`); G3 closes too.
     edge first. The outside edges then run around it.
 
   The second pass finds its edges by reference on the first pass's result.
-- **Anything else** is refused: four or more edges at a corner no ball fits, fillets meeting where the faces
+- **Anything else** is refused: more than eight edges at a corner, or some of a corner's edges only
+  where four or more meet, fillets meeting where the faces
   aren't flat, inside and outside fillets meeting where only two edges are picked, or orders that
   conflict along one edge.
 
@@ -2137,8 +2143,9 @@ Not yet: ellipses, splines, slots and text; curvature (G2) constraints; Blend Cu
 
 Roughly in order of usefulness:
 
-1. **Fillet corners beyond three edges** where no one ball touches every face (an irregular apex;
-   Setback and G2/G3 corners of four or more), and three unequal radii at a corner.
+1. **Unequal radii at a corner** (one feature has one radius; a second fillet on an edge running
+   into the first's corner is refused), and corners of four or more edges where only some are
+   rounded or the faces are not flat.
 2. **Variable radius fillets meeting other fillets at a corner** of three edges within one
    feature, and full rounds of curved ribs whose ends are not flat through the axis.
 3. **Blends on other curved edges:** a flat face meeting a curved one that is not ruled away from

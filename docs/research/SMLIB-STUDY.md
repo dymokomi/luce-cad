@@ -922,8 +922,19 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   (a rectangular pyramid: volume 198, faces off their planes); it now declines. Four or more G1
   fillets meeting at a vertex are rounded by a ball where one touches every face there (the
   pyramid's four apex edges alone: closed, 1991.926), with the corner tool a convex cell of the
-  edges' and faces' half-spaces; elsewhere refused by name. Regression: `apex_tests`. Still open:
-  the 2N-sided patch for apexes no ball fits, unequal radii, mixed convexity at N edges.
+  edges' and faces' half-spaces; elsewhere refused by name. Regression: `apex_tests`. Then the
+  2N-sided patch: the setback corner of three G2/G3 (or Setback G1) fillets generalized to N edges
+  (`setback.lucb`, ordered round the corner face by face), its six-quad fit to 2N quads about a
+  center (`patch_fit.lucb`; the seams' G1 coefficient 2 cos(2π/2N), 1 for six). A G1 corner's
+  quads bulged 0.009 out through a face of the rectangular apex (control points beyond the first
+  row free): with four or more fillets they keep two rows in each face's plane. The rectangular
+  pyramid's apex alone, G1 and G2: closed, every edge between two faces G1 to 0.5° (angle
+  0.0000°, the G2 corner's curvature to 0.003%); every edge rounded: G1 1152.586, G2 1154.428 at
+  64 divisions (32: 1152.578, 1154.425); the square pyramid's apex G2 1993.82 (its G1 a ball,
+  1991.93). Stage 7's Fill was not used: it lives in surfacing, above modeling, and gives a
+  trimmed face with tolerant edges where these quads meet the fillets exactly. Still open:
+  unequal radii (one feature has one radius; a second fillet into the first's corner is
+  refused), mixed convexity at N edges.
 
 - **8, overflow by rail classification (part).** The same-convexity case: a fillet on a straight
   edge between planes that runs off one face over a parallel convex edge into a flat face is trimmed
