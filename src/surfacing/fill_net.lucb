@@ -246,9 +246,9 @@ func net_jet(fn: const FillNet*, uv: Vector3) -> Vector3[6]:
 ## condition: a weight of ten million left a planar fill 2e-8 off its plane,
 ## one of a hundred thousand 2e-10. So the weight stays at a hundred
 ## thousand and the method of multipliers (Hestenes, Powell) takes the rest:
-## after each answer every exact row's target is shifted by its residual,
-## and the same factored system solved again, so the rows converge to hold
-## while the matrix never stiffens. Eased rows (a conflicting corner's) stay
+## every exact row's target is shifted (solve_held finds the shifts) and the
+## same factored system solved again, so the rows hold while the matrix
+## never stiffens. Eased rows (a conflicting corner's) stay
 ## plain penalties: a conflict has no answer to converge to.
 struct HeldRows:
     var index: Growing[usize]
@@ -258,7 +258,7 @@ struct HeldRows:
     var constant: Growing[f64]
     var target: Growing[f64]
     var shift: Growing[f64]
-    var exact: Growing[bool]
+    var enough: Growing[f64]
 
     func close():
         self.index.close()
@@ -268,11 +268,12 @@ struct HeldRows:
         self.constant.close()
         self.target.close()
         self.shift.close()
-        self.exact.close()
+        self.enough.close()
 
-    ## `row` (to equal `target`, weighted `weight`) into `system`'s matrix
-    ## and kept. Cleared.
-    func hold(system: BandSystem*, row: FillRow*, weight: f64, target: f64, exact: bool) -> !:
+    ## `row` (to equal `target`, weighted `weight`, driven to hold within
+    ## `enough`, or a penalty alone at zero) into `system`'s matrix and
+    ## kept. Cleared.
+    func hold(system: BandSystem*, row: FillRow*, weight: f64, target: f64, enough: f64) -> !:
         let length = row.norm()
         if not (length > 0.0):
             row.clear()
@@ -290,7 +291,7 @@ struct HeldRows:
         try self.constant.push(row.constant)
         try self.target.push(target)
         try self.shift.push(0.0)
-        try self.exact.push(exact)
+        try self.enough.push(enough)
         row.clear()
 
     ## The right-hand side: `base` plus each row's share at its target and
@@ -303,22 +304,121 @@ struct HeldRows:
             for k in start..<self.offsets.items[r]: out.items[self.index.items[k]] += self.value.items[k] * goal
             start = self.offsets.items[r]
 
-    ## Each exact row's target shifted by its residual at `x` (the
-    ## multipliers' step); the largest residual of an exact row.
-    func settle(x: const f64[]) -> f64:
-        var worst = 0.0
+    ## Each row's value at `x` less its target (`constants`: with its
+    ## constant; else the row's linear part alone) onto `out`, zero for
+    ## penalties.
+    func residuals(x: const f64[], constants: bool, out: Growing[f64]*) -> !:
+        out.clear()
         var start: usize = 0
         for r in 0..<self.offsets.count:
-            var sum = self.constant.items[r] - self.target.items[r]
+            var sum = self.constant.items[r] - self.target.items[r] if constants else 0.0
             for k in start..<self.offsets.items[r]: sum += self.value.items[k] * x[self.index.items[k]]
             start = self.offsets.items[r]
-            if not self.exact.items[r]: continue
-            self.shift.items[r] -= sum
-            worst = math.max(worst, math.abs(sum))
+            try out.push(sum if self.enough.items[r] > 0.0 else 0.0)
+
+    ## The right-hand side of the shifts `shifts` alone (no base, targets
+    ## or constants) onto `out`, `size` long.
+    func shift_side(shifts: const f64[], size: usize, out: Growing[f64]*) -> !:
+        out.clear()
+        try out.fill(size, 0.0)
+        var start: usize = 0
+        for r in 0..<self.offsets.count:
+            let goal = shifts[r] * self.scale.items[r]
+            for k in start..<self.offsets.items[r]: out.items[self.index.items[k]] += self.value.items[k] * goal
+            start = self.offsets.items[r]
+
+    ## The worst of the residuals `r` over their rows' `enough` (below 1:
+    ## every driven row holds).
+    func worst_of(r: const f64[]) -> f64:
+        var worst = 0.0
+        for k in 0..<r.length:
+            if self.enough.items[k] > 0.0: worst = math.max(worst, math.abs(r[k]) / self.enough.items[k])
         return worst
 
+    ## The W-weighted dot product of two row vectors (W each row's scale).
+    func weighted_dot(a: const f64[], b: const f64[]) -> f64:
+        var sum = 0.0
+        for r in 0..<a.length: sum += self.scale.items[r] * a[r] * b[r]
+        return sum
+
+## The answer of `system` (factored) for the base right side `base`, its
+## exact rows in `held` driven to hold onto `x`. The multipliers' shifts λ
+## move the residuals affinely, g(λ) = g(0) + C K⁻¹ Cᵀ W λ (C the rows, K
+## the matrix, W the rows' scales), and that operator is symmetric and
+## positive in the W-weighted product: conjugate gradients on λ settle
+## them in a few dozen solves, where shifting each by its residual (the
+## plain method of multipliers) crawls along the slow directions of a fine
+## net and stalled hundredths of a degree short. They stop once every
+## driven row holds within its `enough` (a tenth of its tolerance): the
+## rows are stations of boundaries no net meets exactly (a circle's), and
+## driving them on past that only bends the fill between them (a ball's cap
+## sank a quarter of a percent of its radius). Returns the solves.
+func solve_held(system: BandSystem*, held: HeldRows*, base: const f64[], x: Growing[f64]*) -> i64!:
+    let n = system.size
+    let rows = held.offsets.count
+    try held.right_side(base, &system.rhs)
+    try system.solve(x)
+    var solves: i64 = 1
+    var r = Growing[f64]()
+    defer r.close()
+    try held.residuals(x.view(), true, &r)
+    let worst = held.worst_of(r.view())
+    if worst < 1.0: return solves
+    var lambda = Growing[f64]()
+    defer lambda.close()
+    try lambda.fill(rows, 0.0)
+    # Solve A λ = -g(0): the residual of that equation is -g(λ).
+    for k in 0..<rows: r.items[k] = -r.items[k]
+    var p = Growing[f64]()
+    defer p.close()
+    try p.assign(r.view())
+    var ap = Growing[f64]()
+    defer ap.close()
+    var side = Growing[f64]()
+    defer side.close()
+    var y = Growing[f64]()
+    defer y.close()
+    var rr = held.weighted_dot(r.view(), r.view())
+    var best = worst
+    var best_lambda = Growing[f64]()
+    defer best_lambda.close()
+    try best_lambda.assign(lambda.view())
+    # Stalled: no tenth gained on the best for eight solves (rows that
+    # conflict have no exact answer, and driving them on only bends the
+    # fill between its stations).
+    var stalled = 0
+    for _ in 0..<200:
+        try held.shift_side(p.view(), n, &side)
+        try system.rhs.assign(side.view())
+        try system.solve(&y)
+        solves += 1
+        try held.residuals(y.view(), false, &ap)
+        let pap = held.weighted_dot(p.view(), ap.view())
+        if not (pap > 0.0): break
+        let alpha = rr / pap
+        for k in 0..<rows:
+            lambda.items[k] += alpha * p.items[k]
+            r.items[k] -= alpha * ap.items[k]
+        let now = held.worst_of(r.view())
+        if now < best * 0.9:
+            stalled = 0
+        else:
+            stalled += 1
+        if now < best:
+            best = now
+            try best_lambda.assign(lambda.view())
+        if now < 1.0 or stalled >= 8: break
+        let next = held.weighted_dot(r.view(), r.view())
+        let beta = next / rr
+        rr = next
+        for k in 0..<rows: p.items[k] = r.items[k] + beta * p.items[k]
+    for k in 0..<rows: held.shift.items[k] = best_lambda.items[k]
+    try held.right_side(base, &system.rhs)
+    try system.solve(x)
+    return solves + 1
+
 func held_rows() -> HeldRows:
-    return HeldRows(Growing[usize](), Growing[f64](), Growing[usize](), Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64](), Growing[bool]())
+    return HeldRows(Growing[usize](), Growing[f64](), Growing[usize](), Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64](), Growing[f64]())
 
 ## The corrections `x` added to the base of `fn`'s free control points.
 func take_answer(fn: FillNet*, x: const f64[]):

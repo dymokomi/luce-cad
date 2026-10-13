@@ -64,6 +64,13 @@
 ## stations' G1 and G2 rows eased to nothing at the corner within a zone,
 ## and what fails at the end is reported as runs along the boundaries.
 
+## N-sided domains (Alias's N-sided Projected and Molded): Auto projects
+## onto the loop's best plane unless a neighbor stands square to it, then
+## molds.
+pub let fill_domain_auto: i64 = 0
+pub let fill_domain_projected: i64 = 1
+pub let fill_domain_molded: i64 = 2
+
 ## Boundary flows (Quad; Plasticity's xNURBS Boundary).
 pub let fill_flow_natural: i64 = 0
 pub let fill_flow_normal: i64 = 1
@@ -92,11 +99,13 @@ pub struct FillOptions:
     pub var position: f64
     pub var angle: f64
     pub var curvature: f64
+    pub var domain: i64
 
 ## A conflict: the boundary (picked index; -1 a guide), the order that
 ## fails (0 G0, 1 G1, 2 G2), where it runs from and to (a corner: twice
-## the corner), the worst amount (model units, degrees, percent) and
-## whether it is a corner whose neighbors disagree.
+## the corner), the worst amount (model units, degrees, percent),
+## whether it is a corner whose neighbors disagree, and how far from a
+## corner the fill gives way to it (model units; zero for a run).
 pub struct FillConflict:
     pub var boundary: i64
     pub var order: i64
@@ -104,6 +113,7 @@ pub struct FillConflict:
     pub var finish: Vector3
     pub var amount: f64
     pub var corner: bool
+    pub var reach: f64
 
 ## A station: its side and fraction along it, the point (normalized
 ## units) and the unit tangent along the loop, its chart point and the
@@ -125,6 +135,27 @@ struct FillStation:
     ## The neighbor's own way across the boundary, out of it (G1 and G2):
     ## the way the fill leaves it.
     var leave: Vector3
+    ## The normal its G1 rows hold the fill to, and the way the fill leaves
+    ## (the neighbor's, but turned toward a conflicting corner's: see
+    ## corner_turn), and whether it is turned.
+    var held: Vector3
+    var way: Vector3
+    var turned: bool
+
+## A corner whose neighbors' tangent planes disagree (a lid's corner on two
+## walls) and whose boundaries meet at an angle: the fill cannot be G1 to
+## both, but its own tangent plane there is fixed, the plane of the two
+## boundaries' tangents. Within `zone` of each side (a fraction of it)
+## the way the fill leaves the boundary turns from the neighbor's to the
+## way into the patch at the corner (`into_a` square to side a's tangent
+## toward side b, `into_b` the other way), so its normal turns smoothly
+## onto the corner's instead of being let go (letting go left the cross
+## derivative to collapse there: zebra stripes pinched to the corner).
+struct CornerTurn:
+    var turned: bool
+    var zone: f64
+    var into_a: Vector3
+    var into_b: Vector3
 
 ## What a fill works with: its sides (loop order), options, guides, the
 ## normalized frame (the loop's middle and size; the chart frame ex, ey
@@ -146,6 +177,12 @@ struct FillWork:
     var corners: Growing[FillConflict]
     ## Each corner's zone is eased (corner k: side k's end, side k + 1's start).
     var eased: Growing[bool]
+    ## Each corner's turn (corner_turn), when its tangent planes disagree.
+    var turns: Growing[CornerTurn]
+    ## Molded (N-sided): the loop laid round the unit circle by its length,
+    ## side k from angles[k] to angles[k + 1] (the last 2π).
+    var molded: bool
+    var angles: Growing[f64]
 
     func close():
         close_fill_sides(&self.sides)
@@ -153,6 +190,8 @@ struct FillWork:
         self.points.close()
         self.corners.close()
         self.eased.close()
+        self.turns.close()
+        self.angles.close()
 
     ## A world point in normalized units, and back.
     func local(p: Vector3) -> Vector3:
@@ -164,6 +203,34 @@ struct FillWork:
     ## The N-sided chart point of a normalized point.
     func chart(p: Vector3) -> Vector3:
         return Vector3(p.dot(self.ex), p.dot(self.ey), 0.0)
+
+    ## Molded: side `k`'s chart point at fraction `s` along its length:
+    ## on the polygon inscribed in the unit circle with a corner where each
+    ## side starts (the loop's corners stay corners: a smooth circle would
+    ## have the net turn them), on the circle itself for one or two sides.
+    func disk(k: usize, s: f64) -> Vector3:
+        let a0 = self.angles.items[k]
+        let a1 = self.angles.items[k + 1]
+        if self.sides.count < 3:
+            let a = a0 + (a1 - a0) * s
+            return Vector3(math.cos(a), math.sin(a), 0.0)
+        let p0 = Vector3(math.cos(a0), math.sin(a0), 0.0)
+        let p1 = Vector3(math.cos(a1), math.sin(a1), 0.0)
+        return p0.add(p1.subtract(p0).multiply_scalar(s))
+
+    ## Molded: the way across side `k` into the domain.
+    func disk_inward(k: usize, s: f64) -> Vector3:
+        if self.sides.count < 3: return self.disk(k, s).multiply_scalar(-1.0)
+        let t = self.disk(k, 1.0).subtract(self.disk(k, 0.0)).normalized() catch failure: return self.disk(k, s).multiply_scalar(-1.0)
+        return Vector3(-t.y, t.x, 0.0)
+
+    ## Where to start looking for side `k`'s point at its parameter `t`
+    ## (normalized point `p`) on the N-sided net: its projection, or Molded
+    ## its place on the circle.
+    func seed_of(k: usize, t: f64, p: Vector3) -> Vector3!:
+        if not self.molded: return self.chart(p)
+        let side = &self.sides.items[k]
+        return self.disk(k, try arc_fraction(&side.curve, &side.arc, t))
 
 ## What Fill made: the net (world units), whether it is trimmed to the
 ## loop, its sense, the conflicts, each side's worst gap, angle and
@@ -254,7 +321,7 @@ func make_station(w: FillWork*, k: usize, s: f64, uv: Vector3, d: Vector3) -> Fi
             let goal = try m.target(spline_nearest(&m.curve, p), &probe, 0.0)
             leave = goal.t.multiply_scalar(-1.0) if m.kind == master_edge else goal.t
             if w.opts.quad and w.opts.flow == fill_flow_adjacent: flow = leave
-    return FillStation(k, s, w.local(p), tangent, uv, d, order, has_face, form, flow, 1.0, leave)
+    return FillStation(k, s, w.local(p), tangent, uv, d, order, has_face, form, flow, 1.0, leave, form.n, leave, false)
 
 ## The stations of the N-sided chart: `per` along each side by the side's
 ## share of the loop's chart length, at the middles of equal steps (never
@@ -270,6 +337,7 @@ func nsided_stations(w: FillWork*, per_length: f64, out: Growing[FillStation]*) 
             let now = w.chart(w.local(side.curve.point_at((f64)q / 64.0)))
             length += now.subtract(before).length()
             before = now
+        if w.molded: length = w.disk(k, 1.0).subtract(w.disk(k, 0.0)).length() if w.sides.count >= 3 else w.angles.items[k + 1] - w.angles.items[k]
         let count = (usize)math.clamp(math.ceil(length * per_length), 12.0, 600.0)
         for q in 0..<count + 1:
             # The side's start (a corner of the loop, G0 alone: its two
@@ -278,8 +346,14 @@ func nsided_stations(w: FillWork*, per_length: f64, out: Growing[FillStation]*) 
             let s = 0.0 if q == 0 else ((f64)q - 0.5) / (f64)count
             var station = try make_station(w, k, s, Vector3(), Vector3())
             if q == 0 and station.order > 0: station.order = 0
+            if w.molded:
+                # On the circle, across toward its middle.
+                station.uv = w.disk(k, s)
+                station.d = w.disk_inward(k, s)
+                try out.push(station)
+                continue
             station.uv = w.chart(station.p)
-            let t = Vector3(station.tangent.dot(w.ex), station.tangent.dot(w.ey), 0.0).normalized() catch failure: error(invalid, "Fill: a boundary runs square to the hole's plane; use Quad, or pick a flatter loop")
+            let t = Vector3(station.tangent.dot(w.ex), station.tangent.dot(w.ey), 0.0).normalized() catch failure: error(invalid, "Fill: a boundary runs square to the hole's plane; use Molded or Quad, or pick a flatter loop")
             # Inside lies to the left of a counterclockwise loop (the
             # plane's normal is Newell's: the loop runs counterclockwise).
             station.d = Vector3(-t.y, t.x, 0.0)
@@ -333,14 +407,17 @@ func quad_stations(w: FillWork*, net: const Net*, out: Growing[FillStation]*) ->
 ## Each corner's disagreement (corner k between side k's end and side
 ## k + 1's start) onto `w.corners`, the corner marked to ease: two G1
 ## neighbors' normals apart (the amount in degrees), a boundary leaving the
-## other's tangent plane (degrees), two G1 neighbors' twists apart, or two
-## G2 neighbors' normal curvatures apart along the boundaries (percent).
+## other's tangent plane (degrees), two G1 neighbors' twists apart, two G2
+## neighbors' normal curvatures apart along the boundaries, or their
+## curvatures' rates apart (percent).
 func find_corners(w: FillWork*) -> !:
     w.corners.clear()
     w.eased.clear()
+    w.turns.clear()
     let n = w.sides.count
     for k in 0..<n:
         try w.eased.push(false)
+        try w.turns.push(CornerTurn(false, 0.0, Vector3(), Vector3()))
         if n < 2: continue
         let a = &w.sides.items[k]
         let b = &w.sides.items[(k + 1) % n]
@@ -368,6 +445,8 @@ func find_corners(w: FillWork*) -> !:
             if off > w.angle:
                 worst = off * 180.0 / math.pi
                 order = 1
+        # Tangent planes apart: the fill's own there is the boundaries'.
+        let planes_apart = order == 1
         if a.order() >= 1 and b.order() >= 1 and order < 1:
             # The vertex's twist (Gregory's compatibility): G1 along both
             # boundaries fixes the fill's shape operator on each one's
@@ -394,10 +473,53 @@ func find_corners(w: FillWork*) -> !:
                 if rel > w.curvature and rel > worst:
                     worst = rel
                     order = 2
+        if a.order() >= 2 and b.order() >= 2 and order < 1:
+            # The curvatures' rates (the third derivatives' symmetry, as the
+            # twist is the second's): G2 along side a fixes how the fill's
+            # II(tb, X) changes along ta, G2 along side b how II(ta, X)
+            # changes along tb, and a smooth surface's are the same. A G2
+            # fillet's end (its curvature rising from nothing at a wall)
+            # meeting a wall at an angle disagrees; a G3 fillet's (rising
+            # with no rate) does not.
+            # One-sided differences at two steps, extrapolated (Richardson):
+            # the rate at the corner itself, not a step in (a G3 end's
+            # curvature grows as the square of the distance).
+            var rates: f64[4] = [0.0, 0.0, 0.0, 0.0]
+            var measured = true
+            for (step, slot) in [(1e-4, 0), (2e-4, 2)]:
+                let pa = a.curve.point_at(1.0 - step)
+                let pb = b.curve.point_at(step)
+                let ha = pa.subtract(p).length() / w.scale
+                let hb = pb.subtract(p).length() / w.scale
+                if not (ha > 0.0 and hb > 0.0):
+                    measured = false
+                    continue
+                let ga = try neighbor_at(&a.master, pa, w.scale)
+                let gb = try neighbor_at(&b.master, pb, w.scale)
+                # II(tb, X) along side a, and II(ta, X) along side b, X
+                # their mean way.
+                let x = ta.add(tb).normalized() catch failure: recover ta
+                rates[slot] = (tb.dot(fa.times(x)) - tb.dot(ga.times(x))) / ha
+                rates[slot + 1] = (ta.dot(gb.times(x)) - ta.dot(fb.times(x))) / hb
+            if measured:
+                let ra = 2.0 * rates[0] - rates[2]
+                let rb = 2.0 * rates[1] - rates[3]
+                let rel = fill_rate_relative(ra, rb)
+                if rel > w.curvature * 10.0 and rel > worst:
+                    worst = rel
+                    order = 2
         if order < 0: continue
         w.eased.items[k] = true
+        let into_a = tb.subtract(ta.multiply_scalar(tb.dot(ta))).normalized() catch failure: recover Vector3()
+        let into_b = ta.multiply_scalar(-1.0).subtract(tb.multiply_scalar(-ta.dot(tb))).normalized() catch failure: recover Vector3()
+        var zone = 0.03
+        if planes_apart and ta.cross(tb).length() > 0.1 and into_a.length() > 0.0 and into_b.length() > 0.0:
+            # The zone grows with the turn: a quarter of each side for a
+            # right angle (a lid's corner on two walls), narrower for less.
+            zone = math.clamp(0.25 * worst / 90.0, 0.03, 0.25)
+            w.turns.items[k] = CornerTurn(true, zone, into_a, into_b)
         let corner = p
-        try w.corners.push(FillConflict((i64)a.picked, order, corner, corner, worst, true))
+        try w.corners.push(FillConflict((i64)a.picked, order, corner, corner, worst, true, zone * math.max(a.length, b.length)))
 
 ## |a - b| relative to the larger magnitude, in percent, below a floor of
 ## 5e-4 in normalized units (the Check tools' floor, a thousandth over the
@@ -407,15 +529,67 @@ func fill_relative(a: f64, b: f64) -> f64:
     let larger = math.max(math.max(math.abs(a), math.abs(b)), 5e-4)
     return math.abs(a - b) / larger * 100.0
 
+## Station `st` turned toward the conflicting corners its side runs into
+## (CornerTurn): the way it leaves the boundary turned from the neighbor's
+## toward the way into the patch at the corner by a quintic smoothstep of
+## the distance (so the turn starts with no change of slope or curvature),
+## its G1 normal the tangent across that way. Its G2 rows are eased there
+## (station.weight, corner_ease) as at any conflicting corner.
+func corner_turn(w: const FillWork*, st: FillStation*) -> !:
+    st.held = st.form.n
+    st.way = st.leave
+    st.turned = false
+    if st.order < 1 or not st.has_face or st.leave.length() == 0.0: return
+    let n = w.sides.count
+    let end = &w.turns.items[st.side]
+    let start = &w.turns.items[(st.side + n - 1) % n]
+    var into = Vector3()
+    var f = 0.0
+    if end.turned and st.s > 1.0 - end.zone:
+        into = end.into_a
+        f = 1.0 - (1.0 - st.s) / end.zone
+    if start.turned and st.s < start.zone:
+        let g = 1.0 - st.s / start.zone
+        if g > f:
+            into = start.into_b
+            f = g
+    if not (f > 0.0): return
+    let t = st.tangent
+    let leave = st.leave.subtract(t.multiply_scalar(st.leave.dot(t))).normalized() catch failure: return
+    let inward = into.subtract(t.multiply_scalar(into.dot(t))).normalized() catch failure: return
+    let e = f * f * f * (10.0 - 15.0 * f + 6.0 * f * f)
+    # Turned on the great circle from leave to inward (a quarter turn for a
+    # lid's walls: never through the other side).
+    let angle = math.acos(math.clamp(leave.dot(inward), -1.0, 1.0))
+    var way = inward
+    if angle > 1e-9 and angle < math.pi - 1e-6:
+        let a = math.sin((1.0 - e) * angle) / math.sin(angle)
+        let b = math.sin(e * angle) / math.sin(angle)
+        way = leave.multiply_scalar(a).add(inward.multiply_scalar(b))
+    let normal = t.cross(way).normalized() catch failure: return
+    st.held = normal
+    st.way = way
+    st.turned = true
+
+## |a - b| relative to the larger rate of curvature, in percent, below a
+## floor of 1e-3 in normalized units (the Check tools' rate floor, a
+## thousandth over the model's size squared).
+func fill_rate_relative(a: f64, b: f64) -> f64:
+    let larger = math.max(math.max(math.abs(a), math.abs(b)), 1e-3)
+    return math.abs(a - b) / larger * 100.0
+
 ## The ease of station `st` near an eased corner: 1 off the zones, falling
 ## as the square of the distance to the corner within a zone of 3% of the
-## side.
+## side (a turned corner's: its turn's zone).
 func corner_ease(w: const FillWork*, st: const FillStation*) -> f64:
     let n = w.sides.count
-    let zone = 0.03
+    let before = (st.side + n - 1) % n
+    # A turned corner's zone is its turn's.
+    let zone_end = w.turns.items[st.side].zone if w.turns.items[st.side].turned else 0.03
+    let zone_start = w.turns.items[before].zone if w.turns.items[before].turned else 0.03
     var ease = 1.0
-    if w.eased.items[st.side] and st.s > 1.0 - zone: ease = math.min(ease, math.pow((1.0 - st.s) / zone, 2.0))
-    if w.eased.items[(st.side + n - 1) % n] and st.s < zone: ease = math.min(ease, math.pow(st.s / zone, 2.0))
+    if w.eased.items[st.side] and st.s > 1.0 - zone_end: ease = math.min(ease, math.pow((1.0 - st.s) / zone_end, 2.0))
+    if w.eased.items[before] and st.s < zone_start: ease = math.min(ease, math.pow(st.s / zone_start, 2.0))
     return ease
 
 # -- The nets.

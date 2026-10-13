@@ -28,17 +28,54 @@ func fillet_trims(set: interop.Reference[GeometrySet], made: const FilletMade*, 
                 try points.push(p)
                 try others.push(q)
             if points.count < 2: continue
-            let next = try trimmed_by_contacts(current, &fs.faces.items[k], points.view(), others.view(), trim, name, which)
+            let next = try trimmed_by_contacts(current, &fs.faces.items[k], &made.net, points.view(), others.view(), trim, name, which)
             current.release()
             current = next
     return current
 
+## The fillet net's own edge running through `points` (within a
+## millionth of their spread), copied onto `out`: whether one does (a
+## single face's contacts along the whole fillet).
+func net_edge_through(net: const Net*, points: const Vector3[], out: Spline*) -> bool!:
+    var spread = 0.0
+    for p in points: spread = math.max(spread, p.subtract(points[0]).length())
+    var edges = Growing[Spline]()
+    defer close_splines_of(&edges)
+    var all_u = Growing[Spline]()
+    defer close_splines_of(&all_u)
+    var all_v = Growing[Spline]()
+    defer close_splines_of(&all_v)
+    try curves_along(net, 0, &all_u)
+    try curves_along(net, 1, &all_v)
+    var best = 1.0e300
+    var chosen: i64 = -1
+    let candidates: (usize, usize)[4] = [(0, 0), (0, all_u.count - 1), (1, 0), (1, all_v.count - 1)]
+    for at in 0..<(usize)4:
+        let (way, line) = candidates[at]
+        let c = &all_u.items[line] if way == 0 else &all_v.items[line]
+        var worst = 0.0
+        for p in points: worst = math.max(worst, c.point_at(spline_nearest(c, p)).subtract(p).length())
+        if worst < best:
+            best = worst
+            chosen = (i64)at
+    if chosen < 0 or not (best <= math.max(spread, 1e-9) * 1e-6): return false
+    let (way, line) = candidates[(usize)chosen]
+    out.close()
+    *out = try (&all_u.items[line] if way == 0 else &all_v.items[line]).copy()
+    return true
+
 ## `set` with face `master`'s contact curve through `points` (as a free
 ## curve cast onto it along its normals): the face trimmed by it, the part
 ## toward `others` (the other set's contacts) taken away (`trim`
-## Automatic), or the curve kept on the face (Curves on surface).
-func trimmed_by_contacts(set: interop.Reference[GeometrySet], master: Master*, points: const Vector3[], others: const Vector3[], trim: i64, name: str, which: usize) -> interop.Reference[GeometrySet]!:
-    # The contact curve: a cubic through the contacts by chord length.
+## Automatic), or the curve kept on the face (Curves on surface). The curve
+## is the fillet `net`'s own edge where one runs through the contacts, so
+## the face and the fillet meet on one curve exactly (a curve through the
+## contacts strayed between them by enough to unsettle G3's measure).
+func trimmed_by_contacts(set: interop.Reference[GeometrySet], master: Master*, net: const Net*, points: const Vector3[], others: const Vector3[], trim: i64, name: str, which: usize) -> interop.Reference[GeometrySet]!:
+    var own = empty_spline(1)
+    defer own.close()
+    let exact = try net_edge_through(net, points, &own)
+    # Else the contact curve: a cubic through the contacts by chord length.
     var params = Growing[f64]()
     defer params.close()
     var run = 0.0
@@ -63,6 +100,9 @@ func trimmed_by_contacts(set: interop.Reference[GeometrySet], master: Master*, p
     defer curve.close()
     try curve.knots.assign(knots.view())
     try curve.points.assign(solved.view())
+    if exact:
+        curve.close()
+        curve = try own.copy()
     let face = master.w.face_name(master.f)
     var buffer: u8[300]
     let curve_name = try strings.format(buffer, f"{name}/contact{which + 1}[{face}]")

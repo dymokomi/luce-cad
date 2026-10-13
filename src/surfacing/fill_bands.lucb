@@ -49,38 +49,54 @@ struct BandSystem:
         let ridge = 1e-13 * self.diagonal_mean()
         for i in 0..<n: self.band.items[i * w] += ridge
         try self.kept.assign(self.band.view())
+        if n == 0: return
+        # The hot loops index the band through its pointer (unchecked): every
+        # index is within the band by the bounds above.
+        let band: f64* = &self.band.items[0]
         for j in 0..<n:
             let low_j = j - fewer(j, self.half)
-            var d = self.band.items[j * w]
+            # Row j's pointer: (j, k) at row_j - k, the diagonal at row_j - j.
+            let row_j: f64* = band + (j * w + j)
+            var d = (row_j - j)[0]
             for k in low_j..<j:
-                let l = self.band.items[j * w + j - k]
+                let l = (row_j - k)[0]
                 d -= l * l
             if not (d > 0.0): error(invalid, "Fill: the patch's equations have no single answer (the boundaries hold too little of it)")
             let diagonal = math.sqrt(d)
-            self.band.items[j * w] = diagonal
+            (row_j - j)[0] = diagonal
             for i in j + 1..<fewer(n, j + w):
                 let low_i = i - fewer(i, self.half)
-                var s = self.band.items[i * w + i - j]
-                var k = low_i if low_i > low_j else low_j
-                while k < j:
-                    s -= self.band.items[i * w + i - k] * self.band.items[j * w + j - k]
-                    k += 1
-                self.band.items[i * w + i - j] = s / diagonal
+                let row_i: f64* = band + (i * w + i)
+                let start = low_i if low_i > low_j else low_j
+                # (i, k) and (j, k) for k from start to j: both runs lie
+                # backward in memory from their rows' diagonals.
+                var a: f64* = row_i - start
+                var c: f64* = row_j - start
+                var s = (row_i - j)[0]
+                for _ in start..<j:
+                    s -= a[0] * c[0]
+                    a = a - 1
+                    c = c - 1
+                (row_i - j)[0] = s / diagonal
 
     ## Solves L Lᵀ x = b in place (`b` becomes x).
     func substitute(b: f64[]):
         let n = self.size
+        if n == 0: return
         let w = self.half + 1
+        let band: f64* = &self.band.items[0]
+        let x: f64* = &b[0]
         for i in 0..<n:
-            var s = b[i]
-            for k in i - fewer(i, self.half)..<i: s -= self.band.items[i * w + i - k] * b[k]
-            b[i] = s / self.band.items[i * w]
+            let row: f64* = band + (i * w + i)
+            var s = x[i]
+            for k in i - fewer(i, self.half)..<i: s -= (row - k)[0] * x[k]
+            x[i] = s / (row - i)[0]
         var i = n
         while i > 0:
             i -= 1
-            var s = b[i]
-            for k in i + 1..<fewer(n, i + w): s -= self.band.items[k * w + k - i] * b[k]
-            b[i] = s / self.band.items[i * w]
+            var s = x[i]
+            for k in i + 1..<fewer(n, i + w): s -= band[k * w + k - i] * x[k]
+            x[i] = s / band[i * w]
 
     ## The answer for the right-hand side `self.rhs` onto `out`, refined
     ## three times by its residual against the kept matrix.

@@ -28,7 +28,10 @@ pub func fill_tests() -> unit!:
     fill_corner()
     fill_guides()
     fill_options()
-    print("PASS fill: a planar pentagon and a hole in a plane fill with the plane (G1, G2, N-sided and Quad untrimmed); a height field's hole fills G0, G1 and G2 on every edge both ways; a ball's cap G1 and G2 near the sphere; a five-sided corner of three fillets and two walls G1 on all five edges, circular fillets' twist conflicts reported at their corners; guides and points on the fill; a hole found from one edge; Tension, Flatness, Normal flow and Explicit Control")
+    fill_lid()
+    fill_molded()
+    fill_rates()
+    print("PASS fill: a planar pentagon and a hole in a plane fill with the plane (G1, G2, N-sided and Quad untrimmed); a height field's hole fills G0, G1 and G2 on every edge both ways; a ball's cap G1 and G2 near the sphere; a five-sided corner of three fillets and two walls G1 on all five edges, circular fillets' twist conflicts reported at their corners; guides and points on the fill; a hole found from one edge; Tension, Flatness, Normal flow and Explicit Control; a lid on four walls G1 and G2 turns onto the walls' plane at its corners (no pinch), every wall met elsewhere; Auto molds a steep pentagon; G2 fillets' corners against walls are rate conflicts, G3 fillets' are not")
 
 # -- Shapes.
 
@@ -329,3 +332,98 @@ func fill_options() -> unit!:
             skew[flow] = math.max(skew[flow], math.abs(along.dot(across)))
     assert(skew[0] > 0.05 and skew[1] < 0.02, f"Normal flow: the cross isoparms' skew {skew}")
     assert(explicit.degree_u == 7 and explicit.degree_v == 6 and explicit.spans_u == 3 and explicit.spans_v == 2, f"Explicit Control: {explicit.degree_u} {explicit.degree_v} {explicit.spans_u} {explicit.spans_v}")
+
+## A box's four walls (x, y = ±1, z = 0 to 1), open at the top.
+func walls() -> (GeometrySet, str)!:
+    var data = CadGeometry.of_model(flat(Vector3(-1.0, -1.0, 0.0), Vector3(1.0, -1.0, 0.0), Vector3(-1.0, -1.0, 1.0), "s"))
+    data = data.merged(CadGeometry.of_model(flat(Vector3(1.0, -1.0, 0.0), Vector3(1.0, 1.0, 0.0), Vector3(1.0, -1.0, 1.0), "e")))
+    data = data.merged(CadGeometry.of_model(flat(Vector3(1.0, 1.0, 0.0), Vector3(-1.0, 1.0, 0.0), Vector3(1.0, 1.0, 1.0), "n")))
+    data = data.merged(CadGeometry.of_model(flat(Vector3(-1.0, 1.0, 0.0), Vector3(-1.0, -1.0, 0.0), Vector3(-1.0, 1.0, 1.0), "w")))
+    return (data, "edge s 0 -1 1;edge e 1 0 1;edge n 0 1 1;edge w -1 0 1")
+
+func fill_lid() -> unit!:
+    # Quad G1 and G2 on four perpendicular walls: only the four corners
+    # conflict (the walls' planes meet square there), every wall is met
+    # away from them, and at each corner the lid turns onto the walls' top
+    # plane: its normal there is the plane's, and the cross derivative
+    # never collapses (the pinch the eased corners left).
+    let (data, words) = walls()
+    for order in [1, 2]:
+        let code = order + 1
+        let made = CadSurfaceFill.fill(data, words, [code, code, code, code], [], quad = true)
+        assert(made.conflict_count() == 4, f"G{order} lid: {made.conflict_count()} conflicts")
+        for k in 0..<4:
+            let c = made.conflict(k)
+            assert(c.corner and c.order == 1 and math.abs(c.amount - 90.0) < 1e-6 and c.reach > 0.0, f"G{order} lid's conflict {k}: {c.start} G{c.order} {c.amount}")
+            assert(made.angle(k) < 0.05 and (order < 2 or made.curvature(k) < 0.5), f"G{order} lid's wall {k}: {made.angle(k)} degrees, {made.curvature(k)}%")
+        assert(made.spans_u <= 8 and made.spans_v <= 8, f"G{order} lid: {made.spans_u} by {made.spans_v} spans")
+        let (model, s) = sheet_of(made.geometry(), 4)
+        for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]:
+            let a = CadNurbs.point_at(model, s, u, v)
+            let h = 1e-4
+            let du = CadNurbs.point_at(model, s, u + (h if u < 0.5 else -h), v).subtract(a)
+            let dv = CadNurbs.point_at(model, s, u, v + (h if v < 0.5 else -h)).subtract(a)
+            let n = du.cross(dv).normalized()
+            assert(math.abs(n.z) > 0.999, f"G{order} lid's corner {a} has normal {n}")
+            # A step in along the diagonal: still a regular surface.
+            let w = 0.02
+            let b = CadNurbs.point_at(model, s, u + (w if u < 0.5 else -w), v + (w if v < 0.5 else -w))
+            let eu = CadNurbs.point_at(model, s, u + (w if u < 0.5 else -w) + h, v + (w if v < 0.5 else -w)).subtract(b)
+            let ev = CadNurbs.point_at(model, s, u + (w if u < 0.5 else -w), v + (w if v < 0.5 else -w) + h).subtract(b)
+            assert(eu.cross(ev).length() > 1e-9, f"G{order} lid pinches near its corner {a}")
+
+## Why a Projected fill of `words` is refused ("" when it is not).
+func projected_refusal(data: GeometrySet, words: str) -> str:
+    _ = CadSurfaceFill.fill(data, words, [2, 2, 2, 2, 2], [], domain = 1) catch failure:
+        return failure.message
+    return ""
+
+func fill_molded() -> unit!:
+    # A pentagonal prism's walls, open at the top: Projected refuses (the
+    # walls stand square to the hole's plane), Auto molds the hole onto a
+    # pentagon and fills it G1, its five corners the conflicts; four walls
+    # on Auto mold onto the square itself, Quad.
+    var data = GeometrySet()
+    let picks: list[str] = []
+    let corners: list[Vector3] = []
+    for k in 0..<5:
+        let a = 2.0 * math.pi * float(k) / 5.0
+        corners.append(Vector3(1.2 * math.cos(a), 1.2 * math.sin(a), 0.0))
+    for k in 0..<5:
+        let a = corners[k]
+        let b = corners[(k + 1) % 5]
+        data = data.merged(CadGeometry.of_model(flat(a, b, a.add(Vector3(0.0, 0.0, 1.0)), f"w{k}")))
+        let m = a.add(b).multiply_scalar(0.5)
+        picks.append(f"edge w{k} {m.x} {m.y} 1")
+    let words = picks.join(";")
+    let refused = projected_refusal(data, words)
+    assert(refused.contains("use Molded or Quad"), f"Projected on steep walls: {refused}")
+    let made = CadSurfaceFill.fill(data, words, [2, 2, 2, 2, 2], [])
+    assert(made.molded and made.trimmed, "the steep pentagon is not molded")
+    var corners_found = 0
+    for k in 0..<made.conflict_count():
+        if made.conflict(k).corner:
+            corners_found += 1
+    assert(corners_found == 5, f"{corners_found} corner conflicts of {made.conflict_count()}")
+    for k in 0..<5:
+        assert(made.gap(k) < 1e-5 and made.angle(k) < 0.05, f"the molded pentagon's wall {k}: gap {made.gap(k)}, {made.angle(k)} degrees")
+    let (box, box_words) = walls()
+    let boxed = CadSurfaceFill.fill(box, box_words, [2, 2, 2, 2], [])
+    assert(not boxed.trimmed and not boxed.molded, "four steep walls on Auto are not Quad")
+
+func fill_rates() -> unit!:
+    # G2 at the five-sided corner: a G2 fillet's curvature rises from
+    # nothing at its walls with a rate, a wall's has none, so where a G2
+    # fillet's end meets a wall strip their curvatures' rates disagree
+    # (four corners); G3 fillets' rise with no rate: no rate conflicts.
+    let h = math.sqrt(0.5)
+    let q = 0.5 - 0.5 * h
+    let words = f"edge FTX {1.0 - h} 1 {1.0 - h};edge X1 0 0.75 1.5;edge FXY {q} {q} 2;edge Y1 0.75 0 1.5;edge FTY 1 {1.0 - h} {1.0 - h}"
+    for section in [2, 3]:
+        let made = CadSurfaceFill.fill(five_sided(section), words, [3, 3, 3, 3, 3], [])
+        var rates = 0
+        for k in 0..<made.conflict_count():
+            let c = made.conflict(k)
+            if c.corner and c.order == 2:
+                rates += 1
+        assert(rates == (4 if section == 2 else 0), f"G{section} fillets: {rates} rate conflicts at the corners")

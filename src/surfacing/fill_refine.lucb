@@ -66,11 +66,72 @@ func spans_of(knots: const f64[], degree: i64) -> usize:
 
 # -- The fill.
 
+## Whether the N-sided fill molds its domain (Alias's N-sided Molded):
+## asked, or Auto with a G1 or G2 neighbor standing square to the loop's
+## best plane (a lid's walls: projected, the fill would rise straight up
+## from its chart); Auto molds four sides onto the square itself (Quad).
+## The polygon's corners follow the sides' lengths.
+func choose_domain(w: FillWork*) -> !:
+    w.molded = false
+    if w.opts.quad or w.opts.domain == fill_domain_projected: return
+    var steep = w.opts.domain == fill_domain_molded
+    if not steep:
+        for k in 0..<w.sides.count:
+            if w.sides.items[k].order() < 1: continue
+            for q in 0..<(usize)5:
+                let st = try make_station(w, k, ((f64)q + 0.5) / 5.0, Vector3(), Vector3())
+                if st.has_face and math.abs(st.form.n.dot(w.ez)) < 0.17: steep = true
+    if not steep: return
+    if w.opts.domain == fill_domain_auto and w.sides.count == 4:
+        # Four sides mold onto the square: Quad's untrimmed patch (its rows
+        # fixed to the boundaries) rather than a trimmed one.
+        w.opts.quad = true
+        return
+    w.molded = true
+    var total = 0.0
+    for side in w.sides.view(): total += side.length
+    # Turned so the polygon fills its box best (the net covers the box; what
+    # lies outside the polygon only bends): a square's sides along the axes.
+    var best_turn = 0.0
+    var best_area = 1.0e300
+    for q in 0..<(usize)32:
+        let turn = 2.0 * math.pi * (f64)q / 32.0
+        try mold_angles(w, total, turn)
+        let (low, high) = molded_box(w)
+        let area = (high.x - low.x) * (high.y - low.y)
+        if area < best_area - 1e-12:
+            best_area = area
+            best_turn = turn
+    try mold_angles(w, total, best_turn)
+
+## The Molded corners' angles, side k's start at the share of the loop's
+## length before it, turned by `turn`.
+func mold_angles(w: FillWork*, total: f64, turn: f64) -> !:
+    w.angles.clear()
+    var at = 0.0
+    for side in w.sides.view():
+        try w.angles.push(turn + 2.0 * math.pi * at / total)
+        at += side.length
+    try w.angles.push(turn + 2.0 * math.pi)
+
+## The Molded domain's box (its polygon's, or the circle's).
+func molded_box(w: const FillWork*) -> (Vector3, Vector3):
+    var low = Vector3(1.0e300, 1.0e300, 0.0)
+    var high = Vector3(-1.0e300, -1.0e300, 0.0)
+    for k in 0..<w.sides.count:
+        for q in 0..<(usize)16:
+            let c = w.disk(k, (f64)q / 16.0)
+            low = Vector3(math.min(low.x, c.x), math.min(low.y, c.y), 0.0)
+            high = Vector3(math.max(high.x, c.x), math.max(high.y, c.y), 0.0)
+    return (low, high)
+
 ## The fill of `w` (its sides walked, options set): the net, refined until
 ## its stations pass or the spans reach the limit, and its measures.
 func fill_made(w: FillWork*) -> FillMade!:
     try set_frame(w)
     if w.opts.quad and w.sides.count != 4: error(invalid, "Fill: Quad takes four boundaries (a loop of four meeting end to end)")
+    if w.sides.count > 64: error(invalid, "Fill: a hole takes at most 64 boundaries")
+    try choose_domain(w)
     try find_corners(w)
     let du = w.opts.degree_u if w.opts.explicit else 5
     let dv = w.opts.degree_v if w.opts.explicit else 5
@@ -84,6 +145,13 @@ func fill_made(w: FillWork*) -> FillMade!:
         let lu = (w.sides.items[0].length + w.sides.items[2].length) * 0.5 / w.scale
         let lv = (w.sides.items[1].length + w.sides.items[3].length) * 0.5 / w.scale
         high = Vector3(lu, lv, 0.0)
+    elif w.molded:
+        let (box_low, box_high) = molded_box(w)
+        low = box_low
+        high = box_high
+        let margin = math.max(high.x - low.x, high.y - low.y) * 0.1
+        low = low.subtract(Vector3(margin, margin, 0.0))
+        high = high.add(Vector3(margin, margin, 0.0))
     else:
         low = Vector3(1.0e300, 1.0e300, 0.0)
         high = Vector3(-1.0e300, -1.0e300, 0.0)
@@ -147,15 +215,28 @@ func fill_made(w: FillWork*) -> FillMade!:
             try nsided_stations(w, 4.0 / width, &stations)
             # A surface standing square to the hole's plane: the fill would
             # rise straight up from the chart (a box's top on its walls);
-            # Quad's own domain takes that.
-            for st in stations.view():
-                if st.order >= 1 and st.has_face and math.abs(st.form.n.dot(w.ez)) < 0.17:
-                    error(invalid, "Fill: a boundary's surface stands square to the hole's plane (an N-sided fill would rise straight up from it); use Quad, or G0 on that boundary")
-        for at in 0..<stations.count: stations.items[at].weight = corner_ease(w, &stations.items[at])
-        if not w.opts.quad: _ = try fit_reference(w, &fn, stations.view())
+            # Quad's own domain takes that, and Molded.
+            if not w.molded:
+                for st in stations.view():
+                    if st.order >= 1 and st.has_face and math.abs(st.form.n.dot(w.ez)) < 0.17:
+                        error(invalid, "Fill: a boundary's surface stands square to the hole's plane (a Projected fill would rise straight up from it); use Molded or Quad, or G0 on that boundary")
+        for at in 0..<stations.count:
+            stations.items[at].weight = corner_ease(w, &stations.items[at])
+            try corner_turn(w, &stations.items[at])
+        # The reference's miss on this net: the spans the fill needs to
+        # follow its neighbors' shape (a ball's cap its sphere), refined
+        # while it misses by more than a ten-thousandth of the loop.
+        var reference_miss = 0.0
+        if not w.opts.quad: reference_miss = try fit_reference(w, &fn, stations.view())
+        if w.molded:
+            # Molded's ribbons (fill_reference.lucb) only start the fill:
+            # rough near the polygon's corners, measured from they rippled
+            # it; the plate's own bending is the smoother rule there.
+            fn.reference.clear()
+            reference_miss = 0.0
         let width = math.min((high.x - low.x) / (f64)spans_of(ku.view(), du), (high.y - low.y) / (f64)spans_of(kv.view(), dv))
         try guide_points(w, 4.0 / width, &guides)
-        if w.opts.quad and guides.count > 0:
+        if (w.opts.quad or w.molded) and guides.count > 0:
             # The guides' chart points: the nearest of an answer without them.
             var none_guides: GuidePoint[1] = [GuidePoint(Vector3(), Vector3(), Vector3())]
             passes += try solve_fill(w, &fn, stations.view(), none_guides[..<0])
@@ -166,7 +247,9 @@ func fill_made(w: FillWork*) -> FillMade!:
             for at in 0..<stations.count: try checks.push(stations.items[at])
         else:
             try nsided_stations(w, 8.0 / width, &checks)
-            for at in 0..<checks.count: checks.items[at].weight = corner_ease(w, &checks.items[at])
+            for at in 0..<checks.count:
+                checks.items[at].weight = corner_ease(w, &checks.items[at])
+                try corner_turn(w, &checks.items[at])
         var failing = false
         for at in 0..<checks.count:
             let st = &checks.items[at]
@@ -191,6 +274,10 @@ func fill_made(w: FillWork*) -> FillMade!:
                 failing = true
                 split_u.items[span_index(ku.view(), du, g.uv.x)] = true
                 split_v.items[span_index(kv.view(), dv, g.uv.y)] = true
+        if reference_miss > 1e-4:
+            failing = true
+            for at in 0..<split_u.count: split_u.items[at] = true
+            for at in 0..<split_v.count: split_v.items[at] = true
         var row_missed = false
         for m in split_u.view(): row_missed = row_missed or m
         for m in split_v.view(): row_missed = row_missed or m
@@ -268,8 +355,11 @@ func fill_finished(w: const FillWork*, fn: const FillNet*, checks: const FillSta
             here = w.world(st.p)
             let (gap, angle, curvature) = fill_measure(fn, st)
             made.gaps.items[picked] = math.max(made.gaps.items[picked], gap * w.scale)
-            made.angles.items[picked] = math.max(made.angles.items[picked], angle * 180.0 / math.pi)
-            made.curvatures.items[picked] = math.max(made.curvatures.items[picked], curvature)
+            # Angles and curvatures away from conflicting corners (theirs
+            # are the conflicts').
+            if st.weight >= 1.0:
+                made.angles.items[picked] = math.max(made.angles.items[picked], angle * 180.0 / math.pi)
+                made.curvatures.items[picked] = math.max(made.curvatures.items[picked], curvature)
             if st.has_face and st.order >= 1:
                 let j = net_jet(fn, st.uv)
                 lean += j[1].cross(j[2]).dot(st.form.n)
@@ -283,7 +373,7 @@ func fill_finished(w: const FillWork*, fn: const FillNet*, checks: const FillSta
                 order = 2
                 amount = curvature
         if run_order >= 0 and (order != run_order or side != run_side or at == checks.length):
-            try made.conflicts.push(FillConflict((i64)w.sides.items[run_side].picked, run_order, run_from, run_to, run_worst, false))
+            try made.conflicts.push(FillConflict((i64)w.sides.items[run_side].picked, run_order, run_from, run_to, run_worst, false, 0.0))
             run_order = -1
         if order >= 0:
             if run_order < 0:
@@ -300,7 +390,7 @@ func fill_finished(w: const FillWork*, fn: const FillNet*, checks: const FillSta
         for q in 0..<(usize)129:
             let s = (f64)q / 128.0
             let p = w.local(side.curve.point_at(try side_param(w, k, s)))
-            var seed = w.chart(p)
+            var seed = try w.seed_of(k, try side_param(w, k, s), p)
             if w.opts.quad:
                 let (uv, _) = quad_place(&fn.net, k, s)
                 seed = uv
@@ -312,7 +402,7 @@ func fill_finished(w: const FillWork*, fn: const FillNet*, checks: const FillSta
         made.guide_miss = math.max(made.guide_miss, miss * w.scale)
         if miss > w.position:
             let p = w.world(g.p)
-            try made.conflicts.push(FillConflict(-1, 0, p, p, miss * w.scale, false))
+            try made.conflicts.push(FillConflict(-1, 0, p, p, miss * w.scale, false, 0.0))
     # Facing the neighbors (else the plane's normal, Newell's way).
     if lean != 0.0: made.sense = lean > 0.0
     else:
@@ -338,8 +428,8 @@ func laid_sides(w: const FillWork*, fn: const FillNet*, out: Growing[Spline]*) -
         let before = &w.sides.items[(k + n - 1) % n]
         let a = w.local(w.sides.items[k].curve.point_at(0.0))
         let b = w.local(before.curve.point_at(1.0))
-        let fa = net_jet(fn, net_foot(fn, a, w.chart(a)))[0]
-        let fb = net_jet(fn, net_foot(fn, b, w.chart(b)))[0]
+        let fa = net_jet(fn, net_foot(fn, a, try w.seed_of(k, w.sides.items[k].curve.low(), a)))[0]
+        let fb = net_jet(fn, net_foot(fn, b, try w.seed_of((k + n - 1) % n, before.curve.high(), b)))[0]
         try corners.push(fa.add(fb).multiply_scalar(0.5))
     for k in 0..<n:
         let side = &w.sides.items[k]
@@ -369,7 +459,7 @@ func laid_sides(w: const FillWork*, fn: const FillNet*, out: Growing[Spline]*) -
             defer values.close()
             for t in params.view():
                 let p = w.local(side.curve.point_at(t))
-                try values.push(weighted(net_jet(fn, net_foot(fn, p, w.chart(p)))[0], 1.0))
+                try values.push(weighted(net_jet(fn, net_foot(fn, p, try w.seed_of(k, t, p)))[0], 1.0))
             var starts: Weighted[4] = [weighted(corners.items[k], 1.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
             var ends: Weighted[4] = [weighted(corners.items[(k + 1) % n], 1.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0), Weighted(0.0, 0.0, 0.0, 0.0)]
             var made = empty_spline(5)
@@ -381,7 +471,7 @@ func laid_sides(w: const FillWork*, fn: const FillNet*, out: Growing[Spline]*) -
             for at in 0..<params.count - 1:
                 let t = (params.items[at] + params.items[at + 1]) * 0.5
                 let p = w.local(side.curve.point_at(t))
-                let foot = net_jet(fn, net_foot(fn, p, w.chart(p)))[0]
+                let foot = net_jet(fn, net_foot(fn, p, try w.seed_of(k, t, p)))[0]
                 worst = math.max(worst, made.point_at(t).subtract(foot).length())
             if worst <= 1e-9 or per >= 128:
                 for at in 0..<made.points.count: made.points.items[at] = weighted(w.world(made.points.items[at].point()), 1.0)

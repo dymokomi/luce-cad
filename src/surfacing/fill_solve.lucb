@@ -9,16 +9,27 @@
 ## G2 linearized about it; the flow. Into `system` and kept in `held`.
 func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, held: HeldRows*, row: FillRow*, st: const FillStation*, cross: Vector3?, weight: f64) -> !:
     let axes: Vector3[3] = [Vector3(1.0, 0.0, 0.0), Vector3(0.0, 1.0, 0.0), Vector3(0.0, 0.0, 1.0)]
+    let ease = st.weight
+    let exact = ease >= 1.0
+    # How closely the multipliers drive each row: positions to a thousandth
+    # of their tolerance (the trim lays the boundaries on the fill to a
+    # billionth); slopes and curvatures to a tenth of theirs (the angle's
+    # sine on a cross derivative of about unit length; the curvature's
+    # share below).
+    let close = w.position * 1e-3
+    let square = w.angle * 0.1
     if not w.opts.quad:
         # G0 (Free too: the boundary's position holds the trim).
         for c in 0..<(usize)3:
             try put_derivative(fn, row, st.uv, st.d, 0, axes[c])
-            try held.hold(system, row, weight, st.p.dot(axes[c]), true)
-    let ease = st.weight
-    let exact = ease >= 1.0
-    if st.order >= 1 and st.has_face and ease > 0.0:
-        try put_derivative(fn, row, st.uv, st.d, 1, st.form.n)
-        try held.hold(system, row, weight * ease, 0.0, exact)
+            try held.hold(system, row, weight, st.p.dot(axes[c]), close)
+    if st.order >= 1 and st.has_face and (ease > 0.0 or st.turned):
+        # Turned toward a conflicting corner (corner_turn): held whole to
+        # the turned normal, by the weight alone (the turn is not a spline
+        # of the net's: driven exactly, its rows' leftovers would spread).
+        try put_derivative(fn, row, st.uv, st.d, 1, st.held)
+        if st.turned: try held.hold(system, row, weight, 0.0, 0.0)
+        else: try held.hold(system, row, weight * ease, 0.0, square if exact else 0.0)
         # Quad: G1 alone is met by a cross derivative shrunk to nothing
         # (the normal then undefined: a lid on vertical walls stays flat),
         # so it leaves the neighbor its way at the base's speed across, a
@@ -39,17 +50,20 @@ func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, h
             # sides fix.
             let across = speed.subtract(st.tangent.multiply_scalar(speed.dot(st.tangent)))
             let steep = math.abs((across.normalized() catch failure: recover Vector3()).dot(st.form.n)) > 0.99
-            if steep and st.s > 0.05 and st.s < 0.95:
-                let way = st.leave.normalized() catch failure: recover Vector3()
+            if steep and (st.turned or (st.s > 0.05 and st.s < 0.95)):
+                let way = st.way.normalized() catch failure: recover Vector3()
                 try put_derivative(fn, row, st.uv, st.d, 1, way)
-                try held.hold(system, row, weight * 1e-4 * ease, across.length(), false)
+                try held.hold(system, row, weight * 1e-4, across.length(), 0.0)
     if st.order >= 2 and st.has_face and ease > 0.0:
         if let l = cross:
             # n . S_dd = II(S_d, S_d), linearized about the last answer's
             # S_d = l (Gauss-Newton): II(S_d, S_d) ~ 2 II(l, S_d) - II(l, l).
             try put_derivative(fn, row, st.uv, st.d, 2, st.form.n)
             try put_derivative(fn, row, st.uv, st.d, 1, st.form.times(l).multiply_scalar(-2.0))
-            try held.hold(system, row, weight * ease, -st.form.curvature_of(l), exact)
+            # Within a tenth of the curvature tolerance of the larger
+            # curvature (the Check tools' floor below).
+            let bent = math.max(math.abs(st.form.curvature_of(l)), 5e-4 * l.dot(l))
+            try held.hold(system, row, weight * ease, -st.form.curvature_of(l), bent * w.curvature * 1e-3 if exact else 0.0)
     if w.opts.quad and w.opts.flow != fill_flow_natural:
         # The cross derivative's part square to the wanted way vanishes:
         # Normal along the tangent; Next and Adjacent across the way. A
@@ -62,7 +76,7 @@ func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, h
             e = n.cross(st.flow).normalized() catch failure: recover Vector3()
         if e.length() > 0.0:
             try put_derivative(fn, row, st.uv, st.d, 1, e)
-            try held.hold(system, row, weight * 1e-2, 0.0, false)
+            try held.hold(system, row, weight * 1e-2, 0.0, 0.0)
 
 ## A guide point: where (normalized), its chart point, and the guide
 ## face's normal for G1 (zero none).
@@ -107,22 +121,69 @@ func solve_fill(w: const FillWork*, fn: FillNet*, stations: const FillStation[],
     defer crosses.close()
     var passes = try solve_once(w, fn, stations, guides, crosses.view())
     if not any_g2: return passes
+    var merit = fill_merit(w, fn, stations)
+    var before = Growing[Weighted]()
+    defer before.close()
+    var after = Growing[Weighted]()
+    defer after.close()
     for round in 0..<8:
         crosses.clear()
-        var change = 0.0
         for st in stations:
             if st.order < 2 or not st.has_face:
                 try crosses.push(none)
                 continue
             let j = net_jet(fn, st.uv)
             try crosses.push(j[1].multiply_scalar(st.d.x).add(j[2].multiply_scalar(st.d.y)))
-        var before = Growing[Weighted]()
-        defer before.close()
         try before.assign(fn.net.points.view())
         passes += try solve_once(w, fn, stations, guides, crosses.view())
+        try after.assign(fn.net.points.view())
+        # Damped: the step's share that lowers the stations' misfit (a
+        # Gauss-Newton step is quadratic's guess, and on a tight neighbor,
+        # a small fillet's curvature asking a long cross derivative, the
+        # full step can overshoot and the rounds run away).
+        var share = 1.0
+        var taken = false
+        for _ in 0..<6:
+            for k in 0..<after.count:
+                let a = before.items[k].point()
+                fn.net.points.items[k] = weighted(a.add(after.items[k].point().subtract(a).multiply_scalar(share)), 1.0)
+            let now = fill_merit(w, fn, stations)
+            if now < merit:
+                merit = now
+                taken = true
+                break
+            share *= 0.5
+        if not taken:
+            # No share helps: the last answer stands.
+            try fn.net.points.assign(before.view())
+            break
+        var change = 0.0
         for k in 0..<before.count: change = math.max(change, fn.net.points.items[k].point().subtract(before.items[k].point()).length())
-        if change < 1e-10 or round == 7: break
+        # Settled within a hundredth of the position tolerance.
+        if change < w.position * 0.01: break
     return passes
+
+## How far `fn` misses what `stations` ask, each measure over its
+## tolerance, squared and summed (the damped rounds' merit): G0's gap, G1's
+## normal part of the cross derivative, G2's normal curvature across.
+func fill_merit(w: const FillWork*, fn: const FillNet*, stations: const FillStation[]) -> f64:
+    var sum = 0.0
+    for st in stations:
+        let j = net_jet(fn, st.uv)
+        if not w.opts.quad:
+            let gap = j[0].subtract(st.p).length() / w.position
+            sum += gap * gap
+        if st.order < 1 or not st.has_face or st.weight < 1.0: continue
+        let sd = j[1].multiply_scalar(st.d.x).add(j[2].multiply_scalar(st.d.y))
+        let speed = math.max(sd.dot(sd), 1e-300)
+        let slope = st.held.dot(sd) / (math.sqrt(speed) * math.max(w.angle, 1e-12))
+        sum += slope * slope
+        if st.order < 2: continue
+        let sdd = j[3].multiply_scalar(st.d.x * st.d.x).add(j[4].multiply_scalar(2.0 * st.d.x * st.d.y)).add(j[5].multiply_scalar(st.d.y * st.d.y))
+        let want = st.form.curvature_of(sd)
+        let bent = (st.form.n.dot(sdd) - want) / (math.max(math.abs(want), 5e-4 * speed) * w.curvature * 0.01)
+        sum += bent * bent
+    return sum
 
 ## One factored solve of `stations` and `guides` on `fn`, G2 rows where
 ## `crosses` gives a station's cross derivative (empty: none), repeated
@@ -137,7 +198,7 @@ func solve_once(w: const FillWork*, fn: FillNet*, stations: const FillStation[],
     # Séquin's minimum variation): with position, slope and curvature held
     # it is the well-posed one, as bending is for position and slope.
     var higher = false
-    for st in stations: higher = higher or (st.order >= 2 and st.has_face)
+    for st in stations: higher = higher or (st.order >= 2 and st.has_face) or st.turned
     let bend = 1.0 - 0.99 * tension
     try add_energy(&system, fn, bend * (0.01 if higher else 1.0), bend if higher else 0.0, tension * 10.0, flat * 100.0, w.ez)
     var base = Growing[f64]()
@@ -154,25 +215,15 @@ func solve_once(w: const FillWork*, fn: FillNet*, stations: const FillStation[],
     for g in guides:
         for c in 0..<(usize)3:
             try put_derivative(fn, &row, g.uv, Vector3(), 0, axes[c])
-            try held.hold(&system, &row, weight, g.p.dot(axes[c]), true)
+            try held.hold(&system, &row, weight, g.p.dot(axes[c]), w.position * 0.1)
         if g.n.length() > 0.0:
             try put_derivative(fn, &row, g.uv, Vector3(1.0, 0.0, 0.0), 1, g.n)
-            try held.hold(&system, &row, weight, 0.0, true)
+            try held.hold(&system, &row, weight, 0.0, w.angle * 0.1)
             try put_derivative(fn, &row, g.uv, Vector3(0.0, 1.0, 0.0), 1, g.n)
-            try held.hold(&system, &row, weight, 0.0, true)
+            try held.hold(&system, &row, weight, 0.0, w.angle * 0.1)
     try system.factor()
     var x = Growing[f64]()
     defer x.close()
-    var passes: i64 = 0
-    var last = 1.0e300
-    while passes < 40:
-        try held.right_side(base.view(), &system.rhs)
-        try system.solve(&x)
-        take_answer(fn, x.view())
-        passes += 1
-        let worst = held.settle(x.view())
-        # Settled, or stalled at the rounding of the system.
-        if worst < 1e-10: break
-        if passes > 3 and worst > last * 0.7: break
-        last = worst
+    let passes = try solve_held(&system, &held, base.view(), &x)
+    take_answer(fn, x.view())
     return passes

@@ -1923,8 +1923,9 @@ the tangent offset, by bisection on its weight; 0 the ball's circle); **Curvatur
 along each leg on any face (a step of a hundred-thousandth of the model); **Variable Fillets** (pairs of
 a fraction along the fillet and a radius or chord: the ball rolled at the first size gives a spine whose
 fractions the law is read on, then rolled again at the law's size at each station, smoothstep between;
-the contacts of a variable fillet with G3 sections measure G2, their sections leaning off the square
-plane). Blend Surface's Flow Control **Edge align** (the sides matched by their own parameters),
+a variable G3 or Bias fillet measures G3 at its contacts: the faces are trimmed by the fillet's own
+edges, `fillet_trims`, not a cubic through its contacts, which strayed between them by enough to break
+the rate's measure). Blend Surface's Flow Control **Edge align** (the sides matched by their own parameters),
 **Interior Edge Align** (side 2 matched through the profiles' far ends, so a slanted profile lies on the
 blend) and **Explicit Control** (the net refitted to the degrees and spans, its end rows held). Tube's
 **variable radius** (the same law) and **trims**: where the tube meets its face (each station's circle
@@ -2024,11 +2025,49 @@ twists disagree); a guide curve and a point lie on the fill (N-sided and Quad) w
 Tension lower a cap's dome, Explicit Control's degrees and spans are kept, and Normal flow leaves the
 cross isoparms square to the side.
 
-Not yet: Molded domains (a boundary folding over its best plane is refused, Quad is the way round);
-the reference's ribbons for B-spline neighbors beyond their domain are tangent planes (a natural
-extension would carry their curvature); G2 at corners whose neighbors' curvature rates disagree (a
-G2 fillet's end meeting a wall at an angle) is not detected before the solve: what fails is reported as
-runs.
+**Follow-ups (2026-10-12, with Stage 8):**
+
+- **Corners that turn** (`corner_turn`). Where two G1 neighbors' tangent planes disagree and their
+  boundaries meet at an angle (a lid's corner on two walls), the fill's own tangent plane there is the
+  boundaries' plane. Easing the G1 rows to nothing near such a corner left the cross derivative to
+  collapse (zebra stripes pinched to the corner); now the way the fill leaves each boundary turns from
+  the neighbor's onto the way into the patch at the corner, by a quintic smoothstep over a zone that
+  grows with the disagreement (a quarter of each side for a right angle), and the G1 rows hold the
+  turned normal (penalties, the turn being no spline of the net). The lid is regular at its corners,
+  horizontal there, and G1 to its walls elsewhere. The zone is the conflict's `reach`; the
+  Continuity Check draws but does not count stations within it (`CadMeasure.check_eased`), and the
+  fill's own measures leave them out. (The zebra stripes' meeting point in the middle of a lid with
+  the stripes about Y is the cylinder's pole where the normal points up, not the surface's.)
+- **The multipliers by conjugate gradients** (`solve_held`). The exact rows' shifts move their
+  residuals affinely, by an operator symmetric and positive in the rows' weights, so conjugate
+  gradients settle them in tens of solves where shifting by the residual crawled (a lid's G1 rows
+  stalled hundredths of a degree short and refined to 32 by 32 spans; now 4 by 4). Each row is driven
+  only within a part of its tolerance (positions a thousandth, slopes and curvatures a tenth):
+  boundaries no net meets exactly (a circle's) bend between their stations when pushed further (a
+  ball's cap sank a quarter of a percent). G2's Gauss–Newton rounds are damped by the stations'
+  misfit (a full step on a tight neighbor ran away), and the reference's miss now refines too.
+- **Corners' curvature rates.** Two G2 neighbors' curvatures' rates at a corner (the third
+  derivatives' symmetry, as the twist is the second's) are compared before the solve, by one-sided
+  differences extrapolated to the corner: a G2 fillet's end meeting a wall at an angle is a G2 corner
+  conflict, a G3 fillet's is not.
+- **Molded domain** (Alias's N-sided Molded; `domain` Auto, Projected or Molded). The loop is laid
+  round the polygon inscribed in the unit circle, a corner where each side starts (turned to fill its
+  box), the stations' ways across the polygon's, the reference each side's neighbor carried on the way
+  it leaves (out past the polygon, on down it), the energy of the plate itself. Auto molds when a G1
+  or G2 neighbor stands square to the loop's best plane, and a four-sided such hole onto the square
+  itself: Quad, untrimmed.
+- **Neighbors carried on naturally.** A B-spline neighbor's ribbon follows its end spans' own
+  polynomials past its domain (`natural_surface_jet`, as Extend Natural carries it), up to half its
+  domain, before the tangent plane takes over.
+- **Speed.** A ribbon's Newton stops once it no longer closes in (most chart points miss a fillet's
+  face), the band Cholesky runs on the band's pointer, Gauss–Newton settles to a hundredth of the
+  position tolerance: the G1 five-sided corner 7.5 s to 3.9 s, G2 22 s to 10 s (48 by 32 spans; the
+  factor is what is left, n h²).
+
+Not yet: the five-sided corner between G3 fillets and walls fills G1 but not G2 (its stations' G2
+rows do not settle together: 60 to 190% off at the walls); a Molded fill's trimmed face can be hard to
+mesh where it rises square from its boundaries (its nearest-point searches stall), so four steep
+sides go to Quad; a corner's turn zone is a fixed share of each side.
 
 ## Sketches (`sketch/`)
 

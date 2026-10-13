@@ -5,7 +5,8 @@
 
 ## What Fill made: the set, each boundary's worst gap (model units), angle
 ## between normals (degrees) and normal curvature difference across
-## (percent) in the picked order, the guides' worst miss, the conflicts
+## (percent) in the picked order (angles and curvatures away from the
+## conflicting corners, which are conflicts of their own), the guides' worst miss, the conflicts
 ## (FillConflict), the spans and whether the face is trimmed.
 pub struct CadFill:
     var made: interop.Reference[GeometrySet]?
@@ -20,6 +21,8 @@ pub struct CadFill:
     pub var degree_u: i64
     pub var degree_v: i64
     pub var trimmed: bool
+    ## N-sided on a Molded domain (Auto chose it, or it was asked).
+    pub var molded: bool
 
     pub func init():
         self.made = none
@@ -34,6 +37,7 @@ pub struct CadFill:
         self.degree_u = 0
         self.degree_v = 0
         self.trimmed = false
+        self.molded = false
 
     pub func geometry() -> interop.Reference[GeometrySet]!:
         let made = self.made else error(invalid, "a fill has no geometry")
@@ -88,19 +92,21 @@ pub struct CadSurfaceFill:
     ## Control (`explicit`: the degrees and spans as asked, no refining);
     ## `refine` up to `most_spans` each way; the tolerances (`position` in
     ## model units, 0: a millionth of the loop's size; `angle` degrees;
-    ## `curvature` percent). The fill is a body of one sheet named `name`.
+    ## `curvature` percent); N-sided's `domain` (fill_domain_auto, _projected,
+    ## _molded). The fill is a body of one sheet named `name`.
     pub static func fill(set: interop.Reference[GeometrySet], boundaries: str, continuity: const i64[], points: const Vector3[], guides: str = "", guide_order: i64 = 0,
                          quad: bool = false, tension: f64 = 0.0, flatness: f64 = 0.0, flow: i64 = 0, explicit: bool = false, degree_u: i64 = 5, spans_u: i64 = 4,
                          degree_v: i64 = 5, spans_v: i64 = 4, refine: bool = true, most_spans: i64 = 32, position: f64 = 0.0, angle: f64 = 0.05, curvature: f64 = 0.5,
-                         name: str = "Fill") -> interop.Reference[CadFill]!:
+                         name: str = "Fill", domain: i64 = 0) -> interop.Reference[CadFill]!:
         if not (tension >= 0.0 and tension <= 1.0): error(invalid, "Fill: Tension is 0 to 1")
         if not (flatness >= 0.0 and flatness <= 1.0): error(invalid, "Fill: Flatness is 0 to 1")
         if flow < fill_flow_natural or flow > fill_flow_adjacent: error(invalid, "Fill: the boundary flow is Natural, Normal, Next or Adjacent")
         if guide_order < 0 or guide_order > 1: error(invalid, "Fill: guides are G0 or G1")
         if explicit and (spans_u < 1 or spans_v < 1 or spans_u > 64 or spans_v > 64): error(invalid, "Fill: Explicit Control's spans are 1 to 64")
         if not (angle > 0.0 and curvature > 0.0 and position >= 0.0): error(invalid, "Fill: the tolerances must be more than zero")
-        let opts = FillOptions(quad, tension, flatness, flow, guide_order, explicit, degree_u, spans_u, degree_v, spans_v, refine, most_spans, position, angle, curvature)
-        var w = FillWork(Growing[FillSide](), opts, Growing[Master](), Growing[Vector3](), Vector3(), 1.0, Vector3(), Vector3(), Vector3(), 0.0, 0.0, 0.0, Growing[FillConflict](), Growing[bool]())
+        if domain < fill_domain_auto or domain > fill_domain_molded: error(invalid, "Fill: the domain is Auto, Projected or Molded")
+        let opts = FillOptions(quad, tension, flatness, flow, guide_order, explicit, degree_u, spans_u, degree_v, spans_v, refine, most_spans, position, angle, curvature, domain)
+        var w = FillWork(Growing[FillSide](), opts, Growing[Master](), Growing[Vector3](), Vector3(), 1.0, Vector3(), Vector3(), Vector3(), 0.0, 0.0, 0.0, Growing[FillConflict](), Growing[bool](), Growing[CornerTurn](), false, Growing[f64]())
         defer w.close()
         try walk_loop(set, boundaries, continuity, &w.sides)
         if guides.length > 0: try builder_masters(set, guides, &w.guides)
@@ -123,7 +129,8 @@ pub struct CadSurfaceFill:
         fill.spans_v = (i64)spans_of(made.net.kv.view(), made.net.dv)
         fill.degree_u = made.net.du
         fill.degree_v = made.net.dv
-        fill.trimmed = not quad
+        fill.trimmed = not w.opts.quad
+        fill.molded = w.molded
         return result
 
     ## The words of every edge round the hole the edge `word` lies on (the
