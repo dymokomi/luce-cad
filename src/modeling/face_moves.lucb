@@ -159,6 +159,15 @@ func corner_point(w: const Shape*, surfaces: const i64[], seed: Vector3) -> Vect
     if worst > w.tolerance * 10.0: error(invalid, "the faces at a corner no longer meet in one point: the move changes the body's shape too much")
     return x
 
+## Whether edge `e` of `w` is a seam: its one face uses it both ways.
+func seam_edge(w: const Shape*, e: usize) -> bool!:
+    let f = w.sides.items[e * 2] if w.sides.items[e * 2] >= 0 else w.sides.items[e * 2 + 1]
+    if f < 0: return false
+    var uses = 0
+    for use in w.face_uses((usize)f):
+        if edge_index(use) == e: uses += 1
+    return uses > 1
+
 ## How far point `x` lies from the farthest of the surfaces `surfaces`.
 func corner_gap(w: const Shape*, surfaces: const i64[], x: Vector3) -> f64!:
     var worst = 0.0
@@ -218,7 +227,7 @@ func solve_small(a: f64[], z: f64[], n: usize) -> bool:
 ## `targets`, one per face, for move_replace, with `senses`; an offset by
 ## `distances`, one per face, or `m.distance` when it is empty), every
 ## vertex and edge on them found again, checked, as a new model.
-func substitute(w: Shape*, faces: const usize[], m: const FaceMove*, targets: const Surface[], senses: const bool[], distances: const f64[]) -> interop.Reference[CadModel]!:
+func substitute(w: Shape*, faces: const usize[], m: const FaceMove*, targets: const Surface[], senses: const bool[], distances: const f64[], open: bool = false) -> interop.Reference[CadModel]!:
     let moved_count = faces.length
     if moved_count == 0: error(invalid, "pick the faces to move")
     var moved = Growing[bool]()
@@ -283,7 +292,7 @@ func substitute(w: Shape*, faces: const usize[], m: const FaceMove*, targets: co
         try refit_edge(w, e, moved.view(), m, old_points.items[(usize)edge.start], old_points.items[(usize)edge.end])
     try check_loops(w)
     try check_reach(w)
-    try orient(w, w.faces.count)
+    try orient(w, w.faces.count, open)
     let solid = try used_brep(w)
     defer solid.release()
     return try CadModel.of_brep(solid)
@@ -454,6 +463,10 @@ func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, ol
         if both and (m.kind == move_translate or m.kind == move_rotate):
             # Moved with both its faces: the carrier moves alike.
             carrier = try w.add_carrier(rigid_carrier(&old, m))
+        elif (fb < 0 or fa < 0) and m.kind == move_replace and not try seam_edge(w, e):
+            # An open body's boundary on a face replaced by its own surface
+            # (Stitch's joins rebuilt): it keeps its curve.
+            carrier = edge.carrier
         elif fb < 0 or fa < 0:
             # A seam (one face both ways): a line through its ends, or its
             # circle about its center, grown with the face.

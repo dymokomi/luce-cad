@@ -17,12 +17,13 @@
 ## by up to the gap. Each edge so made keeps that distance as its precision
 ## and each merged vertex its own (Parasolid's tolerant edges and
 ## vertices: BrepModel.edge_precision), so the model's tolerance is not
-## widened for all of it; meshing reads the largest. A closed result's
+## widened for all of it; meshing reads the largest. The result's
 ## tolerant edges are then rebuilt where their faces' surfaces meet, and
 ## its vertices where theirs do (SMLib's edge refinement after sewing):
-## their precision falls back under the tolerance. Where that changes the
-## body's shape too much (a face's surface not reaching), the tolerant
-## result stays.
+## their precision falls back under the tolerance; an open result's
+## boundary edges keep their curves, their ends the rebuilt vertices. Where
+## that changes the body's shape too much (a face's surface not reaching),
+## the tolerant result stays.
 ##
 ## Unstitch is the other way: every face of a body its own open body, its
 ## edges its own.
@@ -122,10 +123,11 @@ pub func stitch_models(models: const interop.Reference[CadModel][], gap: f64, to
     var made = try write_pieces(&work, &pieces, piece_face.view(), piece_name.view(), keep.view(), turn.view(), false, 0.0, base, gaps.view())
     errdefer made.release()
     let widest = try tolerant_joins(made.value(), gap, base)
-    # A closed result's tolerant edges rebuilt where their faces' surfaces
-    # meet (rebuilt_joins): their precision falls back under the tolerance.
-    if after == 0 and widest > base and not tolerant:
-        if let exact = try rebuilt_joins(made.value(), base):
+    # Tolerant edges rebuilt where their faces' surfaces meet
+    # (rebuilt_joins): their precision falls back under the tolerance. An
+    # open result's boundary keeps its curves.
+    if widest > base and not tolerant:
+        if let exact = try rebuilt_joins(made.value(), base, after > 0):
             made.release()
             made = exact
             _ = try tolerant_joins(made.value(), gap, base)
@@ -442,7 +444,7 @@ func split_closed_loops(w: Shape*) -> i64!:
 ## and their vertices where theirs do: Offset Face's machinery with each
 ## face replaced by its own surface (face_moves.lucb). None when that
 ## refuses.
-func rebuilt_joins(model: const CadModel*, base: f64) -> interop.Reference[CadModel]?!:
+func rebuilt_joins(model: const CadModel*, base: f64, open: bool = false) -> interop.Reference[CadModel]?!:
     let b = model.brep() else return none
     var w = try shape_of(model)
     defer w.close()
@@ -477,7 +479,7 @@ func rebuilt_joins(model: const CadModel*, base: f64) -> interop.Reference[CadMo
     let m = FaceMove(move_replace, Vector3(), Vector3(), Vector3(), 0.0, 0.0)
     var no_distances = Growing[f64]()
     defer no_distances.close()
-    let made = substitute(&w, faces.view(), &m, targets.view(), senses.view(), no_distances.view()) catch failure:
+    let made = substitute(&w, faces.view(), &m, targets.view(), senses.view(), no_distances.view(), open) catch failure:
         if failure.code != invalid: error(failure.code, failure.message)
         return none
     return made

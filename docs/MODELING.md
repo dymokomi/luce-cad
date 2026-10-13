@@ -1605,10 +1605,12 @@ are turned so every shared edge is used once each way (a breadth-first walk; a o
 and a body whose every edge is shared is a closed solid. The joined edges keep the first face's curve;
 their **precision** is the widest the joined edges lay apart, or the faces' surfaces off the edge
 (sampled), and each merged vertex's the most of its edges'; the model's own tolerance stays as it was.
-A closed result's tolerant joins are then rebuilt where their faces' surfaces meet, and its vertices
+The result's tolerant joins are then rebuilt where their faces' surfaces meet, and its vertices
 where theirs do (`rebuilt_joins`: Offset Face's machinery, each face replaced by its own surface), so
 their precision falls back under the tolerance (a box's faces moved 1e-3 apart stitch into the moved
-box exactly); `tolerant` keeps them as they are, and so does a rebuild that would change the shape.
+box exactly); an open result's boundary edges keep their curves, ending at the rebuilt vertices (five
+of the box's faces: precision 2e-5 again). `tolerant` keeps them as they are, and so does a rebuild
+that would change the shape.
 Unstitch makes every face its own open body.
 
 Tests (`tests/regressions/surfacing_tests.luc`), against closed forms:

@@ -1018,7 +1018,10 @@ What has landed since the study, item by item (the runs of §2 repeated with the
   in), stitched within 0.003, close with every edge's precision back at the model's tolerance
   (2e-5, from 1.4e-3) and the moved box's volume to 3e-4 at 8 divisions. `tolerant` keeps the joins
   (a boolean through tolerant edges is still tested). Regression: `surfacing_tests`
-  (`stitch_passes`). Still open: short-edge and sliver removal, open results' joins.
+  (`stitch_passes`). Then open results' joins: rebuilt alike, their boundary edges keeping
+  their curves (five of the box's faces moved apart: precision back to 2e-5 from 1.4e-3). Still open:
+  short-edge and sliver removal (a face thinner than the gap is kept whole by design: a thin
+  plate's sides; telling a sliver from such a side needs the faces either side).
 
 - **13, where the boolean time goes (part).** P1 profiled: per hole the cost grew with the
   plate's faces (46 ms for the first ten holes, 390 ms for the last ten), and over half of it was
