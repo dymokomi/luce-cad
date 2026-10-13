@@ -79,6 +79,7 @@ func shell_of(model: interop.Reference[CadModel], removed: const bool[], thickne
         # (vanishing_inner): it is the inner body of the body without them.
         var past = try vanishing_inner(model, removed, wall_in, wall_out, &m)
         if past == none: past = try convex_inner(model, removed, wall_in, wall_out)
+        if past == none: past = try refilleted_inner(model, removed, wall_in, &m)
         if let made = past:
             inner.release()
             inner = made
@@ -183,6 +184,19 @@ func with_void(outer: const CadModel*, inner: const CadModel*) -> interop.Refere
     defer b.release()
     return try CadModel.of_brep(b)
 
+## Whether round face `f` (a cylinder, sphere or torus) turns outward: its
+## outward normal away from its axis (a torus's tube's center line), a
+## convex round.
+func outward_round(w: const Shape*, f: usize) -> bool!:
+    let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+    let p = try w.edge_at(edge_index(w.face_uses(f)[0]), 0.5)
+    var core = s.origin
+    if s.kind == surface_cylinder: core = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+    if s.kind == surface_torus:
+        let flat = p.subtract(s.origin).subtract(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
+        core = s.origin.add((try flat.normalized()).multiply_scalar(s.radius))
+    return (try w.face_normal(f, p)).dot(p.subtract(core)) > 0.0
+
 ## The inner body of a shell whose wall (`wall_in` inside, nothing
 ## outside) is thicker than some convex rounds' radii (cylinders, spheres
 ## and tori turned outward, a fillet's strip or ball corner; G2 and G3
@@ -206,14 +220,7 @@ func vanishing_inner(model: interop.Reference[CadModel], removed: const bool[], 
         if s.kind != surface_cylinder and s.kind != surface_sphere and s.kind != surface_torus: continue
         let radius = s.angle if s.kind == surface_torus else s.radius
         if radius > wall_in + w.tolerance * 10.0: continue
-        # Convex: its outward normal points away from its axis (center).
-        let p = try w.edge_at(edge_index(w.face_uses(f)[0]), 0.5)
-        var core = s.origin
-        if s.kind == surface_cylinder: core = s.origin.add(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
-        if s.kind == surface_torus:
-            let flat = p.subtract(s.origin).subtract(s.z.multiply_scalar(p.subtract(s.origin).dot(s.z)))
-            core = s.origin.add((try flat.normalized()).multiply_scalar(s.radius))
-        if (try w.face_normal(f, p)).dot(p.subtract(core)) <= 0.0: continue
+        if not try outward_round(&w, f): continue
         if names.count > 0: try names.push(59)
         for byte in w.face_name(f).bytes: try names.push(byte)
     # G2 and G3 strips between flat faces whose radius the wall passes, and
@@ -484,6 +491,113 @@ func swallowed_strip(w: const Shape*, f: usize, wall: f64) -> bool!:
         if p.subtract(center).length() < radius * (1.0 - 1e-6) - w.tolerance * 10.0: return false
     return true
 
+## The inner body of a body of flat faces and circular rounds between them
+## (each a cylinder blending two flat walls, convex or concave, and their
+## corners: balls and tori), not necessarily convex (an L rounded on every
+## edge, where Delete cannot heal the convex rounds alone past the concave
+## ones): every round deleted (Delete heals between flat faces), the sharp
+## body's faces offset, and the rounds made again on it as one fillet of
+## edge sets: a convex round of r at r - wall (gone when the wall passes
+## it), a concave one at r + wall. Exact: a round's offset is the round of
+## the offset walls about the same axis, and the fillet's corners (balls,
+## setback corners, the rolled corners where both kinds meet) at the new
+## radii are the old ones' offsets. `removed` faces must be flat. None when
+## a curved face is no such round, or a step fails.
+func refilleted_inner(model: interop.Reference[CadModel], removed: const bool[], wall_in: f64, m: const FaceMove*) -> interop.Reference[CadModel]?!:
+    if not (wall_in > 0.0): return none
+    var w = try shape_of(model.value())
+    defer w.close()
+    var names = Growing[u8]()
+    defer names.close()
+    var store = Growing[u8]()
+    defer store.close()
+    var walls = Growing[WallPair]()
+    defer walls.close()
+    for f in 0..<w.faces.count:
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind == surface_plane: continue
+        if removed[f]: return none
+        if s.kind != surface_cylinder and s.kind != surface_sphere and s.kind != surface_torus: return none
+        # A round beside an opened face is tangent_opening's (the hollow
+        # opens square to the face there).
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            let fa = w.sides.items[e * 2]
+            let fb = w.sides.items[e * 2 + 1]
+            if (fa >= 0 and removed[(usize)fa]) or (fb >= 0 and removed[(usize)fb]): return none
+        if names.count > 0: try names.push(59)
+        for byte in w.face_name(f).bytes: try names.push(byte)
+        if s.kind != surface_cylinder: continue
+        # A strip: its two flat walls, met tangentially along its length.
+        let (fa, fb) = strip_walls(&w, f) catch failure:
+            if failure.code != invalid: error(failure.code, failure.message)
+            return none
+        if w.surfaces.items[(usize)w.faces.items[fa].surface].kind != surface_plane or w.surfaces.items[(usize)w.faces.items[fb].surface].kind != surface_plane: return none
+        let size = s.radius - wall_in if try outward_round(&w, f) else s.radius + wall_in
+        if size <= w.tolerance * 100.0: continue
+        let a_from = store.count
+        for byte in w.face_name(fa).bytes: try store.push(byte)
+        let b_from = store.count
+        for byte in w.face_name(fb).bytes: try store.push(byte)
+        try walls.push(WallPair(a_from, b_from, b_from, store.count, size))
+    if names.count == 0: return none
+    let sharp = CadDirect.deleted_faces(model, (str)names.view()) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return none
+    defer sharp.release()
+    var v = try shape_of(sharp.value())
+    defer v.close()
+    try join_straight_pieces(&v)
+    # The sharp body offset: every face in by the wall, removed ones out.
+    var all = Growing[usize]()
+    defer all.close()
+    var distances = Growing[f64]()
+    defer distances.close()
+    for f in 0..<v.faces.count:
+        try all.push(f)
+        var open = false
+        for g in 0..<w.faces.count:
+            if removed[g] and w.face_name(g) == v.face_name(f): open = true
+        try distances.push(wall_in if open else -wall_in)
+    var targets = Growing[Surface]()
+    defer targets.close()
+    var senses = Growing[bool]()
+    defer senses.close()
+    let offset = substitute(&v, all.view(), m, targets.view(), senses.view(), distances.view()) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return none
+    if walls.count == 0: return offset
+    defer offset.release()
+    # The rounds again, as edge sets by radius.
+    var o = try shape_of(offset.value())
+    defer o.close()
+    var radii = Growing[f64]()
+    defer radii.close()
+    for pair in walls.view():
+        var known = false
+        for r in radii.view(): known = known or math.abs(r - pair.size) <= w.tolerance
+        if not known: try radii.push(pair.size)
+    var sets = Growing[u8]()
+    defer sets.close()
+    var edges = Growing[i64]()
+    defer edges.close()
+    var text = Growing[u8]()
+    defer text.close()
+    for at in 0..<radii.count:
+        edges.clear()
+        for pair in walls.view():
+            if math.abs(pair.size - radii.items[at]) > w.tolerance: continue
+            edges_between(&o, (str)store.view()[pair.a_from..<pair.a_to], (str)store.view()[pair.b_from..<pair.b_to], &edges) catch failure:
+                if failure.code != invalid: error(failure.code, failure.message)
+                return none
+        try references_of(&o, edges.view(), &text)
+        if at > 0: try sets.push(124)
+        for byte in text.view(): try sets.push(byte)
+    let made = filleted_sets(offset.value(), (str)sets.view(), radii.view(), "r", 1, false) catch failure:
+        if failure.code != invalid: error(failure.code, failure.message)
+        return none
+    return made
+
 ## The inner body of a convex body whose curved faces the wall all swallows
 ## (convex rounds of no more than its radius, G2 and G3 strips and their
 ## corners: vanishing_inner's), when Delete cannot heal them all (a G2
@@ -502,6 +616,17 @@ func convex_inner(model: interop.Reference[CadModel], removed: const bool[], wal
         let fb = w.sides.items[e * 2 + 1]
         if fa < 0 or fb < 0 or fa == fb: continue
         if not try tangent_edge(&w, e) and not try convex(&w, e): return none
+    # Convex all over: every vertex behind every flat face's plane (a body
+    # rounded on every edge has only tangent edges, an L's inside rounds
+    # too: its notch's planes cut it).
+    let slack = w.tolerance * 100.0
+    for f in 0..<w.faces.count:
+        let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
+        if s.kind != surface_plane: continue
+        let n = face_outward(&w, f)
+        let h = n.dot(s.origin)
+        for p in w.points.view():
+            if n.dot(p) > h + slack: return none
     # Every curved face swallowed.
     var swallowed = Growing[u8]()
     defer swallowed.close()
@@ -526,7 +651,9 @@ func convex_inner(model: interop.Reference[CadModel], removed: const bool[], wal
             var taken = false
             for g in gone.view(): taken = taken or g == f
             let radius = s.angle if s.kind == surface_torus else s.radius
-            let round = (s.kind == surface_cylinder or s.kind == surface_sphere or s.kind == surface_torus) and radius <= wall_in + w.tolerance * 10.0
+            # A round the wall swallows, turned outward (a concave one, an
+            # inside corner's, grows instead: the body is not convex).
+            let round = (s.kind == surface_cylinder or s.kind == surface_sphere or s.kind == surface_torus) and radius <= wall_in + w.tolerance * 10.0 and try outward_round(&w, f)
             if not taken and not round: return none
             continue
         let n = face_outward(&w, f)

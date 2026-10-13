@@ -812,7 +812,8 @@ its points are not checked against one; each quad is turned as the face it touch
 corner). Fusion's own (probe 14) is one bicubic fitted over a hexagon (a transfinite patch), fuller
 than our fair fill: its solids (exported as STEP, measured here) take 1817.0823 and 6001.6447 against
 our 1816.933 and 6002.838, and its convex cube corner at G1 and G2 7777.892 and 7816.853 against our
-7763.545 and 7811.634. A fullness of about 1.3 at G1 (all three) and 1.1 at G2 takes ours to them.
+7763.545 and 7811.634 with the fair fill (fullness 1, the default); Fusion's fullness (below) meets
+them.
 
 **The corner's controls** (Alias's; `corner_shape`, `corner_fullness`; `vertex_blend_tests`):
 - **Edge shape** (Corner Blend's Edge Shape sliders): the G1 face curves as conics of that rho
@@ -820,7 +821,10 @@ our 1816.933 and 6002.838, and its convex cube corner at G1 and G2 7777.892 and 
   the corner);
 - **Fullness** (Ball Corner's Pivot Curve Length Ratio): the patch made once, then again with its
   center held where its bulge from the hole's curves' middle is scaled by it (1 the fair fill's own;
-  more fuller).
+  more fuller); 0 asks Fusion's: 1.27 at G1 and 1.1 at G2 and G3 (`fusion_fullness`), which takes
+  the corners above to Fusion's volumes within 0.4 (the cube's at G1 and G2, the boss's and the L's
+  vertex blends). Not the default: a fuller patch's offsets (a box rounded G2 on every edge, shelled)
+  no longer meet within the tolerance at its center.
 
 **Too large.** Before any tool, each edge's blend must fit (the way into each face is found a
 quarter of the reach in, clear of where a curved boundary's chart, its chords, strays off the
@@ -1395,7 +1399,19 @@ cannot heal them all (a G2 setback corner's quads), a convex body's inner body i
 flat faces' planes moved in by the wall (`convex_inner`, each face named after its plane's), which
 also drops flat faces the inset swallows (a small chamfer). `shell_tests`: a 20 cube's uprights
 rounded 3 G2 and G3, shelled 4 closed and open, hollow the sharp 12 box (12 × 16 × 12 open); every
-edge G2, shelled 4 closed; a cube chamfered 1 on one edge shelled 3, its hollow the 14 cube (5246). Any other wall that
+edge G2, shelled 4 closed; a cube chamfered 1 on one edge shelled 3, its hollow the 14 cube (5246). **Bodies that are not convex** (an L prism; Fusion 2705's probes 15 and 16, `shell_tests`): sharp,
+its hollow the L moved in (3504 closed, 3192 open: Fusion's); its inside upright and an outer one
+rounded 1, shelled 2, the outer round swallowed (Delete heals it) and the inside one grown to 3 (the
+closed form 3473.0975, Fusion's 3473.0973); its top edges and inside upright rounded 1, shelled 2
+(Fusion's 3460.7174, 25 faces); rounded 3 everywhere, shelled 1 open (Fusion's 1570.7683). Where
+Delete cannot heal the swallowed rounds alone, `refilleted_inner` deletes every round (each a
+cylinder between two flat walls, and their balls and tori), offsets the sharp body and makes the
+rounds again on it as one fillet of edge sets (convex r at r − wall, gone past it; concave at r +
+wall: the offsets of rounds about the same axes); a round beside an opened face is left to
+`tangent_opening`. `convex_inner` now checks the body is convex (every vertex behind every flat
+face's plane, its rounds turned outward): an L rounded 1 on every edge had been taken for convex and
+given 5374 where Fusion gives 3423.30; it is refused by name now (Delete cannot heal all its rounds
+together). Any other wall that
 would change the body's topology is refused: "the shell's thickness is too large for this body",
 with the inner wall's own reason after it. The inner wall's faces are named `<tag>/` and the face's own name. B-spline faces are offset as
 Offset Face's are: a box rounded G2 shells closed or opened at its top, and one rounded G2 on every
@@ -2551,9 +2567,11 @@ Roughly in order of usefulness:
    it, joined; a pipe inside a box touching its wall, subtracted; a pipe grazing a box's top and
    bottom, taken from it; a box laid against a B-spline strip, found by `modeling/contact.lucb`
    since no curve follows a touch) are refused as non-manifold.
-9. **Offsets where faces vanish or reconnect** beyond convex bodies and convex rounds (G2 strips and
-   flat faces an inset swallows on a body that is not convex: the face soup's arrangement by
-   winding number), outward offsets that reconnect, a body rounded on every edge shelled open at a
+9. **Offsets where faces vanish or reconnect** beyond convex bodies and convex rounds (a body that is
+   not convex shells where Delete heals its swallowed rounds, or all its rounds for the refillet
+   (Shell); an L rounded 1 on every edge shelled 2 is refused, as are G2 strips and flat faces an
+   inset swallows on a body that is not convex: the face soup's arrangement by winding number is not
+   built), outward offsets that reconnect, a body rounded on every edge shelled open at a
    curved face (a flat one opens square to it: Shell above), and draft; Delete healing several faces at once beside curved faces
    beyond a band round one face and strips apart (adjacent strips of a curved chain, healing by
    extended neighbors' arrangement).
