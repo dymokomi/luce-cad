@@ -1,0 +1,158 @@
+## Invariance and consistency of the booleans. For pairs of solids and each
+## operation: the operands swapped (union, intersect), the first's faces
+## numbered backwards, both moved and turned, both scaled (inches to
+## millimeters, meters to millimeters and back) give the same topology
+## signature and the same volume (scaled); and the volumes keep the
+## identities V(A ∪ B) + V(A ∩ B) = V(A) + V(B) and V(A − B) + V(A ∩ B) =
+## V(A). Every result must be closed. Each property that does not hold is
+## printed and counted (the baseline in docs/research/KERNEL-ROBUSTNESS.md).
+import interop
+import memory
+from luce_std import math
+import strings
+from luce_geocore.geocore import Vector3, invalid
+from model import CadModel
+from solids import CadSolids
+from modeling import CadModeling
+from measures import signature, volume, closed
+
+pub struct Tally:
+    pub var checks: i64 = 0
+    pub var failures: i64 = 0
+
+    pub func record(ok: bool, name: str, detail: str) -> bool:
+        self.checks += 1
+        if ok: return true
+        self.failures += 1
+        print(f"robustness FAIL {name}: {detail}")
+        return false
+
+let pair_count: i64 = 4
+
+func pair_name(which: i64) -> str:
+    if which == 0: return "boxes"
+    if which == 1: return "box/cylinder"
+    if which == 2: return "box/sphere"
+    return "cylinder/cylinder"
+
+## Pair `which`, both placed by `matrix` parts (translation, rotation, uniform scale).
+func pair(which: i64, translation: Vector3, rotation: Vector3, scale: f64) -> (interop.Reference[CadModel], interop.Reference[CadModel])!:
+    let s = Vector3(scale, scale, scale)
+    if which == 0:
+        let a = try CadSolids.box(10.0, 10.0, 10.0)
+        defer a.release()
+        let b = try CadSolids.box(10.0, 10.0, 10.0)
+        defer b.release()
+        let pa = try a.value().transformed(translation, rotation, s)
+        errdefer pa.release()
+        let moved = try b.value().transformed(Vector3(4.0, 3.0, 2.0), Vector3(0.2, 0.1, 0.0), Vector3(1.0, 1.0, 1.0))
+        defer moved.release()
+        return (pa, try moved.value().transformed(translation, rotation, s))
+    if which == 1:
+        let a = try CadSolids.box(20.0, 12.0, 8.0)
+        defer a.release()
+        let b = try CadSolids.cylinder(2.5, 30.0)
+        defer b.release()
+        let pa = try a.value().transformed(translation, rotation, s)
+        errdefer pa.release()
+        let moved = try b.value().transformed(Vector3(3.0, 1.0, 0.0), Vector3(0.3, 0.0, 0.2), Vector3(1.0, 1.0, 1.0))
+        defer moved.release()
+        return (pa, try moved.value().transformed(translation, rotation, s))
+    if which == 2:
+        let a = try CadSolids.box(10.0, 10.0, 10.0)
+        defer a.release()
+        let b = try CadSolids.sphere(4.0)
+        defer b.release()
+        let pa = try a.value().transformed(translation, rotation, s)
+        errdefer pa.release()
+        let moved = try b.value().transformed(Vector3(5.0, 2.0, 1.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+        defer moved.release()
+        return (pa, try moved.value().transformed(translation, rotation, s))
+    let a = try CadSolids.cylinder(3.0, 20.0)
+    defer a.release()
+    let b = try CadSolids.cylinder(2.0, 20.0)
+    defer b.release()
+    let pa = try a.value().transformed(translation, rotation, s)
+    errdefer pa.release()
+    let moved = try b.value().transformed(Vector3(0.5, 0.0, 0.0), Vector3(1.2, 0.0, 0.0), Vector3(1.0, 1.0, 1.0))
+    defer moved.release()
+    return (pa, try moved.value().transformed(translation, rotation, s))
+
+## `model` with its faces numbered backwards.
+func reversed_faces(model: interop.Reference[CadModel]) -> interop.Reference[CadModel]!:
+    let count = (usize)model.value().face_count()
+    let order = try new i64[count] --- in memory.heap
+    defer free(order) in memory.heap
+    for at in 0..<count: order[at] = (i64)(count - 1 - at)
+    return try model.value().subset(order)
+
+## One result's signature and volume, or a failure.
+struct Outcome:
+    var ok: bool
+    var signature: u64
+    var volume: f64
+    var message: str
+
+func outcome(a: interop.Reference[CadModel], b: interop.Reference[CadModel], op: i64, tally: Tally*, name: str) -> Outcome!:
+    let result = CadModeling.combined(a, b, op) catch failure:
+        print(f"robustness FAIL {name}: failed: {failure.message}")
+        tally.checks += 1
+        tally.failures += 1
+        return Outcome(false, 0, 0.0, "")
+    defer result.release()
+    let shut = try closed(result)
+    _ = tally.record(shut, name, "not closed")
+    return Outcome(true, try signature(result), try volume(result), "")
+
+func op_name(op: i64) -> str:
+    return "union" if op == 0 else ("subtract" if op == 1 else "intersect")
+
+func same(base: Outcome, other: Outcome, scale: f64, relative: f64, tally: Tally*, name: str):
+    if not base.ok or not other.ok: return
+    _ = tally.record(base.signature == other.signature, name, "topology differs")
+    let expected = base.volume * scale * scale * scale
+    let off = math.abs(other.volume - expected) / math.max(1e-300, math.abs(expected))
+    if not tally.record(off <= relative, name, "volume differs"): print(f"    by {off} of it")
+
+pub func invariance(tally: Tally*) -> !:
+    let none_moved = Vector3()
+    for which in 0..<pair_count:
+        # Volumes from vertices are good to rounding; from tessellations
+        # (curved faces) to about 1e-4 (a sphere's at 64 segments: 8e-5).
+        let relative = 1e-9 if which == 0 else 5e-4
+        let (a, b) = try pair(which, none_moved, none_moved, 1.0)
+        defer a.release()
+        defer b.release()
+        var volumes: f64[3]
+        for op in 0..<3:
+            var label_bytes: u8[96]
+            let label = try strings.format(label_bytes, f"{pair_name(which)} {op_name(op)}")
+            var name_bytes: u8[128]
+            let base = try outcome(a, b, op, tally, label)
+            volumes[(usize)op] = base.volume
+            if op != 1:
+                let name = try strings.format(name_bytes, f"{label} swapped")
+                same(base, try outcome(b, a, op, tally, name), 1.0, relative, tally, name)
+            let backwards = try reversed_faces(a)
+            defer backwards.release()
+            let reversed_name = try strings.format(name_bytes, f"{label} faces reversed")
+            same(base, try outcome(backwards, b, op, tally, reversed_name), 1.0, relative, tally, reversed_name)
+            let (ma, mb) = try pair(which, Vector3(123.4, -56.7, 8.9), Vector3(0.3, 0.5, 0.7), 1.0)
+            defer ma.release()
+            defer mb.release()
+            let moved_name = try strings.format(name_bytes, f"{label} moved")
+            same(base, try outcome(ma, mb, op, tally, moved_name), 1.0, relative, tally, moved_name)
+            let scales: f64[3] = [25.4, 0.001, 1000.0]
+            for scale in scales:
+                let (sa, sb) = try pair(which, none_moved, none_moved, scale)
+                defer sa.release()
+                defer sb.release()
+                let scaled_name = try strings.format(name_bytes, f"{label} scaled {scale}")
+                same(base, try outcome(sa, sb, op, tally, scaled_name), scale, relative, tally, scaled_name)
+        # The identities, from the inputs' own volumes.
+        let va = try volume(a)
+        let vb = try volume(b)
+        let union_rule = math.abs(volumes[0] + volumes[2] - va - vb) / (va + vb)
+        if not tally.record(union_rule <= relative, pair_name(which), "V(A+B) + V(A*B) differs from V(A) + V(B)"): print(f"    by {union_rule} of the volumes")
+        let subtract_rule = math.abs(volumes[1] + volumes[2] - va) / va
+        if not tally.record(subtract_rule <= relative, pair_name(which), "V(A-B) + V(A*B) differs from V(A)"): print(f"    by {subtract_rule} of V(A)")

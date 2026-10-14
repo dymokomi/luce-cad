@@ -1,0 +1,64 @@
+## Determinism: each operation run again and again, one after another and
+## on several threads at once, gives the same fingerprint every time. The
+## fingerprints are printed so runs on the three OSes can be compared
+## (docs/research/KERNEL-ROBUSTNESS.md, "Determinism contract").
+import memory
+from luce_std import parallel
+from luce_geocore.geocore import invalid
+from operations import operation, operation_name, operation_count
+from measures import fingerprint, closed
+
+## Runs in a row, and at once on threads.
+let in_row: i64 = 3
+let at_once: usize = 4
+
+struct Concurrent:
+    var prints: u64[]
+    var failed: u64[]
+
+func run_one(context: void*, index: usize, worker: usize) -> !:
+    _ = worker
+    let c = (Concurrent*)context
+    let which = (i64)index % operation_count
+    let model = operation(which) catch failure:
+        c.failed[index] = 1
+        return
+    defer model.release()
+    c.prints[index] = try fingerprint(model)
+
+pub func determinism() -> !:
+    let count = (usize)operation_count
+    let reference = try new u64[count] --- in memory.heap
+    defer free(reference) in memory.heap
+    for which in 0..<operation_count:
+        let first = try operation(which)
+        defer first.release()
+        if not try closed(first):
+            print(f"robustness {operation_name(which)}: result not closed")
+            error(invalid, "a result is not closed")
+        reference[(usize)which] = try fingerprint(first)
+        for _ in 1..<in_row:
+            let again = try operation(which)
+            defer again.release()
+            if (try fingerprint(again)) != reference[(usize)which]:
+                print(f"robustness {operation_name(which)}: a second run differs")
+                error(invalid, "a second run differs")
+        print(f"robustness fingerprint {operation_name(which)} {reference[(usize)which]}")
+    # Every operation on `at_once` threads at the same time.
+    let total = count * at_once
+    var c = Concurrent(prints = try new u64[total] --- in memory.heap, failed = try new u64[total] --- in memory.heap)
+    defer free(c.prints) in memory.heap
+    defer free(c.failed) in memory.heap
+    for at in 0..<total:
+        c.prints[at] = 0
+        c.failed[at] = 0
+    try parallel.for_each(total, (void*)&c, run_one, at_once)
+    for at in 0..<total:
+        let name = operation_name((i64)(at % count))
+        if c.failed[at] != 0:
+            print(f"robustness {name}: failed on a thread")
+            error(invalid, "an operation failed on a thread")
+        if c.prints[at] != reference[at % count]:
+            print(f"robustness {name}: differs on a thread")
+            error(invalid, "an operation differs on a thread")
+    print(f"robustness determinism: {operation_count} operations, {in_row} in a row and {at_once} at once each, identical")

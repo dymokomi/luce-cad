@@ -1,0 +1,132 @@
+## The tolerance band (owner, 2026-10-13: "we should probably test up to
+## 0.01mm"). Two boxes whose faces lie a distance δ apart, swept across
+## the planned positional tolerance P = 0.01 mm: faces offset sideways
+## (flush), a gap or overlap between end faces, and faces tilted by an
+## angle. At model sizes from 1 mm to 1 m, offset along one axis, along a
+## diagonal and with everything turned. Each result is classed against the
+## two clean outcomes, δ = 0 and δ far beyond P:
+##   M  as at δ = 0 (the faces taken as one)
+##   D  as far apart (the faces kept apart)
+##   X  neither: some faces merged and some not, or slivers
+##   E  the operation failed      O  the result is not closed
+## A principled kernel answers M up to P and D beyond, the same at every
+## size, direction and turn. Each row is printed with the ideal and the
+## number of cells off it: the baseline in docs/research/KERNEL-ROBUSTNESS.md.
+import interop
+from luce_std import math
+from luce_geocore.geocore import Vector3
+from model import CadModel
+from solids import CadSolids
+from modeling import CadModeling
+from measures import closed
+
+## The planned positional tolerance, in millimeters (model units).
+let positional: f64 = 0.01
+
+pub struct BandTally:
+    pub var rows: i64 = 0
+    pub var cells: i64 = 0
+    pub var off: i64 = 0
+    pub var mixed: i64 = 0
+    pub var failed: i64 = 0
+
+## One result: lumps and faces, or a failure.
+struct Shape:
+    var code: u8
+    var lumps: i64
+    var faces: i64
+
+func shape_of(a: interop.Reference[CadModel], b: interop.Reference[CadModel], op: i64) -> Shape!:
+    let result = CadModeling.combined(a, b, op) catch failure:
+        return Shape(69, 0, 0)
+    defer result.release()
+    if not try closed(result): return Shape(79, 0, 0)
+    return Shape(63, try CadModeling.lump_count(result), result.value().face_count())
+
+## The configurations: 0 flush faces offset sideways, 1 gap between end
+## faces, 2 faces tilted by an angle (δ in radians).
+func config_name(config: i64, variant: i64) -> str:
+    if config == 0:
+        if variant == 0: return "flush y"
+        if variant == 1: return "flush diagonal"
+        return "flush turned"
+    if config == 1: return "gap"
+    return "tilt"
+
+## The two boxes of a configuration at size `size` and offset `delta`.
+func boxes(config: i64, variant: i64, size: f64, delta: f64) -> (interop.Reference[CadModel], interop.Reference[CadModel])!:
+    let turn = Vector3(0.3, 0.5, 0.7) if variant == 2 else Vector3()
+    let a0 = try CadSolids.box(size, size, size)
+    defer a0.release()
+    let b0 = try CadSolids.box(size, size, size)
+    defer b0.release()
+    var offset = Vector3()
+    var tilt = Vector3()
+    if config == 0:
+        let r = math.sqrt(0.5)
+        offset = Vector3(0.5 * size, delta * r, delta * r) if variant == 1 else Vector3(0.5 * size, delta, 0.0)
+    elif config == 1:
+        offset = Vector3(size + delta, 0.0, 0.0)
+    else:
+        offset = Vector3(0.5 * size, 0.0, 0.0)
+        tilt = Vector3(0.0, 0.0, delta)
+    let b1 = try b0.value().transformed(offset, tilt, Vector3(1.0, 1.0, 1.0))
+    defer b1.release()
+    let one = Vector3(1.0, 1.0, 1.0)
+    let a = try a0.value().transformed(Vector3(), turn, one)
+    errdefer a.release()
+    return (a, try b1.value().transformed(Vector3(), turn, one))
+
+## Whether offset `delta` should join the faces at `size`: within P (for a
+## tilt, the farthest the tilted face strays over the overlap, δ · size / 2).
+func ideal_merge(config: i64, size: f64, delta: f64) -> bool:
+    if config == 2: return delta * size * 0.5 <= positional
+    return delta <= positional
+
+pub func bands(tally: BandTally*) -> !:
+    let offsets: f64[10] = [0.0, 0.001, 0.005, 0.009, 0.0099, 0.01, 0.0101, 0.011, 0.02, 0.1]
+    let gaps: f64[13] = [-0.1, -0.01, -0.005, 0.0, 0.001, 0.005, 0.009, 0.0099, 0.01, 0.0101, 0.011, 0.02, 0.1]
+    let angles: f64[10] = [0.0, 1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+    let sizes: f64[4] = [1.0, 10.0, 100.0, 1000.0]
+    for config in 0..<3:
+        let variants = 3 if config == 0 else 1
+        for variant in 0..<variants:
+            for size in sizes:
+                for op in 0..<2:
+                    # A gap is only joined; a tilt is joined and cut.
+                    if config == 1 and op == 1: continue
+                    var values = offsets[..<10]
+                    if config == 1: values = gaps[..<13]
+                    if config == 2: values = angles[..<10]
+                    let (ma, mb) = try boxes(config, variant, size, 0.0)
+                    let merged = try shape_of(ma, mb, op)
+                    ma.release()
+                    mb.release()
+                    let (da, db) = try boxes(config, variant, size, values[values.length - 1])
+                    let apart = try shape_of(da, db, op)
+                    da.release()
+                    db.release()
+                    var row: u8[16]
+                    var ideal: u8[16]
+                    var off: i64 = 0
+                    for at in 0..<values.length:
+                        let (a, b) = try boxes(config, variant, size, values[at])
+                        let s = try shape_of(a, b, op)
+                        a.release()
+                        b.release()
+                        var code = s.code
+                        if code == 63:
+                            if s.lumps == merged.lumps and s.faces == merged.faces: code = 77
+                            elif s.lumps == apart.lumps and s.faces == apart.faces: code = 68
+                            else: code = 88
+                        row[at] = code
+                        ideal[at] = 77 if ideal_merge(config, size, values[at]) else 68
+                        tally.cells += 1
+                        if code != ideal[at]: off += 1
+                        if code == 88: tally.mixed += 1
+                        if code == 69 or code == 79: tally.failed += 1
+                    tally.rows += 1
+                    tally.off += off
+                    let name = config_name(config, variant)
+                    let verb = "union" if op == 0 else "subtract"
+                    print(f"robustness band {name} {verb} {size} mm: {(str)row[..<values.length]} ideal {(str)ideal[..<values.length]} off {off} (M {merged.lumps}/{merged.faces}, D {apart.lumps}/{apart.faces})")

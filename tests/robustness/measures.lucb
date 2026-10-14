@@ -1,0 +1,116 @@
+## What the robustness harness measures on a result (docs/research/
+## KERNEL-ROBUSTNESS.md): its fingerprint (every column's bits and its
+## placement), a topology signature that ignores numbering (lumps,
+## vertices, edges, faces, and the sorted kinds and edge-use counts of the
+## faces), whether it is closed (every edge used twice, once each way) and
+## its volume (exact from vertices when every edge is a line, else from a
+## fine tessellation).
+import interop
+import memory
+from luce_std import math
+from luce_geocore.geocore import Vector3, Matrix4, invalid
+from luce_geocore.core.growing import Growing
+from model import CadModel, BrepModel
+from modeling import CadModeling
+
+let fnv_offset: u64 = 14695981039346656037
+let fnv_prime: u64 = 1099511628211
+
+func fnv_bytes(h: u64, data: const u8*, count: usize) -> u64:
+    var r = h
+    for at in 0..<count: r = (r ^ (u64)data[at]) *% fnv_prime
+    return r
+
+func fnv_i64(h: u64, value: i64) -> u64:
+    let v = value
+    return fnv_bytes(h, (const u8*)&v, 8)
+
+## The B-rep's fingerprint and the placement over it.
+pub func fingerprint(model: interop.Reference[CadModel]) -> u64!:
+    let brep = model.value().brep() else error(invalid, "a robustness result has no B-rep")
+    let placement = model.value().brep_placement()
+    return fnv_bytes(try brep.fingerprint(), (const u8*)&placement, memory.size_of(Matrix4))
+
+## Lumps, vertices, edges, faces and each face's surface kind and edge
+## uses, sorted: equal for the same topology however it is numbered.
+pub func signature(model: interop.Reference[CadModel]) -> u64!:
+    let brep = model.value().brep() else error(invalid, "a robustness result has no B-rep")
+    var keys = Growing[i64]()
+    defer keys.close()
+    for face in 0..<brep.face_count(): try keys.push(brep.face_surface_kind(face) * 1000000 + (try brep.face_edge_count(face)))
+    # Insertion sort: a few dozen keys.
+    let items = keys.items[..<keys.count]
+    for at in 1..<items.length:
+        let key = items[at]
+        var to = at
+        while to > 0 and items[to - 1] > key:
+            items[to] = items[to - 1]
+            to -= 1
+        items[to] = key
+    var h = fnv_i64(fnv_offset, try CadModeling.lump_count(model))
+    h = fnv_i64(h, brep.vertex_count())
+    h = fnv_i64(h, brep.edge_count())
+    h = fnv_i64(h, brep.face_count())
+    for key in items: h = fnv_i64(h, key)
+    return h
+
+## Whether every edge is used by exactly two faces, in opposite directions.
+pub func closed(model: interop.Reference[CadModel]) -> bool!:
+    let brep = model.value().brep() else return false
+    let edges = (usize)brep.edge_count()
+    if edges == 0: return false
+    let uses = try new i64[edges] --- in memory.heap
+    defer free(uses) in memory.heap
+    let starts = try new Vector3[edges * 2] --- in memory.heap
+    defer free(starts) in memory.heap
+    for at in 0..<edges: uses[at] = 0
+    for face in 0..<brep.face_count():
+        for use in 0..<(try brep.face_edge_count(face)):
+            let edge = (usize)(try brep.face_edge_id(face, use))
+            if uses[edge] >= 2: return false
+            starts[edge * 2 + (usize)uses[edge]] = try brep.face_edge_point(face, use, 0.0)
+            uses[edge] += 1
+    for at in 0..<edges:
+        if uses[at] != 2: return false
+        # A closed edge (a circle's seam) starts where it ends either way.
+        let a = starts[at * 2]
+        let b = starts[at * 2 + 1]
+        let ends_apart = (try brep_edge_length_hint(brep, at)) > 0.0
+        if ends_apart and a.subtract(b).length() == 0.0: return false
+    return true
+
+## Whether edge `at`'s two ends are apart (a closed edge's are not).
+func brep_edge_length_hint(brep: const BrepModel*, at: usize) -> f64!:
+    let curve = try brep.edge_record((i64)at)
+    defer curve.close()
+    return (try curve.at(0.0)).subtract(try curve.at(1.0)).length()
+
+## The volume: exact from the vertices when every face is bounded by lines
+## (each face's vector area is half the sum of start × end over its edge
+## uses, whatever its loops), else that of a tessellation at `segments`.
+## Single precision meshes make the second good to about 1e-6 of the size.
+pub func volume(model: interop.Reference[CadModel], segments: i64 = 64) -> f64!:
+    let brep = model.value().brep() else error(invalid, "a robustness result has no B-rep")
+    var linear = true
+    for face in 0..<brep.face_count():
+        for use in 0..<(try brep.face_edge_count(face)):
+            if not try brep.face_edge_linear(face, use): linear = false
+    if linear:
+        var total = 0.0
+        for face in 0..<brep.face_count():
+            var area = Vector3()
+            let count = try brep.face_edge_count(face)
+            for use in 0..<count:
+                area = area.add((try brep.face_edge_point(face, use, 0.0)).cross(try brep.face_edge_point(face, use, 1.0)))
+            total += (try brep.face_edge_point(face, 0, 0.0)).dot(area) / 6.0
+        let m = model.value().brep_placement()
+        return total * math.abs(m.determinant())
+    let mesh = try model.value().tessellate(segments)
+    defer mesh.release()
+    let m = mesh.value()
+    var total = 0.0
+    for face in 0..<m.face_count():
+        let first = try m.point(try m.face_point(face, 0))
+        for k in 1..<(try m.face_size(face)) - 1:
+            total += first.dot((try m.point(try m.face_point(face, k))).cross(try m.point(try m.face_point(face, k + 1)))) / 6.0
+    return total
