@@ -527,6 +527,28 @@ show. These two remain open for the heavy sweep (stage 7) to argue for.
   rechecked under the project's tolerances. Ask names a file looser than P on the node until
   one is chosen; Adopt names what it could not heal.
 
+### 3.8 Stage 6, first step (working tolerances, the literal ratchet)
+
+- **The work tolerance never exceeds R.** A boolean's, trim's or split's work tolerance was a
+  ten-millionth of the model's size, which crosses the resolution R (1e-5 mm at P = 0.01 mm)
+  at 100 mm and reached 0.1 mm at the edge of the size box. It is now
+  `work_tolerance(shape, size)`: the same below 100 mm, never coarser than R above it.
+- **The result's tolerance is decoupled.** What a boolean's result is meshed to, and what its
+  edges are checked against when written, is two millionths of the model's size or its edges'
+  precision, no longer derived from the work tolerance. Capping the work tolerance therefore
+  leaves meshing as it was.
+- **Not yet absolute below 100 mm.** Making the work tolerance R / 10 at every size kept the
+  harness at zero but failed two regressions. A box 0.000003 mm from a G2 strip was no longer
+  found touching, because tolerant coincidence covers analytic surfaces only. Blends fitted
+  to the shape's tolerance could not be fitted to R. Both wait for the blend fits to use F and
+  for spline coincidence within P.
+- **The literal ratchet.** The harness counts the small literals left in `src/`: numbers with
+  a negative exponent and numbers below a tenth written out, outside comments and strings
+  (`tests/robustness/literals.lucb`). It fails when the count rises. The 91 division and
+  zero-length guards (`1e-300`) became the named guard `nonzero` (geometry/tolerances.lucb,
+  where named values are defined and not counted). That brings the count from 1005 to 904,
+  and the ratchet is 904.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
@@ -831,7 +853,7 @@ identity are absolute (P); the construction slop stays relative to size until th
 | 3 ✓ | **Classification and degeneracy** (3.6). The two invariance failures were mesh bugs (a sphere trim through the pole, a band's hole a turn off), now fixed. Rings thinner than a chart chord now chart. Rays are clean. March seeds are skipped only on a traced polyline. The harness fails on a face left out of a mesh. | done | Invariance 0 of 224; band 0 of 452 |
 | 4 ✓ | **Canonical results** (3.7). Peer booleans are the same bit for bit with operands swapped or faces renumbered: canonical meet and trace order, canonical coincidence surface and merged points, results written in their geometry's order. Tool booleans keep the body's geometry. | done | 0 of 23 swapped or renumbered results differ, bit for bit |
 | 5 ✓ (part) | **Per-entity tolerances and the recheck.** `rechecked` and `tolerance_report` (measured precision, tightening, healing on adopt). STEP imports join within P and are rechecked; the File node's Tolerances option asks. Edit CAD's held bodies call `rechecked` when the setting changes. Not done: shape_of still works to the widest precision anywhere (`model_tolerance()`). Working to each entity's own broke fillets, whose tools rely on the wider tolerance, so it moves to stage 6 with the absolute working tolerances. A body checker node is left for stage 7. | done | Rechecks in the harness; imports name looser files |
-| 6 | **The rest of the kernel by directory, and absolute working tolerances.** Meshing gets its own display tolerance, then `tolerance_for(size)` and the `size × 1e-7` work tolerances become the project's resolution. Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
+| 6 (part) | **The rest of the kernel by directory, and absolute working tolerances.** Done (3.8): the work tolerance capped at R, the result's tolerance decoupled from it, the literal ratchet on (904), the guards named. Left: the blend fits move onto F and spline coincidence within P; then `tolerance_for(size)` and the `size × 1e-7` work tolerances become the project's resolution. Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
 | 7 | **Heavy sweep tool** (`dev/robustness`): randomised rotations, scales and near-degenerate placements in the thousands, run on demand, not in `luc test`. Per the owner's priority this is after all requests and is not fuzzing. | S: 2 days | Continued coverage |
 
 Stages 1 and 2 hold most of the value. Each stage is pushed in green, gated pieces.

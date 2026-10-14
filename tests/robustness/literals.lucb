@@ -1,0 +1,77 @@
+## The literal ratchet (docs/research/KERNEL-ROBUSTNESS.md, 2.2 and stage 6):
+## every small literal in src/ outside comments and strings, a number with a
+## negative exponent (1e-9) or one below a tenth written out (0.001), is a
+## tolerance, guard or step someone chose by hand. Stage 6 moves them onto
+## the project's tolerances and named helpers; this counts what is left, so
+## the count can only go down. geometry/tolerances.lucb, where the named
+## values are defined, is not counted.
+import c
+import strings
+from luce_std import files, process
+from luce_geocore.geocore import invalid
+
+## How many small literals src/ holds.
+pub func literals() -> usize!:
+    let here = process.variable("LUC_TEST_DIR") else error(invalid, "the literal count needs LUC_TEST_DIR (luc test sets it)")
+    var room: u8[1024]
+    let root = try strings.format(room, f"{here}/../../src")
+    let native = try strings.copy(root)
+    defer strings.release(native)
+    let names = try files.walk((c.str)native)
+    defer names.release()
+    var count: usize = 0
+    var path_room: u8[1024]
+    for name in names.value:
+        if not (strings.ends_with(name, ".lucb") or strings.ends_with(name, ".luc")) or name == "geometry/tolerances.lucb": continue
+        let text = try files.read_text(try strings.format(path_room, f"{root}/{name}"))
+        defer text.release()
+        count += small_literals(text.value)
+    return count
+
+func identifier(byte: u8) -> bool:
+    return (byte >= 'a' and byte <= 'z') or (byte >= 'A' and byte <= 'Z') or (byte >= '0' and byte <= '9') or byte == '_'
+
+func digit(byte: u8) -> bool:
+    return byte >= '0' and byte <= '9'
+
+## The small literals in `text`, skipping comments (`#` to the line's end)
+## and quoted strings and characters.
+func small_literals(text: str) -> usize:
+    let b = text.bytes
+    let n = b.length
+    var count: usize = 0
+    var at: usize = 0
+    while at < n:
+        let byte = b[at]
+        if byte == '#':
+            while at < n and b[at] != '\n': at += 1
+            continue
+        if byte == '"' or byte == '\'':
+            at += 1
+            while at < n and b[at] != byte and b[at] != '\n':
+                at += 2 if b[at] == '\\' else 1
+            at += 1
+            continue
+        if not digit(byte) or (at > 0 and (identifier(b[at - 1]) or b[at - 1] == '.')):
+            at += 1
+            continue
+        # A number: digits, a fraction, an exponent.
+        let start = at
+        while at < n and digit(b[at]): at += 1
+        let whole = at - start
+        var below_tenth = false
+        if at + 1 < n and b[at] == '.' and digit(b[at + 1]):
+            at += 1
+            # 0.0 then a digit other than 0 somewhere: below a tenth.
+            let fraction = at
+            while at < n and digit(b[at]):
+                if at > fraction and b[at] != '0': below_tenth = whole == 1 and b[start] == '0' and b[fraction] == '0'
+                at += 1
+        var negative_exponent = false
+        if at + 2 < n and b[at] == 'e' and b[at + 1] == '-' and digit(b[at + 2]):
+            negative_exponent = true
+            at += 2
+            while at < n and digit(b[at]): at += 1
+        if at < n and (identifier(b[at]) or b[at] == '.'): continue
+        if negative_exponent or below_tenth: count += 1
+    return count
