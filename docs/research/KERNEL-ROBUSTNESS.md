@@ -483,7 +483,7 @@ The following are derived and are not settings:
 | derived | value at defaults | rule |
 |---|---|---|
 | Resolution R | 1e-5 mm | P / 1000, which equals Parasolid's 1e-8 m. Solvers converge to R; constructed points (intersections, projections) are accurate to R; no decision is made closer than R to its threshold without the exact path. |
-| Size box | 1 km cube (±500 m) | 1e8 × P, the same box-to-resolution ratio as Parasolid (1e11 × R). Operations refuse geometry outside it with an error naming the box; the user can move a lower P to model smaller parts. |
+| Size box | 1 km cube (±500 m) | 1e8 × P, the same box-to-resolution ratio as Parasolid (1e11 × R). Operations refuse geometry outside it with an error naming the box. The box scales with P, so a coarser P allows larger parts, and a finer P suits smaller ones. |
 | Angular resolution | 1e-11 rad | R / size box. Used only where no extent is known, for example to compare two unit vectors as raw data. Every topological "parallel" test has an extent and is posed positionally instead: "does face A stray more than P from surface B over its own extent". |
 | Solver tolerances | R (positions), R / extent (parameters) | Newton and Gauss–Newton stop when the step is below R in model space. Parameter-space stops are R mapped through the local derivative, never a raw parameter epsilon. |
 | Fit budget | F + R ≤ P / 5 | Fitted geometry plus its construction error stays within a fifth of P, so a result is never born at the decision threshold. The ×5 margin replaces today's chains of ×10, ×20 and ×100. |
@@ -696,7 +696,7 @@ Stages 1 and 2 hold most of the value. Each stage is pushed in green, gated piec
    change? *Recommendation: rebuild on Apply and flag changes afterwards.* It is simple and honest,
    and undo is the safety net.
 3. **The size box.** Should operations refuse geometry outside 1e8 × P (1 km at the default), or
-   only warn? *Recommendation: refuse, with a message to lower P or move the part.* Beyond the box,
+   only warn? *Recommendation: refuse, with a message to raise P (a coarser P gives a larger box) or move the part.* Beyond the box,
    double precision can no longer resolve P, and a silent wrong answer is the worse outcome.
 4. **Imported data looser than P.** Should it stay as tolerant entities (Parasolid), with healing
    only on request, or be healed automatically on import? *Recommendation: tolerant entities, with
