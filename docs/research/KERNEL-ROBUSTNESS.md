@@ -572,6 +572,33 @@ show. These two remain open for the heavy sweep (stage 7) to argue for.
 - **Harness:** unchanged (invariance 0 of 224, band 0 of 452, canonical 0
   of 23); literals 904 to 900, ratchet 900.
 
+### 3.10 Stage 6, third step: the working tolerance absolute
+
+- **Booleans, trims, face meets and splits work to R** (1e-5 mm at the
+  default P) at every size: `work_tolerance(w)` is the project's
+  resolution, no longer a ten-millionth of the model's size below 100 mm.
+  The result is never fed a tolerance that grows, since nothing depends on
+  size. R/10 was tried and failed one regression: a box 3e-6 mm into a G2
+  strip at its extreme crossed it in a sliver no curve follows. At R the
+  contact is decided as touching, as it was at the size-relative tolerance,
+  so no B-spline coincidence was needed for it.
+- **Modeling works to the project's tolerances.** `shape_of` gives the
+  shape R, or the widest tolerant entity's precision where wider, never the
+  body's own tolerance. That tolerance (a millionth of a primitive's
+  extent, `tolerance_for`) is now only what its display meshes are made to:
+  the shape carries it as `display`, and results are written with it, so
+  meshing is as it was. Making the body's tolerance R too was tried: the
+  mesher at 1e-5 on small parts made degenerate triangles.
+- **Curves projected onto faces keep their accuracy.** Surfacing's fit
+  tolerance for projected and intersection curves stays a ten-millionth of
+  the body (or its tolerant precision): a G3 fillet's trims are checked for
+  rate continuity, which F, or even R, would lose.
+- **A timing guard made robust.** offset_spline_tests' shell guard (3 s,
+  against the booleans' former 11 s) took 3.5 s once under load on Windows;
+  it runs in half a second on macOS. The guard is now 8 s.
+- **Harness:** invariance 0 of 224, band 0 of 452, canonical 0 of 23;
+  literals 900 to 898, ratchet 898.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
@@ -876,7 +903,7 @@ identity are absolute (P); the construction slop stays relative to size until th
 | 3 ✓ | **Classification and degeneracy** (3.6). The two invariance failures were mesh bugs (a sphere trim through the pole, a band's hole a turn off), now fixed. Rings thinner than a chart chord now chart. Rays are clean. March seeds are skipped only on a traced polyline. The harness fails on a face left out of a mesh. | done | Invariance 0 of 224; band 0 of 452 |
 | 4 ✓ | **Canonical results** (3.7). Peer booleans are the same bit for bit with operands swapped or faces renumbered: canonical meet and trace order, canonical coincidence surface and merged points, results written in their geometry's order. Tool booleans keep the body's geometry. | done | 0 of 23 swapped or renumbered results differ, bit for bit |
 | 5 ✓ (part) | **Per-entity tolerances and the recheck.** `rechecked` and `tolerance_report` (measured precision, tightening, healing on adopt). STEP imports join within P and are rechecked; the File node's Tolerances option asks. Edit CAD's held bodies call `rechecked` when the setting changes. Not done: shape_of still works to the widest precision anywhere (`model_tolerance()`). Working to each entity's own broke fillets, whose tools rely on the wider tolerance, so it moves to stage 6 with the absolute working tolerances. A body checker node is left for stage 7. | done | Rechecks in the harness; imports name looser files |
-| 6 (part) | **The rest of the kernel by directory, and absolute working tolerances.** Done (3.8): the work tolerance capped at R, the result's tolerance decoupled from it, the literal ratchet on (904), the guards named. Left: the blend fits move onto F and spline coincidence within P; then `tolerance_for(size)` and the `size × 1e-7` work tolerances become the project's resolution. Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
+| 6 (part) | **The rest of the kernel by directory, and absolute working tolerances.** Done: the work tolerance capped at R, the result's tolerance decoupled from it, the literal ratchet on, the guards named (3.8); blends fitted to F, trims meshed to the validity contract (3.9); the working tolerance R at every size, modeling working to the project's tolerances, the body's own tolerance only a display one (3.10). Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
 | 7 | **Heavy sweep tool** (`dev/robustness`): randomised rotations, scales and near-degenerate placements in the thousands, run on demand, not in `luc test`. Per the owner's priority this is after all requests and is not fuzzing. | S: 2 days | Continued coverage |
 
 Stages 1 and 2 hold most of the value. Each stage is pushed in green, gated pieces.

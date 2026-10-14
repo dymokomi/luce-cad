@@ -49,8 +49,9 @@ pub struct ShapeSpline:
 ## their edge intervals, surfaces, faces and their loops, the spline store,
 ## face names, and each edge's two faces (sides).
 pub struct Shape:
-    ## The project's tolerances the solid was built under, and its working
-    ## tolerance (BrepModel's).
+    ## The project's tolerances the solid was built under, and the
+    ## tolerance modeling works to: their resolution R, or a tolerant
+    ## entity's precision where wider (shape_of).
     pub var tolerances: CadTolerances
     pub var tolerance: f64
     pub var points: Growing[Vector3]
@@ -76,6 +77,10 @@ pub struct Shape:
     ## The booleans merge and match by them (boolean.lucb).
     pub var edge_slack: Growing[f64]
     pub var point_slack: Growing[f64]
+    ## What a B-rep written from it is meshed to (BrepModel's own
+    ## tolerance, a millionth of a primitive's extent): carried from the
+    ## body it came from, never read by modeling.
+    pub var display: f64
 
     pub func close():
         self.points.close()
@@ -234,18 +239,18 @@ pub struct Shape:
         try self.splines.push(ShapeSpline(first, points.length, knot_first, degree))
         return (i64)self.splines.count - 1
 
-## The tolerance a boolean on `w` works to, over a model `size` across:
-## a ten-millionth of its size (results are inputs again, and their
-## tolerance must not grow from one to the next), never coarser than the
-## resolution of its project's tolerances, so a big model's facts are kept
-## apart as finely as a small one's (docs/research/KERNEL-ROBUSTNESS.md, 4.2).
-pub func work_tolerance(w: const Shape*, size: f64) -> f64:
-    return math.min(math.max(size * 1e-7, 1e-10), w.tolerances.resolution())
+## The tolerance a boolean, trim or split on `w` works to: the resolution
+## R of its project's tolerances (docs/research/KERNEL-ROBUSTNESS.md, 4.2),
+## the same at every size, so its facts are kept apart as finely on a big
+## model as on a small one, and a result fed back in never grows it.
+pub func work_tolerance(w: const Shape*) -> f64:
+    return w.tolerances.resolution()
 
-## A shape with nothing in it, under `tolerances`, working to `tolerance`.
+## A shape with nothing in it, under `tolerances`, working to `tolerance`
+## (and meshed to it when written, unless its display is set).
 pub func empty_shape(tolerances: CadTolerances, tolerance: f64) -> Shape:
     return Shape(tolerances, tolerance, Growing[Vector3](), Growing[Carrier](), Growing[ShapeEdge](), Growing[Surface](), Growing[ShapeFace](),
-                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize](), Growing[i64](), Growing[f64](), Growing[f64]())
+                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize](), Growing[i64](), Growing[f64](), Growing[f64](), tolerance)
 
 ## Surface coordinates of `p` on `s`: a plane's (x, y); an angle about the
 ## axis and a height (cylinder, cone); longitude and latitude (sphere); a
@@ -264,7 +269,12 @@ pub func periodic(s: const Surface*) -> bool:
 pub func shape_of(model: const CadModel*) -> Shape!:
     if model.independent_faces() > 0: error(invalid, "modeling needs a solid B-rep, not independent faces")
     let b = model.brep() else error(invalid, "modeling needs a solid B-rep")
-    var shape = empty_shape(b.cad_tolerances(), b.model_tolerance())
+    # Modeling works to the project's resolution, or to the widest precision
+    # of a tolerant entity where wider (Stitch's joins, an import's edges);
+    # the body's own tolerance is what it is meshed to.
+    let tolerant = b.model_tolerance() if b.model_tolerance() > b.base_tolerance() else 0.0
+    var shape = empty_shape(b.cad_tolerances(), math.max(b.cad_tolerances().resolution(), tolerant))
+    shape.display = b.base_tolerance()
     errdefer shape.close()
     let top = model.brep_placement()
     # Vertices and edges are shared; faces may carry their own placement,
@@ -346,7 +356,7 @@ pub func shape_of(model: const CadModel*) -> Shape!:
 
 ## `shape` as a new B-rep: its points, edges, surfaces and faces as they are.
 pub func brep_of(shape: const Shape*) -> interop.Reference[BrepModel]!:
-    let output = try BrepModel.held(shape.tolerances, math.max(shape.tolerance, least_tolerance))
+    let output = try BrepModel.held(shape.tolerances, math.max(shape.display, least_tolerance))
     errdefer output.release()
     let b = output.value()
     for at in 0..<shape.points.count:
