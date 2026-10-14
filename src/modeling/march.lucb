@@ -131,9 +131,18 @@ pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, s
     defer knots.close()
     var weights = Growing[f64]()
     defer weights.close()
+    # The traced curves' points, each curve's from its start, to tell a seed
+    # on one of them from a seed on another branch close by.
+    var polylines = Growing[Vector3]()
+    defer polylines.close()
+    var polyline_starts = Growing[usize]()
+    defer polyline_starts.close()
+    try polyline_starts.push(0)
     for seed in seeds.view():
-        # A seed on a curve already traced adds nothing.
-        if traced.near(seed): continue
+        # A seed on a curve already traced adds nothing: near its points and
+        # on its polyline (a chord strays from the curve by step² / 8r at
+        # most; another branch a little way off is not skipped).
+        if traced.near(seed) and on_polylines(seed, polylines.view(), polyline_starts.view(), math.max(tol * 10.0, step * 0.05)): continue
         # Each trace searches B-splines afresh from its seed.
         unseed(s1)
         unseed(s2)
@@ -150,9 +159,20 @@ pub func marched(w: Shape*, fa: usize, fb: usize, low: Vector3, high: Vector3, s
             if attempt == 4 or (try stays_on(s1, s2, net.view(), weights.view(), knots.view(), line.count * 4, tol)): break
             spacing *= 0.5
         if line.count < 4: continue
-        for p in line.view(): try traced.add(p)
+        for p in line.view():
+            try traced.add(p)
+            try polylines.push(p)
+        try polyline_starts.push(polylines.count)
         let spline = try w.store_spline(net.view(), weights.view(), knots.view(), 3, Matrix4())
         try out.push(Carrier(2, Vector3(), Vector3(), Vector3(), 0.0, 0.0, spline))
+
+## Whether `p` lies within `reach` of a segment of the polylines in `points`
+## (each from `starts[k]` to `starts[k + 1]`).
+func on_polylines(p: Vector3, points: const Vector3[], starts: const usize[], reach: f64) -> bool:
+    for k in 0..<starts.length - 1:
+        for at in starts[k] + 1..<starts[k + 1]:
+            if segment_distance(points[at - 1], points[at], p, p) <= reach: return true
+    return false
 
 ## The curve through `seed` on both fields, traced both ways (or round
 ## once, closed) `step` apart, onto `line` (`back` is scratch).

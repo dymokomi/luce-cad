@@ -464,6 +464,39 @@ Before stage 2, 169 cells were off the ideal and 22 failed. Now:
 The diagonal ideal changed with stage 2. Coincidence is decided per face: two faces each δ/√2
 apart are one, so the diagonal row merges while δ/√2 ≤ P.
 
+### 3.6 After stage 3 (classification and degeneracy)
+
+The harness is clean: invariance 0 of 224 and the band 0 of 452 cells off the ideal, boxes
+and coaxial cylinders alike. Its ratchet is now zero for both. Stage 3 found that both
+remaining invariance failures were in the display mesh, not the B-rep. (A − B) ∪ (A ∩ B)
+gives the box back. The harness now fails any result whose mesh leaves a face out, instead of
+reporting a smaller volume.
+
+- **Sphere through its pole.** A sphere piece whose trim crosses the sphere's pole between two
+  samples (a meridian through the pole) was meshed in the latitude–longitude chart, where its
+  longitude jumps half a turn. One orientation of the piece came out right by chance; the
+  other covered the sphere many times over. Such a trim is now found by the jump and a chord
+  passing the pole, and it is meshed in a chart away from the pole (`touches_pole`).
+- **A band's hole a turn off.** On a cylinder band (an outer loop going once round) a hole's
+  chart start was unwrapped near the outer loop's start. Depending on which edge each loop
+  started at, which depends on face order, the hole could land a whole turn outside the band
+  and the face was left out of the mesh. Holes are now moved by whole turns into the band's
+  span (`mesh_in_chart`).
+- **Rings thinner than a chord.** The booleans' face charts sampled circles every 0.05 rad. On
+  a radius of 250 mm a chord strays 0.08 mm, so a 0.01 mm ring between two radii could not be
+  charted, and its inside point was found off it. Circles are now also sampled so that a
+  chord strays no more than the boolean's decision distance (`loop_chart`).
+- **Rays.** A ray counts only when it is clean: no hit on a face's boundary and none grazing
+  a surface. Rays are tried in a fixed order until three clean ones are found, and their
+  majority decides (they agree unless the point lies on the solid's boundary).
+- **Tracing.** A march seed was skipped when it lay within 0.8% of the model's size of any
+  traced point, which could drop a nearby branch. It is now skipped only when it lies on a
+  traced polyline.
+
+Not done in stage 3: exact predicates with symbolic perturbation and certified subdivision
+seeding. Clean rays and the polyline test removed every failure the harness and the tests
+show. These two remain open for the heavy sweep (stage 7) to argue for.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
@@ -765,7 +798,7 @@ identity are absolute (P); the construction slop stays relative to size until th
 | 0 ✓ | Harness and fingerprint (60a9332) | done | Baseline; cross-OS determinism measured |
 | 1 ✓ | **Tolerance type and plumbing** (luce-cad 2256fc7, luced-3d 0b6745b). `CadTolerances` (P, F, T, K, derived R, size box) in luce-cad; every body-making call takes it; `BrepModel` stores and saves it; the size box is enforced. luced-3d: Network field, save and load, Project Settings rows, a cook-key part, pass-down. The working tolerances stay as they are: switching them to absolute values alone, without the predicate layer, was tried and made the tilt band worse (shallow plane crossings at 1e-7 to 1e-5 rad fail in more places), so the switch moved to stage 2. | L: 3–4 days | The setting reaches every body; results unchanged (fingerprints identical) |
 | 2 ✓ | **Tolerant coincidence: one decision per fact at P** (4.4a). Faces of the second solid on a first-solid surface within P are put on it, and their edges and vertices become tolerant. Every later step honours that slack. A vertex merges into the nearest in reach. Planes are never tangent. The coaxial band rows were added to the harness. | done | Box band 0 of 372 off (was 169) and 0 failed (was 22); all tests green |
-| 3 | **Classification and degeneracy.** Classification by local facts plus exact single-ray parity with Simulation of Simplicity; certified subdivision seeding for the march; fix the box/sphere-on-face case and the face-order tessellation case. | L: about 2k lines, 1 week | Invariance failures 0; band assertion becomes hard |
+| 3 ✓ | **Classification and degeneracy** (3.6). The two invariance failures were mesh bugs (a sphere trim through the pole, a band's hole a turn off), now fixed. Rings thinner than a chart chord now chart. Rays are clean. March seeds are skipped only on a traced polyline. The harness fails on a face left out of a mesh. | done | Invariance 0 of 224; band 0 of 452 |
 | 4 | **Canonical order and representatives** (vertex merge, final edges, march start, Stitch representatives, output ordering). | M: about 800 lines, 3–4 days | Operand and face permutation give identical topology; contract item 2 asserted |
 | 5 | **Per-entity tolerances done right and the checker.** Remove `model_tolerance()`; keep B's tolerances; measured precision on import, stitch, intersection and fillet; tolerance tightening; a `check_body` (structure, geometry on topology, orientation, loops, sampled self-intersection) usable as a node and run on every result in tests. | L: about 2k lines, 1 week | Imports keep P; no model-wide widening |
 | 6 | **The rest of the kernel by directory, and absolute working tolerances.** Meshing gets its own display tolerance, then `tolerance_for(size)` and the `size × 1e-7` work tolerances become the project's resolution. Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
