@@ -97,6 +97,17 @@ struct Work:
     ## Each merged vertex's zone: how far from it a point is still it
     ## (the work's own tolerance, or a tolerant entity's precision).
     var zones: Growing[f64] = Growing[f64]()
+    ## Each merged vertex's canonical point: of the points merged into it,
+    ## one that was exact (the least slack) and of those the first,
+    ## lexicographically: where the result puts it, one place whichever
+    ## operand came first, and never a tolerant point where an exact one
+    ## is there (the merging itself goes by the vertex as found).
+    var canonical: Growing[Vector3] = Growing[Vector3]()
+    var canonical_slack: Growing[f64] = Growing[f64]()
+    ## Whether the operands are peers (a user's union, subtraction or
+    ## intersection: the result the same either way round), or the first is
+    ## a body a tool works on (its geometry kept where they meet).
+    var symmetric: bool = false
     ## Each final edge's slack: how far it may lie from the edges it stands
     ## for (a tolerant edge's precision, or a section's).
     var final_slack: Growing[f64] = Growing[f64]()
@@ -113,6 +124,8 @@ struct Work:
         self.contacts.close()
         self.zones.close()
         self.final_slack.close()
+        self.canonical.close()
+        self.canonical_slack.close()
         self.finals.close()
         self.piece_ids.close()
         self.piece_starts.close()
@@ -141,8 +154,23 @@ struct Work:
                 best_distance = d
         if best >= 0:
             self.zones.items[(usize)best] = math.max(self.zones.items[(usize)best], zone)
+            # Between peers every merge goes to the canonical point; under a
+            # tool only a tolerant one (points further apart than the fine
+            # zone), so the body keeps its own points to the bit.
+            if (usize)best < self.canonical.count and (self.symmetric or p.subtract(self.canonical.items[(usize)best]).length() > self.tol * 10.0):
+                let held = self.canonical_slack.items[(usize)best]
+                if slack < held or (slack == held and lexicographic_before(p, self.canonical.items[(usize)best])):
+                    self.canonical.items[(usize)best] = p
+                    self.canonical_slack.items[(usize)best] = slack
             return best
+        # Vertices pushed elsewhere (Stitch's) have no canonical point:
+        # theirs is where they are.
+        while self.canonical.count < self.vertices.count:
+            try self.canonical.push(self.vertices.items[self.canonical.count])
+            try self.canonical_slack.push(0.0)
         try self.vertices.push(p)
+        try self.canonical.push(p)
+        try self.canonical_slack.push(slack)
         try self.zones.push(zone)
         return (i64)self.vertices.count - 1
 
@@ -194,8 +222,19 @@ struct Work:
         try self.final_slack.push(slack)
         return ((i64)self.finals.count - 1, true)
 
+    ## Where merged vertex `v` goes in the result (its canonical point).
+    func placed(v: i64) -> Vector3:
+        if not self.symmetric: return self.vertices.items[(usize)v]
+        return self.canonical.items[(usize)v] if (usize)v < self.canonical.count else self.vertices.items[(usize)v]
+
     func is_a(f: usize) -> bool:
         return f < self.faces_a
+
+## Whether point `a` comes before `b`: by x, then y, then z.
+func lexicographic_before(a: Vector3, b: Vector3) -> bool:
+    if a.x != b.x: return a.x < b.x
+    if a.y != b.y: return a.y < b.y
+    return a.z < b.z
 
 ## A box holding face `f` of `w`, never short of it (a pair of faces whose
 ## boxes miss is never met). A plane's face lies within its boundary's box;
@@ -317,8 +356,10 @@ func append_shape(into: Shape*, source: const Shape*) -> !:
         for use in source.face_uses(f): try uses.push(use + edges if use > 0 else use - edges)
         try into.add_face(source.faces.items[f].surface + surfaces, source.faces.items[f].sense, uses.view(), source.face_sizes(f), try into.add_name(source.face_name(f)))
 
-## `a` combined with `b` by `op` (op_union, op_subtract, op_intersect).
-pub func combine(a: const CadModel*, b: const CadModel*, op: i64) -> interop.Reference[CadModel]!:
+## `a` combined with `b` by `op` (op_union, op_subtract, op_intersect);
+## `symmetric` for peers (Work.symmetric), else `a` is the body a tool `b`
+## works on.
+pub func combine(a: const CadModel*, b: const CadModel*, op: i64, symmetric: bool = false) -> interop.Reference[CadModel]!:
     var first = try shape_of(a)
     let faces_a = first.faces.count
     var second = try shape_of(b)
@@ -327,6 +368,7 @@ pub func combine(a: const CadModel*, b: const CadModel*, op: i64) -> interop.Ref
     var work = Work(first, faces_a, 1.0, 1e-9, Growing[Vector3](), Growing[i64](), Growing[Cut](), Growing[Section](), Growing[Imprint](),
                     Growing[Coincident](), Growing[ShapeEdge](), Growing[i64](), Growing[usize](), Growing[i64](), Growing[bool]())
     defer work.close()
+    work.symmetric = symmetric
     var low = Vector3(1.0e300, 1.0e300, 1.0e300)
     var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
     for f in 0..<work.w.faces.count:
@@ -386,7 +428,12 @@ func intersect_faces(work: Work*) -> !:
                 met = try spline_coincidence(w, fa, fb, work.tol)
                 if met == meet_curves and not try spline_meet(w, fa, fb, work.tol, &curves): met = meet_march
             else:
-                met = try meet(&w.surfaces.items[(usize)sa.surface], &w.surfaces.items[(usize)sb.surface], work.tol, &curves)
+                # Between peers the surfaces are met in an order of their
+                # own, so the curves come out the same either way round.
+                let first_surface = &w.surfaces.items[(usize)sa.surface]
+                let second_surface = &w.surfaces.items[(usize)sb.surface]
+                if work.symmetric and surface_before(second_surface, first_surface): met = try meet(second_surface, first_surface, work.tol, &curves)
+                else: met = try meet(first_surface, second_surface, work.tol, &curves)
             if met == meet_march:
                 # Where both faces are, a little more.
                 let pad = Vector3(work.size * 0.01, work.size * 0.01, work.size * 0.01)
@@ -396,7 +443,8 @@ func intersect_faces(work: Work*) -> !:
                 let hb = highs.items[fb]
                 let box_low = Vector3(math.max(la.x, lb.x), math.max(la.y, lb.y), math.max(la.z, lb.z)).subtract(pad)
                 let box_high = Vector3(math.min(ha.x, hb.x), math.min(ha.y, hb.y), math.min(ha.z, hb.z)).add(pad)
-                try marched(w, fa, fb, box_low, box_high, work.size, work.tol, &curves)
+                if work.symmetric and surface_before(&w.surfaces.items[(usize)sb.surface], &w.surfaces.items[(usize)sa.surface]): try marched(w, fb, fa, box_low, box_high, work.size, work.tol, &curves)
+                else: try marched(w, fa, fb, box_low, box_high, work.size, work.tol, &curves)
                 met = meet_curves
             if met != meet_curves:
                 let same = (met == meet_same) == (sa.sense == sb.sense)

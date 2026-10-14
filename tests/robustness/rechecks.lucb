@@ -1,0 +1,50 @@
+## Rechecking bodies against changed tolerances (CadModeling.rechecked and
+## tolerance_report, modeling/rechecks.lucb): what a held body or an import
+## does when the project's tolerances change. Exact bodies stay exact;
+## edges shorter than P are reported; a tolerant join within P becomes
+## tolerant beyond a tighter P, and adopting the tighter P heals it where
+## the faces' surfaces meet.
+import interop
+from luce_std import math
+from luce_geocore.geocore import Vector3, invalid
+from model import CadModel, CadTolerances
+from solids import CadSolids
+from modeling import CadModeling
+
+pub func rechecks() -> !:
+    let tight = CadTolerances(positional = 0.001, fit = 0.0001)
+    # An exact box: nothing tolerant, nothing short, under either setting.
+    let box = try CadSolids.box(10.0, 10.0, 10.0)
+    defer box.release()
+    let plain = try CadModeling.tolerance_report(box)
+    if plain.tolerant_edges != 0 or plain.short_edges != 0: error(invalid, "an exact box reported tolerant or short edges")
+    let tighter = try CadModeling.rechecked(box, tight)
+    defer tighter.release()
+    if (try CadModeling.tolerance_report(tighter)).tolerant_edges != 0: error(invalid, "an exact box rechecked tighter became tolerant")
+    # A plate 0.005 mm thin: its four short edges below P = 0.01 mm, none
+    # below 0.001 mm.
+    let plate = try CadSolids.box(10.0, 10.0, 0.005)
+    defer plate.release()
+    if (try CadModeling.tolerance_report(plate)).short_edges != 4: error(invalid, "a plate thinner than P did not report its short edges")
+    let fine = try CadModeling.rechecked(plate, tight)
+    defer fine.release()
+    if (try CadModeling.tolerance_report(fine)).short_edges != 0: error(invalid, "a plate rechecked under a finer P still reported short edges")
+    # Two boxes whose sides lie 0.005 mm apart, joined within P = 0.01 mm:
+    # within P, but beyond P = 0.001 mm; adopting it heals the joins.
+    let b0 = try CadSolids.box(10.0, 10.0, 10.0)
+    defer b0.release()
+    let b = try b0.value().transformed(Vector3(5.0, 0.005, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0))
+    defer b.release()
+    let joined = try CadModeling.combined(box, b, 0)
+    defer joined.release()
+    let within = try CadModeling.tolerance_report(joined)
+    let kept = try CadModeling.rechecked(joined, tight)
+    defer kept.release()
+    let beyond = try CadModeling.tolerance_report(kept)
+    let healed = try CadModeling.rechecked(joined, tight, true)
+    defer healed.release()
+    let after = try CadModeling.tolerance_report(healed)
+    print(f"robustness rechecks: joined within P {within.tolerant_edges} tolerant; under 0.001 mm {beyond.tolerant_edges} tolerant (worst {beyond.worst}); adopted {after.tolerant_edges} tolerant")
+    if within.tolerant_edges != 0: error(invalid, "a join within P reported tolerant edges")
+    if beyond.tolerant_edges == 0 or math.abs(beyond.worst - 0.005) > 0.0001: error(invalid, "a join 0.005 mm wide was not tolerant beyond P = 0.001 mm")
+    if after.tolerant_edges != 0: error(invalid, "adopting the tighter tolerance did not heal the joins")

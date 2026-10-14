@@ -1,0 +1,114 @@
+## A body checked against the project's tolerances (docs/research/
+## KERNEL-ROBUSTNESS.md, 4.5 and 4.6): a held body (Edit CAD's) when the
+## setting changes, and an imported one, measured the way Parasolid's
+## tolerant modelling does. Each edge lying off its faces' surfaces by more
+## than the body's working tolerance keeps that distance as its precision,
+## and each vertex the most of its edges'; with `adopt`, such edges are
+## first found again where their faces' surfaces meet (Stitch's rebuilt
+## joins), so what can be brought within the tolerance is. The report says
+## how many edges are tolerant beyond P and by how much at worst, and how
+## many edges are shorter than P (features the setting can no longer tell
+## apart).
+
+## What rechecking found (CadModeling.tolerance_report).
+pub struct ToleranceReport:
+    ## Edges lying off their faces, or ending off their vertices, by more
+    ## than the positional tolerance.
+    pub var tolerant_edges: i64
+    ## The widest such distance (0 when none).
+    pub var worst: f64
+    ## Edges shorter than the positional tolerance, and the shortest.
+    pub var short_edges: i64
+    pub var shortest: f64
+
+## `model` under `tolerances`, its edges' and vertices' precision measured
+## (with `adopt`, tolerant edges healed first where they can be).
+func rechecked_model(model: interop.Reference[CadModel], tolerances: CadTolerances, adopt: bool) -> interop.Reference[CadModel]!:
+    # Independent faces (no B-rep, or beside one) have no joins to check.
+    if model.value().independent_faces() > 0: return model.clone()
+    let b = model.value().brep() else return model.clone()
+    let placed = try b.under(tolerances)
+    defer placed.release()
+    var body = try CadModel.of_brep(placed)
+    errdefer body.release()
+    let held = try body.value().placed(model.value().brep_placement())
+    body.release()
+    body = held
+    try measure_precision(body.value())
+    if not adopt or (try report_of(body.value())).tolerant_edges == 0: return body
+    let mended = (try rebuilt_joins(body.value(), placed.value().base_tolerance())) else return body
+    body.release()
+    body = mended
+    try measure_precision(body.value())
+    return body
+
+## Each edge of `model` its measured precision: how far it lies off its
+## faces' surfaces (sampled), when more than the working tolerance, else
+## none (a precision a stitch, an import or a boolean's zone set wider than
+## the geometry needs is tightened); each vertex the most of its edges' and
+## of how far it lies off their ends.
+func measure_precision(model: const CadModel*) -> !:
+    let b = model.brep() else return
+    let brep = (BrepModel*)b
+    let base = b.base_tolerance()
+    var w = try shape_of(model)
+    defer w.close()
+    let scale = model.brep_placement().transform_direction(Vector3(1.0, 0.0, 0.0)).length()
+    var vertex_most = Growing[f64]()
+    defer vertex_most.close()
+    try vertex_most.fill(w.points.count, 0.0)
+    for e in 0..<w.edges.count:
+        # In the model's own units (the shape is placed).
+        let gap = (try edge_gap(&w, e)) / math.max(scale, 1e-300)
+        let precision = gap * 1.01 if gap > base else 0.0
+        try brep.set_edge_precision((i64)e, precision)
+        let edge = w.edges.items[e]
+        # A vertex holds its edges' precision, and lies as far off their
+        # ends as it does (an import's edges ending near, not at, it).
+        let off_start = (try w.edge_at(e, 0.0)).subtract(w.points.items[(usize)edge.start]).length() / math.max(scale, 1e-300)
+        let off_end = (try w.edge_at(e, 1.0)).subtract(w.points.items[(usize)edge.end]).length() / math.max(scale, 1e-300)
+        vertex_most.items[(usize)edge.start] = math.max(vertex_most.items[(usize)edge.start], math.max(precision, off_start * 1.01 if off_start > base else 0.0))
+        vertex_most.items[(usize)edge.end] = math.max(vertex_most.items[(usize)edge.end], math.max(precision, off_end * 1.01 if off_end > base else 0.0))
+    for v in 0..<vertex_most.count: try brep.set_vertex_precision((i64)v, vertex_most.items[v])
+
+## How far edge `e` of `w` lies off its faces' surfaces at 17 points.
+func edge_gap(w: const Shape*, e: usize) -> f64!:
+    var most = 0.0
+    for side in 0..<(usize)2:
+        let f = w.sides.items[e * 2 + side]
+        if f < 0: continue
+        for k in 0..<17:
+            most = math.max(most, try gap_off_surface(&w.surfaces.items[(usize)w.faces.items[(usize)f].surface], try w.edge_at(e, (f64)k / 16.0)))
+    return most
+
+## What `model`'s edges say against its tolerances, measured: how far each
+## lies off its faces, and how long it is.
+func report_of(model: const CadModel*) -> ToleranceReport!:
+    var report = ToleranceReport(0, 0.0, 0, 0.0)
+    if model.independent_faces() > 0: return report
+    let b = model.brep() else return report
+    let p = b.cad_tolerances().positional
+    var w = try shape_of(model)
+    defer w.close()
+    let scale = math.max(model.brep_placement().transform_direction(Vector3(1.0, 0.0, 0.0)).length(), 1e-300)
+    for e in 0..<w.edges.count:
+        # Off its faces, or its ends off its vertices.
+        let edge = w.edges.items[e]
+        var gap = try edge_gap(&w, e)
+        gap = math.max(gap, (try w.edge_at(e, 0.0)).subtract(w.points.items[(usize)edge.start]).length())
+        gap = math.max(gap, (try w.edge_at(e, 1.0)).subtract(w.points.items[(usize)edge.end]).length())
+        gap = gap / scale
+        if gap > p:
+            report.tolerant_edges += 1
+            report.worst = math.max(report.worst, gap)
+        var length = 0.0
+        var previous = try w.edge_at(e, 0.0)
+        for k in 1..<17:
+            let next = try w.edge_at(e, (f64)k / 16.0)
+            length += next.subtract(previous).length()
+            previous = next
+        length = length / scale
+        if length < p:
+            report.short_edges += 1
+            report.shortest = length if report.short_edges == 1 else math.min(report.shortest, length)
+    return report

@@ -1,0 +1,202 @@
+## The order a boolean writes its result in (docs/research/KERNEL-ROBUSTNESS.md,
+## section 5, item 2). Between peers (Work.symmetric: a user's union,
+## subtraction or intersection) the result must not depend on which operand
+## came first or how their faces were numbered, so everything the B-rep
+## holds is put in an order of its own geometry:
+##
+## - pieces by their surface (kind, then its frame and sizes), then by their
+##   first vertex (lexicographically) and the middle of their vertices;
+## - each piece's outer loop first, its holes by their first vertex; each
+##   loop starting at its first vertex (ties: the vertex after it);
+## - edges and vertices numbered as the pieces first use them;
+## - each edge running from its first vertex to the other (a closed edge
+##   as its curve runs), a circle's or ellipse's axis pointing up the first
+##   axis it leans along.
+##
+## A body worked on by a tool keeps the order the work has (its own faces'
+## first), as do the layouts nothing asks to be canonical.
+
+## Kept pieces in writing order, each with its loops' uses (turned pieces
+## already reversed, signs in final edges' own directions), the edges in
+## writing order and whether each is written reversed.
+struct Layout:
+    var order: Growing[usize]
+    ## Piece order[k]'s loops: uses[loop_starts[...]] by loops from
+    ## piece_loops[k] to piece_loops[k + 1].
+    var uses: Growing[i64]
+    var loop_starts: Growing[usize]
+    var piece_loops: Growing[usize]
+    var edges: Growing[usize]
+    var flipped: Growing[bool]
+
+    func close():
+        self.order.close()
+        self.uses.close()
+        self.loop_starts.close()
+        self.piece_loops.close()
+        self.edges.close()
+        self.flipped.close()
+
+    func piece_uses(k: usize, loop: usize) -> const i64[]:
+        let at = self.piece_loops.items[k] + loop
+        return self.uses.view()[self.loop_starts.items[at]..<self.loop_starts.items[at + 1]]
+
+    func loop_count(k: usize) -> usize:
+        return self.piece_loops.items[k + 1] - self.piece_loops.items[k]
+
+## The writing layout of the kept pieces.
+func layout_of(work: Work*, pieces: const Pieces*, piece_face: const usize[], keep: const bool[], turn: const bool[]) -> Layout!:
+    var made = Layout(Growing[usize](), Growing[i64](), Growing[usize](), Growing[usize](), Growing[usize](), Growing[bool]())
+    errdefer made.close()
+    for p in 0..<pieces.piece_count():
+        if keep[p]: try made.order.push(p)
+    if work.symmetric: try sort_pieces(work, pieces, piece_face, turn, made.order.items[..<made.order.count])
+    # Loops: turned pieces reversed; between peers holes sorted and each
+    # loop rotated to its first vertex.
+    var loop = Growing[i64]()
+    defer loop.close()
+    var held = Growing[i64]()
+    defer held.close()
+    var held_starts = Growing[usize]()
+    defer held_starts.close()
+    try made.loop_starts.push(0)
+    for p in made.order.view():
+        try made.piece_loops.push(made.loop_starts.count - 1)
+        held.clear()
+        held_starts.clear()
+        try held_starts.push(0)
+        for c in pieces.piece_cycles(p):
+            let cycle = pieces.cycle(c)
+            if cycle.length == 0: continue
+            loop.clear()
+            for k in 0..<cycle.length:
+                # A turned piece runs each loop backwards.
+                try loop.push(-cycle[cycle.length - 1 - k] if turn[p] else cycle[k])
+            if work.symmetric: try rotate_to_first(work, loop.items[..<loop.count])
+            for use in loop.view(): try held.push(use)
+            try held_starts.push(held.count)
+        let count = held_starts.count - 1
+        var at_order = Growing[usize]()
+        defer at_order.close()
+        for k in 0..<count: try at_order.push(k)
+        if work.symmetric and count > 2:
+            # The outer loop stays first; holes by their first vertex.
+            let holes = at_order.items[1..<count]
+            for i in 1..<holes.length:
+                let key = holes[i]
+                var to = i
+                while to > 0 and loop_before(work, held.view(), held_starts.view(), key, holes[to - 1]):
+                    holes[to] = holes[to - 1]
+                    to -= 1
+                holes[to] = key
+        for k in at_order.view():
+            for use in held.view()[held_starts.items[k]..<held_starts.items[k + 1]]: try made.uses.push(use)
+            try made.loop_starts.push(made.uses.count)
+    try made.piece_loops.push(made.loop_starts.count - 1)
+    # Edges as first used, each written from its first vertex between
+    # peers.
+    var seen = Growing[bool]()
+    defer seen.close()
+    try seen.fill(work.finals.count, false)
+    try made.flipped.fill(work.finals.count, false)
+    if not work.symmetric:
+        for e in 0..<work.finals.count: try made.edges.push(e)
+        return made
+    for use in made.uses.view():
+        let e = edge_index(use)
+        if seen.items[e]: continue
+        seen.items[e] = true
+        try made.edges.push(e)
+        let edge = work.finals.items[e]
+        if edge.start != edge.end: made.flipped.items[e] = lexicographic_before(work.placed(edge.end), work.placed(edge.start))
+    # Edges no kept piece uses are not written; listed last so every final
+    # edge has a place.
+    for e in 0..<work.finals.count:
+        if not seen.items[e]: try made.edges.push(e)
+    return made
+
+## The start vertex of use `use` (a signed final edge).
+func final_use_start(work: const Work*, use: i64) -> i64:
+    let edge = work.finals.items[edge_index(use)]
+    return edge.start if use > 0 else edge.end
+
+## `loop` rotated to start at its first vertex (ties: the vertex after).
+func rotate_to_first(work: const Work*, loop: i64[]) -> !:
+    let n = loop.length
+    if n < 2: return
+    var best: usize = 0
+    for k in 1..<n:
+        let a = work.placed(final_use_start(work, loop[k]))
+        let b = work.placed(final_use_start(work, loop[best]))
+        if lexicographic_before(a, b): best = k
+        elif not lexicographic_before(b, a):
+            # One vertex twice (a seam): by the vertex each goes to.
+            if lexicographic_before(work.placed(final_use_start(work, loop[(k + 1) % n])), work.placed(final_use_start(work, loop[(best + 1) % n]))): best = k
+    if best == 0: return
+    let copy = try new i64[n] --- in memory.heap
+    defer free(copy) in memory.heap
+    for k in 0..<n: copy[k] = loop[(k + best) % n]
+    for k in 0..<n: loop[k] = copy[k]
+
+## Whether loop `a` comes before loop `b` (of `uses` split at `starts`): by
+## their first vertices.
+func loop_before(work: const Work*, uses: const i64[], starts: const usize[], a: usize, b: usize) -> bool:
+    let pa = work.placed(final_use_start(work, uses[starts[a]]))
+    let pb = work.placed(final_use_start(work, uses[starts[b]]))
+    return lexicographic_before(pa, pb)
+
+## Kept pieces `order` sorted by their surface, then their first vertex,
+## then the middle of their vertices.
+func sort_pieces(work: const Work*, pieces: const Pieces*, piece_face: const usize[], turn: const bool[], order: usize[]) -> !:
+    let count = order.length
+    let keys = try new f64[count * 17] --- in memory.heap
+    defer free(keys) in memory.heap
+    for k in 0..<count:
+        let p = order[k]
+        let face = work.w.faces.items[piece_face[p]]
+        let s = &work.w.surfaces.items[(usize)face.surface]
+        var at = k * 17
+        let surface: f64[11] = [(f64)s.kind, s.origin.x, s.origin.y, s.origin.z, s.z.x, s.z.y, s.z.z, s.x.x, s.x.y, s.x.z, s.radius]
+        for value in surface:
+            keys[at] = value
+            at += 1
+        keys[at] = s.angle
+        at += 1
+        # Its facing, then its first vertex and the middle of its vertices.
+        keys[at] = 1.0 if face.sense != turn[p] else 0.0
+        at += 1
+        var first = Vector3(1e300, 1e300, 1e300)
+        var middle = Vector3()
+        var n = 0.0
+        for c in pieces.piece_cycles(p):
+            for use in pieces.cycle(c):
+                let q = work.placed(final_use_start(work, use))
+                if lexicographic_before(q, first): first = q
+                middle = middle.add(q)
+                n += 1.0
+        middle = middle.multiply_scalar(1.0 / math.max(n, 1.0))
+        let tail: f64[4] = [first.x, first.y, first.z, middle.x]
+        for value in tail:
+            keys[at] = value
+            at += 1
+    for i in 1..<count:
+        let piece = order[i]
+        var key: f64[17]
+        for j in 0..<(usize)17: key[j] = keys[i * 17 + j]
+        var to = i
+        while to > 0 and keys_before(key[..<17], keys[(to - 1) * 17..<to * 17]):
+            order[to] = order[to - 1]
+            for j in 0..<(usize)17: keys[to * 17 + j] = keys[(to - 1) * 17 + j]
+            to -= 1
+        order[to] = piece
+        for j in 0..<(usize)17: keys[to * 17 + j] = key[j]
+
+func keys_before(a: const f64[], b: const f64[]) -> bool:
+    for j in 0..<a.length:
+        if a[j] != b[j]: return a[j] < b[j]
+    return false
+
+## `v` with its sign turned to point up the first axis it leans along.
+func canonical_axis(v: Vector3) -> (Vector3, bool):
+    let flip = v.x < 0.0 or (v.x == 0.0 and (v.y < 0.0 or (v.y == 0.0 and v.z < 0.0)))
+    return (v.multiply_scalar(-1.0), true) if flip else (v, false)

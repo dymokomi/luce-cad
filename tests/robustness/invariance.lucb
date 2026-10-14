@@ -14,11 +14,13 @@ from luce_geocore.geocore import Vector3, invalid
 from model import CadModel
 from solids import CadSolids
 from modeling import CadModeling
-from measures import signature, volume, closed
+from measures import signature, volume, closed, same_vertices, fingerprint
 
 pub struct Tally:
     pub var checks: i64 = 0
     pub var failures: i64 = 0
+    ## Results the same to the resolution but not bit for bit.
+    pub var unequal: i64 = 0
 
     pub func record(ok: bool, name: str, detail: str) -> bool:
         self.checks += 1
@@ -92,6 +94,12 @@ struct Outcome:
     var signature: u64
     var volume: f64
     var message: str
+    ## The result itself, kept for the geometric comparisons (released by
+    ## `let_go`).
+    var model: interop.Reference[CadModel]? = none
+
+    func let_go():
+        if let held = self.model: held.release()
 
 func outcome(a: interop.Reference[CadModel], b: interop.Reference[CadModel], op: i64, tally: Tally*, name: str) -> Outcome!:
     let result = CadModeling.combined(a, b, op) catch failure:
@@ -102,7 +110,12 @@ func outcome(a: interop.Reference[CadModel], b: interop.Reference[CadModel], op:
     defer result.release()
     let shut = try closed(result)
     _ = tally.record(shut, name, "not closed")
-    return Outcome(true, try signature(result), try volume(result), "")
+    let v = volume(result) catch failure:
+        print(f"robustness FAIL {name}: {failure.message}")
+        tally.checks += 1
+        tally.failures += 1
+        return Outcome(false, 0, 0.0, "")
+    return Outcome(true, try signature(result), v, "", result.clone())
 
 func op_name(op: i64) -> str:
     return "union" if op == 0 else ("subtract" if op == 1 else "intersect")
@@ -114,7 +127,39 @@ func same(base: Outcome, other: Outcome, scale: f64, relative: f64, tally: Tally
     let off = math.abs(other.volume - expected) / math.max(1e-300, math.abs(expected))
     if not tally.record(off <= relative, name, "volume differs"): print(f"    by {off} of it")
 
-pub func invariance(tally: Tally*) -> !:
+## Whether two results that should be one have their vertices at the same
+## places, to the resolution (the determinism contract's item 2: operands
+## swapped, faces numbered backwards).
+func identical(base: Outcome, other: Outcome, canonical: Tally*, name: str) -> !:
+    let a = base.model else return
+    let b = other.model else return
+    _ = canonical.record(try same_vertices(a, b), name, "the vertices are not where the other's are")
+    if (try fingerprint(a)) != (try fingerprint(b)):
+        canonical.unequal += 1
+        print(f"robustness differs bit for bit: {name}")
+
+## Tolerant merges swapped: boxes whose faces lie 0.005 mm apart (offset
+## sideways, along a diagonal and across a gap) joined either way round must
+## come out the same, the faces kept wherever either operand had them.
+func tolerant_swaps(canonical: Tally*) -> !:
+    let offsets: Vector3[3] = [Vector3(5.0, 0.005, 0.0), Vector3(5.0, 0.0035, 0.0035), Vector3(10.005, 0.0, 0.0)]
+    var tally = Tally()
+    for offset in offsets:
+        let a = try CadSolids.box(10.0, 10.0, 10.0)
+        defer a.release()
+        let b0 = try CadSolids.box(10.0, 10.0, 10.0)
+        defer b0.release()
+        let b = try b0.value().transformed(offset, Vector3(), Vector3(1.0, 1.0, 1.0))
+        defer b.release()
+        var base = try outcome(a, b, 0, &tally, "tolerant boxes")
+        defer base.let_go()
+        var swapped = try outcome(b, a, 0, &tally, "tolerant boxes swapped")
+        defer swapped.let_go()
+        var buffer: u8[96]
+        try identical(base, swapped, canonical, try strings.format(buffer, f"tolerant boxes {offset.x},{offset.y},{offset.z} swapped"))
+
+pub func invariance(tally: Tally*, canonical: Tally*) -> !:
+    try tolerant_swaps(canonical)
     let none_moved = Vector3()
     for which in 0..<pair_count:
         # Volumes from vertices are good to rounding; from tessellations
@@ -128,20 +173,29 @@ pub func invariance(tally: Tally*) -> !:
             var label_bytes: u8[96]
             let label = try strings.format(label_bytes, f"{pair_name(which)} {op_name(op)}")
             var name_bytes: u8[128]
-            let base = try outcome(a, b, op, tally, label)
+            var base = try outcome(a, b, op, tally, label)
+            defer base.let_go()
             volumes[(usize)op] = base.volume
             if op != 1:
                 let name = try strings.format(name_bytes, f"{label} swapped")
-                same(base, try outcome(b, a, op, tally, name), 1.0, relative, tally, name)
+                var swapped = try outcome(b, a, op, tally, name)
+                same(base, swapped, 1.0, relative, tally, name)
+                try identical(base, swapped, canonical, name)
+                swapped.let_go()
             let backwards = try reversed_faces(a)
             defer backwards.release()
             let reversed_name = try strings.format(name_bytes, f"{label} faces reversed")
-            same(base, try outcome(backwards, b, op, tally, reversed_name), 1.0, relative, tally, reversed_name)
+            var reversed = try outcome(backwards, b, op, tally, reversed_name)
+            same(base, reversed, 1.0, relative, tally, reversed_name)
+            try identical(base, reversed, canonical, reversed_name)
+            reversed.let_go()
             let (ma, mb) = try pair(which, Vector3(123.4, -56.7, 8.9), Vector3(0.3, 0.5, 0.7), 1.0)
             defer ma.release()
             defer mb.release()
             let moved_name = try strings.format(name_bytes, f"{label} moved")
-            same(base, try outcome(ma, mb, op, tally, moved_name), 1.0, relative, tally, moved_name)
+            var moved = try outcome(ma, mb, op, tally, moved_name)
+            same(base, moved, 1.0, relative, tally, moved_name)
+            moved.let_go()
             # Inches to millimeters, and a tenth and a hundred times: every
             # feature stays far from the positional tolerance (0.01 mm) and
             # inside the size box, so the topology must not change.
@@ -151,7 +205,9 @@ pub func invariance(tally: Tally*) -> !:
                 defer sa.release()
                 defer sb.release()
                 let scaled_name = try strings.format(name_bytes, f"{label} scaled {scale}")
-                same(base, try outcome(sa, sb, op, tally, scaled_name), scale, relative, tally, scaled_name)
+                var scaled = try outcome(sa, sb, op, tally, scaled_name)
+                same(base, scaled, scale, relative, tally, scaled_name)
+                scaled.let_go()
         # The identities, from the inputs' own volumes.
         let va = try volume(a)
         let vb = try volume(b)

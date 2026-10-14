@@ -497,6 +497,36 @@ Not done in stage 3: exact predicates with symbolic perturbation and certified s
 seeding. Clean rays and the polyline test removed every failure the harness and the tests
 show. These two remain open for the heavy sweep (stage 7) to argue for.
 
+### 3.7 After stages 4 and 5 (canonical results, per-entity tolerances)
+
+- **Peer booleans are canonical.** `CadModeling.combined` (a user's union, subtraction or
+  intersection) gives the same result bit for bit with the operands swapped or the first
+  solid's faces renumbered. The harness checks this on all 23 cases by fingerprint, traced
+  intersections included, and its ratchet is zero.
+  - Surfaces are met, and traced, in an order of their own.
+  - A tolerant coincidence keeps the surface that sorts first.
+  - Merged vertices are placed at the exact, then lexicographically first, of their points.
+  - The result is written in the order of its own geometry (`canonical.lucb`): pieces by
+    surface, then by first vertex; outer loop first, holes by first vertex; each loop starting
+    at its first vertex; edges numbered as first used and running from their first vertex; a
+    circle's or ellipse's axis canonical.
+- **Tool booleans keep the body's geometry.** A fillet's, chamfer's or extent's tool keeps the
+  body's surfaces and points, and they are deterministic (the harness's repeated and
+  concurrent runs of fillets, shells and tool booleans).
+- **Rechecking.** `CadModeling.rechecked(body, tolerances, adopt)` measures each edge's
+  distance from its faces and each vertex's distance from its edges' ends. A precision wider
+  than the geometry needs is tightened. With `adopt`, tolerant joins are healed where their
+  faces' surfaces meet. `CadModeling.tolerance_report(body)` counts the edges beyond P and
+  shorter than P.
+  - The harness checks it on three bodies. An exact box stays exact. A 0.005 mm plate reports
+    its four short edges at P = 0.01 mm and none at 0.001 mm. Two boxes flush within 0.005 mm,
+    joined, have no tolerant edges at P = 0.01 mm; at 0.001 mm six edges are tolerant (worst
+    0.005 mm), and adopting the tighter P heals them all.
+- **Imports.** The STEP File node's Tolerances row (Ask, Keep the file's, Adopt the scene's)
+  replaces "STEP tolerance". The reader joins vertices within the project's P, and the body is
+  rechecked under the project's tolerances. Ask names a file looser than P on the node until
+  one is chosen; Adopt names what it could not heal.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
@@ -799,8 +829,8 @@ identity are absolute (P); the construction slop stays relative to size until th
 | 1 ✓ | **Tolerance type and plumbing** (luce-cad 2256fc7, luced-3d 0b6745b). `CadTolerances` (P, F, T, K, derived R, size box) in luce-cad; every body-making call takes it; `BrepModel` stores and saves it; the size box is enforced. luced-3d: Network field, save and load, Project Settings rows, a cook-key part, pass-down. The working tolerances stay as they are: switching them to absolute values alone, without the predicate layer, was tried and made the tilt band worse (shallow plane crossings at 1e-7 to 1e-5 rad fail in more places), so the switch moved to stage 2. | L: 3–4 days | The setting reaches every body; results unchanged (fingerprints identical) |
 | 2 ✓ | **Tolerant coincidence: one decision per fact at P** (4.4a). Faces of the second solid on a first-solid surface within P are put on it, and their edges and vertices become tolerant. Every later step honours that slack. A vertex merges into the nearest in reach. Planes are never tangent. The coaxial band rows were added to the harness. | done | Box band 0 of 372 off (was 169) and 0 failed (was 22); all tests green |
 | 3 ✓ | **Classification and degeneracy** (3.6). The two invariance failures were mesh bugs (a sphere trim through the pole, a band's hole a turn off), now fixed. Rings thinner than a chart chord now chart. Rays are clean. March seeds are skipped only on a traced polyline. The harness fails on a face left out of a mesh. | done | Invariance 0 of 224; band 0 of 452 |
-| 4 | **Canonical order and representatives** (vertex merge, final edges, march start, Stitch representatives, output ordering). | M: about 800 lines, 3–4 days | Operand and face permutation give identical topology; contract item 2 asserted |
-| 5 | **Per-entity tolerances done right and the checker.** Remove `model_tolerance()`; keep B's tolerances; measured precision on import, stitch, intersection and fillet; tolerance tightening; a `check_body` (structure, geometry on topology, orientation, loops, sampled self-intersection) usable as a node and run on every result in tests. | L: about 2k lines, 1 week | Imports keep P; no model-wide widening |
+| 4 ✓ | **Canonical results** (3.7). Peer booleans are the same bit for bit with operands swapped or faces renumbered: canonical meet and trace order, canonical coincidence surface and merged points, results written in their geometry's order. Tool booleans keep the body's geometry. | done | 0 of 23 swapped or renumbered results differ, bit for bit |
+| 5 ✓ (part) | **Per-entity tolerances and the recheck.** `rechecked` and `tolerance_report` (measured precision, tightening, healing on adopt). STEP imports join within P and are rechecked; the File node's Tolerances option asks. Edit CAD's held bodies call `rechecked` when the setting changes. Not done: shape_of still works to the widest precision anywhere (`model_tolerance()`). Working to each entity's own broke fillets, whose tools rely on the wider tolerance, so it moves to stage 6 with the absolute working tolerances. A body checker node is left for stage 7. | done | Rechecks in the harness; imports name looser files |
 | 6 | **The rest of the kernel by directory, and absolute working tolerances.** Meshing gets its own display tolerance, then `tolerance_for(size)` and the `size × 1e-7` work tolerances become the project's resolution. Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
 | 7 | **Heavy sweep tool** (`dev/robustness`): randomised rotations, scales and near-degenerate placements in the thousands, run on demand, not in `luc test`. Per the owner's priority this is after all requests and is not fuzzing. | S: 2 days | Continued coverage |
 

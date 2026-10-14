@@ -117,3 +117,72 @@ pub func volume(model: interop.Reference[CadModel], segments: i64 = 64) -> f64!:
         for k in 1..<(try m.face_size(face)) - 1:
             total += first.dot((try m.point(try m.face_point(face, k))).cross(try m.point(try m.face_point(face, k + 1)))) / 6.0
     return total
+
+## Whether models `a` and `b` have their vertices at the same places (in
+## world space, sorted), each within the resolution of their tolerances.
+pub func same_vertices(a: interop.Reference[CadModel], b: interop.Reference[CadModel]) -> bool!:
+    var pa = Growing[Vector3]()
+    defer pa.close()
+    var pb = Growing[Vector3]()
+    defer pb.close()
+    try sorted_vertices(a, &pa)
+    try sorted_vertices(b, &pb)
+    if pa.count != pb.count: return false
+    let brep = a.value().brep() else return false
+    let reach = brep.cad_tolerances().resolution()
+    for at in 0..<pa.count:
+        if pa.items[at].subtract(pb.items[at]).length() > reach: return false
+    # And the faces' planes at the same places: each plane's distance from
+    # the origin along its normal (turned to point up the first axis it
+    # leans along), sorted.
+    var oa = Growing[Vector3]()
+    defer oa.close()
+    var ob = Growing[Vector3]()
+    defer ob.close()
+    try plane_keys(a, &oa)
+    try plane_keys(b, &ob)
+    if oa.count != ob.count: return false
+    for at in 0..<oa.count:
+        if oa.items[at].subtract(ob.items[at]).length() > reach: return false
+    return true
+
+## Each planar face's normal (canonical sign) scaled by its distance from
+## the origin, sorted.
+func plane_keys(model: interop.Reference[CadModel], out: Growing[Vector3]*) -> !:
+    let brep = model.value().brep() else return
+    for f in 0..<brep.face_count():
+        if try brep.face_surface_kind(f) != 0: continue
+        var support = try brep.face_support(f)
+        defer support.close()
+        var n = support.z
+        if n.x < -1e-12 or (math.abs(n.x) <= 1e-12 and (n.y < -1e-12 or (math.abs(n.y) <= 1e-12 and n.z < 0.0))): n = n.multiply_scalar(-1.0)
+        try out.push(n.multiply_scalar(n.dot(support.origin)).add(n.multiply_scalar(1e3)))
+    let items = out.items[..<out.count]
+    for at in 1..<items.length:
+        let key = items[at]
+        var to = at
+        while to > 0 and before(key, items[to - 1]):
+            items[to] = items[to - 1]
+            to -= 1
+        items[to] = key
+
+func sorted_vertices(model: interop.Reference[CadModel], out: Growing[Vector3]*) -> !:
+    let brep = model.value().brep() else return
+    let m = model.value().brep_placement()
+    for v in 0..<brep.vertex_count(): try out.push(m.transform_point(try brep.vertex_at(v)))
+    let items = out.items[..<out.count]
+    for at in 1..<items.length:
+        let key = items[at]
+        var to = at
+        while to > 0 and before(key, items[to - 1]):
+            items[to] = items[to - 1]
+            to -= 1
+        items[to] = key
+
+## Lexicographic order of points, to a millionth in each coordinate (so
+## points a rounding apart keep one order).
+func before(a: Vector3, b: Vector3) -> bool:
+    let close = 1e-6
+    if math.abs(a.x - b.x) > close: return a.x < b.x
+    if math.abs(a.y - b.y) > close: return a.y < b.y
+    return a.z < b.z
