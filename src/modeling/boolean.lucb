@@ -31,10 +31,13 @@ let class_in: i64 = 1
 let class_same: i64 = 2
 let class_opposite: i64 = 3
 
-## Where an original edge is cut, by parameter.
+## Where an original edge is cut, by parameter; `slack`, how far the cut
+## may lie from where it is (it came from a tolerant edge or vertex), so its
+## vertex merges that far.
 struct Cut:
     var edge: usize
     var t: f64
+    var slack: f64 = 0.0
 
 ## A new edge: an interval of a carrier between merged vertices, lying
 ## across faces fa and fb (fb -1 for one face); `precision`, how far a
@@ -94,6 +97,9 @@ struct Work:
     ## Each merged vertex's zone: how far from it a point is still it
     ## (the work's own tolerance, or a tolerant entity's precision).
     var zones: Growing[f64] = Growing[f64]()
+    ## Each final edge's slack: how far it may lie from the edges it stands
+    ## for (a tolerant edge's precision, or a section's).
+    var final_slack: Growing[f64] = Growing[f64]()
 
     func close():
         self.w.close()
@@ -106,6 +112,7 @@ struct Work:
         self.tangencies.close()
         self.contacts.close()
         self.zones.close()
+        self.final_slack.close()
         self.finals.close()
         self.piece_ids.close()
         self.piece_starts.close()
@@ -119,14 +126,22 @@ struct Work:
     ## The merged vertex at `p`, merging within `slack` too (a tolerant
     ## edge's or vertex's precision: Parasolid's tolerant modeling).
     ## Two points are one vertex when they are nearer than their zones
-    ## together (SMLib's rule): each zone five tolerances, or a tolerant
-    ## entity's precision; the vertex's zone grows to the larger.
+    ## together: each zone five tolerances, or a tolerant entity's
+    ## precision; the vertex's zone grows to the larger. Of the vertices in
+    ## reach the nearest is the one (the first of equals), not the first
+    ## found.
     func vertex_within(p: Vector3, slack: f64) -> i64!:
         let zone = math.max(self.tol * 5.0, slack)
+        var best: i64 = -1
+        var best_distance = 0.0
         for at in 0..<self.vertices.count:
-            if self.vertices.items[at].subtract(p).length() <= zone + self.zones.items[at]:
-                self.zones.items[at] = math.max(self.zones.items[at], zone)
-                return (i64)at
+            let d = self.vertices.items[at].subtract(p).length()
+            if d <= zone + self.zones.items[at] and (best < 0 or d < best_distance):
+                best = (i64)at
+                best_distance = d
+        if best >= 0:
+            self.zones.items[(usize)best] = math.max(self.zones.items[(usize)best], zone)
+            return best
         try self.vertices.push(p)
         try self.zones.push(zone)
         return (i64)self.vertices.count - 1
@@ -155,23 +170,28 @@ struct Work:
     func edge_tol(e: usize) -> f64:
         return math.max(self.tol, self.w.edge_slack_of(e) * 0.1)
 
-    ## The final edge for `edge` (vertices merged): an existing one with the
-    ## same ends and middle, or a new one; and whether `edge` runs its way.
-    func final_edge(edge: ShapeEdge) -> (i64, bool)!:
+    ## The final edge for `edge` (vertices merged; `slack` how far it may lie
+    ## from where it is, a tolerant edge's precision): an existing one with
+    ## the same ends and middle, or a new one; and whether `edge` runs its
+    ## way.
+    func final_edge(edge: ShapeEdge, slack: f64) -> (i64, bool)!:
         let middle = try self.w.at(edge.carrier, (edge.t0 + edge.t1) * 0.5)
         for at in 0..<self.finals.count:
             let other = self.finals.items[at]
             let same_ends = (other.start == edge.start and other.end == edge.end) or (other.start == edge.end and other.end == edge.start)
             if not same_ends: continue
-            if (try self.w.at(other.carrier, (other.t0 + other.t1) * 0.5)).subtract(middle).length() > self.tol * 100.0: continue
+            let reach = math.max(self.tol * 100.0, math.max(slack, self.final_slack.items[at]))
+            if (try self.w.at(other.carrier, (other.t0 + other.t1) * 0.5)).subtract(middle).length() > reach: continue
             var forward = other.start == edge.start
             if edge.start == edge.end:
                 # A closed edge: its way by the tangent in its middle.
                 let mine = (try self.w.tangent(edge.carrier, (edge.t0 + edge.t1) * 0.5)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0)
                 let theirs = (try self.w.tangent(other.carrier, (other.t0 + other.t1) * 0.5)).multiply_scalar(1.0 if other.t1 > other.t0 else -1.0)
                 forward = mine.dot(theirs) > 0.0
+            self.final_slack.items[at] = math.max(self.final_slack.items[at], slack)
             return ((i64)at, forward)
         try self.finals.push(edge)
+        try self.final_slack.push(slack)
         return ((i64)self.finals.count - 1, true)
 
     func is_a(f: usize) -> bool:
@@ -318,6 +338,7 @@ pub func combine(a: const CadModel*, b: const CadModel*, op: i64) -> interop.Ref
     # are inputs again, and their tolerance must not grow from one to the
     # next.
     work.tol = math.max(work.size * 1e-7, 1e-10)
+    try coincide(&work)
     for at in 0..<work.w.points.count: try work.point_vertex.push(try work.vertex_within(work.w.points.items[at], work.w.point_slack_of(at)))
     try intersect_faces(&work)
     try vertex_cuts(&work)
@@ -333,10 +354,17 @@ func intersect_faces(work: Work*) -> !:
     defer lows.close()
     var highs = Growing[Vector3]()
     defer highs.close()
+    # Each face's widest edge slack: a tolerant face (put on another's
+    # surface by coincide.lucb) is met as far off as it may lie.
+    var slacks = Growing[f64]()
+    defer slacks.close()
     for f in 0..<w.faces.count:
         let (l, h) = try face_box(w, f)
         try lows.push(l)
         try highs.push(h)
+        var most = 0.0
+        for use in w.face_uses(f): most = math.max(most, w.edge_slack_of(edge_index(use)))
+        try slacks.push(most)
     var curves = Growing[Carrier]()
     defer curves.close()
     var hits = Growing[Hit]()
@@ -349,7 +377,7 @@ func intersect_faces(work: Work*) -> !:
     for fa in 0..<work.faces_a:
         if work.chosen.count > 0 and not work.chosen.items[fa]: continue
         for fb in work.faces_a..<w.faces.count:
-            if not boxes_meet((lows.items[fa], highs.items[fa]), (lows.items[fb], highs.items[fb]), work.tol * 10.0): continue
+            if not boxes_meet((lows.items[fa], highs.items[fa]), (lows.items[fb], highs.items[fb]), math.max(work.tol * 10.0, math.max(slacks.items[fa], slacks.items[fb]))): continue
             let sa = w.faces.items[fa]
             let sb = w.faces.items[fb]
             curves.clear()
@@ -440,7 +468,7 @@ func intersect_faces(work: Work*) -> !:
                         # other face is: elsewhere no section ends there,
                         # and the cut would leave a stray vertex on the edge.
                         for at in before..<hits.count:
-                            if try lookup_contains(&lookup, w, other, try w.at(c, hits.items[at].t), work.tol) != outside: try work.cuts.push(Cut(e, hits.items[at].s))
+                            if try lookup_contains(&lookup, w, other, try w.at(c, hits.items[at].t), work.tol) != outside: try work.cuts.push(Cut(e, hits.items[at].s, w.edge_slack_of(e)))
                 for hit in hits.view(): try ts.push(hit.t)
                 for p in crossing_points.view():
                     let t = try nearest_on(w, c, p, lowest, highest)
@@ -606,6 +634,10 @@ func hugs_boundary(work: Work*, lookup: Lookup*, c: i64, t0: f64, t1: f64, f: us
 ## angle (normals nearly parallel too) fall on either side.
 func note_tangency(work: Work*, fa: usize, fb: usize, c: i64, t0: f64, t1: f64) -> !:
     let w = &work.w
+    # Two planes meet along a line only by crossing: lying together within
+    # P they were made one before (coincide.lucb), so a shallow angle
+    # between them is a crossing, whatever their normals say.
+    if w.surfaces.items[(usize)w.faces.items[fa].surface].kind == surface_plane and w.surfaces.items[(usize)w.faces.items[fb].surface].kind == surface_plane: return
     var agree: f64 = 0.0
     for fraction in [0.25, 0.5, 0.75]:
         let t = t0 + (t1 - t0) * fraction
@@ -650,8 +682,9 @@ func imprint(work: Work*, onto: usize, source: usize) -> !:
             hits.clear()
             try crossings(w, edge.carrier, edge.t0, edge.t1, o, work.size, math.max(work.edge_tol(e), work.edge_tol(o)), &hits)
             for hit in hits.view():
-                try work.cuts.push(Cut(e, hit.t))
-                try work.cuts.push(Cut(o, hit.s))
+                let slack = math.max(w.edge_slack_of(e), w.edge_slack_of(o))
+                try work.cuts.push(Cut(e, hit.t, slack))
+                try work.cuts.push(Cut(o, hit.s, slack))
         try work.imprints.push(Imprint(onto, e))
 
 ## A vertex lying inside an edge cuts it there, so faces meeting along it
@@ -665,6 +698,8 @@ func vertex_cuts(work: Work*) -> !:
     var highs = Growing[Vector3]()
     defer highs.close()
     let pad = work.tol * 10.0
+    var widest_zone = 0.0
+    for zone in work.zones.view(): widest_zone = math.max(widest_zone, zone)
     for e in 0..<w.edges.count:
         var low = Vector3(1.0e300, 1.0e300, 1.0e300)
         var high = Vector3(-1.0e300, -1.0e300, -1.0e300)
@@ -672,8 +707,9 @@ func vertex_cuts(work: Work*) -> !:
             let p = try w.edge_at(e, (f64)step / 16.0)
             low = Vector3(math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z))
             high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
-        # Arcs bulge between samples: a sixteenth of their reach more.
-        let bulge = high.subtract(low).length() * 0.02 + math.max(pad, work.edge_tol(e) * 10.0)
+        # Arcs bulge between samples: a sixteenth of their reach more; and a
+        # tolerant vertex reaches as far as its zone.
+        let bulge = high.subtract(low).length() * 0.02 + math.max(math.max(pad, work.edge_tol(e) * 10.0), widest_zone)
         try lows.push(low.subtract(Vector3(bulge, bulge, bulge)))
         try highs.push(high.add(Vector3(bulge, bulge, bulge)))
     # The ends of new edges, and every vertex of both solids (one solid's
@@ -690,7 +726,7 @@ func vertex_cuts(work: Work*) -> !:
     # Where edges are cut too: an edge lying along a cut one is cut alike.
     for at in 0..<work.cuts.count:
         let cut = work.cuts.items[at]
-        try candidates.push(try work.vertex(try w.at(w.edges.items[cut.edge].carrier, cut.t)))
+        try candidates.push(try work.vertex_within(try w.at(w.edges.items[cut.edge].carrier, cut.t), cut.slack))
         try done.push(false)
     for v in candidates.view():
         if done.items[(usize)v]: continue
@@ -704,39 +740,54 @@ func vertex_cuts(work: Work*) -> !:
             # An edge's own ends cut nothing.
             if work.point_vertex.items[(usize)edge.start] == v or work.point_vertex.items[(usize)edge.end] == v: continue
             let t = try nearest_on(w, edge.carrier, p, edge.t0, edge.t1)
-            if (try w.at(edge.carrier, t)).subtract(p).length() > math.max(pad, work.edge_tol(e) * 10.0): continue
-            try work.cuts.push(Cut(e, t))
+            # Within the edge's reach, or the vertex's own (a tolerant one).
+            if (try w.at(edge.carrier, t)).subtract(p).length() > math.max(math.max(pad, work.edge_tol(e) * 10.0), work.zones.items[(usize)v]): continue
+            try work.cuts.push(Cut(e, t, work.zones.items[(usize)v]))
 
 ## Step 3: every original edge cut where it was crossed, into final edges.
 func cut_edges(work: Work*) -> !:
     let w = &work.w
     var ts = Growing[f64]()
     defer ts.close()
+    var slacks = Growing[f64]()
+    defer slacks.close()
     try work.piece_starts.push(0)
     for e in 0..<w.edges.count:
         let edge = w.edges.items[e]
         ts.clear()
+        slacks.clear()
         let span = edge.t1 - edge.t0
         for cut in work.cuts.view():
             if cut.edge != e: continue
             let f = (cut.t - edge.t0) / span
-            if f > 1e-9 and f < 1.0 - 1e-9: try ts.push(f)
-        sort.sort(ts.items[..<ts.count])
+            if not (f > 1e-9 and f < 1.0 - 1e-9): continue
+            # In order along the edge, ties the widest slack first (one
+            # order, whatever order the cuts came in; the tolerant cut makes
+            # the vertex the others then merge into).
+            var at = ts.count
+            try ts.push(f)
+            try slacks.push(cut.slack)
+            while at > 0 and (ts.items[at - 1] > f or (ts.items[at - 1] == f and slacks.items[at - 1] < cut.slack)):
+                ts.items[at] = ts.items[at - 1]
+                slacks.items[at] = slacks.items[at - 1]
+                at -= 1
+            ts.items[at] = f
+            slacks.items[at] = cut.slack
         var previous_fraction = 0.0
         var previous_vertex = work.point_vertex.items[(usize)edge.start]
         let last_vertex = work.point_vertex.items[(usize)edge.end]
         for at in 0..<ts.count + 1:
             let fraction = ts.items[at] if at < ts.count else 1.0
-            let vertex = (try work.vertex_within(try w.edge_at(e, fraction), w.edge_slack_of(e))) if at < ts.count else last_vertex
+            let vertex = (try work.vertex_within(try w.edge_at(e, fraction), math.max(w.edge_slack_of(e), slacks.items[at]))) if at < ts.count else last_vertex
             # Cuts that merge into a vertex already there cut nothing.
             if at < ts.count and (vertex == previous_vertex or vertex == last_vertex): continue
             if vertex == previous_vertex and fraction - previous_fraction < 1e-9: continue
             let piece = ShapeEdge(edge.carrier, edge.t0 + span * previous_fraction, edge.t0 + span * fraction, previous_vertex, vertex)
-            let (id, forward) = try work.final_edge(piece)
+            let (id, forward) = try work.final_edge(piece, w.edge_slack_of(e))
             try work.piece_ids.push((id + 1) * (1 if forward else -1))
             previous_fraction = fraction
             previous_vertex = vertex
         try work.piece_starts.push(work.piece_ids.count)
     for section in work.sections.view():
-        let (id, forward) = try work.final_edge(section.edge)
+        let (id, forward) = try work.final_edge(section.edge, section.precision)
         try work.section_ids.push((id + 1) * (1 if forward else -1))

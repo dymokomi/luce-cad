@@ -44,18 +44,26 @@ func shape_of(a: interop.Reference[CadModel], b: interop.Reference[CadModel], op
     return Shape(63, try CadModeling.lump_count(result), result.value().face_count())
 
 ## The configurations: 0 flush faces offset sideways, 1 gap between end
-## faces, 2 faces tilted by an angle (δ in radians).
+## faces, 2 faces tilted by an angle (δ in radians), 3 two cylinders on one
+## axis, one δ wider, overlapping by half.
 func config_name(config: i64, variant: i64) -> str:
     if config == 0:
         if variant == 0: return "flush y"
         if variant == 1: return "flush diagonal"
         return "flush turned"
     if config == 1: return "gap"
-    return "tilt"
+    if config == 2: return "tilt"
+    return "coaxial"
 
 ## The two boxes of a configuration at size `size` and offset `delta`.
 func boxes(config: i64, variant: i64, size: f64, delta: f64) -> (interop.Reference[CadModel], interop.Reference[CadModel])!:
     let turn = Vector3(0.3, 0.5, 0.7) if variant == 2 else Vector3()
+    if config == 3:
+        let a = try CadSolids.cylinder(size * 0.25, size)
+        errdefer a.release()
+        let b0 = try CadSolids.cylinder(size * 0.25 + delta, size)
+        defer b0.release()
+        return (a, try b0.value().transformed(Vector3(0.0, size * 0.5, 0.0), Vector3(), Vector3(1.0, 1.0, 1.0)))
     let a0 = try CadSolids.box(size, size, size)
     defer a0.release()
     let b0 = try CadSolids.box(size, size, size)
@@ -77,10 +85,12 @@ func boxes(config: i64, variant: i64, size: f64, delta: f64) -> (interop.Referen
     errdefer a.release()
     return (a, try b1.value().transformed(Vector3(), turn, one))
 
-## Whether offset `delta` should join the faces at `size`: within P (for a
-## tilt, the farthest the tilted face strays over the overlap, δ · size / 2).
-func ideal_merge(config: i64, size: f64, delta: f64) -> bool:
+## Whether offset `delta` should join the faces at `size`: each face within
+## P of the other (offset along a diagonal, each face δ / √2 off; for a tilt,
+## the farthest the tilted face strays, δ · size / 2).
+func ideal_merge(config: i64, variant: i64, size: f64, delta: f64) -> bool:
     if config == 2: return delta * size * 0.5 <= positional
+    if config == 0 and variant == 1: return delta * math.sqrt(0.5) <= positional
     return delta <= positional
 
 pub func bands(tally: BandTally*) -> !:
@@ -88,7 +98,7 @@ pub func bands(tally: BandTally*) -> !:
     let gaps: f64[13] = [-0.1, -0.01, -0.005, 0.0, 0.001, 0.005, 0.009, 0.0099, 0.01, 0.0101, 0.011, 0.02, 0.1]
     let angles: f64[10] = [0.0, 1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
     let sizes: f64[4] = [1.0, 10.0, 100.0, 1000.0]
-    for config in 0..<3:
+    for config in 0..<4:
         let variants = 3 if config == 0 else 1
         for variant in 0..<variants:
             for size in sizes:
@@ -98,6 +108,7 @@ pub func bands(tally: BandTally*) -> !:
                     var values = offsets[..<10]
                     if config == 1: values = gaps[..<13]
                     if config == 2: values = angles[..<10]
+                    if config == 3: values = offsets[..<10]
                     let (ma, mb) = try boxes(config, variant, size, 0.0)
                     let merged = try shape_of(ma, mb, op)
                     ma.release()
@@ -115,12 +126,16 @@ pub func bands(tally: BandTally*) -> !:
                         a.release()
                         b.release()
                         var code = s.code
+                        ideal[at] = 77 if ideal_merge(config, variant, size, values[at]) else 68
+                        let ambiguous = merged.code == 63 and apart.code == 63 and merged.lumps == apart.lumps and merged.faces == apart.faces
                         if code == 63:
-                            if s.lumps == merged.lumps and s.faces == merged.faces: code = 77
+                            # Where both outcomes look alike (a wider tool
+                            # cutting all of a narrower one) either is right.
+                            if ambiguous and s.lumps == merged.lumps and s.faces == merged.faces: code = ideal[at]
+                            elif s.lumps == merged.lumps and s.faces == merged.faces: code = 77
                             elif s.lumps == apart.lumps and s.faces == apart.faces: code = 68
                             else: code = 88
                         row[at] = code
-                        ideal[at] = 77 if ideal_merge(config, size, values[at]) else 68
                         tally.cells += 1
                         if code != ideal[at]: off += 1
                         if code == 88: tally.mixed += 1

@@ -1,0 +1,184 @@
+## Tolerant coincidence (docs/research/KERNEL-ROBUSTNESS.md, 4.4): before a
+## boolean meets its faces, what lies together within the project's
+## positional tolerance P is made one, once, as a fact every later step
+## reads, the way Parasolid's tolerant modelling does:
+##
+## - A face of the second solid whose surface is the first's within P (the
+##   same kind, the same placement and size to within P, and its whole
+##   boundary within P of it) is put on that surface. It is coincident with
+##   the first's face from then on, exactly, and its edges and vertices
+##   lying off it become tolerant by P (or by how far they lie, where two
+##   faces moved at a corner put it further).
+## - A vertex of the second solid within P of one of the first's is
+##   tolerant by P, so the two merge.
+##
+## Beyond P nothing is changed: the faces cross, touch or stay apart, and
+## the rest of the boolean decides at its own fine tolerance. So two faces
+## 0.005 mm apart are one face at P = 0.01 mm, at every model size, and two
+## faces 0.011 mm apart are two.
+
+## Samples of each edge the boundary tests take.
+let edge_samples: usize = 9
+
+## Put the second solid's faces and vertices lying on the first's within P
+## onto them (see above).
+func coincide(work: Work*) -> !:
+    let w = &work.w
+    # Within P, to the resolution: a distance of exactly P computed with
+    # rounding is within.
+    let p = w.tolerances.positional + w.tolerances.resolution()
+    # The faces' boxes, once.
+    var lows = Growing[Vector3]()
+    defer lows.close()
+    var highs = Growing[Vector3]()
+    defer highs.close()
+    for f in 0..<w.faces.count:
+        let (l, h) = try face_box(w, f)
+        try lows.push(l)
+        try highs.push(h)
+    var moved = Growing[bool]()
+    defer moved.close()
+    try moved.fill(w.faces.count, false)
+    for fb in work.faces_a..<w.faces.count:
+        let sb = w.surfaces.items[(usize)w.faces.items[fb].surface]
+        if sb.kind == surface_spline: continue
+        for fa in 0..<work.faces_a:
+            let sa_index = w.faces.items[fa].surface
+            let sa = w.surfaces.items[(usize)sa_index]
+            if sa.kind != sb.kind or sa_index == w.faces.items[fb].surface: continue
+            if not boxes_meet((lows.items[fa], highs.items[fa]), (lows.items[fb], highs.items[fb]), p): continue
+            if not same_placement(&sa, &sb, p, highs.items[fb].subtract(lows.items[fb]).length()): continue
+            if not try boundary_on(w, fb, &sa, p): continue
+            try put_on(w, fb, sa_index)
+            moved.items[fb] = true
+            break
+    try settle_moved(work, moved.view(), p)
+    # Vertices of the second solid within P of the first's.
+    let first_points = first_point_count(work)
+    for b in first_points..<w.points.count:
+        let q = w.points.items[b]
+        for a in 0..<first_points:
+            let d = w.points.items[a].subtract(q).length()
+            if d > p or d <= work.tol * 10.0: continue
+            try slacken_point(w, b, p)
+
+## The edges and vertices of the faces put on other surfaces that lie off
+## where their faces' surfaces now meet (a point projected onto each of its
+## faces' surfaces in turn until it settles) made tolerant by P: the
+## decision that made them one was made at P, so whatever is found about
+## them later (a crossing, a cut, a merged vertex) is one within P too.
+func settle_moved(work: Work*, moved: const bool[], p: f64) -> !:
+    let w = &work.w
+    # Each edge's faces.
+    var sides = Growing[i64]()
+    defer sides.close()
+    try sides.fill(w.edges.count * 2, -1)
+    for f in 0..<w.faces.count:
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            if sides.items[e * 2] < 0: sides.items[e * 2] = (i64)f
+            elif sides.items[e * 2 + 1] < 0 and sides.items[e * 2] != (i64)f: sides.items[e * 2 + 1] = (i64)f
+    # Each point's faces (its edges' faces), when one of them moved.
+    var around = Growing[i64]()
+    defer around.close()
+    for f in 0..<w.faces.count:
+        if not moved[f]: continue
+        for use in w.face_uses(f):
+            let e = edge_index(use)
+            var faces: i64[2] = [sides.items[e * 2], sides.items[e * 2 + 1]]
+            var off = 0.0
+            for k in 0..<edge_samples:
+                let q = try w.edge_at(e, (f64)k / (f64)(edge_samples - 1))
+                off = math.max(off, (try snapped(w, q, faces[..<2])).subtract(q).length())
+            if off > work.tol * 10.0: try slacken_edge(w, e, math.max(p, off))
+    for f in 0..<w.faces.count:
+        if not moved[f]: continue
+        for use in w.face_uses(f):
+            let edge = w.edges.items[edge_index(use)]
+            for v in [edge.start, edge.end]:
+                around.clear()
+                for e in 0..<w.edges.count:
+                    let other = w.edges.items[e]
+                    if other.start != v and other.end != v: continue
+                    for side in 0..<(usize)2:
+                        let g = sides.items[e * 2 + side]
+                        if g < 0: continue
+                        var known = false
+                        for h in around.view(): known = known or h == g
+                        if not known: try around.push(g)
+                let q = w.points.items[(usize)v]
+                let off = (try snapped(w, q, around.view())).subtract(q).length()
+                if off > work.tol * 10.0: try slacken_point(w, (usize)v, math.max(p, off))
+
+## `q` projected onto each of `faces`' surfaces in turn (-1 skipped) until
+## it moves no more: where they meet nearest it.
+func snapped(w: const Shape*, q: Vector3, faces: const i64[]) -> Vector3!:
+    var at = q
+    for _ in 0..<64:
+        let before = at
+        for f in faces:
+            if f >= 0: at = try nearest_on_surface(w, (usize)f, at)
+        if at.subtract(before).length() <= w.tolerances.resolution() * 1e-3: break
+    return at
+
+## How many of the shape's points are the first solid's: those its faces'
+## edges reach (append_shape puts the second's after them).
+func first_point_count(work: const Work*) -> usize:
+    let w = &work.w
+    var most: usize = 0
+    for f in 0..<work.faces_a:
+        for use in w.face_uses(f):
+            let edge = w.edges.items[edge_index(use)]
+            if (usize)edge.start + 1 > most: most = (usize)edge.start + 1
+            if (usize)edge.end + 1 > most: most = (usize)edge.end + 1
+    return most
+
+## Whether surfaces `a` and `b` (one kind, not B-splines) may be one
+## surface to within `p` over `extent` (the face's reach): planes by their
+## normals turned over the extent (the face's boundary decides), surfaces of
+## revolution by their axes, centers and radii.
+func same_placement(a: const Surface*, b: const Surface*, p: f64, extent: f64) -> bool:
+    let tilt = a.z.cross(b.z).length()
+    # A plane: nearly parallel (boundary_on then measures the face itself;
+    # turned about its middle it strays half as far as the tilt times its
+    # reach).
+    if a.kind == surface_plane: return tilt * extent <= p * 4.0
+    if a.kind == surface_sphere:
+        return b.origin.subtract(a.origin).length() <= p and math.abs(a.radius - b.radius) <= p
+    # A cylinder, cone or torus: one axis to within p over the extent.
+    if tilt * extent > p: return false
+    let offset = b.origin.subtract(a.origin)
+    if offset.subtract(a.z.multiply_scalar(offset.dot(a.z))).length() > p: return false
+    if a.kind == surface_cylinder: return math.abs(a.radius - b.radius) <= p
+    if a.kind == surface_torus:
+        return math.abs(offset.dot(a.z)) <= p and math.abs(a.radius - b.radius) <= p and math.abs(a.angle - b.angle) <= p
+    # A cone: the same radius where each is placed, and the same slope over
+    # the extent.
+    let h = offset.dot(a.z)
+    let ra = a.radius + h * math.tan(a.angle)
+    return math.abs(ra - b.radius) <= p and math.abs(math.tan(a.angle) - math.tan(b.angle)) * extent <= p
+
+## Whether face `f`'s whole boundary lies within `p` of surface `s`.
+func boundary_on(w: const Shape*, f: usize, s: const Surface*, p: f64) -> bool!:
+    for use in w.face_uses(f):
+        let e = edge_index(use)
+        for k in 0..<edge_samples:
+            if surface_distance(s, try w.edge_at(e, (f64)k / (f64)(edge_samples - 1))) > p: return false
+    return true
+
+## Face `f` put on surface `onto`, facing as it did.
+func put_on(w: Shape*, f: usize, onto: i64) -> !:
+    let s = &w.surfaces.items[(usize)onto]
+    # Its outward normal where it is, before and after.
+    let sample = try w.edge_at(edge_index(w.face_uses(f)[0]), 0.5)
+    let before = try w.face_normal(f, sample)
+    w.faces.items[f].surface = onto
+    w.faces.items[f].sense = (try normal_at(s, sample, w.tolerance)).dot(before) > 0.0
+
+func slacken_edge(w: Shape*, e: usize, by: f64) -> !:
+    while w.edge_slack.count <= e: try w.edge_slack.push(0.0)
+    w.edge_slack.items[e] = math.max(w.edge_slack.items[e], by * 1.01)
+
+func slacken_point(w: Shape*, p: usize, by: f64) -> !:
+    while w.point_slack.count <= p: try w.point_slack.push(0.0)
+    w.point_slack.items[p] = math.max(w.point_slack.items[p], by * 1.01)

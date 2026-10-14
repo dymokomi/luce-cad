@@ -440,6 +440,30 @@ the relative tolerance, and the kernel answers X (some faces merged, some not) o
 band fails outright at 1e-6 to 1e-5 rad at every size: that is finding 1. Directions and turns
 change nothing, which is consistent with the determinism results.
 
+### 3.5 After stage 2 (tolerant coincidence)
+
+The box rows of the band now match the ideal in every one of their 372 cells. The table
+below shows a sample:
+
+```
+flush y union        1 mm: MMMMMMDDDD   ideal MMMMMMDDDD
+flush diagonal union 1 mm: MMMMMMMMDD   ideal MMMMMMMMDD   (each face δ/√2 off)
+gap union         1000 mm: MMMMMMMMMDDDD  ideal MMMMMMMMMDDDD
+tilt subtract     1000 mm: MMMMMMDDDD   ideal MMMMMMDDDD
+```
+
+Before stage 2, 169 cells were off the ideal and 22 failed. Now:
+
+- **Boxes:** 0 cells off the ideal, 0 failed.
+- **Coaxial rows (new):** cylinders one δ wider. They are right at 1 and 10 mm. At 100 mm and
+  1 m, radii just beyond P fail (12 cells). There the ring between the radii is narrower than
+  the chord error of a face's chart (circles sampled every 0.05 rad), so the piece's inside
+  point is found off the piece. Stage 3 fixes that with exact classification.
+- **Invariance:** 5 of 224 checks fail (unchanged; stage 3).
+
+The diagonal ideal changed with stage 2. Coincidence is decided per face: two faces each δ/√2
+apart are one, so the diagonal row merges while δ/√2 ≤ P.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
@@ -559,6 +583,39 @@ until each cell either has no intersection (excluded) or holds one simple branch
 Seeds come from the certified cells, ordered canonically. This removes "skip any seed within 0.8%
 of the size" and makes a missed branch impossible.
 
+### 4.4a As built (stage 2): tolerant coincidence
+
+`modeling/coincide.lucb` is the fact pass. It runs once per boolean, after both solids are in
+one shape and before any face pair is met.
+
+- **Faces.** A face of the second solid whose surface is a first-solid surface of the same kind
+  within P (axes, centers and radii within P; for planes, its whole boundary within P) is put
+  on that surface. From then on the pair is coincident exactly, and every later step (meet,
+  imprint, clip, split, classify, merge) sees one surface.
+- **Edges and vertices.** Those left off where their faces' surfaces now meet become tolerant
+  by P, or by how far they actually lie where that is further (a corner where two moved faces
+  meet). A point is projected onto each of its faces' surfaces in turn until it settles.
+- **Vertices of the second solid** within P of the first's become tolerant by P.
+
+The later steps honour that slack wherever they ask whether two things are one:
+
+- face pairs are met within it;
+- cuts carry it, so a cut that came from a tolerant edge or vertex merges its vertex that far;
+  cuts at one point are taken widest slack first;
+- final edges are one when their middles lie within it;
+- vertex cuts reach a tolerant vertex's zone;
+- a lookup's loop boxes and the classification boxes are padded by it.
+
+A vertex merges into the nearest vertex in reach, not the first one found. Two planes never
+count as tangent along a line: lying together within P they were made one before, so a
+shallow angle between them is a crossing.
+
+Not done in stage 2: the working tolerances are still a millionth of the model's size. Making
+them absolute also changed tessellation, because the mesher uses the model's tolerance for its
+own decisions: a 10 m part meshed with degenerate triangles, and a 10 µm contract failed. So
+the switch waits until meshing has its own display tolerance (stage 6). Decisions about
+identity are absolute (P); the construction slop stays relative to size until then.
+
 ### 4.5 Changing the setting on an existing project
 
 - **Re-evaluation.** The tolerances are part of every CAD node's cook key, as the units are part of
@@ -574,6 +631,15 @@ of the size" and makes a missed branch impossible.
     under P = 0.05 mm. Every operation that meets such a feature reports it on its node ("a face
     narrower than the positional tolerance") rather than producing a sliver. The viewport keeps the
     last good result, as for any failing node.
+- **Held bodies.** Edit CAD is becoming a held-state node: it keeps its bodies rather than
+  replaying a recipe, so nothing re-cooks them. luce-cad gives it one call for a changed
+  setting, `CadModeling.rechecked(body, tolerances)`. It returns the body under the new
+  tolerances and a report:
+  - tightening makes entities that no longer meet P tolerant, with their measured precision;
+  - loosening reports edges shorter than P and faces narrower than P.
+
+  The held state calls it on each held body when the project's tolerances change and shows the
+  report on the node (landing with stage 5's checker).
 - **Confirmation.** Before Apply, the dialog says that the model will be rebuilt. Afterwards, nodes
   whose topology signature changed are flagged, using the harness's signature. Undo restores the
   old setting and the old results.
@@ -697,12 +763,12 @@ of the size" and makes a missed branch impossible.
 | stage | what | size | outcome |
 |---|---|---|---|
 | 0 ✓ | Harness and fingerprint (60a9332) | done | Baseline; cross-OS determinism measured |
-| 1 | **Tolerance type and plumbing.** `CadTolerances` (P, F, T, K, derived R, size box) in luce-cad; every body-making call takes it; `BrepModel` stores and saves it; the size box is enforced. luced-3d: Network field, save and load, Project Settings rows, a cook-key part, pass-down. The working tolerances stay as they are: switching them to absolute values alone, without the predicate layer, was tried and made the tilt band worse (shallow plane crossings at 1e-7 to 1e-5 rad fail in more places), so the switch moved to stage 2. | L: 3–4 days | The setting reaches every body; results unchanged (fingerprints identical) |
-| 2 | **Predicate layer, boolean fact table, absolute tolerances.** `src/predicates/` with exact signs; `Facts` in Work; intersect, clip, split, classify, merge and boolean_result rewritten to read facts; the boolean's roughly 120 tolerance literals and multiplier chains removed; one coincidence rule for all surface kinds; `tolerance_for(size)` and the `size × 1e-7` work tolerances replaced by the project's. | XL: 1.5–2 weeks | No contradictory decisions; tilt band no longer fails; band rows ideal for booleans |
+| 1 ✓ | **Tolerance type and plumbing** (luce-cad 2256fc7, luced-3d 0b6745b). `CadTolerances` (P, F, T, K, derived R, size box) in luce-cad; every body-making call takes it; `BrepModel` stores and saves it; the size box is enforced. luced-3d: Network field, save and load, Project Settings rows, a cook-key part, pass-down. The working tolerances stay as they are: switching them to absolute values alone, without the predicate layer, was tried and made the tilt band worse (shallow plane crossings at 1e-7 to 1e-5 rad fail in more places), so the switch moved to stage 2. | L: 3–4 days | The setting reaches every body; results unchanged (fingerprints identical) |
+| 2 ✓ | **Tolerant coincidence: one decision per fact at P** (4.4a). Faces of the second solid on a first-solid surface within P are put on it, and their edges and vertices become tolerant. Every later step honours that slack. A vertex merges into the nearest in reach. Planes are never tangent. The coaxial band rows were added to the harness. | done | Box band 0 of 372 off (was 169) and 0 failed (was 22); all tests green |
 | 3 | **Classification and degeneracy.** Classification by local facts plus exact single-ray parity with Simulation of Simplicity; certified subdivision seeding for the march; fix the box/sphere-on-face case and the face-order tessellation case. | L: about 2k lines, 1 week | Invariance failures 0; band assertion becomes hard |
 | 4 | **Canonical order and representatives** (vertex merge, final edges, march start, Stitch representatives, output ordering). | M: about 800 lines, 3–4 days | Operand and face permutation give identical topology; contract item 2 asserted |
 | 5 | **Per-entity tolerances done right and the checker.** Remove `model_tolerance()`; keep B's tolerances; measured precision on import, stitch, intersection and fillet; tolerance tightening; a `check_body` (structure, geometry on topology, orientation, loops, sampled self-intersection) usable as a node and run on every result in tests. | L: about 2k lines, 1 week | Imports keep P; no model-wide widening |
-| 6 | **The rest of the kernel by directory.** Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
+| 6 | **The rest of the kernel by directory, and absolute working tolerances.** Meshing gets its own display tolerance, then `tolerance_for(size)` and the `size × 1e-7` work tolerances become the project's resolution. Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
 | 7 | **Heavy sweep tool** (`dev/robustness`): randomised rotations, scales and near-degenerate placements in the thousands, run on demand, not in `luc test`. Per the owner's priority this is after all requests and is not fuzzing. | S: 2 days | Continued coverage |
 
 Stages 1 and 2 hold most of the value. Each stage is pushed in green, gated pieces.
