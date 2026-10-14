@@ -599,6 +599,20 @@ show. These two remain open for the heavy sweep (stage 7) to argue for.
 - **Harness:** invariance 0 of 224, band 0 of 452, canonical 0 of 23;
   literals 900 to 898, ratchet 898.
 
+### 3.11 Stage 6, fourth step: per-entity tolerances
+
+- **Modeling works to R alone.** `shape_of` gives every shape the
+  project's resolution; a tolerant edge or vertex (a stitch's join, an
+  import's edge) carries its own precision as its slack, and only what is
+  asked about it uses it (the booleans' `edge_tol`, the vertex zones). The
+  widest precision anywhere no longer widens every decision in the model
+  (finding 8).
+- **Meshing works to the model's own tolerance**, no longer to the widest
+  precision anywhere; a tolerant trim is still taken through the validity
+  contract (`Surface.trim_tolerance` = max(P, the widest precision)).
+- **Harness:** invariance 0 of 224, band 0 of 452, canonical 0 of 23;
+  literals 898.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
