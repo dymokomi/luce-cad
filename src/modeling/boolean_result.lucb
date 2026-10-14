@@ -231,10 +231,12 @@ func write_result(work: Work*, pieces: const Pieces*, piece_face: const usize[],
 
 ## The kept pieces as a new B-rep: with `closed`, every edge must be used
 ## twice, once each way (a solid); without, an edge used once is an open
-## body's boundary (Trim's sheets). Its tolerance takes in `precision`
-## (how far new edges may lie off their faces); with `exact` > 0 it is that
-## instead, and each vertex lying off its edges' ends by more is tolerant
-## by as much (Stitch's merged vertices).
+## body's boundary (Trim's sheets). An edge or vertex lying off by more
+## than the project's fit tolerance F (`exact`, when > 0: Stitch's) is
+## tolerant by as much (within F, fitted geometry is where it belongs by
+## the fit's contract): a vertex off its edges' ends, an edge by its slack
+## in `edge_slack` (a joined or traced edge's), or by `precision` (how far
+## Trim's curves may lie off their face) when that is wider.
 func write_pieces(work: Work*, pieces: const Pieces*, piece_face: const usize[], piece_name: const i64[], keep: const bool[], turn: const bool[], closed: bool, precision: f64, exact: f64,
                   edge_slack: const f64[]) -> interop.Reference[CadModel]!:
     let w = &work.w
@@ -267,12 +269,9 @@ func write_pieces(work: Work*, pieces: const Pieces*, piece_face: const usize[],
         if closed and crowded == open_edges: error(invalid, non_manifold)
         if closed: error(invalid, not_closed)
         error(invalid, "the result's faces do not meet edge to edge")
-    # Merged vertices sit within ten tolerances of their curves.
-    # The result's own tolerance (what it is meshed to and its edges are
-    # checked against when written): two millionths of the work's size,
-    # or wider where its edges' precision is.
-    let tolerance = exact if exact > 0.0 else math.min(1.0, math.max(math.max(work.size * 2e-6, precision * 2.0), least_tolerance))
-    let output = try BrepModel.held(work.w.tolerances, math.max(tolerance, least_tolerance))
+    # What is where it belongs: within the fit tolerance (or Stitch's own).
+    let tolerance = exact if exact > 0.0 else work.w.tolerances.fit
+    let output = try BrepModel.held(work.w.tolerances)
     defer output.release()
     let b = output.value()
     var vertex_ids = Growing[i64]()
@@ -290,7 +289,7 @@ func write_pieces(work: Work*, pieces: const Pieces*, piece_face: const usize[],
         let a = (try w.at(edge.carrier, edge.t0)).subtract(work.placed(edge.start)).length()
         let z = (try w.at(edge.carrier, edge.t1)).subtract(work.placed(edge.end)).length()
         # A vertex's zone holds its edges' (a tolerant edge's precision).
-        let own = edge_slack[e] if e < edge_slack.length else 0.0
+        let own = math.max(edge_slack[e] if e < edge_slack.length else 0.0, precision)
         slack.items[(usize)edge.start] = math.max(slack.items[(usize)edge.start], math.max(a * 1.01, own))
         slack.items[(usize)edge.end] = math.max(slack.items[(usize)edge.end], math.max(z * 1.01, own))
     # The order everything is written in (canonical.lucb): between peers
@@ -337,7 +336,8 @@ func write_pieces(work: Work*, pieces: const Pieces*, piece_face: const usize[],
             let (points, weights, knots, degree) = w.spline_net(c.spline)
             id = try b.add_spline_edge(start, end, points, weights, degree, knots, forward)
         # A joined edge's precision: how far apart the edges it joined lay.
-        if e < edge_slack.length and edge_slack[e] > tolerance: try b.set_edge_precision(id, edge_slack[e])
+        let own = math.max(edge_slack[e] if e < edge_slack.length else 0.0, precision)
+        if own > tolerance: try b.set_edge_precision(id, own)
         edge_ids.items[e] = id
     var surface_ids = Growing[i64]()
     defer surface_ids.close()

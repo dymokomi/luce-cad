@@ -16,7 +16,7 @@ from luce_geocore.geocore import Vector3, Mesh, MeshBuilder, invalid
 from geometry import Curve, Surface, BrepFace, Samples, edge_index, surface_plane, surface_cylinder, surface_cone, surface_spline, copied, chart_parameter, basis_derivatives, surface_sphere, surface_torus, nonzero
 from luce_geocore.kernel import TableBuilder, Domain, text_attribute, append_text
 from strings import format
-from layout import curve_intervals, compact_seams, PatchSides, patch_sides, Stations, GridLayout, initialize_rows, bind, equalize_counts, cut_impossible, regularize_circles, classify, ArcMetric, close_metrics, measure_curves, space_curves, UVChain, NormalCache, check_grid_size, fill, fill_plane, refine_axis, refine_cells, balance, Settled, rail_axis, bounds, include_conics, redistribute, regularize_extrusions, cached, chain_face, accept_plane_row, accept_extruded_row, prefers_clipping, trim_rails, row_endpoint, extrusion_axis, affine_axis, refine_pitch, accept_pitch_row, FaceErrors, TrimMemo, intersection, speculate, first_above, grazes, absorb_crossing, edge_demands, snap_lines, edge_stations, axis_stations
+from layout import Density, display_rounding, curve_intervals, PatchSides, patch_sides, Stations, GridLayout, initialize_rows, bind, equalize_counts, cut_impossible, regularize_circles, classify, ArcMetric, close_metrics, measure_curves, space_curves, UVChain, NormalCache, check_grid_size, fill, fill_plane, refine_axis, refine_cells, balance, Settled, rail_axis, bounds, include_conics, redistribute, regularize_extrusions, cached, chain_face, accept_plane_row, accept_extruded_row, prefers_clipping, trim_rails, row_endpoint, extrusion_axis, affine_axis, refine_pitch, accept_pitch_row, FaceErrors, TrimMemo, intersection, speculate, first_above, grazes, absorb_crossing, edge_demands, snap_lines, edge_stations, axis_stations
 from meshing import mesh_face, model_normals, mapped_patch, face_normals
 from luce_geocore.core.growing import Growing
 from luce_std import sort
@@ -26,9 +26,9 @@ from luce_std import sort
 ## (with_notes); only running out of memory, or every face failing, fails.
 ## With `curvature`, corner attributes curvature.k1/k2 hold the principal
 ## curvatures (surface_curvature); `directions` adds curvature.d1/d2.
-pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], divisions: i64, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]? = none, selected: i64 = -1, curvature: bool = false, directions: bool = false, cache: FaceCache*? = none) -> interop.Reference[Mesh]!:
-    if divisions < 1 or divisions > 64 or faces.length == 0:
-        error(invalid, "B-rep tessellation requires faces and 1..64 divisions")
+pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], divisions: Density, tolerance: f64, edge_size: f64, progress: interop.Callback[f64, unit]? = none, selected: i64 = -1, curvature: bool = false, directions: bool = false, cache: FaceCache*? = none) -> interop.Reference[Mesh]!:
+    if divisions.steps < 1 or divisions.steps > 128 or faces.length == 0 or not math.is_finite(divisions.chord) or divisions.chord < 0.0:
+        error(invalid, "B-rep tessellation requires faces, 1..128 divisions and a chord limit not negative")
     if selected < -1 or selected >= (i64)faces.length: error(invalid, "CAD face index out of range")
     var mesh = try MeshBuilder(precise = true)
     defer mesh.close()
@@ -51,14 +51,12 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     let metrics = try measure_curves(edges)
     defer close_metrics(metrics)
     try space_curves(metrics, edges, faces, surfaces)
-    let compact = try compact_seams(faces, edges.length)
-    defer free(compact) in memory.heap
     # Each edge's interval count on its own (in parallel); a failing edge is
     # counted again here, so its error is the serial one.
-    var counting = EdgeCounts(edges, metrics, compact, counts, divisions, tolerance, edge_size, 0)
+    var counting = EdgeCounts(edges, metrics, counts, divisions, tolerance, edge_size, 0)
     try parallel.for_each_range(edges.length, 64, (void*)&counting, count_edges)
     if counting.failed.load(.acquire) != 0:
-        for index in 0..<edges.length: counts[index] = try edge_count(edges[index], &metrics[index], compact[index], divisions, tolerance, edge_size)
+        for index in 0..<edges.length: counts[index] = try edge_count(edges[index], &metrics[index], divisions, tolerance, edge_size)
     # Curved faces raise their edges' counts to their interior targets
     # before the samples are shared, so no face's interior refinement has
     # to chase a boundary coarser than it may be.
@@ -66,7 +64,7 @@ pub func tessellate(vertices: const Vector3[], edges: const Curve[], surfaces: c
     let sides = try new PatchSides[faces.length] --- in memory.heap
     defer free(sides) in memory.heap
     for at in 0..<faces.length:
-        sides[at] = patch_sides(faces[at], surfaces[(usize)faces[at].surface], edges, tolerance) catch failure:
+        sides[at] = patch_sides(faces[at], edges) catch failure:
             if failure.code != invalid: error(failure.code, failure.message)
             recover PatchSides()
     let seams = try classify(edges, surfaces, faces, plans, tolerance)
@@ -275,9 +273,8 @@ func with_curvature(shaded: interop.Reference[Mesh], mesh: MeshBuilder*, origina
 struct EdgeCounts:
     let edges: const Curve[]
     let metrics: ArcMetric[]
-    let compact: const bool[]
     let counts: usize[]
-    let divisions: i64
+    let divisions: Density
     let tolerance: f64
     let edge_size: f64
     var failed: @u32
@@ -285,14 +282,14 @@ struct EdgeCounts:
 func count_edges(context: void*, first: usize, end: usize, worker: usize):
     let work = (EdgeCounts*)context
     for index in first..<end:
-        work.counts[index] = edge_count(work.edges[index], &work.metrics[index], work.compact[index], work.divisions, work.tolerance, work.edge_size) catch failure:
+        work.counts[index] = edge_count(work.edges[index], &work.metrics[index], work.divisions, work.tolerance, work.edge_size) catch failure:
             _ = failure
             work.failed.store(1, .relaxed)
             return
 
 ## An edge's interval count: its curvature's, raised to the target edge size.
-func edge_count(edge: Curve, metric: ArcMetric*, compact: bool, divisions: i64, tolerance: f64, edge_size: f64) -> usize!:
-    var count = try curve_intervals(edge, divisions, tolerance, metric, compact)
+func edge_count(edge: Curve, metric: ArcMetric*, divisions: Density, tolerance: f64, edge_size: f64) -> usize!:
+    var count = try curve_intervals(edge, divisions, tolerance, metric)
     if edge_size > 0.0:
         var length: f64 = 0.0
         var previous = try edge.at(0.0)

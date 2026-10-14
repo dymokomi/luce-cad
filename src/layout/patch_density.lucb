@@ -2,9 +2,9 @@
 ## A curved interior with straight trims must not collapse to one planar quad.
 
 ## Raise opposite edge counts from sampled interior curvature, never lower them.
-pub func patch_density(face: BrepFace, surface: Surface, edges: const Curve[], counts: usize[], metrics: const ArcMetric[], divisions: i64, tolerance: f64) -> !:
+pub func patch_density(face: BrepFace, surface: Surface, edges: const Curve[], counts: usize[], metrics: const ArcMetric[], divisions: Density, tolerance: f64) -> !:
     if surface.kind != surface_spline: return
-    let sides = try patch_sides(face, surface, edges, tolerance)
+    let sides = try patch_sides(face, edges)
     if not sides.valid: return
     let boundary = try new Vector3[36] --- in memory.heap
     defer free(boundary) in memory.heap
@@ -14,38 +14,69 @@ pub func patch_density(face: BrepFace, surface: Surface, edges: const Curve[], c
             let t = (f64)at / 8.0
             seed = try chart_parameter(surface, try side_position(face, sides, side, t, edges, counts, metrics), seed, tolerance)
             boundary[side * 9 + at] = seed
-    let cosine = math.cos(0.75 * 2.0 * math.pi / (4.0 * (f64)divisions))
+    # An interval may turn the step angle (a quarter turn over the steps):
+    # each pair of its quarters by at most three quarters of it.
+    let step = math.pi * 0.5 / (f64)divisions.steps
+    let chord = math.max(tolerance, divisions.within(flat_sag))
+    let most = (usize)(divisions.steps * 4)
+    var counts_of: usize[2] = [1, 1]
     for axis in 0..<(usize)2:
         var count: usize = 1
-        while count < (usize)(divisions * 4):
-            var accepted = true
+        while count < most:
+            # How many times finer the worst interval must be: its turn and
+            # its sag per unit length (an arc's turn) fall as the interval
+            # does, its sag against the chord limit as its square.
+            var worst = 0.0
             for cross in 0..<(usize)5:
                 let other = ((f64)cross + 0.5) / 5.0
-                let start = try sample_cross(surface, boundary, 0.0, other, axis)
-                let end = try sample_cross(surface, boundary, 1.0, other, axis)
-                let chord = math.max(tolerance, end.subtract(start).length() / ((f64)divisions * (f64)divisions * 16.0))
                 for interval in 0..<count:
                     var p = [Vector3(), Vector3(), Vector3(), Vector3(), Vector3()]
                     for sample in 0..<(usize)5:
                         p[sample] = try sample_cross(surface, boundary, ((f64)interval + (f64)sample / 4.0) / (f64)count, other, axis)
                     let span = p[4].subtract(p[0])
+                    var along = 0.0
+                    for sample in 0..<(usize)4: along += p[sample + 1].subtract(p[sample]).length()
                     var deflection: f64 = 0.0
                     for sample in 1..<(usize)4:
                         let t = math.clamp(p[sample].subtract(p[0]).dot(span) / span.dot(span), 0.0, 1.0) if span.dot(span) > 1e-30 else 0.0
                         deflection = math.max(deflection, p[sample].subtract(p[0].add(span.multiply_scalar(t))).length())
-                    # Or within an arc's sag turning as a cylinder's sampling
-                    # does (turn_sag): a small patch is no finer than a
-                    # cylinder of its curvature.
-                    if deflection > math.max(chord, span.length() * turn_sag(divisions)): accepted = false
+                    # Within an arc's sag turning the step (turn_sag) or the
+                    # chord limit, whichever allows more.
+                    let turning = along * turn_sag(divisions)
+                    if deflection > math.max(chord, turning): worst = math.max(worst, math.min(deflection / turning, math.sqrt(deflection / chord)))
                     if deflection > tolerance:
                         for a in 0..<(usize)4:
                             for b in a + 1..<(usize)4:
                                 let da = p[a + 1].subtract(p[a])
                                 let db = p[b + 1].subtract(p[b])
-                                if da.dot(db) < cosine * da.length() * db.length(): accepted = false
-                if not accepted: break
-            if accepted: break
-            count = (usize)math.min((f64)(count * 2), (f64)(divisions * 4))
+                                let turn = math.acos(math.clamp(da.dot(db) / (da.length() * db.length()), -1.0, 1.0))
+                                if turn > step * 0.75: worst = math.max(worst, turn / (step * 0.75))
+            if worst <= 1.0: break
+            # An even count, so a symmetric patch's crest (a dome's top, a
+            # fillet's middle) is a sample.
+            let needed = math.max((f64)(count + 1), math.ceil((f64)count * worst))
+            count = (usize)math.min((f64)most, math.ceil(needed * 0.5) * 2.0)
+        counts_of[axis] = count
+    # Along a straight (or barely turning) direction the angle asks for no
+    # rows: as many as keep the cells no more than row_stretch times
+    # longer than the other direction's steps.
+    var lengths: f64[2] = [0.0, 0.0]
+    for axis in 0..<(usize)2:
+        for cross in 0..<(usize)5:
+            let other = ((f64)cross + 0.5) / 5.0
+            var previous = try sample_cross(surface, boundary, 0.0, other, axis)
+            var length = 0.0
+            for at in 1..<(usize)17:
+                let p = try sample_cross(surface, boundary, (f64)at / 16.0, other, axis)
+                length += p.subtract(previous).length()
+                previous = p
+            lengths[axis] = math.max(lengths[axis], length)
+    for axis in 0..<(usize)2:
+        # The steps across as the sides already have them, if finer.
+        let across = math.max((f64)counts_of[1 - axis], math.max((f64)side_count(face, sides, 1 - axis, counts), (f64)side_count(face, sides, 3 - axis, counts)))
+        let spacing = lengths[1 - axis] / across
+        var count = counts_of[axis]
+        if spacing > 0.0: count = (usize)math.min((f64)most, math.max((f64)count, math.ceil(lengths[axis] / (spacing * row_stretch) - 1e-9)))
         for side in [axis, axis + 2]:
             raise_side(face, sides, side, counts, metrics, count)
 

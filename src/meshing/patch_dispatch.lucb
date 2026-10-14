@@ -2,13 +2,243 @@
 
 ## A face's polygons, or its failure: every face either meshes or says
 ## why not (the tessellator names it), none is left out silently.
-pub func mesh_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+pub func mesh_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, divisions: Density, tolerance: f64, edge_size: f64) -> !:
     let first = mesh.nf
+    let first_corner = mesh.nc
     try dispatch_face(mesh, face, surface, edges, full_samples, plan, divisions, tolerance, edge_size)
     if mesh.nf == first: error(invalid, "no mesher made a polygon of it")
+    try straighten(mesh, first, first_corner)
+
+## The face's polygons (from `first`, corners from `first_corner`) again,
+## as they are, each one with a straight corner (a corner off the line
+## through its neighbors by no more than the single-precision display can
+## show: a side carrying a sample another cell's row ends at) shown by ear
+## clipping, whose ears never span a straight corner: its own display
+## triangulation could pass through it, a triangle of no area once the
+## mesh is single precision. The others keep theirs.
+func straighten(mesh: MeshBuilder*, first: usize, first_corner: usize) -> !:
+    var any = false
+    var corner = first_corner
+    for f in first..<mesh.nf:
+        let n = (usize)mesh.sizes[f]
+        if n >= 4 and straight_at(mesh, corner, n) >= 0: any = true
+        corner += n
+    if not any: return
+    let faces = mesh.nf - first
+    let sizes = try new i64[faces] --- in memory.heap
+    defer free(sizes) in memory.heap
+    let corners = try new i64[mesh.nc - first_corner] --- in memory.heap
+    defer free(corners) in memory.heap
+    let triangles = try new i64[(mesh.nc - first_corner) * 3] --- in memory.heap
+    defer free(triangles) in memory.heap
+    let parents = try new i64[faces] --- in memory.heap
+    defer free(parents) in memory.heap
+    let has_display = mesh.display.length > 0
+    var display_at: usize = 0
+    corner = first_corner
+    for f in first..<mesh.nf:
+        let n = (usize)mesh.sizes[f]
+        sizes[f - first] = (i64)n
+        parents[f - first] = mesh.face_parents[f]
+        for k in 0..<n: corners[corner - first_corner + k] = mesh.corners[corner + k]
+        # Its display triangles, as indices into its own corners (-1: none).
+        let slot = (corner - 2 * f) * 3
+        for k in 0..<(n - 2) * 3:
+            let value = mesh.display[slot + k] if has_display and slot + k < mesh.display.length else -1
+            triangles[display_at + k] = value - (i64)corner if value >= 0 else -1
+        display_at += (n - 2) * 3
+        corner += n
+    mesh.nf = first
+    mesh.nc = first_corner
+    corner = 0
+    display_at = 0
+    var scratch = Growing[i64]()
+    defer scratch.close()
+    for f in 0..<faces:
+        let n = (usize)sizes[f]
+        let ids = corners[corner..<corner + n]
+        let straight = straight_at_ids(mesh, ids) if n >= 4 else -1
+        try mesh.face((i64)n, parents[f])
+        for id in ids: try mesh.corner(id)
+        var shown = false
+        if straight >= 0:
+            shown = true
+            straight_display(mesh, ids, &scratch) catch failure:
+                if failure.code != invalid: error(failure.code, failure.message)
+                shown = false
+                recover ()
+            if shown: try mesh.set_last_display(scratch.view())
+        if not shown and n >= 4 and triangles[display_at] >= 0:
+            scratch.clear()
+            for k in 0..<(n - 2) * 3: try scratch.push(triangles[display_at + k])
+            try mesh.set_last_display(scratch.view())
+        corner += n
+        display_at += (n - 2) * 3
+
+## The first straight corner of the polygon at `start` (`n` corners), or -1.
+func straight_at(mesh: const MeshBuilder*, start: usize, n: usize) -> i64:
+    return straight_at_ids(mesh, mesh.corners[start..<start + n])
+
+## A flat polygon of more than four corners counts as straight at its
+## first: any three of its corners may lie on one line (a side folding back
+## past a sample), and the ear clipping that shows it never spans them. A
+## curved one keeps its own triangulation unless a corner is straight as
+## the polygon faces.
+func straight_at_ids(mesh: const MeshBuilder*, ids: const i64[]) -> i64:
+    let n = ids.length
+    if n > 4 and flat(mesh, ids): return 0
+    var normal = Vector3()
+    for at in 0..<n: normal = normal.add(mesh.points[(usize)ids[at]].cross(mesh.points[(usize)ids[(at + 1) % n]]))
+    let facing = normal.multiply_scalar(1.0 / math.max(normal.length(), nonzero))
+    for at in 0..<n:
+        let a = mesh.points[(usize)ids[(at + n - 1) % n]]
+        let b = mesh.points[(usize)ids[at]]
+        let c = mesh.points[(usize)ids[(at + 1) % n]]
+        let ac = c.subtract(a)
+        # Off the line through its neighbors, as the polygon faces, by no
+        # more than the display's single-precision rounding: a triangle
+        # through it could show flat, on edge or turned over.
+        let off = math.abs(b.subtract(a).cross(ac).dot(facing)) / math.max(ac.length(), nonzero)
+        if off <= display_rounding(b): return (i64)at
+    return -1
+
+## Whether polygon `ids` lies in one plane, to the display's rounding.
+func flat(mesh: const MeshBuilder*, ids: const i64[]) -> bool:
+    let n = ids.length
+    var normal = Vector3()
+    for at in 0..<n: normal = normal.add(mesh.points[(usize)ids[at]].cross(mesh.points[(usize)ids[(at + 1) % n]]))
+    let length = normal.length()
+    if not (length > 0.0): return false
+    let axis = normal.multiply_scalar(1.0 / length)
+    let origin = mesh.points[(usize)ids[0]]
+    for id in ids:
+        let p = mesh.points[(usize)id]
+        if math.abs(p.subtract(origin).dot(axis)) > display_rounding(p): return false
+    return true
+
+## Display triangles of polygon `ids` (indices into its corners): ear
+## clipping in its own plane. An ear is taken when each of its corners lies
+## farther from the opposite side than the single-precision display can
+## blur (display_rounding) and no other corner lies in or on it; when none
+## is that thick, the thickest unblocked one (a polygon only thin ears can
+## cover: the least thin is shown). An error when no ear is left at all.
+func straight_display(mesh: const MeshBuilder*, ids: const i64[], out: Growing[i64]*) -> !:
+    let n = ids.length
+    var normal = Vector3()
+    for at in 0..<n: normal = normal.add(mesh.points[(usize)ids[at]].cross(mesh.points[(usize)ids[(at + 1) % n]]))
+    out.clear()
+    # A convex polygon (every corner turning its way, or straight): the fan
+    # from the corner whose fan triangles are thickest, when the display
+    # shows them all.
+    var convex = true
+    for at in 0..<n:
+        let a = mesh.points[(usize)ids[(at + n - 1) % n]]
+        let b = mesh.points[(usize)ids[at]]
+        let c = mesh.points[(usize)ids[(at + 1) % n]]
+        if b.subtract(a).cross(c.subtract(b)).dot(normal) < 0.0: convex = false
+    if convex:
+        var apex = n
+        var best = 0.0
+        for candidate in 0..<n:
+            var least = 1.0e300
+            for k in 1..<n - 1:
+                least = math.min(least, ear(mesh, ids, candidate, (candidate + k) % n, (candidate + k + 1) % n, normal))
+                if least <= best: break
+            if least > best:
+                apex = candidate
+                best = least
+        if apex < n and best >= 1.0:
+            for k in 1..<n - 1:
+                try out.push((i64)apex)
+                try out.push((i64)((apex + k) % n))
+                try out.push((i64)((apex + k + 1) % n))
+            return
+    var left = Growing[usize]()
+    defer left.close()
+    for at in 0..<n: try left.push(at)
+    var scan: usize = 0
+    while left.count > 3:
+        # Of the unblocked ears the display shows, the best shaped (least
+        # aspect); when none shows, the thickest.
+        var chosen = left.count
+        var best = 0.0
+        var shape = 0.0
+        for tries in 0..<left.count:
+            let k = (scan + tries) % left.count
+            let ia = left.items[(k + left.count - 1) % left.count]
+            let ib = left.items[k]
+            let ic = left.items[(k + 1) % left.count]
+            let thickness = ear(mesh, ids, ia, ib, ic, normal)
+            if thickness <= 0.0 or (best >= 1.0 and thickness < 1.0): continue
+            let quality = roundness(mesh.points[(usize)ids[ia]], mesh.points[(usize)ids[ib]], mesh.points[(usize)ids[ic]])
+            if best >= 1.0 and quality <= shape: continue
+            if best < 1.0 and thickness < 1.0 and thickness <= best: continue
+            var blocked = false
+            for other in left.view():
+                if other == ia or other == ib or other == ic: continue
+                if inside_or_on(mesh.points[(usize)ids[other]], mesh.points[(usize)ids[ia]], mesh.points[(usize)ids[ib]], mesh.points[(usize)ids[ic]], normal):
+                    blocked = true
+                    break
+            if blocked: continue
+            chosen = k
+            best = thickness
+            shape = quality
+        if chosen == left.count: error(invalid, "a polygon has no ear to show it by")
+        try out.push((i64)left.items[(chosen + left.count - 1) % left.count])
+        try out.push((i64)left.items[chosen])
+        try out.push((i64)left.items[(chosen + 1) % left.count])
+        # Its middle corner leaves the polygon.
+        for at in chosen..<left.count - 1: left.items[at] = left.items[at + 1]
+        left.count -= 1
+        scan = chosen % left.count
+    let ia = left.items[0]
+    let ib = left.items[1]
+    let ic = left.items[2]
+    if ear(mesh, ids, ia, ib, ic, normal) <= 0.0: error(invalid, "a polygon's last triangle turns over")
+    try out.push((i64)ia)
+    try out.push((i64)ib)
+    try out.push((i64)ic)
+
+## How round triangle `a`, `b`, `c` is: twice its area over its longest
+## side squared (the inverse of its aspect; 0 for a needle).
+func roundness(a: Vector3, b: Vector3, c: Vector3) -> f64:
+    let longest = math.max(b.subtract(a).length(), math.max(c.subtract(b).length(), a.subtract(c).length()))
+    if not (longest > 0.0): return 0.0
+    return b.subtract(a).cross(c.subtract(a)).length() / (longest * longest)
+
+## How thick corners `a`, `b`, `c` of polygon `ids` are as an ear (in the
+## polygon's own facing, `normal`): 0 when
+## they turn against the polygon (or not at all), else the least of each
+## corner's height over the opposite side in display roundings there (at
+## least 1: the display shows it as it is).
+func ear(mesh: const MeshBuilder*, ids: const i64[], a: usize, b: usize, c: usize, normal: Vector3) -> f64:
+    let pa = mesh.points[(usize)ids[a]]
+    let pb = mesh.points[(usize)ids[b]]
+    let pc = mesh.points[(usize)ids[c]]
+    let cross = pb.subtract(pa).cross(pc.subtract(pa))
+    if cross.dot(normal) <= 0.0: return 0.0
+    # Its area as the polygon faces: an ear standing on edge to it (three
+    # samples of a trim bending out of the surface) has none.
+    let twice = cross.dot(normal) / math.max(normal.length(), nonzero)
+    let sides: f64[3] = [pc.subtract(pb).length(), pa.subtract(pc).length(), pb.subtract(pa).length()]
+    # As conditioned as geocore admits a display triangle.
+    let longest = math.max(sides[0], math.max(sides[1], sides[2]))
+    if twice <= math.max(nonzero, longest * longest * display_conditioning): return 0.0
+    let points: Vector3[3] = [pa, pb, pc]
+    var least = 1.0e300
+    for k in 0..<(usize)3: least = math.min(least, twice / math.max(sides[k] * display_rounding(points[k]), nonzero))
+    return least
+
+## Whether `p` lies in or on triangle `a`, `b`, `c` (turning about `normal`).
+func inside_or_on(p: Vector3, a: Vector3, b: Vector3, c: Vector3, normal: Vector3) -> bool:
+    return b.subtract(a).cross(p.subtract(a)).dot(normal) >= 0.0 and c.subtract(b).cross(p.subtract(b)).dot(normal) >= 0.0 and a.subtract(c).cross(p.subtract(c)).dot(normal) >= 0.0
+
+## How small a display triangle's cross product may be against its longest
+## side squared before geocore takes it as degenerate.
+let display_conditioning: f64 = 1e-14
 
 ## Each failed strategy rewinds scratch before the next strategy runs.
-func dispatch_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+func dispatch_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, divisions: Density, tolerance: f64, edge_size: f64) -> !:
     # Hard oblique trims use an independent support grid. Compatible mapped
     # seams retain their shared row contract and continuous quad strips.
     let mapped_np = mesh.np
@@ -17,7 +247,7 @@ func dispatch_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: 
     # A sphere triangle (a rounded corner): a barycentric grid.
     if sphere_triangle(face, surface, edges, tolerance):
         var meshed = true
-        barycentric_sphere(mesh, face, surface, full_samples, tolerance, divisions) catch failure:
+        barycentric_sphere(mesh, face, surface, full_samples, divisions) catch failure:
             mesh.np = mapped_np
             mesh.nf = mapped_nf
             mesh.nc = mapped_nc
@@ -32,7 +262,9 @@ func dispatch_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: 
         try conical_fan(mesh, face, surface, edges, full_samples, tolerance)
         if plan.method.length > 0: plan.method[0] = 6
         return
-    if plan.valid and plan.cut_first and (try attempt_clip(mesh, face, surface, full_samples, plan, tolerance, divisions)): return
+    # A flat face has no rows of its own (trim_layout): its boundary
+    # triangulated in its plane, not a mapped grid stretched between sides.
+    if plan.valid and (plan.cut_first or surface.kind == surface_plane) and (try attempt_clip(mesh, face, surface, full_samples, plan, tolerance, divisions)): return
     var mapped = true
     mapped_rows(mesh, face, surface, edges, full_samples, plan, tolerance, divisions) catch failure:
         mesh.np = mapped_np
@@ -84,7 +316,7 @@ func dispatch_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: 
     try validate(mesh, first_face, first_corner)
     plan.method[0] = 5
 
-func attempt_clip(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: i64) -> bool!:
+func attempt_clip(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: Density) -> bool!:
     let np = mesh.np
     let nf = mesh.nf
     let nc = mesh.nc
@@ -98,7 +330,7 @@ func attempt_clip(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples:
     plan.method[0] = 2
     return true
 
-func mapped_rows(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: i64) -> !:
+func mapped_rows(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], full_samples: const Samples[], plan: GridLayout, tolerance: f64, divisions: Density) -> !:
     let nf = mesh.nf
     let nc = mesh.nc
     let samples = try new Samples[full_samples.length] --- in memory.heap
@@ -121,19 +353,19 @@ func mapped_rows(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Cu
             recover ()
     else: try validate(mesh, nf, nc)
 
-func mapped_full(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, divisions: i64) -> !:
+func mapped_full(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, divisions: Density) -> !:
     let nf = mesh.nf
     let nc = mesh.nc
     try mapped_patch(mesh, face, s, edges, samples, tolerance, divisions)
     try validate(mesh, nf, nc)
 
-func constrained_checked(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], samples: const Samples[], divisions: i64, tolerance: f64, edge_size: f64) -> !:
+func constrained_checked(mesh: MeshBuilder*, face: BrepFace, s: Surface, edges: const Curve[], samples: const Samples[], divisions: Density, tolerance: f64, edge_size: f64) -> !:
     let nf = mesh.nf
     let nc = mesh.nc
     try constrained_face(mesh, face, s, edges, samples, divisions, tolerance, edge_size, true)
     try validate(mesh, nf, nc)
 
-func constrained_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], divisions: i64, tolerance: f64, edge_size: f64, mapped_tried: bool = false) -> !:
+func constrained_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], divisions: Density, tolerance: f64, edge_size: f64, mapped_tried: bool = false) -> !:
     if surface.kind == surface_plane:
         if mapped_tried:
             try planar(mesh, face, surface, samples, tolerance, edge_size, divisions)
@@ -160,7 +392,7 @@ func constrained_face(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edge
         try nurbs_trim(mesh, face, surface, samples, divisions, edge_size, tolerance)
         recover ()
 
-func structured(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, mapped_tried: bool, divisions: i64) -> !:
+func structured(mesh: MeshBuilder*, face: BrepFace, surface: Surface, edges: const Curve[], samples: const Samples[], tolerance: f64, mapped_tried: bool, divisions: Density) -> !:
     if mapped_tried:
         if surface.kind == surface_spline: try ruled(mesh, face, surface, edges, samples, tolerance)
         else: try periodic_band(mesh, face, surface, edges, samples, tolerance)
@@ -186,7 +418,7 @@ func boundary_samples(face: BrepFace, samples: const Samples[]) -> usize:
     for use in face.uses: count += samples[edge_index(use)].ids.length - 1
     return count
 
-func nurbs_trim(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], divisions: i64, edge_size: f64, tolerance: f64) -> !:
+func nurbs_trim(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], divisions: Density, edge_size: f64, tolerance: f64) -> !:
     let ids = try new i64[boundary_samples(face, samples)] --- in memory.heap
     defer free(ids) in memory.heap
     let sizes = try new i64[face.sizes.length] --- in memory.heap
@@ -208,7 +440,7 @@ func nurbs_trim(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: c
     else:
         try analytic_trim(mesh, ids[..<count], sizes, surface, face.sense, divisions, tolerance, edge_size)
 
-func planar(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], tolerance: f64, edge_size: f64, divisions: i64) -> !:
+func planar(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], tolerance: f64, edge_size: f64, divisions: Density) -> !:
     let boundary = boundary_samples(face, samples)
     let points = try new Vector3[boundary] --- in memory.heap
     defer free(points) in memory.heap
@@ -251,23 +483,18 @@ func planar(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const
             for at in 0..<4:
                 try mesh.corner(ids[at if sign > 0.0 else 3 - at])
             return
+    # A flat face takes no inner points from the angle (nothing on it
+    # curves). A boundary of many samples (a cap of curved edges) gets a
+    # lattice as fine as its own coarsest sample spacing, so the samples
+    # are not fanned to far corners in slivers; or the longest edge's.
     var spacing = edge_size
-    var vertical = edge_size
     if edge_size == 0.0 and count > 8:
-        # Complex planar trims need interior support too: do not connect every
-        # fine hole/border sample to a far-away corner of the outer boundary.
-        let reference = Vector3(1.0, 0.0, 0.0) if math.abs(normal.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
-        let u = try reference.subtract(normal.multiply_scalar(reference.dot(normal))).normalized()
-        let v = normal.cross(u)
-        var low = Vector3()
-        var high = Vector3()
-        for p in points[..<count]:
-            let relative = p.subtract(points[0])
-            low = Vector3(math.min(low.x, relative.dot(u)), math.min(low.y, relative.dot(v)), 0.0)
-            high = Vector3(math.max(high.x, relative.dot(u)), math.max(high.y, relative.dot(v)), 0.0)
-        let resolution = math.min(math.max(32.0, (f64)divisions), math.max((f64)divisions, (f64)count / 4.0))
-        spacing = (high.x - low.x) / resolution
-        vertical = (high.y - low.y) / resolution
+        var start: usize = 0
+        for size in sizes:
+            for at in 0..<(usize)size:
+                spacing = math.max(spacing, points[start + at].subtract(points[start + (at + 1) % (usize)size]).length())
+            start += (usize)size
+    let vertical = spacing
     let part = try TrimPolygon.quadrangulate_seams(points[..<count], sizes, normal, ids[..<count], spacing, vertical)
     defer part.release()
     let all = try new i64[(usize)part.value().point_count()] --- in memory.heap

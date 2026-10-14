@@ -5,7 +5,7 @@
 ## Initialize and reconcile layouts before shared vertices are allocated.
 ## Invalid/over-budget layouts fall back; their already registered edge cuts are
 ## still shared by both incident faces. No tolerance welding is performed.
-pub func plan_layouts(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], sides: const PatchSides[], cuts: Stations[], metrics: const ArcMetric[], plans: GridLayout[], divisions: i64, tolerance: f64, edge_size: f64) -> !:
+pub func plan_layouts(vertices: const Vector3[], edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], sides: const PatchSides[], cuts: Stations[], metrics: const ArcMetric[], plans: GridLayout[], divisions: Density, tolerance: f64, edge_size: f64) -> !:
     let settled = try new Settled[faces.length] --- in memory.heap
     defer free(settled) in memory.heap
     for at in 0..<settled.length: settled[at] = Settled()
@@ -68,7 +68,7 @@ struct Seeding:
     let sides: const PatchSides[]
     let cuts: const Stations[]
     let plans: GridLayout[]
-    let divisions: i64
+    let divisions: Density
     let tolerance: f64
     let edge_size: f64
     let errors: FaceErrors*
@@ -124,7 +124,7 @@ func seed_face(job: Seeding*, at: usize) -> !:
         plans[at].valid = false
         recover ()
 
-func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const Vector3[], edges: const Curve[], cuts: const Stations[], divisions: i64, tolerance: f64, edge_size: f64) -> !:
+func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const Vector3[], edges: const Curve[], cuts: const Stations[], divisions: Density, tolerance: f64, edge_size: f64) -> !:
     # A face may have any number of coedges and boundary samples: the chart
     # and the cut grid size their scratch by the face.
     try plan.u.open(axis_stations)
@@ -174,8 +174,8 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
     if rails[3]: _ = try plan.v.insert(trim_high.y, plan.epsilon)
     # Nearby competing row phases must not create microscopic sliver columns.
     # This bounds optional flow propagation, never the shared CAD edge samples.
-    plan.u.separation = (high.x - low.x) / math.max(32.0, (f64)divisions * 4.0) * 0.9
-    plan.v.separation = (high.y - low.y) / math.max(32.0, (f64)divisions * 4.0) * 0.9
+    plan.u.separation = (high.x - low.x) / math.max(32.0, (f64)divisions.steps * 4.0) * 0.9
+    plan.v.separation = (high.y - low.y) / math.max(32.0, (f64)divisions.steps * 4.0) * 0.9
     var dominant_u = plan.chains.length
     var dominant_v = plan.chains.length
     var count_u: usize = 0
@@ -203,11 +203,9 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
         # independent phase which gets unioned with its real seam stations later.
         if (try same_rail(s, plan.chains, at, dominant_u, 0, plan.epsilon, tolerance)) or (try same_rail(s, plan.chains, at, dominant_v, 1, plan.epsilon, tolerance)):
             _ = try inherit(plan, s, face, at, tolerance)
-    var planar_support: usize = 1
-    if s.kind == surface_plane:
-        var samples: usize = 0
-        for use in face.uses: samples += cuts[edge_index(use)].count - 1
-        if samples > 8: planar_support = (usize)math.min(math.max(32.0, (f64)divisions), math.max((f64)divisions, (f64)samples / 4.0))
+    # A flat face gets no rows of its own from the angle: nothing on it
+    # curves (its rows are its neighbors' and the longest edge's).
+    let planar_support: usize = 1
     if s.kind == surface_plane: plan.independent_phase = try fill_plane(&plan.u, &plan.v, trim_low, trim_high, planar_support, plan.epsilon)
     else:
         try fill(&plan.u, planar_support, plan.epsilon)
@@ -217,7 +215,7 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
     if s.kind != surface_plane:
         try snap_lines(&plan.u, plan.chains, 0, 0.3)
         try snap_lines(&plan.v, plan.chains, 1, 0.3)
-    if plan.cut_first: plan.pitch_axes = try refine_pitch(&plan.u, &plan.v, s, plan.epsilon)
+    if plan.cut_first or s.kind == surface_cylinder: plan.pitch_axes = try refine_pitch(&plan.u, &plan.v, s, plan.epsilon)
     try check_grid_size(plan.u.count, plan.v.count)
     try refine_cells(&plan.u, &plan.v, s, divisions, tolerance, plan.epsilon)
     plan.valid = true
@@ -324,7 +322,7 @@ pub func reconcile(plan: GridLayout*, face: BrepFace, s: Surface, vertices: cons
                     # A crossing a hair from a sample moves the sample onto
                     # the line in this chart instead of becoming a station.
                     if not preserve and (try absorb_crossing(&plan.chains[use], edge, times, segment, axis, value, t, lines, seam, incidence)): continue
-                    let added = (try cuts[index].insert(t, cuts[index].epsilon)) if preserve else (try insert_cut(&cuts[index], edge, t, tolerance))
+                    let added = (try insert_root(&cuts[index], edge, t)) if preserve else (try insert_cut(&cuts[index], edge, t, tolerance))
                     changed = changed or added
     return changed
 
@@ -340,8 +338,32 @@ func separates_crossings(uv: const Vector3[], times: const f64[], segment: usize
         let b = uv[at + 1].x if axis == 0 else uv[at + 1].y
         if math.abs(p - value) <= incidence: continue
         if value > math.min(a, b) + incidence and value < math.max(a, b) - incidence: continue
-        if (try edge.at(t)).subtract(try edge.at(times[at])).length() < math.max(1e-8, tolerance * 0.01): return true
+        let q = try edge.at(times[at])
+        let spacing = math.min(q.subtract(try edge.at(times[at - 1])).length(), q.subtract(try edge.at(times[at + 1])).length())
+        if (try edge.at(t)).subtract(q).length() < math.max(tolerance, spacing * station_share): return true
     return false
+
+## Stations on an edge closer than this share of the interval they fall in
+## are one (scale-invariant: a sliver interval no mesh keeps), as are
+## stations within the B-rep's resolution `tolerance` (one point by its
+## exactness contract).
+let station_share: f64 = 1e-6
+
+## A crossing kept beside an extremum's sample (separates_crossings): a
+## station of its own unless the single-precision display could not tell
+## it from a station beside it.
+func insert_root(cuts: Stations*, edge: Curve, t: f64) -> bool!:
+    var low: usize = 0
+    var high = cuts.count
+    while low < high:
+        let mid = (low + high) // 2
+        if cuts.values[mid] < t: low = mid + 1
+        else: high = mid
+    let p = try edge.at(t)
+    let apart = display_rounding(p)
+    if low < cuts.count and p.subtract(try edge.at(cuts.values[low])).length() <= apart: return false
+    if low > 0 and p.subtract(try edge.at(cuts.values[low - 1])).length() <= apart: return false
+    return try cuts.insert(t, cuts.epsilon)
 
 func insert_cut(cuts: Stations*, edge: Curve, t: f64, tolerance: f64) -> bool!:
     var low: usize = 0
@@ -351,7 +373,10 @@ func insert_cut(cuts: Stations*, edge: Curve, t: f64, tolerance: f64) -> bool!:
         if cuts.values[mid] < t: low = mid + 1
         else: high = mid
     let p = try edge.at(t)
-    let separation = math.max(1e-8, tolerance * 0.01)
+    # The interval the new station falls in.
+    let before = try edge.at(cuts.values[low - 1]) if low > 0 else p
+    let after = try edge.at(cuts.values[low]) if low < cuts.count else p
+    let separation = math.max(tolerance, after.subtract(before).length() * station_share)
     if low < cuts.count and p.subtract(try edge.at(cuts.values[low])).length() < separation: return false
     if low > 0 and p.subtract(try edge.at(cuts.values[low - 1])).length() < separation: return false
     return try cuts.insert(t, cuts.epsilon)

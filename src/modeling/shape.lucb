@@ -77,10 +77,6 @@ pub struct Shape:
     ## The booleans merge and match by them (boolean.lucb).
     pub var edge_slack: Growing[f64]
     pub var point_slack: Growing[f64]
-    ## What a B-rep written from it is meshed to (BrepModel's own
-    ## tolerance, a millionth of a primitive's extent): carried from the
-    ## body it came from, never read by modeling.
-    pub var display: f64
 
     pub func close():
         self.points.close()
@@ -246,11 +242,10 @@ pub struct Shape:
 pub func work_tolerance(w: const Shape*) -> f64:
     return w.tolerances.resolution()
 
-## A shape with nothing in it, under `tolerances`, working to `tolerance`
-## (and meshed to it when written, unless its display is set).
+## A shape with nothing in it, under `tolerances`, working to `tolerance`.
 pub func empty_shape(tolerances: CadTolerances, tolerance: f64) -> Shape:
     return Shape(tolerances, tolerance, Growing[Vector3](), Growing[Carrier](), Growing[ShapeEdge](), Growing[Surface](), Growing[ShapeFace](),
-                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize](), Growing[i64](), Growing[f64](), Growing[f64](), tolerance)
+                 Growing[i64](), Growing[i64](), Growing[ShapeSpline](), Growing[Vector3](), Growing[f64](), Growing[f64](), Growing[u8](), Growing[usize](), Growing[i64](), Growing[f64](), Growing[f64]())
 
 ## Surface coordinates of `p` on `s`: a plane's (x, y); an angle about the
 ## axis and a height (cylinder, cone); longitude and latitude (sphere); a
@@ -272,9 +267,7 @@ pub func shape_of(model: const CadModel*) -> Shape!:
     # Modeling works to the project's resolution; a tolerant entity (a
     # Stitch join, an import's edge) carries its own precision as its slack
     # and only what is asked about it uses it (KERNEL-ROBUSTNESS.md, 4.3).
-    # The body's own tolerance is what it is meshed to.
     var shape = empty_shape(b.cad_tolerances(), b.cad_tolerances().resolution())
-    shape.display = b.base_tolerance()
     errdefer shape.close()
     let top = model.brep_placement()
     # Vertices and edges are shared; faces may carry their own placement,
@@ -290,10 +283,10 @@ pub func shape_of(model: const CadModel*) -> Shape!:
     for v in 0..<b.vertex_count():
         _ = try shape.add_point(placement.transform_point(try b.vertex_at(v)))
         let precision = try b.vertex_precision_of(v)
-        try shape.point_slack.push(precision * scale if precision > b.base_tolerance() else 0.0)
+        try shape.point_slack.push(precision * scale)
     for e in 0..<b.edge_count():
         let precision = try b.edge_precision_of(e)
-        try shape.edge_slack.push(precision * scale if precision > b.base_tolerance() else 0.0)
+        try shape.edge_slack.push(precision * scale)
     for e in 0..<b.edge_count():
         var curve = try b.edge_record(e)
         defer curve.close()
@@ -356,13 +349,13 @@ pub func shape_of(model: const CadModel*) -> Shape!:
 
 ## `shape` as a new B-rep: its points, edges, surfaces and faces as they are.
 pub func brep_of(shape: const Shape*) -> interop.Reference[BrepModel]!:
-    let output = try BrepModel.held(shape.tolerances, math.max(shape.display, least_tolerance))
+    let output = try BrepModel.held(shape.tolerances)
     errdefer output.release()
     let b = output.value()
     for at in 0..<shape.points.count:
         let v = try b.add_vertex(shape.points.items[at])
         # Tolerant vertices and edges stay tolerant.
-        if shape.point_slack_of(at) > b.base_tolerance(): try b.set_vertex_precision(v, shape.point_slack_of(at))
+        if shape.point_slack_of(at) > 0.0: try b.set_vertex_precision(v, shape.point_slack_of(at))
     for e in 0..<shape.edges.count:
         let edge = shape.edges.items[e]
         let c = shape.carriers.items[(usize)edge.carrier]
@@ -377,7 +370,7 @@ pub func brep_of(shape: const Shape*) -> interop.Reference[BrepModel]!:
         else:
             let (points, weights, knots, degree) = shape.spline_net(c.spline)
             id = try b.add_spline_edge(edge.start, edge.end, points, weights, degree, knots, forward)
-        if shape.edge_slack_of(e) > b.base_tolerance(): try b.set_edge_precision(id, shape.edge_slack_of(e))
+        if shape.edge_slack_of(e) > 0.0: try b.set_edge_precision(id, shape.edge_slack_of(e))
     for s in shape.surfaces.view():
         let made = (try b.add_spline_surface(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv)) if s.kind == surface_spline else (try b.add_surface(s.kind, s.origin, s.z, s.x, s.radius, s.angle))
         # Edited surfaces stay edited (their trims keep taking nearest parameters).

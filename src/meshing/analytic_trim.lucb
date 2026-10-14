@@ -1,6 +1,6 @@
 ## Periodic analytic support inversion and trim meshing in unwrapped UV space.
 
-pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: Density, tolerance: f64, edge_size: f64) -> !:
     if s.kind == surface_sphere and touches_pole(s, mesh.points[..<mesh.np], ids):
         try local_or_holes(mesh, ids, sizes, s, sense, divisions, tolerance, edge_size)
         return
@@ -19,7 +19,7 @@ pub func analytic_trim(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[],
         recover ()
 
 ## A sphere face in a local hemisphere's chart, or else sphere_axis's.
-func local_or_holes(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+func local_or_holes(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: Density, tolerance: f64, edge_size: f64) -> !:
     let np = mesh.np
     let nf = mesh.nf
     let nc = mesh.nc
@@ -33,12 +33,12 @@ func local_or_holes(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s:
         recover ()
     if not meshed: try sphere_axis(mesh, ids, sizes, s, sense, divisions, tolerance, edge_size)
 
-func local_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+func local_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: Density, tolerance: f64, edge_size: f64) -> !:
     let chart = try local_sphere(s, mesh.points[..<mesh.np], ids)
     defer chart.close()
     try mesh_in_chart(mesh, ids, sizes, chart, sense, divisions, tolerance, edge_size)
 
-func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: i64, tolerance: f64, edge_size: f64) -> !:
+func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: Surface, sense: bool, divisions: Density, tolerance: f64, edge_size: f64) -> !:
     let uv = try new Vector3[ids.length] --- in memory.heap
     defer free(uv) in memory.heap
     let uscale = math.max(s.radius, tolerance)
@@ -101,8 +101,8 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
         if outer >= 0:
             try sphere_disk(mesh, ids, sizes, uv, (usize)outer, s, sense, divisions, tolerance)
             return
-    var spacing = uscale * math.pi / (2.0 * (f64)divisions)
-    var vertical = vscale * math.pi / (2.0 * (f64)divisions) if s.kind == surface_sphere or s.kind == surface_torus else spacing
+    var spacing = uscale * math.pi / (2.0 * (f64)divisions.steps)
+    var vertical = vscale * math.pi / (2.0 * (f64)divisions.steps) if s.kind == surface_sphere or s.kind == surface_torus else spacing
     var minimum = uv[0]
     var maximum = uv[0]
     for p in uv:
@@ -112,8 +112,8 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
         # A tiny-radius, long axial strip must not request millions of square
         # cells when target edge length is off. Shared boundary samples retain
         # angular resolution; interior refinement stays bounded by divisions.
-        spacing = math.max(math.min(spacing, (maximum.x - minimum.x) / (f64)divisions), (maximum.x - minimum.x) / ((f64)divisions * 4.0))
-        vertical = math.max(math.min(vertical, (maximum.y - minimum.y) / (f64)divisions), (maximum.y - minimum.y) / ((f64)divisions * 4.0))
+        spacing = math.max(math.min(spacing, (maximum.x - minimum.x) / (f64)divisions.steps), (maximum.x - minimum.x) / ((f64)divisions.steps * 4.0))
+        vertical = math.max(math.min(vertical, (maximum.y - minimum.y) / (f64)divisions.steps), (maximum.y - minimum.y) / ((f64)divisions.steps * 4.0))
     if edge_size > 0.0:
         spacing = math.min(spacing, edge_size)
         vertical = math.min(vertical, edge_size)
@@ -141,7 +141,7 @@ func mesh_in_chart(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s: 
     # shape the cells, so they are at most `divisions` apart over the face
     # and cells at most three times as long as wide.
     if (s.kind == surface_cylinder or s.kind == surface_cone) and edge_size == 0.0:
-        vertical = math.min(spacing * 3.0, math.max(vertical, (maximum.y - minimum.y) / (f64)divisions))
+        vertical = math.min(spacing * 3.0, math.max(vertical, (maximum.y - minimum.y) / (f64)divisions.steps))
     try lift_chart(mesh, ids, sizes, uv, s, uscale, vscale, sense, spacing, vertical, deviation)
 
 ## The trim loops `ids` (by `sizes`; their chart points `uv`, scaled by
@@ -198,7 +198,7 @@ func winds_once(uv: const Vector3[], uscale: f64) -> bool:
 ## the pole and closed by a fan there (polar_rows). Going east along the
 ## loop and north to the pole faces out, so the corners' own order faces
 ## the face's way.
-func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s: Surface, sense: bool, divisions: i64, tolerance: f64) -> !:
+func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s: Surface, sense: bool, divisions: Density, tolerance: f64) -> !:
     let north = (uv[uv.length - 1].x > uv[0].x) == sense
     let pole_v = math.pi * (0.5 if north else -0.5)
     let longitudes = try new f64[ids.length] --- in memory.heap
@@ -212,5 +212,5 @@ func spherical_cap(mesh: MeshBuilder*, ids: const i64[], uv: const Vector3[], s:
         mean += starts[at]
     mean /= (f64)ids.length
     let step = sag_step(s.radius, analytic_target(s, 0.0, divisions, tolerance) * 0.45)
-    let rows = (usize)math.max((f64)divisions, math.ceil(math.abs(pole_v - mean) / step))
+    let rows = (usize)math.max((f64)divisions.steps, math.ceil(math.abs(pole_v - mean) / step))
     try polar_rows(mesh, s, ids, longitudes, starts, pole_v, rows, false)

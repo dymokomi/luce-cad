@@ -1,21 +1,20 @@
 ## A circular segment and its reflection must both reach the clipped-grid path.
-## Translation, chart axes and trim uncertainty cannot leave unsplit crossings.
+## Translation and chart axes cannot leave unsplit crossings.
 from luce_cad.model import BrepModel
 from luce_geocore.geocore import Vector3
-from checks import near
+from checks import near, contract, brep_lines, display_aspect
 from luce_std import math
 
 pub func planar_sliver_tests() -> unit!:
     for offset in [0.0,41.0]:
         for angle in [0.0,math.pi]:
-            for uncertainty in [0.000001,0.01]:
-                for minor in [2.8,1.6]:
-                    for rotation in [0.0,0.37]:
-                        for reversed_curve in [false,true]: segment(offset,angle,uncertainty,minor,rotation,reversed_curve)
+            for minor in [2.8,1.6]:
+                for rotation in [0.0,0.37]:
+                    for reversed_curve in [false,true]: segment(offset,angle,minor,rotation,reversed_curve)
     print("PASS planar arc/chord slivers, reflections, translated charts and canonical crossings")
 
-func segment(offset: float, angle: float, uncertainty: float, minor: float, rotation: float, reversed_curve: bool) -> unit!:
-    let model = BrepModel(uncertainty)
+func segment(offset: float, angle: float, minor: float, rotation: float, reversed_curve: bool) -> unit!:
+    let model = BrepModel()
     let radius = 2.8
     let span = math.acos(2.575/radius)
     let z = Vector3(0.0,0.0,1.0)
@@ -38,17 +37,15 @@ func segment(offset: float, angle: float, uncertainty: float, minor: float, rota
     for edge in 0..<mesh.edge_count():
         counts.append(0)
         directions.append(0)
-    var quads = 0
     for face in 0..<mesh.face_count():
         if mesh.attribute_value(method,face,0) != 2.0:
-            print(f"sliver offset={offset} angle={angle} uncertainty={uncertainty} method={mesh.attribute_value(method,face,0)}")
+            print(f"sliver offset={offset} angle={angle} method={mesh.attribute_value(method,face,0)}")
             assert(false)
-        if mesh.face_size(face) == 4: quads += 1
         for corner in 0..<mesh.face_size(face):
             let edge = mesh.face_edge(face,corner)
             counts[edge] += 1
             directions[edge] += 1 if mesh.face_point(face,corner) == mesh.edge_point(edge,0) else -1
-    assert(quads > 8)
+    contract(mesh, brep_lines(model), display_aspect, 11.25)
     near(mesh.point(0).subtract(b if reversed_curve else a).length(),0.0)
     near(mesh.point(1).subtract(a if reversed_curve else b).length(),0.0)
     for edge in 0..<mesh.edge_count():
@@ -70,7 +67,13 @@ func segment(offset: float, angle: float, uncertainty: float, minor: float, rota
         area += normal.length()*0.5
         for corner_normal in [pa.normal,pb.normal,pc.normal]: assert(normal.dot(corner_normal) > 0.0)
     let exact = radius*minor*(span-math.sin(span)*math.cos(span))
-    assert(area > exact*0.99 and area <= exact*1.000001)
+    # Short of it by at most what chords stepping a quarter turn over 16
+    # leave of an arc of the major radius: each chord's segment, r² (d -
+    # sin d) / 2, about r² d³ / 12, over the arc of 2 span in steps d.
+    let step = math.pi/32.0
+    let deficit = radius*radius*2.0*span*step*step/12.0
+    if not (area >= exact-deficit and area <= exact*1.000001): print(f"segment area {area}, exact {exact}, at most {deficit} short")
+    assert(area >= exact-deficit and area <= exact*1.000001)
     let radial = x.multiply_scalar(math.cos(angle))
     let inside = origin.add(radial.multiply_scalar((radius+2.575)*0.5))
     near(mesh.ray_distance(inside.add(z),z.multiply_scalar(-1.0)),1.0)

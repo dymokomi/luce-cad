@@ -92,6 +92,15 @@ manifold on Monday but not on Tuesday". This document has seven parts:
   Parasolid's precision is a fixed numerical floor, with local tolerances where geometry cannot
   meet it. The two coexist. Alias builds geometry to a user tolerance and hands Parasolid-based
   systems data that those systems mark as tolerant where needed.
+- **Meshing is separate from modelling.** Alias tessellates (for display
+  and for export) to its own settings: a largest angle between neighbouring
+  normals, with an optional chord height and edge length, in presets from
+  coarse to fine and a user-defined set. None of these depends on the
+  Construction Options or on the part's size; a part and its copy scaled up
+  mesh alike. Only the validity of the trims ties the mesh to the model. The
+  owner's direction (2026-10-13): "tolerances are explicit and not size
+  based"; "meshing works on keeping curvature well represented (angles)";
+  "do like in Alias". Section 3.12 is the result.
 
 ### Robustness literature
 
@@ -613,6 +622,108 @@ show. These two remain open for the heavy sweep (stage 7) to argue for.
 - **Harness:** invariance 0 of 224, band 0 of 452, canonical 0 of 23;
   literals 898.
 
+### 3.12 No size-based tolerances; meshing like Alias
+
+The owner's direction replaced step four's plan (1, Alias): tolerances are
+set, not derived from a body's size, and the mesh is a setting of its own,
+driven by angle.
+
+**No body carries a size-derived tolerance.**
+
+- `BrepModel` has no tolerance of its own: it is built under the project's
+  `CadTolerances` and nothing else (`BrepModel(tolerances)`,
+  `BrepModel.held(tolerances)`). `sized`, `model_tolerance`,
+  `base_tolerance`, `Shape.display`, `tolerance_for` and `least_tolerance`
+  are gone; `widest_precision()` reports the widest tolerant entity.
+- Only tolerant edges and vertices carry slack, each its own precision:
+  a stitch's join, or an import's (STEP's declared uncertainty, USD's
+  `intersectTol3d`) when it is looser than the resolution.
+- The mesher's identity (when two mesh points are one) is R, the B-rep's
+  exactness contract, with a floor at the coordinates' own roundoff for
+  parts far from the origin (`mesh_roundoff`). A part at R is a point: the
+  exact-chart contract runs from a micron (100 R) up.
+
+**The mesh follows the angle.** `MeshQuality` (src/model/mesh_quality.lucb)
+holds the largest angle a mesh edge may turn, an optional chord height
+(mm) and an optional longest edge (mm), with Fusion's display qualities as
+presets: Low 25.9°, Medium 9.43°, High 4.71°, Very High 2.36° (probe 19,
+its sphere's largest edge angles). `CadModel.tessellated(quality)` meshes
+by it; `tessellate(steps)` keeps its quarter-turn count. Inside the mesher
+a `Density` (steps per quarter turn, chord) replaces the division count.
+
+- **Per direction.** An edge takes as many pieces as the surface's normal
+  turns along it over the step (`edge_demands`, `normal_turn`); a curve
+  (`curve_intervals`) and a B-spline patch (`patch_density`, each axis
+  apart) as many as the turn along them needs; a circle family steps the
+  angle round its axis (`regularize_circles`). A torus is no longer meshed
+  at its tube's tightness both ways: 512 triangles at Low, not 1,152.
+- **As many as needed, not doubled.** Counts rise to the worst interval's
+  need (`ceil(count × worst)`), rounded up to even so a symmetric patch's
+  crest (a dome's top, a fillet's middle) is a sample.
+- **Straight directions stretch, to a point.** Along a cylinder's axis, an
+  extrusion's or a patch's straight direction, cells are at most
+  `row_stretch` (24) times the mean step across (pitch.lucb,
+  mapped_extrusion.lucb, patch_density, edge_demands): no needles. Fusion's
+  display keeps cells up to about 48, its export 21.5.
+- **Flat faces get nothing from the angle.** A plane is meshed from its
+  boundary; a boundary of many samples gets a lattice at its own coarsest
+  sample spacing (not the angle's), so it is not fanned in slivers.
+- **The sphere corner's grid** is as fine as its arcs (no 1.2× stretch);
+  a mapped torus or sphere cell may stray by both directions' sags.
+- **Scale invariance fixed where it hid.** A face's four logical sides were
+  found from chart directions (a cylinder's chart is angle by height, so
+  corners changed with the part's size); they come from the edges' tangents
+  in space now. A box/cylinder union at 100× failed to mesh because of it.
+- **Display triangulation** (patch_dispatch `straighten`): of the ears the
+  single-precision display shows, the best shaped; thickness and straight
+  corners measured as the polygon faces, so an ear standing on edge (three
+  samples of a trim bending out of the surface) is never taken.
+
+**Measuring.** `CadMeasure.volume(model, steps, chord)` adds to the mesh's
+volume each triangle's cap to its surface (6-point Gauss, B-spline feet
+seeded): within about 1e-7 of Fusion's volumes. The deviation map also
+samples each mesh edge's middle on the model's own surface (an odd strip's
+crest lies there).
+
+**Fusion, triangle counts at Low / Medium / High / Very High** (ours over
+Fusion's; mesh_calibration_tests, which also holds the counts identical
+from 0.5 to 500 mm and the topology identical built 10 m off):
+
+| shape | Low | Medium | High | Very High |
+|---|---|---|---|---|
+| sphere | 1.29 | 1.02 | 0.99 | 0.94 |
+| cylinder (h = 2r) | 0.79 | 0.72 | 1.10 | 1.44 |
+| torus (R = 2r, r / 2) | 1.18 | 0.99 | 1.00 | 0.96 |
+| box 2r, edges rounded r / 4 | 1.16 | 1.64 | 1.92 | 2.05 |
+
+The rounded box is the one shape well above: Fusion meshes its small
+fillets and corners coarser than its own angle allows (its sphere at
+Medium has 351 triangles an octant, the box's corners far fewer), so its
+display also has a size-relative deviation. Ours is the angle alone.
+
+**Tests re-baselined** (each count that went gained the contract it stood
+for; checks.contract: trim sides within P, beyond the arc's sag at their
+middle, no needles past `display_aspect` (100), normals within twice the
+step): quad_flow, periodic_grid, planar_sliver, planar_spacing, seam_flow,
+spacing (cells within twice `row_stretch` of their narrowest step),
+brep_cache (a small lift reuses the cap, a large one re-meshes it), apex
+(no face over 25,000 at 32 divisions, every corner at 2.8°), cad_tests
+(tube caps). Volume checks moved from extrapolated mesh volumes to
+`CadMeasure.volume` (measure, fusion_probe, fusion_roll, spline_boolean,
+fillet_sets, touching, modeling, thin, full_round, apex, blend_cap,
+mesh_quality's long pipes); no Fusion value or tolerance was loosened.
+
+**Open.** Slivers where a trim grazes a stretched row (to aspect 250 on a
+40 mm strip at 0.6°) and where a densely sampled trim (a corner patch's)
+meets a coarser strip (to about 4,000 at 2.8°; the size-based mesher's
+reached 21,000): both want grading toward the dense side. `refine_axis`,
+`refine_cells` and analytic_trim still take the tightest radius's sag for
+the clipped chart's rows. Fusion's small-feature coarsening has no
+counterpart here.
+
+**Harness:** invariance 0 of 224, band 0 of 452, canonical 0 of 23,
+determinism identical; literals 894.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
@@ -917,7 +1028,7 @@ identity are absolute (P); the construction slop stays relative to size until th
 | 3 ✓ | **Classification and degeneracy** (3.6). The two invariance failures were mesh bugs (a sphere trim through the pole, a band's hole a turn off), now fixed. Rings thinner than a chart chord now chart. Rays are clean. March seeds are skipped only on a traced polyline. The harness fails on a face left out of a mesh. | done | Invariance 0 of 224; band 0 of 452 |
 | 4 ✓ | **Canonical results** (3.7). Peer booleans are the same bit for bit with operands swapped or faces renumbered: canonical meet and trace order, canonical coincidence surface and merged points, results written in their geometry's order. Tool booleans keep the body's geometry. | done | 0 of 23 swapped or renumbered results differ, bit for bit |
 | 5 ✓ (part) | **Per-entity tolerances and the recheck.** `rechecked` and `tolerance_report` (measured precision, tightening, healing on adopt). STEP imports join within P and are rechecked; the File node's Tolerances option asks. Edit CAD's held bodies call `rechecked` when the setting changes. Not done: shape_of still works to the widest precision anywhere (`model_tolerance()`). Working to each entity's own broke fillets, whose tools rely on the wider tolerance, so it moves to stage 6 with the absolute working tolerances. A body checker node is left for stage 7. | done | Rechecks in the harness; imports name looser files |
-| 6 (part) | **The rest of the kernel by directory, and absolute working tolerances.** Done: the work tolerance capped at R, the result's tolerance decoupled from it, the literal ratchet on, the guards named (3.8); blends fitted to F, trims meshed to the validity contract (3.9); the working tolerance R at every size, modeling working to the project's tolerances, the body's own tolerance only a display one (3.10). Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
+| 6 (part) | **The rest of the kernel by directory, and absolute working tolerances.** Done: the work tolerance capped at R, the result's tolerance decoupled from it, the literal ratchet on, the guards named (3.8); blends fitted to F, trims meshed to the validity contract (3.9); the working tolerance R at every size, modeling working to the project's tolerances, the body's own tolerance only a display one (3.10). No body carries a size-derived tolerance and the mesh follows the angle (3.12). Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
 | 7 | **Heavy sweep tool** (`dev/robustness`): randomised rotations, scales and near-degenerate placements in the thousands, run on demand, not in `luc test`. Per the owner's priority this is after all requests and is not fuzzing. | S: 2 days | Continued coverage |
 
 Stages 1 and 2 hold most of the value. Each stage is pushed in green, gated pieces.

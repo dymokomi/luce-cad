@@ -1,6 +1,8 @@
 ## Shared assertions for the CAD regressions.
 from luce_geocore.geocore import Mesh, Vector3
 from luce_std import math
+from luce_cad.measure import CadMeasure
+from luce_cad.model import CadModel, BrepModel
 
 pub func near(a: float, b: float):
     if math.abs(a - b) >= 0.000001: print(f"near failed: actual={a}, expected={b}")
@@ -15,6 +17,9 @@ pub func manifold(mesh: Mesh) -> unit!:
         let b = mesh.vertex(mesh.index(triangle * 3 + 1))
         let c = mesh.vertex(mesh.index(triangle * 3 + 2))
         if b.position.subtract(a.position).cross(c.position.subtract(a.position)).dot(a.normal) <= 0.0:
+            let parent = mesh.find_attribute("cad_face", 2)
+            let mesher = mesh.find_attribute("cad_mesher", 2)
+            if parent >= 0 and mesher >= 0: print(f"CAD face {mesh.attribute_value(parent, mesh.triangle_face(triangle), 0)}, mesher {mesh.attribute_value(mesher, mesh.triangle_face(triangle), 0)}")
             print(f"invalid display triangle {triangle}: {a.position.x},{a.position.y},{a.position.z}; {b.position.x},{b.position.y},{b.position.z}; {c.position.x},{c.position.y},{c.position.z}; normal {a.normal.x},{a.normal.y},{a.normal.z}")
             assert(false)
 
@@ -37,8 +42,13 @@ pub func closed(mesh: Mesh) -> unit!:
             directions[edge] += 1 if p == a else -1
     for edge in 0..<mesh.edge_count(): assert(counts[edge] == 2 and directions[edge] == 0)
 
-## The volume a closed triangle mesh encloses (signed: outward faces
-## positive), by the divergence theorem.
+## `model`'s volume as CadMeasure measures it (its mesh's, each triangle's
+## cap to its surface added: it follows the B-rep, where a mesh's own falls
+## short by the square of its step), its mesh closed.
+pub func measured(model: CadModel) -> float!:
+    closed(model.tessellate(32))
+    return CadMeasure.volume(model, 64)
+
 ## Which of `mesh`'s points lie on a CAD face's trim: on an edge used once
 ## or by two different CAD faces.
 pub func trim_points(mesh: Mesh) -> list[bool]!:
@@ -76,6 +86,8 @@ pub func along_grid(a: Vector3, b: Vector3, trim: bool, vertical: bool) -> bool:
     if first < 0.000001 or second < 0.000001: return true
     return trim and math.min(first, second) < math.max(first, second)
 
+## The volume a closed triangle mesh encloses (signed: outward faces
+## positive), by the divergence theorem.
 pub func volume(mesh: Mesh) -> float!:
     var total = 0.0
     for triangle in 0..<mesh.index_count() // 3:
@@ -121,3 +133,140 @@ pub func face_quality(mesh: Mesh, faces: int) -> list[FaceQuality]!:
         result[face].aspect = math.max(result[face].aspect, aspect)
         if aspect > 10.0 or angle > 150.0: result[face].slivers += 1
     return result
+
+## The mesh contract a density change must keep (what counts of rows and
+## quads used to stand for), `lines` each CAD face's boundary as a fine
+## polyline (brep_lines, cad_lines):
+## - every trim side (a mesh edge used once, or by two CAD faces) has its
+##   ends within the positional tolerance P of its face's edges and its
+##   middle within P beyond the sag of an arc turning `degrees` over it;
+## - no display triangle of a curved face has an aspect (longest side
+##   squared over twice its area) over `aspect`, but for a small cap of
+##   three trim points (under a tenth of its face's longest side);
+## - every display triangle's normal (of those within display_aspect)
+##   lies within `degrees` of the exact surface normals at its corners.
+## Watertightness is closed()'s.
+## The aspect no display triangle of a curved face exceeds: cells stretch
+## along straight directions up to about 32 times their width (row_stretch), and
+## where a trim cuts a cell near its corner the piece is thinner; a needle
+## (the defects this guards, aspects to 66,000) is far beyond.
+pub let display_aspect = 100.0
+
+pub func contract(mesh: Mesh, lines: list[list[Vector3]], aspect: float, degrees: float) -> unit!:
+    let p = 0.01
+    let parent = mesh.find_attribute("cad_face", 2)
+    # A trim side: a mesh edge used once, or by two different CAD faces.
+    let owner: list[float] = []
+    let uses: list[int] = []
+    let trim: list[bool] = []
+    for edge in 0..<mesh.edge_count():
+        owner.append(-1.0)
+        uses.append(0)
+        trim.append(false)
+    for face in 0..<mesh.face_count():
+        let cad = mesh.attribute_value(parent, face, 0)
+        for at in 0..<mesh.face_size(face):
+            let edge = mesh.face_edge(face, at)
+            if uses[edge] > 0 and owner[edge] != cad: trim[edge] = true
+            owner[edge] = cad
+            uses[edge] += 1
+    for face in 0..<mesh.face_count():
+        let cad = int(mesh.attribute_value(parent, face, 0))
+        let size = mesh.face_size(face)
+        for at in 0..<size:
+            let edge = mesh.face_edge(face, at)
+            if not (trim[edge] or uses[edge] == 1): continue
+            let a = mesh.point(mesh.face_point(face, at))
+            let b = mesh.point(mesh.face_point(face, (at + 1) % size))
+            for end in [a, b]:
+                if distance_to(lines[cad], end) > p: print(f"a trim point {end.x},{end.y},{end.z} lies {distance_to(lines[cad], end)} off its face's edges")
+                assert(distance_to(lines[cad], end) <= p)
+            let middle = a.add(b).multiply_scalar(0.5)
+            let off = distance_to(lines[cad], middle)
+            let allowed = p + b.subtract(a).length() * 0.5 * math.tan(degrees * math.pi / 720.0)
+            if off > allowed: print(f"a trim side's middle {middle.x},{middle.y},{middle.z} lies {off} off its edges ({allowed} allowed)")
+            assert(off <= allowed)
+    # A flat CAD face's triangles come from its boundary alone (no angle
+    # refines a plane): its aspect is its outline's, not the mesher's.
+    let flat: list[bool] = []
+    let first: list[Vector3] = []
+    for face in 0..<lines.length:
+        flat.append(true)
+        first.append(Vector3())
+    for triangle in 0..<mesh.index_count() // 3:
+        let cad = int(mesh.attribute_value(parent, mesh.triangle_face(triangle), 0))
+        for corner in 0..<3:
+            let n = mesh.vertex(mesh.index(triangle * 3 + corner)).normal
+            if first[cad].length() == 0.0: first[cad] = n
+            elif n.subtract(first[cad]).length() > 1e-6: flat[cad] = false
+    # Each CAD face's longest mesh side: a sliver of three trim points
+    # under a tenth of it (a cap of a trim's own nearly straight samples)
+    # is no needle.
+    let on_trim = trim_points(mesh)
+    let longest_side: list[float] = []
+    for face in 0..<lines.length: longest_side.append(0.0)
+    for triangle in 0..<mesh.index_count() // 3:
+        let cad = int(mesh.attribute_value(parent, mesh.triangle_face(triangle), 0))
+        for corner in 0..<3:
+            let a = mesh.vertex(mesh.index(triangle * 3 + corner)).position
+            let b = mesh.vertex(mesh.index(triangle * 3 + (corner + 1) % 3)).position
+            longest_side[cad] = math.max(longest_side[cad], b.subtract(a).length())
+    let limit = math.cos(degrees * math.pi / 180.0)
+    for triangle in 0..<mesh.index_count() // 3:
+        let va = mesh.vertex(mesh.index(triangle * 3))
+        let vb = mesh.vertex(mesh.index(triangle * 3 + 1))
+        let vc = mesh.vertex(mesh.index(triangle * 3 + 2))
+        let ab = vb.position.subtract(va.position)
+        let ac = vc.position.subtract(va.position)
+        let bc = vc.position.subtract(vb.position)
+        let n = ab.cross(ac)
+        let twice = n.length()
+        let longest = math.max(ab.length(), math.max(ac.length(), bc.length()))
+        assert(twice > 0.0)
+        let ratio = longest * longest / twice
+        let cad = int(mesh.attribute_value(parent, mesh.triangle_face(triangle), 0))
+        var cap = longest * 10.0 < longest_side[cad]
+        for corner in 0..<3: cap = cap and on_trim[mesh.corner_point(mesh.index(triangle * 3 + corner))]
+        let curved = not flat[cad] and not cap
+        if curved and ratio > aspect: print(f"display triangle {triangle} of CAD face {cad} aspect {ratio}: {va.position.x},{va.position.y},{va.position.z}; {vb.position.x},{vb.position.y},{vb.position.z}; {vc.position.x},{vc.position.y},{vc.position.z}")
+        assert(not curved or ratio <= aspect)
+        # A sliver's facing is how its nearly straight corners happen to
+        # lie (the aspect guard is its check): normals are checked on
+        # triangles of a display's aspect.
+        if ratio > display_aspect: continue
+        let facing = n.multiply_scalar(1.0 / twice)
+        for normal in [va.normal, vb.normal, vc.normal]:
+            if facing.dot(normal) < limit * normal.length(): print(f"display triangle {triangle} of CAD face {cad} (aspect {ratio}) turns {math.acos(facing.dot(normal) / normal.length()) * 180.0 / math.pi} degrees from its surface: {va.position.x},{va.position.y},{va.position.z}; {vb.position.x},{vb.position.y},{vb.position.z}; {vc.position.x},{vc.position.y},{vc.position.z}")
+            assert(facing.dot(normal) >= limit * normal.length())
+
+## Each of `model`'s faces' boundaries as a polyline, 256 pieces an edge.
+pub func brep_lines(model: BrepModel) -> list[list[Vector3]]!:
+    let lines: list[list[Vector3]] = []
+    for face in 0..<model.face_count():
+        let line: list[Vector3] = []
+        for use in 0..<model.face_edge_count(face):
+            for k in 0..<257: line.append(model.face_edge_point(face, use, float(k) / 256.0))
+        lines.append(line)
+    return lines
+
+## The same for a CadModel.
+pub func cad_lines(model: CadModel) -> list[list[Vector3]]!:
+    let lines: list[list[Vector3]] = []
+    for face in 0..<model.face_count():
+        let line: list[Vector3] = []
+        for use in 0..<model.face_edge_count(face):
+            for k in 0..<257: line.append(model.face_edge_point(face, use, float(k) / 256.0))
+        lines.append(line)
+    return lines
+
+## The distance from `p` to polyline `line`'s points and segments.
+func distance_to(line: list[Vector3], p: Vector3) -> float:
+    var least = 1e300
+    for k in 0..<line.length - 1:
+        let a = line[k]
+        let ab = line[k + 1].subtract(a)
+        let length2 = ab.dot(ab)
+        var t = 0.0
+        if length2 > 0.0: t = math.max(0.0, math.min(1.0, p.subtract(a).dot(ab) / length2))
+        least = math.min(least, p.subtract(a.add(ab.multiply_scalar(t))).length())
+    return least

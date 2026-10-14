@@ -28,10 +28,10 @@ pub func natural_face(model: const CadModel*, face: str) -> interop.Reference[Ca
     if f < 0: error(invalid, "the face to untrim is not in the body: pick it again")
     let shape_face = w.faces.items[(usize)f]
     let s = &w.surfaces.items[(usize)shape_face.surface]
-    let output = try BrepModel.held(w.tolerances, math.max(w.display, least_tolerance))
+    let output = try BrepModel.held(w.tolerances)
     defer output.release()
     let b = output.value()
-    if s.kind == surface_spline: try untrim_spline(b, s, shape_face.sense, w.tolerance)
+    if s.kind == surface_spline: try untrim_spline(b, s, shape_face.sense)
     elif s.kind == surface_plane: try untrim_plane(b, &w, (usize)f)
     elif s.kind == surface_cylinder or s.kind == surface_cone: try untrim_band(b, &w, (usize)f)
     elif s.kind == surface_sphere:
@@ -57,13 +57,15 @@ pub func natural_face(model: const CadModel*, face: str) -> interop.Reference[Ca
 
 ## A B-spline's whole domain: its boundary rows as edges, counterclockwise
 ## in its chart (clockwise when the face faces against its normal).
-func untrim_spline(b: BrepModel*, s: const Surface*, sense: bool, tol: f64) -> !:
+func untrim_spline(b: BrepModel*, s: const Surface*, sense: bool) -> !:
     let surface = try b.add_spline_surface(s.points, s.weights, s.nu, s.nv, s.du, s.dv, s.ku, s.kv)
     let nu = (usize)s.nu
     let nv = (usize)s.nv
     # The corners (u, v) = (0, 0), (1, 0), (1, 1), (0, 1).
     let corners: Vector3[4] = [s.points[0], s.points[(nu - 1) * nv], s.points[(nu - 1) * nv + nv - 1], s.points[nv - 1]]
     var vertices: i64[4] = [-1, -1, -1, -1]
+    # Corners within the resolution are one (a collapsed side, a pole).
+    let tol = b.cad_tolerances().resolution()
     for k in 0..<(usize)4:
         for j in 0..<k:
             if vertices[k] < 0 and corners[j].subtract(corners[k]).length() <= tol: vertices[k] = vertices[j]
@@ -255,7 +257,7 @@ pub func replaced_face(model: const CadModel*, face: str, replacement: const Cad
     let rest = try without_face(model, face) else return held.clone()
     defer rest.release()
     let b = model.brep() else error(invalid, "Untrim needs a B-rep body")
-    let within = math.min(1.0, gap if gap > 0.0 else b.base_tolerance() * 10.0)
+    let within = math.min(1.0, gap if gap > 0.0 else b.cad_tolerances().positional)
     let pair: interop.Reference[CadModel][2] = [rest, held]
     let stitched = stitch_models(pair[..<2], within) catch failure:
         return try joined_bodies(rest.value(), replacement)
@@ -263,13 +265,13 @@ pub func replaced_face(model: const CadModel*, face: str, replacement: const Cad
 
 ## A body of one B-spline face over its whole domain (Trim Convert's
 ## result), named `name`, facing along its normal with `sense`.
-pub func spline_face(tolerances: CadTolerances, points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], sense: bool, name: str, tolerance: f64) -> interop.Reference[CadModel]!:
+pub func spline_face(tolerances: CadTolerances, points: const Vector3[], weights: const f64[], nu: i64, nv: i64, du: i64, dv: i64, ku: const f64[], kv: const f64[], sense: bool, name: str) -> interop.Reference[CadModel]!:
     var s = try Surface(surface_spline, Vector3(), Vector3(1.0, 0.0, 0.0), Vector3(0.0, 0.0, 1.0), 0.0, 0.0, points, weights, ku, kv, nu, nv, du, dv)
     defer s.close()
-    let output = try BrepModel.held(tolerances, math.max(tolerance, least_tolerance))
+    let output = try BrepModel.held(tolerances)
     defer output.release()
     let b = output.value()
-    try untrim_spline(b, &s, sense, tolerance)
+    try untrim_spline(b, &s, sense)
     for k in 0..<b.face_count(): try b.set_face_name(k, name)
     return try CadModel.of_brep(output)
 

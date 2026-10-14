@@ -20,7 +20,7 @@ from luce_cad.model import CadModel
 from luce_cad.solids import CadSolids
 from luce_cad.measure import CadMeasure
 from luce_geocore.geocore import Vector3
-from checks import closed, volume
+from checks import closed, measured, volume, contract, cad_lines
 from luce_std import math
 from luce_std import clock
 
@@ -60,10 +60,7 @@ pub func apex_tests() -> unit!:
     near(volume(square.tessellate(16)), 2000.0, 1e-6, "pyramid")
     # Every edge: the Steiner volume.
     let rounded = CadModeling.filleted(square, "", 1.0, "f", 1)
-    let coarse = volume(rounded.tessellate(32))
-    let mesh = rounded.tessellate(64)
-    closed(mesh)
-    near(volume(mesh) + (volume(mesh) - coarse) / 3.0, 1933.19692, 0.01, "pyramid rounded whole")
+    near(measured(rounded), 1933.19692, 0.01, "pyramid rounded whole")
     # The four edges at the apex: a ball there.
     let apex = func (a: Vector3, b: Vector3) -> bool:
         return a.y > 14.0 or b.y > 14.0
@@ -72,12 +69,9 @@ pub func apex_tests() -> unit!:
     for face in 0..<tipped.face_count():
         if tipped.face_surface_kind(face) == 4: spheres += 1
     assert(spheres == 1)
-    var previous = 0.0
-    for d in [16, 32, 64]:
-        let m = tipped.tessellate(d)
-        closed(m)
-        if d == 64: near(volume(m), previous, 0.003, "apex rounded, converging")
-        previous = volume(m)
+    for d in [16, 32, 64]: closed(tipped.tessellate(d))
+    let previous = CadMeasure.volume(tipped, 64)
+    near(previous, CadMeasure.volume(tipped, 32), 0.003, "apex rounded, converging")
     assert(previous < 2000.0 - 7.0 and previous > 2000.0 - 9.0)
     # A rectangular base: no ball touches the apex's four faces.
     let oblong = pyramid(12.0)
@@ -89,8 +83,9 @@ pub func apex_tests() -> unit!:
             let at64 = made.tessellate(64)
             closed(at32)
             closed(at64)
-            near(volume(at64), volume(at32), 0.02, f"rectangular pyramid, {what} G{continuity}, converging")
-            assert(volume(at64) < 1200.0 - 1.0)
+            let fine = CadMeasure.volume(made, 64)
+            near(fine, CadMeasure.volume(made, 32), 0.02, f"rectangular pyramid, {what} G{continuity}, converging")
+            assert(fine < 1200.0 - 1.0)
             # Every edge G2: its base corners are three-sided (Fusion's
             # Rolling ball), not square, so G1 there; G2 under Setback.
             let level = 1 if continuity == 2 and references == "" else continuity
@@ -103,15 +98,19 @@ pub func apex_tests() -> unit!:
     if held.passed() != held.edge_count(): print(f"rectangular pyramid, every edge G2, Setback: {held.summary()}")
     assert(held.passed() == held.edge_count())
     lean_corners(oblong, oblong_apex)
-    print("PASS four edges at a vertex: a square pyramid rounded whole (the Steiner volume), its apex's four edges met by one ball (closed, converging), a rectangular pyramid's apex closed by an eight-sided setback patch, G1 and G2 (alone and with every edge), built directly in under 300 ms with no face over 20,000 triangles at 32 divisions")
+    print("PASS four edges at a vertex: a square pyramid rounded whole (the Steiner volume), its apex's four edges met by one ball (closed, converging), a rectangular pyramid's apex closed by an eight-sided setback patch, G1 and G2 (alone and with every edge), built directly in under 300 ms with no face over 25,000 triangles at 32 divisions, trims on their edges, no needles, normals within two steps")
 
 ## The rectangular pyramid's fillets are built directly (local_blend.lucb),
 ## its corners of four edges too: each in well under 300 ms (2 s by
 ## booleans; SMLib 30 ms), and their meshes lean: at 32 divisions no face
-## over 20,000 triangles (the booleans' strips had 54,000 each), the apex
-## G1 under 120,000 in all and every edge G2 under 300,000.
+## over 25,000 triangles (the booleans' strips had 54,000 each; a G2 strip
+## along a slanted edge, its ends' rows matched to two corner patches'
+## sides, has 23,700), the apex G1 under 130,000 in all (its cylinders
+## rowed to row_stretch) and every edge G2
+## under 300,000; each keeps the mesh contract (checks.contract) at twice
+## the step angle.
 func lean_corners(oblong: CadModel, apex: str) -> unit!:
-    for (references, continuity, most) in [(apex, 1, 120000), ("", 1, 200000), (apex, 2, 200000), ("", 2, 300000)]:
+    for (references, continuity, most) in [(apex, 1, 130000), ("", 1, 200000), (apex, 2, 200000), ("", 2, 300000)]:
         let start = clock.now()
         let made = CadModeling.filleted(oblong, references, 1.0, "o", continuity)
         let took = float(start.elapsed().milliseconds())
@@ -126,5 +125,11 @@ func lean_corners(oblong: CadModel, apex: str) -> unit!:
         var largest = 0
         for count in counts:
             if count > largest: largest = count
-        if largest > 20000 or mesh.index_count() // 3 > most: print(f"rectangular pyramid G{continuity}: {mesh.index_count() // 3} triangles, a face of {largest}")
-        assert(largest <= 20000 and mesh.index_count() // 3 <= most)
+        if largest > 25000 or mesh.index_count() // 3 > most: print(f"rectangular pyramid G{continuity}: {mesh.index_count() // 3} triangles, a face of {largest}")
+        assert(largest <= 25000 and mesh.index_count() // 3 <= most)
+        # A corner patch's trims are sampled for its own tight curvature and
+        # shared with the coarser strips beside it, which fan to them: slivers
+        # to aspects of about 4,000 (the size-based mesher's reached 21,000)
+        # until those strips grade toward a dense trim (open,
+        # docs/research/KERNEL-ROBUSTNESS.md).
+        contract(mesh, cad_lines(made), 5000.0, 5.625)

@@ -1,0 +1,96 @@
+## A body's volume, measured: its double-precision mesh's (the divergence
+## theorem over its display triangles), with each triangle's cap added, the
+## volume between the flat triangle and the face's surface over it,
+## integrated by Gauss quadrature. A flat triangle cuts off its surface by
+## the square of the step angle; the caps take that back, so the volume
+## follows the B-rep to the order of the step's fourth power, not its
+## square, with no extrapolation between meshes.
+
+## Gauss's six-point rule on a triangle (exact for quintics): barycentric
+## coordinates (the third is one less the other two) and weights summing
+## to one.
+let gauss_a: f64 = 0.445948490915965
+let gauss_b: f64 = 0.091576213509771
+let gauss_wa: f64 = 0.223381589678011
+let gauss_wb: f64 = 0.109951743655322
+
+## The volume of `model`'s B-rep meshed at `steps` per quarter turn and
+## `chord` (MeshQuality's), caps included.
+func body_volume(model: const CadModel*, steps: i64, chord: f64) -> f64!:
+    let b = model.brep() else error(invalid, "a volume needs a B-rep body")
+    let mesh = try b.precise_mesh(steps, chord)
+    defer mesh.release()
+    let m = mesh.value()
+    let parent = m.find_attribute("cad_face", 2)
+    if parent < 0: error(invalid, "a measured mesh has no CAD faces")
+    var surfaces = Growing[Surface]()
+    defer:
+        for k in 0..<surfaces.count: surfaces.items[k].close()
+        surfaces.close()
+    var places = Growing[Matrix4]()
+    defer places.close()
+    var backs = Growing[Matrix4]()
+    defer backs.close()
+    for f in 0..<b.face_count():
+        var record = try b.face_record(f)
+        defer record.close()
+        try surfaces.push(try b.surface_record(record.surface))
+        try places.push(record.placement)
+        try backs.push(try record.placement.inverse())
+    # Each face's last foot on its B-spline, the next search's start.
+    var seeds = Growing[Vector3]()
+    defer seeds.close()
+    try seeds.fill(surfaces.count, Vector3(-1.0, -1.0, 0.0))
+    var total = 0.0
+    let bary: Vector3[6] = [Vector3(gauss_a, gauss_a, 0.0), Vector3(1.0 - 2.0 * gauss_a, gauss_a, 0.0), Vector3(gauss_a, 1.0 - 2.0 * gauss_a, 0.0), Vector3(gauss_b, gauss_b, 0.0), Vector3(1.0 - 2.0 * gauss_b, gauss_b, 0.0), Vector3(gauss_b, 1.0 - 2.0 * gauss_b, 0.0)]
+    let weights: f64[6] = [gauss_wa, gauss_wa, gauss_wa, gauss_wb, gauss_wb, gauss_wb]
+    for triangle in 0..<m.index_count() // 3:
+        var corners: Vector3[3] = [Vector3(), Vector3(), Vector3()]
+        for k in 0..<(usize)3:
+            let corner = m.index(triangle * 3 + (i64)k)
+            defer corner.release()
+            corners[k] = try m.point(try m.corner_point(try corner.get()))
+        let a = corners[0]
+        let ab = corners[1].subtract(a)
+        let ac = corners[2].subtract(a)
+        total += a.dot(corners[1].cross(corners[2])) / 6.0
+        let cross = ab.cross(ac)
+        let twice = cross.length()
+        if not (twice > 0.0): continue
+        let n = cross.multiply_scalar(1.0 / twice)
+        let f = (usize)(try m.attribute_value(parent, try m.triangle_face(triangle), 0))
+        let s = &surfaces.items[f]
+        if s.kind == surface_plane: continue
+        let back = backs.items[f]
+        # The cap: the surface's offset above the triangle, along its
+        # outward normal, integrated over it.
+        var cap = 0.0
+        for k in 0..<(usize)6:
+            let q = a.add(ab.multiply_scalar(bary[k].x)).add(ac.multiply_scalar(bary[k].y))
+            let local = back.transform_point(q)
+            let on = try foot_of(s, local, &seeds.items[f], b.cad_tolerances().resolution())
+            cap += weights[k] * places.items[f].transform_direction(on.subtract(local)).dot(n)
+        total += cap * twice * 0.5
+    return total
+
+## The point of surface `s` nearest `p`: an analytic surface's along its
+## normal (signed_gap); a B-spline's by Newton from `seed` (the face's last
+## foot, updated), or from its lattice when that start is unset or leads
+## off the normal through `p`.
+func foot_of(s: const Surface*, p: Vector3, seed: Vector3*, tolerance: f64) -> Vector3!:
+    if s.kind != surface_spline:
+        let (gap, normal) = try signed_gap(s, p, tolerance)
+        return p.subtract(normal.multiply_scalar(gap))
+    var uv = try nearest_parameters(*s, p, *seed, seed.x < 0.0)
+    var on = try evaluate(*s, uv)
+    let off = p.subtract(on)
+    let n = try nurbs_normal(*s, uv)
+    if seed.x >= 0.0 and off.cross(n).length() > off.length() * foot_alignment:
+        uv = try nearest_parameters(*s, p, *seed, true)
+        on = try evaluate(*s, uv)
+    *seed = uv
+    return on
+
+## A foot found from the last one is taken when `p` lies off it along the
+## surface's normal to within this sine.
+let foot_alignment: f64 = 1e-3

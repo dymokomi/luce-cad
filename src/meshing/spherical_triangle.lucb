@@ -9,7 +9,7 @@
 ## (a latitude-longitude chart crowds or folds triangles about its pole).
 ## Arcs sampled unequally are left to the general meshers.
 
-pub func barycentric_sphere(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], tolerance: f64, divisions: i64) -> !:
+pub func barycentric_sphere(mesh: MeshBuilder*, face: BrepFace, surface: Surface, samples: const Samples[], divisions: Density) -> !:
     # Each side's samples the way the loop runs, one after another.
     var ids = Growing[i64]()
     defer ids.close()
@@ -26,17 +26,17 @@ pub func barycentric_sphere(mesh: MeshBuilder*, face: BrepFace, surface: Surface
     for at in 0..<(usize)3:
         if ids.items[starts[at] + n] != ids.items[starts[(at + 1) % 3]]: error(invalid, "a sphere triangle's sides do not chain")
     let sides = ids.view()
-    # Its triangles are about as fine as the arcs' samples: those must keep
-    # the target the general meshers keep (analytic_trim's, for a whole
-    # sphere), with room for the grid's stretch, or they mesh it.
+    # Its triangles are about as fine as the arcs' samples (an octant's
+    # grid triangles about 1.2 times their steps): each arc piece must turn
+    # no more than the step angle, or the general meshers mesh it.
     let c = surface.origin
-    let deviation = analytic_target(surface, 0.0, divisions, tolerance) / grid_stretch
+    let step = math.pi * 0.5 / (f64)divisions.steps
     for at in 0..<(usize)3:
         for k in 0..<n:
             let p = mesh.points[(usize)ids.items[starts[at] + k]].subtract(c)
             let q = mesh.points[(usize)ids.items[starts[at] + k + 1]].subtract(c)
-            let half = 0.5 * math.acos(math.clamp(p.dot(q) / (p.length() * q.length()), -1.0, 1.0))
-            if surface.radius * (1.0 - math.cos(half)) > deviation: error(invalid, "a sphere triangle's arcs are sampled too coarsely for a grid")
+            let turn = math.acos(math.clamp(p.dot(q) / (p.length() * q.length()), -1.0, 1.0))
+            if turn > step * (1.0 + step_slack): error(invalid, "a sphere triangle's arcs are sampled too coarsely for a grid")
     # Point (a, b): side 0 is b = 0 (A to B), side 1 is a + b = n (B to
     # C), side 2 is a = 0 (C to A).
     let width = n + 1
@@ -71,6 +71,10 @@ pub func barycentric_sphere(mesh: MeshBuilder*, face: BrepFace, surface: Surface
             if a + b + 1 < n:
                 let second: i64[3] = [grid[(a + 1) * width + b], grid[(a + 1) * width + b + 1], grid[a * width + b + 1]]
                 try push_triangle(mesh, second, forward)
+
+## How far past the step angle an arc piece may turn: its samples' own
+## roundoff, not a coarser grid.
+let step_slack: f64 = 1e-9
 
 func push_triangle(mesh: MeshBuilder*, corners: i64[3], forward: bool) -> !:
     try mesh.face(3)

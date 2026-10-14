@@ -2,35 +2,27 @@
 ## and the tessellator read), made once per model and kept, with its
 ## meshes, until the model changes.
 extend BrepModel:
-    ## For modeling (luce-cad's modeling module): the tolerance, vertex
-    ## `index`, and owned records of an edge, a surface and a face.
-    ## The model's tolerance, or the largest edge or vertex precision when
-    ## a stitch or an import made one larger: how far a trim may lie off its
-    ## surface anywhere in it (Surface.trim_tolerance). Meshing works to the
-    ## model's own tolerance and modeling to the project's (shape_of), each
-    ## tolerant entity to its own precision.
-    pub func model_tolerance() -> f64:
-        var most = self.tolerance
+    ## The widest edge or vertex precision (0 when every entity is exact):
+    ## how far a trim may lie off its surface anywhere in the model beyond
+    ## the positional tolerance (Surface.trim_tolerance).
+    pub func widest_precision() -> f64:
+        var most = 0.0
         for p in self.edge_precision.view(): most = math.max(most, p)
         for p in self.vertex_precision.view(): most = math.max(most, p)
         return most
 
-    ## The model's own tolerance, whatever its edges' precision.
-    pub func base_tolerance() -> f64:
-        return self.tolerance
-
     ## Edge `index`'s precision: how far its faces may lie from it (Parasolid's
-    ## tolerant edge); the model's tolerance unless Stitch joined it across a
-    ## larger gap.
+    ## tolerant edge, a stitch's or an import's); 0 when it is exact (to the
+    ## project's resolution).
     pub func edge_precision_of(index: i64) -> f64!:
         if index < 0 or index >= self.edge_count(): error(invalid, "B-rep edge out of range")
-        return math.max(self.tolerance, self.edge_precision.get((usize)index))
+        return self.edge_precision.get((usize)index)
 
     pub func vertex_precision_of(index: i64) -> f64!:
         if index < 0 or index >= self.vertex_count(): error(invalid, "B-rep vertex out of range")
-        return math.max(self.tolerance, self.vertex_precision.get((usize)index))
+        return self.vertex_precision.get((usize)index)
 
-    ## Give edge `index` precision `value` (0: the model's tolerance).
+    ## Give edge `index` precision `value` (0: exact).
     pub func set_edge_precision(index: i64, value: f64) -> !:
         if index < 0 or index >= self.edge_count() or not math.is_finite(value) or value < 0.0: error(invalid, "invalid B-rep edge precision")
         try self.edge_precision.set((usize)index, value)
@@ -109,16 +101,16 @@ extend BrepModel:
         return made
 
     ## A kept tessellation for these parameters (another owner), or none.
-    func kept_mesh(divisions: i64, edge_size: f64, curvature: bool, directions: bool) -> interop.Reference[Mesh]?:
+    func kept_mesh(divisions: Density, edge_size: f64, curvature: bool, directions: bool) -> interop.Reference[Mesh]?:
         let derived = self.derived
         derived.lock.lock()
         defer derived.lock.unlock()
         for kept in derived.meshes.view():
-            if kept.divisions == divisions and kept.edge_size == edge_size and kept.curvature == curvature and kept.directions == directions: return kept.mesh.clone()
+            if kept.divisions.steps == divisions.steps and kept.divisions.chord == divisions.chord and kept.edge_size == edge_size and kept.curvature == curvature and kept.directions == directions: return kept.mesh.clone()
         return none
 
     ## Keep `mesh` for these parameters (the last four are kept).
-    func keep_mesh(divisions: i64, edge_size: f64, curvature: bool, directions: bool, mesh: interop.Reference[Mesh]) -> !:
+    func keep_mesh(divisions: Density, edge_size: f64, curvature: bool, directions: bool, mesh: interop.Reference[Mesh]) -> !:
         let derived = self.derived
         derived.lock.lock()
         defer derived.lock.unlock()
@@ -164,7 +156,7 @@ func make_records(model: const BrepModel*) -> Records*!:
         edges[index] = try model.curve(index)
         made.made_edges += 1
     # Trims are held to the validity contract (Surface.trim_tolerance).
-    let contract = math.max(model.cad_tolerances().positional, model.model_tolerance())
+    let contract = math.max(model.cad_tolerances().positional, model.widest_precision())
     for index in 0..<surfaces.length:
         surfaces[index] = try model.surface(index)
         surfaces[index].trim_tolerance = contract

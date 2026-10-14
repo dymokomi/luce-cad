@@ -1,32 +1,74 @@
 ## A B-rep's display meshes: the whole model's (kept by settings), one
 ## face's preview, and one face's planned mesh.
+## The display mesh is single precision: how many units in the last place
+## of a float at the largest coordinate two of its points may differ by
+## and still be one point, and a float's unit in the last place as a share
+## of its binade (2^-23).
+let display_ulps: f64 = 16.0
+let single_ulp: f64 = 1.1920928955078125e-7
+
 extend BrepModel:
+    ## What the mesher takes as one point (its `tolerance`): the project's
+    ## resolution R, the B-rep's exactness (its edges and vertices meet to
+    ## R), or, where coordinates are so large that the single-precision
+    ## display mesh cannot tell points that far apart, `display_ulps` units
+    ## in the last place of a float at the largest coordinate. Neither is a
+    ## share of the model's size: a part's mesh depends on where it lies
+    ## only as far as a float can show it there. How finely curved faces are
+    ## meshed is the mesh quality's angle (MeshQuality); how far a trim may
+    ## lie off its surface is the validity contract (P,
+    ## Surface.trim_tolerance).
+    func mesh_roundoff(records: const Records*) -> f64:
+        var most = 0.0
+        for p in self.vertices.view(): most = math.max(most, math.max(math.abs(p.x), math.max(math.abs(p.y), math.abs(p.z))))
+        for s in records.surfaces:
+            let reach = math.abs(s.radius) + math.abs(s.angle) if s.kind != surface_spline else 0.0
+            most = math.max(most, math.max(math.abs(s.origin.x), math.max(math.abs(s.origin.y), math.abs(s.origin.z))) + reach)
+            for p in s.points: most = math.max(most, math.max(math.abs(p.x), math.max(math.abs(p.y), math.abs(p.z))))
+        # The binade of the largest coordinate (a power of two: moving a
+        # point within it keeps the bound, and the untouched faces' cached
+        # meshes).
+        var binade = 1.0
+        while binade * 2.0 <= most: binade *= 2.0
+        while binade > most and binade > 1.0e-300: binade *= 0.5
+        return math.max(self.tolerances.resolution(), binade * single_ulp * display_ulps)
+
     ## Disposable per-face display mesh; independent of the whole-model budget.
     pub func preview_face(face: i64, divisions: i64 = 8) -> interop.Reference[Mesh]!:
         try self.check_face(face)
         let records = try self.tessellation_records()
         let entry = records.faces[(usize)face]
-        return try published(try face_mesh(self.vertices.view(), records.edges, records.surfaces[(usize)entry.surface], entry, divisions, self.base_tolerance()))
+        return try published(try face_mesh(self.vertices.view(), records.edges, records.surfaces[(usize)entry.surface], entry, Density(divisions), self.mesh_roundoff(records)))
 
     ## Boundary-conforming tessellation; each shared edge is sampled once.
     ## `curvature` adds corner attributes curvature.k1/k2 (principal
     ## curvatures, k1 >= k2, positive where convex); `directions` adds the unit
     ## principal directions curvature.d1/d2. Both are off by default.
     ## With `quick`, a copy with moved cvs may answer with its quick preview
-    ## (quick.lucb) instead of tessellating.
-    pub func mesh(divisions: i64 = 16, edge_size: f64 = 0.0, progress: interop.Callback[f64, unit]? = none, curvature: bool = false, directions: bool = false, quick: bool = false) -> interop.Reference[Mesh]!:
+    ## (quick.lucb) instead of tessellating. `divisions` steps per quarter
+    ## turn (MeshQuality's angle); `chord` (mm, 0: none) the farthest the
+    ## mesh may stray from its surfaces.
+    pub func mesh(steps: i64 = 16, edge_size: f64 = 0.0, progress: interop.Callback[f64, unit]? = none, curvature: bool = false, directions: bool = false, quick: bool = false, chord: f64 = 0.0) -> interop.Reference[Mesh]!:
         if not math.is_finite(edge_size) or edge_size < 0.0:
             error(invalid, "edge size must be finite and nonnegative")
+        let divisions = Density(steps, chord)
         # The same parameters give the same mesh: share the kept one.
         if let kept = self.kept_mesh(divisions, edge_size, curvature, directions): return kept
         if quick:
             if let fast = try self.quick_mesh(divisions, edge_size, curvature, directions): return fast
         let records = try self.tessellation_records()
-        let raw = try published(try tessellate(self.vertices.view(), records.edges, records.surfaces, records.faces, divisions, self.base_tolerance(), edge_size, progress, -1, curvature, directions, try self.face_cache()))
+        let raw = try published(try tessellate(self.vertices.view(), records.edges, records.surfaces, records.faces, divisions, self.mesh_roundoff(records), edge_size, progress, -1, curvature, directions, try self.face_cache()))
         let made = try self.with_paths(raw)
         errdefer made.release()
         try self.keep_mesh(divisions, edge_size, curvature, directions, made)
         return made
+
+    ## Its mesh in double precision (as `mesh` makes it before handing out
+    ## a single-precision copy): each display triangle with its `cad_face`.
+    ## For measuring (CadMeasure.volume), not for display.
+    pub func precise_mesh(steps: i64, chord: f64 = 0.0) -> interop.Reference[Mesh]!:
+        let records = try self.tessellation_records()
+        return try tessellate(self.vertices.view(), records.edges, records.surfaces, records.faces, Density(steps, chord), self.mesh_roundoff(records), 0.0)
 
     ## Takes `mesh`: with each face's B-rep path (by its `cad_face`) in the
     ## `path` text attribute, when any face has one.
@@ -53,11 +95,12 @@ extend BrepModel:
 
     ## Diagnostic face mesh using the complete model's shared edge/layout plan.
     ## Other face jobs are skipped; success does not establish whole-model validity.
-    pub func planned_face(face: i64, divisions: i64 = 16, edge_size: f64 = 0.0) -> interop.Reference[Mesh]!:
+    pub func planned_face(face: i64, steps: i64 = 16, edge_size: f64 = 0.0) -> interop.Reference[Mesh]!:
+        let divisions = Density(steps)
         try self.check_face(face)
         if not math.is_finite(edge_size) or edge_size < 0.0: error(invalid, "edge size must be finite and nonnegative")
         let records = try self.tessellation_records()
-        let result = try tessellate(self.vertices.view(), records.edges, records.surfaces, records.faces, divisions, self.base_tolerance(), edge_size, none, face)
+        let result = try tessellate(self.vertices.view(), records.edges, records.surfaces, records.faces, divisions, self.mesh_roundoff(records), edge_size, none, face)
         defer result.release()
         return try published(try result.value().compacted())
 

@@ -1,4 +1,12 @@
 ## Align numerical grid incidence without moving canonical CAD positions.
+## A trim point moves onto a grid line in the chart only when the surface
+## point it then maps to moves no more than `align_share` of its sample
+## spacing (a mesh-quality allowance, scale-invariant) and stays within the
+## mesher's tolerance of the canonical point (the mesh keeps the canonical
+## point either way).
+
+## The chart snap allowance as a share of a trim point's sample spacing.
+pub let align_share: f64 = 1e-5
 
 pub func align(uv: Vector3[], sizes: const i64[], ids: const i64[], canonical: const Vector3[], surface: Surface, plan: GridLayout, tolerance: f64) -> !:
     let original_uv = try new Vector3[uv.length] --- in memory.heap
@@ -15,7 +23,7 @@ pub func align(uv: Vector3[], sizes: const i64[], ids: const i64[], canonical: c
             let before = canonical[(usize)ids[previous]]
             let after = canonical[(usize)ids[next]]
             let spacing = math.min(p.subtract(before).length(), p.subtract(after).length())
-            let budget = math.min(tolerance * 0.05, spacing * 0.2)
+            let budget = spacing * align_share
             let original = try surface_point(surface, uv[index])
             for axis in 0..<(usize)2:
                 let stations = plan.u if axis == 0 else plan.v
@@ -32,8 +40,13 @@ pub func align(uv: Vector3[], sizes: const i64[], ids: const i64[], canonical: c
                 let grazing = aligned != value and (a - aligned) * (b - aligned) > 0.0
                 if math.abs(aligned - value) > incidence and not grazing and (aligned <= math.min(a, b) or aligned >= math.max(a, b)): continue
                 let support = try surface_point(surface, candidate)
-                let limit = graze_budget(spacing, tolerance) if grazing else budget
-                if support.subtract(original).length() <= limit and support.subtract(p).length() <= tolerance: uv[index] = candidate
+                let limit = graze_budget(spacing, p) if grazing else budget
+                # Never onto a neighbor: two samples would become one.
+                if candidate.subtract(uv[previous]).length() == 0.0 or candidate.subtract(uv[next]).length() == 0.0: continue
+                # A grazed extremum lands on the line by its graze (the mesh keeps
+                # the canonical point); any other point stays within the
+                # mesher's tolerance of it.
+                if support.subtract(original).length() <= limit and support.subtract(p).length() <= (limit if grazing else tolerance): uv[index] = candidate
         begin += count
     # Crossings above can land beside a numerical endpoint that was visited
     # earlier. Resolve that incidence only after all crossings are aligned.
@@ -48,7 +61,7 @@ pub func align(uv: Vector3[], sizes: const i64[], ids: const i64[], canonical: c
             let previous = begin + (at + count - 1) % count
             let next = begin + (at + 1) % count
             let p = canonical[(usize)ids[index]]
-            let budget = math.min(tolerance * 0.05, math.min(p.subtract(canonical[(usize)ids[previous]]).length(), p.subtract(canonical[(usize)ids[next]]).length()) * 0.2)
+            let budget = math.min(p.subtract(canonical[(usize)ids[previous]]).length(), p.subtract(canonical[(usize)ids[next]]).length()) * align_share
             let original = try surface_point(surface, uv[index])
             for axis in 0..<(usize)2:
                 let value = coordinate(uv[index], axis)

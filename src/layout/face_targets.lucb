@@ -6,17 +6,66 @@
 ## never sags more than its interior may, and refining the interior can
 ## always reach its target.
 
-## The target of a face on a plane, cylinder, cone, sphere or torus whose
-## loops span `extent`: relative to the face's extent, or to its whole
-## surface's when that is larger (a sphere's, a torus's, a cylinder's
-## section), so a small patch is meshed as densely as its surface would
-## be, not more.
-pub func analytic_target(s: Surface, extent: f64, divisions: i64, tolerance: f64) -> f64:
-    var size = extent
-    if s.kind == surface_sphere: size = math.max(size, s.radius * 3.4641016151377544)
-    elif s.kind == surface_torus: size = math.max(size, (s.radius + s.angle) * 2.0)
-    elif s.kind == surface_cylinder or s.kind == surface_cone: size = math.max(size, s.radius * 2.0)
-    return math.max(tolerance, size / ((f64)divisions * (f64)divisions * 16.0))
+## The target of a face on a cylinder, cone, sphere or torus: the sag of a
+## mesh edge turning the step angle (a quarter turn over `divisions`) on
+## the surface's tightest radius, so a face meshes by angle, whatever its
+## size or extent (`extent` is not used), never finer than the mesher's
+## identity `tolerance` (the B-rep's exactness, or what the display can
+## show). A plane has none.
+pub func analytic_target(s: Surface, extent: f64, divisions: Density, tolerance: f64) -> f64:
+    _ = extent
+    var radius = math.abs(s.radius)
+    if s.kind == surface_torus: radius = math.min(math.abs(s.angle), math.abs(math.abs(s.radius) - math.abs(s.angle)))
+    return math.max(tolerance, divisions.within(step_sag(radius, divisions)))
+
+## How far a chord of a circle of `radius` turning a quarter turn over
+## `divisions` strays from it.
+pub func step_sag(radius: f64, divisions: Density) -> f64:
+    return radius * (1.0 - math.cos(math.pi * 0.25 / (f64)divisions.steps))
+
+## How far a mesh of surface `s` may stray from it: the sag of a mesh edge
+## turning the step angle on the surface's tightest radius of curvature
+## (analytic_target; a B-spline's from its normal curvatures sampled over
+## its domain, spline_radius), within the chord limit, never under the
+## mesher's identity `tolerance`. A plane has no limit (`flat_sag`).
+pub func surface_sag(s: Surface, divisions: Density, tolerance: f64) -> f64!:
+    if s.kind == surface_plane: return flat_sag
+    if s.kind != surface_spline: return analytic_target(s, 0.0, divisions, tolerance)
+    let radius = try spline_radius(s)
+    if not (radius < flat_radius): return math.max(tolerance, divisions.within(flat_sag))
+    return math.max(tolerance, divisions.within(step_sag(radius, divisions)))
+
+## The sag a mesh of analytic surface `s` may have where it curves least
+## (a torus's around its axis, at its outer radius): what a cell stepping
+## the step angle that way strays. A mapped grid is checked against it, so
+## a cell is not split for straying, the way it turns least, by the sag
+## its tightest way allows (surface_sag is that tightest one).
+pub func loosest_sag(s: Surface, divisions: Density, tolerance: f64) -> f64!:
+    if s.kind == surface_torus: return math.max(tolerance, divisions.within(step_sag(math.abs(s.radius) + math.abs(s.angle), divisions)))
+    return try surface_sag(s, divisions, tolerance)
+
+## A radius of curvature taken as flat.
+let flat_radius: f64 = 1.0e300
+
+## The tightest radius of curvature of B-spline `s`: of its normal
+## curvatures along u, along v and across (the twist), at a 9 by 9 lattice
+## over its domain.
+pub func spline_radius(s: Surface) -> f64!:
+    var most = 0.0
+    for i in 0..<9:
+        for j in 0..<9:
+            let uv = Vector3((f64)i / 8.0, (f64)j / 8.0, 0.0)
+            let jet = try surface_jet(&s, uv, i == 8, j == 8)
+            let lu = jet.su.length()
+            let lv = jet.sv.length()
+            let normal = jet.su.cross(jet.sv)
+            let ln = normal.length()
+            if lu <= 0.0 or lv <= 0.0 or ln <= 0.0: continue
+            let n = normal.multiply_scalar(1.0 / ln)
+            most = math.max(most, math.abs(jet.suu.dot(n)) / (lu * lu))
+            most = math.max(most, math.abs(jet.svv.dot(n)) / (lv * lv))
+            most = math.max(most, math.abs(jet.suv.dot(n)) / (lu * lv))
+    return 1.0 / most if most > 0.0 else flat_radius
 
 ## A B-spline surface's lengths along u and v (x and y): polylines of 16
 ## spans along its middle isoparms.
@@ -30,8 +79,8 @@ pub func spline_lengths(s: Surface) -> Vector3!:
     return lengths
 
 ## The target of a trimmed B-spline face with those lengths.
-pub func spline_target(lengths: Vector3, divisions: i64, tolerance: f64) -> f64:
-    return math.max(tolerance * 4.0, math.min(lengths.x, lengths.y) / ((f64)divisions * (f64)divisions * 4.0))
+pub func spline_target(lengths: Vector3, divisions: Density, tolerance: f64) -> f64:
+    return divisions.sag(math.min(lengths.x, lengths.y), 4.0, tolerance)
 
 ## The angle a circle of `radius` may turn between samples so that its
 ## chords sag at most `target`.
@@ -48,13 +97,8 @@ pub func sphere_triangle(face: BrepFace, surface: Surface, edges: const Curve[],
         if math.abs(edge.radius - surface.radius) > tolerance * 10.0: return false
     return true
 
-## How much more an interior triangle of a sphere triangle's barycentric
-## grid sags than the arcs' steps beside it: an octant's grid triangles
-## are about 1.2 times as long as its arcs' steps.
-pub let grid_stretch: f64 = 1.5
-
 ## Raise each edge's interval count to what its curved faces demand.
-pub func edge_demands(edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], metrics: ArcMetric[], counts: usize[], divisions: i64, tolerance: f64) -> !:
+pub func edge_demands(edges: const Curve[], surfaces: const Surface[], faces: const BrepFace[], metrics: ArcMetric[], counts: usize[], divisions: Density, tolerance: f64) -> !:
     for face in faces:
         let s = surfaces[(usize)face.surface]
         # A B-spline face's interior target is the trimmed fallback's
@@ -66,19 +110,35 @@ pub func edge_demands(edges: const Curve[], surfaces: const Surface[], faces: co
         # from that loop (spherical_cap, sphere_disk), with no interior target.
         let corner = sphere_triangle(face, s, edges, tolerance)
         if s.kind == surface_sphere and not corner and (try circles_axis(face, s, edges)): continue
-        var box_low = try edges[edge_index(face.uses[0])].at(0.0)
-        var box_high = box_low
-        for use in face.uses:
-            let edge = edges[edge_index(use)]
-            for step in 0..<9:
-                let p = try edge.at((f64)step / 8.0)
-                box_low = Vector3(math.min(box_low.x, p.x), math.min(box_low.y, p.y), math.min(box_low.z, p.z))
-                box_high = Vector3(math.max(box_high.x, p.x), math.max(box_high.y, p.y), math.max(box_high.z, p.z))
-        var target = analytic_target(s, box_high.subtract(box_low).length(), divisions, tolerance)
-        if corner: target = target / grid_stretch
+        # Each edge takes as many pieces as the surface's normal turns along
+        # it over the step angle (the turn that way, whatever the surface
+        # does across it).
+        let step = math.pi * 0.5 / (f64)divisions.steps
+        # A cylinder's rows across its axis step the angle round it: an
+        # edge running along the axis takes as many pieces as keep its
+        # cells no more than row_stretch times longer than wide.
+        let across = math.abs(s.radius) * math.pi * 0.5 / (f64)divisions.steps
         for use in face.uses:
             let index = edge_index(use)
-            counts[index] = try demanded_intervals(edges[index], &metrics[index], counts[index], target, tolerance)
+            let turn = try normal_turn(edges[index], s)
+            counts[index] = (usize)math.max((f64)counts[index], math.min(1024.0, math.ceil(turn / step - 1e-9)))
+            if s.kind == surface_cylinder and across > 0.0:
+                let along = math.abs((try edges[index].at(1.0)).subtract(try edges[index].at(0.0)).dot(s.z))
+                counts[index] = (usize)math.max((f64)counts[index], math.min(1024.0, math.ceil(along / (across * row_stretch) - 1e-9)))
+
+## How far analytic surface `s`'s normal turns along `edge` (radians), by
+## 64 pieces.
+func normal_turn(edge: Curve, s: Surface) -> f64!:
+    var seed = Vector3()
+    var previous = Vector3()
+    var turn = 0.0
+    for at in 0..<65:
+        let p = try edge.at((f64)at / 64.0)
+        seed = chart_uv(s, p, seed, at > 0)
+        let n = try support_normal(s, seed)
+        if at > 0: turn += math.acos(math.clamp(n.dot(previous) / math.max(n.length() * previous.length(), nonzero), -1.0, 1.0))
+        previous = n
+    return turn
 
 ## Whether one of a sphere face's loops goes once round the sphere's axis.
 func circles_axis(face: BrepFace, s: Surface, edges: const Curve[]) -> bool!:
@@ -99,24 +159,3 @@ func circles_axis(face: BrepFace, s: Surface, edges: const Curve[]) -> bool!:
         offset += (usize)size
         if math.abs(math.abs(total) - 2.0 * math.pi) < 0.5: return true
     return false
-
-## The fewest intervals, at least `count` and at most 1024, whose chords
-## stay within `target` of the edge.
-func demanded_intervals(edge: Curve, metric: ArcMetric*, count: usize, target: f64, tolerance: f64) -> usize!:
-    if edge.kind == curve_line or count >= 1024: return count
-    if edge.kind == curve_circle or edge.kind == curve_ellipse:
-        let radius = math.max(edge.radius, edge.weights[0]) if edge.kind == curve_ellipse else edge.radius
-        let needed = math.ceil(math.abs(edge.sweep) / sag_step(radius, target) - 1e-9)
-        return (usize)math.min(1024.0, math.max((f64)count, needed))
-    if (try measure_error(edge, metric, count, tolerance)).x <= target: return count
-    var lower = count
-    var upper = count
-    while upper < 1024:
-        lower = upper
-        upper = (usize)math.min(1024.0, (f64)(upper * 2))
-        if (try measure_error(edge, metric, upper, tolerance)).x <= target: break
-    while upper > lower + 1:
-        let middle = (lower + upper) // 2
-        if (try measure_error(edge, metric, middle, tolerance)).x <= target: upper = middle
-        else: lower = middle
-    return upper
