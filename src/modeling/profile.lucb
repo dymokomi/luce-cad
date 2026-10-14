@@ -12,7 +12,7 @@ import ownership
 from luce_std import math
 from luce_geocore.geocore import Vector3, Matrix4, invalid, GeometrySet
 from luce_geocore.core.growing import Growing
-from luce_geocore.kernel import Curves, CurveType, KnotMode, set_curves, sketch_plane_of, curve_weight_span, CurvesBuilder, empty_set, dispose_set, adopt_set, with_curves
+from luce_geocore.kernel import Curves, CurveType, KnotMode, set_curves, sketch_plane_of, CurvesBuilder, empty_set, dispose_set, adopt_set, with_curves
 from geometry import Surface, NurbsCurve, basis_derivatives, basis_jet, nurbs_basis, surface_normal_checked, project, evaluate, nearest_parameters, nurbs_normal, surface_point, chart_uv, normal_at, surface_distance, interpolate_cubic, edge_index, wrap, union_root, push_decimal, least_tolerance, CadTolerances, surface_plane, surface_cylinder, surface_cone, surface_spline, surface_sphere, surface_torus, curve_line, curve_circle, curve_spline, curve_ellipse, nonzero
 from brep import BrepModel, brep_model_type
 from model import CadModel, cad_model_type
@@ -98,9 +98,12 @@ pub struct Profiles:
         return (self.spline_points.view()[s.first..<s.first + s.count], self.spline_weights.view()[s.first..<s.first + s.count],
                 self.spline_knots.view()[s.knot_first..<s.knot_first + s.count + (usize)s.degree + 1], s.degree)
 
-    ## A point of `edge` at `fraction` of the way along it.
+    ## A point of `edge` at `fraction` of the way along it: its ends exactly
+    ## at 0 and 1.
     pub func edge_at(edge: const ProfileEdge*, fraction: f64) -> Vector3!:
-        if edge.kind == profile_line: return edge.start.add(edge.end.subtract(edge.start).multiply_scalar(fraction))
+        if fraction == 0.0: return edge.start
+        if fraction == 1.0: return edge.end
+        if edge.kind == profile_line: return edge.start.multiply_scalar(1.0 - fraction).add(edge.end.multiply_scalar(fraction))
         if edge.kind == profile_arc:
             let x = try edge.start.subtract(edge.center).normalized()
             let y = self.normal.cross(x)
@@ -320,22 +323,23 @@ func read_curve(curves: const Curves*, curve: usize, result: Profiles*, out: Gro
         return settings.cyclic
     if settings.kind != CurveType.nurbs:
         error(invalid, "profiles read polylines and NURBS curves; convert Bezier and Catmull-Rom curves first")
-    let weights = curve_weight_span(curves)
+    # Points, weights and knots exact (f64) where the sketch kept them.
     var points = Growing[Vector3]()
     defer points.close()
     var w = Growing[f64]()
     defer w.close()
     for at in 0..<count:
         try points.push(curves.point(first + at))
-        var weight = 1.0
-        if let column = weights: weight = (f64)column[first + at]
-        try w.push(weight)
+        try w.push(curves.weight_at(first + at))
     var knots = Growing[f64]()
     defer knots.close()
     let order = settings.order
     let custom = curves.custom_knots(curve)
     if settings.knot_mode == KnotMode.custom and custom.length == count + order:
-        for k in custom: try knots.push((f64)k)
+        if let exact = curves.exact_knots(curve):
+            for k in exact: try knots.push(k)
+        else:
+            for k in custom: try knots.push((f64)k)
     else:
         # Clamped uniform (endpoint) knots; uniform ones as they are.
         for at in 0..<count + order:
