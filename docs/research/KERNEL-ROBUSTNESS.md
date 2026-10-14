@@ -549,6 +549,29 @@ show. These two remain open for the heavy sweep (stage 7) to argue for.
   where named values are defined and not counted). That brings the count from 1005 to 904,
   and the ratchet is 904.
 
+### 3.9 Stage 6, second step: blends fitted to F
+
+- **Blends are fitted to the fit tolerance F.** A fillet's rows (constant,
+  curved, cap loop, rolled and tilted variable fillets, Y corners) and a cap
+  run-out's trim on its wall were fitted to the body's working tolerance, a
+  millionth of its size, so a big part's fit asked for more spans than the
+  fitter allows, and making the working tolerance absolute would have done
+  the same at every size. They now follow `CadTolerances.fit` (0.001 mm by
+  default), whatever the body's size. In practice the fits stop well below
+  F: the regressions' blends come out a few micrometres off at most.
+- **Meshing takes every valid B-rep.** A fitted contact lies within F of the
+  face it trims, which is more than the mesher's own resolution (still a
+  millionth of the model's size). The mesher now holds trims to the
+  validity contract instead: `Surface.trim_tolerance`, set from the model's
+  P (or a tolerant edge's precision, where wider), is how far a trim may lie
+  off its surface. Its resolution for everything else is unchanged.
+  Measuring each fitted edge's distance and making it tolerant was tried
+  first and dropped: sampled distances miss the worst point between
+  samples, and a lattice projection onto a B-spline strip found the wrong
+  foot (a 0.03 mm "gap" on an edge that lies on its strip).
+- **Harness:** unchanged (invariance 0 of 224, band 0 of 452, canonical 0
+  of 23); literals 904 to 900, ratchet 900.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
