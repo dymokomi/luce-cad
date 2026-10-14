@@ -22,7 +22,7 @@ pub struct CadSurfaceBuild:
     ## (0.1 to 3).
     pub static func square(set: interop.Reference[GeometrySet], boundaries: str, continuity: const i64[], angles: const f64[], cubic: bool = false, explicit: bool = false,
                            degree_u: i64 = 5, spans_u: i64 = 1, degree_v: i64 = 5, spans_v: i64 = 1, name: str = "Square",
-                           rebuild: const bool[] = [false, false, false, false], colinear: const bool[] = [false, false, false, false], blend: const f64[] = [0.5, 0.5], influence: const f64[] = [1.0, 1.0]) -> interop.Reference[CadSurfaceEdit]!:
+                           rebuild: const bool[] = [false, false, false, false], colinear: const bool[] = [false, false, false, false], blend: const f64[] = [0.5, 0.5], influence: const f64[] = [1.0, 1.0], tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadSurfaceEdit]!:
         if continuity.length != 4 or angles.length != 4: error(invalid, "Square: one continuity and one angle for each of the four boundaries")
         if rebuild.length != 4 or colinear.length != 4: error(invalid, "Square: Rebuild and Colinear take one flag for each of the four boundaries")
         if blend.length != 2 or influence.length != 2: error(invalid, "Square: Boundary Blend and Influence take one value for 1-3 and one for 2-4")
@@ -35,7 +35,7 @@ pub struct CadSurfaceBuild:
             if continuity[k] < square_free or continuity[k] > square_angle: error(invalid, "Square: a boundary's continuity is Free, G0, G1, G2, Implied Tangent, Implied Curvature or Tangent Angle")
         var made = try square_net(set, boundaries, &opts)
         defer made.net.close()
-        let body = try net_body(&made.net, name, true)
+        let body = try net_body(tolerances, &made.net, name, true)
         defer body.release()
         let edit = try edit_of(try with_body_added(set, body))
         edit.value().deviation = made.deviation
@@ -56,21 +56,21 @@ pub struct CadSurfaceBuild:
     ## (`explicit`: degrees, 0 as built, and spans along u and across v).
     pub static func skin(set: interop.Reference[GeometrySet], sections: str, degree: i64 = 5, closed: bool = false, start: i64 = 0, end: i64 = 0, name: str = "Skin",
                          multiple: bool = false, crown: f64 = 0.0, flow: i64 = 0, range_from: f64 = 0.0, range_to: f64 = 1.0, explicit: bool = false,
-                         degree_u: i64 = 0, spans_u: i64 = 4, degree_v: i64 = 0, spans_v: i64 = 4) -> interop.Reference[CadSurfaceEdit]!:
+                         degree_u: i64 = 0, spans_u: i64 = 4, degree_v: i64 = 0, spans_v: i64 = 4, tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadSurfaceEdit]!:
         if start < 0 or start > 3 or end < 0 or end > 3: error(invalid, "Skin's start and end continuity are G0 to G3")
         if not (crown >= -0.25 and crown <= 0.25): error(invalid, "Skin's Proportional Crown is -0.25 to 0.25")
         let opts = SkinOptions(degree, closed, start, end, crown, flow, [range_from, range_to], Explicit(explicit, degree_u, spans_u, degree_v, spans_v))
         var nets = Growing[Net]()
         defer close_nets(&nets)
         try skin_nets(set, sections, &opts, multiple, &nets)
-        if nets.count == 1: return try added_sheet(set, &nets.items[0], name)
+        if nets.count == 1: return try added_sheet(set, &nets.items[0], name, tolerances)
         # Multiple Surfaces: a body each, named after the first.
         var list = Growing[interop.Reference[CadModel]]()
         defer release_models(&list)
         for k in 0..<nets.count:
             var buffer: u8[200]
             let label = name if k == 0 else try strings.format(buffer, f"{name}{k + 1}")
-            try list.push(try net_body(&nets.items[k], label, true))
+            try list.push(try net_body(tolerances, &nets.items[k], label, true))
         let edit = try edit_of(try with_bodies_added(set, list.view()))
         edit.value().count = (i64)nets.count
         return edit
@@ -93,7 +93,7 @@ pub struct CadSurfaceBuild:
                          bias: f64 = 1.0, continuity: const i64[] = [0, 0, 0, 0], name: str = "Rail", spine: str = "", pivot: i64 = 0, pivot_rail: f64 = 0.0,
                          pivot_generation: f64 = 0.0, pivot_point: Vector3 = Vector3(), fixed: i64 = 0, segments: const f64[] = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
                          rebuild: const bool[] = [false, false, false], colinear: const bool[] = [false, false], explicit: bool = false, degree_u: i64 = 0, spans_u: i64 = 4,
-                         degree_v: i64 = 0, spans_v: i64 = 4) -> interop.Reference[CadSurfaceEdit]!:
+                         degree_v: i64 = 0, spans_v: i64 = 4, tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadSurfaceEdit]!:
         if rebuild.length != 3 or colinear.length != 2: error(invalid, "Rail: Rebuild takes rail 1, rail 2 and the generation curves; Colinear each rail")
         if mode != sweep_natural and mode != sweep_parallel and mode != sweep_vector and mode != sweep_spine: error(invalid, "Rail's sweep mode is Natural, Parallel, Vector or Spine")
         if transform < two_rail_scale or transform > two_rail_rotate: error(invalid, "Rail's two-rail transform is Scale, Non-proportional scale or Rotate")
@@ -109,7 +109,7 @@ pub struct CadSurfaceBuild:
                                 Explicit(explicit, degree_u, spans_u, degree_v, spans_v))
         var net = try sweep_net(set, sections, rails, &opts, spine)
         defer net.close()
-        return try added_sheet(set, &net, name)
+        return try added_sheet(set, &net, name, tolerances)
 
     ## Profile (sweep.lucb): the profiles `profiles` placed on the rail
     ## `rail` where each comes nearest it, oriented `orientation` (0
@@ -118,7 +118,7 @@ pub struct CadSurfaceBuild:
     ## (transition_linear, transition_local, transition_global,
     ## transition_limited); Explicit Control as Rail's.
     pub static func profile(set: interop.Reference[GeometrySet], profiles: str, rail: str, orientation: i64 = 1, transition: i64 = 0, name: str = "Profile",
-                            explicit: bool = false, degree_u: i64 = 0, spans_u: i64 = 4, degree_v: i64 = 0, spans_v: i64 = 4) -> interop.Reference[CadSurfaceEdit]!:
+                            explicit: bool = false, degree_u: i64 = 0, spans_u: i64 = 4, degree_v: i64 = 0, spans_v: i64 = 4, tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadSurfaceEdit]!:
         if orientation < 0 or orientation > 2: error(invalid, "Profile's orientation is Parallel, Radial or Surface normal")
         if transition < transition_linear or transition > transition_limited: error(invalid, "Profile's transition is Linear, Local, Global or Limited")
         let modes: i64[3] = [sweep_parallel, sweep_natural, sweep_normal]
@@ -126,12 +126,12 @@ pub struct CadSurfaceBuild:
         opts.explicit = Explicit(explicit, degree_u, spans_u, degree_v, spans_v)
         var net = try sweep_net(set, profiles, rail, &opts, "")
         defer net.close()
-        return try added_sheet(set, &net, name)
+        return try added_sheet(set, &net, name, tolerances)
 
     ## Set Planar (sheets.lucb): the closed curves `curves`, in one plane,
     ## filled: a trimmed plane face (a curve inside another a hole).
-    pub static func set_planar(set: interop.Reference[GeometrySet], curves: str, name: str = "Planar") -> interop.Reference[CadSurfaceEdit]!:
-        let body = try set_planar(set, curves, name)
+    pub static func set_planar(set: interop.Reference[GeometrySet], curves: str, name: str = "Planar", tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadSurfaceEdit]!:
+        let body = try set_planar(tolerances, set, curves, name)
         defer body.release()
         let edit = try edit_of(try with_body_added(set, body))
         edit.value().count = 1
@@ -139,8 +139,8 @@ pub struct CadSurfaceBuild:
 
     ## Extrude (sheets.lucb): the curves `curves` carried along `direction`
     ## by `distance` (both ways with `both`), a sheet each, joined.
-    pub static func extruded(set: interop.Reference[GeometrySet], curves: str, direction: Vector3, distance: f64, both: bool = false, name: str = "Extrude") -> interop.Reference[CadSurfaceEdit]!:
-        let body = try swept_sheets(set, curves, false, direction, distance, both, Vector3(), Vector3(), 0.0, 0.0, name)
+    pub static func extruded(set: interop.Reference[GeometrySet], curves: str, direction: Vector3, distance: f64, both: bool = false, name: str = "Extrude", tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadSurfaceEdit]!:
+        let body = try swept_sheets(tolerances, set, curves, false, direction, distance, both, Vector3(), Vector3(), 0.0, 0.0, name)
         defer body.release()
         let edit = try edit_of(try with_body_added(set, body))
         edit.value().count = body.value().face_count()
@@ -148,8 +148,8 @@ pub struct CadSurfaceBuild:
 
     ## Revolve (sheets.lucb): the curves `curves` turned about the axis
     ## through `origin` along `axis` from `start` to `end` degrees, exactly.
-    pub static func revolved(set: interop.Reference[GeometrySet], curves: str, origin: Vector3, axis: Vector3, start: f64 = 0.0, end: f64 = 360.0, name: str = "Revolve") -> interop.Reference[CadSurfaceEdit]!:
-        let body = try swept_sheets(set, curves, true, Vector3(), 0.0, false, origin, axis, start, end, name)
+    pub static func revolved(set: interop.Reference[GeometrySet], curves: str, origin: Vector3, axis: Vector3, start: f64 = 0.0, end: f64 = 360.0, name: str = "Revolve", tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadSurfaceEdit]!:
+        let body = try swept_sheets(tolerances, set, curves, true, Vector3(), 0.0, false, origin, axis, start, end, name)
         defer body.release()
         let edit = try edit_of(try with_body_added(set, body))
         edit.value().count = body.value().face_count()
@@ -222,8 +222,8 @@ pub struct CadSurfaceBuild:
         return try interop.copy_text((str)out.view())
 
 ## `set` with a body of one sheet on `net` named `name` added.
-func added_sheet(set: interop.Reference[GeometrySet], net: const Net*, name: str) -> interop.Reference[CadSurfaceEdit]!:
-    let body = try net_body(net, name, true)
+func added_sheet(set: interop.Reference[GeometrySet], net: const Net*, name: str, tolerances: CadTolerances) -> interop.Reference[CadSurfaceEdit]!:
+    let body = try net_body(tolerances, net, name, true)
     defer body.release()
     let edit = try edit_of(try with_body_added(set, body))
     edit.value().count = 1

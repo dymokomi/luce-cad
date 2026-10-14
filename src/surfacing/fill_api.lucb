@@ -101,7 +101,7 @@ pub struct CadSurfaceFill:
     pub static func fill(set: interop.Reference[GeometrySet], boundaries: str, continuity: const i64[], points: const Vector3[], guides: str = "", guide_order: i64 = 0,
                          quad: bool = false, tension: f64 = 0.0, flatness: f64 = 0.0, flow: i64 = 0, explicit: bool = false, degree_u: i64 = 5, spans_u: i64 = 4,
                          degree_v: i64 = 5, spans_v: i64 = 4, refine: bool = true, most_spans: i64 = 32, position: f64 = 0.0, angle: f64 = 0.05, curvature: f64 = 0.5,
-                         name: str = "Fill", domain: i64 = 0) -> interop.Reference[CadFill]!:
+                         name: str = "Fill", domain: i64 = 0, tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadFill]!:
         if not (tension >= 0.0 and tension <= 1.0): error(invalid, "Fill: Tension is 0 to 1")
         if not (flatness >= 0.0 and flatness <= 1.0): error(invalid, "Fill: Flatness is 0 to 1")
         if flow < fill_flow_natural or flow > fill_flow_adjacent: error(invalid, "Fill: the boundary flow is Natural, Normal, Next or Adjacent")
@@ -110,7 +110,7 @@ pub struct CadSurfaceFill:
         if not (angle > 0.0 and curvature > 0.0 and position >= 0.0): error(invalid, "Fill: the tolerances must be more than zero")
         if domain < fill_domain_auto or domain > fill_domain_quads: error(invalid, "Fill: the domain is Auto, Projected, Molded or Quads")
         let opts = FillOptions(quad, tension, flatness, flow, guide_order, explicit, degree_u, spans_u, degree_v, spans_v, refine, most_spans, position, angle, curvature, domain)
-        var w = FillWork(Growing[FillSide](), opts, Growing[Master](), Growing[Vector3](), Vector3(), 1.0, Vector3(), Vector3(), Vector3(), 0.0, 0.0, 0.0, Growing[FillConflict](), Growing[bool](), Growing[CornerTurn](), false, Growing[f64](), no_ball())
+        var w = FillWork(Growing[FillSide](), opts, Growing[Master](), Growing[Vector3](), Vector3(), 1.0, Vector3(), Vector3(), Vector3(), 0.0, 0.0, 0.0, Growing[FillConflict](), Growing[bool](), Growing[CornerTurn](), false, Growing[f64](), no_ball(), tolerances)
         defer w.close()
         try walk_loop(set, boundaries, continuity, &w.sides)
         if guides.length > 0: try builder_masters(set, guides, &w.guides)
@@ -151,16 +151,16 @@ pub struct CadSurfaceFill:
 ## so the trim's edges lie on the face and meet the neighbors' edges within
 ## the fill's worst gap (Stitch's tolerant edges join them).
 func fill_body(w: const FillWork*, made: const FillMade*, name: str) -> interop.Reference[CadModel]!:
-    if w.opts.quad: return try net_body(&made.net, name, made.sense)
+    if w.opts.quad: return try net_body(w.tolerances, &made.net, name, made.sense)
     if made.quads.count > 0: return try quads_body(w, made, name)
     var worst = 0.0
     for g in made.gaps.view(): worst = math.max(worst, g)
     let precision = math.max(worst * 2.0, w.scale * 1e-7)
-    let sheet = try net_body_within(&made.net, name, made.sense, w.scale * 1e-9)
+    let sheet = try net_body_within(w.tolerances, &made.net, name, made.sense, w.scale * 1e-9)
     defer sheet.release()
     var shape = try shape_of(sheet.value())
     defer shape.close()
-    var cuts = empty_shape(shape.tolerance)
+    var cuts = empty_shape(shape.tolerances, shape.tolerance)
     defer cuts.close()
     for c in made.cuts.view():
         var points = Growing[Vector3]()

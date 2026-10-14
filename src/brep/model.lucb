@@ -14,9 +14,13 @@ from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import BitsBuilder, GeometryWriter, GeometryReader, PropertyHeader, dtype_float64, dtype_int32, dtype_uint8
 from luce_geocore.core.shared import Column
 from luce_geocore.kernel import TableBuilder, Domain, text_attribute
+import geometry
 from geometry import NurbsSurface, NurbsCurve, Curve, Surface, BrepFace, surface_jet, curve_parameter, project, evaluate, least_tolerance, tolerance_for, edge_index, surface_plane, surface_cylinder, surface_cone, surface_spline, surface_sphere, surface_torus, curve_line
 from luce_geocore.kernel import moved_storage, mesh_adopt, precise_span, Float3, Attribute
 from tessellation import tessellate, FaceCache, dispose_cache, inherited, face_mesh
+
+## The project's tolerances (geometry/tolerances.lucb), for model.lucb to name.
+pub type CadTolerances = geometry.CadTolerances
 
 ## Values per curve frame: origin, x and y axes, radius, start angle, sweep.
 let curve_stride: usize = 12
@@ -70,6 +74,11 @@ struct Derived:
 ## with the records, meshes and previews made from them kept until it
 ## changes.
 pub struct BrepModel:
+    ## The project's tolerances the model was built under, and its working
+    ## tolerance: how far its edges' ends may lie from their vertices and
+    ## its edges from their faces before an edge is tolerant (the
+    ## resolution, or twice it for a boolean's result).
+    let tolerances: CadTolerances
     let tolerance: f64
     var vertices: Store[Vector3]
     # Curves: kind (0 line, 1 circle arc, 2 B-spline interval, 3 ellipse
@@ -120,9 +129,12 @@ pub struct BrepModel:
     var face_names: FaceTexts
     var derived: Derived*
 
-    pub func init(tolerance: f64 = 0.000001) -> !:
+    ## A B-rep working to `tolerance` under the project's `tolerances`.
+    pub func init(tolerance: f64 = 0.000001, tolerances: CadTolerances = CadTolerances()) -> !:
+        try tolerances.checked()
         if not math.is_finite(tolerance) or tolerance < least_tolerance or tolerance > 1.0:
-            error(invalid, "CAD tolerance must be finite and between 1e-9 and 1 source unit")
+            error(invalid, "a CAD model's working tolerance must be finite and between 1e-9 and 1 mm")
+        self.tolerances = tolerances
         self.tolerance = tolerance
         self.vertices = Store[Vector3]()
         self.curve_kind = Store[u8]()
@@ -171,13 +183,19 @@ pub struct BrepModel:
         try self.face_use_offsets.push(0)
         try self.face_loop_offsets.push(0)
 
-    ## An empty B-rep of tolerance `tolerance`, held by reference.
-    pub static func held(tolerance: f64) -> interop.Reference[BrepModel]!:
-        return try interop.Reference[BrepModel].adopt(new BrepModel(tolerance) in memory.heap, brep_model_type, memory.heap)
+    ## An empty B-rep under `tolerances`, working to `tolerance` (0: their
+    ## resolution), held by reference.
+    pub static func held(tolerances: CadTolerances, tolerance: f64 = 0.0) -> interop.Reference[BrepModel]!:
+        return try interop.Reference[BrepModel].adopt(new BrepModel(tolerance if tolerance > 0.0 else tolerances.resolution(), tolerances) in memory.heap, brep_model_type, memory.heap)
 
-    ## An empty B-rep for a model of extent `size` (its tolerance_for).
-    pub static func sized(size: f64) -> interop.Reference[BrepModel]!:
-        return try BrepModel.held(tolerance_for(size))
+    ## An empty B-rep under `tolerances` for a model of extent `size`,
+    ## working to tolerance_for(size).
+    pub static func sized(tolerances: CadTolerances, size: f64) -> interop.Reference[BrepModel]!:
+        return try BrepModel.held(tolerances, tolerance_for(size))
+
+    ## The project's tolerances the model was built under.
+    pub func cad_tolerances() -> CadTolerances:
+        return self.tolerances
 
     pub func face_count() -> i64:
         return (i64)self.face_surface.count
@@ -233,7 +251,7 @@ pub struct BrepModel:
     ## Extract faces with compact shared topology; unrelated points and curves
     ## are not copied into the result. Face paths/colors/placements survive.
     pub func subset(selection: const i64[]) -> interop.Reference[BrepModel]!:
-        let output = try BrepModel.held(self.tolerance)
+        let output = try BrepModel.held(self.tolerances, self.tolerance)
         errdefer output.release()
         let target = output.value()
         let vertices = try new i64[self.vertices.count] --- in memory.heap

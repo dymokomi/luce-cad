@@ -1,8 +1,7 @@
 # Kernel Robustness: tolerances, determinism and boolean consistency
 
-Status: Phase 1 (audit and design), 2026-10-13. Nothing in the kernel has been refactored yet. Two
-things have landed: a robustness harness (`tests/robustness`, commit 60a9332) and
-`BrepModel.fingerprint`. The design below waits for the owner's go-ahead.
+Status: the owner approved the design and stages 1–7 on 2026-10-13, with the decisions in section
+7. Stage 0 (the harness, 60a9332) has landed; section 6 tracks the stages as they land.
 
 The owner wants luce-cad to stand with Parasolid, ACIS and Alias. He does not want it to behave like
 NVIDIA's usd-brep/SMLib, which a review describes this way: "internally inconsistent booleans, loose
@@ -65,7 +64,7 @@ manifold on Monday but not on Tuesday". This document has seven parts:
 - **Its failures are the lessons.**
   - Tolerances only grow. `SameParameter`, sewing and booleans each widen tolerances to make their
     output "valid", and the next operation inherits the larger values. After a few operations a
-    model carries millimetre-sized tolerances on micrometre features.
+    model carries millimetre-sized tolerances on micrometer features.
   - The fuzzy boolean (`SetFuzzyValue`) adds a user value to every tolerance, which repairs one
     case and changes others.
   - Classification and intersection are computed against different tolerances in different
@@ -400,6 +399,11 @@ checked with the operands swapped, with the faces reversed, moved and turned, an
 | box/sphere subtract: moved, ×25.4, ×0.001, ×1000 differ by 15.5%; V(A−B) + V(A∩B) ≠ V(A) by 11.7% | the unmoved case is wrong: sphere center exactly on the box's face (finding 5) |
 | cylinder/cylinder subtract, faces reversed: mesh volume off 71% | tessellation at 64 segments depends on face order (B-rep correct) |
 
+Stage 1 changed the scales to ×25.4, ×0.1 and ×100. The old ×0.001 made the
+features 0.002–0.01 mm, at the positional tolerance itself, where no fixed outcome is
+right, and ×1000 made a 10 m part. The stage 1 baseline with the new scales is 5 of 224:
+the box/sphere case 4 times, and the face-order tessellation case once.
+
 ### 3.3 The tolerance band: 169 of 372 cells off the ideal, 5 mixed, 22 failed
 
 Two boxes are placed with faces δ apart:
@@ -431,7 +435,7 @@ tilt union        1000 mm: MMMMXEDDDD   ideal MMMMMMDDDD
 ```
 
 Every flush and gap row looks the same from 1 mm to 100 mm: today's tolerance is about size ×
-1e-7, so even 0.001 mm is "apart" and leaves a micrometre sliver face. At 1 m, 0.001 mm is near
+1e-7, so even 0.001 mm is "apart" and leaves a micrometer sliver face. At 1 m, 0.001 mm is near
 the relative tolerance, and the kernel answers X (some faces merged, some not) or fails. The tilt
 band fails outright at 1e-6 to 1e-5 rad at every size: that is finding 1. Directions and turns
 change nothing, which is consistent with the determinism results.
@@ -454,8 +458,8 @@ change nothing, which is consistent with the determinism results.
    Construction Options, it lives with the units and is the contract the model is built to. Like
    Parasolid's precision, it is the same for every operation and never changes during a
    computation.
-2. **Absolute, in millimetres.** luced-3d already keeps every length in millimetres; inches are
-   display only (`luced-3d src/units.luc`). Kernel tolerances are therefore absolute millimetres,
+2. **Absolute, in millimeters.** luced-3d already keeps every length in millimeters; inches are
+   display only (`luced-3d src/units.luc`). Kernel tolerances are therefore absolute millimeters,
    never fractions of a model's size.
 3. **Everything else derives from it.** No literal in the kernel stands for a model distance or an
    angle. Every such decision calls the predicate layer (section 4.4).
@@ -577,14 +581,26 @@ of the size" and makes a missed branch impossible.
 ### 4.6 Imported geometry with looser tolerances
 
 - STEP declares an uncertainty (`UNCERTAINTY_MEASURE_WITH_UNIT`), but the real accuracy varies by
-  entity. The import measures each edge and vertex as in 4.3 and keeps the result as local
-  precision. The declared uncertainty is shown, not used.
+  entity. The import measures each edge and vertex as in 4.3. The declared uncertainty is shown,
+  not used.
 - The project P is never raised to fit an import. The STEP node's "STEP tolerance" field
   (`node_catalog.luc:332`) is removed (no backward compatibility).
+- **The owner's decision: the import asks** (2026-10-13). When an import is looser than the
+  project's P, the user chooses between two ways, and the choice is an option on the import node
+  ("Tolerances: Adopt the scene's / Keep the file's"), so it replays with the project and is
+  never asked again:
+  - **Adopt the scene's tolerances:** the import heals and tightens to P. Edges are
+    re-intersected and refitted where the surfaces allow; what still cannot meet P is reported
+    on the node with its worst gap.
+  - **Keep the file's tolerances:** the looser entities stay tolerant, each with its measured
+    precision (Parasolid's tolerant modelling). The body is still under the project's
+    tolerances, and only those entities are looser.
+  - The first time a file turns out looser than P, the node shows a prompt with the two choices
+    and the worst gap; the answer sets the option. Until it is answered, the node keeps the
+    file's tolerances, so nothing is moved unasked. It follows luced-3d's existing pattern of a
+    node notice with actions.
 - Operations on a body with tolerant entities work normally. Where a new edge meets a tolerant
   one, the new vertex inherits the larger tolerance only locally.
-- An explicit **Heal** step (Edit CAD) re-intersects and re-fits tolerant edges to bring them
-  under P where the surfaces allow, and reports what remains.
 
 ### 4.7 Where the setting lives in luced-3d
 
@@ -599,15 +615,23 @@ of the size" and makes a missed branch impossible.
   - Curvature in percent;
   - a Preset menu;
   - the draft and Apply flow as for units.
-- **Read once and passed down.** The evaluation of each CAD node reads `network.tolerances` once
-  per cook and passes a `CadTolerances` value, a plain Base struct of luce-cad's, into every
-  `CadModeling`, `CadSolids`, `CadSurfacing`, sketch and import call. Inside luce-cad the value
-  travels in the operation's work structure and the predicate `Context`.
-- **Bodies record their tolerances.** `BrepModel.tolerance` becomes the P the body was built under,
-  saved with it, plus F, T and K.
-  - An operation given bodies built under another P treats them as imports: it measures them and
-    makes entities tolerant where needed, so it never trusts a looser contract.
-  - Saved `.geo` files keep the tolerances, so a reloaded body is valid exactly as it was.
+- **Read once and passed down.** A cook reads `network.tolerances` once and passes the
+  `CadTolerances` value, a plain Base struct of luce-cad's, down with the node's other inputs: to
+  `Node.compute`, then to the tool's `Invocation` and to each Edit step (`EditKind.run`). Every
+  luce-cad call that makes a body from nothing takes it as an argument: the `CadSolids`
+  primitives, `CadModeling.extruded`/`extruded_sides`/`revolved`/`revolved_about` from a sketch,
+  the surfacing builders (`square`, `skin`, `rail`, `profile`, `set_planar`, `extruded`,
+  `revolved`, `blend`, `fillet`, `bridge`, `tube`, `fill`, `patch`) and the STEP import.
+- **Bodies record their tolerances.** `BrepModel` carries the `CadTolerances` it was built under
+  (`cad_tolerances()`), saved with it in `.geo` files, so a reloaded body is valid exactly as it
+  was. An operation on bodies works under its inputs' tolerances (the first operand's), the way
+  Parasolid's precision belongs to the session rather than to each call, so `combined`, `filleted`,
+  `shelled` and the rest need no extra argument and cannot be handed the wrong one.
+  - From stage 5, an operation given a second body built under another P treats it as an
+    import: it measures it and makes entities tolerant where needed, so it never trusts a looser
+    contract.
+- **The cook key.** Every node's stamp includes the project's tolerances (`stamps.luc`), so
+  changing them re-cooks everything and the result store never mixes results of two settings.
 - **No global state anywhere:** no module variable, no session object. Two documents with
   different tolerances can cook concurrently in one process.
 
@@ -621,7 +645,7 @@ of the size" and makes a missed branch impossible.
 - **Staging.** Each stage of section 6 lands only when every existing contract, regression and
   parity test is green on all three OSes. The harness ratchet must also not worsen, and should
   improve.
-- **Scale tests.** Tests that build models at micrometre or kilometre scale (for example
+- **Scale tests.** Tests that build models at micrometer or kilometer scale (for example
   `exact_contract.lucb` at 1e-5 and 1e4) pass a matching P, inside the size-box rule. That is the
   only kind of test edit allowed.
 - **The harness changes meaning.** Its scale checks become "same topology when every feature is
@@ -673,8 +697,8 @@ of the size" and makes a missed branch impossible.
 | stage | what | size | outcome |
 |---|---|---|---|
 | 0 ✓ | Harness and fingerprint (60a9332) | done | Baseline; cross-OS determinism measured |
-| 1 | **Tolerance type and plumbing.** `CadTolerances` (P, F, T, K, derived R, size box) in luce-cad; every public operation takes it; `BrepModel` stores it; `tolerance_for(size)` and every `size × 1e-7` work tolerance removed. luced-3d: Network field, save and load, Project Settings rows, a cook-key part, pass-down. Test edits only for scale tests (4.8). | L: about 1.5k lines across luce-cad and luced-3d, 3–4 days | Absolute tolerances end to end; the band flips at a fixed size-independent δ (not yet P everywhere) |
-| 2 | **Predicate layer and boolean fact table.** `src/predicates/` with exact signs; `Facts` in Work; intersect, clip, split, classify, merge and boolean_result rewritten to read facts; the boolean's roughly 120 tolerance literals and multiplier chains removed; one coincidence rule for all surface kinds. | XL: about 4k lines, 1.5–2 weeks | No contradictory decisions; tilt band no longer fails; band rows ideal for booleans |
+| 1 | **Tolerance type and plumbing.** `CadTolerances` (P, F, T, K, derived R, size box) in luce-cad; every body-making call takes it; `BrepModel` stores and saves it; the size box is enforced. luced-3d: Network field, save and load, Project Settings rows, a cook-key part, pass-down. The working tolerances stay as they are: switching them to absolute values alone, without the predicate layer, was tried and made the tilt band worse (shallow plane crossings at 1e-7 to 1e-5 rad fail in more places), so the switch moved to stage 2. | L: 3–4 days | The setting reaches every body; results unchanged (fingerprints identical) |
+| 2 | **Predicate layer, boolean fact table, absolute tolerances.** `src/predicates/` with exact signs; `Facts` in Work; intersect, clip, split, classify, merge and boolean_result rewritten to read facts; the boolean's roughly 120 tolerance literals and multiplier chains removed; one coincidence rule for all surface kinds; `tolerance_for(size)` and the `size × 1e-7` work tolerances replaced by the project's. | XL: 1.5–2 weeks | No contradictory decisions; tilt band no longer fails; band rows ideal for booleans |
 | 3 | **Classification and degeneracy.** Classification by local facts plus exact single-ray parity with Simulation of Simplicity; certified subdivision seeding for the march; fix the box/sphere-on-face case and the face-order tessellation case. | L: about 2k lines, 1 week | Invariance failures 0; band assertion becomes hard |
 | 4 | **Canonical order and representatives** (vertex merge, final edges, march start, Stitch representatives, output ordering). | M: about 800 lines, 3–4 days | Operand and face permutation give identical topology; contract item 2 asserted |
 | 5 | **Per-entity tolerances done right and the checker.** Remove `model_tolerance()`; keep B's tolerances; measured precision on import, stitch, intersection and fillet; tolerance tightening; a `check_body` (structure, geometry on topology, orientation, loops, sampled self-intersection) usable as a node and run on every result in tests. | L: about 2k lines, 1 week | Imports keep P; no model-wide widening |
@@ -685,20 +709,15 @@ Stages 1 and 2 hold most of the value. Each stage is pushed in green, gated piec
 
 ---
 
-## 7. Questions for the owner
+## 7. Owner decisions (2026-10-13)
 
-1. **Fit tolerance.** Should the fit tolerance F be its own setting (default 0.001 mm = P / 10), as
-   Alias's Curve Fit Distance is, or always be derived from P? *Recommendation: its own setting,
-   default P / 10.* Class-A work wants tighter fits without tighter coincidence, and parity tests
-   can pin it.
-2. **Applying a changed tolerance.** Should Apply re-cook the whole CAD graph at once (undoable,
-   changed nodes flagged), or should the dialog ask first and list the nodes whose topology would
-   change? *Recommendation: rebuild on Apply and flag changes afterwards.* It is simple and honest,
-   and undo is the safety net.
-3. **The size box.** Should operations refuse geometry outside 1e8 × P (1 km at the default), or
-   only warn? *Recommendation: refuse, with a message to raise P (a coarser P gives a larger box) or move the part.* Beyond the box,
-   double precision can no longer resolve P, and a silent wrong answer is the worse outcome.
-4. **Imported data looser than P.** Should it stay as tolerant entities (Parasolid), with healing
-   only on request, or be healed automatically on import? *Recommendation: tolerant entities, with
-   Heal as an explicit Edit CAD step.* Import should never move the customer's geometry
-   unasked.
+The owner agreed with the whole design and approved stages 1–7, in order.
+
+1. **Fit tolerance:** its own setting, default 0.001 mm.
+2. **Changing the setting:** Apply rebuilds the CAD graph and flags what changed; undo is the
+   safety net (4.5).
+3. **The size box:** geometry outside it is refused, with a message to use a coarser P or move
+   the part.
+4. **Imports looser than P:** the import asks whether to adopt the scene's tolerances (heal and
+   tighten to P) or keep the file's (tolerant entities). The answer is an option on the import
+   node, so it replays without asking again; the prompt sets it the first time (4.6).

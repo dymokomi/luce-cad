@@ -1,0 +1,74 @@
+## The tolerances a model is built under (docs/research/KERNEL-ROBUSTNESS.md,
+## section 4): one set per project, chosen by the user next to the units,
+## absolute in millimeters, carried by every body and never changed by an
+## operation. Everything the kernel compares against derives from them:
+##   positional P   points within P are one point; edges lie within P of
+##                  their faces (the validity contract)
+##   fit F          how closely approximated geometry (sections, offsets,
+##                  traces) follows its definition
+##   tangent        directions within this angle are tangent (G1)
+##   curvature      curvature deviation (R1 - R2) / (R1 + R2) within this
+##                  fraction is G2
+## Derived: the resolution R = P / 1000 (Parasolid's 1e-8 m at the default
+## P), what solvers converge to and constructed points are accurate to; the
+## size box 1e8 P (a kilometer at the default), outside which double
+## precision no longer resolves P; the angular resolution R / box.
+
+## The default positional tolerance, in millimeters.
+pub let default_positional: f64 = 0.01
+
+## The bounds a project's tolerances are kept in.
+pub let least_positional: f64 = 0.000001
+pub let most_positional: f64 = 1.0
+
+pub struct CadTolerances:
+    pub var positional: f64 = 0.01
+    pub var fit: f64 = 0.001
+    ## Radians (0.1 degree).
+    pub var tangent: f64 = 0.0017453292519943296
+    ## A fraction (0.5%).
+    pub var curvature: f64 = 0.005
+
+    ## The resolution R: P / 1000.
+    pub func resolution() -> f64:
+        return self.positional * 0.001
+
+    ## The size box's side: geometry must lie within half of it of the
+    ## origin.
+    pub func size_box() -> f64:
+        return self.positional * 1e8
+
+    ## The angular resolution: the resolution over the size box.
+    pub func angular() -> f64:
+        return self.resolution() / self.size_box()
+
+    ## An error unless every value is within its bounds: P from 1e-6 to
+    ## 1 mm, F from P / 1000 to P, the tangent from 0.001 to 5 degrees, the
+    ## curvature from 0.01% to 10%.
+    pub func checked() -> !:
+        let p = self.positional
+        if not math.is_finite(p) or p < least_positional or p > most_positional:
+            error(invalid, "the positional tolerance must be from 0.000001 to 1 mm")
+        if not math.is_finite(self.fit) or self.fit < p * 0.001 or self.fit > p:
+            error(invalid, "the fit tolerance must be from a thousandth of the positional tolerance up to it")
+        if not math.is_finite(self.tangent) or self.tangent < 0.001 * math.pi / 180.0 or self.tangent > 5.0 * math.pi / 180.0:
+            error(invalid, "the tangent tolerance must be from 0.001 to 5 degrees")
+        if not math.is_finite(self.curvature) or self.curvature < 0.0001 or self.curvature > 0.1:
+            error(invalid, "the curvature tolerance must be from 0.01% to 10%")
+
+    ## Whether `p` lies inside the size box.
+    pub func holds(p: Vector3) -> bool:
+        let half = self.size_box() * 0.5
+        return math.abs(p.x) <= half and math.abs(p.y) <= half and math.abs(p.z) <= half
+
+    ## An error naming the size box unless `p` lies inside it.
+    pub func check_point(p: Vector3) -> !:
+        if self.holds(p): return
+        var buffer: u8[200]
+        let text = try strings.format(buffer, f"geometry lies outside the size box (±{self.size_box() * 0.0005} m at a positional tolerance of {self.positional} mm): use a coarser positional tolerance or move the part")
+        let owned = try interop.copy_text(text)
+        if let owner = owned.owner: _ = ownership.pool_object(owner)
+        error(invalid, owned.value)
+
+    pub func equals(other: CadTolerances) -> bool:
+        return self.positional == other.positional and self.fit == other.fit and self.tangent == other.tangent and self.curvature == other.curvature
