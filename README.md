@@ -16,7 +16,7 @@ evaluation and trimmed-surface meshing) → `luce-geocore` (display mesh).
 - `cad_geometry` (`luce_cad.cad_geometry`): CAD models as a family of
   luce-geocore's `GeometrySet`. The `cad` component holds models (shared,
   never copied), places, joins and filters them by face path;
-  `CadGeometry.tessellated(set, segments, edge_size, progress)` turns them
+  `CadGeometry.tessellated(set, quality, progress)` (a `MeshQuality`) turns them
   into the set's mesh in one pass (each face's B-rep path in the `path` text
   attribute; instances' prototypes tessellated once each, their placements
   kept). `register_codec()` adds the family to geocore's geometry files, so a

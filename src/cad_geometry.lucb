@@ -11,7 +11,7 @@ from luce_geocore.geocore import Mesh, Vector3, Matrix4, Bounds, invalid, Geomet
 from luce_geocore.core.growing import Growing
 from luce_geocore.kernel import ComponentType, Placement, IdSet, TableBuilder, PathFilter, MeshPart, Domain, Attribute, Instances
 from luce_geocore.kernel import adopt_set, dispose_set, empty_set, set_mesh, append_text, append_number, mesh_component, instances_component, new_instances, concatenated, text_attribute, mesh_share
-from model import CadModel, cad_model_type, encode_model, decode_model, cloud_mesh, is_cloud, moved_models
+from model import CadModel, MeshQuality, cad_model_type, encode_model, decode_model, cloud_mesh, is_cloud, moved_models
 from geometry import push_decimal
 from cad_sketches import CadSketches
 from cad_curves import CadCurves, curve_cloud, moved_curves
@@ -337,10 +337,13 @@ pub struct CadGeometry:
     ## The set with its CAD models tessellated into its mesh, instances
     ## included. Each face's `path` text attribute names its B-rep face's
     ## path; principal curvatures ride along where the model supports them.
-    pub static func tessellated(set: interop.Reference[GeometrySet], segments: i64, edge_size: f64, progress: interop.Callback[f64, unit]? = none) -> interop.Reference[GeometrySet]!:
-        return try adopt_set(try tessellated_storage(try set.get(), segments, edge_size, progress, 0))
+    ## Every model, an instance's prototype's too, is meshed at `quality`
+    ## (its angle, chord height and longest edge; MeshQuality).
+    pub static func tessellated(set: interop.Reference[GeometrySet], quality: MeshQuality, progress: interop.Callback[f64, unit]? = none) -> interop.Reference[GeometrySet]!:
+        try quality.checked()
+        return try adopt_set(try tessellated_storage(try set.get(), quality, progress, 0))
 
-func tessellated_storage(set: const GeometrySet*, segments: i64, edge_size: f64, progress: interop.Callback[f64, unit]?, depth: usize) -> GeometrySet*!:
+func tessellated_storage(set: const GeometrySet*, quality: MeshQuality, progress: interop.Callback[f64, unit]?, depth: usize) -> GeometrySet*!:
     if depth > 64: error(invalid, "instances nest more than 64 deep")
     let result = try set.storage()
     errdefer dispose_set(result)
@@ -354,7 +357,7 @@ func tessellated_storage(set: const GeometrySet*, segments: i64, edge_size: f64,
         defer pieces.close()
         if let existing = set_mesh(set): try pieces.push(MeshPart(existing, Matrix4()))
         for model in parts.models.view():
-            let owner = try tessellate_with_paths(model.value(), segments, edge_size, progress)
+            let owner = try tessellate_with_paths(model.value(), quality, progress)
             owners.push(owner) catch failure:
                 owner.release()
                 error(failure.code, failure.message)
@@ -370,13 +373,13 @@ func tessellated_storage(set: const GeometrySet*, segments: i64, edge_size: f64,
             let mesh = try with_joined_notes(joined, owners.view())
             defer mesh.release()
             try result.put(mesh_component(), (void*)(try mesh_share(mesh.value())))
-    try tessellate_instances(result, segments, edge_size, progress, depth)
+    try tessellate_instances(result, quality, progress, depth)
     return result
 
 ## One model's tessellation with its faces' B-rep paths as `path` (a B-rep
 ## model's kept mesh has them already).
-func tessellate_with_paths(model: const CadModel*, segments: i64, edge_size: f64, progress: interop.Callback[f64, unit]?) -> interop.Reference[Mesh]!:
-    let part = try model.tessellate(segments, edge_size, progress, model.supports_curvature())
+func tessellate_with_paths(model: const CadModel*, quality: MeshQuality, progress: interop.Callback[f64, unit]?) -> interop.Reference[Mesh]!:
+    let part = try model.tessellated(quality, progress, model.supports_curvature())
     if part.value().find_attribute("path", 2) >= 0: return part
     defer part.release()
     let mesh = part.value()
@@ -403,13 +406,13 @@ func tessellate_with_paths(model: const CadModel*, segments: i64, edge_size: f64
 
 ## The set's instances with each prototype tessellated once: every
 ## instance keeps its prototype index and placement.
-func tessellate_instances(result: GeometrySet*, segments: i64, edge_size: f64, progress: interop.Callback[f64, unit]?, depth: usize) -> !:
+func tessellate_instances(result: GeometrySet*, quality: MeshQuality, progress: interop.Callback[f64, unit]?, depth: usize) -> !:
     let data = result.find(instances_component()) else return
     let source = (const Instances*)data
     let rebuilt = try new_instances()
     let close = instances_component().close
     for index in 0..<source.prototype_count():
-        let child = tessellated_storage(source.prototype(index), segments, edge_size, progress, depth + 1) catch failure:
+        let child = tessellated_storage(source.prototype(index), quality, progress, depth + 1) catch failure:
             close((void*)rebuilt)
             error(failure.code, failure.message)
         let slot = rebuilt.add_prototype(child) catch failure:
