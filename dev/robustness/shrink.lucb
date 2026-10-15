@@ -1,0 +1,69 @@
+## A failing case made as plain as it stays failing in: each body's rounding
+## dropped, its turn zeroed, its numbers rounded (to whole millimeters, then
+## to tenths and hundredths, and a turn to whole degrees), keeping each
+## change under which the same check still fails. What is left is printed
+## as a regression to paste (print_regression).
+
+## Case `c` (failing `check`) shrunk.
+pub func shrink(c: Case, check: i64, buffer: u8[]) -> Case!:
+    var best = c
+    for round in 0..<3:
+        var changed = false
+        for which in 0..<2:
+            for step in 0..<5:
+                var trial = best
+                var body = trial.a if which == 0 else trial.b
+                if step == 0:
+                    if body.round == 0.0: continue
+                    body.round = 0.0
+                elif step == 1:
+                    if body.turn.length() == 0.0: continue
+                    body.turn = Vector3()
+                else:
+                    # Whole millimeters, then tenths, then hundredths; a turn
+                    # to whole degrees.
+                    let grain = [1.0, 0.1, 0.01][(usize)(step - 2)]
+                    body.size = rounded(body.size, grain)
+                    body.at = rounded(body.at, grain)
+                    body.round = math.round(body.round / grain) * grain
+                    body.turn = rounded(body.turn, math.pi / 180.0)
+                    if same_body(body, trial.a if which == 0 else trial.b) or not valid_body(body): continue
+                if which == 0: trial.a = body
+                else: trial.b = body
+                let verdict = try check_case(trial, buffer)
+                if verdict.check != check or verdict.operation != trial.operation: continue
+                best = trial
+                changed = true
+        if not changed: break
+    return best
+
+func rounded(v: Vector3, grain: f64) -> Vector3:
+    return Vector3(math.round(v.x / grain) * grain, math.round(v.y / grain) * grain, math.round(v.z / grain) * grain)
+
+func same_body(a: Body, b: Body) -> bool:
+    return a.size.subtract(b.size).length() == 0.0 and a.at.subtract(b.at).length() == 0.0 and a.turn.subtract(b.turn).length() == 0.0 and a.round == b.round
+
+## Whether the body's sizes still make a solid (none rounded to nothing, a
+## rounding under a third of the box's least side).
+func valid_body(body: Body) -> bool:
+    if body.size.x <= 0.0: return false
+    if body.kind == kind_box and (body.size.y <= 0.0 or body.size.z <= 0.0): return false
+    if body.kind == kind_cylinder and body.size.y <= 0.0: return false
+    if body.round > 0.0 and body.round * 3.0 > math.min(body.size.x, math.min(body.size.y, body.size.z)): return false
+    return true
+
+## Case `c` as Luce to paste into a regression (tests/regressions), which
+## fails `check`.
+pub func print_regression(c: Case, check: i64):
+    # c.operation is the boolean that failed (main sets it).
+    print(f"    # sweep: {check_name(check)}")
+    print_body("a", c.a)
+    print_body("b", c.b)
+    print(f"    let made = CadModeling.combined(a, b, {c.operation})")
+
+func print_body(name: str, body: Body):
+    if body.kind == kind_cylinder: print(f"    var {name} = CadSolids.cylinder({body.size.x}, {body.size.y})")
+    elif body.kind == kind_sphere: print(f"    var {name} = CadSolids.sphere({body.size.x})")
+    else: print(f"    var {name} = CadSolids.box({body.size.x}, {body.size.y}, {body.size.z})")
+    if body.kind == kind_box and body.round > 0.0: print(f"    {name} = CadModeling.filleted({name}, \"\", {body.round}, \"r\", {body.continuity})")
+    print(f"    {name} = {name}.transformed(Vector3({body.at.x}, {body.at.y}, {body.at.z}), Vector3({body.turn.x}, {body.turn.y}, {body.turn.z}), Vector3(1.0, 1.0, 1.0))")

@@ -50,14 +50,40 @@ pub func sphere_axis(mesh: MeshBuilder*, ids: const i64[], sizes: const i64[], s
         let np = mesh.np
         let nf = mesh.nf
         let nc = mesh.nc
-        let meshed = about_axis(mesh, ids, sizes, directions, s, axis_candidate(order[tried]), sense, divisions, tolerance, edge_size) catch failure:
+        let axis = axis_candidate(order[tried])
+        let meshed = about_axis(mesh, ids, sizes, directions, s, axis, sense, divisions, tolerance, edge_size) catch failure:
             if failure.code != invalid: error(failure.code, failure.message)
             mesh.np = np
             mesh.nf = nf
             mesh.nc = nc
             recover false
         if meshed: return
+        # A face whose loops make no band about the axis (a disk: a slab's
+        # piece of a half sphere, running from its rim over the top to its
+        # rim) is an ordinary trimmed patch of the latitude-longitude chart
+        # about it, its poles clear of the trims.
+        var turned = try turned_sphere(s, axis)
+        defer turned.close()
+        var charted = true
+        mesh_in_chart(mesh, ids, sizes, turned, sense, divisions, tolerance, edge_size) catch failure:
+            if failure.code != invalid: error(failure.code, failure.message)
+            mesh.np = np
+            mesh.nf = nf
+            mesh.nc = nc
+            charted = false
+            recover ()
+        if charted: return
     error(invalid, "a sphere face's trims leave no latitude-longitude chart")
+
+## Sphere `s` with its pole along `axis`.
+func turned_sphere(s: Surface, axis: Vector3) -> Surface!:
+    let reference = Vector3(1.0, 0.0, 0.0) if math.abs(axis.x) < 0.9 else Vector3(0.0, 1.0, 0.0)
+    let x = try reference.subtract(axis.multiply_scalar(reference.dot(axis))).normalized()
+    var controls: Vector3[]
+    var numbers: f64[]
+    var turned = try Surface(4, s.origin, x, axis, s.radius, 0.0, controls, numbers, numbers, numbers, 0, 0, 0, 0)
+    turned.trim_tolerance = s.trim_tolerance
+    return turned
 
 ## Direction `k` of a Fibonacci lattice over the upper hemisphere.
 func axis_candidate(k: usize) -> Vector3:
@@ -328,19 +354,21 @@ func pole_cap(mesh: MeshBuilder*, chart: Surface, circle: const i64[], latitude:
         longitudes[k] = 2.0 * math.pi * (f64)k / (f64)circle.length
         starts[k] = latitude
     let north = latitude > 0.0
-    try polar_rows(mesh, chart, circle, longitudes, starts, pole_lat, rows, north != sense)
+    try polar_rows(mesh, chart, circle, longitudes, starts, pole_lat, rows, north != sense, step)
 
 ## Rows from a ring of points `ring` (at `longitudes`, increasing or
 ## decreasing once round, and latitudes `starts`) along meridians to the
 ## pole at `pole_lat`, `rows` of them evenly, closed by a fan. The rows'
-## columns stand evenly round, as many as make square cells on the first
-## row (a multiple of 8), halved on each row where they crowd to under half
-## a row apart, so they neither close into needles at the pole nor depend
-## on how the ring is sampled; the ring is joined to the first row by
-## triangles in longitude order. A row's latitude at a longitude follows
+## columns stand evenly round: on a ring sampled evenly round, its own
+## columns (or a whole multiple, so no column spans more than `angle`), the
+## first row meeting it in quads; else as many as make square cells on the
+## first row (a multiple of 8), the ring joined to it by triangles in
+## longitude order. They are halved on each row where they crowd to under
+## half a row apart, so they close into no needles at the pole. A row's
+## latitude at a longitude follows
 ## the ring's there. The faces run ring k, k + 1, next row k + 1, k,
 ## reversed when `flipped`.
-func polar_rows(mesh: MeshBuilder*, s: Surface, ring: const i64[], longitudes: const f64[], starts: const f64[], pole_lat: f64, rows: usize, flipped: bool) -> !:
+func polar_rows(mesh: MeshBuilder*, s: Surface, ring: const i64[], longitudes: const f64[], starts: const f64[], pole_lat: f64, rows: usize, flipped: bool, angle: f64) -> !:
     let count = ring.length
     let way: f64 = 1.0 if longitudes[count - 1] > longitudes[0] else -1.0
     var mean: f64 = 0.0
@@ -353,6 +381,17 @@ func polar_rows(mesh: MeshBuilder*, s: Surface, ring: const i64[], longitudes: c
         return
     let first_lat = mean + (pole_lat - mean) / (f64)rows
     var width = (usize)math.max(8.0, math.ceil(2.0 * math.pi * math.cos(first_lat) / row_step / 8.0) * 8.0)
+    # A ring sampled evenly round (a latitude circle, a hemisphere's rim)
+    # gives the rows its own columns, or a whole multiple of them when its
+    # steps are wider than `angle` (the most a column may span), so the
+    # rows meet it square (quads, the same both sides of an equator)
+    # instead of zipping a finer row to it in triangles.
+    # (Its count a multiple of 4, so the columns can still halve toward
+    # the pole twice: an odd count would hold them all the way up, thin.)
+    let even = count % 4 == 0 and evenly_round(longitudes, way)
+    if even:
+        let needed = math.ceil(2.0 * math.pi * math.cos(first_lat) / angle * (1.0 - even_step))
+        width = count * (usize)math.max(1.0, math.ceil(needed / (f64)count))
     let previous = try new i64[width] --- in memory.heap
     defer free(previous) in memory.heap
     let next = try new i64[width] --- in memory.heap
@@ -369,12 +408,27 @@ func polar_rows(mesh: MeshBuilder*, s: Surface, ring: const i64[], longitudes: c
             let start = ring_latitude(longitudes, starts, longitude, way)
             next[j] = try mesh.point(analytic_point(s, longitude, start + (pole_lat - start) * fraction))
             column_longitudes[j] = longitude
-        if row == 1: try zip_ring(mesh, ring, longitudes, next[..<columns], column_longitudes[..<columns], way, flipped)
+        if row == 1 and even and columns == count: try ring_band(mesh, ring, next[..<columns], flipped)
+        elif row == 1: try zip_ring(mesh, ring, longitudes, next[..<columns], column_longitudes[..<columns], way, flipped)
         else: try ring_band(mesh, previous[..<width], next[..<columns], flipped)
         for j in 0..<columns: previous[j] = next[j]
         width = columns
     let pole = try mesh.point(analytic_point(s, 0.0, pole_lat))
     for k in 0..<width: try band_face(mesh, [previous[k], previous[(k + 1) % width], pole], flipped)
+
+## Whether `longitudes` (running `way`) step evenly round a whole turn,
+## each step within `even_step` of its share of the turn.
+func evenly_round(longitudes: const f64[], way: f64) -> bool:
+    let count = longitudes.length
+    if count < 3: return false
+    let share = 2.0 * math.pi / (f64)count
+    for k in 0..<count:
+        let next = longitudes[k + 1] if k + 1 < count else longitudes[0] + way * 2.0 * math.pi
+        if math.abs((next - longitudes[k]) * way - share) > share * even_step: return false
+    return true
+
+## How far a ring's step may be from its even share and still count as even.
+let even_step: f64 = 1e-6
 
 ## The ring's latitude at `longitude` (its samples' linearly between them;
 ## `way` the direction the longitudes run).

@@ -849,6 +849,110 @@ body's size (`fit_share`, `relative_zero` against a size): naming them is
 the step before moving each onto CadTolerances, which changes values and
 so goes case by case with the harness.
 
+### 3.17 Tolerant spline coincidence (in progress)
+
+Partial overlaps of B-spline faces within P (a G2-rounded box and its copy
+moved half its height up its strips and δ across) are the open case of
+stage 2's coincidence. The patch (luce_work/patches/robust7-step2-spline-
+coincide-wip.patch, re-derived on this main) adds the harness rows
+(`rounded`, 80 cells) and decides spline coincidence once at P:
+`spline_coincidence` measures each lattice point's gap within P (no longer
+10 R), the normals only telling which way the faces face (surfaces a part
+of P apart turn from each other by that over their curvature, past any
+angle test), and on a coincidence makes both faces' edges tolerant by P and
+both surfaces hold their trims within P (`trim_tolerance`; a lattice's
+largest gap can miss the worst point). With it the within-P cells get past
+the meet and the projections, and stop at the face split: the boundary
+each face imprints on the other meets the other's boundary a gap away, the
+crossing and the end are not merged, and the loop tracer finds a loose
+end ("a face being split traced into another loop"). What is left: merge
+an imprinted edge's ends into the other face's boundary within P as
+stage 2 merges vertices, then the split traces. Cells beyond P (0.02 mm and
+more) are a second case: two strips δ apart cross at a grazing angle near
+their tangent flats, refused as non-manifold. Not landed: the bands would
+go from 0 to 63 cells off with the new rows in.
+
+### 3.18 Stage 7: the sweep (dev/robustness)
+
+`dev/robustness` is the heavy sweep, run on demand (not by `luc test`):
+
+    luce-base build dev/robustness --native -o build/sweep
+    build/sweep [COUNT [SEED [FIRST]]]
+
+Each case (cases.lucb) is two bodies, a box (40% rounded G1 or G2 along
+every edge), a cylinder or a sphere, each turned and moved: half in general
+position, half near degenerate (axis-aligned or a quarter turn, sizes and
+offsets on a 1 mm grid, the second body then moved a hair: 0, P / 10,
+0.99 P or 1.01 P). Every case runs union, subtraction and intersection and
+checks (checks.lucb) that each succeeds, is closed, meshes watertight at
+Medium with every face meshed, that the volumes add up (V(A ∪ B) +
+V(A ∩ B) = V(A) + V(B), V(A − B) = V(A) − V(A ∩ B), within a millionth
+or P over the surfaces), that the same booleans of both bodies moved and
+turned together give the same volumes and face counts, and that a boolean
+run twice gives the same B-rep bit for bit. A refusal by design (a
+non-manifold result) is counted apart. A failing case is shrunk (shrink.lucb:
+roundings dropped, turns zeroed, numbers rounded while the same check of
+the same boolean still fails) and printed as Luce to paste into a
+regression. The generator is splitmix64 from the seed: a case replays the
+same on every machine. About 2.5 s a case (three booleans, each three
+times, meshes and volumes).
+
+**First runs** (seeds 1 to 3, 250 cases each): 43 failing cases of 750,
+and 7 refused as non-manifold (bodies touching along an edge, by design).
+Fixed in this series:
+
+- **A disk-shaped face on a sphere off every chart** (a slab through a ball
+  across its two half spheres: each half's piece runs from its rim over
+  its top to its rim): no chart about the ball's axis, no local hemisphere
+  and no band took it, so it was left out of the mesh, and the
+  intersection's volume was measured without it. `sphere_axis` now also
+  tries the plain latitude-longitude chart about each candidate axis (its
+  poles clear of the trims), where the face is an ordinary trimmed patch.
+  Six of the 43 pass now (sweep_tests keeps one).
+- **A volume measured without a face**: `CadMeasure.volume` refuses a mesh
+  with a face left out instead of returning a smaller volume. luce-usd's
+  round trips compare measured volumes (each triangle's cap added, so the
+  B-rep's, not how a NURBS rim happens to be sampled against a circle).
+- **Narrow ellipses refused** ("ellipse endpoints are not on the curve": a
+  pipe cut at a slant by a rounded box's flat face): an end's angle was read
+  off its coordinates, which for a point a hair off a narrow ellipse lands
+  far along it; the angle of its nearest point (Newton from that start) is
+  taken instead (brep/building.lucb `ellipse_angle`). Both cases pass (sweep_tests).
+- **Sphere halves alike** (reported from luced-3d's viewport): a half
+  sphere's rows were zipped to its rim in triangles, the rows' columns
+  finer (from a sag with a margin) than the rim's own samples at the step
+  angle. A ring sampled evenly round now gives the rows its own columns,
+  or a whole multiple where its steps exceed the angle, met in quads.
+  (when the rim's count is a multiple of 4, so the columns can still halve
+  toward the pole). Same deviation, a third fewer triangles; polygon sides
+  within the preset's angle (22.5 / 9.0 / 4.5 / 2.31 degrees at Low to Very
+  High), display diagonals to 1.17 times it as before (26.8 / 10.8 / 5.4 /
+  2.77), the largest distance from the ball unchanged (0.122 / 0.0198 /
+  0.0049 / 0.0013 mm at r = 5); mesh_calibration checks both
+  halves mesh to the same count and deviation. Sphere against Fusion now
+  0.89 / 0.73 / 0.72 / 0.69 (was 1.29 / 1.02 / 0.99 / 0.94), every edge
+  within the preset's angle.
+
+Open after these: 35 of 750 (4.7%), all from the near-degenerate half
+(axis-aligned bodies on a 1 mm grid, flush or a hair off) except the moved
+ones. Each replays with `build/sweep 1 SEED CASE`, which prints it shrunk:
+
+| failure | cases | example |
+|---|---|---|
+| "not a closed solid": a tangency within P (a box face a hair from a cylinder's extreme line, a sphere's equator edge tangent to a cylinder) leaves section ends unmerged | 17 | seed 2 case 63, seed 2 case 104 |
+| a face that no longer meshes once both bodies are moved and turned (sphere charts) | 7 | seed 2 case 49, seed 2 case 14 |
+| a different result once moved (face counts 2 against 4: a body found inside a ball at home, through it moved) | 4 | seed 1 case 80, seed 2 case 201 |
+| a sphere face meshed over far more than itself once moved (constrained chart; intersection volume negative) | 1 | seed 2 case 17 |
+| "a face being split traced into another loop" | 3 | seed 3 case 19 |
+| "a face piece has no inside to classify" | 2 | seed 3 case 32 |
+| volume identity off | 2 | seed 3 case 56, seed 1 case 225 |
+| mesh not watertight at home | 2 | seed 1 case 141 |
+| a tilted ring round a rod: its 14-edge torus face passes the clipped grid's cell budget at 64 divisions and is left out (found by the measure's new refusal; it had measured the union without it) | – | modeling_tests' marched |
+
+The first group is the next robustness stage: tangent contacts decided once
+at P, as coincident faces are (stage 2), so a section ending on an edge it
+touches within P ends at a shared vertex.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
@@ -1154,7 +1258,7 @@ identity are absolute (P); the construction slop stays relative to size until th
 | 4 ✓ | **Canonical results** (3.7). Peer booleans are the same bit for bit with operands swapped or faces renumbered: canonical meet and trace order, canonical coincidence surface and merged points, results written in their geometry's order. Tool booleans keep the body's geometry. | done | 0 of 23 swapped or renumbered results differ, bit for bit |
 | 5 ✓ (part) | **Per-entity tolerances and the recheck.** `rechecked` and `tolerance_report` (measured precision, tightening, healing on adopt). STEP imports join within P and are rechecked; the File node's Tolerances option asks. Edit CAD's held bodies call `rechecked` when the setting changes. Not done: shape_of still works to the widest precision anywhere (`model_tolerance()`). Working to each entity's own broke fillets, whose tools rely on the wider tolerance, so it moves to stage 6 with the absolute working tolerances. A body checker node is left for stage 7. | done | Rechecks in the harness; imports name looser files |
 | 6 (part) | **The rest of the kernel by directory, and absolute working tolerances.** Done: the work tolerance capped at R, the result's tolerance decoupled from it, the literal ratchet on, the guards named (3.8); blends fitted to F, trims meshed to the validity contract (3.9); the working tolerance R at every size, modeling working to the project's tolerances, the body's own tolerance only a display one (3.10). No body carries a size-derived tolerance and the mesh follows the angle (3.12). Fillet and blend, shell, surfacing, sketch, layout and meshing literals moved onto predicates and derived tolerances. Guards become helpers. Angular tests become the T or positional forms. About 800 literals, mechanical, one directory per commit, gated. | L: 1.5–2 weeks | No unprincipled literal left; the grep gate turns on |
-| 7 | **Heavy sweep tool** (`dev/robustness`): randomised rotations, scales and near-degenerate placements in the thousands, run on demand, not in `luc test`. Per the owner's priority this is after all requests and is not fuzzing. | S: 2 days | Continued coverage |
+| 7 (part) | **Heavy sweep tool** (`dev/robustness`, 3.18): random and near-degenerate booleans of boxes, cylinders, spheres and rounded boxes, checked for success, validity, watertight meshes, volume identities, invariance and determinism, failing cases shrunk into regressions. Built and run; its first findings partly fixed, the rest listed in 3.18. | S: 2 days | Continued coverage |
 
 Stages 1 and 2 hold most of the value. Each stage is pushed in green, gated pieces.
 

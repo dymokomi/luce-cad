@@ -1,0 +1,170 @@
+## What the sweep checks on a case (docs/research/KERNEL-ROBUSTNESS.md,
+## stage 7): each of the three booleans of its two bodies
+## - succeeds (an intersection of bodies apart, or a subtraction of a body
+##   from one round it, may be empty);
+## - is a valid closed solid (every edge used twice, once each way);
+## - meshes watertight at Fusion's Medium quality, every face meshed;
+## and across them
+## - volumes add up: V(A ∪ B) + V(A ∩ B) = V(A) + V(B), V(A − B) = V(A) − V(A ∩ B);
+## - the same booleans of the bodies moved and turned together give the
+##   same volumes and face counts (invariance);
+## - a boolean run twice gives the same B-rep, bit for bit (determinism).
+## A boolean refused as unsupported by design (a non-manifold result: the
+## bodies touch along an edge) is counted apart ("refused"), not as a
+## failure.
+
+## The checks, by number.
+pub let check_fails: i64 = 0
+pub let check_open: i64 = 1
+pub let check_mesh: i64 = 2
+pub let check_volume: i64 = 3
+pub let check_moved: i64 = 4
+pub let check_repeat: i64 = 5
+pub let check_refused: i64 = 6
+pub let check_count: i64 = 7
+
+pub func check_name(check: i64) -> str:
+    if check == check_fails: return "fails"
+    if check == check_open: return "open"
+    if check == check_mesh: return "mesh"
+    if check == check_volume: return "volume"
+    if check == check_moved: return "moved"
+    if check == check_repeat: return "repeat"
+    return "refused"
+
+## How far volumes that should agree may differ: a millionth of the bodies'
+## (the volume measure follows the B-rep to about 1e-7), or the positional
+## tolerance P over their surfaces (tolerant coincidence moves a face by up
+## to P), whichever is larger.
+let volume_share: f64 = 1e-6
+let positional: f64 = 0.01
+
+## The result of a case: which check failed first (check_count: none) and
+## what was seen.
+pub struct Verdict:
+    pub var check: i64 = 7
+    pub var operation: i64 = 0
+    pub var detail: str = ""
+
+## One boolean's outcome: its volume and face count, or that it failed
+## (`refused`: an intersection found empty) with the failure's message.
+struct Outcome:
+    var ok: bool = false
+    var empty: bool = false
+    var volume: f64 = 0.0
+    var faces: i64 = 0
+    var bits: u64 = 0
+
+## Case `c` checked (`buffer` holds the verdict's detail).
+pub func check_case(c: Case, buffer: u8[]) -> Verdict!:
+    let a = try solid(c.a)
+    defer a.release()
+    let b = try solid(c.b)
+    defer b.release()
+    let va = try CadMeasure.volume(a)
+    let vb = try CadMeasure.volume(b)
+    var outcomes = Growing[Outcome]()
+    defer outcomes.close()
+    for op in 0..<3:
+        let (outcome, verdict) = try run(a, b, op, buffer)
+        if verdict.check != check_count: return verdict
+        try outcomes.push(outcome)
+    let joined = outcomes.items[0]
+    let difference = outcomes.items[1]
+    let common = outcomes.items[2]
+    let slack = math.max(volume_share * (va + vb), positional * 6.0 * math.pow(va + vb, 2.0 / 3.0))
+    let common_volume = common.volume if common.ok else 0.0
+    if math.abs(joined.volume + common_volume - va - vb) > slack:
+        return Verdict(check_volume, 0, try strings.format(buffer, f"V(A+B) {joined.volume} + V(A*B) {common_volume} against V(A) {va} + V(B) {vb}"))
+    if math.abs(difference.volume - (va - common_volume)) > slack:
+        return Verdict(check_volume, 1, try strings.format(buffer, f"V(A-B) {difference.volume} against V(A) {va} - V(A*B) {common_volume}"))
+    # Moved and turned together: the same booleans.
+    let shift = Vector3(37.0, -21.0, 13.0)
+    let spin = Vector3(0.7, -1.1, 0.4)
+    let ma = try a.value().transformed(shift, spin, Vector3(1.0, 1.0, 1.0))
+    defer ma.release()
+    let mb = try b.value().transformed(shift, spin, Vector3(1.0, 1.0, 1.0))
+    defer mb.release()
+    for op in 0..<3:
+        let (moved, verdict) = try run(ma, mb, op, buffer)
+        let base = outcomes.items[(usize)op]
+        if verdict.check != check_count or moved.ok != base.ok or moved.empty != base.empty:
+            var held: u8[512]
+            let seen = strings.copy_into(held[..<512], verdict.detail)
+            return Verdict(check_moved, op, try strings.format(buffer, f"moved: {seen} (ok {moved.ok}, at home ok {base.ok})"))
+        if math.abs(moved.volume - base.volume) > slack or moved.faces != base.faces:
+            return Verdict(check_moved, op, try strings.format(buffer, f"moved: volume {moved.volume} faces {moved.faces}, at home {base.volume} and {base.faces}"))
+    # Twice: the same bits.
+    for op in 0..<3:
+        if not outcomes.items[(usize)op].ok or outcomes.items[(usize)op].empty: continue
+        let (again, verdict) = try run(a, b, op, buffer)
+        if verdict.check != check_count or again.bits != outcomes.items[(usize)op].bits:
+            return Verdict(check_repeat, op, "run again: another B-rep")
+    return Verdict()
+
+## Boolean `op` of `a` and `b`, measured, and the first check it fails.
+func run(a: interop.Reference[CadModel], b: interop.Reference[CadModel], op: i64, buffer: u8[]) -> (Outcome, Verdict)!:
+    var out = Outcome()
+    let made = CadModeling.combined(a, b, op) catch failure:
+        if failure.code == memory.exhausted: error(failure.code, failure.message)
+        # Bodies apart have no intersection: an empty result, refused.
+        if op == 2 and strings.contains(failure.message, "empty"):
+            out.empty = true
+            return (out, Verdict())
+        let check = check_refused if strings.contains(failure.message, "non-manifold") else check_fails
+        return (out, Verdict(check, op, try strings.format(buffer, f"{failure.message}")))
+    defer made.release()
+    out.ok = true
+    out.faces = made.value().face_count()
+    # Nothing left (bodies apart intersected, a body inside the other
+    # subtracted): an empty result, volume 0.
+    if out.faces == 0:
+        out.empty = true
+        return (out, Verdict())
+    if not try closed(made): return (out, Verdict(check_open, op, "an edge not used twice"))
+    let mesh = made.value().tessellated(MeshQuality.medium()) catch failure:
+        if failure.code == memory.exhausted: error(failure.code, failure.message)
+        return (out, Verdict(check_mesh, op, try strings.format(buffer, f"{failure.message}")))
+    defer mesh.release()
+    if not try watertight(mesh.value()): return (out, Verdict(check_mesh, op, "the mesh is not watertight or a face did not mesh"))
+    out.volume = CadMeasure.volume(made) catch failure:
+        if failure.code == memory.exhausted: error(failure.code, failure.message)
+        return (out, Verdict(check_mesh, op, try strings.format(buffer, f"{failure.message}")))
+    out.bits = try fingerprint(made)
+    return (out, Verdict())
+
+## Whether every edge of the B-rep is used by two faces.
+func closed(model: interop.Reference[CadModel]) -> bool!:
+    let brep = model.value().brep() else return false
+    let edges = (usize)brep.edge_count()
+    if edges == 0: return false
+    let uses = try new i64[edges] --- in memory.heap
+    defer free(uses) in memory.heap
+    for at in 0..<edges: uses[at] = 0
+    for face in 0..<brep.face_count():
+        for use in 0..<(try brep.face_edge_count(face)): uses[(usize)(try brep.face_edge_id(face, use))] += 1
+    for count in uses:
+        if count != 2: return false
+    return true
+
+## Whether `mesh` has every face meshed and every edge used twice.
+func watertight(mesh: const Mesh*) -> bool!:
+    if mesh.find_attribute(".cad_skipped_faces", 3) >= 0 or mesh.find_attribute(".cad_dropped_faces", 3) >= 0: return false
+    let edges = (usize)(try mesh.edge_count())
+    let uses = try new i64[edges] --- in memory.heap
+    defer free(uses) in memory.heap
+    for at in 0..<edges: uses[at] = 0
+    for face in 0..<mesh.face_count():
+        for at in 0..<(try mesh.face_size(face)): uses[(usize)(try mesh.face_edge(face, at))] += 1
+    for count in uses:
+        if count != 2: return false
+    return true
+
+## The B-rep's fingerprint and its placement.
+func fingerprint(model: interop.Reference[CadModel]) -> u64!:
+    let brep = model.value().brep() else error(invalid, "a boolean's result has no B-rep")
+    let placement = model.value().brep_placement()
+    var h = try brep.fingerprint()
+    let bytes = (const u8*)&placement
+    for at in 0..<memory.size_of(Matrix4): h = (h ^ (u64)bytes[at]) *% 1099511628211
+    return h

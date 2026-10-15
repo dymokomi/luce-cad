@@ -1,0 +1,130 @@
+## The sweep's random cases: two solids (a box, a cylinder or a sphere,
+## a box sometimes rounded G1 or G2 along every edge), each placed by a
+## rotation and a translation, and a boolean between them. Half the cases are
+## in general position (any rotation, any offset); the other half are near
+## degenerate: axis-aligned, sizes and offsets on a coarse grid, so faces
+## lie flush, edges meet and surfaces touch, sometimes moved off that by a
+## hair under or over the positional tolerance P. A case is a few numbers,
+## so it is printed, shrunk and replayed exactly.
+
+import interop
+import memory
+import strings
+from luce_geocore.core.growing import Growing
+from luce_std import math
+from luce_geocore.geocore import Vector3, Matrix4, Mesh, invalid
+from model import CadModel, MeshQuality
+from solids import CadSolids
+from modeling import CadModeling
+from measure import CadMeasure
+
+## A deterministic generator (splitmix64): the same seed, the same cases on
+## every machine.
+struct Random:
+    var state: u64
+
+    func next() -> u64:
+        self.state = self.state +% 0x9E3779B97F4A7C15
+        var z = self.state
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB
+        return z ^ (z >> 31)
+
+    ## A number in [0, 1).
+    func unit() -> f64:
+        return (f64)(self.next() >> 11) / 9007199254740992.0
+
+    ## A number in [low, high).
+    func between(low: f64, high: f64) -> f64:
+        return low + (high - low) * self.unit()
+
+    ## A whole number in [0, count).
+    func below(count: i64) -> i64:
+        return (i64)(self.next() % (u64)count)
+
+## The kinds of solid.
+pub let kind_box: i64 = 0
+pub let kind_cylinder: i64 = 1
+pub let kind_sphere: i64 = 2
+
+## One solid of a case: its kind, its sizes (a box's width, height and
+## depth; a cylinder's radius and height; a sphere's radius), a box's
+## rounding (radius, 0 none) and continuity, and its placement.
+pub struct Body:
+    pub var kind: i64 = 0
+    pub var size: Vector3 = Vector3(1.0, 1.0, 1.0)
+    pub var round: f64 = 0.0
+    pub var continuity: i64 = 1
+    pub var turn: Vector3 = Vector3()
+    pub var at: Vector3 = Vector3()
+
+## A case: two bodies and the operation (0 union, 1 subtract, 2 intersect).
+pub struct Case:
+    pub var a: Body = Body()
+    pub var b: Body = Body()
+    pub var operation: i64 = 0
+
+## The share of near-degenerate cases, and the offsets they are moved by
+## off the grid (none, a tenth of P, just under P, just over P), in P.
+let degenerate_share: f64 = 0.5
+let hair_offsets: f64[4] = [0.0, 0.1, 0.99, 1.01]
+
+## The default positional tolerance P the hairs are measured in (mm).
+let hair_unit: f64 = 0.01
+
+## Case `index` of the sweep seeded `seed`.
+pub func make_case(seed: u64, index: u64) -> Case:
+    var r = Random(seed *% 0x2545F4914F6CDD1D +% index)
+    _ = r.next()
+    let degenerate = r.unit() < degenerate_share
+    var made = Case()
+    made.a = make_body(&r, degenerate, Vector3())
+    made.b = make_body(&r, degenerate, made.a.size)
+    made.operation = r.below(3)
+    if degenerate:
+        let hair = hair_offsets[(usize)r.below(4)] * hair_unit
+        let axis = r.below(3)
+        made.b.at = made.b.at.add(Vector3(hair if axis == 0 else 0.0, hair if axis == 1 else 0.0, hair if axis == 2 else 0.0))
+    return made
+
+## A random body; near `near` (the first body's sizes) for the second.
+func make_body(r: Random*, degenerate: bool, near: Vector3) -> Body:
+    var body = Body()
+    body.kind = r.below(3)
+    if degenerate:
+        # Sizes and offsets on a grid of 1 mm, axis-aligned or a quarter turn.
+        body.size = Vector3((f64)(2 + r.below(9)), (f64)(2 + r.below(9)), (f64)(2 + r.below(9)))
+        if body.kind == kind_cylinder: body.size = Vector3((f64)(1 + r.below(4)), (f64)(2 + r.below(9)), 0.0)
+        if body.kind == kind_sphere: body.size = Vector3((f64)(1 + r.below(5)), 0.0, 0.0)
+        let quarter = math.pi * 0.5
+        body.turn = Vector3(quarter * (f64)r.below(2), quarter * (f64)r.below(2), 0.0)
+        let reach = math.max(near.x, math.max(near.y, near.z)) * 0.5 + 1.0
+        body.at = Vector3(math.round(r.between(-reach, reach)), math.round(r.between(-reach, reach)), math.round(r.between(-reach, reach)))
+    else:
+        body.size = Vector3(r.between(1.0, 10.0), r.between(1.0, 10.0), r.between(1.0, 10.0))
+        if body.kind == kind_cylinder: body.size = Vector3(r.between(0.5, 4.0), r.between(1.0, 10.0), 0.0)
+        if body.kind == kind_sphere: body.size = Vector3(r.between(0.5, 5.0), 0.0, 0.0)
+        body.turn = Vector3(r.between(-math.pi, math.pi), r.between(-math.pi, math.pi), r.between(-math.pi, math.pi))
+        let reach = math.max(near.x, math.max(near.y, near.z)) * 0.6 + 1.0
+        body.at = Vector3(r.between(-reach, reach), r.between(-reach, reach), r.between(-reach, reach))
+    if body.kind == kind_box and r.unit() < 0.4:
+        let least = math.min(body.size.x, math.min(body.size.y, body.size.z))
+        body.round = least * r.between(0.05, 0.3)
+        if degenerate: body.round = math.max(0.25, math.round(body.round * 4.0) * 0.25)
+        body.continuity = 1 + r.below(2)
+    return body
+
+## The body as a solid.
+pub func solid(body: Body) -> interop.Reference[CadModel]!:
+    let made = try shaped(body)
+    defer made.release()
+    return try made.value().transformed(body.at, body.turn, Vector3(1.0, 1.0, 1.0))
+
+## The body's solid where it is made, at the origin.
+func shaped(body: Body) -> interop.Reference[CadModel]!:
+    if body.kind == kind_cylinder: return try CadSolids.cylinder(body.size.x, body.size.y)
+    if body.kind == kind_sphere: return try CadSolids.sphere(body.size.x)
+    let box = try CadSolids.box(body.size.x, body.size.y, body.size.z)
+    if body.round == 0.0: return box
+    defer box.release()
+    return try CadModeling.filleted(box, "", body.round, "r", body.continuity)

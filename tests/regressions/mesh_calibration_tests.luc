@@ -12,6 +12,7 @@ from luce_cad.model import CadModel, MeshQuality
 from luce_cad.solids import CadSolids
 from luce_geocore.geocore import Vector3
 from checks import closed
+from luce_std import math
 
 func qualities() -> list[MeshQuality]:
     return [MeshQuality.low(), MeshQuality.medium(), MeshQuality.high(), MeshQuality.very_high()]
@@ -56,4 +57,28 @@ pub func mesh_calibration_tests() -> unit!:
         let mesh = CadModeling.filleted(cube, "", r * 0.25, "f", 1).tessellated(quality)
         closed(mesh)
         assert(mesh.topology_hash() == base.topology_hash(), f"built at {offset.x},{offset.y},{offset.z} with r = {r}: another topology")
+    sphere_symmetry()
     print("PASS mesh calibration: sphere, cylinder, torus and rounded box within 2.5 times Fusion's counts at its four qualities, the same counts from 0.5 to 500 mm, the same topology built 10 m off and from 0.05 to 500 mm")
+
+## A ball's two half spheres mesh alike, mirrored: at each quality as many
+## triangles and the same largest distance from the ball either side of the
+## equator (each half's rows meet the equator in quads, not a finer zipped
+## band on one side).
+func sphere_symmetry() -> unit!:
+    let r = 5.0
+    let ball = CadSolids.sphere(r)
+    for quality in qualities():
+        let mesh = ball.tessellated(quality)
+        let parent = mesh.find_attribute("cad_face", 2)
+        let counts = [0, 0]
+        let deviations = [0.0, 0.0]
+        for triangle in 0..<mesh.index_count() // 3:
+            let face = int(mesh.attribute_value(parent, mesh.triangle_face(triangle), 0))
+            let a = mesh.vertex(mesh.index(triangle * 3)).position
+            let b = mesh.vertex(mesh.index(triangle * 3 + 1)).position
+            let c = mesh.vertex(mesh.index(triangle * 3 + 2)).position
+            counts[face] += 1
+            deviations[face] = math.max(deviations[face], r - a.add(b).add(c).multiply_scalar(1.0 / 3.0).length())
+        if counts[0] != counts[1] or math.abs(deviations[0] - deviations[1]) > 1e-9 * r:
+            print(f"half spheres at {quality.angle}: {counts[0]} and {counts[1]} triangles, deviations {deviations[0]} and {deviations[1]}")
+        assert(counts[0] == counts[1] and math.abs(deviations[0] - deviations[1]) <= 1e-9 * r)
