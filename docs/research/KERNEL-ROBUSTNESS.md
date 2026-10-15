@@ -791,6 +791,44 @@ near it), which the mapped grid's sides would have to carry as stations.
 **Harness:** invariance 0 of 224, band 0 of 452, canonical 0 of 23,
 determinism identical; literals 732.
 
+### 3.15 Per-direction rows in the clipped chart
+
+`refine_axis` (layout/density.lucb) splits a clipped chart's rows each way
+by the sag a chord turning the step angle has on the tightest radius *that
+way* (`axis_sag`, face_targets.lucb: a B-spline's normal curvature along u
+or along v alone, a torus's around its axis or round its tube, a cylinder's
+or cone's round its axis and none along it), no longer by the tightest
+radius in any direction. A surface curving one way only is no longer
+refined across the way it is straight or gently bent.
+
+Why the first attempt broke the clipped mesher: it also gave `refine_cells`
+(cell_error.lucb) the per-direction targets as its floor. The cell check is
+the one that sees the twist (a bilinear saddle has straight isocurves, so
+both directions' radii are infinite, yet its quads leave the surface), and
+with the twist's term gone from its floor no cell was ever split
+(layout_contract's diagonal_error_contract). `refine_cells` keeps the
+surface's tightest sag, twist included, as its floor; only the rows'
+directional split changed.
+
+**Fusion, re-measured:** unchanged, as the four calibration shapes do not
+mesh through the clipped chart (the sphere's octants are charted and
+refined, the cylinder's and torus's faces and the rounded box's fillets are
+mapped, its corners barycentric). Sphere 1.29 / 1.02 / 0.99 / 0.94,
+cylinder 0.79 / 0.72 / 1.10 / 1.44, torus 1.18 / 0.99 / 1.00 / 0.96,
+rounded box 1.16 / 1.64 / 1.92 / 2.05 (Low to Very High).
+
+**What remains on the rounded box** (cube of 10 mm, edges rounded 1.25 mm),
+by surface at Medium: planes 48 triangles, the 12 fillets 480 (each 10 steps
+round, the step angle's ceil(90 / 9.43), by 2 rows along), the 8 corners 800
+(100 each, 10 by 10): 1,328 against Fusion's 812. Fusion's own sphere at
+Medium has 351 triangles an octant, so its rounded box's fillets and corners
+(about 770 together) are meshed at well under half its own angle: its display
+adds a deviation relative to the body's size, which coarsens small radii on
+a larger part. Ours is the angle alone, by the owner's direction (3.12), so
+the ratio grows with the quality (more steps on the small radii) and is the
+same at every size. At Very High: planes 588, fillets 6,552 (39 steps by 7
+rows), corners 12,168 (39²): 19,308 against 9,436.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.
