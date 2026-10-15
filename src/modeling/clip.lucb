@@ -162,6 +162,52 @@ pub func crossings(w: const Shape*, c: i64, low: f64, high: f64, e: usize, size:
                 if (try w.at(c, hit.t)).subtract(try w.at(c, at_t)).length() <= tol * 10.0 and math.abs(hit.s - at_s) <= math.abs(edge.t1 - edge.t0) * repeat_hit_share + repeat_hit_floor: known = true
             if not known: try out.push(Hit(at_t, at_s))
             if out.count > first_hit and not known: try found.push(try w.at(c, at_t))
+    try merge_touches(w, c, low, high, ec, edge.t0, edge.t1, tol, out, first_hit)
+
+## Hits from `first` on that are one touch: where the curve meets the edge
+## tangentially (a sphere's equator edge tangent to a cylinder the section
+## runs on), it stays within reach of the edge over a stretch, and a hit
+## is found at each sample along it, each a vertex cutting both: the
+## section is left in slivers with gaps between. Consecutive hits inside
+## both ranges whose stretch of the curve between them stays within reach
+## of the edge are one, kept where the two come closest.
+func merge_touches(w: const Shape*, c: i64, low: f64, high: f64, ec: i64, s0: f64, s1: f64, tol: f64, out: Growing[Hit]*, first: usize) -> !:
+    if out.count < first + 2: return
+    let hits = out.items[first..<out.count]
+    # In order along the curve (a few hits: insertion).
+    for at in 1..<hits.length:
+        let hit = hits[at]
+        var to = at
+        while to > 0 and hits[to - 1].t > hit.t:
+            hits[to] = hits[to - 1]
+            to -= 1
+        hits[to] = hit
+    let a = math.min(s0, s1)
+    let b = math.max(s0, s1)
+    var kept = first
+    for at in first + 1..<out.count:
+        let previous = out.items[kept]
+        let hit = out.items[at]
+        let interior = previous.t > low and previous.t < high and hit.t > low and hit.t < high and previous.s > a and previous.s < b and hit.s > a and hit.s < b
+        var touching = interior
+        var s = previous.s
+        for k in 1..<touch_samples:
+            if not touching: break
+            let p = try w.at(c, previous.t + (hit.t - previous.t) * (f64)k / (f64)touch_samples)
+            s = try nearest_from(w, ec, p, a, b, s)
+            touching = (try w.at(ec, s)).subtract(p).length() <= tol * 10.0
+        if touching:
+            # One touch: the closer of the two stands for it.
+            let gap_previous = (try w.at(c, previous.t)).subtract(try w.at(ec, previous.s)).length()
+            let gap_hit = (try w.at(c, hit.t)).subtract(try w.at(ec, hit.s)).length()
+            if gap_hit < gap_previous: out.items[kept] = hit
+            continue
+        kept += 1
+        out.items[kept] = hit
+    out.count = kept + 1
+
+## The points a stretch between two hits is checked at for a touch.
+let touch_samples: usize = 8
 
 ## Whether carrier `c` from `t` to `end` stays within reach (ten
 ## tolerances) of carrier `ec` on [s0, s1], `seed` its nearest parameter
@@ -241,13 +287,18 @@ func full_range(w: const Shape*, c: i64) -> (f64, f64):
     _ = weights
     return (knots[(usize)degree], knots[points.length])
 
-## Whether edge `e` lies on carrier `c`'s whole curve: its ends and middle
-## on it.
+## The points of an edge `same_curve` checks: its ends and quarters.
+let same_curve_samples: usize = 5
+
+## Whether edge `e` lies on carrier `c`'s whole curve: its ends and
+## quarters on it.
 func same_curve(w: const Shape*, c: i64, e: usize, tol: f64) -> bool!:
     let edge = w.edges.items[e]
     let (low, high) = full_range(w, c)
-    for k in 0..<3:
-        let p = try w.at(edge.carrier, edge.t0 + (edge.t1 - edge.t0) * (f64)k * 0.5)
+    # Quarters, not halves: a whole circle's start, middle and end lie on
+    # any line through its center.
+    for k in 0..<same_curve_samples:
+        let p = try w.at(edge.carrier, edge.t0 + (edge.t1 - edge.t0) * (f64)k / (f64)(same_curve_samples - 1))
         let t = try nearest_on(w, c, p, low, high)
         if (try w.at(c, t)).subtract(p).length() > tol * 10.0: return false
     return true
@@ -438,6 +489,10 @@ func winding(points: const Vector3[], starts: const usize[], u: f64, v: f64) -> 
                 total -= 1
     return total
 
+## How far, as a share of a turn, a point on a full-turn loop's seam
+## meridian is moved on to be counted (chart_winding).
+let seam_nudge: f64 = 1e-9
+
 ## The winding number of the chart's loops about (u, v); with `wraps` (an
 ## angle chart) each loop sees (u, v) moved by whole turns into its own
 ## range, since a loop's unwrapped angles start wherever its curve does.
@@ -452,9 +507,18 @@ pub func chart_winding(points: const Vector3[], starts: const usize[], u: f64, v
         var shifted_v = v
         if wraps:
             var low = points[first].x
-            for at in first..<last: low = math.min(low, points[at].x)
+            var high = low
+            for at in first..<last:
+                low = math.min(low, points[at].x)
+                high = math.max(high, points[at].x)
             while shifted < low: shifted += 2.0 * math.pi
             while shifted >= low + 2.0 * math.pi: shifted -= 2.0 * math.pi
+            # A loop going once round (closed over a pole) has its chart
+            # sides at its first longitude and a turn on: a point on that
+            # meridian lies on both, its winding undecided. The region is
+            # the same a hair on, where it is decided.
+            let turn = 2.0 * math.pi
+            if high - low >= turn * (1.0 - seam_nudge) and shifted - low < turn * seam_nudge: shifted = low + turn * seam_nudge
         if wraps_v:
             var low_v = points[first].y
             for at in first..<last: low_v = math.min(low_v, points[at].y)

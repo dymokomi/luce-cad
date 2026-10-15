@@ -933,25 +933,47 @@ Fixed in this series:
   0.89 / 0.73 / 0.72 / 0.69 (was 1.29 / 1.02 / 0.99 / 0.94), every edge
   within the preset's angle.
 
-Open after these: 35 of 750 (4.7%), all from the near-degenerate half
-(axis-aligned bodies on a 1 mm grid, flush or a hair off) except the moved
-ones. Each replays with `build/sweep 1 SEED CASE`, which prints it shrunk:
+Then, from the shrunk cases (sweep_tests keeps each):
+
+- **A tangent touch is one vertex** (clip.lucb `merge_touches`): where a
+  section touches an edge tangentially (a ball's equator edge tangent to the
+  pipe the section runs on), it stays within reach of the edge over a
+  stretch and a crossing was found at every sample along it, each cutting
+  both: the section broke into slivers with gaps ("not a closed solid").
+  Consecutive hits whose stretch of the curve stays within reach of the
+  edge are one, kept where the two come closest.
+- **A line through a circle's center is not the circle** (`same_curve`):
+  it compared the edge's start, middle and end, which for a whole circle
+  all lie on any line through its center, so a box face through a pipe's
+  axis took its cap circle for the cut line and never cut it at the far
+  side. Ends and quarters now.
+- **A point on a half ball's seam meridian is inside** (`chart_winding`): a
+  loop going once round (closed over the pole) has its chart sides on that
+  meridian, where the winding is undecided; two balls whose meeting circle
+  passed it had the union drop one ball (a different result once moved).
+  The point is counted a billionth of a turn on.
+- **A stalled trim triangulation takes its roundest ear** (polygons/trim):
+  where no well-conditioned ear is left, the roundest one turning the
+  polygon's way and holding no corner, before giving up.
+
+Open now: 23 of 750 (3.1%), and 6 refused as non-manifold by design. Each
+replays with `build/sweep 1 SEED CASE`, which prints it shrunk:
 
 | failure | cases | example |
 |---|---|---|
-| "not a closed solid": a tangency within P (a box face a hair from a cylinder's extreme line, a sphere's equator edge tangent to a cylinder) leaves section ends unmerged | 17 | seed 2 case 63, seed 2 case 104 |
-| a face that no longer meshes once both bodies are moved and turned (sphere charts) | 7 | seed 2 case 49, seed 2 case 14 |
-| a different result once moved (face counts 2 against 4: a body found inside a ball at home, through it moved) | 4 | seed 1 case 80, seed 2 case 201 |
+| "a face being split traced into another loop" or "not closed" where a section touches a face's boundary at one point (a closed section on a half ball touching its equator; a ball inside a pipe touching its wall at the cap rim) | 8 | seed 2 case 209, seed 2 case 124 |
+| a face that no longer meshes once both bodies are moved and turned: offsets of exactly P (the shrunk case rounded a hair of 0.99 P or 1.01 P to P) decided one way at home and the other moved, leaving edges within P of a cylinder its chart triangulation cannot close | 7 | seed 2 case 125, seed 2 case 49 |
+| a pipe tangent to a box face inside it (subtracted): the face's trims touch along the line ("trim loops cross or touch") | 2 | seed 3 case 85, seed 1 case 141 |
 | a sphere face meshed over far more than itself once moved (constrained chart; intersection volume negative) | 1 | seed 2 case 17 |
-| "a face being split traced into another loop" | 3 | seed 3 case 19 |
-| "a face piece has no inside to classify" | 2 | seed 3 case 32 |
+| a different result once moved (two balls; a box and a ball) | 2 | seed 2 case 201, seed 3 case 160 |
+| "a face piece has no inside to classify" | 1 | seed 3 case 32 |
 | volume identity off | 2 | seed 3 case 56, seed 1 case 225 |
-| mesh not watertight at home | 2 | seed 1 case 141 |
 | a tilted ring round a rod: its 14-edge torus face passes the clipped grid's cell budget at 64 divisions and is left out (found by the measure's new refusal; it had measured the union without it) | – | modeling_tests' marched |
 
-The first group is the next robustness stage: tangent contacts decided once
-at P, as coincident faces are (stage 2), so a section ending on an edge it
-touches within P ends at a shared vertex.
+The first group is the next step: a section touching a face's boundary at a
+single point makes a loop that passes that vertex twice, which the face
+split's turn order at the vertex must take the right way round (the section
+and the edge leave it along one tangent).
 
 ### 3.4 Reproducing
 

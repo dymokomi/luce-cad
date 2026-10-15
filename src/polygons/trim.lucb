@@ -272,7 +272,26 @@ pub struct TrimPolygon:
             if not clipped:
                 if sizes.length == 1 and (try star_seed(&mesh, points, n, expected, epsilon)):
                     return try mesh.finish()
-                error(invalid, "trim triangulation stalled; no boundary vertices were discarded")
+                # No well-conditioned ear left (a nearly straight run of
+                # samples, a thin bridge to a hole): the roundest ear that
+                # turns the polygon's way and holds no corner, however thin;
+                # the chart's flips and refinement improve it later. Only
+                # when no ear turns the right way at all is the polygon stuck.
+                let thinnest = roundest_ear(points, path[..<length], n)
+                if thinnest < 0: error(invalid, "trim triangulation stalled; no boundary vertices were discarded")
+                let at = (usize)thinnest
+                let ai = path[(at + length - 1) % length]
+                let bi = path[at]
+                let ci = path[(at + 1) % length]
+                try triangle(&mesh, ai, bi, ci)
+                area += orientation(points[ai], points[bi], points[ci], n) * 0.5
+                for index in at..<length - 1:
+                    path[index] = path[index + 1]
+                length -= 1
+                candidates = 0
+                for k in 0..<length:
+                    if eligible(points[path[(k + length - 1) % length]], points[path[k]], points[path[(k + 1) % length]], n): candidates += 1
+                scan = (at + length - 1) % length
         let tail = orientation(points[path[0]], points[path[1]], points[path[2]], n)
         if not usable(points[path[0]], points[path[1]], points[path[2]], n):
             error(invalid, "trim triangulation has a degenerate final triangle")
@@ -368,6 +387,36 @@ func triangle(mesh: MeshBuilder*, a: usize, b: usize, c: usize) -> !:
     try mesh.corner((i64)a)
     try mesh.corner((i64)b)
     try mesh.corner((i64)c)
+
+## The corner of `path` whose ear (it and its neighbors) turns the
+## polygon's way, holds no other corner and is roundest (twice its area over
+## its longest side squared), or -1 when none does.
+func roundest_ear(points: const Vector3[], path: const usize[], n: Vector3) -> i64:
+    let length = path.length
+    var best: i64 = -1
+    var roundest: f64 = 0.0
+    for at in 0..<length:
+        let ai = path[(at + length - 1) % length]
+        let bi = path[at]
+        let ci = path[(at + 1) % length]
+        let a = points[ai]
+        let b = points[bi]
+        let c = points[ci]
+        if side(a, b, c, n) <= 0: continue
+        let longest = math.max(b.subtract(a).dot(b.subtract(a)), math.max(c.subtract(b).dot(c.subtract(b)), a.subtract(c).dot(a.subtract(c))))
+        let round = orientation(a, b, c, n) / math.max(longest, degenerate)
+        if round <= roundest: continue
+        var blocked = false
+        for index in 0..<length:
+            let id = path[index]
+            if id == ai or id == bi or id == ci: continue
+            if inside_triangle(a, b, c, points[id], n):
+                blocked = true
+                break
+        if blocked: continue
+        best = (i64)at
+        roundest = round
+    return best
 
 func orientation(a: Vector3, b: Vector3, c: Vector3, n: Vector3) -> f64:
     return b.subtract(a).cross(c.subtract(a)).dot(n)
