@@ -6,6 +6,12 @@
 ## each end. A plane meeting a cylinder along the edge has its own section
 ## (ruled_profile).
 
+## How far past each end, as a share of the edge's length (beyond twice the
+## size), a tool runs into the empty corner beyond.
+let tool_margin_share: f64 = 0.01
+## An offset section: the central-difference step in its parameter.
+let section_difference: f64 = 1e-5
+
 ## The section of edge `e`'s blend at `p` (its start), swept along `along`:
 ## the corner profile between two planes, or between a plane and a
 ## cylinder along the edge (ruled_profile). A chamfer reaches `other` along
@@ -126,7 +132,7 @@ func off_cylinder(points: const Vector3[], weights: const f64[], knots: const f6
     for k in 1..<(usize)64:
         let q = (try NurbsCurve.at(points, weights, 5, knots, (f64)k / 64.0)).subtract(axis_point)
         let gap = q.subtract(axis.multiply_scalar(q.dot(axis))).length() - radius
-        if math.abs(gap) <= radius * 1e-9: continue
+        if math.abs(gap) <= radius * relative_zero: continue
         if side == 0.0: side = gap
         elif (gap < 0.0) != (side < 0.0): error(invalid, "a fillet section weighted this heavily crosses the cylinder it meets: use a lower Tangency weight")
 
@@ -188,7 +194,7 @@ func edge_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i6
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
     # Past each end by a margin, where the corner beyond is empty.
-    let margin = size * 2.0 + length * 0.01
+    let margin = size * 2.0 + length * tool_margin_share
     let corner = try ua.add(ub).normalized().multiply_scalar(size * 0.25)
     let extent = math.max(length, size) * 4.0
     let before = 0.0 if exact_start or try body.inside(w, start.subtract(along.multiply_scalar(size * 0.5)).add(corner), extent) else margin
@@ -328,7 +334,7 @@ func offset_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, offse
     # The moved legs' meeting point.
     let k = ea.dot(eb)
     let det = 1.0 - k * k
-    if det < 1e-12: error(invalid, "a section's legs run along one line")
+    if det < singular_floor: error(invalid, "a section's legs run along one line")
     let r = ta0.subtract(tb0)
     let s = (k * r.dot(eb) - r.dot(ea)) / det
     let p0 = ta0.add(ea.multiply_scalar(s))
@@ -355,8 +361,8 @@ func offset_section(ta: Vector3, tb: Vector3, p: Vector3, continuity: i64, offse
     for q in 0..<samples + 1:
         let t = (f64)q / (f64)samples
         let at = try NurbsCurve.at(base.view(), weights[..<8], 5, knots.view(), t)
-        let ahead = try NurbsCurve.at(base.view(), weights[..<8], 5, knots.view(), math.min(t + 1e-5, 1.0))
-        let behind = try NurbsCurve.at(base.view(), weights[..<8], 5, knots.view(), math.max(t - 1e-5, 0.0))
+        let ahead = try NurbsCurve.at(base.view(), weights[..<8], 5, knots.view(), math.min(t + section_difference, 1.0))
+        let behind = try NurbsCurve.at(base.view(), weights[..<8], 5, knots.view(), math.max(t - section_difference, 0.0))
         var normal = try plane.cross(ahead.subtract(behind)).normalized()
         if q == 0: sign = 1.0 if normal.dot(ua) > 0.0 else -1.0
         normal = normal.multiply_scalar(sign)
@@ -443,7 +449,7 @@ func g3_leg(t: Vector3, p: Vector3, blend_shape: BlendShape, bend: Vector3, turn
     # Flat across at the contact (to rounding): the points stay on the leg.
     let kappa = bend.length()
     let length = span.length()
-    if kappa * length <= 1e-12: return leg
+    if kappa * length <= flat_bend: return leg
     let e = span.multiply_scalar(1.0 / length)
     let n = try bend.subtract(e.multiply_scalar(bend.dot(e))).normalized()
     let a1 = weighted_fraction(g3[1], blend_shape) * length
@@ -477,7 +483,7 @@ func concave_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity:
     let ub = try into_face(w, fb, e, along)
     let (n0, h0) = (along.multiply_scalar(-1.0), -along.dot(start)) if exact_start else try end_plane(w, start, fa, fb)
     let (n1, h1) = (along, along.dot(end)) if exact_end else try end_plane(w, end, fa, fb)
-    let square = math.abs(n0.dot(along)) > 1.0 - 1e-9 and math.abs(n1.dot(along)) > 1.0 - 1e-9
+    let square = math.abs(n0.dot(along)) > 1.0 - parallel_slack and math.abs(n1.dot(along)) > 1.0 - parallel_slack
     let margin = 0.0 if square else size * 4.0 + length * 0.1
     var profile = try section_profile(w, e, start.subtract(along.multiply_scalar(margin)), along, size, round, continuity, other, blend_shape, spill)
     defer profile.close()
@@ -548,7 +554,7 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     if edge.start == edge.end:
         var profile = try rim_profile(w, e, ball, p, along, ua, ub, size, round, continuity, other, blend_shape)
         defer profile.close()
-        try revolve_into(solid.value(), &profile, carrier.origin, normal, (carrier.a + size) * 1e-7, "")
+        try revolve_into(solid.value(), &profile, carrier.origin, normal, (carrier.a + size) * turned_tool_share, "")
         try name_tool(solid.value(), name)
         return try CadModel.of_brep(solid)
     # The axis turning the way the edge runs.
@@ -567,7 +573,7 @@ func rim_tool(w: const Shape*, e: usize, size: f64, round: bool, continuity: i64
     let back = -(sweep * 0.5 + before)
     var profile = try rim_profile(w, e, ball, turned_point(p, carrier.origin, a, back), turned_direction(along, a, back), turned_direction(ua, a, back), turned_direction(ub, a, back), size, round, continuity, other, blend_shape)
     defer profile.close()
-    try revolve_into(solid.value(), &profile, carrier.origin, a, (carrier.a + size) * 1e-7, "", sweep + before + after)
+    try revolve_into(solid.value(), &profile, carrier.origin, a, (carrier.a + size) * turned_tool_share, "", sweep + before + after)
     try name_tool(solid.value(), name)
     return try CadModel.of_brep(solid)
 

@@ -21,6 +21,12 @@
 ## about its axis; a G2 strip's at G2, r + wall); their corners are the
 ## fillet's own.
 
+## Corners: three corners span a plane when their cross product is longer
+## than this share of the size squared, and a fourth off that plane by more
+## than this share of the size makes a solid.
+let corners_span_share: f64 = 1e-12
+let corners_solid_share: f64 = 1e-7
+
 ## A plane of the body's flat faces: its outward normal and offset, the
 ## first face on it (its name), whether that face is opened, and its offset
 ## moved for the inner body.
@@ -112,7 +118,7 @@ func cells_remade(w: const Shape*, planes: const CellPlane[], rounds: const Cell
         let offset = normal.dot(s.origin)
         var named = false
         for plane in planes:
-            if plane.normal.dot(normal) > 1.0 - 1e-9 and math.abs(plane.moved - offset) <= w.tolerance * 100.0:
+            if plane.normal.dot(normal) > 1.0 - parallel_slack and math.abs(plane.moved - offset) <= w.tolerance * 100.0:
                 v.faces.items[f].name = try v.add_name(w.face_name(plane.face))
                 named = true
         if not named: return none
@@ -167,7 +173,7 @@ func add_cell_plane(w: const Shape*, f: usize, opened: bool, wall_in: f64, wall_
     let normal = face_outward(w, f)
     let offset = normal.dot(w.surfaces.items[(usize)w.faces.items[f].surface].origin)
     for plane in planes.view():
-        if math.abs(plane.normal.dot(normal)) < 1.0 - 1e-9: continue
+        if math.abs(plane.normal.dot(normal)) < 1.0 - parallel_slack: continue
         if math.abs(plane.offset - offset * plane.normal.dot(normal)) > w.tolerance * 100.0: continue
         if plane.normal.dot(normal) < 0.0 or plane.opened != opened: return false
         return true
@@ -179,7 +185,7 @@ func plane_of(w: const Shape*, planes: const CellPlane[], f: usize) -> i64!:
     let normal = face_outward(w, f)
     let offset = normal.dot(w.surfaces.items[(usize)w.faces.items[f].surface].origin)
     for k in 0..<planes.length:
-        if planes[k].normal.dot(normal) > 1.0 - 1e-9 and math.abs(planes[k].offset - offset) <= w.tolerance * 100.0: return (i64)k
+        if planes[k].normal.dot(normal) > 1.0 - parallel_slack and math.abs(planes[k].offset - offset) <= w.tolerance * 100.0: return (i64)k
     error(invalid, "a round's wall has no plane")
 
 ## Curved face `f` of `w` as cells_inner takes it: a round strip between
@@ -242,7 +248,7 @@ func spline_strip(w: const Shape*, f: usize, wall: f64) -> (CellRound, bool)!:
     let na = face_outward(w, walls.items[0])
     let nb = face_outward(w, walls.items[1])
     let turn = math.acos(math.clamp(na.dot(nb), -1.0, 1.0))
-    if turn < 1e-6 or turn > math.pi - 1e-6: return (none_round, false)
+    if turn < least_wall_turn or turn > math.pi - least_wall_turn: return (none_round, false)
     let line = try na.cross(nb).normalized()
     let ca = contacts.items[0]
     let hb = nb.dot(w.surfaces.items[(usize)w.faces.items[walls.items[1]].surface].origin)
@@ -268,11 +274,11 @@ func box_planes(low: Vector3, high: Vector3, size: f64, normals: Growing[Vector3
 ## `corners` (cleared first): each three planes' meeting point inside all.
 func cell_corners(normals: const Vector3[], offsets: const f64[], size: f64, corners: Growing[Vector3]*) -> !:
     corners.clear()
-    let eps = size * 1e-9
+    let eps = size * relative_zero
     for i in 0..<normals.length:
         for j in i + 1..<normals.length:
             for k in j + 1..<normals.length:
-                if math.abs(normals[i].dot(normals[j].cross(normals[k]))) < 1e-9: continue
+                if math.abs(normals[i].dot(normals[j].cross(normals[k]))) < planes_meet_floor: continue
                 let three: Vector3[3] = [normals[i], normals[j], normals[k]]
                 let at: f64[3] = [offsets[i], offsets[j], offsets[k]]
                 let p = try least_squares_point(three[..<3], at[..<3])
@@ -301,10 +307,10 @@ func solid_corners(corners: const Vector3[], size: f64) -> bool:
             best = lift
             c = q
     let n = b.subtract(a).cross(c.subtract(a))
-    if n.length() <= size * size * 1e-12: return false
+    if n.length() <= size * size * corners_span_share: return false
     let across_unit = n.multiply_scalar(1.0 / n.length())
     for q in corners:
-        if math.abs(q.subtract(a).dot(across_unit)) > size * 1e-7: return true
+        if math.abs(q.subtract(a).dot(across_unit)) > size * corners_solid_share: return true
     return false
 
 ## The cells of `planes` over the box about `low` to `high` inside the

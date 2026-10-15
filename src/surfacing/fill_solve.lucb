@@ -2,6 +2,26 @@
 ## station's rows and the guides', the energy and rows factored once and
 ## solved again with the multipliers' shifts, and G2's Gauss-Newton rounds.
 
+## The rows' holds: positions to `close_share` of their tolerance (the
+## trim lays the boundaries on the fill to a billionth); a steep slope is
+## held only off the side's ends (between `steep_from` and `steep_to`),
+## with `steep_weight` of the row weight; curvature rows within
+## `curvature_hold` of the curvature tolerance; the flow's rows at
+## `flow_weight` of the row weight.
+let close_share: f64 = 1e-3
+let steep_from: f64 = 0.05
+let steep_to: f64 = 0.95
+let steep_weight: f64 = 1e-4
+let curvature_hold: f64 = 1e-3
+let flow_weight: f64 = 1e-2
+## The rounds stop when the net moves less than this share of the position
+## tolerance; the merit's angle tolerance is at least this (radians); with
+## a G2 side or a turn, bending weighs this (the rate of bending carries
+## the plate).
+let settled_share: f64 = 0.01
+let least_angle_tolerance: f64 = 1e-12
+let bend_with_rate: f64 = 0.01
+
 # -- The solve.
 
 ## The rows of station `st`: G0 (N-sided: Quad's boundary rows are
@@ -16,7 +36,7 @@ func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, h
     # billionth); slopes and curvatures to a tenth of theirs (the angle's
     # sine on a cross derivative of about unit length; the curvature's
     # share below).
-    let close = w.position * 1e-3
+    let close = w.position * close_share
     let square = w.angle * 0.1
     if not w.opts.quad:
         # G0 (Free too: the boundary's position holds the trim).
@@ -52,10 +72,10 @@ func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, h
             # sides fix.
             let across = speed.subtract(st.tangent.multiply_scalar(speed.dot(st.tangent)))
             let steep = math.abs((across.normalized() catch failure: recover Vector3()).dot(st.form.n)) > 0.99
-            if steep and (st.turned or (st.s > 0.05 and st.s < 0.95)):
+            if steep and (st.turned or (st.s > steep_from and st.s < steep_to)):
                 let way = st.way.normalized() catch failure: recover Vector3()
                 try put_derivative(fn, row, st.uv, st.d, 1, way)
-                try held.hold(system, row, weight * 1e-4, across.length(), 0.0)
+                try held.hold(system, row, weight * steep_weight, across.length(), 0.0)
     # A turn held (its cross derivative leaves the neighbor's plane) has no
     # curvature of the neighbor's to meet.
     if st.order >= 2 and st.has_face and ease > 0.0 and not (st.turned and st.cross.length() > 0.0):
@@ -66,8 +86,8 @@ func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, h
             try put_derivative(fn, row, st.uv, st.d, 1, st.form.times(l).multiply_scalar(-2.0))
             # Within a tenth of the curvature tolerance of the larger
             # curvature (the Check tools' floor below).
-            let bent = math.max(math.abs(st.form.curvature_of(l)), 5e-4 * l.dot(l))
-            try held.hold(system, row, weight * ease, -st.form.curvature_of(l), bent * w.curvature * 1e-3 if exact else 0.0)
+            let bent = math.max(math.abs(st.form.curvature_of(l)), fill_curvature_floor * l.dot(l))
+            try held.hold(system, row, weight * ease, -st.form.curvature_of(l), bent * w.curvature * curvature_hold if exact else 0.0)
     if w.opts.quad and w.opts.flow != fill_flow_natural:
         # The cross derivative's part square to the wanted way vanishes:
         # Normal along the tangent; Next and Adjacent across the way. A
@@ -80,7 +100,7 @@ func station_rows(w: const FillWork*, fn: const FillNet*, system: BandSystem*, h
             e = n.cross(st.flow).normalized() catch failure: recover Vector3()
         if e.length() > 0.0:
             try put_derivative(fn, row, st.uv, st.d, 1, e)
-            try held.hold(system, row, weight * 1e-2, 0.0, 0.0)
+            try held.hold(system, row, weight * flow_weight, 0.0, 0.0)
 
 ## A guide point: where (normalized), its chart point, and the guide
 ## face's normal for G1 (zero none).
@@ -167,7 +187,7 @@ func solve_fill(w: const FillWork*, fn: FillNet*, stations: const FillStation[],
         var change = 0.0
         for k in 0..<before.count: change = math.max(change, fn.net.points.items[k].point().subtract(before.items[k].point()).length())
         # Settled within a hundredth of the position tolerance.
-        if change < w.position * 0.01: break
+        if change < w.position * settled_share: break
     return passes
 
 ## How far `fn` misses what `stations` ask, each measure over its
@@ -183,12 +203,12 @@ func fill_merit(w: const FillWork*, fn: const FillNet*, stations: const FillStat
         if st.order < 1 or not st.has_face or st.weight < 1.0: continue
         let sd = j[1].multiply_scalar(st.d.x).add(j[2].multiply_scalar(st.d.y))
         let speed = math.max(sd.dot(sd), nonzero)
-        let slope = st.held.dot(sd) / (math.sqrt(speed) * math.max(w.angle, 1e-12))
+        let slope = st.held.dot(sd) / (math.sqrt(speed) * math.max(w.angle, least_angle_tolerance))
         sum += slope * slope
         if st.order < 2: continue
         let sdd = j[3].multiply_scalar(st.d.x * st.d.x).add(j[4].multiply_scalar(2.0 * st.d.x * st.d.y)).add(j[5].multiply_scalar(st.d.y * st.d.y))
         let want = st.form.curvature_of(sd)
-        let bent = (st.form.n.dot(sdd) - want) / (math.max(math.abs(want), 5e-4 * speed) * w.curvature * 0.01)
+        let bent = (st.form.n.dot(sdd) - want) / (math.max(math.abs(want), fill_curvature_floor * speed) * w.curvature * percent_share)
         sum += bent * bent
     return sum
 
@@ -207,7 +227,7 @@ func solve_once(w: const FillWork*, fn: FillNet*, stations: const FillStation[],
     var higher = false
     for st in stations: higher = higher or (st.order >= 2 and st.has_face) or st.turned
     let bend = 1.0 - 0.99 * tension
-    try add_energy(&system, fn, bend * (0.01 if higher else 1.0), bend if higher else 0.0, tension * 10.0, flat * 100.0, w.ez)
+    try add_energy(&system, fn, bend * (bend_with_rate if higher else 1.0), bend if higher else 0.0, tension * 10.0, flat * 100.0, w.ez)
     var base = Growing[f64]()
     defer base.close()
     try base.assign(system.rhs.view())

@@ -26,6 +26,23 @@
 ## boundaries polynomial curves of degree 5 or less; Domain: Quads asks it
 ## for any neighbors.
 
+## The ruled-neighbor test: second-form entries, and the cross of normals
+## or of leaving directions, under `rule_same` are zero (the same); the
+## two steps along the rule (normalized units) that must land on the
+## neighbor within `rule_on` of the scale.
+let rule_same: f64 = 1e-9
+let rule_probe_near: f64 = 0.02
+let rule_probe_far: f64 = 0.06
+let rule_on: f64 = 1e-9
+
+## Unit tangents whose cross is under this run on in one direction (two
+## boundaries going on smoothly, or a side leaving along the seam).
+let quad_parallel: f64 = 1e-6
+
+## The quads are stitched within this share of the scale (at most half a
+## unit).
+let quad_stitch_share: f64 = 1e-6
+
 ## How strongly G2's rounds keep the first answer's slopes (of G1's and
 ## G2's own weight).
 let slope_hold: f64 = 1e-3
@@ -84,21 +101,21 @@ func ruled_neighbor(w: FillWork*, k: usize) -> (i64, Vector3)!:
         try normals.push(st.form.n)
         try leaves.push(leave)
         try points.push(st.p)
-        for value in st.form.h: flat_form = flat_form and math.abs(value) < 1e-9
+        for value in st.form.h: flat_form = flat_form and math.abs(value) < rule_same
     var same_normal = true
     var same_leave = true
     for at in 1..<normals.count:
-        same_normal = same_normal and normals.items[at].cross(normals.items[0]).length() < 1e-9
-        same_leave = same_leave and leaves.items[at].cross(leaves.items[0]).length() < 1e-9
+        same_normal = same_normal and normals.items[at].cross(normals.items[0]).length() < rule_same
+        same_leave = same_leave and leaves.items[at].cross(leaves.items[0]).length() < rule_same
     if not same_leave and not (same_normal and flat_form): return (0, Vector3())
     # The neighbor goes on as the rule says: a step in along it lies on it.
     var m = w.sides.items[k].master
     for at in 0..<points.count:
-        for step in [0.02, 0.06]:
+        for step in [rule_probe_near, rule_probe_far]:
             let q = w.world(points.items[at].subtract(leaves.items[at].multiply_scalar(step)))
             let uv = try m.chart_of(q)
             let on = try surface_point(*m.surface(), uv)
-            if on.subtract(q).length() > w.scale * 1e-9: return (0, Vector3())
+            if on.subtract(q).length() > w.scale * rule_on: return (0, Vector3())
     if same_normal and flat_form: return (1, normals.items[0])
     return (2, leaves.items[0])
 
@@ -122,7 +139,7 @@ func quad_runs(w: const FillWork*, firsts: Growing[usize]*, counts: Growing[usiz
         if goes_on:
             let ta = (try curve_jet(&a.curve, 1.0, 1, true)).d[1].normalized() catch failure: recover Vector3()
             let tb = (try curve_jet(&b.curve, 0.0, 1, false)).d[1].normalized() catch failure: recover Vector3()
-            goes_on = ta.cross(tb).length() < 1e-6 and ta.dot(tb) > 0.0
+            goes_on = ta.cross(tb).length() < quad_parallel and ta.dot(tb) > 0.0
         try smooth.push(goes_on)
         any_corner = any_corner or not goes_on
     if not any_corner: return
@@ -171,13 +188,13 @@ func quad_curves(w: const FillWork*, firsts: const usize[], counts: const usize[
         if c.degree < 5: try elevate(&c, (usize)(5 - c.degree))
         var inner = Growing[f64]()
         defer inner.close()
-        try distinct_inner(&c, 1e-12, &inner)
+        try distinct_inner(&c, knot_same, &inner)
         for u in inner.view():
-            let times = multiplicity(c.knots.view(), u, 1e-12)
+            let times = multiplicity(c.knots.view(), u, knot_same)
             for v in [u, 1.0 - u]:
                 var found = false
                 for at in 0..<values.count:
-                    if math.abs(values.items[at] - v) <= 1e-9:
+                    if math.abs(values.items[at] - v) <= knot_near:
                         found = true
                         if times > times_of.items[at]: times_of.items[at] = times
                 if not found:
@@ -192,14 +209,14 @@ func quad_curves(w: const FillWork*, firsts: const usize[], counts: const usize[
         try marks.push(0.0)
         try marks.push(0.5)
         for v in values.view():
-            if v > 1e-9 and v < 0.5 - 1e-9: try marks.push(v)
+            if v > knot_near and v < 0.5 - knot_near: try marks.push(v)
         if marks.count >= quad_spans + 1: break
         var widest = 0.0
         var at = 0.0
         for a in marks.view():
             var next = 1.0
             for b in marks.view():
-                if b > a + 1e-12 and b < next: next = b
+                if b > a + knot_same and b < next: next = b
             if next <= 0.5 and next - a > widest:
                 widest = next - a
                 at = (a + next) * 0.5
@@ -209,7 +226,7 @@ func quad_curves(w: const FillWork*, firsts: const usize[], counts: const usize[
     for at in 0..<curves.count:
         let c = &curves.items[at]
         for q in 0..<values.count:
-            let have = multiplicity(c.knots.view(), values.items[q], 1e-9)
+            let have = multiplicity(c.knots.view(), values.items[q], knot_near)
             if have < times_of.items[q]: _ = try insert_knot(c, values.items[q], times_of.items[q] - have)
     let n = curves.items[0].points.count
     # Each half keeps n / 2 + 3 points (the middle inserted five times).
@@ -231,7 +248,7 @@ func leaves_along(w: const FillWork*, sides: const Spline[], run: usize, way: Ve
     let after = &sides[(run + 1) % count]
     let a = (try curve_jet(before, 1.0, 1, true)).d[1].normalized() catch failure: return false
     let b = (try curve_jet(after, 0.0, 1, false)).d[1].normalized() catch failure: return false
-    return a.cross(way).length() < 1e-6 and b.cross(way).length() < 1e-6
+    return a.cross(way).length() < quad_parallel and b.cross(way).length() < quad_parallel
 
 ## Where boundary `k`'s station `st` lies on the quads: its run's quad side,
 ## the fraction along that side's joined curve `side` (unit domain), the quad
@@ -334,7 +351,7 @@ func quads_body(w: const FillWork*, made: const FillMade*, name: str) -> interop
         for model in models.view(): model.release()
         models.close()
     for at in 0..<made.quads.count: try models.push(try net_body(w.tolerances, &made.quads.items[at], name, made.sense))
-    let stitched = try stitch_models(models.view(), math.min(w.scale * 1e-6, 0.5))
+    let stitched = try stitch_models(models.view(), math.min(w.scale * quad_stitch_share, 0.5))
     return stitched.model
 
 ## A station of a side for quad_patch: the quad and its (u, v) on it, the

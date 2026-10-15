@@ -22,6 +22,23 @@
 ## near it, and R is fitted into the net by least squares on a grid of the
 ## spans' fit parameters (a tensor fit, rows then columns).
 
+## The ribbons: a side's chart speed is at least this (a degenerate side
+## has no length in the chart); a point met on the neighbor counts within
+## twice the distance from the side plus `ribbon_slack` (normalized); the
+## ribbon Newton meets the line at this share of the scale.
+let least_chart_speed: f64 = 1e-9
+let ribbon_slack: f64 = 0.05
+let ribbon_residual: f64 = 1e-12
+## A line meets no plane, cylinder or sphere when its rise or quadratic
+## coefficient is under this (unit direction: it runs along it).
+let line_grazes: f64 = 1e-12
+## The reference blends the sides' ribbons by inverse fourth powers of
+## the distance (normalized), the distance at least `reference_near`; a
+## side whose weight is under `reference_weight_share` of the largest
+## leaves no mark and is skipped.
+let reference_near: f64 = 1e-6
+let reference_weight_share: f64 = 1e-6
+
 ## The ribbon of side `k` at chart point `q` (normalized units), from the
 ## stations `stations` (the side's, in order along it).
 func ribbon_at(w: FillWork*, k: usize, q: Vector3, stations: const FillStation[], charts: const Vector3[], first: usize, count: usize) -> Vector3!:
@@ -61,7 +78,7 @@ func ribbon_at(w: FillWork*, k: usize, q: Vector3, stations: const FillStation[]
         let off = q.subtract(charts[a].multiply_scalar(1.0 - f).add(charts[b].multiply_scalar(f)))
         let inward = sa.d.multiply_scalar(1.0 - f).add(sb.d.multiply_scalar(f))
         let along = off.length()
-        let speed = side.length / w.scale / math.max(w.disk(k, 1.0).subtract(w.disk(k, 0.0)).length() if w.sides.count >= 3 else w.angles.items[k + 1] - w.angles.items[k], 1e-9)
+        let speed = side.length / w.scale / math.max(w.disk(k, 1.0).subtract(w.disk(k, 0.0)).length() if w.sides.count >= 3 else w.angles.items[k + 1] - w.angles.items[k], least_chart_speed)
         let t = sa.tangent.multiply_scalar(1.0 - f).add(sb.tangent.multiply_scalar(f)).normalized() catch failure: recover sa.tangent
         var leave = sa.leave.multiply_scalar(1.0 - f).add(sb.leave.multiply_scalar(f))
         if not (leave.length() > 0.0): leave = p.multiply_scalar(-1.0)
@@ -82,14 +99,14 @@ func ribbon_at(w: FillWork*, k: usize, q: Vector3, stations: const FillStation[]
     let analytic = try line_meets(s, w.world(on_plane), w.ez, w.world(p).subtract(w.world(on_plane)).dot(w.ez))
     if let t = analytic:
         let hit = w.local(w.world(on_plane).add(w.ez.multiply_scalar(t)))
-        if hit.subtract(p).length() <= 2.0 * q.subtract(charts[a].multiply_scalar(1.0 - f).add(charts[b].multiply_scalar(f))).length() + 0.05: return hit
+        if hit.subtract(p).length() <= 2.0 * q.subtract(charts[a].multiply_scalar(1.0 - f).add(charts[b].multiply_scalar(f))).length() + ribbon_slack: return hit
     # Newton from the nearest point of the side's neighbor.
     let line = w.world(on_plane)
     let (met, _, t) = try ribbon_newton(w, s, line, try side.master.chart_of(w.world(p)), (w.world(p).subtract(line)).dot(w.ez))
     # Only near the side: the line may meet the neighbor's face again far
     # off (a fillet's own sheet beyond the corner).
     let hit = w.local(line.add(w.ez.multiply_scalar(t)))
-    if met and hit.subtract(p).length() <= 2.0 * q.subtract(charts[a].multiply_scalar(1.0 - f).add(charts[b].multiply_scalar(f))).length() + 0.05: return hit
+    if met and hit.subtract(p).length() <= 2.0 * q.subtract(charts[a].multiply_scalar(1.0 - f).add(charts[b].multiply_scalar(f))).length() + ribbon_slack: return hit
     # Else its tangent plane there, carried on flat (a second-order
     # paraboloid of a tight neighbor, a small fillet, bulges far across the
     # hole; the plane does not, the curvature comes from the G2 rows), met
@@ -114,7 +131,7 @@ func ribbon_newton(w: const FillWork*, s: const Surface*, line: Vector3, start: 
         let j = natural_surface_jet(s, uv) catch failure: break
         let r = j.p.subtract(line.add(w.ez.multiply_scalar(t)))
         let miss = r.length()
-        if miss <= w.scale * 1e-12:
+        if miss <= w.scale * ribbon_residual:
             met = true
             break
         # Not closing in (the line passes the face by): no use going on.
@@ -147,7 +164,7 @@ func line_meets(s: const Surface*, o: Vector3, e: Vector3, near: f64) -> f64?!:
     let d = o.subtract(s.origin)
     if s.kind == surface_plane:
         let rise = s.z.dot(e)
-        if not (math.abs(rise) > 1e-12): return none
+        if not (math.abs(rise) > line_grazes): return none
         return -s.z.dot(d) / rise
     var a = 0.0
     var b = 0.0
@@ -163,7 +180,7 @@ func line_meets(s: const Surface*, o: Vector3, e: Vector3, near: f64) -> f64?!:
         b = 2.0 * dp.dot(ep)
         c = dp.dot(dp) - s.radius * s.radius
     else: return none
-    if not (a > 1e-12): return none
+    if not (a > line_grazes): return none
     let disc = b * b - 4.0 * a * c
     if disc < 0.0: return none
     let root = math.sqrt(disc)
@@ -190,12 +207,12 @@ func reference_at(w: FillWork*, q: Vector3, stations: const FillStation[], chart
         if count == 0: continue
         var d = 1.0e300
         for at in first..<first + count: d = math.min(d, charts[at].subtract(q).length())
-        weights[k] = 1.0 / math.pow(math.max(d, 1e-6), 4.0)
+        weights[k] = 1.0 / math.pow(math.max(d, reference_near), 4.0)
         largest = math.max(largest, weights[k])
     var sum = Vector3()
     var total = 0.0
     for k in 0..<n:
-        if not (weights[k] > largest * 1e-6): continue
+        if not (weights[k] > largest * reference_weight_share): continue
         let first = starts[k]
         let count = starts[k + 1] - first
         sum = sum.add((try ribbon_at(w, k, q, stations, charts, first, count)).multiply_scalar(weights[k]))

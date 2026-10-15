@@ -42,6 +42,27 @@
 ## along its normals); Curves on surface leaves the contact curves on the
 ## faces; Off leaves the faces as they are.
 
+## The march: the longest step is half the smallest radius, at least
+## `march_least_share` of the work's size; a step halved below
+## `march_give_up` of the size ends the march; the bisection for where a
+## contact leaves its set stops at `march_edge` of the size.
+let march_least_share: f64 = 1e-4
+let march_give_up: f64 = 1e-9
+let march_edge: f64 = 1e-11
+## The ball's section must turn short of a half turn by more than this
+## (radians).
+let wrap_margin: f64 = 1e-9
+## A face's turn is differenced over a step of this share of the size; a
+## conic's weight is bisected between `conic_lightest` and
+## `conic_heaviest`, its peak measured by differences `peak_step` either
+## side of the middle; the section net is fitted to `section_share` of the
+## size.
+let turn_step: f64 = 1e-5
+let conic_lightest: f64 = 1e-3
+let conic_heaviest: f64 = 1e3
+let peak_step: f64 = 1e-4
+let section_share: f64 = 1e-8
+
 pub let fillet_chamfer: i64 = 0
 pub let fillet_circular: i64 = 1
 pub let fillet_g2: i64 = 2
@@ -250,7 +271,7 @@ func march(w: FilletWork*, start: BallStation, way: f64, out: Growing[BallStatio
     var before = (try spine_way(w, &current, Vector3(1.0, 0.0, 0.0))).multiply_scalar(way)
     var smallest = w.opts.size
     for k in 0..<w.law.count // 2: smallest = math.min(smallest, w.law.items[2 * k + 1])
-    let longest = math.max(smallest * 0.5, w.size * 1e-4)
+    let longest = math.max(smallest * 0.5, w.size * march_least_share)
     var h = longest
     var count = 0
     while count < 4000:
@@ -266,7 +287,7 @@ func march(w: FilletWork*, start: BallStation, way: f64, out: Growing[BallStatio
             continue
         if result == ball_failed:
             h *= 0.5
-            if h < w.size * 1e-9: return
+            if h < w.size * march_give_up: return
             continue
         # A contact leaves its set within this step: the last station
         # inside it found by bisection.
@@ -274,7 +295,7 @@ func march(w: FilletWork*, start: BallStation, way: f64, out: Growing[BallStatio
         var high = h
         var last = current
         var have = false
-        while high - low > w.size * 1e-11:
+        while high - low > w.size * march_edge:
             let middle = (low + high) * 0.5
             var probe = current
             let r = try ball_at(w, &probe, current.center.add(t.multiply_scalar(middle)), t, true)
@@ -365,7 +386,7 @@ func fillet_cross(w: FilletWork*, b: const BallStation*, out: Growing[Weighted]*
     let r = b.radius
     let cosine = math.clamp(u1.dot(u2) / math.max(nonzero, u1.length() * u2.length()), -1.0, 1.0)
     let theta = math.acos(cosine)
-    if not (theta < math.pi - 1e-9): error(invalid, "Surface Fillet: the ball wraps half round or more (the sets turn back on each other); flip a side")
+    if not (theta < math.pi - wrap_margin): error(invalid, "Surface Fillet: the ball wraps half round or more (the sets turn back on each other); flip a side")
     let half = math.cos(theta * 0.5)
     let bisector = u1.add(u2).normalized() catch failure: error(invalid, "Surface Fillet: the contacts are opposite each other on the ball")
     let corner = c.add(bisector.multiply_scalar(r / half))
@@ -458,7 +479,7 @@ func turn_of(set: FilletSet*, k: usize, uv: Vector3, e: Vector3, bend: Vector3, 
     let master = &set.faces.items[k]
     let j = try surface_jet(master.surface(), uv, false, false)
     let a = chart_direction(j.su, j.sv, e)
-    let h = size * 1e-5
+    let h = size * turn_step
     let ahead = Vector3(uv.x + a.x * h, uv.y + a.y * h, 0.0)
     let later = bend_of(set, k, ahead, e) catch failure: return 0.0
     var way = bend.normalized() catch failure: recover Vector3()
@@ -470,8 +491,8 @@ func turn_of(set: FilletSet*, k: usize, uv: Vector3, e: Vector3, bend: Vector3, 
 ## radius of curvature at its middle is `peak` (bisection: a heavier weight
 ## draws the curve to the corner, its peak tighter).
 func conic_weight(p1: Vector3, c: Vector3, p2: Vector3, peak: f64) -> f64!:
-    var low = 1e-3
-    var high = 1e3
+    var low = conic_lightest
+    var high = conic_heaviest
     for _ in 0..<200:
         let middle = math.sqrt(low * high)
         if conic_peak(p1, c, p2, middle) > peak: low = middle
@@ -481,7 +502,7 @@ func conic_weight(p1: Vector3, c: Vector3, p2: Vector3, peak: f64) -> f64!:
 ## The radius of curvature at t = 1/2 of the rational quadratic (p1, w c,
 ## p2): A = p1 + 2wc + p2 over 2 + 2w at the shoulder, by differences.
 func conic_peak(p1: Vector3, c: Vector3, p2: Vector3, weight: f64) -> f64:
-    let h = 1e-4
+    let h = peak_step
     let a = conic_point(p1, c, p2, weight, 0.5 - h)
     let m = conic_point(p1, c, p2, weight, 0.5)
     let b = conic_point(p1, c, p2, weight, 0.5 + h)
@@ -585,7 +606,7 @@ func fillet_net(set: interop.Reference[GeometrySet], first: str, second: str, op
     defer across.close()
     let degree = try cross_knots(opts.section, &across)
     let size = across.count - (usize)degree - 1
-    var source = SectionSource((void*)&w, fillet_section_at, w.size * 1e-8)
+    var source = SectionSource((void*)&w, fillet_section_at, w.size * section_share)
     var net = try along_net(&source, across.view(), degree, size, 1)
     errdefer net.close()
     var contacts = Growing[BallStation]()

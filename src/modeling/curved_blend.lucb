@@ -20,6 +20,23 @@
 ## their face. Each loop lies between one pair of faces. Anything else is
 ## declined.
 
+## A side edge's leaving way counts as square to the blended edge when
+## |dot| is at most this (a traced edge's end tangent is only near).
+let square_leaving_slack: f64 = 1e-3
+## Central-difference steps, as shares of the blend's reach: for the
+## face's curvature toward a way, and for its turn along one.
+let curvature_difference_share: f64 = 1e-4
+let turn_difference_share: f64 = 1e-3
+## Two lines' determinant below this share of their squared lengths'
+## product: they run together (the faces meet tangentially).
+let tangential_lines: f64 = 1e-24
+## How far off its line, as a share of the reach, a contact may fall on
+## the edge running on from a corner.
+let contact_off_share: f64 = 1e-3
+## A shortened edge's parameter span below this share of the edge's (at
+## least 1) has no length left.
+let least_shortened_share: f64 = 1e-12
+
 ## A picked edge of a curved loop: its two faces, whether it is convex,
 ## and what it becomes: its contact edges on face `a` (`outer`) and `b`
 ## (`inner`), its strip's surface and sense.
@@ -161,7 +178,7 @@ func curved_eligible(c: Curved*, chosen: const usize[]) -> bool!:
                     let next = c.sides.items[(usize)k]
                     if not ((next.a == side.a and next.b == side.b) or (next.a == side.b and next.b == side.a)) or next.convex != side.convex: return false
                     # Tangent (traced edges' ends agree to a hair).
-                    if g != side.edge and (try w.leaving(g, 0 if other.start == v else 1)).dot(along) > -1.0 + 1e-6: return false
+                    if g != side.edge and (try w.leaving(g, 0 if other.start == v else 1)).dot(along) > -1.0 + parallel_slack_loose: return false
                     continue
                 let (ga, gb) = edge_faces(w, g) catch failure:
                     # A seam: one face's both ways.
@@ -172,7 +189,7 @@ func curved_eligible(c: Curved*, chosen: const usize[]) -> bool!:
                 if on_a == on_b: return false
                 # Square to the edge (a traced edge's end tangent is near).
                 let leaving = try w.leaving(g, 0 if other.start == v else 1)
-                if math.abs(leaving.dot(along)) > 1e-3: return false
+                if math.abs(leaving.dot(along)) > square_leaving_slack: return false
             if picked != 2: return false
             # The loop's way at the vertex, both edges' averaged (the section
             # there is square to it for both strips).
@@ -191,10 +208,10 @@ func curved_eligible(c: Curved*, chosen: const usize[]) -> bool!:
             if c.side_of.items[g] >= 0 or (other.start != (i64)v and other.end != (i64)v): continue
             var way = try w.leaving(g, 0 if other.start == (i64)v else 1)
             for done in runs.view(): way = way.subtract(done.multiply_scalar(way.dot(done)))
-            if way.length() > 1e-9: try runs.push(try way.normalized())
+            if way.length() > parallel_slack: try runs.push(try way.normalized())
         var normal = c.tangents.items[v]
         for way in runs.view(): normal = normal.subtract(way.multiply_scalar(normal.dot(way)))
-        if normal.length() <= 1e-9: return false
+        if normal.length() <= parallel_slack: return false
         c.tangents.items[v] = try normal.normalized()
     return true
 
@@ -268,7 +285,7 @@ func section_on(c: Curved*, side: const CurvedSide*, t: f64) -> CurvedSection!:
         values[1] = db - s * r
         values[2] = center.subtract(e).dot(tangent)
         let worst = math.max(math.abs(values[0]), math.max(math.abs(values[1]), math.abs(values[2])))
-        if worst <= w.tolerance * 0.01: break
+        if worst <= w.tolerance * solve_settled_share: break
         rows[0] = ga.x
         rows[1] = ga.y
         rows[2] = ga.z
@@ -332,7 +349,7 @@ func section_on(c: Curved*, side: const CurvedSide*, t: f64) -> CurvedSection!:
 ## normal section's), from how its normal turns along `way` (face_distance's
 ## normals a hair either side). Zero on a plane.
 func curvature_toward(c: Curved*, f: usize, q: Vector3, way: Vector3) -> Vector3!:
-    let h = c.reach * 1e-4
+    let h = c.reach * curvature_difference_share
     let (_, n, _) = try face_distance(c, f, q)
     let (_, ahead, _) = try face_distance(c, f, q.add(way.multiply_scalar(h)))
     let (_, behind, _) = try face_distance(c, f, q.subtract(way.multiply_scalar(h)))
@@ -344,9 +361,9 @@ func curvature_toward(c: Curved*, f: usize, q: Vector3, way: Vector3) -> Vector3
 ## face flat there, and on a sphere or a cylinder's circle).
 func curvature_turn(c: Curved*, f: usize, q: Vector3, way: Vector3, bend: Vector3) -> f64!:
     let kappa = bend.length()
-    if kappa * c.reach <= 1e-12: return 0.0
+    if kappa * c.reach <= flat_bend: return 0.0
     let toward = bend.multiply_scalar(1.0 / kappa)
-    let h = c.reach * 1e-3
+    let h = c.reach * turn_difference_share
     let (_, _, ahead) = try face_distance(c, f, q.add(way.multiply_scalar(h)))
     let (_, _, behind) = try face_distance(c, f, q.subtract(way.multiply_scalar(h)))
     let k_ahead = (try curvature_toward(c, f, ahead, way)).dot(toward)
@@ -366,7 +383,7 @@ func chamfer_point(c: Curved*, f: usize, e: Vector3, tangent: Vector3, toward: V
         values[0] = d
         values[1] = offset.dot(tangent)
         values[2] = (offset.dot(offset) - size * size) * 0.5
-        if math.max(math.abs(values[0]), math.max(math.abs(values[1]), math.abs(values[2]) / size)) <= c.w.tolerance * 0.01: return q
+        if math.max(math.abs(values[0]), math.max(math.abs(values[1]), math.abs(values[2]) / size)) <= c.w.tolerance * solve_settled_share: return q
         rows[0] = n.x
         rows[1] = n.y
         rows[2] = n.z
@@ -397,10 +414,10 @@ func angled_point(c: Curved*, f: usize, q: Vector3, e: Vector3, tangent: Vector3
     for _ in 0..<60:
         let (d, n, _) = try face_distance(c, f, q.add(way.multiply_scalar(reach)))
         let rate = n.dot(way)
-        if math.abs(rate) < 1e-12: break
+        if math.abs(rate) < parallel_slack_tight: break
         let step = d / rate
         reach -= step
-        if math.abs(step) <= c.w.tolerance * 0.01: return q.add(way.multiply_scalar(reach))
+        if math.abs(step) <= c.w.tolerance * solve_settled_share: return q.add(way.multiply_scalar(reach))
     try too_tight(c)
     return q
 
@@ -420,7 +437,7 @@ func lines_meet(a: Vector3, da: Vector3, b: Vector3, db: Vector3) -> Vector3!:
     let ab = da.dot(db)
     let bb = db.dot(db)
     let det = aa * bb - ab * ab
-    if det <= 1e-24 * aa * bb: error(invalid, "a blend's faces meet tangentially here: nothing to blend")
+    if det <= tangential_lines * aa * bb: error(invalid, "a blend's faces meet tangentially here: nothing to blend")
     let s = (ab * db.dot(r) - bb * da.dot(r)) / det
     let u = (aa * db.dot(r) - ab * da.dot(r)) / det
     return a.add(da.multiply_scalar(s)).add(b.add(db.multiply_scalar(u))).multiply_scalar(0.5)
@@ -512,7 +529,7 @@ func shorten(c: Curved*, g: usize, v: i64, point: i64) -> !:
         # end tangent is near square to it): the line from the contact to
         # its other end, still on its face (a ruling, the cut a chord of
         # the hair).
-        if w.carriers.items[(usize)edge.carrier].kind != curve_line or off > c.reach * 1e-3: error(invalid, "a blend's contact falls off the edge running on from its corner")
+        if w.carriers.items[(usize)edge.carrier].kind != curve_line or off > c.reach * contact_off_share: error(invalid, "a blend's contact falls off the edge running on from its corner")
         let other_end = so_far.end if edge.start == v else so_far.start
         let far = c.out.points.items[(usize)other_end]
         let span = far.subtract(p)
@@ -529,7 +546,7 @@ func shorten(c: Curved*, g: usize, v: i64, point: i64) -> !:
     else:
         made.t1 = t
         made.end = point
-    if math.abs(made.t1 - made.t0) <= 1e-12 * math.max(1.0, math.abs(edge.t1 - edge.t0)) or (made.t1 - made.t0) * (edge.t1 - edge.t0) < 0.0:
+    if math.abs(made.t1 - made.t0) <= least_shortened_share * math.max(1.0, math.abs(edge.t1 - edge.t0)) or (made.t1 - made.t0) * (edge.t1 - edge.t0) < 0.0:
         error(invalid, "a blend takes the whole edge running on from its corner")
     if c.shortened.items[g] >= 0:
         c.out.edges.items[(usize)c.shortened.items[g]] = made

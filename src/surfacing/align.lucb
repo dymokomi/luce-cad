@@ -44,6 +44,17 @@
 ## square to the plane; row 2 its curvature kept in the plane; row 3 the
 ## rate square to it). Curves align the same way with one CV a row.
 
+## Align's own limits: a hull leg shorter along the tangent than this
+## share of its length keeps its whole length; a vector whose part along
+## the master's normal is under this (unit vector) lies in the tangent
+## plane; a Partial range's widened ends this near 0 or 1 are the ends
+## (no knot goes in there); values whose magnitudes are both under
+## `align_flat` agree (both flat).
+let kept_along: f64 = 1e-9
+let vector_least: f64 = 1e-6
+let partial_end: f64 = 1e-9
+let align_flat: f64 = 1e-9
+
 ## Alignment types (Alias's).
 pub let align_edge: i64 = 0
 pub let align_project: i64 = 1
@@ -172,7 +183,7 @@ func kept_lengths(cur: const Vector3[4]*, t: Vector3, out: f64[3]*):
     for k in 0..<(usize)3:
         let d = (*cur)[k].subtract((*cur)[k + 1])
         let along = d.dot(t)
-        (*out)[k] = along if along > 1e-9 * d.length() else d.length()
+        (*out)[k] = along if along > kept_along * d.length() else d.length()
 
 ## The rows 0..`order` of the side's net matched to `stations` (see the
 ## file's header): each row's values at the stations, fitted by `fit`
@@ -251,7 +262,7 @@ func vector_row(e: const Ends*, st: const Station*, opts: const AlignOptions*, k
     if k > 2: error(invalid, "Align (Vector) sets G1 and G2: choose G2 or less, or the Edge type")
     let d = try opts.vector.normalized()
     let nd = t.n.dot(d)
-    if math.abs(nd) < 1e-6: error(invalid, "Align (Vector): the vector lies in the master's tangent plane, so it cannot set the rows")
+    if math.abs(nd) < vector_least: error(invalid, "Align (Vector): the vector lies in the master's tangent plane, so it cannot set the rows")
     let ckk = e.at(k, k)
     let p = st.cur[k]
     if k == 1:
@@ -344,11 +355,11 @@ pub func align_side(net: Net*, which: i64, master: Master*, opts: const AlignOpt
     if opts.partial:
         a = math.clamp(math.min(opts.start, opts.end), 0.0, 1.0)
         b = math.clamp(math.max(opts.start, opts.end), 0.0, 1.0)
-        if not (b - a > 1e-6): error(invalid, "Align (Partial): the range is empty")
+        if not (b - a > least_range): error(invalid, "Align (Partial): the range is empty")
         let reach = (b - a) * 0.1
         for f in [a - reach, a, b, b + reach]:
-            if f <= 1e-9 or f >= 1.0 - 1e-9: continue
-            let times = (usize)turned_net.dv - multiplicity(turned_net.kv.view(), v_at(&turned_net, f), 1e-12)
+            if f <= partial_end or f >= 1.0 - partial_end: continue
+            let times = (usize)turned_net.dv - multiplicity(turned_net.kv.view(), v_at(&turned_net, f), knot_same)
             if times > 0: _ = try net_insert(&turned_net, 1, f, times)
     # Refine: knots inserted along the edge in the spans whose stations miss
     # the limits, and the align done again, up to Max New Spans.
@@ -411,13 +422,13 @@ func align_once(net: const Net*, master: Master*, opts: const AlignOptions*, ord
     var last = net.nv - 1
     if opts.partial:
         for k in 0..<net.kv.count:
-            if net.kv.items[k] >= low - 1e-12 * (1.0 + math.abs(low)):
+            if net.kv.items[k] >= low - knot_same * (1.0 + math.abs(low)):
                 first = k - 1 if k > 0 else 0
                 break
         var k = net.kv.count
         while k > 0:
             k -= 1
-            if net.kv.items[k] <= high + 1e-12 * (1.0 + math.abs(high)):
+            if net.kv.items[k] <= high + knot_same * (1.0 + math.abs(high)):
                 last = fewer(net.nv - 1, k - p if k >= p else 0)
                 break
     var side = Aligning(try net.copy(), ends_of(net.ku.view(), net.nu, net.du), low, high, 0.0, 1.0, false)
@@ -439,7 +450,7 @@ func align_once(net: const Net*, master: Master*, opts: const AlignOptions*, ord
     defer knots.close()
     for _ in 0..<p + 1: try knots.push(low)
     for k in net.kv.view():
-        if k > low + 1e-12 * (1.0 + math.abs(low)) and k < high - 1e-12 * (1.0 + math.abs(high)): try knots.push(k)
+        if k > low + knot_same * (1.0 + math.abs(low)) and k < high - knot_same * (1.0 + math.abs(high)): try knots.push(k)
     for _ in 0..<p + 1: try knots.push(high)
     var params = Growing[f64]()
     defer params.close()
@@ -493,8 +504,8 @@ func prepare(net: Net*, master: const Master*, opts: const AlignOptions*, order:
             let along = (k - c.low()) / (c.high() - c.low())
             let f = 1.0 - along if reversed else along
             let at = v_at(net, f)
-            let have = multiplicity(net.kv.view(), at, 1e-12 * (net.v_high() - net.v_low()))
-            let want = multiplicity(c.knots.view(), k, 1e-12)
+            let have = multiplicity(net.kv.view(), at, knot_same * (net.v_high() - net.v_low()))
+            let want = multiplicity(c.knots.view(), k, knot_same)
             if want > have: _ = try net_insert(net, 1, f, want - have)
 
 ## The distinct spans of a clamped knot vector of `degree`.
@@ -567,5 +578,5 @@ func measure_station(own: Jet, target: Goal, order: usize, opts: const AlignOpti
 ## |a - b| relative to the larger, in percent (flat sides agree).
 func relative(a: f64, b: f64) -> f64:
     let most = math.max(math.abs(a), math.abs(b))
-    if most <= 1e-9: return 0.0
+    if most <= align_flat: return 0.0
     return math.abs(a - b) / most * 100.0

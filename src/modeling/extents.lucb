@@ -8,6 +8,10 @@
 ## for a spline (which takes no taper). Caps close the lowest and highest
 ## levels. Every loop runs as extrude.lucb's do, so each edge is used twice.
 
+## The fraction along an edge its end tangent is taken toward from the
+## start.
+let end_tangent_fraction: f64 = 0.001
+
 ## A level: the profile `height` along its normal, its edges moved `grow`
 ## outward (0: as drawn).
 pub struct Level:
@@ -28,7 +32,7 @@ struct LevelEdge:
 pub func extrude_levels(b: BrepModel*, p: const Profiles*, levels: const Level[], tag: str) -> !:
     if levels.length < 2: error(invalid, "an extrusion needs two levels")
     for at in 1..<levels.length:
-        if not (levels[at].height - levels[at - 1].height > 1e-9): error(invalid, "an extrusion needs a nonzero distance")
+        if not (levels[at].height - levels[at - 1].height > least_extrude_distance): error(invalid, "an extrusion needs a nonzero distance")
     let tol = b.cad_tolerances().resolution()
     var moved = Growing[LevelEdge]()
     defer moved.close()
@@ -122,7 +126,7 @@ func upright(b: BrepModel*, p: const Profiles*, edges: const ProfileEdge[], i: u
     let tb = try end_tangent(p, e, true)
     # Tangent within a profile's drawing (a rounded rectangle's arcs): the
     # plane along the cone's line, or two cones touching along one.
-    if ta.cross(tb).length() <= 1e-6 and ta.dot(tb) > 0.0: return try b.add_line(start, end)
+    if ta.cross(tb).length() <= parallel_slack_loose and ta.dot(tb) > 0.0: return try b.add_line(start, end)
     var points = Growing[Vector3]()
     defer points.close()
     let steps = 32
@@ -190,7 +194,7 @@ func joint(p: const Profiles*, a: const ProfileEdge*, b: const ProfileEdge*, gro
     let ta = try end_tangent(p, a, false)
     let tb = try end_tangent(p, b, true)
     let right_a = ta.cross(p.normal)
-    if ta.cross(tb).length() <= 1e-9 and ta.dot(tb) > 0.0: return v.add(right_a.multiply_scalar(grow))
+    if ta.cross(tb).length() <= parallel_slack and ta.dot(tb) > 0.0: return v.add(right_a.multiply_scalar(grow))
     let right_b = tb.cross(p.normal)
     let guess = v.add(right_a.add(right_b).multiply_scalar(grow * 0.5))
     var best = Vector3()
@@ -232,7 +236,7 @@ func end_tangent(p: const Profiles*, e: const ProfileEdge*, start: bool) -> Vect
         let t = p.normal.cross(at.subtract(e.center))
         return try t.multiply_scalar(1.0 if e.sweep > 0.0 else -1.0).normalized()
     let a = try p.edge_at(e, 0.0 if start else 0.999)
-    let z = try p.edge_at(e, 0.001 if start else 1.0)
+    let z = try p.edge_at(e, end_tangent_fraction if start else 1.0)
     return try z.subtract(a).normalized()
 
 ## Where the line through `origin` along unit `along` meets the circle
@@ -287,7 +291,7 @@ func level_surface(b: BrepModel*, p: const Profiles*, e: const ProfileEdge*, low
         let center = e.center.add(p.normal.multiply_scalar(a.height))
         let radial = low.start.subtract(center)
         var surface: i64 = -1
-        if math.abs(high.radius - low.radius) <= 1e-12 * math.max(1.0, low.radius):
+        if math.abs(high.radius - low.radius) <= relative_zero_tight * math.max(1.0, low.radius):
             surface = try b.add_surface(1, center, p.normal, radial, low.radius)
         else:
             surface = try b.add_surface(2, center, p.normal, radial, low.radius, math.atan((high.radius - low.radius) / (z.height - a.height)))

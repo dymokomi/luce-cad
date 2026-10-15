@@ -15,6 +15,12 @@
 ##   on those faces alone.
 ## Each starts at the sketch's plane or the plane moved along its normal.
 
+## How far short of a quarter turn (radians) a taper angle must stay.
+let taper_limit_slack: f64 = 1e-6
+## The least |cos| between a surface's normal and the extrusion an offset
+## is divided by.
+let least_offset_facing: f64 = 1e-9
+
 ## The levels of an extrusion of `distance` along the normal and `other`
 ## against it, from the plane moved `start` along it, each side leaning in
 ## by its taper (radians; negative leans out), onto `out`. One side may run
@@ -23,11 +29,11 @@
 func side_levels(distance: f64, other: f64, taper: f64, other_taper: f64, start: f64, out: Growing[Level]*) -> !:
     out.clear()
     for angle in [taper, other_taper]:
-        if not math.is_finite(angle) or math.abs(angle) >= math.pi * 0.5 - 1e-6: error(invalid, "a taper angle is between -90 and 90 degrees")
+        if not math.is_finite(angle) or math.abs(angle) >= math.pi * 0.5 - taper_limit_slack: error(invalid, "a taper angle is between -90 and 90 degrees")
     if not math.is_finite(distance) or not math.is_finite(other) or not math.is_finite(start): error(invalid, "an extrusion's distances must be finite")
     if other < 0.0: error(invalid, "the second side's distance must be positive (or zero: one side)")
     if other == 0.0:
-        if math.abs(distance) < 1e-9: error(invalid, "an extrusion needs a nonzero distance")
+        if math.abs(distance) < least_extrude_distance: error(invalid, "an extrusion needs a nonzero distance")
         let grow = -math.abs(distance) * math.tan(taper)
         if distance > 0.0:
             try out.push(Level(start, 0.0))
@@ -48,7 +54,7 @@ func side_levels(distance: f64, other: f64, taper: f64, other_taper: f64, start:
 ## The profiles of `set` (keys `profiles`) extruded through `levels`.
 func extruded_levels(tolerances: CadTolerances, set: const GeometrySet*, profiles: str, levels: const Level[], tag: str) -> interop.Reference[CadModel]!:
     let size = try sketch_size(set)
-    var p = try profiles_of(set, size * 0.0001, profiles)
+    var p = try profiles_of(set, size * sketch_tolerance_share, profiles)
     defer p.close()
     let solid = try BrepModel.held(tolerances)
     defer solid.release()
@@ -79,14 +85,14 @@ func extruded_through_body(set: const GeometrySet*, model: const CadModel*, tag:
     var w = try shape_of(model)
     defer w.close()
     let (low, high) = try reach_along(&w, plane.origin, plane.normal)
-    let margin = (high - low) * 0.01 + size * 0.001
+    let margin = (high - low) * past_body_share + size * past_body_sketch_share
     var levels = Growing[Level]()
     defer levels.close()
     if direction == 1:
-        if high - start <= size * 1e-6: error(invalid, "the body is not on that side of the sketch: extrude the other way")
+        if high - start <= size * extent_level_share: error(invalid, "the body is not on that side of the sketch: extrude the other way")
         try side_levels(high + margin - start, 0.0, taper, 0.0, start, &levels)
     elif direction == -1:
-        if low - start >= -size * 1e-6: error(invalid, "the body is not on that side of the sketch: extrude the other way")
+        if low - start >= -size * extent_level_share: error(invalid, "the body is not on that side of the sketch: extrude the other way")
         try side_levels(low - margin - start, 0.0, taper, 0.0, start, &levels)
     else:
         try side_levels(math.max(high - start, 0.0) + margin, math.max(start - low, 0.0) + margin, taper, taper, start, &levels)
@@ -129,13 +135,13 @@ func extruded_to_target(set: const GeometrySet*, model: const CadModel*, tag: st
     if face != "":
         target = (i64)try named_face(&w, face)
         let side = try face_middle(&w, (usize)target).subtract(base).dot(n)
-        if math.abs(side) <= size * 1e-6: error(invalid, "the face touches the start plane: there is nothing to extrude to")
+        if math.abs(side) <= size * extent_level_share: error(invalid, "the face touches the start plane: there is nothing to extrude to")
         direction = 1.0 if side > 0.0 else -1.0
-    elif high > size * 1e-6 and -low <= size * 1e-6: direction = 1.0
-    elif -low > size * 1e-6 and high <= size * 1e-6: direction = -1.0
+    elif high > size * extent_level_share and -low <= size * extent_level_share: direction = 1.0
+    elif -low > size * extent_level_share and high <= size * extent_level_share: direction = -1.0
     else: error(invalid, "the body lies on both sides of the sketch: pick a face of it to extrude to")
     if extend != extend_face:
-        let reach = (high if direction > 0.0 else -low) + (high - low) * 0.01 + size * 0.001
+        let reach = (high if direction > 0.0 else -low) + (high - low) * past_body_share + size * past_body_sketch_share
         try side_levels(direction * reach, 0.0, taper, 0.0, start, &levels)
         let long = try extruded_levels(w.tolerances, set, profiles, levels.view(), tag)
         defer long.release()
@@ -159,10 +165,10 @@ func extruded_to_target(set: const GeometrySet*, model: const CadModel*, tag: st
         return reached
     let s = &w.surfaces.items[(usize)w.faces.items[(usize)target].surface]
     if s.kind == surface_spline: error(invalid, "To Object stops at a plane, cylinder, cone, sphere or torus face")
-    if s.kind == surface_plane and math.abs(math.abs(s.z.dot(n)) - 1.0) <= 1e-9:
+    if s.kind == surface_plane and math.abs(math.abs(s.z.dot(n)) - 1.0) <= parallel_slack:
         # A parallel plane: a distance.
         let h = s.origin.subtract(plane.origin).dot(n) + direction * offset
-        if (h - start) * direction <= size * 1e-6: error(invalid, "the offset takes the face behind the start")
+        if (h - start) * direction <= size * extent_level_share: error(invalid, "the offset takes the face behind the start")
         try side_levels(h - start, 0.0, taper, 0.0, start, &levels)
         return try extruded_levels(w.tolerances, set, profiles, levels.view(), tag)
     # Long, then the half-space beyond the surface taken away.
@@ -247,7 +253,7 @@ func surface_side(s: const Surface*, origin: Vector3, direction: f64, n: Vector3
         # far side, the plane moved along it by the offset.
         let toward = direction * z.dot(n)
         let away = z.multiply_scalar(1.0 if toward > 0.0 else -1.0)
-        let shift = away.multiply_scalar(offset / math.max(1e-9, math.abs(away.dot(n))))
+        let shift = away.multiply_scalar(offset / math.max(least_offset_facing, math.abs(away.dot(n))))
         let center = s.origin.add(shift).add(away.multiply_scalar(span * 0.5))
         let box = try CadSolids.box(span, span, span)
         defer box.release()

@@ -64,6 +64,29 @@
 ## stations' G1 and G2 rows eased to nothing at the corner within a zone,
 ## and what fails at the end is reported as runs along the boundaries.
 
+## Fill's frame and corners: the position tolerance when none is given
+## (a share of the boundaries' size); a corner whose tangents' cross is
+## under `corner_straight` runs straight through; the two steps (fractions
+## of each side) of the one-sided differences extrapolated for the rate of
+## curvature at a corner; the least zone of a corner's ease (a fraction of
+## each side, three hundredths).
+let fill_position_share: f64 = 1e-6
+let corner_straight: f64 = 1e-3
+let rate_step_near: f64 = 1e-4
+let rate_step_far: f64 = 2e-4
+let least_corner_zone: f64 = 0.03
+## The Check tools' floors in normalized units, below which curvatures
+## (and rates of curvature) count as flat alike: curvature 5e-4 (a
+## thousandth over the model's size, the loop's diameter being about twice
+## its normalized one), rate 1e-3 (a thousandth over its size squared).
+let fill_curvature_floor: f64 = 5e-4
+let fill_rate_floor: f64 = 1e-3
+## A turn between two directions is interpolated on the sphere only when
+## its angle lies above `slerp_least` and short of a half turn by more than
+## `slerp_turn_back` (radians); else the end direction stands.
+let slerp_least: f64 = 1e-9
+let slerp_turn_back: f64 = 1e-6
+
 ## N-sided domains (Alias's N-sided Projected and Molded, and its N
 ## quads round a center): Auto fills with quads where their rows can match
 ## every neighbor exactly (fill_quads.lucb), else projects onto the loop's
@@ -304,7 +327,7 @@ func set_frame(w: FillWork*) -> !:
     w.ez = normal.normalized() catch failure: error(invalid, "Fill: the boundaries enclose no area (they double back on themselves)")
     w.ex = try square_to(w.ez)
     w.ey = w.ez.cross(w.ex)
-    w.position = (w.opts.position if w.opts.position > 0.0 else size * 1e-6) / size
+    w.position = (w.opts.position if w.opts.position > 0.0 else size * fill_position_share) / size
     w.angle = w.opts.angle * math.pi / 180.0
     w.curvature = w.opts.curvature
 
@@ -475,7 +498,7 @@ func find_corners(w: FillWork*) -> !:
             # boundary running straight through, its normal curvature
             # II(t, t) the same from both). Else no smooth fill is G1 to both
             # there.
-            let flat = ta.cross(tb).length() < 1e-3
+            let flat = ta.cross(tb).length() < corner_straight
             let ka = ta.dot(fa.times(ta)) if flat else ta.dot(fa.times(tb))
             let kb = ta.dot(fb.times(ta)) if flat else ta.dot(fb.times(tb))
             let rel = fill_relative(ka, kb)
@@ -506,7 +529,7 @@ func find_corners(w: FillWork*) -> !:
             # curvature grows as the square of the distance).
             var rates: f64[4] = [0.0, 0.0, 0.0, 0.0]
             var measured = true
-            for (step, slot) in [(1e-4, 0), (2e-4, 2)]:
+            for (step, slot) in [(rate_step_near, 0), (rate_step_far, 2)]:
                 let pa = a.curve.point_at(1.0 - step)
                 let pb = b.curve.point_at(step)
                 let ha = pa.subtract(p).length() / w.scale
@@ -532,12 +555,12 @@ func find_corners(w: FillWork*) -> !:
         w.eased.items[k] = true
         let into_a = tb.subtract(ta.multiply_scalar(tb.dot(ta))).normalized() catch failure: recover Vector3()
         let into_b = ta.multiply_scalar(-1.0).subtract(tb.multiply_scalar(-ta.dot(tb))).normalized() catch failure: recover Vector3()
-        var zone = 0.03
+        var zone = least_corner_zone
         if planes_apart and ta.cross(tb).length() > 0.1 and into_a.length() > 0.0 and into_b.length() > 0.0:
             # The zone grows with the turn: a quarter of each side for a
             # right angle (a lid's corner on two walls), narrower for less.
             let most = quad_turn_zone if w.opts.quad else 0.25
-            zone = math.clamp(most * worst / 90.0, 0.03, most)
+            zone = math.clamp(most * worst / 90.0, least_corner_zone, most)
             w.turns.items[k] = CornerTurn(true, zone, into_a, into_b)
         let corner = p
         let eased_zone = zone * turn_margin(w) if w.turns.items[k].turned else zone
@@ -557,7 +580,7 @@ func turn_margin(w: const FillWork*) -> f64:
 ## model's size, the loop's diameter being about twice its normalized one)
 ## curvatures being flat alike.
 func fill_relative(a: f64, b: f64) -> f64:
-    let larger = math.max(math.max(math.abs(a), math.abs(b)), 5e-4)
+    let larger = math.max(math.max(math.abs(a), math.abs(b)), fill_curvature_floor)
     return math.abs(a - b) / larger * 100.0
 
 ## Station `st` turned toward the conflicting corners its side runs into
@@ -598,7 +621,7 @@ func corner_turn(w: const FillWork*, st: FillStation*) -> !:
     # lid's walls: never through the other side).
     let angle = math.acos(math.clamp(leave.dot(inward), -1.0, 1.0))
     var way = inward
-    if angle > 1e-9 and angle < math.pi - 1e-6:
+    if angle > slerp_least and angle < math.pi - slerp_turn_back:
         let a = math.sin((1.0 - e) * angle) / math.sin(angle)
         let b = math.sin(e * angle) / math.sin(angle)
         way = leave.multiply_scalar(a).add(inward.multiply_scalar(b))
@@ -613,7 +636,7 @@ func corner_turn(w: const FillWork*, st: FillStation*) -> !:
 ## floor of 1e-3 in normalized units (the Check tools' rate floor, a
 ## thousandth over the model's size squared).
 func fill_rate_relative(a: f64, b: f64) -> f64:
-    let larger = math.max(math.max(math.abs(a), math.abs(b)), 1e-3)
+    let larger = math.max(math.max(math.abs(a), math.abs(b)), fill_rate_floor)
     return math.abs(a - b) / larger * 100.0
 
 ## The ease of station `st` near an eased corner: 1 off the zones, falling
@@ -623,8 +646,8 @@ func corner_ease(w: const FillWork*, st: const FillStation*) -> f64:
     let n = w.sides.count
     let before = (st.side + n - 1) % n
     # A turned corner's zone is its turn's.
-    let zone_end = w.turns.items[st.side].zone * turn_margin(w) if w.turns.items[st.side].turned else 0.03
-    let zone_start = w.turns.items[before].zone * turn_margin(w) if w.turns.items[before].turned else 0.03
+    let zone_end = w.turns.items[st.side].zone * turn_margin(w) if w.turns.items[st.side].turned else least_corner_zone
+    let zone_start = w.turns.items[before].zone * turn_margin(w) if w.turns.items[before].turned else least_corner_zone
     var ease = 1.0
     if w.eased.items[st.side] and st.s > 1.0 - zone_end: ease = math.min(ease, math.pow((1.0 - st.s) / zone_end, 2.0))
     if w.eased.items[before] and st.s < zone_start: ease = math.min(ease, math.pow(st.s / zone_start, 2.0))

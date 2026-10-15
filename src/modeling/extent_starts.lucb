@@ -13,6 +13,10 @@
 ##   the whole body (All). A taper needs a start parallel to the sketch.
 ##   The start face is named `<tag>/from/f<i>`, the end `<tag>/to/f<i>`.
 
+## How far past the surface, as a share of the span, the point telling
+## which side the solid's inside is lies.
+let past_surface_share: f64 = 1e-5
+
 ## Extent kinds of extruded_from: Distance, To object (a face), All.
 pub let from_distance: i64 = 0
 pub let from_to_face: i64 = 1
@@ -44,11 +48,11 @@ func extruded_from_face(set: const GeometrySet*, model: const CadModel*, tag: st
     var way = 1.0 if distance >= 0.0 else -1.0
     if extent == from_to_face:
         let toward = try face_middle(&w, try named_face(&w, target)).subtract(at).dot(n)
-        if math.abs(toward) <= size * 1e-6: error(invalid, "the face to extrude to is level with the start face")
+        if math.abs(toward) <= size * extent_level_share: error(invalid, "the face to extrude to is level with the start face")
         way = 1.0 if toward > 0.0 else -1.0
-    elif extent == from_distance and math.abs(distance) < 1e-9:
+    elif extent == from_distance and math.abs(distance) < least_extrude_distance:
         error(invalid, "an extrusion needs a nonzero distance")
-    if s.kind == surface_plane and math.abs(math.abs(s.z.dot(n)) - 1.0) <= 1e-9:
+    if s.kind == surface_plane and math.abs(math.abs(s.z.dot(n)) - 1.0) <= parallel_slack:
         # A parallel plane: a start offset.
         let start = s.origin.subtract(plane.origin).dot(n) + way * offset
         if extent == from_to_face:
@@ -74,7 +78,7 @@ func extruded_from_face(set: const GeometrySet*, model: const CadModel*, tag: st
     defer started.release()
     if extent == from_all:
         # A plane square to the normal past the whole body.
-        let far = plane.origin.add(n.multiply_scalar((high if way > 0.0 else low) + way * ((high - low) * 0.01 + size * 0.001)))
+        let far = plane.origin.add(n.multiply_scalar((high if way > 0.0 else low) + way * ((high - low) * past_body_share + size * past_body_sketch_share)))
         var name = Growing[u8]()
         defer name.close()
         try role_name(&name, tag, "to")
@@ -125,7 +129,7 @@ func bounded(solid: const CadModel*, s: const Surface*, shift: Vector3, along: V
     defer w.close()
     var rays = try shape_rays(&w)
     defer rays.close()
-    let step = span * 1e-5
+    let step = span * past_surface_share
     let inside_far = try rays.inside(&w, on.add(along.multiply_scalar(step)), span)
     let keep_inside = inside_far == past
     return try combine(solid, tool.value(), op_intersect if keep_inside else op_subtract)
@@ -135,7 +139,7 @@ func bounded(solid: const CadModel*, s: const Surface*, shift: Vector3, along: V
 ## `name`.
 func plane_bounded(solid: const CadModel*, origin: Vector3, z: Vector3, x: Vector3, along: Vector3, past: bool, span: f64, name: str) -> interop.Reference[CadModel]!:
     let facing = z.dot(along)
-    if math.abs(facing) < 1e-9: error(invalid, "the face runs along the extrusion: it cannot start or end it")
+    if math.abs(facing) < parallel_slack: error(invalid, "the face runs along the extrusion: it cannot start or end it")
     # A box past the plane: its inside is the far side.
     let away = z.multiply_scalar(1.0 if facing > 0.0 else -1.0)
     let sideways = x.subtract(away.multiply_scalar(x.dot(away))).normalized() catch failure: error(invalid, "a plane needs an axis across it")

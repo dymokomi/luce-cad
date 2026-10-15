@@ -2,6 +2,27 @@
 ## lines and arcs in closed form, pieces with a B-spline by their samples
 ## refined by Newton, each piece cut there into sub-edges.
 
+## Exact meets: two lines whose cross product is below this share of their
+## lengths' product are parallel, and a line whose two roots on a circle
+## spread less than this share of its squared length touches it once.
+let exact_meet_zero: f64 = 1e-12
+## An arc's fraction at a point: how far past either end (in radians) the
+## point still counts as on the arc.
+let arc_fraction_slack: f64 = 1e-7
+## Sampled meets: a sample segments' cross product below this is parallel
+## (and so is a Newton step's Jacobian); a crossing this far outside both
+## segments (in their fractions) is still taken as a start, refined by
+## Newton until the gap is within this share of the tolerance, with this
+## central-difference step in fractions.
+let sampled_parallel: f64 = 1e-18
+let sampled_overrun: f64 = 0.01
+let sampled_settled_share: f64 = 1e-3
+let sampled_difference: f64 = 1e-6
+## Nearest point on a piece: the central-difference step in its fraction
+## and the step Newton stops at.
+let nearest_on_difference: f64 = 1e-6
+let nearest_on_step: f64 = 1e-12
+
 ## A piece cut: piece `piece` at `fraction` of the way along it.
 struct PieceCut:
     var piece: usize
@@ -35,7 +56,7 @@ func split_pieces(result: Profiles*, pieces: const Growing[ProfileEdge]*, tolera
         let length = try piece_length(result, &piece)
         # A whole circle cut somewhere splits only there: its last part runs
         # on round its seam to the first cut.
-        if piece.kind == profile_arc and math.abs(math.abs(piece.sweep) - 2.0 * math.pi) <= 1e-9 and fractions.count > 2:
+        if piece.kind == profile_arc and math.abs(math.abs(piece.sweep) - 2.0 * math.pi) <= angle_slack and fractions.count > 2:
             try split_circle(result, &piece, fractions.view()[1..<fractions.count - 1], length, tolerance, number, out)
             number += (i64)fractions.count - 2
             continue
@@ -114,7 +135,7 @@ func exact_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdge*
         let la = math.hypot(dax, day)
         let lb = math.hypot(dbx, dby)
         # Parallel lines meet only end on line (handled by the caller).
-        if math.abs(d) <= 1e-12 * la * lb: return
+        if math.abs(d) <= exact_meet_zero * la * lb: return
         let s = ((bx - ax) * dby - (by - ay) * dbx) / d
         let t = ((bx - ax) * day - (by - ay) * dax) / d
         if within_slack(s, tolerance / la) and within_slack(t, tolerance / lb):
@@ -149,7 +170,7 @@ func exact_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdge*
             if not onto: continue
             try found.push(fraction if flip else t)
             try found.push(t if flip else fraction)
-            if spread <= 1e-12 * l2: break
+            if spread <= exact_meet_zero * l2: break
         return
     # Two circles.
     let (c1x, c1y) = result.planar(a.center)
@@ -179,10 +200,10 @@ func arc_fraction(result: Profiles*, arc: const ProfileEdge*, p: Vector3) -> (bo
     let (sx, sy) = result.planar(arc.start)
     var turn = math.atan2(p.y - cy, p.x - cx) - math.atan2(sy - cy, sx - cx)
     if arc.sweep < 0.0: turn = -turn
-    while turn < -1e-9: turn += 2.0 * math.pi
-    while turn >= 2.0 * math.pi - 1e-9: turn -= 2.0 * math.pi
+    while turn < -angle_slack: turn += 2.0 * math.pi
+    while turn >= 2.0 * math.pi - angle_slack: turn -= 2.0 * math.pi
     let sweep = math.abs(arc.sweep)
-    let slack = 1e-7
+    let slack = arc_fraction_slack
     if turn <= sweep + slack: return (true, turn / sweep)
     # Just before the start wraps to near a whole turn.
     if 2.0 * math.pi - turn <= slack: return (true, 0.0)
@@ -212,10 +233,10 @@ func sampled_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdg
             let ex = q1.x - q0.x
             let ey = q1.y - q0.y
             let d = dx * ey - dy * ex
-            if math.abs(d) <= 1e-18: continue
+            if math.abs(d) <= sampled_parallel: continue
             let s = ((q0.x - p0.x) * ey - (q0.y - p0.y) * ex) / d
             let t = ((q0.x - p0.x) * dy - (q0.y - p0.y) * dx) / d
-            if s < -0.01 or s > 1.01 or t < -0.01 or t > 1.01: continue
+            if s < -sampled_overrun or s > 1.01 or t < -sampled_overrun or t > 1.01: continue
             var fa = ((f64)i + s) / (f64)n
             var fb = ((f64)j + t) / (f64)n
             # Newton on P(fa) - Q(fb) = 0, slopes by central differences.
@@ -224,8 +245,8 @@ func sampled_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdg
                 let (qx, qy) = result.planar(try result.edge_at(b, fb))
                 let rx = px - qx
                 let ry = py - qy
-                if math.hypot(rx, ry) <= tolerance * 1e-3: break
-                let h = 1e-6
+                if math.hypot(rx, ry) <= tolerance * sampled_settled_share: break
+                let h = sampled_difference
                 let (pxa, pya) = result.planar(try result.edge_at(a, clamp_fraction(fa + h)))
                 let (pxb, pyb) = result.planar(try result.edge_at(a, clamp_fraction(fa - h)))
                 let (qxa, qya) = result.planar(try result.edge_at(b, clamp_fraction(fb + h)))
@@ -233,7 +254,7 @@ func sampled_meets(result: Profiles*, a: const ProfileEdge*, b: const ProfileEdg
                 let ja = Vector3((pxa - pxb) / (2.0 * h), (pya - pyb) / (2.0 * h), 0.0)
                 let jb = Vector3((qxa - qxb) / (2.0 * h), (qya - qyb) / (2.0 * h), 0.0)
                 let det = -ja.x * jb.y + ja.y * jb.x
-                if math.abs(det) <= 1e-18: break
+                if math.abs(det) <= sampled_parallel: break
                 fa -= (-rx * jb.y + ry * jb.x) / det
                 fb -= (ja.x * ry - ja.y * rx) / det
                 fa = clamp_fraction(fa)
@@ -276,7 +297,7 @@ func arranged_nearest_on(result: Profiles*, piece: const ProfileEdge*, p: Vector
         if d < best_distance:
             best_distance = d
             best = f
-    let h = 1e-6
+    let h = nearest_on_difference
     for _ in 0..<(usize)20:
         let (sx, sy) = result.planar(try result.edge_at(piece, best))
         let (ax, ay) = result.planar(try result.edge_at(piece, clamp_fraction(best + h)))
@@ -287,7 +308,7 @@ func arranged_nearest_on(result: Profiles*, piece: const ProfileEdge*, p: Vector
         if t2 <= 0.0: break
         let step = ((sx - x) * tx + (sy - y) * ty) / t2
         best = clamp_fraction(best - step)
-        if math.abs(step) <= 1e-12: break
+        if math.abs(step) <= nearest_on_step: break
     let (sx, sy) = result.planar(try result.edge_at(piece, best))
     return (math.hypot(sx - x, sy - y), best)
 

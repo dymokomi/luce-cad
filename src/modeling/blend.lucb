@@ -13,13 +13,23 @@
 ## straight edges between planes (local_blend.lucb) are first built directly.
 ## Whether a blend fits: blend_fits.lucb.
 
+## How far into a face, as a share of the edge's length, its way in is
+## sampled.
+let into_face_share: f64 = 0.01
+## A rim: the circle edge's center within this share of its radius of the
+## round's axis, and its radius within this share of the round's there.
+let rim_share: f64 = 1e-6
+## A corner's radii differ from the size when apart by more than this share
+## of it.
+let radius_differs_share: f64 = 1e-9
+
 ## The unit direction across face `f` from the middle of edge `e`, into the
 ## face, perpendicular to the edge.
 func into_face(w: const Shape*, f: usize, e: usize, along: Vector3) -> Vector3!:
     let middle = try w.edge_at(e, 0.5)
     let n = try w.face_normal(f, middle)
     let side = try n.cross(along).normalized()
-    let reach = math.max((try w.edge_at(e, 0.0)).subtract(try w.edge_at(e, 1.0)).length(), (try w.edge_at(e, 0.0)).subtract(middle).length()) * 0.01
+    let reach = math.max((try w.edge_at(e, 0.0)).subtract(try w.edge_at(e, 1.0)).length(), (try w.edge_at(e, 0.0)).subtract(middle).length()) * into_face_share
     if try face_contains(w, f, middle.add(side.multiply_scalar(reach)), w.tolerance) == inside_face: return side
     return side.multiply_scalar(-1.0)
 
@@ -42,13 +52,13 @@ func is_rim(w: const Shape*, e: usize, fa: usize, fb: usize) -> bool:
     let plane = sa if sa.kind == surface_plane else sb
     let round = sb if sa.kind == surface_plane else sa
     if plane.kind != surface_plane or (round.kind != surface_cylinder and round.kind != surface_cone): return false
-    if math.abs(math.abs(plane.z.dot(axis)) - 1.0) > 1e-9 or math.abs(math.abs(round.z.dot(axis)) - 1.0) > 1e-9: return false
+    if math.abs(math.abs(plane.z.dot(axis)) - 1.0) > parallel_slack or math.abs(math.abs(round.z.dot(axis)) - 1.0) > parallel_slack: return false
     # On the cylinder or cone, about its axis: its radius there is the
     # circle's (a cone's along its height).
     let offset = c.origin.subtract(round.origin)
     let height = offset.dot(round.z)
     let radius = round.radius + (height * math.tan(round.angle) if round.kind == surface_cone else 0.0)
-    return offset.subtract(round.z.multiply_scalar(height)).length() < c.a * 1e-6 and math.abs(radius - c.a) < c.a * 1e-6
+    return offset.subtract(round.z.multiply_scalar(height)).length() < c.a * rim_share and math.abs(radius - c.a) < c.a * rim_share
 
 ## Whether edge `e` can be blended: a line between two planar faces, a
 ## rim (is_rim), or an edge round a flat face whose wall is ruled away
@@ -72,7 +82,7 @@ func blendable(w: const Shape*, e: usize) -> bool!:
     let along = try along_edge(w, e)
     let ua = try into_face(w, fa, e, along)
     let ub = try into_face(w, fb, e, along)
-    return ua.cross(ub).length() > 1e-9
+    return ua.cross(ub).length() > parallel_slack
 
 ## Whether faces fa and fb are both curved (neither flat): their edges
 ## are blended by a ball rolling between them (curved_blend.lucb).
@@ -95,7 +105,7 @@ func ruled_pair(w: const Shape*, e: usize, fa: usize, fb: usize) -> i64:
     let c = w.surfaces.items[(usize)w.faces.items[(usize)cylinder].surface]
     let edge = w.edges.items[e]
     let direction = w.carriers.items[(usize)edge.carrier].x
-    if c.z.cross(direction).length() > 1e-9: return -1
+    if c.z.cross(direction).length() > parallel_slack: return -1
     return cylinder
 
 ## Whether edge `e`'s faces turn away from each other (the other face runs
@@ -266,7 +276,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
                 let edge = w.edges.items[corner.edges[i]]
                 let starts = law.forward.items[corner.edges[i]] == (edge.start == corner.vertex)
                 radii[i] = law.radii.items[0] if starts else law.radii.items[law.radii.count - 1]
-                differs = differs or math.abs(radii[i] - size) > size * 1e-9
+                differs = differs or math.abs(radii[i] - size) > size * radius_differs_share
             if not differs: continue
             var remade = try setback_at(w, corner.vertex, corner.edges[..<corner.count], size, corner.inside, radii[..<corner.count])
             try roomy_setback(w, &remade, size, continuity)
@@ -357,7 +367,7 @@ func blend_chosen(model: const CadModel*, w: Shape*, chosen: const usize[], ever
         for corner in setbacks.view():
             let apex = w.points.items[(usize)corner.vertex]
             for k in 0..<corner.count:
-                if math.abs(corner.ways[k].dot(along)) < 1.0 - 1e-9: continue
+                if math.abs(corner.ways[k].dot(along)) < 1.0 - parallel_slack: continue
                 let foot = apex.add(corner.ways[k].multiply_scalar(corner.distances[k]))
                 if apex.subtract(low).length() <= w.tolerance * 10.0:
                     low = foot
@@ -534,7 +544,7 @@ func tangent_chains(w: const Shape*, chosen: Growing[usize]*) -> !:
                     if c == f: known = true
                 if known: continue
                 let leaving = try w.leaving(f, 0 if other.start == v else 1)
-                if leaving.dot(arriving) < 1.0 - 1e-6: continue
+                if leaving.dot(arriving) < 1.0 - parallel_slack_loose: continue
                 if not try blendable(w, f) or try convex(w, f) != outward: continue
                 try chosen.push(f)
 

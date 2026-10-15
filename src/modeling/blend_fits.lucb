@@ -2,6 +2,17 @@
 ## into each face against how far the face goes, said with the size that
 ## would fit when it does not.
 
+## How far beyond a side's least room, as a share of it, the probe steps.
+let room_probe_share: f64 = 1e-3
+## The fractions along an edge its overlap samples stay off its ends by.
+let overlap_end_fraction: f64 = 1e-3
+## A point snaps an overlap's limit when this near it, as a share of the
+## reach.
+let overlap_snap_share: f64 = 1e-3
+## The far edge: the gap a nearest edge may have, beyond the tolerance, as
+## a share of the depth.
+let far_gap_share: f64 = 1e-6
+
 ## How far along each face from edge `e` a blend of `size` reaches (a
 ## fillet's contact distance, a chamfer's own size).
 func reach_of(w: const Shape*, e: usize, size: f64, round: bool) -> f64!:
@@ -41,7 +52,7 @@ func room_at(w: const Shape*, e: usize, f: usize, limit: f64, fraction: f64, aro
     let behind = try face_contains(w, f, try stepped(w, f, p, side.multiply_scalar(-1.0), quarter, around), w.tolerance) == inside_face
     if behind and not ahead: side = side.multiply_scalar(-1.0)
     elif ahead == behind:
-        let probe = try stepped(w, f, p, side, least * 1e-3 + w.tolerance * 100.0, around)
+        let probe = try stepped(w, f, p, side, least * room_probe_share + w.tolerance * 100.0, around)
         if try face_contains(w, f, probe, w.tolerance) != inside_face: side = side.multiply_scalar(-1.0)
     # On a rim's cylinder the straight step runs along the axis, on the
     # face; one leaving the surface has left the face.
@@ -86,7 +97,7 @@ func overlap_limits(w: const Shape*, e: usize, size: f64, round: bool) -> (f64, 
     var best_count: usize = 0
     var run_start: i64 = -1
     for k in 0..<samples + 1:
-        let fraction = math.clamp((f64)k / (f64)samples, 1e-3, 1.0 - 1e-3)
+        let fraction = math.clamp((f64)k / (f64)samples, overlap_end_fraction, 1.0 - overlap_end_fraction)
         let fits = try fits_at(w, e, fa, fb, reach, fraction)
         if fits and run_start < 0: run_start = (i64)k
         if (not fits or k == samples) and run_start >= 0:
@@ -110,8 +121,8 @@ func overlap_limits(w: const Shape*, e: usize, size: f64, round: bool) -> (f64, 
     let length = span.length()
     for q in w.points.view():
         let at = q.subtract(a).dot(span) / (length * length)
-        if start > 0.0 and math.abs(at - start) * length < reach * 1e-3: start = at
-        if finish < 1.0 and math.abs(at - finish) * length < reach * 1e-3: finish = at
+        if start > 0.0 and math.abs(at - start) * length < reach * overlap_snap_share: start = at
+        if finish < 1.0 and math.abs(at - finish) * length < reach * overlap_snap_share: finish = at
     return (start, finish)
 
 ## Whether a blend reaching `reach` into faces `fa` and `fb` fits both at
@@ -286,7 +297,7 @@ func notched_end(w: const Shape*, e: usize, f: usize, depth: f64) -> bool!:
         let (ga, gb) = try edge_faces(w, far)
         let next = gb if ga == f else ga
         if w.surfaces.items[(usize)w.faces.items[next].surface].kind != surface_plane: continue
-        if face_outward(w, next).dot(face_outward(w, f)) > 1.0 - 1e-9: continue
+        if face_outward(w, next).dot(face_outward(w, f)) > 1.0 - parallel_slack: continue
         if try convex(w, far): return true
     return false
 
@@ -311,7 +322,7 @@ func face_across(w: const Shape*, e: usize, f: usize, depth: f64, kind: i64) -> 
     let (ga, gb) = try edge_faces(w, far)
     let next = gb if ga == f else ga
     if w.surfaces.items[(usize)w.faces.items[next].surface].kind != surface_plane: return (-1, 0)
-    let flat = face_outward(w, next).dot(face_outward(w, f)) > 1.0 - 1e-9
+    let flat = face_outward(w, next).dot(face_outward(w, f)) > 1.0 - parallel_slack
     if kind == beyond_flat: return ((i64)next, far) if flat else (-1, 0)
     if flat or (try convex(w, far)) != (kind == beyond_convex): return (-1, 0)
     return ((i64)next, far)
@@ -340,10 +351,10 @@ func far_edge(w: const Shape*, e: usize, f: usize, depth: f64, fraction: f64 = 0
         if d < gap:
             gap = d
             nearest = (i64)k
-    if nearest < 0 or gap > w.tolerance * 1000.0 + depth * 1e-6: return -1
+    if nearest < 0 or gap > w.tolerance * 1000.0 + depth * far_gap_share: return -1
     let far = (usize)nearest
     if w.carriers.items[(usize)w.edges.items[far].carrier].kind != curve_line: return -1
-    if math.abs((try along_edge(w, far)).dot(along)) < 1.0 - 1e-9: return -1
+    if math.abs((try along_edge(w, far)).dot(along)) < 1.0 - parallel_slack: return -1
     return nearest
 
 ## Smooth overflow onto a curved face: where face `off` (flat, `depth` in
@@ -365,11 +376,11 @@ func rolled_spill(w: const Shape*, e: usize, off: usize, depth: f64, size: f64) 
     let next = gb if ga == off else ga
     let s = w.surfaces.items[(usize)w.faces.items[next].surface]
     let along = try along_edge(w, e)
-    if s.kind != surface_cylinder or s.z.cross(along).length() > 1e-9: return no_spill
+    if s.kind != surface_cylinder or s.z.cross(along).length() > parallel_slack: return no_spill
     # Tangent to `off` along the far edge: the plane at the radius from the
     # axis, the cylinder's normal there the plane's.
     let m = try w.edge_at(far, 0.5)
-    if math.abs((try w.face_normal(next, m)).dot(face_outward(w, off)) - 1.0) > 1e-6: return no_spill
+    if math.abs((try w.face_normal(next, m)).dot(face_outward(w, off)) - 1.0) > parallel_slack_loose: return no_spill
     let rest = fb if off == fa else fa
     let p = try w.edge_at(e, 0.5)
     let (ta, tb, _) = ruled_contacts(w, rest, next, p, try into_face(w, rest, e, along), Vector3(), size, true, outer, size) catch failure:

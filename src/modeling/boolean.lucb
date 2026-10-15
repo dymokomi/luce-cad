@@ -20,6 +20,24 @@
 ## 7. Written as a new B-rep; an edge not used exactly twice, once each
 ##    way, means the result is not closed: an error, never a broken solid.
 
+## Marched meets: how far past both faces' boxes (a share of the work's
+## size) the march may run, and the pad round a traced curve's box.
+let march_pad_share: f64 = 0.01
+let curve_pad_share: f64 = 1e-6
+## Mutual crossings: a sampled distance minimum below this share of the
+## work's size is narrowed.
+let crossing_dip_share: f64 = 0.05
+## Tangency: normals whose |dot| is within this of 1 touch, and the two
+## sideways reaches (shares of the work's size) it is probed at.
+let tangency_slack: f64 = 5e-7
+let tangency_near_share: f64 = 1e-3
+let tangency_far_share: f64 = 1e-2
+## How far an arc may bulge between samples, as a share of their box.
+let arc_bulge_share: f64 = 0.02
+## Cuts within this fraction of an edge's end, or of each other at one
+## vertex, cut nothing.
+let cut_end_fraction: f64 = 1e-9
+
 ## Boolean operations (combine's `op`).
 pub let op_union: i64 = 0
 pub let op_subtract: i64 = 1
@@ -365,7 +383,7 @@ pub func combine(a: const CadModel*, b: const CadModel*, op: i64, symmetric: boo
     var second = try shape_of(b)
     defer second.close()
     try append_shape(&first, &second)
-    var work = Work(first, faces_a, 1.0, 1e-9, Growing[Vector3](), Growing[i64](), Growing[Cut](), Growing[Section](), Growing[Imprint](),
+    var work = Work(first, faces_a, 1.0, work_start_tolerance, Growing[Vector3](), Growing[i64](), Growing[Cut](), Growing[Section](), Growing[Imprint](),
                     Growing[Coincident](), Growing[ShapeEdge](), Growing[i64](), Growing[usize](), Growing[i64](), Growing[bool]())
     defer work.close()
     work.symmetric = symmetric
@@ -375,7 +393,7 @@ pub func combine(a: const CadModel*, b: const CadModel*, op: i64, symmetric: boo
         let (l, h) = try face_box(&work.w, f)
         low = Vector3(math.min(low.x, l.x), math.min(low.y, l.y), math.min(low.z, l.z))
         high = Vector3(math.max(high.x, h.x), math.max(high.y, h.y), math.max(high.z, h.z))
-    work.size = math.max(1e-6, high.subtract(low).length())
+    work.size = math.max(least_work_size, high.subtract(low).length())
     # Relative to the model's size, not the inputs' tolerances.
     work.tol = work_tolerance(&work.w)
     try coincide(&work)
@@ -434,7 +452,7 @@ func intersect_faces(work: Work*) -> !:
                 else: met = try meet(first_surface, second_surface, work.tol, &curves)
             if met == meet_march:
                 # Where both faces are, a little more.
-                let pad = Vector3(work.size * 0.01, work.size * 0.01, work.size * 0.01)
+                let pad = Vector3(work.size * march_pad_share, work.size * march_pad_share, work.size * march_pad_share)
                 let la = lows.items[fa]
                 let lb = lows.items[fb]
                 let ha = highs.items[fa]
@@ -498,7 +516,7 @@ func intersect_faces(work: Work*) -> !:
                     let q = try w.at(c, lowest + (highest - lowest) * (f64)at / 128.0)
                     curve_low = lower(curve_low, q)
                     curve_high = upper(curve_high, q)
-                let curve_pad = curve_high.subtract(curve_low).length() / 64.0 + work.size * 1e-6
+                let curve_pad = curve_high.subtract(curve_low).length() / 64.0 + work.size * curve_pad_share
                 let cuts_before = work.cuts.count
                 let sections_before = work.sections.count
                 let imprints_before = work.imprints.count
@@ -553,7 +571,7 @@ func mutual_crossings(work: Work*, first: i64, count: usize, out: Growing[Vector
                 let p = try w.at(a, math.min(t, high_a))
                 let d = (try w.at(b, try nearest_on(w, b, p, 0.0, high_b))).subtract(p).length()
                 # A minimum at the previous sample: narrow its stretch.
-                if k >= 2 and previous <= before and previous <= d and previous < work.size * 0.05:
+                if k >= 2 and previous <= before and previous <= d and previous < work.size * crossing_dip_share:
                     let found = try narrowed(w, a, b, high_a * (f64)(k - 2) / (f64)samples, math.min(t, high_a), high_b)
                     if found.y <= work.tol * 10.0:
                         var known = false
@@ -691,12 +709,12 @@ func note_tangency(work: Work*, fa: usize, fb: usize, c: i64, t0: f64, t1: f64) 
         let na = try w.face_normal(fa, p)
         let nb = try w.face_normal(fb, p)
         let dot = na.dot(nb)
-        if math.abs(dot) < 1.0 - 5e-7: return
+        if math.abs(dot) < 1.0 - tangency_slack: return
         agree = dot
         let along = w.tangent(c, t) catch failure: recover Vector3()
         let sideways = na.cross(along).normalized() catch failure: recover Vector3()
         if sideways.length() == 0.0: continue
-        for reach in [work.size * 1e-3, work.size * 1e-2]:
+        for reach in [work.size * tangency_near_share, work.size * tangency_far_share]:
             var sides: f64[2] = [0.0, 0.0]
             for k in 0..<(usize)2:
                 let q = try nearest_on_surface(w, fa, p.add(sideways.multiply_scalar(reach if k == 0 else -reach)))
@@ -755,7 +773,7 @@ func vertex_cuts(work: Work*) -> !:
             high = Vector3(math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z))
         # Arcs bulge between samples: a sixteenth of their reach more; and a
         # tolerant vertex reaches as far as its zone.
-        let bulge = high.subtract(low).length() * 0.02 + math.max(math.max(pad, work.edge_tol(e) * 10.0), widest_zone)
+        let bulge = high.subtract(low).length() * arc_bulge_share + math.max(math.max(pad, work.edge_tol(e) * 10.0), widest_zone)
         try lows.push(low.subtract(Vector3(bulge, bulge, bulge)))
         try highs.push(high.add(Vector3(bulge, bulge, bulge)))
     # The ends of new edges, and every vertex of both solids (one solid's
@@ -806,7 +824,7 @@ func cut_edges(work: Work*) -> !:
         for cut in work.cuts.view():
             if cut.edge != e: continue
             let f = (cut.t - edge.t0) / span
-            if not (f > 1e-9 and f < 1.0 - 1e-9): continue
+            if not (f > cut_end_fraction and f < 1.0 - cut_end_fraction): continue
             # In order along the edge, ties the widest slack first (one
             # order, whatever order the cuts came in; the tolerant cut makes
             # the vertex the others then merge into).
@@ -827,7 +845,7 @@ func cut_edges(work: Work*) -> !:
             let vertex = (try work.vertex_within(try w.edge_at(e, fraction), math.max(w.edge_slack_of(e), slacks.items[at]))) if at < ts.count else last_vertex
             # Cuts that merge into a vertex already there cut nothing.
             if at < ts.count and (vertex == previous_vertex or vertex == last_vertex): continue
-            if vertex == previous_vertex and fraction - previous_fraction < 1e-9: continue
+            if vertex == previous_vertex and fraction - previous_fraction < cut_end_fraction: continue
             let piece = ShapeEdge(edge.carrier, edge.t0 + span * previous_fraction, edge.t0 + span * fraction, previous_vertex, vertex)
             let (id, forward) = try work.final_edge(piece, w.edge_slack_of(e))
             try work.piece_ids.push((id + 1) * (1 if forward else -1))

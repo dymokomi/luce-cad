@@ -20,6 +20,21 @@
 ## where the center face was, joined into one face (strip_join.lucb), as
 ## Fusion's full round is one face.
 
+## How far past a rib's ends a curved rib's round reaches: this share of
+## its span plus this many radians (at most a quarter of what is left of
+## the turn).
+let rib_margin_share: f64 = 0.05
+let rib_margin_turn: f64 = 0.01
+## A rib end's plane whose cos-sin amplitude is below this never crosses
+## the round.
+let least_rib_amplitude: f64 = 1e-12
+## The inscribed circle: the determinant below which no circle touches all
+## three faces, and its Newton solve's residual and central-difference step
+## as shares of the scale.
+let inscribed_singular: f64 = 1e-12
+let inscribed_residual_share: f64 = 1e-14
+let inscribed_difference_share: f64 = 1e-7
+
 ## `model` with face `center` rounded fully between faces `side1` and
 ## `side2` (empty: found as above), of `continuity` (1 G1, 2 G2, 3 G3), the
 ## round named for feature `tag`.
@@ -182,7 +197,7 @@ func rib_ends(w: const Shape*, c: usize, sides: const usize[2], section: RibSect
         if f == sides[0] or f == sides[1]: continue
         let s = &w.surfaces.items[(usize)w.faces.items[f].surface]
         if s.kind != surface_plane: error(invalid, "a curved rib's full round needs its ends flat")
-        let through = math.abs(s.z.dot(section.axis)) < 1e-9 and math.abs(section.origin.subtract(s.origin).dot(s.z)) <= w.tolerance * 10.0
+        let through = math.abs(s.z.dot(section.axis)) < parallel_slack and math.abs(section.origin.subtract(s.origin).dot(s.z)) <= w.tolerance * 10.0
         if through: continue
         try trims.push(f)
         # The end's side (the turn to its edge), then each corner's turn to
@@ -204,7 +219,7 @@ func rib_ends(w: const Shape*, c: usize, sides: const usize[2], section: RibSect
     if trims.count == 0: return
     if low >= 0.0 or high <= 0.0: error(invalid, "a curved rib's full round needs an end on each side of the round")
     let span = high - low
-    let margin = math.min(0.05 * span + 0.01, (2.0 * math.pi - span) * 0.25)
+    let margin = math.min(rib_margin_share * span + rib_margin_turn, (2.0 * math.pi - span) * 0.25)
     if not (margin > 0.0): error(invalid, "a curved rib's ends overlap round its axis: no full round fits")
     section.low = (low - margin) if leaning_low else low
     section.high = (high + margin) if leaning_high else high
@@ -230,7 +245,7 @@ func plane_turn(section: const RibSection*, x: Vector3, o: Vector3, n: Vector3, 
     let sin_part = n.dot(a.cross(radial))
     let c = n.dot(o.subtract(section.origin.add(level)))
     let amplitude = math.sqrt(cos_part * cos_part + sin_part * sin_part)
-    if amplitude <= 1e-12 or math.abs(c) > amplitude: error(invalid, "a curved rib's end does not cross its round: no full round fits")
+    if amplitude <= least_rib_amplitude or math.abs(c) > amplitude: error(invalid, "a curved rib's end does not cross its round: no full round fits")
     let phase = math.atan2(sin_part, cos_part)
     let spread = math.acos(c / amplitude)
     var best = 0.0
@@ -332,7 +347,7 @@ func round_part(w: const Shape*, ea: usize, eb: usize, radius: f64, section: con
         try single_region(&profile)
         let slab = try BrepModel.held(w.tolerances)
         defer slab.release()
-        try revolve_into(slab.value(), &profile, o, a, (carrier.a + radius) * 1e-7, "", sweep)
+        try revolve_into(slab.value(), &profile, o, a, (carrier.a + radius) * turned_tool_share, "", sweep)
         for face in 0..<slab.value().face_count():
             try slab.value().set_face_name(face, "")
         return try CadModel.of_brep(slab)
@@ -370,7 +385,7 @@ func round_part(w: const Shape*, ea: usize, eb: usize, radius: f64, section: con
     try single_region(&profile)
     let solid = try BrepModel.held(w.tolerances)
     defer solid.release()
-    try revolve_into(solid.value(), &profile, o, a, (carrier.a + radius) * 1e-7, "", sweep)
+    try revolve_into(solid.value(), &profile, o, a, (carrier.a + radius) * turned_tool_share, "", sweep)
     # The round's faces named for the edges' blends.
     var name_a = Growing[u8]()
     defer name_a.close()
@@ -408,11 +423,11 @@ func other_side(w: const Shape*, c: usize, e: usize) -> usize!:
 func alike(w: const Shape*, a: usize, b: usize) -> bool!:
     let ca = w.carriers.items[(usize)w.edges.items[a].carrier]
     let cb = w.carriers.items[(usize)w.edges.items[b].carrier]
-    if ca.kind == curve_line and cb.kind == curve_line: return math.abs(math.abs(ca.x.dot(cb.x)) - 1.0) <= 1e-9
+    if ca.kind == curve_line and cb.kind == curve_line: return math.abs(math.abs(ca.x.dot(cb.x)) - 1.0) <= parallel_slack
     if ca.kind != curve_circle or cb.kind != curve_circle: return false
     let axis_a = ca.x.cross(ca.y)
     let axis_b = cb.x.cross(cb.y)
-    if math.abs(math.abs(axis_a.dot(axis_b)) - 1.0) > 1e-9: return false
+    if math.abs(math.abs(axis_a.dot(axis_b)) - 1.0) > parallel_slack: return false
     let offset = cb.origin.subtract(ca.origin)
     return offset.subtract(axis_a.multiply_scalar(offset.dot(axis_a))).length() <= w.tolerance * 10.0
 
@@ -437,13 +452,13 @@ func inscribed_circle(w: const Shape*, c: usize, sides: const usize[2], e: usize
     var b: f64[3]
     for k in 0..<(usize)3:
         let n = try w.face_normal(faces[k], feet[k])
-        if math.abs(n.dot(along)) > 1e-6: error(invalid, "a full round's faces must run along its edges")
+        if math.abs(n.dot(along)) > parallel_slack_loose: error(invalid, "a full round's faces must run along its edges")
         m[k * 3] = n.dot(u)
         m[k * 3 + 1] = n.dot(v)
         m[k * 3 + 2] = 1.0
         b[k] = n.dot(feet[k].subtract(p))
     let det = determinant(m)
-    if math.abs(det) < 1e-12: error(invalid, "no circle touches the center face and both sides: they must close round the rib")
+    if math.abs(det) < inscribed_singular: error(invalid, "no circle touches the center face and both sides: they must close round the rib")
     var mx: f64[9]
     var my: f64[9]
     var mr: f64[9]
@@ -470,8 +485,8 @@ func inscribed_circle(w: const Shape*, c: usize, sides: const usize[2], e: usize
         try round_gaps(w, faces[..<3], x, radius, p, along, values[..<4])
         var worst = 0.0
         for k in 0..<(usize)4: worst = math.max(worst, math.abs(values[k]))
-        if worst <= scale * 1e-14: break
-        let h = scale * 1e-7
+        if worst <= scale * inscribed_residual_share: break
+        let h = scale * inscribed_difference_share
         let steps: Vector3[3] = [Vector3(h, 0.0, 0.0), Vector3(0.0, h, 0.0), Vector3(0.0, 0.0, h)]
         for k in 0..<(usize)4: base[k] = values[k]
         for col in 0..<(usize)3:

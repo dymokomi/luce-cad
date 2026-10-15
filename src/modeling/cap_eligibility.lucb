@@ -3,6 +3,13 @@
 ## joint or an open end, the cap of an edge between two flat faces told by
 ## its neighbors or by the edge its loop goes on into.
 
+## Weights of a ruled B-spline wall's two rows count as one when this
+## near.
+let equal_weight_slack: f64 = 1e-12
+## A wall's ruling matches the scaled one when within this share of its
+## length.
+let ruling_match_share: f64 = 1e-6
+
 ## How face `wall` runs away from the plane of normal `n`, when it is ruled
 ## so a blend can follow it: a plane across it (ruling_between), a
 ## cylinder or cone about `n` (ruling_cone), or a surface swept straight
@@ -12,11 +19,11 @@
 func wall_ruling(w: const Shape*, wall: usize, n: Vector3) -> (i64, Vector3):
     let s = w.surfaces.items[(usize)w.faces.items[wall].surface]
     if s.kind == surface_plane:
-        if math.abs(s.z.dot(n)) > 1.0 - 1e-9: return (-1, Vector3())
+        if math.abs(s.z.dot(n)) > 1.0 - parallel_slack: return (-1, Vector3())
         return (ruling_between, Vector3())
     if s.kind == surface_cylinder or s.kind == surface_cone:
-        if math.abs(s.z.dot(n)) > 1.0 - 1e-12: return (ruling_cone, Vector3())
-        if s.kind == surface_cylinder and math.abs(s.z.dot(n)) > 1e-6: return (ruling_sweep, s.z)
+        if math.abs(s.z.dot(n)) > 1.0 - parallel_slack_tight: return (ruling_cone, Vector3())
+        if s.kind == surface_cylinder and math.abs(s.z.dot(n)) > parallel_slack_loose: return (ruling_sweep, s.z)
         return (-1, Vector3())
     if s.kind != surface_spline: return (-1, Vector3())
     # The swept way is v (two rows per u) or u (two rows per v).
@@ -28,11 +35,11 @@ func wall_ruling(w: const Shape*, wall: usize, n: Vector3) -> (i64, Vector3):
     for i in 0..<(usize)count:
         let first = i * 2 if along_v else i
         let second = i * 2 + 1 if along_v else (usize)s.nv + i
-        if math.abs(s.weights[first] - s.weights[second]) > 1e-12: return (-1, Vector3())
+        if math.abs(s.weights[first] - s.weights[second]) > equal_weight_slack: return (-1, Vector3())
         let d = s.points[second].subtract(s.points[first])
         if i == 0:
             step = d
-            if step.length() <= w.tolerance or math.abs(step.dot(n)) <= step.length() * 1e-6: return (-1, Vector3())
+            if step.length() <= w.tolerance or math.abs(step.dot(n)) <= step.length() * parallel_slack_loose: return (-1, Vector3())
         elif d.subtract(step).length() > w.tolerance: return (-1, Vector3())
     let way = step.normalized() catch failure: return (-1, Vector3())
     return (ruling_sweep, way)
@@ -121,7 +128,7 @@ func cap_eligible(b: Cap*, chosen: const usize[]) -> bool!:
         let cap_way = try into_face(w, cap, e, along)
         let wall_way = try into_face(w, wall, e, along)
         # The wall must leave the cap's plane, not lie along it.
-        if math.abs(wall_way.dot(n)) < 1e-6 or math.abs(wall_way.dot(cap_way)) > 1.0 - 1e-6: return false
+        if math.abs(wall_way.dot(n)) < parallel_slack_loose or math.abs(wall_way.dot(cap_way)) > 1.0 - parallel_slack_loose: return false
         let (ruling, sweep) = wall_ruling(w, wall, n)
         let into_wall = n.multiply_scalar(1.0 if wall_way.dot(n) > 0.0 else -1.0)
         try b.sides.push(CapSide(e, cap, wall, 1.0 if crosswise.dot(cap_way) > 0.0 else -1.0, into_wall, try convex(w, e), ruling, Vector3(), Vector3(),
@@ -142,7 +149,7 @@ func continued_face(w: const Shape*, e: usize, chosen: const usize[]) -> i64!:
         for g in 0..<w.edges.count:
             let other = w.edges.items[g]
             if g == e or (other.start != v and other.end != v) or edge_in(chosen, g): continue
-            if (try w.leaving(g, 0 if other.start == v else 1)).dot(mine) > -1.0 + 1e-9: continue
+            if (try w.leaving(g, 0 if other.start == v else 1)).dot(mine) > -1.0 + parallel_slack: continue
             let (ga, gb) = try edge_faces(w, g)
             if ga == fa or gb == fa: return (i64)fa
             if ga == fb or gb == fb: return (i64)fb
@@ -172,7 +179,7 @@ func vertices_eligible(b: Cap*, k: usize, ends: const i64[]) -> bool!:
             count += 1
             if g == side.edge: continue
             let theirs = try w.leaving(g, 0 if other.start == v else 1)
-            let tangential = mine.dot(theirs) <= -1.0 + 1e-9
+            let tangential = mine.dot(theirs) <= -1.0 + parallel_slack
             let j = b.side_of.items[g]
             if j >= 0:
                 let next = b.sides.items[(usize)j]
@@ -216,7 +223,7 @@ func vertices_eligible(b: Cap*, k: usize, ends: const i64[]) -> bool!:
         else: b.sides.items[k].s1 = scaled
         if side.ruling != ruling_between:
             let ruled = try ruling_at(b, &b.sides.items[k], t)
-            if ruled.subtract(scaled).length() > 1e-6 * ruled.length(): return false
+            if ruled.subtract(scaled).length() > ruling_match_share * ruled.length(): return false
     return true
 
 ## Whether side `side`'s end `end` (0 its start) is a corner end: the
@@ -239,7 +246,7 @@ func corner_end(b: const Cap*, side: const CapSide*, end: usize, turns: usize, s
     let v = edge.start if end == 0 else edge.end
     let inward = try w.leaving(side.edge, (i64)end)
     let outward = try w.face_normal(wall, w.points.items[(usize)v])
-    return outward.dot(inward) <= -1.0 + 1e-9
+    return outward.dot(inward) <= -1.0 + parallel_slack
 
 ## Whether face `f` of `w` uses edge `e`.
 func face_uses_edge(w: const Shape*, f: usize, e: usize) -> bool:

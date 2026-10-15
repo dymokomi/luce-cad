@@ -12,6 +12,18 @@
 ## inside out, or a curved neighbor tangent to a moved face (which no
 ## longer meets it) is an error saying so, never a broken solid.
 
+## A corner point's Gauss-Newton step: the damping added to J Jᵀ's
+## diagonal.
+let corner_damping: f64 = 1e-12
+## An edge whose ends moved less than this share of the tolerance is kept.
+let unmoved_share: f64 = 0.01
+## How far short of a whole turn (radians) an arc must be to be checked
+## for turning round.
+let whole_turn_slack: f64 = 1e-6
+## The box a meeting curve is looked for in: half the chord, and this
+## share of the faces' size, round its middle.
+let meeting_reach_share: f64 = 0.02
+
 ## How a face's surface changes (FaceMove.kind).
 pub let move_translate: i64 = 0
 pub let move_rotate: i64 = 1
@@ -140,12 +152,12 @@ func corner_point(w: const Shape*, surfaces: const i64[], seed: Vector3) -> Vect
             rows[at * 3 + 1] = n.y
             rows[at * 3 + 2] = n.z
             worst = math.max(worst, math.abs(gap))
-        if worst <= w.tolerance * 0.01: return x
+        if worst <= w.tolerance * solve_settled_share: return x
         # (J Jᵀ + μI) z = r, step -Jᵀ z.
         var a: f64[64]
         for i in 0..<count:
             for j in 0..<count:
-                a[i * count + j] = rows[i * 3] * rows[j * 3] + rows[i * 3 + 1] * rows[j * 3 + 1] + rows[i * 3 + 2] * rows[j * 3 + 2] + (1e-12 if i == j else 0.0)
+                a[i * count + j] = rows[i * 3] * rows[j * 3] + rows[i * 3 + 1] * rows[j * 3 + 1] + rows[i * 3 + 2] * rows[j * 3 + 2] + (corner_damping if i == j else 0.0)
         var z: f64[8]
         for i in 0..<count: z[i] = residual[i]
         if not solve_small(a[..<count * count], z[..<count], count): break
@@ -202,7 +214,7 @@ func solve_small(a: f64[], z: f64[], n: usize) -> bool:
         var pivot = col
         for row in col + 1..<n:
             if math.abs(a[row * n + col]) > math.abs(a[pivot * n + col]): pivot = row
-        if math.abs(a[pivot * n + col]) < 1e-14: return false
+        if math.abs(a[pivot * n + col]) < pivot_floor: return false
         if pivot != col:
             for k in 0..<n:
                 let swap = a[col * n + k]
@@ -419,7 +431,7 @@ func same_surface_listed(w: const Shape*, listed: const i64[], s: i64) -> bool!:
     for other in listed:
         if other == s: return true
         let b = &w.surfaces.items[(usize)other]
-        if a.kind == surface_plane and b.kind == surface_plane and math.abs(a.z.dot(b.z)) > 1.0 - 1e-12 and math.abs(b.origin.subtract(a.origin).dot(a.z)) <= w.tolerance: return true
+        if a.kind == surface_plane and b.kind == surface_plane and math.abs(a.z.dot(b.z)) > 1.0 - parallel_slack_tight and math.abs(b.origin.subtract(a.origin).dot(a.z)) <= w.tolerance: return true
     return false
 
 ## An error when a moved face meets a face along an edge where their
@@ -441,7 +453,7 @@ pub func tangent_edge(w: const Shape*, e: usize) -> bool!:
     let middle = try w.edge_at(e, 0.5)
     let na = try w.face_normal((usize)fa, middle)
     let nb = try w.face_normal((usize)fb, middle)
-    return na.dot(nb) > 1.0 - 1e-6
+    return na.dot(nb) > 1.0 - parallel_slack_loose
 
 ## Edge `e` of `w` again on its faces' surfaces now: a new carrier when a
 ## moved face holds it, else its own; its interval from its ends' new
@@ -453,7 +465,7 @@ func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, ol
     let on_moved = (fa >= 0 and moved[(usize)fa]) or (fb >= 0 and moved[(usize)fb])
     let start = w.points.items[(usize)edge.start]
     let end = w.points.items[(usize)edge.end]
-    if not on_moved and start.subtract(old_start).length() <= w.tolerance * 0.01 and end.subtract(old_end).length() <= w.tolerance * 0.01: return
+    if not on_moved and start.subtract(old_start).length() <= w.tolerance * unmoved_share and end.subtract(old_end).length() <= w.tolerance * unmoved_share: return
     let old = w.carriers.items[(usize)edge.carrier]
     # The way it left its start, as the move turns it.
     let old_way = m.direction((try w.tangent(edge.carrier, edge.t0)).multiply_scalar(1.0 if edge.t1 > edge.t0 else -1.0))
@@ -503,11 +515,11 @@ func refit_edge(w: Shape*, e: usize, moved: const bool[], m: const FaceMove*, ol
         t0 = a0
         var span = a1 - a0
         if not forward: span = -span
-        while span <= 1e-9: span += 2.0 * math.pi
-        while span > 2.0 * math.pi + 1e-9: span -= 2.0 * math.pi
+        while span <= angle_slack: span += 2.0 * math.pi
+        while span > 2.0 * math.pi + angle_slack: span -= 2.0 * math.pi
         # A whole circle stays whole.
         if edge.start == edge.end: span = 2.0 * math.pi
-        if was < 2.0 * math.pi - 1e-6 and math.abs(span - was) > math.pi: error(invalid, "an arc would turn round: the move changes the body's shape too much")
+        if was < 2.0 * math.pi - whole_turn_slack and math.abs(span - was) > math.pi: error(invalid, "an arc would turn round: the move changes the body's shape too much")
         t1 = t0 + (span if forward else -span)
     else:
         let (_, _, knots, degree) = w.spline_net(c.spline)
@@ -548,7 +560,7 @@ func note_strays(w: Shape*, e: usize, carrier: i64, t0: f64, t1: f64, fa: usize,
 func tangent_carrier(w: Shape*, fa: usize, fb: usize, old: const Carrier*, e: usize, start: Vector3, end: Vector3, middle: Vector3, reason: str) -> Carrier!:
     let na = try w.face_normal(fa, start)
     let nb = try w.face_normal(fb, start)
-    if na.dot(nb) < 1.0 - 1e-6: error(invalid, reason)
+    if na.dot(nb) < 1.0 - parallel_slack_loose: error(invalid, reason)
     let (gap, n) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[fa].surface], middle, w.tolerance)
     let moved = middle.subtract(n.multiply_scalar(gap))
     if old.kind == curve_line:
@@ -583,7 +595,7 @@ func tangent_there(w: const Shape*, fa: usize, fb: usize, p: Vector3) -> bool!:
     # (Their surfaces moved off `p`: the normals at its nearest points.)
     let (_, na) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[fa].surface], p, w.tolerance)
     let (_, nb) = try signed_gap(&w.surfaces.items[(usize)w.faces.items[fb].surface], p, w.tolerance)
-    return math.abs(na.dot(nb)) >= 1.0 - 1e-6
+    return math.abs(na.dot(nb)) >= 1.0 - parallel_slack_loose
 
 ## A B-spline carrier through edge `e`'s old points (33 along it) each
 ## moved onto face `fa`'s surface along its normal, from `start` to `end`:
@@ -671,7 +683,7 @@ func meeting_carrier(w: Shape*, fa: usize, fb: usize, start: Vector3, end: Vecto
             let (la, ha) = try face_box(w, fa)
             let (lb, hb) = try face_box(w, fb)
             let size = upper(ha, hb).subtract(lower(la, lb)).length()
-            let reach = Vector3(1.0, 1.0, 1.0).multiply_scalar(end.subtract(start).length() * 0.5 + size * 0.02)
+            let reach = Vector3(1.0, 1.0, 1.0).multiply_scalar(end.subtract(start).length() * 0.5 + size * meeting_reach_share)
             try marched(w, fa, fb, lower(lower(start, end), hint).subtract(reach), upper(upper(start, end), hint).add(reach), size, w.tolerance, &curves)
         return try nearest_spline_carrier(w, curves.view(), start, end, hint)
     let met = try meet(sa, sb, w.tolerance, &curves)

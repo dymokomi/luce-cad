@@ -14,6 +14,11 @@
 ## degree, one knot vector, on 0..1); Bezier rows from end derivatives (a
 ## Hermite interpolation of curves, exact); nets made alike and added.
 
+## The builders' fit tolerance is at least this (the curves' size may be
+## zero); match_side's G1 limit in degrees for the Align it runs.
+let least_build: f64 = 1e-12
+let match_angle: f64 = 0.01
+
 ## The curves `text` names (words apart by `;`) as masters, onto `out`.
 func builder_masters(set: interop.Reference[GeometrySet], text: str, out: Growing[Master]*) -> !:
     let bytes = text.bytes
@@ -41,7 +46,7 @@ func close_splines_of(list: Growing[Spline]*):
 func plain_weights(c: const Spline*) -> bool:
     let w0 = c.points.items[0].w
     for q in c.points.view():
-        if math.abs(q.w - w0) > 1e-12 * math.abs(w0): return false
+        if math.abs(q.w - w0) > weight_same * math.abs(w0): return false
     return true
 
 ## The domain's distinct spans of `c`.
@@ -165,7 +170,7 @@ func curves_size(curves: const Spline[]) -> f64:
 
 ## The tolerance builders fit to: a ten-millionth of what they span.
 func build_tolerance(curves: const Spline[]) -> f64:
-    return math.max(1e-12, curves_size(curves) * 1e-7)
+    return math.max(least_build, curves_size(curves) * fit_share)
 
 ## `curves` made compatible: on 0..1, one degree (the highest of theirs,
 ## at least `least`) and one knot vector (each one's inner knots inserted
@@ -186,12 +191,12 @@ func make_compatible(curves: Growing[Spline]*, least: i64) -> !:
     for c in curves.view():
         var inner = Growing[f64]()
         defer inner.close()
-        try distinct_inner(&c, 1e-9, &inner)
+        try distinct_inner(&c, knot_near, &inner)
         for u in inner.view():
-            let m = multiplicity(c.knots.view(), u, 1e-9)
+            let m = multiplicity(c.knots.view(), u, knot_near)
             var found = false
             for k in 0..<values.count:
-                if math.abs(values.items[k] - u) <= 1e-9:
+                if math.abs(values.items[k] - u) <= knot_near:
                     counts.items[k] = fewer(counts.items[k] if counts.items[k] > m else m, (usize)degree)
                     found = true
             if not found:
@@ -202,7 +207,7 @@ func make_compatible(curves: Growing[Spline]*, least: i64) -> !:
         for k in 0..<values.count:
             var u = values.items[k]
             for q in c.knots.view():
-                if math.abs(q - u) <= 1e-9: u = q
+                if math.abs(q - u) <= knot_near: u = q
             let have = multiplicity(c.knots.view(), u, 0.0)
             if counts.items[k] > have: _ = try insert_knot(c, u, counts.items[k] - have)
     # One knot vector: the first's (the others' differ by rounding).
@@ -297,13 +302,13 @@ func match_direction(a: Net*, b: Net*, direction: i64) -> !:
         let low = knots[(usize)(from_net.du if direction == 0 else from_net.dv)]
         let high = knots[from_net.nu if direction == 0 else from_net.nv]
         for k in knots:
-            if k <= low + 1e-9 or k >= high - 1e-9: continue
-            if inner.count > 0 and math.abs(inner.items[inner.count - 1] - k) <= 1e-9: continue
+            if k <= low + knot_near or k >= high - knot_near: continue
+            if inner.count > 0 and math.abs(inner.items[inner.count - 1] - k) <= knot_near: continue
             try inner.push(k)
-            try counts.push(multiplicity(knots, k, 1e-9))
+            try counts.push(multiplicity(knots, k, knot_near))
         for at in 0..<inner.count:
             let target = into.ku.view() if direction == 0 else into.kv.view()
-            let have = multiplicity(target, inner.items[at], 1e-9)
+            let have = multiplicity(target, inner.items[at], knot_near)
             if counts.items[at] > have: _ = try net_insert(into, direction, inner.items[at], counts.items[at] - have)
     # One knot vector (they differ by rounding at most).
     let ka = a.ku.view() if direction == 0 else a.kv.view()
@@ -416,7 +421,7 @@ func match_side(net: Net*, side: i64, master: Master*, order: i64, tolerance: f6
     var plain = try polynomial_net(net, tolerance)
     errdefer plain.close()
     let opts = AlignOptions(order, align_edge, Vector3(), 0.0, false, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0], false, false, 0, 0.0, false, 0.0, 1.0, false, false, 0, 0, 0, 0,
-                            true, 16, [tolerance * 10.0, 0.01, 0.1, 0.1], [0.0, 0.0], -1.0, false, false)
+                            true, 16, [tolerance * 10.0, match_angle, 0.1, 0.1], [0.0, 0.0], -1.0, false, false)
     var report = empty_report()
     try align_side(&plain, side, master, &opts, &report)
     net.close()

@@ -829,6 +829,26 @@ the ratio grows with the quality (more steps on the small radii) and is the
 same at every size. At Very High: planes 588, fillets 6,552 (39 steps by 7
 rows), corners 12,168 (39²): 19,308 against 9,436.
 
+### 3.16 Stage 6, literals: modeling and surfacing
+
+Modeling's and surfacing's small literals are named, values unchanged
+(each changed line checked by putting the values back and comparing):
+the thresholds several modeling operations share in
+src/modeling/thresholds.lucb (`parallel_slack` and its tight and loose
+forms, `angle_slack`, `relative_zero`, `singular_floor`, `pivot_floor`,
+`planes_meet_floor`, `solve_settled_share`, the extrusion and sketch
+shares), surfacing's in its first file (`knot_same`, `knot_near`,
+`weight_same`, `fit_share`, `least_range`, `on_domain_end`, `same_place`,
+`joint_gap_share`), the rest beside their one use with what they mean.
+Public defaults take named constants too (`stitch_gap_default`,
+`align_gap_default`, `fill_angle_default`). Left as written: the Gauss
+quadrature tables of patch_fit and fill_net (data, not tolerances), and
+coincide's and spline_coincidence's three (a change to them is in flight,
+3.17). 732 to 200; the ratchet is 200. Many of these are still shares of a
+body's size (`fit_share`, `relative_zero` against a size): naming them is
+the step before moving each onto CadTolerances, which changes values and
+so goes case by case with the harness.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.

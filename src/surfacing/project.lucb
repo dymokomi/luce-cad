@@ -24,6 +24,49 @@ from cad_trims import stage_model, stage_count, with_stage
 from geometry import CadTolerances, curve_spline, surface_plane, surface_sphere, surface_cylinder
 from brep import BrepModel
 
+## Tolerances shared across surfacing's files.
+## Knots closer than `knot_same` (in a curve's or net's own parameter, or
+## that share of its domain or of 1 plus the knot's size) are one knot;
+## `knot_near` is the looser match the builders and Fill's quads use when
+## they merge the knot vectors of curves fitted apart.
+let knot_same: f64 = 1e-12
+let knot_near: f64 = 1e-9
+## Weights differing by less than this share of the first are equal: the
+## curve is polynomial.
+let weight_same: f64 = 1e-12
+## A fitted, rebuilt or stitched result's precision: this share of the
+## extent of what it spans (a ten-millionth, far inside any model's
+## tolerance, far above rounding).
+let fit_share: f64 = 1e-7
+## A range picked in fractions of a curve or side (0 to 1) must be longer
+## than this to be a range.
+let least_range: f64 = 1e-6
+## A normalized face parameter within this of 0 or 1 lies on the edge of
+## the surface's domain.
+let on_domain_end: f64 = 1e-6
+## Two fractions along a rail or a side closer than this are one place.
+let same_place: f64 = 1e-9
+## Curves meet end to end when their ends lie within this share of their
+## size (a ten-thousandth: looser than the fit, tighter than any gap
+## meant).
+let joint_gap_share: f64 = 1e-4
+## A percentage as a share (the Check tools' limits are in percent).
+let percent_share: f64 = 0.01
+
+## Project's casting: the least size of a target (its edges' box), the
+## residual the ray Newton stops at and the miss a cast point may still
+## have (shares of that size), the determinant below which the ray grazes
+## the surface (a share of |su| |sv|) and walks along it instead, how far
+## behind the start a one-way cast may land (a share of the size), and how
+## far a point found by halving may lie from a boundary to be snapped to
+## it.
+let least_target_size: f64 = 1e-9
+let cast_residual: f64 = 1e-12
+let cast_miss: f64 = 1e-8
+let cast_singular: f64 = 1e-9
+let cast_behind: f64 = 1e-9
+let boundary_reach: f64 = 1e-3
+
 ## This file: Project (surfacing Stage 3: Alias's Project, Rhino's Project and Pull;
 ## §6.3 of luced-3d's docs/research/SURFACING-ALIAS-PLASTICITY.md): a curve
 ## cast onto a face along a vector (or the view) or along the face's
@@ -96,7 +139,7 @@ func target_of(model: const CadModel*, face: str) -> Target!:
             let p = try t.w.edge_at(edge_index(use), (f64)k / 8.0)
             box_low = Vector3(math.min(box_low.x, p.x), math.min(box_low.y, p.y), math.min(box_low.z, p.z))
             box_high = Vector3(math.max(box_high.x, p.x), math.max(box_high.y, p.y), math.max(box_high.z, p.z))
-    t.size = math.max(1e-9, box_high.subtract(box_low).length())
+    t.size = math.max(least_target_size, box_high.subtract(box_low).length())
     return t
 
 ## How a curve is cast: along `direction` (both ways with `both`, else only
@@ -146,11 +189,11 @@ func ray_newton(t: const Target*, how: const Casting*, p: Vector3, start: Vector
     for _ in 0..<40:
         let j = try surface_jet(s, uv, false, false)
         let r = j.p.subtract(p).subtract(d.multiply_scalar(lambda))
-        if r.length() <= t.size * 1e-12: break
+        if r.length() <= t.size * cast_residual: break
         # [su sv -d] x = -r by Cramer's rule.
         let m = d.multiply_scalar(-1.0)
         let det = j.su.dot(j.sv.cross(m))
-        if math.abs(det) <= 1e-9 * j.su.length() * j.sv.length(): return try along_surface(t, how, p, uv)
+        if math.abs(det) <= cast_singular * j.su.length() * j.sv.length(): return try along_surface(t, how, p, uv)
         let minus = r.multiply_scalar(-1.0)
         let du = minus.dot(j.sv.cross(m)) / det
         let dv = j.su.dot(minus.cross(m)) / det
@@ -160,8 +203,8 @@ func ray_newton(t: const Target*, how: const Casting*, p: Vector3, start: Vector
         if s.kind == surface_spline: uv = Vector3(math.clamp(uv.x, 0.0, 1.0), math.clamp(uv.y, 0.0, 1.0), 0.0)
         if not math.is_finite(uv.x) or not math.is_finite(uv.y): return none
     let r = (try surface_point(*s, uv)).subtract(p).subtract(d.multiply_scalar(lambda))
-    if r.length() > t.size * 1e-8: return none
-    if not how.both and lambda < -t.size * 1e-9: return none
+    if r.length() > t.size * cast_miss: return none
+    if not how.both and lambda < -t.size * cast_behind: return none
     return uv
 
 ## A line along the surface (see ray_newton): `p`'s foot on the surface,
@@ -170,8 +213,8 @@ func along_surface(t: const Target*, how: const Casting*, p: Vector3, seed: Vect
     let s = t.surface()
     let uv = (try nearest_parameters(*s, p, seed, false)) if s.kind == surface_spline else chart_uv(*s, p, seed, true)
     let q = try surface_point(*s, uv)
-    if q.subtract(p).cross(how.direction).length() > t.size * 1e-8: return none
-    if not how.both and q.subtract(p).dot(how.direction) < -t.size * 1e-9: return none
+    if q.subtract(p).cross(how.direction).length() > t.size * cast_miss: return none
+    if not how.both and q.subtract(p).dot(how.direction) < -t.size * cast_behind: return none
     return uv
 
 ## One run of the curve inside the face: its parameter range and where its
@@ -250,7 +293,7 @@ func onto_boundary(t: const Target*, uv: Vector3) -> Vector3!:
             best_distance = d
             best = q
     # Only a near edge: one far off means the halving stopped elsewhere.
-    if best_distance > t.size * 1e-3: return uv
+    if best_distance > t.size * boundary_reach: return uv
     if s.kind == surface_spline: return try nearest_parameters(*s, best, uv, false)
     return chart_uv(*s, best, uv, true)
 

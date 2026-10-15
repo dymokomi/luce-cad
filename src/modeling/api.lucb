@@ -1,6 +1,13 @@
 ## Luce's CAD modeling operations: features that make and change closed
 ## B-reps (see docs/MODELING.md for the plan and what each supports).
 
+## Revolve from the API: the tolerance the profile is turned at, and how far
+## the axis may lean out of the sketch plane or stand off it before the
+## revolve is refused (shares of the sketch's size; the lean in its sine).
+let api_revolve_share: f64 = 0.000001
+let api_axis_lean: f64 = 1e-9
+let api_axis_offset_share: f64 = 1e-7
+
 ## A sketch plane on a body's face (CadModeling.face_frame): its origin and
 ## the directions of the sketch's x and y (the normal, x × y, out of the
 ## body); `found` false when there is no such flat face.
@@ -31,7 +38,7 @@ pub struct CadModeling:
     pub static func extruded(set: interop.Reference[GeometrySet], distance: f64, start: f64, tag: str, profiles: str = "", tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadModel]!:
         let source = try set.get()
         let size = try sketch_size(source)
-        var p = try profiles_of(source, size * 0.0001, profiles)
+        var p = try profiles_of(source, size * sketch_tolerance_share, profiles)
         defer p.close()
         if start != 0.0: p.moved(p.normal.multiply_scalar(start))
         let solid = try BrepModel.held(tolerances)
@@ -249,11 +256,11 @@ pub struct CadModeling:
     pub static func revolved(set: interop.Reference[GeometrySet], axis: i64, tag: str, angle: f64 = 2.0 * math.pi, profiles: str = "", tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadModel]!:
         let source = try set.get()
         let size = try sketch_size(source)
-        var p = try profiles_of(source, size * 0.0001, profiles)
+        var p = try profiles_of(source, size * sketch_tolerance_share, profiles)
         defer p.close()
         let solid = try BrepModel.held(tolerances)
         defer solid.release()
-        try revolve_into(solid.value(), &p, p.origin, p.u if axis == 0 else p.v, size * 0.000001, tag, angle)
+        try revolve_into(solid.value(), &p, p.origin, p.u if axis == 0 else p.v, size * api_revolve_share, tag, angle)
         return try CadModel.of_brep(solid)
 
     ## The keys of the sketch's profiles in `set` (the smallest regions its
@@ -264,7 +271,7 @@ pub struct CadModeling:
         let source = try set.get()
         var out = Growing[u8]()
         defer out.close()
-        try face_keys(source, try sketch_size(source) * 0.0001, false, Vector3(), &out)
+        try face_keys(source, try sketch_size(source) * sketch_tolerance_share, false, Vector3(), &out)
         return try interop.copy_text((str)out.view())
 
     ## The key of the profile holding world point `at` (on the sketch
@@ -273,7 +280,7 @@ pub struct CadModeling:
         let source = try set.get()
         var out = Growing[u8]()
         defer out.close()
-        try face_keys(source, try sketch_size(source) * 0.0001, true, at, &out)
+        try face_keys(source, try sketch_size(source) * sketch_tolerance_share, true, at, &out)
         return try interop.copy_text((str)out.view())
 
     ## The outlines of the sketch's profiles in `set` that `keys` names
@@ -282,7 +289,7 @@ pub struct CadModeling:
         let source = try set.get()
         var out = CurvesBuilder()
         defer out.close()
-        try face_outlines(source, try sketch_size(source) * 0.0001, keys, &out)
+        try face_outlines(source, try sketch_size(source) * sketch_tolerance_share, keys, &out)
         let made = try out.finish()
         let blank = try empty_set()
         defer dispose_set(blank)
@@ -341,7 +348,7 @@ pub struct CadModeling:
     ## How many profile regions the sketch in `set` has.
     pub static func profile_count(set: interop.Reference[GeometrySet]) -> i64!:
         let source = try set.get()
-        var p = try profiles_of(source, try sketch_size(source) * 0.0001)
+        var p = try profiles_of(source, try sketch_size(source) * sketch_tolerance_share)
         defer p.close()
         return (i64)p.region_count()
 
@@ -555,14 +562,14 @@ pub struct CadModeling:
     pub static func revolved_about(set: interop.Reference[GeometrySet], origin: Vector3, direction: Vector3, tag: str, angle: f64 = 2.0 * math.pi, profiles: str = "", tolerances: CadTolerances = CadTolerances()) -> interop.Reference[CadModel]!:
         let source = try set.get()
         let size = try sketch_size(source)
-        var p = try profiles_of(source, size * 0.0001, profiles)
+        var p = try profiles_of(source, size * sketch_tolerance_share, profiles)
         defer p.close()
         let axis = direction.normalized() catch failure: error(invalid, "a revolve's axis needs a direction")
-        if math.abs(axis.dot(p.normal)) > 1e-9 or math.abs(origin.subtract(p.origin).dot(p.normal)) > size * 1e-7:
+        if math.abs(axis.dot(p.normal)) > api_axis_lean or math.abs(origin.subtract(p.origin).dot(p.normal)) > size * api_axis_offset_share:
             error(invalid, "a revolve's axis must lie in the sketch's plane")
         let solid = try BrepModel.held(tolerances)
         defer solid.release()
-        try revolve_into(solid.value(), &p, origin, axis, size * 0.000001, tag, angle)
+        try revolve_into(solid.value(), &p, origin, axis, size * api_revolve_share, tag, angle)
         return try CadModel.of_brep(solid)
 
     ## Revolve's To extent: the profiles turned about the line through

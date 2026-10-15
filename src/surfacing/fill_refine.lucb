@@ -3,6 +3,20 @@
 ## halved while one fails, the result with its measures and conflicts, and
 ## the boundaries laid on the fill for the trim.
 
+## Refining a fill: a Molded domain wins only when its box is smaller by
+## more than this (normalized area); ribbons further apart than
+## `ribbon_apart` (normalized) ask for a ball, fitted to `ball_share` of its
+## radius; a reference missing the ribbons by more than
+## `reference_miss_most` splits every span; the inside point sits
+## `inside_step` of the chart box in from side 0; a laid side within
+## `laid_within` of the net needs no more spans.
+let area_better: f64 = 1e-12
+let ribbon_apart: f64 = 0.05
+let ball_share: f64 = 1e-3
+let reference_miss_most: f64 = 1e-4
+let inside_step: f64 = 0.01
+let laid_within: f64 = 1e-9
+
 # -- Measuring.
 
 ## Station `st` measured on `fn`: the gap (normalized), the angle between
@@ -103,7 +117,7 @@ func choose_domain(w: FillWork*) -> !:
         try mold_angles(w, total, turn)
         let (low, high) = molded_box(w)
         let area = (high.x - low.x) * (high.y - low.y)
-        if area < best_area - 1e-12:
+        if area < best_area - area_better:
             best_area = area
             best_turn = turn
     try mold_angles(w, total, best_turn)
@@ -248,8 +262,8 @@ func fill_made(w: FillWork*) -> FillMade!:
             var apart = false
             w.ball = no_ball()
             if not w.molded:
-                apart = try ribbon_spread(w, stations.view()) > 0.05
-                if apart: _ = ball_fit(w, stations.view(), 0.0, 1e-3)
+                apart = try ribbon_spread(w, stations.view()) > ribbon_apart
+                if apart: _ = ball_fit(w, stations.view(), 0.0, ball_share)
             reference_miss = try fit_reference(w, &fn, stations.view())
             if w.molded or (apart and not w.ball.on):
                 fn.reference.clear()
@@ -303,7 +317,7 @@ func fill_made(w: FillWork*) -> FillMade!:
                 failing = true
                 split_u.items[span_index(ku.view(), du, g.uv.x)] = true
                 split_v.items[span_index(kv.view(), dv, g.uv.y)] = true
-        if reference_miss > 1e-4:
+        if reference_miss > reference_miss_most:
             failing = true
             for at in 0..<split_u.count: split_u.items[at] = true
             for at in 0..<split_v.count: split_v.items[at] = true
@@ -341,7 +355,7 @@ func fill_made(w: FillWork*) -> FillMade!:
             var middle = &stations.items[0]
             for at in 0..<stations.count:
                 if stations.items[at].side == 0 and math.abs(stations.items[at].s - 0.5) < math.abs(middle.s - 0.5): middle = &stations.items[at]
-            let step = math.max(high.x - low.x, high.y - low.y) * 0.01
+            let step = math.max(high.x - low.x, high.y - low.y) * inside_step
             made.inside = w.world(net_jet(&fn, middle.uv.add(middle.d.multiply_scalar(step)))[0])
         return made
     error(invalid, "unreachable")
@@ -464,7 +478,7 @@ func laid_sides(w: const FillWork*, fn: const FillNet*, out: Growing[Spline]*) -
         let side = &w.sides.items[k]
         var breaks = Growing[f64]()
         defer breaks.close()
-        try distinct_inner(&side.curve, 1e-12, &breaks)
+        try distinct_inner(&side.curve, knot_same, &breaks)
         var per: usize = 1
         while true:
             # Uniform spans between the side's own breaks.
@@ -502,7 +516,7 @@ func laid_sides(w: const FillWork*, fn: const FillNet*, out: Growing[Spline]*) -
                 let p = w.local(side.curve.point_at(t))
                 let foot = net_jet(fn, net_foot(fn, p, try w.seed_of(k, t, p)))[0]
                 worst = math.max(worst, made.point_at(t).subtract(foot).length())
-            if worst <= 1e-9 or per >= 128:
+            if worst <= laid_within or per >= 128:
                 for at in 0..<made.points.count: made.points.items[at] = weighted(w.world(made.points.items[at].point()), 1.0)
                 try out.push(made)
                 break

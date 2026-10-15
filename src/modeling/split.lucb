@@ -6,6 +6,25 @@
 ## positively in the surface's chart bounds a region; one turning negatively
 ## is a hole, put in the smallest region around it.
 
+## The fraction along an edge a half-edge's direction is taken by default:
+## a short chord, so curves leaving along one tangent order by their bend.
+let half_chord_fraction: f64 = 0.001
+## The fraction a half-chord's search starts doubling from.
+let half_chord_start: f64 = 1e-6
+## The shares of the reach two half-edges are compared at, until they part.
+let clockwise_fractions: f64[4] = [0.01, 0.05, 0.2, 0.5]
+## Turns closer than this (radians) do not order two half-edges; a turn at
+## most this is a whole turn.
+let clockwise_tie: f64 = 1e-9
+let least_clockwise: f64 = 1e-12
+## Each way on from a vertex is measured this share of the shortest one's
+## reach from it; turns closer than this (radians) tie there.
+let way_on_share: f64 = 1e-3
+let way_on_tie: f64 = 1e-6
+## How far left of a hole's first segment (in its chart, as a share of the
+## segment) the point finding its region lies.
+let hole_probe_share: f64 = 0.001
+
 ## A directed use of an edge in a face being split.
 pub struct HalfEdge:
     pub var edge: i64
@@ -52,7 +71,7 @@ func end_of(w: const Shape*, h: HalfEdge) -> i64:
 ## The direction `h` leaves (`leaving`) or arrives back from (not leaving)
 ## the vertex at its start or end: a short chord, so curves leaving along
 ## one tangent still order by how they bend.
-func half_direction(w: const Shape*, h: HalfEdge, at_start: bool, fraction: f64 = 0.001) -> Vector3!:
+func half_direction(w: const Shape*, h: HalfEdge, at_start: bool, fraction: f64 = half_chord_fraction) -> Vector3!:
     let e = (usize)h.edge
     # The edge's own end the half-edge is at.
     let own_start = at_start == h.forward
@@ -73,7 +92,7 @@ func half_chord(w: const Shape*, h: HalfEdge, distance: f64) -> Vector3!:
     # The fraction reaching `distance`: doubled from a small one, then
     # halved between.
     var low = 0.0
-    var high = 1e-6
+    var high = half_chord_start
     while high < 1.0 and (try w.edge_at(e, high if h.forward else 1.0 - high)).subtract(here).length() < distance:
         low = high
         high = math.min(1.0, high * 2.0)
@@ -96,12 +115,12 @@ func half_reach(w: const Shape*, h: HalfEdge) -> f64!:
 ## leaving along one tangent: compared on chords of equal length further
 ## along each until they part.
 func first_clockwise(w: const Shape*, back: Vector3, a: HalfEdge, b: HalfEdge, n: Vector3) -> bool!:
-    let fractions: f64[4] = [0.01, 0.05, 0.2, 0.5]
+    let fractions: f64[4] = clockwise_fractions
     let reach = math.min(try half_reach(w, a), try half_reach(w, b))
     for f in fractions:
         let ta = clockwise(back, try half_chord(w, a, reach * f), n)
         let tb = clockwise(back, try half_chord(w, b, reach * f), n)
-        if math.abs(ta - tb) > 1e-9: return ta < tb
+        if math.abs(ta - tb) > clockwise_tie: return ta < tb
     return false
 
 ## The clockwise turn from `back` to `to` about `n`, in (0, 2 pi].
@@ -110,7 +129,7 @@ func clockwise(back: Vector3, to: Vector3, n: Vector3) -> f64:
     let b = to.subtract(n.multiply_scalar(to.dot(n)))
     let counter = math.atan2(n.dot(a.cross(b)), a.dot(b))
     var turn = -counter
-    if turn <= 1e-12: turn += 2.0 * math.pi
+    if turn <= least_clockwise: turn += 2.0 * math.pi
     return turn
 
 ## Face `f` of `w` split along `halves` (its boundary pieces and the new
@@ -154,7 +173,7 @@ pub func split_face(w: const Shape*, f: usize, halves: const HalfEdge[], pole: f
             var near = 1.0e300
             for k in 0..<halves.length:
                 if start_of(w, halves[k]) == vertex: near = math.min(near, try half_reach(w, halves[k]))
-            near *= 1e-3
+            near *= way_on_share
             var best: i64 = -1
             var best_turn = 1.0e300
             for k in 0..<halves.length:
@@ -162,7 +181,7 @@ pub func split_face(w: const Shape*, f: usize, halves: const HalfEdge[], pole: f
                 # Its own reverse comes last.
                 var turn = clockwise(back, try half_chord(w, halves[k], near), n)
                 if halves[k].edge == h.edge and halves[k].forward != h.forward: turn = 2.0 * math.pi + 1.0
-                if best >= 0 and math.abs(turn - best_turn) < 1e-6:
+                if best >= 0 and math.abs(turn - best_turn) < way_on_tie:
                     # Leaving along one tangent (a curve touching a line, as
                     # a G2 blend's edge does its face's): the one that bends
                     # first clockwise, seen further along both.
@@ -224,7 +243,7 @@ func group_cycles(w: const Shape*, f: usize, out: Pieces*, first_cycle: usize, p
             let a = charts.items[chart_starts.items[k]]
             let next = charts.items[chart_starts.items[k] + 1] if chart_starts.items[k + 1] - chart_starts.items[k] > 1 else a
             let along = next.subtract(a)
-            let left = Vector3(-along.y, along.x, 0.0).multiply_scalar(0.001 * (1.0 if face.sense else -1.0))
+            let left = Vector3(-along.y, along.x, 0.0).multiply_scalar(hole_probe_share * (1.0 if face.sense else -1.0))
             let probe = a.add(along.multiply_scalar(0.5)).add(left)
             var best_area = 1.0e300
             for j in 0..<mine.count:
