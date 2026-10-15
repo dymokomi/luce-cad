@@ -20,6 +20,21 @@ from meshing import planar_grid, nurbs_grid
 import strings
 import thread
 
+## A placement is uniform when its axes' lengths and dot products agree to
+## this share of its scale (curvature shading needs one).
+let uniform_scale: f64 = 1e-9
+## Scales and determinants below these are singular (a transform refused).
+let least_scale: f64 = 0.000001
+let least_determinant: f64 = 0.000000000001
+## Independent planar faces' boundary points lie within this distance of
+## their plane (source units).
+let coplanar: f64 = 0.000001
+## Points moved by less than this share of a model's extent stay where they
+## were (float rounding, cv_cloud.lucb).
+let unmoved: f64 = 0.000001
+## Normal guide lines and overlay arrows: this share of the model's extent.
+let guide_length: f64 = 0.03
+
 struct Face:
     let points: Vector3[]
     let weights: f64[]
@@ -143,14 +158,14 @@ pub struct CadModel:
 
     ## Return an independent transformed analytic model, retaining trim domains.
     pub func transformed(translation: Vector3, rotation: Vector3, scale: Vector3) -> interop.Reference[CadModel]!:
-        if not translation.is_finite() or not rotation.is_finite() or not scale.is_finite() or math.abs(scale.x) < 0.000001 or math.abs(scale.y) < 0.000001 or math.abs(scale.z) < 0.000001:
+        if not translation.is_finite() or not rotation.is_finite() or not scale.is_finite() or math.abs(scale.x) < least_scale or math.abs(scale.y) < least_scale or math.abs(scale.z) < least_scale:
             error(invalid, "CAD transform must be finite and nonsingular")
         return try self.placed(Matrix4.compose(translation, rotation, scale))
 
     ## An independent model placed by `matrix` (finite, nonsingular), with
     ## its trim domains; a B-rep keeps its columns under a new placement.
     pub func placed(matrix: Matrix4) -> interop.Reference[CadModel]!:
-        if not matrix.is_finite() or math.abs(matrix.determinant()) < 0.000000000001:
+        if not matrix.is_finite() or math.abs(matrix.determinant()) < least_determinant:
             error(invalid, "CAD transform must be finite and nonsingular")
         let reflected = matrix.determinant() < 0.0
         let output = try interop.Reference[CadModel].adopt(new CadModel() in memory.heap, cad_model_type, memory.heap)
@@ -180,7 +195,7 @@ pub struct CadModel:
             normal = normal.add(boundary[at].subtract(boundary[0]).cross(boundary[(at + 1) % boundary.length].subtract(boundary[0])))
         normal = try normal.normalized()
         for point in boundary:
-            if not point.is_finite() or math.abs(point.subtract(boundary[0]).dot(normal)) > 0.000001:
+            if not point.is_finite() or math.abs(point.subtract(boundary[0]).dot(normal)) > coplanar:
                 error(invalid, "CAD planar boundary must be finite and coplanar within 1e-6 source units")
         let checked = try planar_mesh(boundary)
         defer checked.release()
@@ -306,7 +321,7 @@ pub let cad_model_type: interop.Type[CadModel] = interop.Type[CadModel]("CadMode
 ## linear part solved for it.
 func unplaced(matrix: Matrix4, delta: Vector3) -> Vector3!:
     let determinant = matrix.determinant()
-    if not math.is_finite(determinant) or math.abs(determinant) < 0.000000000001: error(invalid, "CAD placement is singular")
+    if not math.is_finite(determinant) or math.abs(determinant) < least_determinant: error(invalid, "CAD placement is singular")
     # Cramer's rule over the columns x, y, z.
     let x = delta.dot(matrix.y.cross(matrix.z)) / determinant
     let y = matrix.x.dot(delta.cross(matrix.z)) / determinant

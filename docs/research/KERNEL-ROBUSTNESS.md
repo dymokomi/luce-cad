@@ -724,6 +724,19 @@ counterpart here.
 **Harness:** invariance 0 of 224, band 0 of 452, canonical 0 of 23,
 determinism identical; literals 894.
 
+### 3.13 Stage 6, literals: geometry, NURBS, layout, meshing, polygons
+
+The literal ratchet counts module-level named constants as named (a `let`
+at a line's start, with its comment). Moved onto names, values unchanged:
+the inversion's Newton steps, parallel tangents and parameter roundoff
+(geometry); the curve, edit, B-rep, tessellation, model and NURBS guards;
+the layout's station identities (`same_station`, `same_cut`,
+`count_slack`, `degenerate`, `vanishing`, `incidence_share`,
+`incidence_floor`, `seam_probe`, `period_match`, `direction_share`,
+`station_epsilon`, `plan_epsilon`); geocore's conditioning in meshing and
+polygons. 894 to 732; modeling (about 310 lines) and surfacing (about 165)
+are next.
+
 ### 3.4 Reproducing
 
 - `luc test` in luce-cad runs the harness.

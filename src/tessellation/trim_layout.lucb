@@ -2,6 +2,20 @@
 ## Regular UV directions continue through irregular trims when compatible;
 ## non-isoparametric trims cut cells without bending every interior row.
 
+## A trim layout's chart: a span narrower than this (chart units) is
+## singular; the guard cells reach this share of its span past the trims;
+## rows closer than `row_merge` of its span are one, and a crossing within
+## `incidence_share` of that (at least `least_incidence`) of a row lies on
+## it; cuts on an edge closer than `separation_share` of the tolerance (at
+## least `least_separation`, a length) are one.
+let least_chart_span: f64 = 1e-9
+let guard_margin: f64 = 0.01
+let row_merge: f64 = 1e-7
+let incidence_share: f64 = 1e-5
+let least_incidence: f64 = 1e-13
+let separation_share: f64 = 0.01
+let least_separation: f64 = 1e-8
+
 ## Initialize and reconcile layouts before shared vertices are allocated.
 ## Invalid/over-budget layouts fall back; their already registered edge cuts are
 ## still shared by both incident faces. No tolerance welding is performed.
@@ -145,7 +159,7 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
             low = Vector3(math.min(low.x, seed.x), math.min(low.y, seed.y), 0.0)
             high = Vector3(math.max(high.x, seed.x), math.max(high.y, seed.y), 0.0)
     try include_conics(s, face, edges, &low, &high)
-    if high.x - low.x < 1e-9 or high.y - low.y < 1e-9: error(invalid, "singular trim layout")
+    if high.x - low.x < least_chart_span or high.y - low.y < least_chart_span: error(invalid, "singular trim layout")
     let trim_low = low
     let trim_high = high
     plan.trim_low = trim_low
@@ -153,13 +167,13 @@ func seed_layout(plan: GridLayout*, face: BrepFace, s: Surface, vertices: const 
     # The sampled trim polygon bounds are not the curve bounds. Subsequent exact
     # edge/grid intersections can lie outside that polygon (e.g. a circle near
     # its extremum). Guard cells cover that envelope and are clipped away.
-    let margin = high.subtract(low).multiply_scalar(0.01)
+    let margin = high.subtract(low).multiply_scalar(guard_margin)
     low = low.subtract(margin)
     high = high.add(margin)
     if s.kind == surface_spline:
         low = Vector3(math.max(0.0, low.x), math.max(0.0, low.y), 0.0)
         high = Vector3(math.min(1.0, high.x), math.min(1.0, high.y), 0.0)
-    plan.epsilon = math.max(high.x - low.x, high.y - low.y) * 1e-7
+    plan.epsilon = math.max(high.x - low.x, high.y - low.y) * row_merge
     _ = try plan.u.insert(low.x, plan.epsilon)
     _ = try plan.u.insert(high.x, plan.epsilon)
     _ = try plan.v.insert(low.y, plan.epsilon)
@@ -301,7 +315,7 @@ pub func reconcile(plan: GridLayout*, face: BrepFace, s: Surface, vertices: cons
             # A shallow crossing near a tangent is still a crossing;
             # skipping it sends an unsplit chord through the grid side
             # and can turn an otherwise valid cut cell inside out.
-            let incidence = math.max(1e-13, plan.epsilon * 1e-5)
+            let incidence = math.max(least_incidence, plan.epsilon * incidence_share)
             let last = lines.count - 1
             for segment in 0..<uv.length - 1:
                 let a = uv[segment].x if axis == 0 else uv[segment].y
