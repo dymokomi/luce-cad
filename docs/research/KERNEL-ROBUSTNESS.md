@@ -973,7 +973,18 @@ replays with `build/sweep 1 SEED CASE`, which prints it shrunk:
 The first group is the next step: a section touching a face's boundary at a
 single point makes a loop that passes that vertex twice, which the face
 split's turn order at the vertex must take the right way round (the section
-and the edge leave it along one tangent).
+and the edge leave it along one tangent, in seed 2 case 209 to fourth order,
+so no chord tells them apart). Two patches in luce_work/patches go further
+and are not landed: `sweep-split-used-halves.patch` lets the tracer skip
+half-edges another cycle took (209 then splits, and stops at a face its mesh
+cannot close), and `sweep-touch-closest-point-wip.patch` moves a merged touch
+to its closest point by golden section (the vertex then lies on both to the
+roundoff, which turns "circle endpoints are not on the curve" refusals into
+results; but on a ball touching a pipe's wall at its cap rim the section is
+then dropped and the union comes out as the two bodies apart, a wrong
+result where there was a refusal, so it waits for that to be found).
+`boolean-debug-prints.patch` prints the sections, cuts and open edges of a
+boolean, the quickest way into a sweep case.
 
 ### 3.4 Reproducing
 
