@@ -69,8 +69,12 @@ pub func balance(faces: const BrepFace[], edges: const Curve[], sides: const Pat
                     changed = changed or inserted
             # Publishing a row only adds a boundary corner to a stopped neighbor.
             # It becomes an interior row there only across a classified flow seam.
+            # Across a hard seam the row first takes a station already there
+            # when one is within half its spacing (nest_rows): two families
+            # of different counts unioned beat into stations a hair apart.
             for use in 0..<face.uses.length:
                 let shared = &cuts[edge_index(face.uses[use])]
+                if not plans[face_id].flow[use]: nest_rows(&rows[use], *shared, metrics[edge_index(face.uses[use])])
                 for at in 0..<rows[use].count:
                     let added = try shared.insert(rows[use].values[at],same_cut)
                     changed = changed or added
@@ -78,6 +82,33 @@ pub func balance(faces: const BrepFace[], edges: const Curve[], sides: const Pat
             settled[face_id].clean = not changed
             changed = before or changed
         if not changed: break
+
+## A face's rows on an edge (`rows`) moved onto stations of the edge's
+## shared cuts already there, each to the nearest within `nest_share` of its
+## distance to the rows beside it (along the edge's arc length), so that the
+## edge's stations nest instead of beating: a row of a 33-row family next
+## to a 32-row family's lands a 33rd of their spacing from it, a sliver
+## cell on both faces. The rows' ends (the edge's) stay.
+func nest_rows(rows: Stations*, shared: Stations, metric: ArcMetric):
+    if rows.count < 3 or shared.count < 3: return
+    var station: usize = 0
+    for at in 1..<rows.count - 1:
+        let value = rows.values[at]
+        while station + 1 < shared.count and shared.values[station + 1] <= value: station += 1
+        let below = shared.values[station]
+        let above = shared.values[station + 1] if station + 1 < shared.count else below
+        let here = metric.at(value)
+        let target = below if math.abs(metric.at(below) - here) <= math.abs(metric.at(above) - here) else above
+        let offset = math.abs(metric.at(target) - here)
+        if offset <= same_cut: continue
+        let before = here - metric.at(rows.values[at - 1])
+        let after = metric.at(rows.values[at + 1]) - here
+        if offset >= math.min(before, after) * nest_share: continue
+        rows.values[at] = target
+
+## How near a station a row moves onto it, as a share of the gap to the
+## rows beside it: under half, it stays nearer its own place than theirs.
+let nest_share: f64 = 0.5
 
 func signature(face: BrepFace, side: PatchSides, cuts: const Stations[], plan: GridLayout) -> Settled:
     var result = Settled()

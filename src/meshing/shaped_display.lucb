@@ -1,0 +1,140 @@
+## The display triangles of a polygon whose worst is the roundest. A cell a
+## seam conformed (conform_seams: a denser neighbor's samples on its side)
+## or a trim cut has corners close together along one side; ear clipping or
+## a fan from a fixed corner can join three of them (nearly on one line)
+## into a needle. Of every triangulation of the polygon, the one whose least
+## round triangle is roundest is shown: a minimax triangulation, by dynamic
+## programming over the polygon's corner chains (Klincsek; Bern and
+## Eppstein, "Mesh generation and optimal triangulation", 1992).
+
+## The most corners a polygon is shaped for: the search is cubic in them
+## (and each triangle's check linear), so beyond it a polygon keeps the
+## display it has. Conformed and cut cells are well under it.
+pub let shaped_most: usize = 24
+
+## Display triangles of polygon `ids` (indices into its corners) into `out`,
+## the triangulation whose least round triangle (roundness: twice its area
+## over its longest side squared) is roundest, of those whose every triangle
+## lies inside the polygon (as it faces, in its own plane), holds no other
+## corner and is thick enough for the single-precision display to show
+## (ear). Returns that least roundness, or 0 (and nothing in `out`) when the
+## polygon has more than `shaped_most` corners or no such triangulation.
+pub func shaped_display(mesh: const MeshBuilder*, ids: const i64[], out: Growing[i64]*) -> f64!:
+    out.clear()
+    let n = ids.length
+    if n < 4 or n > shaped_most: return 0.0
+    var normal = Vector3()
+    for at in 0..<n: normal = normal.add(mesh.points[(usize)ids[at]].cross(mesh.points[(usize)ids[(at + 1) % n]]))
+    let length = normal.length()
+    if not (length > nonzero): return 0.0
+    let facing = normal.multiply_scalar(1.0 / length)
+    # The polygon in its own plane: two axes across its facing.
+    let helper = Vector3(1.0, 0.0, 0.0) if math.abs(facing.x) < 0.5 else Vector3(0.0, 1.0, 0.0)
+    let first_axis = helper.cross(facing).normalized() catch failure: recover Vector3(1.0, 0.0, 0.0)
+    let second_axis = facing.cross(first_axis)
+    let plane = try new Vector3[n] --- in memory.heap
+    defer free(plane) in memory.heap
+    let origin = mesh.points[(usize)ids[0]]
+    for at in 0..<n:
+        let p = mesh.points[(usize)ids[at]].subtract(origin)
+        plane[at] = Vector3(p.dot(first_axis), p.dot(second_axis), 0.0)
+    # Which corner pairs may be joined: a side, or a diagonal crossing no
+    # side and leaving its corner into the polygon.
+    var joins: bool[576]
+    for i in 0..<n:
+        for j in 0..<n: joins[i * n + j] = false
+    for i in 0..<n:
+        joins[i * n + (i + 1) % n] = true
+        joins[((i + 1) % n) * n + i] = true
+        for j in i + 2..<n:
+            if i == 0 and j == n - 1: continue
+            let inside = sees_inside(plane, i, j)
+            joins[i * n + j] = inside
+            joins[j * n + i] = inside
+    # best[i * n + j]: the roundest least roundness of chain i..j closed by
+    # the join j-i (-1: none); split: the corner its triangle takes.
+    var best: f64[576]
+    var split: usize[576]
+    for at in 0..<n * n:
+        best[at] = -1.0
+        split[at] = n
+    for i in 0..<n - 1: best[i * n + i + 1] = 1.0e300
+    for span in 2..<n:
+        for i in 0..<n - span:
+            let j = i + span
+            if not joins[i * n + j]: continue
+            for k in i + 1..<j:
+                let left = best[i * n + k]
+                let right = best[k * n + j]
+                if left < 0.0 or right < 0.0: continue
+                let shape = math.min(left, right)
+                if shape <= best[i * n + j]: continue
+                let round = triangle_shape(mesh, ids, plane, i, k, j, facing)
+                if round <= 0.0: continue
+                let worst = math.min(shape, round)
+                if worst > best[i * n + j]:
+                    best[i * n + j] = worst
+                    split[i * n + j] = k
+    let result = best[n - 1]
+    if result <= 0.0 or result >= 1.0e300: return 0.0
+    try emit_shaped(split[..<n * n], n, 0, n - 1, out)
+    return result
+
+## Chain i..j's triangles (polygon i..j closed by j-i), as split chose.
+func emit_shaped(split: const usize[], n: usize, i: usize, j: usize, out: Growing[i64]*) -> !:
+    if j <= i + 1: return
+    let k = split[i * n + j]
+    try out.push((i64)i)
+    try out.push((i64)k)
+    try out.push((i64)j)
+    try emit_shaped(split, n, i, k, out)
+    try emit_shaped(split, n, k, j, out)
+
+## Triangle i, k, j's roundness when the display can show it inside the
+## polygon (turning its way, thick to the display, no other corner in or on
+## it), else 0.
+func triangle_shape(mesh: const MeshBuilder*, ids: const i64[], plane: const Vector3[], i: usize, k: usize, j: usize, facing: Vector3) -> f64:
+    let a = plane[i]
+    let b = plane[k]
+    let c = plane[j]
+    if plane_turn(a, b, c) <= 0.0: return 0.0
+    if ear(mesh, ids, i, k, j, facing) < 1.0: return 0.0
+    for at in 0..<plane.length:
+        if at == i or at == k or at == j: continue
+        let p = plane[at]
+        if plane_turn(a, b, p) >= 0.0 and plane_turn(b, c, p) >= 0.0 and plane_turn(c, a, p) >= 0.0: return 0.0
+    return roundness(mesh.points[(usize)ids[i]], mesh.points[(usize)ids[k]], mesh.points[(usize)ids[j]])
+
+## Twice the signed area of a, b, c in the plane.
+func plane_turn(a: Vector3, b: Vector3, c: Vector3) -> f64:
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+
+## Whether corners i and j (not neighbors) of the counterclockwise polygon
+## `plane` see each other inside it: the segment leaves i into the polygon
+## (within its corner's cone) and crosses no side it does not end on.
+func sees_inside(plane: const Vector3[], i: usize, j: usize) -> bool:
+    let n = plane.length
+    let a = plane[i]
+    let b = plane[j]
+    let before = plane[(i + n - 1) % n]
+    let after = plane[(i + 1) % n]
+    # Within the cone at i (convex corner: left of both sides; reflex: not
+    # right of both).
+    let convex = plane_turn(before, a, after) > 0.0
+    let left_after = plane_turn(a, after, b) > 0.0
+    let left_before = plane_turn(before, a, b) > 0.0
+    if convex and not (left_after and left_before): return false
+    if not convex and not (left_after or left_before): return false
+    for at in 0..<n:
+        let next = (at + 1) % n
+        if at == i or next == i or at == j or next == j: continue
+        let c = plane[at]
+        let d = plane[next]
+        let d1 = plane_turn(a, b, c)
+        let d2 = plane_turn(a, b, d)
+        let d3 = plane_turn(c, d, a)
+        let d4 = plane_turn(c, d, b)
+        if ((d1 > 0.0 and d2 < 0.0) or (d1 < 0.0 and d2 > 0.0)) and ((d3 > 0.0 and d4 < 0.0) or (d3 < 0.0 and d4 > 0.0)): return false
+        # A corner on the segment blocks it.
+        if d1 == 0.0 and (c.subtract(a).dot(c.subtract(b)) <= 0.0): return false
+    return true

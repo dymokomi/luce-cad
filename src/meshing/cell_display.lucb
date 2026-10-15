@@ -1,0 +1,517 @@
+## How a face's cells are shown: each polygon's display triangles chosen
+## for shape once its mesher is done (patch_dispatch's mesh_face), and a
+## grid node a hair from a trim freed (its cells joined).
+
+## The aspect (longest side squared over twice the area) of a needle: twice
+## row_stretch, the most a cell stretches along a straight direction beside
+## its narrowest step (pitch.lucb). A cell whose triangles would pass it is
+## shown by shape, and a grid node standing that close to a trim side
+## (that side's length over it) is freed.
+pub let needle_aspect: f64 = 48.0
+
+## The face's polygons (from `first`, corners from `first_corner`) again,
+## each shown as well as its corners allow:
+## - a grid node a hair from a trim side (a trim grazing a row) is freed
+##   first: the cells round it joined into one (free_nodes);
+## - one of more than four corners (a cell a seam conformed, a trim cut or
+##   a join made), or a quad whose either diagonal leaves a needle, is shown
+##   by its roundest triangulation (shaped_display), whose triangles never
+##   span a straight corner;
+## - else one with a straight corner (a corner off the line through its
+##   neighbors by no more than the single-precision display can show: a
+##   side carrying a sample another cell's row ends at) is shown by ear
+##   clipping, whose ears never span a straight corner: its own display
+##   triangulation could pass through it, a triangle of no area once the
+##   mesh is single precision. The others keep theirs.
+## A clipped face's cached corner normals follow its corners.
+func straighten(mesh: MeshBuilder*, first: usize, first_corner: usize, plan: GridLayout) -> !:
+    var any = false
+    var corner = first_corner
+    for f in first..<mesh.nf:
+        let n = (usize)mesh.sizes[f]
+        let ids = mesh.corners[corner..<corner + n]
+        if n > 4 or (n == 4 and (straight_at(mesh, corner, n) >= 0 or quad_round(mesh, ids) * needle_aspect < 1.0)) or thin_cell(mesh, ids): any = true
+        corner += n
+    if not any: return
+    var cells = try FaceCells(mesh, first, first_corner)
+    defer cells.close()
+    try cells.free_nodes(mesh)
+    # A clipped face's corner normals come cached with its cells
+    # (clipped_patch): written again corner by corner as the cells are.
+    let cached = plan.applied.length > 0 and plan.applied[0] and plan.normals.length > 0
+    var uncached: f64[]
+    let previous = plan.normals[0].values if cached else uncached
+    var normals = Growing[f64]()
+    defer normals.close()
+    mesh.nf = first
+    mesh.nc = first_corner
+    var scratch = Growing[i64]()
+    defer scratch.close()
+    for f in 0..<cells.sizes.count:
+        let n = (usize)cells.sizes.items[f]
+        let at = cells.offsets.items[f]
+        let ids = cells.corners.items[at..<at + n]
+        let sources = cells.sources.items[at..<at + n]
+        let joined = cells.joined.items[f]
+        # A quad whose either diagonal leaves a needle (a short side a
+        # trim's close samples make) is shaped as larger cells are.
+        let needle = n == 4 and quad_round(mesh, ids) * needle_aspect < 1.0
+        let straight = straight_at_ids(mesh, ids) if n >= 4 else -1
+        try mesh.face((i64)n, cells.parents.items[f])
+        for id in ids: try mesh.corner(id)
+        if cached:
+            for source in sources:
+                for axis in 0..<(usize)3: try normals.push(previous[source * 3 + axis])
+        var shown = false
+        if n > 4 or (n == 4 and (joined or needle)):
+            shown = (try shaped_display(mesh, ids, &scratch)) > 0.0
+            if shown: try mesh.set_last_display(scratch.view())
+        if straight >= 0 and not shown:
+            shown = true
+            straight_display(mesh, ids, &scratch) catch failure:
+                if failure.code != invalid: error(failure.code, failure.message)
+                shown = false
+                recover ()
+            if shown: try mesh.set_last_display(scratch.view())
+        let display = cells.display.items[f]
+        if not shown and n >= 4 and not joined and cells.triangles.items[display] >= 0:
+            scratch.clear()
+            for k in 0..<(n - 2) * 3: try scratch.push(cells.triangles.items[display + k])
+            try mesh.set_last_display(scratch.view())
+    if cached and cells.changed:
+        free(plan.normals[0].values) in memory.heap
+        plan.normals[0].values = try new f64[normals.count] --- in memory.heap
+        memory.copy(plan.normals[0].values, normals.view(), normals.count)
+
+## How round quad `ids`'s better diagonal leaves its triangles: the
+## greater over its two diagonals of the lesser roundness of their two.
+func quad_round(mesh: const MeshBuilder*, ids: const i64[]) -> f64:
+    let a = mesh.points[(usize)ids[0]]
+    let b = mesh.points[(usize)ids[1]]
+    let c = mesh.points[(usize)ids[2]]
+    let d = mesh.points[(usize)ids[3]]
+    return math.max(math.min(roundness(a, b, c), roundness(a, c, d)), math.min(roundness(a, b, d), roundness(b, c, d)))
+
+## How far `p` lies from segment `a`-`b`.
+func side_distance(p: Vector3, a: Vector3, b: Vector3) -> f64:
+    let ab = b.subtract(a)
+    let length = ab.dot(ab)
+    let t = math.clamp(p.subtract(a).dot(ab) / length, 0.0, 1.0) if length > 0.0 else 0.0
+    return p.subtract(a.add(ab.multiply_scalar(t))).length()
+
+## Whether polygon `ids` is thin: twice its area over its longest side
+## squared (a triangle's roundness) under 1 / needle_aspect.
+func thin_cell(mesh: const MeshBuilder*, ids: const i64[]) -> bool:
+    let n = ids.length
+    let origin = mesh.points[(usize)ids[0]]
+    var normal = Vector3()
+    var longest: f64 = 0.0
+    for at in 0..<n:
+        let a = mesh.points[(usize)ids[at]].subtract(origin)
+        let b = mesh.points[(usize)ids[(at + 1) % n]].subtract(origin)
+        normal = normal.add(a.cross(b))
+        longest = math.max(longest, b.subtract(a).length())
+    return normal.length() * needle_aspect < longest * longest
+
+## A face's cells while their display is chosen: each one's corners (point
+## ids), where each corner came from (its index among the face's corners,
+## for cached normals), its parent, its display triangles as the mesher
+## left them (`display`: an offset into `triangles`, -1 entries none) and
+## whether it was joined.
+struct FaceCells:
+    var sizes: Growing[i64]
+    var offsets: Growing[usize]
+    var corners: Growing[i64]
+    var sources: Growing[usize]
+    var parents: Growing[i64]
+    var display: Growing[usize]
+    var triangles: Growing[i64]
+    var joined: Growing[bool]
+    var changed: bool = false
+
+    ## The polygons of `mesh` from `first` (corners from `first_corner`).
+    func init(mesh: const MeshBuilder*, first: usize, first_corner: usize) -> !:
+        self.sizes = Growing[i64]()
+        self.offsets = Growing[usize]()
+        self.corners = Growing[i64]()
+        self.sources = Growing[usize]()
+        self.parents = Growing[i64]()
+        self.display = Growing[usize]()
+        self.triangles = Growing[i64]()
+        self.joined = Growing[bool]()
+        self.changed = false
+        let has_display = mesh.display.length > 0
+        var corner = first_corner
+        for f in first..<mesh.nf:
+            let n = (usize)mesh.sizes[f]
+            try self.sizes.push((i64)n)
+            try self.offsets.push(self.corners.count)
+            try self.parents.push(mesh.face_parents[f])
+            try self.joined.push(false)
+            try self.display.push(self.triangles.count)
+            for k in 0..<n:
+                try self.corners.push(mesh.corners[corner + k])
+                try self.sources.push(corner - first_corner + k)
+            # Its display triangles, as indices into its own corners.
+            let slot = (corner - 2 * f) * 3
+            for k in 0..<(n - 2) * 3:
+                let value = mesh.display[slot + k] if has_display and slot + k < mesh.display.length else -1
+                try self.triangles.push(value - (i64)corner if value >= 0 else -1)
+            corner += n
+
+    func close():
+        self.sizes.close()
+        self.offsets.close()
+        self.corners.close()
+        self.sources.close()
+        self.parents.close()
+        self.display.close()
+        self.triangles.close()
+        self.joined.close()
+
+    ## Free each grid node standing closer to a trim side of a cell around
+    ## it than that side's length over needle_aspect (a trim grazing a row
+    ## passes it at a hair): every cell around the node is joined into one
+    ## and the node left out, so no triangle has to stand on the trim side
+    ## with the node as its apex. The trim's points all stay. Only joins
+    ## into a simple polygon of at most 64 corners, each cell joined once a
+    ## round; up to 8 rounds.
+    func free_nodes(mesh: const MeshBuilder*) -> !:
+        for round in 0..<8:
+            var sides = try SideTable(&self)
+            defer sides.close()
+            var taken = Growing[bool]()
+            defer taken.close()
+            for f in 0..<self.sizes.count: try taken.push(false)
+            var fan = Growing[usize]()
+            defer fan.close()
+            var any = false
+            for f in 0..<self.sizes.count:
+                if taken.items[f]: continue
+                let n = (usize)self.sizes.items[f]
+                let at = self.offsets.items[f]
+                var done = false
+                for k in 0..<n:
+                    if done: break
+                    let p = self.corners.items[at + k]
+                    let q = self.corners.items[at + (k + 1) % n]
+                    if sides.across(p, q, f) >= 0: continue
+                    let a = mesh.points[(usize)p]
+                    let b = mesh.points[(usize)q]
+                    let length = b.subtract(a).length()
+                    for j in 0..<n:
+                        let v = self.corners.items[at + j]
+                        if v == p or v == q: continue
+                        if side_distance(mesh.points[(usize)v], a, b) * needle_aspect >= length: continue
+                        if not (try self.fan_of(&sides, f, v, &fan)): continue
+                        var open = true
+                        for cell in fan.view(): open = open and not taken.items[cell]
+                        if not open: continue
+                        if not (try self.merge(fan.view(), v)): continue
+                        for cell in fan.view(): taken.items[cell] = true
+                        any = true
+                        done = true
+                        break
+            if not any: return
+            try self.compact()
+
+    ## The cells round point `v` of cell `f`, in order (into `fan`); false
+    ## when `v` lies on the face's boundary (a side round it has no cell
+    ## across) or more than 16 cells meet there.
+    func fan_of(sides: SideTable*, f: usize, v: i64, fan: Growing[usize]*) -> bool!:
+        fan.clear()
+        var cell = f
+        for step in 0..<16:
+            try fan.push(cell)
+            let n = (usize)self.sizes.items[cell]
+            let at = self.offsets.items[cell]
+            var j: usize = 0
+            while j < n and self.corners.items[at + j] != v: j += 1
+            if j == n: return false
+            let across = sides.across(self.corners.items[at + (j + n - 1) % n], v, cell)
+            if across < 0: return false
+            if (usize)across == f: return true
+            cell = (usize)across
+        return false
+
+    ## Cells `fan` (round point `v`) joined into the first one's place: the
+    ## sides only one of them has, chained into one loop. False, changing
+    ## nothing, when they do not chain into one simple polygon of at most
+    ## 64 corners or `v` is still on it.
+    func merge(fan: const usize[], v: i64) -> bool!:
+        var starts = Growing[i64]()
+        defer starts.close()
+        var ends = Growing[i64]()
+        defer ends.close()
+        var origins = Growing[usize]()
+        defer origins.close()
+        for cell in fan:
+            let n = (usize)self.sizes.items[cell]
+            let at = self.offsets.items[cell]
+            for k in 0..<n:
+                let p = self.corners.items[at + k]
+                let q = self.corners.items[at + (k + 1) % n]
+                # A side two of them share (its reverse in another) is inside.
+                var inner = false
+                for other in fan:
+                    let m = (usize)self.sizes.items[other]
+                    let b = self.offsets.items[other]
+                    for i in 0..<m:
+                        if self.corners.items[b + i] == q and self.corners.items[b + (i + 1) % m] == p: inner = true
+                if inner: continue
+                try starts.push(p)
+                try ends.push(q)
+                try origins.push(self.sources.items[at + k])
+        let count = starts.count
+        if count < 3 or count > 64: return false
+        for k in 0..<count:
+            if starts.items[k] == v: return false
+            for i in k + 1..<count:
+                if starts.items[i] == starts.items[k]: return false
+        let offset = self.corners.count
+        var side: usize = 0
+        for step in 0..<count:
+            try self.corners.push(starts.items[side])
+            try self.sources.push(origins.items[side])
+            var next = count
+            for i in 0..<count:
+                if starts.items[i] == ends.items[side]: next = i
+            if next == count or (next == 0) != (step + 1 == count):
+                self.corners.count = offset
+                self.sources.count = offset
+                return false
+            side = next
+        let first = fan[0]
+        self.offsets.items[first] = offset
+        self.sizes.items[first] = (i64)count
+        self.joined.items[first] = true
+        for k in 1..<fan.length: self.sizes.items[fan[k]] = 0
+        self.changed = true
+        return true
+
+    ## Drop the cells joins emptied.
+    func compact() -> !:
+        var kept: usize = 0
+        for f in 0..<self.sizes.count:
+            if self.sizes.items[f] == 0: continue
+            self.sizes.items[kept] = self.sizes.items[f]
+            self.offsets.items[kept] = self.offsets.items[f]
+            self.parents.items[kept] = self.parents.items[f]
+            self.display.items[kept] = self.display.items[f]
+            self.joined.items[kept] = self.joined.items[f]
+            kept += 1
+        self.sizes.count = kept
+        self.offsets.count = kept
+        self.parents.count = kept
+        self.display.count = kept
+        self.joined.count = kept
+
+## The cells on each side of a face's cells, hashed by the side's points
+## (open addressing): a side one cell uses is on the face's boundary.
+struct SideTable:
+    var keys: i64[]
+    var cells: i64[]
+
+    func init(cells: const FaceCells*) -> !:
+        var capacity: usize = 16
+        while capacity < cells.corners.count * 4: capacity *= 2
+        let keys = try new i64[capacity * 2] --- in memory.heap
+        errdefer free(keys) in memory.heap
+        let owners = try new i64[capacity * 2] --- in memory.heap
+        self.keys = keys
+        self.cells = owners
+        for at in 0..<self.keys.length:
+            self.keys[at] = -1
+            self.cells[at] = -1
+        for f in 0..<cells.sizes.count:
+            let n = (usize)cells.sizes.items[f]
+            let at = cells.offsets.items[f]
+            for k in 0..<n:
+                let slot = self.slot(cells.corners.items[at + k], cells.corners.items[at + (k + 1) % n])
+                self.cells[slot * 2 + (0 if self.cells[slot * 2] < 0 else 1)] = (i64)f
+
+    func close():
+        free(self.keys) in memory.heap
+        free(self.cells) in memory.heap
+
+    ## The slot of side p-q (either way), claimed when new.
+    func slot(p: i64, q: i64) -> usize:
+        let a = p if p < q else q
+        let b = q if p < q else p
+        let count = self.keys.length // 2
+        var at = ((usize)a * 73856093 + (usize)b * 19349663) % count
+        while self.keys[at * 2] >= 0 and (self.keys[at * 2] != a or self.keys[at * 2 + 1] != b): at = (at + 1) % count
+        self.keys[at * 2] = a
+        self.keys[at * 2 + 1] = b
+        return at
+
+    ## The cell across side p-q from cell `f`, or -1 on the boundary.
+    func across(p: i64, q: i64, f: usize) -> i64:
+        let at = self.slot(p, q)
+        let first = self.cells[at * 2]
+        let second = self.cells[at * 2 + 1]
+        if first == (i64)f: return second
+        if second == (i64)f: return first
+        return -1
+
+## The first straight corner of the polygon at `start` (`n` corners), or -1.
+func straight_at(mesh: const MeshBuilder*, start: usize, n: usize) -> i64:
+    return straight_at_ids(mesh, mesh.corners[start..<start + n])
+
+## A flat polygon of more than four corners counts as straight at its
+## first: any three of its corners may lie on one line (a side folding back
+## past a sample), and the ear clipping that shows it never spans them. A
+## curved one keeps its own triangulation unless a corner is straight as
+## the polygon faces.
+func straight_at_ids(mesh: const MeshBuilder*, ids: const i64[]) -> i64:
+    let n = ids.length
+    if n > 4 and flat(mesh, ids): return 0
+    var normal = Vector3()
+    for at in 0..<n: normal = normal.add(mesh.points[(usize)ids[at]].cross(mesh.points[(usize)ids[(at + 1) % n]]))
+    let facing = normal.multiply_scalar(1.0 / math.max(normal.length(), nonzero))
+    for at in 0..<n:
+        let a = mesh.points[(usize)ids[(at + n - 1) % n]]
+        let b = mesh.points[(usize)ids[at]]
+        let c = mesh.points[(usize)ids[(at + 1) % n]]
+        let ac = c.subtract(a)
+        # Off the line through its neighbors, as the polygon faces, by no
+        # more than the display's single-precision rounding: a triangle
+        # through it could show flat, on edge or turned over.
+        let off = math.abs(b.subtract(a).cross(ac).dot(facing)) / math.max(ac.length(), nonzero)
+        if off <= display_rounding(b): return (i64)at
+    return -1
+
+## Whether polygon `ids` lies in one plane, to the display's rounding.
+func flat(mesh: const MeshBuilder*, ids: const i64[]) -> bool:
+    let n = ids.length
+    var normal = Vector3()
+    for at in 0..<n: normal = normal.add(mesh.points[(usize)ids[at]].cross(mesh.points[(usize)ids[(at + 1) % n]]))
+    let length = normal.length()
+    if not (length > 0.0): return false
+    let axis = normal.multiply_scalar(1.0 / length)
+    let origin = mesh.points[(usize)ids[0]]
+    for id in ids:
+        let p = mesh.points[(usize)id]
+        if math.abs(p.subtract(origin).dot(axis)) > display_rounding(p): return false
+    return true
+
+## Display triangles of polygon `ids` (indices into its corners): ear
+## clipping in its own plane. An ear is taken when each of its corners lies
+## farther from the opposite side than the single-precision display can
+## blur (display_rounding) and no other corner lies in or on it; when none
+## is that thick, the thickest unblocked one (a polygon only thin ears can
+## cover: the least thin is shown). An error when no ear is left at all.
+func straight_display(mesh: const MeshBuilder*, ids: const i64[], out: Growing[i64]*) -> !:
+    let n = ids.length
+    var normal = Vector3()
+    for at in 0..<n: normal = normal.add(mesh.points[(usize)ids[at]].cross(mesh.points[(usize)ids[(at + 1) % n]]))
+    out.clear()
+    # A convex polygon (every corner turning its way, or straight): the fan
+    # from the corner whose fan triangles are thickest, when the display
+    # shows them all.
+    var convex = true
+    for at in 0..<n:
+        let a = mesh.points[(usize)ids[(at + n - 1) % n]]
+        let b = mesh.points[(usize)ids[at]]
+        let c = mesh.points[(usize)ids[(at + 1) % n]]
+        if b.subtract(a).cross(c.subtract(b)).dot(normal) < 0.0: convex = false
+    if convex:
+        var apex = n
+        var best = 0.0
+        for candidate in 0..<n:
+            var least = 1.0e300
+            for k in 1..<n - 1:
+                least = math.min(least, ear(mesh, ids, candidate, (candidate + k) % n, (candidate + k + 1) % n, normal))
+                if least <= best: break
+            if least > best:
+                apex = candidate
+                best = least
+        if apex < n and best >= 1.0:
+            for k in 1..<n - 1:
+                try out.push((i64)apex)
+                try out.push((i64)((apex + k) % n))
+                try out.push((i64)((apex + k + 1) % n))
+            return
+    var left = Growing[usize]()
+    defer left.close()
+    for at in 0..<n: try left.push(at)
+    var scan: usize = 0
+    while left.count > 3:
+        # Of the unblocked ears the display shows, the best shaped (least
+        # aspect); when none shows, the thickest.
+        var chosen = left.count
+        var best = 0.0
+        var shape = 0.0
+        for tries in 0..<left.count:
+            let k = (scan + tries) % left.count
+            let ia = left.items[(k + left.count - 1) % left.count]
+            let ib = left.items[k]
+            let ic = left.items[(k + 1) % left.count]
+            let thickness = ear(mesh, ids, ia, ib, ic, normal)
+            if thickness <= 0.0 or (best >= 1.0 and thickness < 1.0): continue
+            let quality = roundness(mesh.points[(usize)ids[ia]], mesh.points[(usize)ids[ib]], mesh.points[(usize)ids[ic]])
+            if best >= 1.0 and quality <= shape: continue
+            if best < 1.0 and thickness < 1.0 and thickness <= best: continue
+            var blocked = false
+            for other in left.view():
+                if other == ia or other == ib or other == ic: continue
+                if inside_or_on(mesh.points[(usize)ids[other]], mesh.points[(usize)ids[ia]], mesh.points[(usize)ids[ib]], mesh.points[(usize)ids[ic]], normal):
+                    blocked = true
+                    break
+            if blocked: continue
+            chosen = k
+            best = thickness
+            shape = quality
+        if chosen == left.count: error(invalid, "a polygon has no ear to show it by")
+        try out.push((i64)left.items[(chosen + left.count - 1) % left.count])
+        try out.push((i64)left.items[chosen])
+        try out.push((i64)left.items[(chosen + 1) % left.count])
+        # Its middle corner leaves the polygon.
+        for at in chosen..<left.count - 1: left.items[at] = left.items[at + 1]
+        left.count -= 1
+        scan = chosen % left.count
+    let ia = left.items[0]
+    let ib = left.items[1]
+    let ic = left.items[2]
+    if ear(mesh, ids, ia, ib, ic, normal) <= 0.0: error(invalid, "a polygon's last triangle turns over")
+    try out.push((i64)ia)
+    try out.push((i64)ib)
+    try out.push((i64)ic)
+
+## How round triangle `a`, `b`, `c` is: twice its area over its longest
+## side squared (the inverse of its aspect; 0 for a needle).
+func roundness(a: Vector3, b: Vector3, c: Vector3) -> f64:
+    let longest = math.max(b.subtract(a).length(), math.max(c.subtract(b).length(), a.subtract(c).length()))
+    if not (longest > 0.0): return 0.0
+    return b.subtract(a).cross(c.subtract(a)).length() / (longest * longest)
+
+## How thick corners `a`, `b`, `c` of polygon `ids` are as an ear (in the
+## polygon's own facing, `normal`): 0 when
+## they turn against the polygon (or not at all), else the least of each
+## corner's height over the opposite side in display roundings there (at
+## least 1: the display shows it as it is).
+func ear(mesh: const MeshBuilder*, ids: const i64[], a: usize, b: usize, c: usize, normal: Vector3) -> f64:
+    let pa = mesh.points[(usize)ids[a]]
+    let pb = mesh.points[(usize)ids[b]]
+    let pc = mesh.points[(usize)ids[c]]
+    let cross = pb.subtract(pa).cross(pc.subtract(pa))
+    if cross.dot(normal) <= 0.0: return 0.0
+    # Its area as the polygon faces: an ear standing on edge to it (three
+    # samples of a trim bending out of the surface) has none.
+    let twice = cross.dot(normal) / math.max(normal.length(), nonzero)
+    let sides: f64[3] = [pc.subtract(pb).length(), pa.subtract(pc).length(), pb.subtract(pa).length()]
+    # As conditioned as geocore admits a display triangle.
+    let longest = math.max(sides[0], math.max(sides[1], sides[2]))
+    if twice <= math.max(nonzero, longest * longest * display_conditioning): return 0.0
+    let points: Vector3[3] = [pa, pb, pc]
+    var least = 1.0e300
+    for k in 0..<(usize)3: least = math.min(least, twice / math.max(sides[k] * display_rounding(points[k]), nonzero))
+    return least
+
+## Whether `p` lies in or on triangle `a`, `b`, `c` (turning about `normal`).
+func inside_or_on(p: Vector3, a: Vector3, b: Vector3, c: Vector3, normal: Vector3) -> bool:
+    return b.subtract(a).cross(p.subtract(a)).dot(normal) >= 0.0 and c.subtract(b).cross(p.subtract(b)).dot(normal) >= 0.0 and a.subtract(c).cross(p.subtract(c)).dot(normal) >= 0.0
+
+## How small a display triangle's cross product may be against its longest
+## side squared before geocore takes it as degenerate.
+let display_conditioning: f64 = 1e-14

@@ -716,7 +716,7 @@ mesh_quality's long pipes); no Fusion value or tolerance was loosened.
 **Open.** Slivers where a trim grazes a stretched row (to aspect 250 on a
 40 mm strip at 0.6°) and where a densely sampled trim (a corner patch's)
 meets a coarser strip (to about 4,000 at 2.8°; the size-based mesher's
-reached 21,000): both want grading toward the dense side. `refine_axis`,
+reached 21,000): both want grading toward the dense side (done, 3.14). `refine_axis`,
 `refine_cells` and analytic_trim still take the tightest radius's sag for
 the clipped chart's rows. Fusion's small-feature coarsening has no
 counterpart here.
@@ -736,6 +736,60 @@ the layout's station identities (`same_station`, `same_cut`,
 `station_epsilon`, `plan_epsilon`); geocore's conditioning in meshing and
 polygons. 894 to 732; modeling (about 310 lines) and surfacing (about 165)
 are next.
+
+### 3.14 Slivers: nested rows, absorbed crossings, cells shown by shape
+
+The two sliver families 3.12 left open came from sampling, not from the
+triangulator. Measured on the guarded cases (aspect: longest side squared
+over twice the area, curved faces, trim caps aside as checks.contract does):
+
+| case | before | after |
+|---|---|---|
+| oblique trim on a 40 mm strip, 0.6 degrees (quad_flow) | 130 | 66 |
+| rectangular pyramid, apex G1, 32 divisions (apex) | 3,825 | 58 |
+| the same, every edge G1 | 3,825 | 35 |
+| apex G2 | 1,955 | 51 |
+| every edge G2 | 2,893 | 69 |
+
+- **Rows nest at hard seams** (layout/balance.lucb `nest_rows`). Two faces
+  of different row counts on one edge (a strip's 80 rows, a corner patch's
+  140) unioned their uniform families into a beat: stations a hair apart
+  (0.0002 mm against 0.015 mm rows), each a needle on both faces. A face's
+  row across a hard seam now takes a station already on the edge when one
+  lies within half its spacing, so the families nest.
+- **Crossings absorbed to nearly half a segment** (layout/trim_crossings
+  `absorb_share` 0.45, was a quarter): a grid line crossing a trim near a
+  sample moves the sample onto the line in that chart instead of splitting
+  the segment, so no trim piece is much under half a sample spacing against
+  cells stretched along the trim.
+- **Cells shown by shape** (meshing/shaped_display.lucb, cell_display.lucb).
+  A polygon of more than four corners (a seam conformed it, a trim cut it)
+  or a quad whose either diagonal leaves a needle is shown by its minimax
+  triangulation: of all triangulations of its corners inside it, the one
+  whose least round triangle is roundest (dynamic programming over corner
+  chains, at most 24 corners, every triangle thick to the single-precision
+  display). Before, ear clipping or a fan took three nearly collinear
+  samples of a conformed side as an ear.
+- **Grid nodes a hair from a trim freed** (cell_display `free_nodes`): a
+  grid node nearer a trim side of one of its cells than that side's length
+  over 48 (a trim grazing a row) has its cells joined into one polygon and
+  drops out, so no triangle stands on the trim side with it as apex.
+
+Grading inside a cell by Delaunay refinement (chart_refine with off-centers)
+was tried and dropped: a cell's long sides are frozen there (its neighbors
+share them), and their 120-degree lenses cover a thin cell's whole inside,
+so nothing could be inserted; it added triangles without lowering the worst.
+
+What is left is the cells' own stretch: rows along a straight direction
+stretch to `row_stretch` (24) times the mean step across, so up to 48 beside
+the narrowest step, and a trim grazing such rows or a corner patch's denser
+samples on a stretched strip's end add up to about 1.5 times that. The
+guards are now 75 (were 1,000 and 5,000). Lowering them to the general 30
+needs a strip's cells graded in length toward a dense end (shorter columns
+near it), which the mapped grid's sides would have to carry as stations.
+
+**Harness:** invariance 0 of 224, band 0 of 452, canonical 0 of 23,
+determinism identical; literals 732.
 
 ### 3.4 Reproducing
 
